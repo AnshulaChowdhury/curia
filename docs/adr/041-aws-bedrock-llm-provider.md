@@ -52,12 +52,13 @@ bare model id for current Claude models and requires a geo or global profile id:
 so it cannot collide with the direct-API `claude-*` keys. Registered at introduction:
 Claude Sonnet 4.6 and Haiku 4.5 for `global`, `us` and `eu`.
 
-**Anthropic is no longer unconditionally required at boot.** Boot previously hard-failed
-without an Anthropic key even if no tier used a Claude model. The requirement now applies
-only when Bedrock is not fully configured; the existing "every tier-mapped model has a
-registered provider" check enforces that a deployment has what its own configuration needs.
-A partial AWS configuration logs a warning. (`setup.sh`'s secret verification still expects
-`anthropic_api_key`; relaxing it for Bedrock-only installs is left open.)
+**No provider is mandatory at boot.** Boot previously hard-failed without an Anthropic key
+even if no tier used a Claude model. Anthropic, OpenRouter and Bedrock now register
+symmetrically, each conditional on its own credentials, and the "every tier-mapped model has
+a registered provider" check enforces what a deployment's own configuration needs, naming the
+tier, model and provider when one is missing. A partial AWS configuration logs a warning.
+`anthropic_api_key` is no longer in the installer's required-secrets list for the same
+reason.
 
 **Two defensive measures at the provider boundary:**
 
@@ -123,9 +124,14 @@ Bedrock should still map those judges deliberately. The provider does not decide
 - **Context window is the conservative 200K** mirrored from the direct-API entries, though
   AWS lists a larger window for Sonnet 4.6; raise it only after confirming the Converse path
   accepts it without extra flags.
-- **Not exercised against a live endpoint in CI.** Unit tests mock the SDK. A live
-  tool-use regression check (the load scenario in finding 1) is worth running whenever a
-  tier's model changes, but needs AWS credentials and is not part of `pnpm test`.
+- **Not exercised against a live endpoint in CI.** Unit tests mock the SDK client (keeping
+  the real `ConverseCommand`). `pnpm run smoke:bedrock-tools` runs the load scenario from
+  finding 1 against live Bedrock and fails loudly on a narrated call, a provider error,
+  or missing credentials. It needs AWS credentials, so it is not part of `pnpm test`; run it
+  whenever a tier's model changes.
+- **The shipped model list has not been re-searched live.** The registered Claude profile ids
+  come from AWS's model cards, not from running the smoke gate, so the gate should be run on
+  a chosen tier model before this ADR moves to Accepted.
 - **The two defensive measures are partial.** The tool-narration detector misses phrasings
   with no JSON block, and the normalizer loses information when it merges turns. An
   LLM-as-judge pass over responses that should have invoked a tool is a possible future

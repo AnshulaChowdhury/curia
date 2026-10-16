@@ -1542,6 +1542,9 @@ export function loadConfig(): Config {
   if (isNaN(awsBedrockTimeoutSeconds) || awsBedrockTimeoutSeconds < 1) {
     throw new Error(`AWS_BEDROCK_TIMEOUT must be a positive number of seconds, got: ${process.env.AWS_BEDROCK_TIMEOUT}`);
   }
+  // The value reaches setTimeout() in BedrockProvider; past Node's 32-bit limit the timer
+  // fires after ~1 ms and every Bedrock call aborts immediately.
+  assertFitsNodeTimer('AWS_BEDROCK_TIMEOUT', awsBedrockTimeoutSeconds, 1000, 'seconds');
 
   // Parsed once into a local (rather than twice inline below) so the
   // > 0 validity check and the value used on the valid branch can't drift.

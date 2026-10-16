@@ -17,17 +17,16 @@ import type { Message, ToolDefinition } from '../../../../src/agents/llm/provide
 const mockSend = vi.hoisted(() => vi.fn());
 const clientConfigs = vi.hoisted(() => [] as unknown[]);
 
-vi.mock('@aws-sdk/client-bedrock-runtime', () => ({
+// Only the network client is replaced. ConverseCommand stays the real SDK class, so the
+// request the provider builds is a genuine ConverseCommand whose `.input` we can assert on.
+vi.mock('@aws-sdk/client-bedrock-runtime', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@aws-sdk/client-bedrock-runtime')>()),
   // The provider calls `new BedrockRuntimeClient({ region, credentials })`.
   BedrockRuntimeClient: class {
     constructor(config: unknown) {
       clientConfigs.push(config);
     }
     send = mockSend;
-  },
-  // ConverseCommand just carries its input so tests can assert the request shape.
-  ConverseCommand: class {
-    constructor(public input: Record<string, unknown>) {}
   },
 }));
 
@@ -61,7 +60,7 @@ interface ConverseRequest {
 function lastRequest(): ConverseRequest {
   const call = mockSend.mock.calls.at(-1);
   expect(call).toBeDefined();
-  // The mocked ConverseCommand carries its constructor input on `.input`.
+  // The real ConverseCommand exposes its constructor input on `.input`.
   return (call![0] as { input: ConverseRequest }).input;
 }
 
@@ -424,6 +423,22 @@ describe('BedrockProvider', () => {
       expect((await pending).type).toBe('error');
     });
 
+    it('aborts without hanging when the caller signal was already aborted before the call', async () => {
+      mockSend.mockImplementationOnce((_cmd: unknown, opts: { abortSignal: AbortSignal }) => new Promise((_resolve, reject) => {
+        // The signal handed to the SDK must already be aborted; a listener added now would never fire.
+        if (opts.abortSignal.aborted) reject(new Error('aborted'));
+      }));
+      const { provider } = makeProvider();
+
+      const res = await provider.chat({
+        messages: [{ role: 'user', content: 'hi' }],
+        model: MODEL,
+        options: { signal: AbortSignal.abort() },
+      });
+
+      expect(res.type).toBe('error');
+    });
+
     it('logs an error when the model returns an empty text response', async () => {
       mockSend.mockResolvedValueOnce({ ...textResponse(), output: { message: { role: 'assistant', content: [] } } });
       const { provider, logger } = makeProvider();
@@ -470,6 +485,13 @@ describe('detectUncalledToolIntent', () => {
   it('finds a fenced JSON object naming an offered tool', () => {
     expect(detectUncalledToolIntent('```json\n{"name":"email-send"}\n```', offered)).toBe('email-send');
     expect(detectUncalledToolIntent('```\n{"name":"contact-lookup"}\n```', offered)).toBe('contact-lookup');
+  });
+
+  it('reports a non-JSON fence at debug level rather than swallowing it silently', () => {
+    const logger = createSilentLogger();
+    const debug = vi.spyOn(logger, 'debug');
+    expect(detectUncalledToolIntent('```json\n{not json}\n```', offered, logger)).toBeUndefined();
+    expect(debug).toHaveBeenCalledTimes(1);
   });
 
   it('ignores a tool name that was not offered, non-JSON fences, arrays and plain mentions', () => {

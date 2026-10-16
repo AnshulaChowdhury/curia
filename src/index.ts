@@ -478,17 +478,14 @@ async function main(): Promise<void> {
   // modelRegistry must be instantiated first (above) — providers use it to look
   // up maxOutputTokens per model rather than using a hardcoded constant.
   //
-  // AWS Bedrock credentials are vault-only (ADR-021); region and timeout are
-  // non-secret env config. A deployment that routes every tier to Bedrock needs no
-  // Anthropic key, so the Anthropic requirement applies only when Bedrock is not
-  // configured. Default deployments (no AWS credentials) behave exactly as before.
+  // Providers register symmetrically: each one is conditional on its own credentials,
+  // and no vendor is mandatory. What a deployment actually needs is enforced by the
+  // tier validation below, which fails with the tier, model and provider named when a
+  // tier maps to a provider that has no credentials. AWS Bedrock credentials are
+  // vault-only (ADR-021); region and timeout are non-secret env config.
   const bedrockCreds = config.awsAccessKeyId && config.awsSecretAccessKey && config.awsRegion
     ? { accessKeyId: config.awsAccessKeyId, secretAccessKey: config.awsSecretAccessKey, region: config.awsRegion }
     : undefined;
-  if (!config.anthropicApiKey && !bedrockCreds) {
-    logger.fatal('ANTHROPIC_API_KEY is required');
-    process.exit(1);
-  }
   // estimateCostUsd is a closure pre-wired with the model registry. Passed to
   // AgentRuntime as config (dependency injection) so the runtime stays testable
   // without importing pricing.ts directly.
@@ -530,6 +527,14 @@ async function main(): Promise<void> {
     logger.warn('AWS Bedrock credentials are incomplete (need aws_access_key_id + aws_secret_access_key in the vault, and AWS_REGION set) — Bedrock provider not registered');
   }
 
+  if (providerRegistry.size === 0) {
+    logger.fatal(
+      'No LLM provider is configured — seed anthropic_api_key, openrouter_api_key, or aws_access_key_id + '
+      + 'aws_secret_access_key (with AWS_REGION) in the vault.',
+    );
+    process.exit(1);
+  }
+
   // Validate that every model mapped to a tier has a registered provider.
   // Models in the registry that aren't mapped to any tier are fine to leave
   // without a provider — they represent available models, not required ones.
@@ -539,8 +544,8 @@ async function main(): Promise<void> {
     if (meta && !providerRegistry.has(meta.provider)) {
       logger.fatal(
         { tier: tierName, model: tierModel, provider: meta.provider },
-        'Tier-mapped model references a provider that is not registered — cannot start. '
-        + 'Set the provider API key or remap the tier to a model with a registered provider.',
+        `Tier '${tierName}' maps to model '${tierModel}', whose provider '${meta.provider}' is not registered — cannot start. `
+        + 'Seed that provider\'s credentials in the vault or remap the tier to a model with a registered provider.',
       );
       process.exit(1);
     }

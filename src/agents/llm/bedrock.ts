@@ -54,7 +54,11 @@ import { resolveTemperature } from './sampling-options.js';
  * merely mention a tool name in passing. Returns the matched tool name, or
  * undefined if no such block is found.
  */
-export function detectUncalledToolIntent(content: string, offeredToolNames: string[]): string | undefined {
+export function detectUncalledToolIntent(
+  content: string,
+  offeredToolNames: string[],
+  logger?: Logger,
+): string | undefined {
   const codeBlockPattern = /```(?:json)?\s*([\s\S]*?)```/g;
   for (const match of content.matchAll(codeBlockPattern)) {
     const block = match[1];
@@ -62,8 +66,9 @@ export function detectUncalledToolIntent(content: string, offeredToolNames: stri
     let parsed: unknown;
     try {
       parsed = JSON.parse(block);
-    } catch {
+    } catch (err) {
       // Not JSON — an ordinary code fence, which is expected. Keep scanning.
+      logger?.debug({ err }, 'Code fence in model output is not JSON — not a narrated tool call');
       continue;
     }
     if (
@@ -396,7 +401,7 @@ export class BedrockProvider implements LLMProvider {
       // skill ever ran. Flag it loudly so it is visible in logs/monitoring rather
       // than indistinguishable from an intentional conversational reply.
       if (tools && tools.length > 0) {
-        const uncalledTool = detectUncalledToolIntent(text, tools.map((t) => t.name));
+        const uncalledTool = detectUncalledToolIntent(text, tools.map((t) => t.name), this.logger);
         if (uncalledTool) {
           this.logger.error(
             { model, uncalledTool, contentPreview: text.slice(0, 300) },

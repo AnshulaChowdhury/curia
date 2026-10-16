@@ -461,11 +461,11 @@ Nylas trio, Signal number, Tavily) lives only in the vault.
   holds. It upserts present values; absent ones are skipped, never cleared.
 
 **Missing secrets:** a missing *required* secret fails closed. Most fail at their consumer
-(e.g. `anthropic_api_key`). `api_token` is special-cased with an explicit boot guard that
+(e.g. a provider key, which fails the boot with the tier, model and provider named). `api_token` is special-cased with an explicit boot guard that
 refuses to start, because its HTTP-auth consumer fails *open* (no token configured = auth
 disabled) — an absent token would otherwise silently expose the API. `setup.sh` also runs
-`seed-vault` with `SEED_VAULT_VERIFY=1`, which confirms the required rows (`anthropic_api_key`,
-`api_token`, `web_app_bootstrap_secret`) landed and aborts the install if any are missing.
+`seed-vault` with `SEED_VAULT_VERIFY=1`, which confirms the required rows (`api_token`,
+`web_app_bootstrap_secret`) landed and aborts the install if any are missing.
 A missing *optional* secret (OpenAI, OpenRouter, AWS Bedrock, Signal) disables its feature via the
 existing `if (config.x)` guards rather than failing the boot.
 
@@ -490,6 +490,12 @@ requests inside that geography (data residency). Registered today: Claude Sonnet
 (`<prefix>.anthropic.claude-sonnet-4-6`) and Claude Haiku 4.5
 (`<prefix>.anthropic.claude-haiku-4-5-20251001-v1:0`) for `global`, `us` and `eu`. A tier
 mapped to a Bedrock model with no Bedrock credentials fails the boot validation.
+
+Before routing the coordinator's tiers to a Bedrock model, run
+`pnpm run smoke:bedrock-tools -- --model <profile id>`. It sends a production-shaped load
+(10K+ token prompt, 40+ tools) several times and fails unless every run makes a real tool
+call, because some models narrate the call as text under that load and nothing else notices.
+It needs the AWS vault secrets and a reachable database.
 
 Limits: the Bedrock provider has no `stream()`, so the model behind the voice channel
 (`channels.voice.model`, or the `fast` tier when unset) must not be a Bedrock model. It emits no
@@ -519,7 +525,7 @@ from `.env`.
 | `DATABASE_URL` | Yes | `.env` | Postgres connection string (also reads the vault that hosts the secrets) |
 | `DB_USER` / `DB_PASSWORD` | Yes | `.env` | Postgres credentials |
 | `TIMEZONE` | Yes | `.env` | IANA timezone (e.g. `America/Toronto`) |
-| `ANTHROPIC_API_KEY` | Yes¹ | vault | Powers all agents. ¹ Boot accepts a deployment with no Anthropic key only when AWS Bedrock is fully configured (below); `setup.sh`'s verify step still expects it. |
+| `ANTHROPIC_API_KEY` | Yes¹ | vault | Powers the agents on the default tiers. ¹ No provider is mandatory: boot requires a credential only for each provider a tier is actually mapped to, and fails naming the tier, model and provider if one is missing. |
 | `API_TOKEN` | Yes | vault | Authenticates HTTP API requests |
 | `WEB_APP_BOOTSTRAP_SECRET` | Yes | vault | Web app login secret |
 | `OPENAI_API_KEY` | Tier 2 | vault | Enables entity memory and semantic search |
