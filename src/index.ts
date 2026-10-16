@@ -34,6 +34,7 @@ import { AuditLogRepo } from './audit/audit-log-repo.js';
 import { DiagnosticsRepo } from './diagnostics/diagnostics-repo.js';
 import { AnthropicProvider } from './agents/llm/anthropic.js';
 import { OpenRouterProvider } from './agents/llm/openrouter.js';
+import { BedrockProvider } from './agents/llm/bedrock.js';
 import { AgentRuntime } from './agents/runtime.js';
 import { Dispatcher } from './dispatch/dispatcher.js';
 import { createPrincipalBacklogSource } from './dispatch/principal-backlog.js';
@@ -472,15 +473,22 @@ async function main(): Promise<void> {
   }
   const modelRegistry = new ModelRegistry(logger);
 
-  // 5. LLM provider — hard fail early rather than discovering the missing
-  // key only when the first user message arrives.
-  // modelRegistry must be instantiated first (above) — the provider uses it
-  // to look up maxOutputTokens per model rather than using a hardcoded constant.
-  if (!config.anthropicApiKey) {
+  // 5. LLM providers — hard fail early rather than discovering a missing key only
+  // when the first user message arrives.
+  // modelRegistry must be instantiated first (above) — providers use it to look
+  // up maxOutputTokens per model rather than using a hardcoded constant.
+  //
+  // AWS Bedrock credentials are vault-only (ADR-021); region and timeout are
+  // non-secret env config. A deployment that routes every tier to Bedrock needs no
+  // Anthropic key, so the Anthropic requirement applies only when Bedrock is not
+  // configured. Default deployments (no AWS credentials) behave exactly as before.
+  const bedrockCreds = config.awsAccessKeyId && config.awsSecretAccessKey && config.awsRegion
+    ? { accessKeyId: config.awsAccessKeyId, secretAccessKey: config.awsSecretAccessKey, region: config.awsRegion }
+    : undefined;
+  if (!config.anthropicApiKey && !bedrockCreds) {
     logger.fatal('ANTHROPIC_API_KEY is required');
     process.exit(1);
   }
-  const llmProvider = new AnthropicProvider(config.anthropicApiKey, logger, modelRegistry);
   // estimateCostUsd is a closure pre-wired with the model registry. Passed to
   // AgentRuntime as config (dependency injection) so the runtime stays testable
   // without importing pricing.ts directly.
@@ -488,9 +496,10 @@ async function main(): Promise<void> {
   // for unrecognised models track operator routing rather than hardcoding Sonnet.
   const estimateCostUsd = createEstimateCostUsd(modelRegistry, modelRoutingConfig.tiers.standard.model);
   const modelRouter = new ModelRouter(modelRoutingConfig, modelRegistry, logger);
-  const providerRegistry = new Map<string, LLMProvider>([
-    ['anthropic', llmProvider],
-  ]);
+  const providerRegistry = new Map<string, LLMProvider>();
+  if (config.anthropicApiKey) {
+    providerRegistry.set('anthropic', new AnthropicProvider(config.anthropicApiKey, logger, modelRegistry));
+  }
 
   // OpenRouter — optional second provider for non-Claude models.
   // Only instantiated when OPENROUTER_API_KEY is present. If absent, OpenRouter
@@ -500,6 +509,25 @@ async function main(): Promise<void> {
     const openrouterProvider = new OpenRouterProvider(config.openrouterApiKey, logger, modelRegistry);
     providerRegistry.set('openrouter', openrouterProvider);
     logger.info('OpenRouter provider registered — non-Claude models available');
+  }
+
+  // AWS Bedrock — optional. Registered only when both vault secrets and a region
+  // are present; the tier validation below fails loudly if a tier is mapped to a
+  // Bedrock model without it.
+  if (bedrockCreds) {
+    providerRegistry.set('bedrock', new BedrockProvider(
+      bedrockCreds.accessKeyId,
+      bedrockCreds.secretAccessKey,
+      bedrockCreds.region,
+      config.awsBedrockTimeoutMs,
+      logger,
+      modelRegistry,
+    ));
+    logger.info({ region: bedrockCreds.region }, 'AWS Bedrock provider registered — Bedrock-hosted models available');
+  } else if (config.awsAccessKeyId || config.awsSecretAccessKey) {
+    // Partial config is almost certainly a mistake — say so rather than leaving
+    // Bedrock silently unavailable.
+    logger.warn('AWS Bedrock credentials are incomplete (need aws_access_key_id + aws_secret_access_key in the vault, and AWS_REGION set) — Bedrock provider not registered');
   }
 
   // Validate that every model mapped to a tier has a registered provider.

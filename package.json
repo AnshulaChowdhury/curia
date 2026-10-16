@@ -48,6 +48,7 @@
   "license": "MIT",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1152.0",
     "@curia/shared-types": "workspace:*",
     "@fastify/cookie": "^11.1.2",
     "@fastify/cors": "^11.3.0",
@@ -87,6 +88,7 @@
     "sanitize-html": "^2.18.0"
   },
   "devDependencies": {
+    "@smithy/types": "^4.19.0",
     "@types/chokidar": "^2.1.7",
     "@types/js-yaml": "^4.0.9",
     "@types/luxon": "^3.7.6",

@@ -24,6 +24,13 @@ export interface Config {
   anthropicApiKey: string | undefined;
   openaiApiKey: string | undefined;
   openrouterApiKey: string | undefined;
+  // AWS Bedrock — credentials are vault-only (ADR-021), resolved by applyVaultSecrets()
+  // after the vault is constructed, same as anthropicApiKey. Region and timeout are
+  // non-secret operational config read straight from env, like TIMEZONE/HTTP_PORT.
+  awsAccessKeyId: string | undefined;
+  awsSecretAccessKey: string | undefined;
+  awsRegion: string | undefined;
+  awsBedrockTimeoutMs: number;
   logLevel: string;
   httpPort: number;
   apiToken: string | undefined;
@@ -1529,6 +1536,13 @@ export function loadConfig(): Config {
     throw new Error(`NYLAS_POLL_INTERVAL_MS must be a number >= 1000, got: ${process.env.NYLAS_POLL_INTERVAL_MS}`);
   }
 
+  // AWS_BEDROCK_TIMEOUT is expressed in seconds (matching how it reads in .env,
+  // e.g. "120"), converted to ms for the request abort timer.
+  const awsBedrockTimeoutSeconds = parseInt(process.env.AWS_BEDROCK_TIMEOUT ?? '120', 10);
+  if (isNaN(awsBedrockTimeoutSeconds) || awsBedrockTimeoutSeconds < 1) {
+    throw new Error(`AWS_BEDROCK_TIMEOUT must be a positive number of seconds, got: ${process.env.AWS_BEDROCK_TIMEOUT}`);
+  }
+
   // Parsed once into a local (rather than twice inline below) so the
   // > 0 validity check and the value used on the valid branch can't drift.
   const parsedSignalVoiceMaxCallSeconds = Number.parseInt(process.env.SIGNAL_VOICE_MAX_CALL_SECONDS ?? '', 10);
@@ -1550,6 +1564,10 @@ export function loadConfig(): Config {
     anthropicApiKey: undefined,
     openaiApiKey: undefined,
     openrouterApiKey: undefined,
+    awsAccessKeyId: undefined,
+    awsSecretAccessKey: undefined,
+    awsRegion: process.env.AWS_REGION?.trim() || undefined,
+    awsBedrockTimeoutMs: awsBedrockTimeoutSeconds * 1000,
     logLevel: process.env.LOG_LEVEL ?? 'info',
     httpPort,
     apiToken: undefined,
