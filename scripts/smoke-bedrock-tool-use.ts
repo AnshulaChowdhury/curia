@@ -162,6 +162,12 @@ async function main(): Promise<number> {
     return 1;
   }
   const timeoutSeconds = Number.parseInt(process.env.AWS_BEDROCK_TIMEOUT ?? '120', 10);
+  // Same bounds as loadConfig(): a NaN or out-of-range value would make setTimeout fire
+  // almost immediately and every run would be misreported as a provider error.
+  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > Math.floor(2_147_483_647 / 1000)) {
+    logger.error({ value: process.env.AWS_BEDROCK_TIMEOUT }, 'FAIL — AWS_BEDROCK_TIMEOUT must be a positive number of seconds within the Node timer limit');
+    return 1;
+  }
 
   const modelRegistry = new ModelRegistry(logger);
   const model = modelArg
