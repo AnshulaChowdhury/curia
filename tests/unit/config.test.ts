@@ -30,6 +30,15 @@ describe('loadConfig', () => {
     expect(config.anthropicApiKey).toBeUndefined();
   });
 
+  it('reads EMBEDDING_BASE_URL and EMBEDDING_MODEL from environment', () => {
+    process.env.DATABASE_URL = 'postgres://test:test@localhost:5432/test';
+    process.env.EMBEDDING_BASE_URL = 'http://embed.local/v1';
+    process.env.EMBEDDING_MODEL = 'Qwen3-Embedding-4B';
+    const config = loadConfig();
+    expect(config.embeddingBaseUrl).toBe('http://embed.local/v1');
+    expect(config.embeddingModel).toBe('Qwen3-Embedding-4B');
+  });
+
   it('defaults LOG_LEVEL to info', () => {
     process.env.DATABASE_URL = 'postgres://test:test@localhost:5432/test';
     // Explicitly remove LOG_LEVEL to test the default — CI sets LOG_LEVEL=error

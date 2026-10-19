@@ -35,6 +35,11 @@ export interface Config {
   awsSecretAccessKey: string | undefined;
   awsRegion: string | undefined;
   awsBedrockTimeoutMs: number;
+  // OpenAI-compatible embeddings endpoint (EMBEDDING_BASE_URL, e.g. a local llama.cpp
+  // server). Unset means OpenAI with openaiApiKey. embeddingApiKey comes from the vault.
+  embeddingBaseUrl: string | undefined;
+  embeddingModel: string | undefined;
+  embeddingApiKey: string | undefined;
   logLevel: string;
   httpPort: number;
   apiToken: string | undefined;
@@ -1815,6 +1820,9 @@ export function loadConfig(): Config {
     awsSecretAccessKey: undefined,
     awsRegion: process.env.AWS_REGION?.trim() || undefined,
     awsBedrockTimeoutMs: awsBedrockTimeoutSeconds * 1000,
+    embeddingBaseUrl: process.env.EMBEDDING_BASE_URL || undefined,
+    embeddingModel: process.env.EMBEDDING_MODEL || undefined,
+    embeddingApiKey: undefined,
     logLevel: process.env.LOG_LEVEL ?? 'info',
     httpPort,
     apiToken: undefined,

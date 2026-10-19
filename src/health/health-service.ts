@@ -76,7 +76,10 @@ export interface HealthServiceDeps {
   mcpServerStatuses?: ReadonlyMap<string, McpServerLoadStatus>;
   modelRoutingConfig: ModelRoutingConfig;
   config: HealthConfig;
+  /** Gates the image_gen canary. */
   openaiApiKey?: string;
+  /** Whether entity memory runs with an embedding service; the embeddings canary is skipped without one. */
+  embeddingsEnabled?: boolean;
   tavilyApiKey?: string;
   /** Absolute path to the Google Workspace credential JSON file.
    *  Required for the google_workspace canary; absent means it is skipped. */
@@ -228,7 +231,7 @@ export class HealthService {
    */
   async runCanaries(): Promise<CanaryResult[]> {
     const {
-      logger, config, openaiApiKey, tavilyApiKey,
+      logger, config, openaiApiKey, embeddingsEnabled, tavilyApiKey,
       nylasClient, nylasCalendarClient, signalRpcClient, googleWorkspaceConfigPath,
       mcpSessions, modelRoutingConfig,
     } = this.deps;
@@ -260,9 +263,10 @@ export class HealthService {
       await run(`llm_${tier}`, async () => this.canaryLlmTier(tier, modelRoutingConfig));
     }
 
-    // Embeddings canary — skipped when OpenAI is not configured.
+    // Embeddings canary — skipped when entity memory has no embedding service, whichever
+    // endpoint (OpenAI or the operator's own) would serve it.
     await run('embeddings', async () => {
-      if (!openaiApiKey) return { name: 'embeddings', status: 'skipped' };
+      if (!embeddingsEnabled) return { name: 'embeddings', status: 'skipped' };
       return this.canaryOutcome('embeddings', 'embeddings');
     });
 

@@ -267,3 +267,18 @@ describe('HealthService LLM outcome tracking', () => {
     expect(outcome.lastErrorAt).toBeNull();
   });
 });
+
+describe('HealthService embeddings canary', () => {
+  it('runs on the embedding service entity memory uses, with or without an OpenAI key', async () => {
+    const svc = new HealthService(makeDeps({ embeddingsEnabled: true, openaiApiKey: undefined }) as never);
+    const results = await svc.runCanaries();
+    expect(results.find((r) => r.name === 'embeddings')?.status).not.toBe('skipped');
+  });
+
+  it('is skipped when entity memory has no embedding service, even with an OpenAI key', async () => {
+    const svc = new HealthService(makeDeps({ embeddingsEnabled: false, openaiApiKey: 'sk-test' }) as never);
+    const results = await svc.runCanaries();
+    expect(results.find((r) => r.name === 'embeddings')?.status).toBe('skipped');
+    expect(results.find((r) => r.name === 'image_gen')?.status).not.toBe('skipped');
+  });
+});

@@ -24,6 +24,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Tier reasoning effort** — **public API (config):** `model_routing.tiers.<tier>.reasoning.effort` for agent turns, validated at boot. (#2044)
 - **`llm.call` reasoning fields** — **public API:** optional `reasoningTokens`, `reasoningEffort`, `upstreamProvider` on the bus event. (#2044)
 - **Suite reasoning metrics** — smoke and scenarios print reasoning tokens and latency p50/p90 per agent. (#2044)
+- **Custom embeddings endpoint** — `EMBEDDING_BASE_URL` and `EMBEDDING_MODEL` point entity memory at any OpenAI-compatible server.
 - **Style scenarios** — seven cases score reply length, filler and register under a fixed office identity. (#2143)
 - **Principal scheduling scenarios** — fourteen on-demand cases for CC'd, forwarded and booking-link scheduling requests.
 - **Scenario harness** — CC'd email envelopes, per-case autonomy score, `workday+N` dates, and the run date for the judge.

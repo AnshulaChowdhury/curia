@@ -57,7 +57,7 @@ import {
 import { WorkingMemory } from './memory/working-memory.js';
 import { sharedIdentifierSourceIndex } from './agents/identifier-source-index.js';
 import { createIdentifierSources } from './agents/identifier-sources.js';
-import { EmbeddingService } from './memory/embedding.js';
+import { EmbeddingService, resolveEmbeddingEndpoint } from './memory/embedding.js';
 import { KnowledgeGraphStore } from './memory/knowledge-graph.js';
 import { MemoryValidator } from './memory/validation.js';
 import { EntityMemory } from './memory/entity-memory.js';
@@ -631,10 +631,12 @@ async function main(): Promise<void> {
   // Sensitivity classifier — declared outside the if-block (like entityMemory above) so it
   // stays in scope for the ExecutionLayer construction further down (#1419), which exposes
   // it to skills as the 'sensitivityClassifier' capability. Same availability as entityMemory:
-  // both require OPENAI_API_KEY today because the classifier is currently only built inside
-  // this branch — see the sensitivity_rules guard below for why it can't be built earlier.
+  // both require an embedding endpoint (OPENAI_API_KEY or EMBEDDING_BASE_URL) because the
+  // classifier is currently only built inside this branch — see the sensitivity_rules guard
+  // below for why it can't be built earlier.
   let sensitivityClassifier: SensitivityClassifier | undefined;
-  if (config.openaiApiKey) {
+  const embeddingEndpoint = resolveEmbeddingEndpoint(config);
+  if (embeddingEndpoint) {
     // Sensitivity classifier — built from the already-merged config (default.yaml +
     // local.yaml, see loadYamlConfig()) so operator overrides in local.yaml actually
     // take effect rather than being silently ignored (#1369). Malformed rules already
@@ -651,8 +653,8 @@ async function main(): Promise<void> {
     sensitivityClassifier = SensitivityClassifier.fromRules(yamlConfig.sensitivity_rules);
     logger.info({ ruleCount: yamlConfig.sensitivity_rules.length }, 'Sensitivity classifier loaded');
 
-    const embeddingService = EmbeddingService.createWithOpenAI(
-      config.openaiApiKey,
+    const embeddingService = EmbeddingService.createWithEndpoint(
+      embeddingEndpoint,
       logger,
       bus,           // EventBus — wired at line 234
       modelRegistry, // ModelRegistry — wired at line 281
@@ -660,9 +662,12 @@ async function main(): Promise<void> {
     const kgStore = KnowledgeGraphStore.createWithPostgres(pool, embeddingService, logger);
     const validator = new MemoryValidator(kgStore, embeddingService);
     entityMemory = new EntityMemory(kgStore, validator, embeddingService, logger, sensitivityClassifier);
-    logger.info('Entity memory initialized with knowledge graph');
+    logger.info(
+      { embeddingBaseUrl: embeddingEndpoint.baseUrl, embeddingModel: embeddingEndpoint.model },
+      'Entity memory initialized with knowledge graph',
+    );
   } else {
-    logger.warn('OPENAI_API_KEY not set — entity memory disabled (knowledge graph unavailable)');
+    logger.warn('No embedding endpoint (OPENAI_API_KEY or EMBEDDING_BASE_URL) — entity memory disabled (knowledge graph unavailable)');
   }
 
   // Bullpen service — Tier 2 inter-agent discussion. Always initialized (no
@@ -2393,6 +2398,7 @@ async function main(): Promise<void> {
     modelRoutingConfig,
     config: healthConfig,
     openaiApiKey: config.openaiApiKey,
+    embeddingsEnabled: entityMemory !== undefined,
     tavilyApiKey: undefined,             // vault secret, not in config — canary skipped
     googleWorkspaceConfigPath: undefined, // OAuth env vars, no credential file — canary skipped
   });
@@ -3192,7 +3198,7 @@ async function main(): Promise<void> {
     // Powers POST /api/setup/suggest-name (wizard starter-name suggestion, #799).
     infraLlmService,
     // Powers principal profile endpoints in setup routes (#392). Undefined when
-    // OPENAI_API_KEY is not set (entity memory requires embeddings); individual
+    // entity memory is off (no usable embedding source, ADR-051); individual
     // endpoints handle the absent case in Tasks 3–5.
     entityMemory,
     // Powers GET /api/health with real probes and canary state (#434).

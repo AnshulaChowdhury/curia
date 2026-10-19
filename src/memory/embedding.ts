@@ -4,6 +4,46 @@ import type { EventBus } from '../bus/bus.js';
 import type { ModelRegistry } from '../agents/llm/model-registry.js';
 import { createEmbeddingCall, createEmbeddingError } from '../bus/events.js';
 
+export const DEFAULT_EMBEDDING_BASE_URL = 'https://api.openai.com/v1';
+export const DEFAULT_EMBEDDING_MODEL = 'text-embedding-3-small';
+
+/**
+ * Where embeddings come from. OpenAI by default; any server that speaks OpenAI's
+ * /embeddings API (llama.cpp, Ollama, vLLM, text-embeddings-inference) otherwise.
+ */
+export interface EmbeddingEndpoint {
+  baseUrl: string;
+  model: string;
+  /** Sent as a Bearer token. Undefined for a local server that takes no key. */
+  apiKey: string | undefined;
+}
+
+/**
+ * Picks the embedding endpoint from config, or returns undefined when none is configured
+ * and entity memory should stay off. A custom base URL uses `embedding_api_key`, which may
+ * be absent; the default OpenAI URL needs `openai_api_key`.
+ */
+export function resolveEmbeddingEndpoint(config: {
+  embeddingBaseUrl: string | undefined;
+  embeddingModel: string | undefined;
+  embeddingApiKey: string | undefined;
+  openaiApiKey: string | undefined;
+}): EmbeddingEndpoint | undefined {
+  if (config.embeddingBaseUrl) {
+    return {
+      baseUrl: config.embeddingBaseUrl.replace(/\/+$/, ''),
+      model: config.embeddingModel ?? DEFAULT_EMBEDDING_MODEL,
+      apiKey: config.embeddingApiKey,
+    };
+  }
+  if (!config.openaiApiKey) return undefined;
+  return {
+    baseUrl: DEFAULT_EMBEDDING_BASE_URL,
+    model: config.embeddingModel ?? DEFAULT_EMBEDDING_MODEL,
+    apiKey: config.openaiApiKey,
+  };
+}
+
 // Internal interface separating the transport/mock concern from the service API.
 // Lets us swap OpenAI for a deterministic fake in tests without touching callers.
 interface EmbeddingBackend {
@@ -27,7 +67,20 @@ export class EmbeddingService {
     bus?: EventBus,
     modelRegistry?: ModelRegistry,
   ): EmbeddingService {
-    return new EmbeddingService(new OpenAIBackend(apiKey, logger, bus, modelRegistry));
+    return EmbeddingService.createWithEndpoint(
+      { baseUrl: DEFAULT_EMBEDDING_BASE_URL, model: DEFAULT_EMBEDDING_MODEL, apiKey },
+      logger, bus, modelRegistry,
+    );
+  }
+
+  // Production factory for any OpenAI-compatible /embeddings endpoint.
+  static createWithEndpoint(
+    endpoint: EmbeddingEndpoint,
+    logger: Logger,
+    bus?: EventBus,
+    modelRegistry?: ModelRegistry,
+  ): EmbeddingService {
+    return new EmbeddingService(new OpenAIBackend(endpoint, logger, bus, modelRegistry));
   }
 
   // Test factory — produces deterministic vectors without any network calls.
@@ -68,11 +121,11 @@ export class EmbeddingService {
   }
 }
 
-// -- Production backend: calls OpenAI text-embedding-3-small --
+// -- Production backend: calls an OpenAI-compatible /embeddings endpoint --
 
 class OpenAIBackend implements EmbeddingBackend {
   constructor(
-    private apiKey: string,
+    private endpoint: EmbeddingEndpoint,
     private logger: Logger,
     private bus?: EventBus,
     private modelRegistry?: ModelRegistry,
@@ -84,14 +137,13 @@ class OpenAIBackend implements EmbeddingBackend {
     // diagnose truncation or oversized input issues).
     let response: Response;
     try {
-      response = await fetch('https://api.openai.com/v1/embeddings', {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (this.endpoint.apiKey) headers['Authorization'] = `Bearer ${this.endpoint.apiKey}`;
+      response = await fetch(`${this.endpoint.baseUrl}/embeddings`, {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-        },
+        headers,
         body: JSON.stringify({
-          model: 'text-embedding-3-small',
+          model: this.endpoint.model,
           input: text,
           // Requesting the canonical dimension so the DB schema never has to change
           // if we upgrade models later.
@@ -103,7 +155,7 @@ class OpenAIBackend implements EmbeddingBackend {
       // Guard: bus is optional (may be null/undefined when used without bus wiring).
       if (this.bus) {
         this.bus.publish('system', createEmbeddingError({
-          model: 'text-embedding-3-small',
+          model: this.endpoint.model,
           errorType: 'FETCH_FAILED',
         })).catch((publishErr: unknown) => {
           this.logger.warn({ publishErr }, 'Failed to publish embedding.error event');
@@ -118,7 +170,7 @@ class OpenAIBackend implements EmbeddingBackend {
       const body = await response.text().catch(() => '<body unreadable>');
       if (this.bus) {
         this.bus.publish('system', createEmbeddingError({
-          model: 'text-embedding-3-small',
+          model: this.endpoint.model,
           errorType: 'API_ERROR',
         })).catch((publishErr: unknown) => {
           this.logger.warn({ publishErr }, 'Failed to publish embedding.error event');
@@ -138,7 +190,7 @@ class OpenAIBackend implements EmbeddingBackend {
     } catch (err) {
       if (this.bus) {
         this.bus.publish('system', createEmbeddingError({
-          model: 'text-embedding-3-small',
+          model: this.endpoint.model,
           errorType: 'PARSE_ERROR',
         })).catch((publishErr: unknown) => {
           this.logger.warn({ publishErr }, 'Failed to publish embedding.error event');
@@ -148,7 +200,13 @@ class OpenAIBackend implements EmbeddingBackend {
       throw new Error(`OpenAI embedding response parse error: ${(err as Error).message}`);
     }
 
-    const embedding = json.data[0]?.embedding;
+    let embedding = json.data[0]?.embedding;
+    // Servers that ignore `dimensions` (llama.cpp, Ollama) return the model's full width.
+    // For a Matryoshka-trained model such as Qwen3-Embedding, the leading dimensions are a
+    // valid smaller embedding once rescaled to unit length.
+    if (embedding && embedding.length > EMBEDDING_DIMENSIONS) {
+      embedding = truncateAndNormalize(embedding, EMBEDDING_DIMENSIONS);
+    }
     if (!embedding || embedding.length !== EMBEDDING_DIMENSIONS) {
       this.logger.error(
         { expected: EMBEDDING_DIMENSIONS, actual: embedding?.length },
@@ -157,7 +215,7 @@ class OpenAIBackend implements EmbeddingBackend {
       // Publish embedding.error so HealthService counts malformed responses as failures.
       if (this.bus) {
         this.bus.publish('system', createEmbeddingError({
-          model: 'text-embedding-3-small',
+          model: this.endpoint.model,
           errorType: 'PARSE_ERROR',
         })).catch((publishErr: unknown) => {
           this.logger.warn({ publishErr }, 'Failed to publish embedding.error event');
@@ -184,7 +242,7 @@ class OpenAIBackend implements EmbeddingBackend {
   ): Promise<void> {
     if (!this.bus || !this.modelRegistry) return;
     try {
-      const pricing = this.modelRegistry.getPricing('text-embedding-3-small');
+      const pricing = this.modelRegistry.getPricing(this.endpoint.model);
       // pricing will always be defined after Task 1 adds the registry entry,
       // but guard defensively so a misconfigured registry doesn't break embed().
       const estimatedCostUsd = pricing
@@ -192,7 +250,7 @@ class OpenAIBackend implements EmbeddingBackend {
         : 0;
 
       const event = createEmbeddingCall({
-        model: 'text-embedding-3-small',
+        model: this.endpoint.model,
         inputTokens,
         estimatedCostUsd,
         latencyMs,
@@ -205,6 +263,12 @@ class OpenAIBackend implements EmbeddingBackend {
       this.logger.warn({ err }, 'OpenAIBackend: failed to publish embedding.call telemetry event — cost tracking gap');
     }
   }
+}
+
+function truncateAndNormalize(vector: number[], dimensions: number): number[] {
+  const head = vector.slice(0, dimensions);
+  const norm = Math.sqrt(head.reduce((sum, x) => sum + x * x, 0));
+  return norm === 0 ? head : head.map(x => x / norm);
 }
 
 // -- Test backend: deterministic fake using a simple LCG seeded by string hash --
