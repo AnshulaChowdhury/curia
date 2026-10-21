@@ -105,16 +105,6 @@ const FACT_TYPE: NodeType = 'fact';
  *  real entities rarely have more than 3-4 name variants. */
 export const MAX_ALIASES_PER_ENTITY = 10;
 
-/** Cosine similarity threshold for auto-resolving a fuzzy entity match.
- *  At or above this, the match is confident enough to return 'found' without
- *  asking the principal. Lower than the 0.92 fact dedup threshold because entity
- *  labels are shorter phrases with less semantic signal. */
-export const FUZZY_RESOLVE_THRESHOLD = 0.90;
-
-/** Cosine similarity floor for surfacing ambiguous fuzzy candidates.
- *  Below this, names are too different to be plausible variants. */
-export const FUZZY_AMBIGUITY_FLOOR = 0.75;
-
 /** Max candidates to retrieve from semantic search during fuzzy resolution.
  *  Kept small — we only need the top few potential matches. */
 const FUZZY_SEARCH_LIMIT = 5;
@@ -137,10 +127,9 @@ export class EntityMemory {
   constructor(
     private store: KnowledgeGraphStore,
     private validator: MemoryValidator,
-    // embeddingService is accepted to keep the constructor signature stable for callers
-    // that wire the dependency graph. All embedding work is currently delegated to the
-    // store (createNode embeds labels; semanticSearch embeds query strings internally).
-    _embeddingService: EmbeddingService,
+    // Read for its profile's fuzzy-resolution thresholds only. All embedding work is
+    // delegated to the store (createNode embeds labels; semanticSearch embeds queries).
+    private embeddingService: EmbeddingService,
     private logger: Logger,
     private sensitivityClassifier?: SensitivityClassifier,
   ) {}
@@ -340,9 +329,10 @@ export class EntityMemory {
    *   2+ exact matches, exactly one has the expected type → { kind: 'found', node: typeMatch }
    *   2+ exact matches, several share the expected type → { kind: 'ambiguous', candidates }
    *   2+ exact matches, none has the expected type → { kind: 'ambiguous', candidates }
-   *   0 exact matches, fuzzy score ≥ 0.90 → auto-resolve, learn alias, return { kind: 'found', node }
-   *   0 exact matches, fuzzy score 0.75–0.90 → return { kind: 'ambiguous', candidates }
-   *   0 exact matches, fuzzy score < 0.75 → create via createEntity(), return { kind: 'created', node }
+   *   0 exact matches, fuzzy score ≥ fuzzyResolve → auto-resolve, learn alias, return { kind: 'found', node }
+   *   0 exact matches, fuzzy score in [fuzzyAmbiguityFloor, fuzzyResolve) → return { kind: 'ambiguous', candidates }
+   *   0 exact matches, fuzzy score < fuzzyAmbiguityFloor → create via createEntity(), return { kind: 'created', node }
+   *   (both thresholds come from the embedding profile; 0.90 and 0.75 for OpenAI's model)
    *
    * Three phases: (1) exact label match via findNodesByLabel, (2) embedding-based fuzzy
    * resolution when exact match finds nothing, (3) create if no plausible candidate exists.
@@ -419,15 +409,17 @@ export class EntityMemory {
     try {
       const fuzzyResults = await this.store.semanticSearch(options.label, {
         limit: FUZZY_SEARCH_LIMIT,
+        purpose: 'similarity',
       });
+      const { fuzzyResolve, fuzzyAmbiguityFloor } = this.embeddingService.profile.thresholds;
 
       // Filter out fact nodes — we only want entity nodes for disambiguation
       const entityCandidates = fuzzyResults.filter(r => r.node.type !== FACT_TYPE);
 
       // Partition candidates by threshold
-      const autoResolve = entityCandidates.filter(r => r.score >= FUZZY_RESOLVE_THRESHOLD);
+      const autoResolve = entityCandidates.filter(r => r.score >= fuzzyResolve);
       const ambiguous = entityCandidates.filter(
-        r => r.score >= FUZZY_AMBIGUITY_FLOOR && r.score < FUZZY_RESOLVE_THRESHOLD,
+        r => r.score >= fuzzyAmbiguityFloor && r.score < fuzzyResolve,
       );
 
       if (autoResolve.length > 0) {
@@ -604,8 +596,8 @@ export class EntityMemory {
           confidence: result.validated.provenance.confidence,
           decayClass: result.validated.provenance.decayClass,
           source: result.validated.provenance.source,
-          // Pass the pre-computed embedding from the validator's dedup check
-          // to avoid a redundant OpenAI API call.
+          // The validator's dedup vector when it is also the storable one; otherwise
+          // the store embeds the label as a document.
           embedding: result.validated.embedding,
           sensitivity,
         });

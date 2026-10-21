@@ -2,6 +2,7 @@ import * as yaml from 'js-yaml';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { parseSensitivityRules, type SensitivityRule } from './memory/sensitivity.js';
+import { parseEmbeddingProfiles, type EmbeddingProfile } from './memory/embedding-profiles.js';
 import { parseProxyConfig } from './browser/proxy-config.js';
 import { AUTONOMY_GATINGS, type AutonomyGating } from './autonomy/band-policy.js';
 import type { VerificationConfig } from './verification/types.js';
@@ -655,6 +656,14 @@ export interface YamlConfig {
    * category must copy the full shipped list into local.yaml and append to it (#1369).
    */
   sensitivity_rules?: SensitivityRule[];
+  /**
+   * Embedding settings that do not fit env (ADR-051). `profiles` is keyed by the exact
+   * EMBEDDING_MODEL value; loadYamlConfig() validates each entry and resolves its `base`,
+   * so after loading every entry is a complete profile.
+   */
+  embedding?: {
+    profiles?: Record<string, EmbeddingProfile>;
+  };
   /**
    * Escalation-line policy judge (issue #948).
    * Classifies disclosure sensitivity and action consequence, then maps
@@ -1740,6 +1749,14 @@ export function loadYamlConfig(configDir: string): YamlConfig {
     config.sensitivity_rules = parseSensitivityRules(
       config.sensitivity_rules,
       'sensitivity_rules (config/default.yaml merged with config/local.yaml)',
+    );
+  }
+
+  // A malformed profile must fail startup: wrong thresholds merge distinct people and facts.
+  if (config.embedding?.profiles !== undefined) {
+    config.embedding.profiles = parseEmbeddingProfiles(
+      config.embedding.profiles,
+      'embedding.profiles (config/default.yaml merged with config/local.yaml)',
     );
   }
 

@@ -6,7 +6,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { KnowledgeGraphStore } from '../../../src/memory/knowledge-graph.js';
 import { EmbeddingService } from '../../../src/memory/embedding.js';
-import { EntityMemory, FUZZY_RESOLVE_THRESHOLD, FUZZY_AMBIGUITY_FLOOR, MAX_ALIASES_PER_ENTITY } from '../../../src/memory/entity-memory.js';
+import { EntityMemory, MAX_ALIASES_PER_ENTITY } from '../../../src/memory/entity-memory.js';
+import { OPENAI_TEXT_EMBEDDING_3_SMALL } from '../../../src/memory/embedding-profiles.js';
+
+const { fuzzyResolve: FUZZY_RESOLVE_THRESHOLD, fuzzyAmbiguityFloor: FUZZY_AMBIGUITY_FLOOR } =
+  OPENAI_TEXT_EMBEDDING_3_SMALL.thresholds;
 import { MemoryValidator, MAX_WRITES_PER_AGENT_TASK } from '../../../src/memory/validation.js';
 import { createSilentLogger } from '../../../src/logger.js';
 import type { Logger } from '../../../src/logger.js';
@@ -439,7 +443,7 @@ describe('EntityMemory.resolveOrCreate — fuzzy fallback', () => {
     expect(result.node.id).toBe(entity.id);
   });
 
-  it('exports threshold constants with correct relative ordering', () => {
+  it('keeps the OpenAI profile thresholds and their ordering', () => {
     expect(FUZZY_RESOLVE_THRESHOLD).toBe(0.90);
     expect(FUZZY_AMBIGUITY_FLOOR).toBe(0.75);
     expect(FUZZY_RESOLVE_THRESHOLD).toBeGreaterThan(FUZZY_AMBIGUITY_FLOOR);
@@ -455,7 +459,7 @@ describe('EntityMemory.resolveOrCreate — fuzzy auto-resolve end-to-end', () =>
 
     // Pre-compute the embedding for the query label we will use
     const queryLabel = 'Darlise';
-    const queryEmbedding = await embeddingService.embed(queryLabel);
+    const queryEmbedding = await embeddingService.embed(queryLabel, 'similarity');
 
     // Create a node whose embedding matches the query exactly (cosine similarity = 1.0)
     // but whose canonical label is different — so Phase 1 (exact match) will miss
@@ -491,7 +495,7 @@ describe('EntityMemory.resolveOrCreate — fuzzy auto-resolve end-to-end', () =>
     const mem = new EntityMemory(store, validator, embeddingService, createSilentLogger());
 
     const queryLabel = 'the Darlise place';
-    const queryEmbedding = await embeddingService.embed(queryLabel);
+    const queryEmbedding = await embeddingService.embed(queryLabel, 'similarity');
 
     await store.createNode({
       type: 'organization',
@@ -515,6 +519,29 @@ describe('EntityMemory.resolveOrCreate — fuzzy auto-resolve end-to-end', () =>
     expect(allOrgs).toHaveLength(1);
   });
 
+  it('matches names with the similarity prefix, not the query prefix', async () => {
+    const embeddingService = EmbeddingService.createForTesting({
+      ...OPENAI_TEXT_EMBEDDING_3_SMALL,
+      model: 'test-prefixed',
+      prefixes: { query: 'Q: ', document: '', similarity: 'S: ' },
+    });
+    const store = KnowledgeGraphStore.createInMemory(embeddingService);
+    const mem = new EntityMemory(store, new MemoryValidator(store, embeddingService), embeddingService, createSilentLogger());
+    const node = await store.createNode({
+      type: 'organization',
+      label: 'Darlise Restaurant',
+      properties: {},
+      source: 'test',
+      embedding: await embeddingService.embed('Darlise', 'similarity'),
+    });
+
+    const result = await mem.resolveOrCreate({ label: 'Darlise', type: 'organization', source: 'test' });
+
+    expect(result.kind).toBe('found');
+    if (result.kind !== 'found') throw new Error('narrowing');
+    expect(result.node.id).toBe(node.id);
+  });
+
   it('returns ambiguous when best score is in the uncertain zone (0.75-0.90)', async () => {
     const embeddingService = EmbeddingService.createForTesting();
     const store = KnowledgeGraphStore.createInMemory(embeddingService);
@@ -522,7 +549,7 @@ describe('EntityMemory.resolveOrCreate — fuzzy auto-resolve end-to-end', () =>
     const mem = new EntityMemory(store, validator, embeddingService, createSilentLogger());
 
     const queryLabel = 'Restaurant X';
-    const queryEmbedding = await embeddingService.embed(queryLabel);
+    const queryEmbedding = await embeddingService.embed(queryLabel, 'similarity');
 
     // Build a vector that is 0.82 similar to the query embedding (in the ambiguous zone).
     // We do this by computing a weighted blend: blend = 0.82 * query + sqrt(1 - 0.82^2) * perp
@@ -886,7 +913,7 @@ describe('resolveOrCreate / addAlias logs never carry the raw label or alias (PI
   it('fuzzy auto-resolve type-differs warn', async () => {
     const log = spyLog();
     const { mem, store, embeddingService } = makeMem(log);
-    const queryEmbedding = await embeddingService.embed(PII_LABEL);
+    const queryEmbedding = await embeddingService.embed(PII_LABEL, 'similarity');
     const node = await store.createNode({
       type: 'person',
       label: 'Completely Unrelated Org Label',

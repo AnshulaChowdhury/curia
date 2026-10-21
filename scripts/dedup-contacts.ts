@@ -14,6 +14,7 @@
 //
 // Run: pnpm run dedup:contacts [--dry-run]
 
+import path from 'node:path';
 import pg from 'pg';
 import { createLogger } from '../src/logger.js';
 import { classifyPair, type PairClassification } from '../src/contacts/dedup-classifier.js';
@@ -26,7 +27,8 @@ import {
 import { ModelRegistry } from '../src/agents/llm/model-registry.js';
 import { EventBus } from '../src/bus/bus.js';
 import { AuditLogger } from '../src/audit/logger.js';
-import { EmbeddingService } from '../src/memory/embedding.js';
+import { EmbeddingService, describeEmbeddingUnavailable, resolveEmbedding } from '../src/memory/embedding.js';
+import { loadYamlConfig } from '../src/config.js';
 import { KnowledgeGraphStore } from '../src/memory/knowledge-graph.js';
 import { MemoryValidator } from '../src/memory/validation.js';
 import { EntityMemory } from '../src/memory/entity-memory.js';
@@ -700,12 +702,22 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
       //   - createTask: uses TaskRepo.createTask(), which publishes task.created events.
       //   - listExclusionPairKeys: reads contact_dedup_exclusions via ContactService.
       // A real sweep merges KG entity nodes (entityMemory.mergeEntities), which embeds fact
-      // labels and therefore needs OpenAI credentials. A dry-run never embeds, so it can run
-      // with a fake embedding backend and no API key — keeping the preview usable in CI /
-      // minimal environments. Fail fast only for a real run.
-      const openaiApiKey = process.env['OPENAI_API_KEY'];
-      if (!dryRun && !openaiApiKey) {
-        logger.error('dedup-contacts: OPENAI_API_KEY is required for a real sweep (KG entity merge embeds fact labels). Re-run with --dry-run to preview without it.');
+      // labels and therefore needs an embedding endpoint with a profile. A dry-run never
+      // embeds, so it can run with a fake embedding backend and no endpoint — keeping the
+      // preview usable in CI / minimal environments. Fail fast only for a real run.
+      // This script reads env only, never the vault, so a custom endpoint that checks a key
+      // (embedding_api_key) cannot run a real sweep from here.
+      const embedding = resolveEmbedding(
+        {
+          embeddingBaseUrl: process.env['EMBEDDING_BASE_URL'] || undefined,
+          embeddingModel: process.env['EMBEDDING_MODEL'] || undefined,
+          embeddingApiKey: undefined,
+          openaiApiKey: process.env['OPENAI_API_KEY'] || undefined,
+        },
+        loadYamlConfig(path.resolve(import.meta.dirname, '../config')).embedding?.profiles,
+      );
+      if (!dryRun && !embedding.ok) {
+        logger.error(`dedup-contacts: ${describeEmbeddingUnavailable(embedding)}. A real sweep needs one (KG entity merge embeds fact labels). Re-run with --dry-run to preview without it.`);
         process.exit(1);
       }
 
@@ -719,11 +731,11 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
       );
 
       const modelRegistry = new ModelRegistry(logger);
-      // With a key, use the real OpenAI-backed embeddings. Without one (dry-run only — the
-      // check above exits a real run that lacks a key), fall back to the fake backend; the
-      // dry-run path never embeds, so its results are unaffected.
-      const embeddingService = openaiApiKey
-        ? EmbeddingService.createWithOpenAI(openaiApiKey, logger, bus, modelRegistry)
+      // With an endpoint, use real embeddings. Without one (dry-run only — the check above
+      // exits a real run that lacks one), fall back to the fake backend; the dry-run path
+      // never embeds, so its results are unaffected.
+      const embeddingService = embedding.ok
+        ? EmbeddingService.createWithEndpoint(embedding.endpoint, embedding.profile, logger, bus, modelRegistry)
         : EmbeddingService.createForTesting();
       const kgStore = KnowledgeGraphStore.createWithPostgres(pool, embeddingService, logger);
       const validator = new MemoryValidator(kgStore, embeddingService);

@@ -1,11 +1,16 @@
-import { EMBEDDING_DIMENSIONS } from './types.js';
 import type { Logger } from '../logger.js';
 import type { EventBus } from '../bus/bus.js';
 import type { ModelRegistry } from '../agents/llm/model-registry.js';
 import { createEmbeddingCall, createEmbeddingError } from '../bus/events.js';
+import {
+  lookupEmbeddingProfile,
+  OPENAI_TEXT_EMBEDDING_3_SMALL,
+  type EmbeddingProfile,
+  type EmbeddingPurpose,
+} from './embedding-profiles.js';
 
 export const DEFAULT_EMBEDDING_BASE_URL = 'https://api.openai.com/v1';
-export const DEFAULT_EMBEDDING_MODEL = 'text-embedding-3-small';
+export const DEFAULT_EMBEDDING_MODEL = OPENAI_TEXT_EMBEDDING_3_SMALL.model;
 
 /**
  * Where embeddings come from. OpenAI by default; any server that speaks OpenAI's
@@ -21,7 +26,7 @@ export interface EmbeddingEndpoint {
 /**
  * Picks the embedding endpoint from config, or returns undefined when none is configured
  * and entity memory should stay off. A custom base URL uses `embedding_api_key`, which may
- * be absent; the default OpenAI URL needs `openai_api_key`.
+ * be absent, and needs `EMBEDDING_MODEL`; the default OpenAI URL needs `openai_api_key`.
  */
 export function resolveEmbeddingEndpoint(config: {
   embeddingBaseUrl: string | undefined;
@@ -30,9 +35,12 @@ export function resolveEmbeddingEndpoint(config: {
   openaiApiKey: string | undefined;
 }): EmbeddingEndpoint | undefined {
   if (config.embeddingBaseUrl) {
+    // No default model here: a server that ignores the model field (llama.cpp does) would
+    // answer under OpenAI's name, and its vectors would pass as OpenAI's.
+    if (!config.embeddingModel) return undefined;
     return {
       baseUrl: config.embeddingBaseUrl.replace(/\/+$/, ''),
-      model: config.embeddingModel ?? DEFAULT_EMBEDDING_MODEL,
+      model: config.embeddingModel,
       apiKey: config.embeddingApiKey,
     };
   }
@@ -44,6 +52,40 @@ export function resolveEmbeddingEndpoint(config: {
   };
 }
 
+export type EmbeddingResolution =
+  | { ok: true; endpoint: EmbeddingEndpoint; profile: EmbeddingProfile }
+  | { ok: false; reason: 'no_endpoint' }
+  | { ok: false; reason: 'no_model' }
+  | { ok: false; reason: 'no_profile'; model: string };
+
+/**
+ * The one place that decides whether entity memory has an embedding source: the endpoint
+ * and the profile for its model, or the reason the knowledge graph stays off. Every
+ * construction site uses it, so a custom endpoint reaches all of them.
+ */
+export function resolveEmbedding(
+  config: Parameters<typeof resolveEmbeddingEndpoint>[0],
+  profileOverrides: Readonly<Record<string, EmbeddingProfile>> | undefined,
+): EmbeddingResolution {
+  if (config.embeddingBaseUrl && !config.embeddingModel) return { ok: false, reason: 'no_model' };
+  const endpoint = resolveEmbeddingEndpoint(config);
+  if (!endpoint) return { ok: false, reason: 'no_endpoint' };
+  const profile = lookupEmbeddingProfile(endpoint.model, profileOverrides);
+  if (!profile) return { ok: false, reason: 'no_profile', model: endpoint.model };
+  return { ok: true, endpoint, profile };
+}
+
+/** One log line explaining why the knowledge graph is off, for a failed resolution. */
+export function describeEmbeddingUnavailable(resolution: Exclude<EmbeddingResolution, { ok: true }>): string {
+  if (resolution.reason === 'no_endpoint') {
+    return 'No embedding endpoint: set EMBEDDING_BASE_URL and EMBEDDING_MODEL, or seed openai_api_key in the vault';
+  }
+  if (resolution.reason === 'no_model') {
+    return 'EMBEDDING_BASE_URL is set but EMBEDDING_MODEL is not. Set EMBEDDING_MODEL to the model the server runs, which must have an embedding profile';
+  }
+  return `No embedding profile for model "${resolution.model}". Add one under embedding.profiles in config/local.yaml (dimensions, prefixes, thresholds) to enable it`;
+}
+
 // Internal interface separating the transport/mock concern from the service API.
 // Lets us swap OpenAI for a deterministic fake in tests without touching callers.
 interface EmbeddingBackend {
@@ -51,45 +93,32 @@ interface EmbeddingBackend {
 }
 
 export class EmbeddingService {
-  private backend: EmbeddingBackend;
+  private constructor(
+    private backend: EmbeddingBackend,
+    readonly profile: EmbeddingProfile,
+  ) {}
 
-  private constructor(backend: EmbeddingBackend) {
-    this.backend = backend;
-  }
-
-  // Production factory — requires a live OpenAI API key.
+  // Production factory for any OpenAI-compatible /embeddings endpoint.
   // Pass bus and modelRegistry to enable embedding.call telemetry.
   // Both are optional so the service still works without them, but in production
   // both should always be provided so costs appear in the audit log.
-  static createWithOpenAI(
-    apiKey: string,
-    logger: Logger,
-    bus?: EventBus,
-    modelRegistry?: ModelRegistry,
-  ): EmbeddingService {
-    return EmbeddingService.createWithEndpoint(
-      { baseUrl: DEFAULT_EMBEDDING_BASE_URL, model: DEFAULT_EMBEDDING_MODEL, apiKey },
-      logger, bus, modelRegistry,
-    );
-  }
-
-  // Production factory for any OpenAI-compatible /embeddings endpoint.
   static createWithEndpoint(
     endpoint: EmbeddingEndpoint,
+    profile: EmbeddingProfile,
     logger: Logger,
     bus?: EventBus,
     modelRegistry?: ModelRegistry,
   ): EmbeddingService {
-    return new EmbeddingService(new OpenAIBackend(endpoint, logger, bus, modelRegistry));
+    return new EmbeddingService(new OpenAIBackend(endpoint, profile.dimensions, logger, bus, modelRegistry), profile);
   }
 
   // Test factory — produces deterministic vectors without any network calls.
-  static createForTesting(): EmbeddingService {
-    return new EmbeddingService(new FakeEmbeddingBackend());
+  static createForTesting(profile: EmbeddingProfile = OPENAI_TEXT_EMBEDDING_3_SMALL): EmbeddingService {
+    return new EmbeddingService(new FakeEmbeddingBackend(profile.dimensions), profile);
   }
 
-  async embed(text: string): Promise<number[]> {
-    return this.backend.embed(text);
+  async embed(text: string, purpose: EmbeddingPurpose): Promise<number[]> {
+    return this.backend.embed(this.profile.prefixes[purpose] + text);
   }
 
   /**
@@ -126,6 +155,7 @@ export class EmbeddingService {
 class OpenAIBackend implements EmbeddingBackend {
   constructor(
     private endpoint: EmbeddingEndpoint,
+    private dimensions: number,
     private logger: Logger,
     private bus?: EventBus,
     private modelRegistry?: ModelRegistry,
@@ -145,9 +175,8 @@ class OpenAIBackend implements EmbeddingBackend {
         body: JSON.stringify({
           model: this.endpoint.model,
           input: text,
-          // Requesting the canonical dimension so the DB schema never has to change
-          // if we upgrade models later.
-          dimensions: EMBEDDING_DIMENSIONS,
+          // Honoured by OpenAI; servers that ignore it return the full width, cut below.
+          dimensions: this.dimensions,
         }),
       });
     } catch (err) {
@@ -204,12 +233,12 @@ class OpenAIBackend implements EmbeddingBackend {
     // Servers that ignore `dimensions` (llama.cpp, Ollama) return the model's full width.
     // For a Matryoshka-trained model such as Qwen3-Embedding, the leading dimensions are a
     // valid smaller embedding once rescaled to unit length.
-    if (embedding && embedding.length > EMBEDDING_DIMENSIONS) {
-      embedding = truncateAndNormalize(embedding, EMBEDDING_DIMENSIONS);
+    if (embedding && embedding.length > this.dimensions) {
+      embedding = truncateAndNormalize(embedding, this.dimensions);
     }
-    if (!embedding || embedding.length !== EMBEDDING_DIMENSIONS) {
+    if (!embedding || embedding.length !== this.dimensions) {
       this.logger.error(
-        { expected: EMBEDDING_DIMENSIONS, actual: embedding?.length },
+        { expected: this.dimensions, actual: embedding?.length },
         'OpenAI embedding dimension mismatch',
       );
       // Publish embedding.error so HealthService counts malformed responses as failures.
@@ -275,6 +304,8 @@ function truncateAndNormalize(vector: number[], dimensions: number): number[] {
 // This produces stable, repeatable vectors that differ per input — no network needed.
 
 class FakeEmbeddingBackend implements EmbeddingBackend {
+  constructor(private dimensions: number) {}
+
   async embed(text: string): Promise<number[]> {
     // djb2-style hash: cheap, non-crypto, good enough to differentiate strings
     let hash = 0;
@@ -284,11 +315,11 @@ class FakeEmbeddingBackend implements EmbeddingBackend {
       hash = hash & hash; // Force 32-bit integer truncation
     }
 
-    // LCG (linear congruential generator) seeded by the hash to fill EMBEDDING_DIMENSIONS floats.
+    // LCG (linear congruential generator) seeded by the hash to fill the profile's width.
     // Constants from glibc — well-known period, adequate for test use.
     const embedding: number[] = [];
     let seed = Math.abs(hash);
-    for (let i = 0; i < EMBEDDING_DIMENSIONS; i++) {
+    for (let i = 0; i < this.dimensions; i++) {
       seed = (seed * 1103515245 + 12345) & 0x7fffffff;
       // Map [0, 0x7fffffff] → [-1, 1] to satisfy the cosine similarity contract
       embedding.push((seed / 0x7fffffff) * 2 - 1);

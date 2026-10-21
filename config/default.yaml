@@ -394,6 +394,32 @@ dreaming:
     errorRateWindowDays: 90       # that rate covers the last 30 competence rows, none older than this
     unparseableAfterDays: 3       # parse failures retry this many days, then dead-letter
 
+# Embedding profiles (ADR-051). The endpoint is set in .env (EMBEDDING_BASE_URL,
+# EMBEDDING_MODEL). The profile for that model gives its vector width, the text put in
+# front of each kind of input, and the three similarity thresholds. Built-in profiles
+# live in src/memory/embedding-profiles.ts. A model with no profile leaves the knowledge
+# graph off. To enable one, add it in config/local.yaml, keyed by the exact
+# EMBEDDING_MODEL value. Thresholds must be calibrated for the model: values copied from
+# another model can merge distinct people and facts.
+#
+# embedding:
+#   profiles:
+#     # Same model under another server's id: `base` copies a built-in profile, and any
+#     # field given beside it overrides that field.
+#     my-server-id-for-text-embedding-3-small:
+#       base: text-embedding-3-small
+#     # A model with no built-in profile: give dimensions and all three thresholds.
+#     my-embedding-model:
+#       dimensions: 1024              # at most 2000 (pgvector's HNSW limit)
+#       prefixes:                     # optional; each defaults to ""
+#         query: ""                   # put before a search query
+#         document: ""                # put before a stored node label
+#         similarity: ""              # put before a label matched against stored labels
+#       thresholds:
+#         fact_dedup: 0.92            # merge a new fact into an existing one at or above
+#         fuzzy_resolve: 0.90         # resolve a name to an existing entity at or above
+#         fuzzy_ambiguity_floor: 0.75 # ask which entity was meant at or above
+
 # Sensitivity classification rules for KG nodes (issue #200).
 # Rules are evaluated in descending sensitivity order — 'restricted' rules are
 # checked before 'confidential', so the most protective rule always wins.

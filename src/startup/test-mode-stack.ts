@@ -101,7 +101,7 @@ import { ConversationEntityState } from '../entity-context/conversation-entities
 import { OfficeIdentityService } from '../identity/service.js';
 import type { OfficeIdentity } from '../identity/types.js';
 import { BullpenService } from '../memory/bullpen.js';
-import { EmbeddingService } from '../memory/embedding.js';
+import { EmbeddingService, resolveEmbedding } from '../memory/embedding.js';
 import { EntityMemory } from '../memory/entity-memory.js';
 import { KnowledgeGraphStore } from '../memory/knowledge-graph.js';
 import { MemoryValidator } from '../memory/validation.js';
@@ -636,6 +636,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
   let awsAccessKeyId = config.awsAccessKeyId;
   let awsSecretAccessKey = config.awsSecretAccessKey;
   let openaiApiKey = config.openaiApiKey;
+  let embeddingApiKey = config.embeddingApiKey;
   let signalPhoneNumber = config.signalPhoneNumber;
   const llmMode = options.llm ?? 'live';
   const warnings: string[] = [];
@@ -702,6 +703,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       awsAccessKeyId = resolved.awsAccessKeyId;
       awsSecretAccessKey = resolved.awsSecretAccessKey;
       openaiApiKey = resolved.openaiApiKey;
+      embeddingApiKey = resolved.embeddingApiKey;
       signalPhoneNumber = resolved.signalPhoneNumber;
       if (resolved.nylasApiKey) {
         try {
@@ -753,8 +755,9 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     const baseMemory = WorkingMemory.createWithPostgres(pool, logger);
     const memory = options.wrapWorkingMemory ? options.wrapWorkingMemory(baseMemory) : baseMemory;
     let entityMemory: EntityMemory | undefined;
-    if (openaiApiKey) {
-      const embeddingService = EmbeddingService.createWithOpenAI(openaiApiKey, logger, bus, modelRegistry);
+    const embedding = resolveEmbedding({ ...config, openaiApiKey, embeddingApiKey }, yamlConfig.embedding?.profiles);
+    if (embedding.ok) {
+      const embeddingService = EmbeddingService.createWithEndpoint(embedding.endpoint, embedding.profile, logger, bus, modelRegistry);
       const kgStore = KnowledgeGraphStore.createWithPostgres(pool, embeddingService, logger);
       entityMemory = new EntityMemory(kgStore, new MemoryValidator(kgStore, embeddingService), embeddingService, logger);
     }

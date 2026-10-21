@@ -57,7 +57,7 @@ import {
 import { WorkingMemory } from './memory/working-memory.js';
 import { sharedIdentifierSourceIndex } from './agents/identifier-source-index.js';
 import { createIdentifierSources } from './agents/identifier-sources.js';
-import { EmbeddingService, resolveEmbeddingEndpoint } from './memory/embedding.js';
+import { EmbeddingService, describeEmbeddingUnavailable, resolveEmbedding } from './memory/embedding.js';
 import { KnowledgeGraphStore } from './memory/knowledge-graph.js';
 import { MemoryValidator } from './memory/validation.js';
 import { EntityMemory } from './memory/entity-memory.js';
@@ -625,18 +625,18 @@ async function main(): Promise<void> {
     workingMemoryTtlDays,
   );
 
-  // Entity memory — optional, requires OPENAI_API_KEY for embeddings.
+  // Entity memory — optional, requires an embedding endpoint and a profile for its model.
   // If not configured, agents still work — they just don't have KG access.
   let entityMemory: EntityMemory | undefined;
   // Sensitivity classifier — declared outside the if-block (like entityMemory above) so it
   // stays in scope for the ExecutionLayer construction further down (#1419), which exposes
   // it to skills as the 'sensitivityClassifier' capability. Same availability as entityMemory:
-  // both require an embedding endpoint (OPENAI_API_KEY or EMBEDDING_BASE_URL) because the
-  // classifier is currently only built inside this branch — see the sensitivity_rules guard
-  // below for why it can't be built earlier.
+  // both require an embedding endpoint (the vault's openai_api_key or EMBEDDING_BASE_URL)
+  // and a profile for its model, because the classifier is currently only built inside this
+  // branch — see the sensitivity_rules guard below for why it can't be built earlier.
   let sensitivityClassifier: SensitivityClassifier | undefined;
-  const embeddingEndpoint = resolveEmbeddingEndpoint(config);
-  if (embeddingEndpoint) {
+  const embedding = resolveEmbedding(config, yamlConfig.embedding?.profiles);
+  if (embedding.ok) {
     // Sensitivity classifier — built from the already-merged config (default.yaml +
     // local.yaml, see loadYamlConfig()) so operator overrides in local.yaml actually
     // take effect rather than being silently ignored (#1369). Malformed rules already
@@ -654,7 +654,8 @@ async function main(): Promise<void> {
     logger.info({ ruleCount: yamlConfig.sensitivity_rules.length }, 'Sensitivity classifier loaded');
 
     const embeddingService = EmbeddingService.createWithEndpoint(
-      embeddingEndpoint,
+      embedding.endpoint,
+      embedding.profile,
       logger,
       bus,           // EventBus — wired at line 234
       modelRegistry, // ModelRegistry — wired at line 281
@@ -663,11 +664,15 @@ async function main(): Promise<void> {
     const validator = new MemoryValidator(kgStore, embeddingService);
     entityMemory = new EntityMemory(kgStore, validator, embeddingService, logger, sensitivityClassifier);
     logger.info(
-      { embeddingBaseUrl: embeddingEndpoint.baseUrl, embeddingModel: embeddingEndpoint.model },
+      {
+        embeddingBaseUrl: embedding.endpoint.baseUrl,
+        embeddingModel: embedding.endpoint.model,
+        embeddingDimensions: embedding.profile.dimensions,
+      },
       'Entity memory initialized with knowledge graph',
     );
   } else {
-    logger.warn('No embedding endpoint (OPENAI_API_KEY or EMBEDDING_BASE_URL) — entity memory disabled (knowledge graph unavailable)');
+    logger.warn(`${describeEmbeddingUnavailable(embedding)} — entity memory disabled (knowledge graph unavailable)`);
   }
 
   // Bullpen service — Tier 2 inter-agent discussion. Always initialized (no

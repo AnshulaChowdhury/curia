@@ -13,6 +13,7 @@ import type {
 } from './types.js';
 import { createNodeId, createEdgeId, SENSITIVITY_LEVELS } from './types.js';
 import { EmbeddingService } from './embedding.js';
+import type { EmbeddingPurpose } from './embedding-profiles.js';
 
 // -- Public option interfaces --
 
@@ -167,7 +168,7 @@ export class KnowledgeGraphStore {
     const now = new Date();
     // Use pre-computed embedding if provided (avoids redundant API call when
     // the validator already embedded the label during dedup checks).
-    const embedding = options.embedding ?? await this.embeddingService.embed(options.label);
+    const embedding = options.embedding ?? await this.embeddingService.embed(options.label, 'document');
 
     const node: KgNode = {
       id: createNodeId(),
@@ -223,7 +224,7 @@ export class KnowledgeGraphStore {
    */
   async upsertNode(options: CreateNodeOptions & { confidence: number }): Promise<{ node: KgNode; created: boolean }> {
     const now = new Date();
-    const embedding = options.embedding ?? await this.embeddingService.embed(options.label);
+    const embedding = options.embedding ?? await this.embeddingService.embed(options.label, 'document');
 
     const node: KgNode = {
       id: createNodeId(),
@@ -282,7 +283,7 @@ export class KnowledgeGraphStore {
       aliases: updates.aliases ?? existing.aliases,
       // Re-embed if the label changed, otherwise keep existing embedding
       embedding: labelChanged
-        ? await this.embeddingService.embed(updates.label!)
+        ? await this.embeddingService.embed(updates.label!, 'document')
         : existing.embedding,
       temporal: {
         ...existing.temporal,
@@ -403,13 +404,21 @@ export class KnowledgeGraphStore {
   /**
    * Semantic search: embed the query, then find the most similar nodes.
    * Returns results sorted by similarity (highest first).
+   *
+   * `purpose` is 'query' for a question against stored labels, and 'similarity' when the
+   * text is itself a label being matched against stored labels (fuzzy entity resolution).
    */
   async semanticSearch(
     query: string,
-    options?: { limit?: number; type?: NodeType; maxSensitivity?: Sensitivity },
+    options?: {
+      limit?: number;
+      type?: NodeType;
+      maxSensitivity?: Sensitivity;
+      purpose?: Exclude<EmbeddingPurpose, 'document'>;
+    },
   ): Promise<SearchResult[]> {
     const limit = options?.limit ?? 10;
-    const queryEmbedding = await this.embeddingService.embed(query);
+    const queryEmbedding = await this.embeddingService.embed(query, options?.purpose ?? 'query');
     return this.backend.semanticSearch(queryEmbedding, limit, {
       type: options?.type,
       maxSensitivity: options?.maxSensitivity,

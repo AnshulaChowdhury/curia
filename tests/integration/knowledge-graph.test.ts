@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
 import { KnowledgeGraphStore } from '../../src/memory/knowledge-graph.js';
 import { EmbeddingService } from '../../src/memory/embedding.js';
+import { OPENAI_TEXT_EMBEDDING_3_SMALL } from '../../src/memory/embedding-profiles.js';
 import { EntityMemory } from '../../src/memory/entity-memory.js';
 import { MemoryValidator } from '../../src/memory/validation.js';
 import { createLogger, createSilentLogger } from '../../src/logger.js';
@@ -61,7 +62,7 @@ describeIf('Knowledge Graph Integration', () => {
     expect(retrieved).toBeDefined();
     expect(retrieved!.label).toBe('Integration Test Person');
     expect(retrieved!.embedding).toBeDefined();
-    expect(retrieved!.embedding).toHaveLength(1536);
+    expect(retrieved!.embedding).toHaveLength(OPENAI_TEXT_EMBEDDING_3_SMALL.dimensions);
   });
 
   it('performs semantic search via pgvector', async () => {

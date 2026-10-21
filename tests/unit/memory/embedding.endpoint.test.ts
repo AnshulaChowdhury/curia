@@ -1,16 +1,20 @@
 // embedding.endpoint.test.ts — unit tests for OpenAI-compatible embedding endpoints:
-// endpoint resolution from config, the request the backend sends, and how it fits a
-// wider vector to EMBEDDING_DIMENSIONS.
+// endpoint and profile resolution from config, the request the backend sends, and how it
+// fits a wider vector to the profile's width.
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   EmbeddingService,
   resolveEmbeddingEndpoint,
+  resolveEmbedding,
+  describeEmbeddingUnavailable,
 } from '../../../src/memory/embedding.js';
 import { createSilentLogger } from '../../../src/logger.js';
-import { EMBEDDING_DIMENSIONS } from '../../../src/memory/types.js';
+import { OPENAI_TEXT_EMBEDDING_3_SMALL, type EmbeddingProfile } from '../../../src/memory/embedding-profiles.js';
 
 const logger = createSilentLogger();
+const EMBEDDING_DIMENSIONS = OPENAI_TEXT_EMBEDDING_3_SMALL.dimensions;
+const profile: EmbeddingProfile = { ...OPENAI_TEXT_EMBEDDING_3_SMALL, model: 'm' };
 
 const noEmbeddingConfig = {
   embeddingBaseUrl: undefined,
@@ -53,6 +57,47 @@ describe('resolveEmbeddingEndpoint', () => {
       apiKey: undefined,
     });
   });
+
+  it('returns undefined for a custom base URL with no model, rather than assuming OpenAI\'s', () => {
+    expect(resolveEmbeddingEndpoint({ ...noEmbeddingConfig, embeddingBaseUrl: 'http://embed.local/v1' })).toBeUndefined();
+  });
+});
+
+describe('resolveEmbedding', () => {
+  it('reports no endpoint when nothing is configured', () => {
+    expect(resolveEmbedding(noEmbeddingConfig, undefined)).toEqual({ ok: false, reason: 'no_endpoint' });
+  });
+
+  it('pairs the OpenAI default with its built-in profile', () => {
+    const resolution = resolveEmbedding({ ...noEmbeddingConfig, openaiApiKey: 'sk-test' }, undefined);
+    expect(resolution.ok && resolution.profile).toBe(OPENAI_TEXT_EMBEDDING_3_SMALL);
+  });
+
+  it('turns the knowledge graph off for a custom base URL with no model, naming EMBEDDING_MODEL', () => {
+    const resolution = resolveEmbedding(
+      { ...noEmbeddingConfig, embeddingBaseUrl: 'http://embed.local/v1', openaiApiKey: 'sk-test' },
+      undefined,
+    );
+    expect(resolution).toEqual({ ok: false, reason: 'no_model' });
+    if (resolution.ok) throw new Error('expected the knowledge graph off');
+    expect(describeEmbeddingUnavailable(resolution)).toContain('EMBEDDING_MODEL');
+  });
+
+  it('turns the knowledge graph off for a model with no profile, naming the model', () => {
+    expect(resolveEmbedding(
+      { ...noEmbeddingConfig, embeddingBaseUrl: 'http://embed.local/v1', embeddingModel: 'unprofiled' },
+      undefined,
+    )).toEqual({ ok: false, reason: 'no_profile', model: 'unprofiled' });
+  });
+
+  it('uses an operator profile for a model the built-in table lacks', () => {
+    const custom: EmbeddingProfile = { ...OPENAI_TEXT_EMBEDDING_3_SMALL, model: 'custom', dimensions: 1024 };
+    const resolution = resolveEmbedding(
+      { ...noEmbeddingConfig, embeddingBaseUrl: 'http://embed.local/v1', embeddingModel: 'custom' },
+      { custom },
+    );
+    expect(resolution.ok && resolution.profile).toBe(custom);
+  });
 });
 
 describe('EmbeddingService — custom endpoint', () => {
@@ -64,10 +109,11 @@ describe('EmbeddingService — custom endpoint', () => {
     const fetchMock = stubFetch(Array.from({ length: EMBEDDING_DIMENSIONS }, () => 0.5));
     const service = EmbeddingService.createWithEndpoint(
       { baseUrl: 'http://embed.local/v1', model: 'qwen3-embedding-4b', apiKey: 'local-key' },
+      profile,
       logger,
     );
 
-    await service.embed('hello');
+    await service.embed('hello', 'document');
 
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe('http://embed.local/v1/embeddings');
@@ -79,10 +125,11 @@ describe('EmbeddingService — custom endpoint', () => {
     const fetchMock = stubFetch(Array.from({ length: EMBEDDING_DIMENSIONS }, () => 0.5));
     const service = EmbeddingService.createWithEndpoint(
       { baseUrl: 'http://embed.local/v1', model: 'm', apiKey: undefined },
+      profile,
       logger,
     );
 
-    await service.embed('hello');
+    await service.embed('hello', 'document');
 
     expect(fetchMock.mock.calls[0]![1].headers).not.toHaveProperty('Authorization');
   });
@@ -95,23 +142,54 @@ describe('EmbeddingService — custom endpoint', () => {
     ]);
     const service = EmbeddingService.createWithEndpoint(
       { baseUrl: 'http://embed.local/v1', model: 'm', apiKey: undefined },
+      profile,
       logger,
     );
 
-    const embedding = await service.embed('hello');
+    const embedding = await service.embed('hello', 'document');
 
     expect(embedding).toHaveLength(EMBEDDING_DIMENSIONS);
     expect(embedding[0]).toBeCloseTo(1 / Math.sqrt(EMBEDDING_DIMENSIONS));
     expect(Math.sqrt(embedding.reduce((sum, x) => sum + x * x, 0))).toBeCloseTo(1);
   });
 
-  it('still rejects a vector narrower than EMBEDDING_DIMENSIONS', async () => {
+  it('still rejects a vector narrower than the profile width', async () => {
     stubFetch(Array.from({ length: 1024 }, () => 0.5));
     const service = EmbeddingService.createWithEndpoint(
       { baseUrl: 'http://embed.local/v1', model: 'm', apiKey: undefined },
+      profile,
       logger,
     );
 
-    await expect(service.embed('hello')).rejects.toThrow('Unexpected embedding dimensions: 1024');
+    await expect(service.embed('hello', 'document')).rejects.toThrow('Unexpected embedding dimensions: 1024');
+  });
+
+  it('asks the server for the profile width and cuts to it', async () => {
+    const fetchMock = stubFetch(Array.from({ length: 2560 }, () => 1));
+    const service = EmbeddingService.createWithEndpoint(
+      { baseUrl: 'http://embed.local/v1', model: 'm', apiKey: undefined },
+      { ...profile, dimensions: 2000 },
+      logger,
+    );
+
+    const embedding = await service.embed('hello', 'document');
+
+    expect(JSON.parse(fetchMock.mock.calls[0]![1].body).dimensions).toBe(2000);
+    expect(embedding).toHaveLength(2000);
+  });
+
+  it('sends the purpose prefix as part of the input', async () => {
+    const fetchMock = stubFetch(Array.from({ length: EMBEDDING_DIMENSIONS }, () => 0.5));
+    const service = EmbeddingService.createWithEndpoint(
+      { baseUrl: 'http://embed.local/v1', model: 'm', apiKey: undefined },
+      { ...profile, prefixes: { query: 'Instruct: find\nQuery: ', document: '', similarity: '' } },
+      logger,
+    );
+
+    await service.embed('who is Ada', 'query');
+    await service.embed('Ada Lovelace', 'document');
+
+    expect(JSON.parse(fetchMock.mock.calls[0]![1].body).input).toBe('Instruct: find\nQuery: who is Ada');
+    expect(JSON.parse(fetchMock.mock.calls[1]![1].body).input).toBe('Ada Lovelace');
   });
 });
