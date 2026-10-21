@@ -68,7 +68,8 @@ Stored as nodes + edges in Postgres:
 - `type` TEXT — `person`, `organization`, `project`, `decision`, `event`, `concept`, `fact`
 - `label` TEXT
 - `properties` JSONB — flexible attributes
-- `embedding` VECTOR(1536) — for semantic search via pgvector
+- `embedding` VECTOR(n) — for semantic search via pgvector; `n` is the configured profile's width, at most 2,000
+- `embedding_model` TEXT — the stamp of the profile that produced `embedding` (see Model stamp below); set exactly when `embedding` is
 - Temporal metadata (see below)
 
 **Edges** (`kg_edges`):
@@ -101,7 +102,19 @@ Every fact and relationship carries:
 
 ## Embedding Layer
 
-Key facts and node descriptions are embedded via OpenAI `text-embedding-3-small` (1536 dimensions) and stored in pgvector with HNSW index. Enables semantic search across the knowledge graph: "find everything related to our fundraising strategy" even if "fundraising" doesn't appear in node labels.
+Key facts and node descriptions are embedded and stored in pgvector with an HNSW index. Enables semantic search across the knowledge graph: "find everything related to our fundraising strategy" even if "fundraising" doesn't appear in node labels. ADR-051 records the design.
+
+**Endpoint.** Embeddings come from any server that speaks OpenAI's `/embeddings` API. `EMBEDDING_BASE_URL` and `EMBEDDING_MODEL` name it, and the vault's `embedding_api_key` authenticates to it when the server checks a key. With no base URL, the endpoint is OpenAI with `openai_api_key`. With neither, entity memory is off, and the sensitivity classifier and the setup wizard with it.
+
+**Profiles.** Each model has a profile in `src/memory/embedding-profiles.ts`: the width to store, a text prefix for each purpose (`query` for a search, `document` for a stored label, `similarity` for a label matched against stored labels), and the three thresholds that fact dedup and fuzzy entity resolution use. `text-embedding-3-small` and `Qwen3-Embedding-4B` are built in. An operator adds or overrides one under `embedding.profiles` in `config/local.yaml`. A model with no profile leaves entity memory off, because thresholds from another model would merge distinct people and facts. `scripts/embedding-eval.ts` (`pnpm embedding-eval`) calibrates a profile against the fixture in `tests/fixtures/embedding-eval/`.
+
+**Model stamp.** Every vector is stored with a stamp in `embedding_model`. The stamp is the model name when the profile's `document` prefix is empty. Otherwise it is the model name plus a short hash of that prefix, because stored vectors keep the prefix they were embedded with. `embeddingStamp()` in `src/memory/embedding-profiles.ts` computes it. Search and dedup compare only vectors that carry the configured profile's stamp.
+
+**Boot gate.** At boot Curia compares the column's declared width and the stored stamps with the profile, and checks `kg_reembed_runs` for an unfinished re-embed. When no row holds a vector, Curia resizes the column itself. Otherwise a width mismatch, a stamp mismatch (another model or `document` prefix) or an open run turns entity memory off, and the log names `pnpm reembed:kg`.
+
+**Re-embed.** `pnpm reembed:kg` resizes the column, rebuilds the index and re-embeds every node, archived ones included. It records the run in `kg_reembed_runs` before it clears any vector and closes the run when it finishes, so an interrupted run keeps entity memory off until a rerun completes it. `--dry-run` reports what would change.
+
+**Instance lock.** Curia holds a session-level Postgres advisory lock for its lifetime. The re-embed command takes the same lock first, and exits naming the holder when a running Curia has it. If Curia boots while the command holds the lock, the knowledge graph stays off and the log says to restart Curia when the command finishes. The schema gate recognises the command by the application name it sets, `curia-reembed-kg`. A second Curia process, or any other holder, gets a warning at boot, and Curia continues without the lock. If the lock's connection drops, Curia logs an error and runs on without the lock until it restarts, so the command could run beside it in that time.
 
 Embeddings are generated:
 - On node/fact creation
@@ -118,7 +131,7 @@ All writes to entity memory and the knowledge graph pass through validation:
 
 ### Deduplication
 Before creating a new fact node, check for existing nodes with:
-- Same entity + similar label (fuzzy match via embedding cosine similarity > 0.92)
+- Same entity + similar label (fuzzy match via embedding cosine similarity at or above the profile's `fact_dedup` threshold, 0.92 for `text-embedding-3-small`)
 - If duplicate found: update `last_confirmed_at` and merge properties instead of creating a new node
 
 ### Contradiction Detection

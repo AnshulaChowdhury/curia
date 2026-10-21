@@ -70,7 +70,8 @@ out the cases marked `release_gate: false` and says how many it left out
   - `openrouter_api_key`, for the judge (`openai/gpt-4o` through OpenRouter) and for
     OpenRouter models such as the production standard tier;
   - `anthropic_api_key`, if you run an Anthropic model;
-  - `openai_api_key` (valid), for embeddings. Seeding a contact creates its KG node.
+  - `openai_api_key` (valid), for embeddings, unless `EMBEDDING_BASE_URL` names your own
+    embedding server (ADR-051). Seeding a contact creates its KG node.
 
   To add one key without touching the others, put it in `.env` and scope the seeder to
   it (the seeder loads all of `.env`, and would otherwise re-upsert every secret there):

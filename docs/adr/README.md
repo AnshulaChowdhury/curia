@@ -30,7 +30,7 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 | [005](005-node-pg-migrate-over-knex.md) | node-pg-migrate over Knex for migrations | Accepted |
 | [006](006-custom-framework-over-existing-agents.md) | Build custom framework over adopting existing agent frameworks | Accepted |
 | [007](007-anthropic-primary-llm-provider-agnostic-interface.md) | Anthropic as primary LLM with provider-agnostic interface | Accepted |
-| [008](008-openai-embeddings-for-knowledge-graph.md) | OpenAI text-embedding-3-small for knowledge graph embeddings | Accepted |
+| [008](008-openai-embeddings-for-knowledge-graph.md) | OpenAI text-embedding-3-small for knowledge graph embeddings | Superseded by ADR-051 |
 | [009](009-nylas-for-email.md) | Nylas as email integration layer | Accepted |
 | [010](010-signal-over-telegram.md) | Signal as high-trust messaging channel, rejecting Telegram | Accepted |
 | [011](011-score-based-autonomy-engine.md) | Score-based autonomy engine over capability-based permissions | Accepted |
@@ -72,6 +72,7 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 | [048](048-reasoning-policy.md) | Reasoning policy — reasoning passes back within a tool loop on every provider; one provider-neutral `reasoning.effort` per tier (unset = provider default) covers OpenRouter and Anthropic adaptive thinking; non-agent call sites state `none`; stale Anthropic thinking is dropped after a prefix change; agent calls send no temperature; `llm.call` records reasoning tokens, effort and upstream endpoint (#2044; amended 2026-10-20 and 2026-10-21) | Accepted |
 | [049](049-band-driven-autonomy.md) | The autonomy band decides when Curia asks first; contact tier only flags an outsider steering Curia, judged per send with the drafting turn's evidence; integrity rules stay deterministic; `autonomy.gating` rolls back (#2159) | Accepted |
 | [050](050-external-verifications-as-first-class-state.md) | External verifications are first-class state — a `verifications` record per site, per-turn injection over always-on prompt, tracked sign-in codes replaced by `[sign-in code]` in every tool input except `web-browser`, in-memory single-process tracker (#2017) | Accepted |
+| [051](051-knowledge-graph-embeddings-from-a-configurable-endpoint.md) | Knowledge graph embeddings come from any OpenAI-compatible endpoint, with a per-model profile (width, prefixes, thresholds), vectors stamped with their model, a boot gate and `pnpm reembed:kg` (#2023) | Accepted |
 
 ## Adding new ADRs
 

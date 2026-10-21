@@ -24,7 +24,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Tier reasoning effort** — **public API (config):** `model_routing.tiers.<tier>.reasoning.effort` for agent turns, validated at boot. (#2044)
 - **`llm.call` reasoning fields** — **public API:** optional `reasoningTokens`, `reasoningEffort`, `upstreamProvider` on the bus event. (#2044)
 - **Suite reasoning metrics** — smoke and scenarios print reasoning tokens and latency p50/p90 per agent. (#2044)
-- **Custom embeddings endpoint** — `EMBEDDING_BASE_URL` and `EMBEDDING_MODEL` point entity memory at any OpenAI-compatible server.
+- **Custom embeddings endpoint** — any OpenAI-compatible server; per-model profiles, calibrated Qwen3-Embedding-4B, model-stamped vectors, `pnpm reembed:kg`. (#2023)
+- **`pnpm embedding-eval`** — scores an embedding model against a labelled fixture and suggests its profile thresholds. (#2023)
 - **Style scenarios** — seven cases score reply length, filler and register under a fixed office identity. (#2143)
 - **Principal scheduling scenarios** — fourteen on-demand cases for CC'd, forwarded and booking-link scheduling requests.
 - **Scenario harness** — CC'd email envelopes, per-case autonomy score, `workday+N` dates, and the run date for the judge.
@@ -94,11 +95,13 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Error-rate guard** — its last-30 window now also stops at 90 days (`errorRateWindowDays`). (#2191)
 - **Task reply binding** — skipped while a sign-in verification is pending for that task. (#2017)
 - **Coordinator tool budget** — raised 78,745 → 79,600 for the `verification` tool. (#2017)
+- **`query-relationships` / `delete-relationship`** — no longer require `openai_api_key`; they fail closed without entity memory. (#2023)
 
 ### Removed
 
 - **Decision posture** — gone from identity, wizard and console; the autonomy level decides act-vs-ask. (#2143)
 - **`weakExpiredWeight`** — scoring setting retired and ignored if set; safe to delete from configs. (#2159)
+- **`kg_memory` setup task** — dropped; the setup wizard cannot run until entity memory is on. (#2023)
 
 ### Security
 

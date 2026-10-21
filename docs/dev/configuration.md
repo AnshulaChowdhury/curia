@@ -379,6 +379,46 @@ audit:
 
 ---
 
+### `embedding.profiles`
+
+A profile tells Curia how to use one embedding model: the vector width to store, a text
+prefix for each purpose, and the three similarity thresholds (ADR-051). The endpoint
+itself is set in `.env` (`EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`), so embedding
+configuration spans both files.
+
+`text-embedding-3-small` and `Qwen3-Embedding-4B` are built in
+(`src/memory/embedding-profiles.ts`). Add a profile in `config/local.yaml`, keyed by the
+exact `EMBEDDING_MODEL` value:
+
+```yaml
+embedding:
+  profiles:
+    # The same model under another server's id: `base` copies a built-in profile,
+    # and any field given beside it overrides that field.
+    "qwen3-embedding:4b":
+      base: Qwen3-Embedding-4B
+    # A model with no built-in profile gives dimensions and all three thresholds.
+    my-embedding-model:
+      dimensions: 1024
+      prefixes: { query: "", document: "", similarity: "" }
+      thresholds: { fact_dedup: 0.92, fuzzy_resolve: 0.90, fuzzy_ambiguity_floor: 0.75 }
+```
+
+| Key | Description |
+|---|---|
+| `dimensions` | Width stored in `kg_nodes.embedding`, at most 2,000 (pgvector's HNSW limit). A longer vector from the server is truncated and renormalised. |
+| `prefixes.query` / `.document` / `.similarity` | Text put before a search query, a stored node label, and a label matched against stored labels. Each defaults to empty. |
+| `thresholds.fact_dedup` | Cosine score at or above which a new fact merges into an existing one. |
+| `thresholds.fuzzy_resolve` | Score at or above which a name resolves to an existing entity. |
+| `thresholds.fuzzy_ambiguity_floor` | Score at or above which an entity is offered as an ambiguous candidate. Must be below `fuzzy_resolve`. |
+
+A malformed profile fails boot with the key named. Thresholds copied from another model
+can merge distinct people and facts; calibrate them with `pnpm embedding-eval` (see
+`scripts/embedding-eval.ts`). A model change on an install that already holds vectors
+leaves entity memory off until `pnpm reembed:kg` has run with Curia stopped. A change to
+`prefixes.document` counts as a model change, because stored vectors keep the prefix they
+were embedded with.
+
 ## Skill, agent, and channel registry
 
 Tools, skills, agents, and channels are not enabled simply by existing on disk — they are tracked in registry tables (`tool_registry`, `skill_registry` for bundles, `agent_registry`, `channel_registry`) with an explicit **install → enable** lifecycle.
@@ -612,7 +652,10 @@ from `.env`.
 | `ANTHROPIC_API_KEY` | Yes¹ | vault | Powers the agents on the default tiers. ¹ No provider is mandatory: boot requires a credential only for each provider a tier is actually mapped to, and fails naming the tier, model and provider if one is missing. |
 | `API_TOKEN` | Yes | vault | Authenticates HTTP API requests |
 | `WEB_APP_BOOTSTRAP_SECRET` | Yes | vault | Web app login secret |
-| `OPENAI_API_KEY` | Tier 2 | vault | Enables entity memory and semantic search |
+| `OPENAI_API_KEY` | Tier 2 | vault | Enables entity memory and semantic search through OpenAI embeddings when `EMBEDDING_BASE_URL` is unset. Also used by `image-generate`. |
+| `EMBEDDING_BASE_URL` | Optional | `.env` | Base URL of an OpenAI-compatible `/embeddings` server (llama.cpp, Ollama, vLLM), e.g. `http://localhost:8080/v1`. Replaces OpenAI as the embedding source for entity memory (ADR-051). |
+| `EMBEDDING_MODEL` | With `EMBEDDING_BASE_URL` | `.env` | Model name sent to the embedding server, and the key of its profile. Required when `EMBEDDING_BASE_URL` is set: without it entity memory stays off. With no base URL it defaults to `text-embedding-3-small`. A model with no profile leaves entity memory off; see [`embedding.profiles`](#embeddingprofiles). |
+| `EMBEDDING_API_KEY` | Optional | vault | Vault key `embedding_api_key`. Sent as a Bearer token to `EMBEDDING_BASE_URL` when the server checks one. |
 | `OPENROUTER_API_KEY` | Optional | vault | Enables multi-model routing via OpenRouter (Gemini Flash, DeepSeek V3, GPT-4o). When set, tiers can map to OpenRouter-hosted models. |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Optional | vault | Vault keys `aws_access_key_id` / `aws_secret_access_key`. With `AWS_REGION`, registers the Bedrock provider so tiers can map to Bedrock-hosted Claude models. A partial set logs a warning and leaves Bedrock off. |
 | `AWS_REGION` | Optional | `.env` | Bedrock region (e.g. `ca-central-1`). Required for Bedrock to register. |

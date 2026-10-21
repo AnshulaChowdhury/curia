@@ -1,0 +1,44 @@
+# ADR-051: Knowledge graph embeddings come from a configurable endpoint, with a profile per model
+
+Date: 2026-10-21
+Status: Accepted
+
+Supersedes [ADR-008](008-openai-embeddings-for-knowledge-graph.md).
+
+## Context
+
+ADR-008 chose OpenAI `text-embedding-3-small` for every knowledge graph vector, and three things hardened around that choice. The column is `vector(1536)` and the width is a constant in the code. The three cosine thresholds for fact dedup, entity auto-resolution and the ambiguity floor are constants tuned to that model's score distribution. Entity memory, the sensitivity classifier and two memory tools are switched off unless the vault holds an OpenAI key.
+
+Issue #2023 asks for a knowledge graph that works with no OpenAI key, for installability, one fewer outage mode, and privacy, since every node label leaves the server today. Cost is not a reason. The issue's own design is an open model that runs in-process in Node and ships inside the image, chosen by an evaluation of at least five candidates. That evaluation has not been run.
+
+Three facts bound the answer. pgvector 0.8.7, which the pinned Postgres image ships, indexes `vector` up to 2,000 dimensions with HNSW. Migrations are SQL-only and run before the vault is read, so a migration cannot call an embedding server. A threshold that is wrong for a model merges distinct people or facts, which is stored data.
+
+## Decision
+
+Embeddings come from any server that speaks OpenAI's `/embeddings` API. `EMBEDDING_BASE_URL` and `EMBEDDING_MODEL` name it, and the vault's `embedding_api_key` authenticates to it when the server checks a key. With no base URL set, OpenAI remains the endpoint and `openai_api_key` its key, so an existing install is unchanged. The server may run on the same machine (llama.cpp, Ollama) or elsewhere. Every embedding in Curia goes through this one path.
+
+Each model has a profile: the vector width to store, the text prefix for each purpose a call can have (`query`, `document`, `similarity`), and the three thresholds. The width is at most 2,000, so the existing `vector` column type and HNSW index serve every model; a wider Matryoshka model is truncated and renormalised. Two profiles ship. `text-embedding-3-small` keeps its 1,536 width and its thresholds of 0.92 for fact dedup, 0.90 for auto-resolution and 0.75 for the ambiguity floor; they were not re-run against the fixture. `Qwen3-Embedding-4B` was calibrated on 2026-10-21 by `scripts/embedding-eval.ts` against the synthetic fixture in `tests/fixtures/embedding-eval/`. Its profile is 1,536 wide, with 0.94 for fact dedup, 0.99 for auto-resolution and 0.80 for the ambiguity floor, and the model card's retrieval instruction in front of search queries. Each of its merge thresholds is the lowest at which no distinct pair in the fixture merged. The best-F1 thresholds, 0.85 and 0.89, merged 12 of 26 distinct fact pairs and 17 of 35 distinct entity pairs. An operator can define a profile for another model in `config/local.yaml`. A model with no profile leaves the knowledge graph off, with the reason logged, because guessed thresholds would merge stored data.
+
+Every vector records the model that made it, in `kg_nodes.embedding_model`. A stored vector also keeps the `document` prefix it was embedded with. When that prefix is not empty, the stamp is the model name plus a short hash of the prefix, so a prefix change under the same model name counts as a model change. Search and dedup compare only vectors that carry the configured profile's stamp. At boot, Curia checks the column width and the stored stamps against the profile. When the table holds no vectors, Curia resizes the column itself and logs that it did, because there is no stored data to protect. With any vector present, a mismatch turns the knowledge graph off with the reason logged, and a person runs `pnpm reembed:kg`, which resizes the column, rebuilds the index and re-embeds every node. The command writes a durable in-progress record before it clears anything and closes it when it finishes; the knowledge graph stays off while that record is open, so an interrupted run cannot pass as complete. Curia takes a session-level Postgres advisory lock at boot and holds it for its lifetime. The command takes the same lock first and exits if Curia holds it, so the two do not write the table at once while the lock's connection is up. If the command holds the lock when Curia boots, Curia keeps the knowledge graph off and logs that it should be restarted once the command finishes. Any other holder is logged as a warning, and boot continues. If the lock's connection drops later, Curia logs an error saying the command could now run beside it, and takes the lock again only when it restarts. Rows that exist before this decision are stamped `text-embedding-3-small`, since upstream Curia has only ever produced vectors with that model. That profile has an empty `document` prefix, so its stamp is the bare model name.
+
+The two memory tools no longer require `openai_api_key`; they depend on entity memory, as `memory-query` and `memory-store` already do.
+
+Alternatives considered:
+
+1. **An in-process open model shipped in the image**, the issue's design. Not rejected: deferred until the evaluation is run and a runtime is chosen. That design reuses everything here except the transport. A bundled model is one more profile, its runtime one more backend behind the same interface, and the purpose argument, the `embedding_model` column, the boot check, the re-embed command and the calibration harness carry over unchanged. A default profile for the bundled model is what would let the knowledge graph start with no configuration.
+2. **OpenAI only** (do nothing). Fails installability and privacy, the reasons the issue gives.
+3. **Re-embed automatically at boot when the model changes.** A typo in `EMBEDDING_MODEL` would rewrite every vector against the wrong server, unsupervised. Running the command is how a person confirms the change. Resizing an empty column at boot is the one automatic step kept, because it rewrites nothing.
+4. **Treat existing rows as an unknown model** and force the re-embed everywhere. That turns the knowledge graph off on every upstream install at upgrade, when the model of those rows is known.
+5. **`halfvec` at a model's native width** (Qwen3-Embedding-4B returns 2,560). The calibration measured 2,560 beside 1,536 and 2,000, app-side. Native width raised ROC-AUC by at most 0.021 on either merge task, chose the same thresholds, and matched 1,536 on search, with recall@5 of 1.000 and MRR of 0.979 at all three widths. A second column and index type was not worth that difference.
+6. **A fixed 1,536 for every model.** It hides the width behind truncation and leaves the thresholds tuned to a model that is not in use.
+7. **The retrieval instruction on `similarity` inputs too**, for Qwen3-Embedding-4B. The calibration measured it. It raised fact-dedup ROC-AUC from 0.67 to 0.84 but cut entity-resolution ROC-AUC from 0.83 to 0.74. One prefix serves both tasks, so `similarity` takes none.
+
+## Consequences
+
+- The knowledge graph works with no OpenAI account, given an embedding server. The operator runs that server; on a six-core CPU, Qwen3-Embedding-4B takes about 0.1 s for a name and 0.3 s for a sentence.
+- Changing the model is a manual step. The knowledge graph, and the setup wizard with it (it needs entity memory), stay off until `pnpm reembed:kg` has run and Curia restarts.
+- With the shipped Qwen3-Embedding-4B values, auto-resolution fires only on near-identical spellings. Most name variants come back as ambiguous for the caller to pick, and fact dedup merges only close restatements, so duplicate facts are the accepted cost.
+- Adding a model means one calibration run and one profile entry. The harness and fixture are the evidence for the thresholds; the fixture is synthetic, so a production label set would sharpen it.
+- A fresh install, or one whose graph is still empty, starts with any profile width and no manual step.
+- The instance lock is new. A second Curia process against the same database was never supported; now it is logged at boot rather than silent, and the re-embed command refuses to run beside one.
+- The decision is cheap to reverse at the code level. Stored vectors can always be re-embedded, so undoing a model choice costs one run of the command.

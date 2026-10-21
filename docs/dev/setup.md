@@ -62,7 +62,7 @@ This guide is organized into three tiers. Start with the minimum and add service
 | Tier | Services | What you get |
 |---|---|---|
 | **1 - Minimum** | Anthropic + Postgres | Agents running, CLI and web app working |
-| **2 - Recommended** | + Nylas + OpenAI | Email channel active, entity memory and semantic search working |
+| **2 - Recommended** | + Nylas + embeddings (OpenAI or your own endpoint) | Email channel active, entity memory and semantic search working |
 | **3 - Full** | + Tavily + Signal | Web research skill, encrypted Signal messaging |
 
 Complete each tier before moving to the next.
@@ -102,7 +102,7 @@ for you:
 3. Prompts for your **Anthropic API key** (validated against `sk-ant-...`,
    3 retries).
 4. Writes `.env` from `.env.example`, leaving optional channel vars
-   (Nylas, OpenAI, Tavily, Signal) commented out for Tiers 2 and 3.
+   (Nylas, embeddings, Tavily, Signal) commented out for Tiers 2 and 3.
 5. Starts the Postgres container, waits for it to be healthy, and applies
    all database migrations.
 6. **Seeds the encrypted secrets vault** from the values it just generated
@@ -183,7 +183,7 @@ full design is documented in
 
 ## Adding secrets after setup
 
-Tiers 2 and 3 add credentials (Nylas, OpenAI, Tavily, Signal). These are
+Tiers 2 and 3 add credentials (Nylas, embeddings, Tavily, Signal). These are
 **secrets**, and most of them resolve from the encrypted vault only (see
 [ADR-021](../adr/021-vault-only-secret-resolution.md)) — setting the key in
 `.env` alone has no effect. The one documented exception is `TAVILY_API_KEY`,
@@ -250,15 +250,36 @@ Restart Curia (`pnpm local`), then **install and enable the email channel** in t
 
 > **Multiple email accounts:** Additional accounts are managed from the console after first boot. Go to **Settings -> Channels -> Email -> Email accounts**. Each account stores its Nylas grant in the vault at `channel.email.<name>.nylas_grant_id`. See [configuration.md](configuration.md#email-accounts) for details.
 
-### OpenAI (Embeddings)
+### Embeddings
 
-OpenAI's embedding model (`text-embedding-3-small`) powers entity memory and semantic search in the knowledge graph. Without it, KG lookups are exact-match only. The smoke tests no longer need it (#1956). Both behavior suites (`pnpm smoke`, `pnpm scenarios`) need `openrouter_api_key` in the vault for their judge; scenarios also need a valid `openai_api_key` for embeddings (see [smoke-tests.md](smoke-tests.md) and `tests/scenarios/README.md`).
+An embedding model powers entity memory and semantic search in the knowledge graph. Without an embedding source, entity memory is off, and the knowledge graph, the sensitivity classifier and the setup wizard with it. The smoke tests no longer need it (#1956). Both behavior suites (`pnpm smoke`, `pnpm scenarios`) need `openrouter_api_key` in the vault for their judge; scenarios also need a working embedding source, either route below (see [smoke-tests.md](smoke-tests.md) and `tests/scenarios/README.md`).
 
-Get an API key from [platform.openai.com](https://platform.openai.com) and seed it into the vault:
+To use OpenAI, get an API key from [platform.openai.com](https://platform.openai.com) and seed it into the vault:
 
 ```bash
 OPENAI_API_KEY=sk-... pnpm run seed-vault
 ```
+
+**Or use your own embedding server.** Any server that speaks OpenAI's `/embeddings` API works (llama.cpp, Ollama, vLLM), on the same machine or elsewhere. Curia sends every knowledge-graph label to this server, sensitive facts included, so use HTTPS for a server on another machine. Set the endpoint in `.env`, and seed its key only if the server checks one:
+
+```bash
+EMBEDDING_BASE_URL=http://localhost:8080/v1
+EMBEDDING_MODEL=Qwen3-Embedding-4B
+```
+
+```bash
+SEED_VAULT_ONLY=embedding_api_key EMBEDDING_API_KEY=... pnpm run seed-vault
+```
+
+Set `EMBEDDING_MODEL` even when the server ignores the field, because Curia picks the profile by that name. The model needs a profile: `text-embedding-3-small` and `Qwen3-Embedding-4B` are built in, and [`embedding.profiles`](configuration.md#embeddingprofiles) adds others. Restart Curia after either route. On a fresh database the first boot sizes the vector column to the profile. To switch models later on a graph that already holds vectors, stop Curia and run `pnpm reembed:kg` once (ADR-051).
+
+In a Docker Compose install, stop Curia and run the command in a one-off container:
+
+```bash
+docker compose run --rm curia ./node_modules/.bin/tsx scripts/reembed-kg.ts
+```
+
+The command refuses to run beside a live Curia, and names the process that holds the lock. An interrupted run stays recorded as open, and the knowledge graph stays off until you run the command again to finish it.
 
 > **Checkpoint:** Email channel active, knowledge graph fully functional with semantic search. This is the recommended baseline for most development work.
 
