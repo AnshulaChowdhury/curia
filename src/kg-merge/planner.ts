@@ -415,17 +415,24 @@ export function buildFactOperations(plan: FactPlan, choices: FactChoices, replac
     collapsedFactCount++;
   }
 
+  // The dropped value lives on in the kept fact's previous_values, so the kept fact must be
+  // at least as sensitive as the dropped one — otherwise the merge would downgrade it.
+  const keepWithPreviousValue = (keep: SnapshotNode, drop: SnapshotNode) => {
+    const u = update(keep);
+    u.sensitivity = maxSensitivity(u.sensitivity, drop.sensitivity);
+    u.previousValues.push(previousValueEntry(drop, replacedAt));
+    deleteFactIds.add(drop.id);
+  };
+
   for (const conflict of plan.conflicts) {
     const choice = choices.facts[conflict.id] ?? conflict.default;
     if (choice === 'both') {
       relink(conflict.absorbedFact, conflict.absorbedLinkEdgeIds);
     } else if (choice === 'survivor') {
-      deleteFactIds.add(conflict.absorbedFact.id);
-      update(conflict.survivorFact).previousValues.push(previousValueEntry(conflict.absorbedFact, replacedAt));
+      keepWithPreviousValue(conflict.survivorFact, conflict.absorbedFact);
     } else {
-      deleteFactIds.add(conflict.survivorFact.id);
       relink(conflict.absorbedFact, conflict.absorbedLinkEdgeIds);
-      update(conflict.absorbedFact).previousValues.push(previousValueEntry(conflict.survivorFact, replacedAt));
+      keepWithPreviousValue(conflict.absorbedFact, conflict.survivorFact);
     }
   }
 
@@ -551,6 +558,7 @@ export function planContacts(
     fieldBase: emptyFieldBase(),
     fieldConflicts: [],
     authOverrideConflicts: [],
+    foldOverridePreferences: [],
   };
 
   if (type === 'person') {
@@ -578,7 +586,7 @@ export function planContacts(
       }
     }
     plan.action = plan.merged.length > 0 ? 'merge' : plan.repointed.length > 0 ? 'repoint' : 'none';
-    if (plan.action === 'merge') planContactFields(plan, surviving);
+    if (plan.action === 'merge') planContactFields(plan, surviving, warnings);
     return plan;
   }
 
@@ -608,27 +616,57 @@ export function planContacts(
   return plan;
 }
 
-function planContactFields(plan: ContactPlan, surviving: SnapshotContact): void {
+/** A contact field value as shown in a warning line — quoted and, if long, shortened. */
+function quoteValue(value: string): string {
+  const flat = value.replace(/\s+/g, ' ').trim();
+  return `'${flat.length > 60 ? `${flat.slice(0, 57)}...` : flat}'`;
+}
+
+function planContactFields(plan: ContactPlan, surviving: SnapshotContact, warnings: MergeWarning[]): void {
+  // Lines for the contacts_disagree warning: values the surviving contact does not hold,
+  // on which two or more folded contacts disagree, so one is kept by rule and not by choice.
+  const disagreements: string[] = [];
+  const mergedByCreation = [...plan.merged].sort(byCreation);
+
   for (const field of CONTACT_MERGE_FIELDS) {
     const survivorValue = surviving.fields[field];
-    const others = plan.merged.map(m => m.fields[field]).filter((v): v is string => v !== null);
     if (survivorValue !== null) {
       plan.fieldBase[field] = survivorValue;
-      const differing = others.find(v => !sameFieldValue(field, v, survivorValue));
+      const differing = plan.merged
+        .map(m => m.fields[field])
+        .find((v): v is string => v !== null && !sameFieldValue(field, v, survivorValue));
       if (differing !== undefined) {
         plan.fieldConflicts.push({ field, survivorValue, absorbedValue: differing });
       }
-    } else {
-      plan.fieldBase[field] = others[0] ?? null;
+      continue;
+    }
+    // No survivor value: the earliest-created folded contact holding one wins.
+    const holders = mergedByCreation.filter(m => m.fields[field] !== null);
+    const kept = holders[0];
+    plan.fieldBase[field] = kept ? kept.fields[field] : null;
+    if (!kept) continue;
+    const keptValue = kept.fields[field]!;
+    const losers = holders.filter(m => !sameFieldValue(field, m.fields[field]!, keptValue));
+    if (losers.length > 0) {
+      disagreements.push(
+        `${CONTACT_MERGE_FIELD_LABELS[field]}: ${quoteValue(keptValue)} (${kept.displayName}) kept over `
+        + losers.map(m => `${quoteValue(m.fields[field]!)} (${m.displayName})`).join(', '),
+      );
     }
   }
 
   const survivorOverrides = new Map(surviving.authOverrides.map(o => [o.permission, o.granted]));
   const seen = new Set<string>();
+  // permission → folded contacts holding an active override for it, in fold order.
+  const unanchored = new Map<string, { contact: SnapshotContact; granted: boolean }[]>();
   for (const m of plan.merged) {
     for (const o of m.authOverrides) {
       const survivorGranted = survivorOverrides.get(o.permission);
-      if (survivorGranted === undefined || survivorGranted === o.granted || seen.has(o.permission)) continue;
+      if (survivorGranted === undefined) {
+        unanchored.set(o.permission, [...(unanchored.get(o.permission) ?? []), { contact: m, granted: o.granted }]);
+        continue;
+      }
+      if (survivorGranted === o.granted || seen.has(o.permission)) continue;
       seen.add(o.permission);
       plan.authOverrideConflicts.push({
         permission: o.permission,
@@ -639,6 +677,30 @@ function planContactFields(plan: ContactPlan, surviving: SnapshotContact): void 
     }
   }
   plan.authOverrideConflicts.sort((a, b) => a.permission.localeCompare(b.permission));
+
+  // Folded contacts that disagree on a permission the survivor holds no override for: the
+  // deny wins (the security-safe reading). A fold carries the first holder's override and
+  // drops later same-permission rows, so when the first holder grants, the first denying
+  // contact must be preferred at its fold.
+  for (const permission of [...unanchored.keys()].sort()) {
+    const holders = unanchored.get(permission)!;
+    const firstDeny = holders.find(h => !h.granted);
+    if (!firstDeny || !holders.some(h => h.granted)) continue;
+    if (holders[0]!.granted) {
+      plan.foldOverridePreferences.push({ permission, contactId: firstDeny.contact.id });
+    }
+    disagreements.push(`${permission}: denied kept over granted`);
+  }
+
+  if (disagreements.length > 0) {
+    warnings.push({
+      code: 'contacts_disagree',
+      message: 'The contacts being merged disagree on values the surviving contact does not hold. '
+        + 'For each field the earliest contact’s value is kept; for each permission, denied wins over granted.',
+      requiresAck: false,
+      details: disagreements,
+    });
+  }
 }
 
 /** Tier survivorship of a fold — computeGoldenRecord's rule applied across every contact. */
@@ -780,12 +842,13 @@ export function planNodeMerge(snapshot: MergeSnapshot): MergePlan {
 
   // -- Label collision (idx_kg_nodes_unique) --
   const resultIdentitySource = s.type === 'person' && contacts.surviving ? 'contact' : s.identitySource;
-  if (snapshot.absorbedLabelOwnerId && resultIdentitySource === 'label' && a.label.toLowerCase() !== s.label.toLowerCase()) {
+  const labelOwner = snapshot.absorbedLabelOwner;
+  if (labelOwner && resultIdentitySource === 'label' && a.label.toLowerCase() !== s.label.toLowerCase()) {
     warnings.push({
       code: 'label_collision',
       message: `‘${a.label}’ cannot be the name: another ${s.type} node already uses it.`,
       requiresAck: false,
-      details: [snapshot.absorbedLabelOwnerId],
+      details: [`${labelOwner.label} (${labelOwner.type})`],
     });
   }
 

@@ -99,6 +99,21 @@ describe('applyResolutions — fact conflict choices and previous_values', () =>
     expect(exec.facts.updates).toEqual([]);
   });
 
+  it('raises the kept fact’s sensitivity to the dropped fact’s, whose value it now holds', () => {
+    const { survivor, absorbed } = basicPair();
+    const sFact = makeFact(uid(100), 'Salary: 100k', { attribute: 'salary', value: '100k' }, { lastConfirmedAt: T1, sensitivity: 'internal' });
+    const aFact = makeFact(uid(101), 'Salary: 120k', { attribute: 'salary', value: '120k' }, { lastConfirmedAt: T2, sensitivity: 'restricted' });
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor, { facts: [sFact] }), makeSide(absorbed, { facts: [aFact] })));
+    const id = plan.facts.conflicts[0]!.id;
+
+    const keepSurvivor = applyResolutions(plan, { facts: { [id]: 'survivor' } }, NOW);
+    expect(keepSurvivor.facts.updates).toEqual([expect.objectContaining({ id: uid(100), sensitivity: 'restricted' })]);
+
+    // Keeping the more sensitive fact never lowers it.
+    const keepAbsorbed = applyResolutions(plan, { facts: { [id]: 'absorbed' } }, NOW);
+    expect(keepAbsorbed.facts.updates).toEqual([expect.objectContaining({ id: uid(101), sensitivity: 'restricted' })]);
+  });
+
   it('auto-collapses duplicates into the survivor fact with max confidence / confirmation / sensitivity', () => {
     const { survivor, absorbed } = basicPair();
     const s = makeFact(uid(100), 'Loves sailing', {}, { confidence: 0.5, lastConfirmedAt: T1, sensitivity: 'internal' });
@@ -251,6 +266,19 @@ describe('applyResolutions — node, edges and contacts', () => {
       outboundMessageCount: 4,
     });
     expect(exec.summary.conflictsResolved).toBe(2);
+  });
+
+  it('prefers the denying contact at its fold when folded contacts disagree and the survivor holds nothing', () => {
+    const { survivor, absorbed } = basicPair();
+    const cs = makeContact({ id: uid(10), kgNodeId: S_ID });
+    const granting = makeContact({ id: uid(11), kgNodeId: A_ID, createdAt: T1, authOverrides: [{ permission: 'calendar.write', granted: true }] });
+    const denying = makeContact({ id: uid(12), kgNodeId: A_ID, createdAt: T2, authOverrides: [{ permission: 'calendar.write', granted: false }] });
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor, { contacts: [cs] }), makeSide(absorbed, { contacts: [granting, denying] })));
+    const exec = applyResolutions(plan, {}, NOW);
+    expect(exec.contacts.merges).toEqual([
+      { secondaryId: uid(11), overridesPreferSecondary: [] },
+      { secondaryId: uid(12), overridesPreferSecondary: ['calendar.write'] },
+    ]);
   });
 
   it('keeps blocked on either side', () => {

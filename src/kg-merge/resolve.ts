@@ -305,10 +305,13 @@ function buildContactOperations(
   // An override conflict resolved to the absorbed side: the survivor's row is revoked
   // just before the contact holding the absorbed value is folded in.
   const preferAbsorbed = new Map<string, string[]>();
+  const prefer = (contactId: string, permission: string) =>
+    preferAbsorbed.set(contactId, [...(preferAbsorbed.get(contactId) ?? []), permission]);
   for (const c of cp.authOverrideConflicts) {
-    if (filled.authOverrides[c.permission] !== 'absorbed') continue;
-    preferAbsorbed.set(c.absorbedContactId, [...(preferAbsorbed.get(c.absorbedContactId) ?? []), c.permission]);
+    if (filled.authOverrides[c.permission] === 'absorbed') prefer(c.absorbedContactId, c.permission);
   }
+  // Folded contacts that disagree where the survivor holds no override: the deny wins.
+  for (const p of cp.foldOverridePreferences) prefer(p.contactId, p.permission);
   ops.merges = cp.merged.map(m => ({ secondaryId: m.id, overridesPreferSecondary: preferAbsorbed.get(m.id) ?? [] }));
   return ops;
 }

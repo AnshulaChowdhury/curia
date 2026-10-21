@@ -725,10 +725,24 @@ describe('POST /api/kg/nodes/merge (#2233)', () => {
     expect(boom.json().error).not.toContain('db down');
   });
 
+  it('names the failed step in the 500: preview vs merge', async () => {
+    app = await buildWithMerge(fakeMergeService({
+      preview: vi.fn().mockRejectedValue(new Error('db down')),
+      apply: vi.fn().mockRejectedValue(new Error('db down')),
+    }));
+    const preview = await postMerge(app, { survivorId: SURVIVOR, absorbedId: ABSORBED });
+    expect(preview.statusCode).toBe(500);
+    expect(preview.json()).toEqual({ error: 'Failed to preview node merge.' });
+    const apply = await postMerge(app, { survivorId: SURVIVOR, absorbedId: ABSORBED, dryRun: false, planToken: 'tok' });
+    expect(apply.statusCode).toBe(500);
+    expect(apply.json()).toEqual({ error: 'Failed to merge nodes.' });
+  });
+
   it('answers 503 when no merge service is wired', async () => {
     app = await buildWithMerge(undefined);
     const res = await postMerge(app, { survivorId: SURVIVOR, absorbedId: ABSORBED });
     expect(res.statusCode).toBe(503);
+    expect(res.json().code).toBe('unavailable');
   });
 });
 
@@ -798,27 +812,78 @@ describe('GET /api/kg/nodes and /api/kg/graph — merge-aware (#2233)', () => {
     expect(sql).toMatch(/archived_at IS NULL/);
   });
 
-  it('returns 404 node_merged with mergedInto for a merged-away node', async () => {
+  it('searches aliases case-insensitively and excludes facts on request, all parameterized', async () => {
+    const pool = makeFakePool();
+    app = await buildWithMerge(fakeMergeService(), pool);
+    const res = await app.inject({ method: 'GET', url: '/api/kg/nodes?query=Janie&exclude_facts=true', headers: auth });
+    expect(res.statusCode).toBe(200);
+    const [sql, params] = vi.mocked(pool.query).mock.calls[0]! as unknown as [string, unknown[]];
+    expect(sql).toMatch(/unnest\(aliases\)[\s\S]*ILIKE '%' \|\| \$2 \|\| '%'/);
+    expect(sql).toMatch(/NOT \$4::boolean OR type <> 'fact'/);
+    expect(sql).not.toContain('Janie');
+    expect(params).toEqual([null, 'Janie', 50, true]);
+
+    // Facts stay in the list by default.
+    await app.inject({ method: 'GET', url: '/api/kg/nodes?query=jane', headers: auth });
+    expect((vi.mocked(pool.query).mock.calls[1]! as unknown as [string, unknown[]])[1]).toEqual([null, 'jane', 50, false]);
+  });
+
+  it('returns 404 node_merged with mergedInto and the absorbed label for a merged-away node', async () => {
     const pool = makeFakePool();
     vi.mocked(pool.query).mockResolvedValueOnce({
-      rows: [{ ...nodeRow, id: ABSORBED, archived_at: '2026-10-21T00:00:00.000Z', properties: { merged_into: SURVIVOR } }],
+      rows: [{ ...nodeRow, id: ABSORBED, label: 'J. Doe', archived_at: '2026-10-21T00:00:00.000Z', properties: { merged_into: SURVIVOR } }],
       rowCount: 1,
     } as never);
     app = await buildWithMerge(fakeMergeService(), pool);
     const res = await app.inject({ method: 'GET', url: `/api/kg/graph?node_id=${ABSORBED}`, headers: auth });
     expect(res.statusCode).toBe(404);
-    expect(res.json()).toMatchObject({ code: 'node_merged', mergedInto: SURVIVOR });
+    expect(res.json()).toEqual({
+      error: `Node ${ABSORBED} was merged into ${SURVIVOR}.`,
+      code: 'node_merged',
+      mergedInto: SURVIVOR,
+      label: 'J. Doe',
+    });
   });
 
-  it('still draws an archived node that was not merged', async () => {
+  it('still draws an archived node that was not merged, flagged archived, with its aliases', async () => {
     const pool = makeFakePool();
     vi.mocked(pool.query)
-      .mockResolvedValueOnce({ rows: [{ ...nodeRow, archived_at: '2026-10-21T00:00:00.000Z' }], rowCount: 1 } as never)
+      .mockResolvedValueOnce({ rows: [{ ...nodeRow, aliases: ['jd'], archived_at: '2026-10-21T00:00:00.000Z' }], rowCount: 1 } as never)
       .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never);
     app = await buildWithMerge(fakeMergeService(), pool);
     const res = await app.inject({ method: 'GET', url: `/api/kg/graph?node_id=${SURVIVOR}`, headers: auth });
     expect(res.statusCode).toBe(200);
     expect(res.json().nodes).toHaveLength(1);
     expect(res.json().nodes[0].archived_at).toBeUndefined();
+    expect(res.json().nodes[0]).toMatchObject({ aliases: ['jd'], archived: true });
+  });
+
+  it('keeps merge tombstones out of the traversal and the top-N graph, and marks live nodes unarchived', async () => {
+    const pool = makeFakePool();
+    vi.mocked(pool.query)
+      .mockResolvedValueOnce({ rows: [{ ...nodeRow, aliases: null, archived_at: null }], rowCount: 1 } as never)
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never)
+      .mockResolvedValueOnce({ rows: [{ ...nodeRow, aliases: ['jd'], archived_at: null }], rowCount: 1 } as never)
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never);
+    app = await buildWithMerge(fakeMergeService(), pool);
+
+    const traversal = await app.inject({ method: 'GET', url: `/api/kg/graph?node_id=${SURVIVOR}`, headers: auth });
+    expect(traversal.statusCode).toBe(200);
+    expect(traversal.json().nodes[0]).toMatchObject({ aliases: [], archived: false });
+    const traversalSql = String(vi.mocked(pool.query).mock.calls[0]![0]);
+    // The recursive step joins the far node and refuses tombstones, so they are neither
+    // drawn nor walked through; edges are then limited to the nodes returned.
+    expect(traversalSql).toMatch(/JOIN kg_nodes o ON o\.id = CASE/);
+    expect(traversalSql).toContain("NOT (o.archived_at IS NOT NULL AND o.properties->>'merged_into' IS NOT NULL)");
+
+    const topN = await app.inject({ method: 'GET', url: '/api/kg/graph', headers: auth });
+    expect(topN.statusCode).toBe(200);
+    expect(topN.json().nodes[0]).toMatchObject({ aliases: ['jd'], archived: false });
+    const topNSql = String(vi.mocked(pool.query).mock.calls[2]![0]);
+    expect(topNSql).toContain("NOT (n.archived_at IS NOT NULL AND n.properties->>'merged_into' IS NOT NULL)");
+    // Decayed archived nodes are not filtered out — only tombstones are.
+    expect(topNSql).not.toMatch(/WHERE\s+archived_at IS NULL/);
+    const edgeSql = String(vi.mocked(pool.query).mock.calls[3]![0]);
+    expect(edgeSql).toMatch(/source_node_id = ANY\(\$1::uuid\[\]\)\s+AND target_node_id = ANY\(\$1::uuid\[\]\)/);
   });
 });

@@ -39,6 +39,24 @@ const REPOINT_EDGES_SQL = `
       target_node_id = CASE WHEN target_node_id = $2::uuid THEN $3::uuid ELSE target_node_id END
   WHERE id = ANY($1::uuid[])`;
 
+/**
+ * Thrown when a statement touches a different number of rows than the plan expects. The
+ * rows were locked and re-planned under those locks, so a mismatch means the plan and the
+ * data disagree — roll back rather than write a half-correct merge.
+ */
+export class MergeInvariantError extends Error {
+  constructor(message: string) {
+    super(`kg-merge invariant violated: ${message}`);
+    this.name = 'MergeInvariantError';
+  }
+}
+
+function expectRows(actual: number | null, expected: number, what: string): void {
+  if ((actual ?? 0) !== expected) {
+    throw new MergeInvariantError(`${what}: expected ${expected} row(s), touched ${actual ?? 0}`);
+  }
+}
+
 export async function executeMerge(
   client: DbPoolClient,
   plan: ExecutionPlan,
@@ -51,18 +69,25 @@ export async function executeMerge(
   // 1. Contacts.
   let contactReferencesRepointed = 0;
   for (const repoint of plan.contacts.repoints) {
-    await client.query(
+    const res = await client.query(
       `UPDATE contacts SET kg_node_id = $2, kind = $3, updated_at = now() WHERE id = $1`,
       [repoint.contactId, survivorId, repoint.kind],
     );
+    expectRows(res.rowCount, 1, `re-point contact ${repoint.contactId}`);
   }
-  if (plan.contacts.survivingContactId && plan.contacts.mergedRow) {
+  if (plan.contacts.merges.length > 0) {
+    const { survivingContactId, mergedRow } = plan.contacts;
+    if (!survivingContactId || !mergedRow) {
+      throw new MergeInvariantError(
+        `${plan.contacts.merges.length} contact fold(s) planned without a surviving contact or merged row`,
+      );
+    }
     for (const merge of plan.contacts.merges) {
       const outcome = await deps.contactService.mergeContactRowsInTx(
         client,
-        plan.contacts.survivingContactId,
+        survivingContactId,
         merge.secondaryId,
-        plan.contacts.mergedRow,
+        mergedRow,
         { overridesPreferSecondary: merge.overridesPreferSecondary },
       );
       contactReferencesRepointed += countRepointedReferences(outcome.references);
@@ -72,42 +97,49 @@ export async function executeMerge(
 
   // 2. Facts.
   if (plan.facts.deleteLinkEdgeIds.length > 0) {
-    await client.query(`DELETE FROM kg_edges WHERE id = ANY($1::uuid[])`, [plan.facts.deleteLinkEdgeIds]);
+    const res = await client.query(`DELETE FROM kg_edges WHERE id = ANY($1::uuid[])`, [plan.facts.deleteLinkEdgeIds]);
+    expectRows(res.rowCount, plan.facts.deleteLinkEdgeIds.length, 'delete shared-fact link edges');
   }
   if (plan.facts.deleteFactIds.length > 0) {
     // type = 'fact' is a guard: this statement must never touch an entity node.
     // Their link edges cascade (kg_edges ON DELETE CASCADE).
-    await client.query(
+    const res = await client.query(
       `DELETE FROM kg_nodes WHERE id = ANY($1::uuid[]) AND type = 'fact'`,
       [plan.facts.deleteFactIds],
     );
+    expectRows(res.rowCount, plan.facts.deleteFactIds.length, 'delete dropped facts');
   }
   for (const update of plan.facts.updates) {
-    await client.query(
+    const res = await client.query(
       `UPDATE kg_nodes
        SET confidence = $2, last_confirmed_at = $3, sensitivity = $4, properties = $5::jsonb
        WHERE id = $1 AND type = 'fact'`,
       [update.id, update.confidence, update.lastConfirmedAt, update.sensitivity, JSON.stringify(update.properties)],
     );
+    expectRows(res.rowCount, 1, `update kept fact ${update.id}`);
   }
   if (plan.facts.relinkEdgeIds.length > 0) {
-    await client.query(REPOINT_EDGES_SQL, [plan.facts.relinkEdgeIds, absorbedId, survivorId]);
+    const res = await client.query(REPOINT_EDGES_SQL, [plan.facts.relinkEdgeIds, absorbedId, survivorId]);
+    expectRows(res.rowCount, plan.facts.relinkEdgeIds.length, 're-link moved facts');
   }
 
   // 3. Edges.
   if (plan.edges.deleteEdgeIds.length > 0) {
-    await client.query(`DELETE FROM kg_edges WHERE id = ANY($1::uuid[])`, [plan.edges.deleteEdgeIds]);
+    const res = await client.query(`DELETE FROM kg_edges WHERE id = ANY($1::uuid[])`, [plan.edges.deleteEdgeIds]);
+    expectRows(res.rowCount, plan.edges.deleteEdgeIds.length, 'delete self-loop and collapsed edges');
   }
   for (const collapse of plan.edges.collapses) {
-    await client.query(
+    const res = await client.query(
       `UPDATE kg_edges
        SET confidence = $2, last_confirmed_at = $3, decay_class = $4, properties = $5::jsonb
        WHERE id = $1`,
       [collapse.survivorEdgeId, collapse.confidence, collapse.lastConfirmedAt, collapse.decayClass, JSON.stringify(collapse.properties)],
     );
+    expectRows(res.rowCount, 1, `update collapsed edge ${collapse.survivorEdgeId}`);
   }
   if (plan.edges.moveEdgeIds.length > 0) {
-    await client.query(REPOINT_EDGES_SQL, [plan.edges.moveEdgeIds, absorbedId, survivorId]);
+    const res = await client.query(REPOINT_EDGES_SQL, [plan.edges.moveEdgeIds, absorbedId, survivorId]);
+    expectRows(res.rowCount, plan.edges.moveEdgeIds.length, 'move edges');
   }
 
   // Everything live on the absorbed node should have been moved or removed. A leftover
@@ -123,13 +155,21 @@ export async function executeMerge(
     throw new Error(`kg-merge: ${leftoverCount} live edge(s) left on the absorbed node ${absorbedId}`);
   }
 
+  // A contact still pointing at the absorbed node would be left on a tombstone.
+  const stranded = await client.query<{ id: string }>(`SELECT id FROM contacts WHERE kg_node_id = $1`, [absorbedId]);
+  if (stranded.rows.length > 0) {
+    log.error({ contactIds: stranded.rows.map(r => r.id) }, 'kg-merge: contacts still linked to the absorbed node — rolling back');
+    throw new MergeInvariantError(`${stranded.rows.length} contact(s) still linked to the absorbed node ${absorbedId}`);
+  }
+
   // 4. Archive the absorbed node as a tombstone (§4.5): label and type kept.
-  await client.query(
+  const archived = await client.query(
     `UPDATE kg_nodes
      SET archived_at = now(), properties = properties || $2::jsonb
-     WHERE id = $1`,
+     WHERE id = $1 AND archived_at IS NULL`,
     [absorbedId, JSON.stringify({ merged_into: survivorId, merged_at: plan.mergedAt })],
   );
+  expectRows(archived.rowCount, 1, `archive absorbed node ${absorbedId}`);
 
   // 5. Survivor node (§4.1). The embedding is replaced only when a new one was computed.
   const node = plan.node;

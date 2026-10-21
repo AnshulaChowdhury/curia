@@ -156,7 +156,7 @@ export interface MergeSnapshot {
    * A third live label-tier node already holding (lower(absorbed label), survivor type),
    * or null. Choosing the absorbed label would collide with it on idx_kg_nodes_unique.
    */
-  absorbedLabelOwnerId: string | null;
+  absorbedLabelOwner: { id: string; label: string; type: string } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +411,12 @@ export interface ContactPlan {
   fieldBase: Record<ContactMergeField, string | null>;
   fieldConflicts: ContactFieldConflictPlan[];
   authOverrideConflicts: AuthOverrideConflictPlan[];
+  /**
+   * Permissions the surviving contact holds no override for, on which the folded contacts
+   * disagree and the deny must win (§5.1): the named contact's override is preferred at its
+   * fold, over the grant an earlier fold carried in.
+   */
+  foldOverridePreferences: { permission: string; contactId: string }[];
 }
 
 export interface NodePlan {

@@ -102,12 +102,23 @@ export function makeSide(
   return { node, facts: parts.facts ?? [], edges: parts.edges ?? [], contacts: parts.contacts ?? [] };
 }
 
+/**
+ * `absorbedLabelOwnerId` names a third node already holding the absorbed label; it gets
+ * that label (as stored, in its own case) and the survivor's type, as the snapshot query does.
+ */
 export function makeSnapshot(
   survivor: MergeSide,
   absorbed: MergeSide,
   absorbedLabelOwnerId: string | null = null,
+  ownerLabel: string = absorbed.node.label,
 ): MergeSnapshot {
-  return { survivor, absorbed, absorbedLabelOwnerId };
+  return {
+    survivor,
+    absorbed,
+    absorbedLabelOwner: absorbedLabelOwnerId
+      ? { id: absorbedLabelOwnerId, label: ownerLabel, type: survivor.node.type }
+      : null,
+  };
 }
 
 /** Two plain person nodes with no contacts, facts or edges. */

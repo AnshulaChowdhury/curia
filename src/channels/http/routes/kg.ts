@@ -86,6 +86,21 @@ interface KgNodeListRow extends KgNodeRow {
   identity_source: string;
 }
 
+/** GET /api/kg/graph nodes carry the alias list and whether the node is archived (#2233). */
+interface KgGraphNodeRow extends KgNodeRow {
+  aliases: string[] | null;
+  archived_at: string | null;
+}
+
+/**
+ * SQL predicate: the row aliased `n` is NOT a merge tombstone — an archived node whose
+ * properties name the survivor it was merged into (#2233). Decayed archived nodes (no
+ * merged_into) still pass.
+ */
+function notMergeTombstone(alias: string): string {
+  return `NOT (${alias}.archived_at IS NOT NULL AND ${alias}.properties->>'merged_into' IS NOT NULL)`;
+}
+
 interface KgEdgeRow {
   id: string;
   source_node_id: string;
@@ -173,28 +188,34 @@ export async function knowledgeGraphRoutes(
       query?: string;
       type?: string;
       limit?: string;
+      exclude_facts?: string;
     };
 
     const limit = normalizeLimit(query.limit, 50, 250);
     const searchQuery = query.query?.trim();
     const typeFilter = query.type?.trim();
+    // exclude_facts=true drops fact nodes — the merge picker searches entities only (#2233).
+    const excludeFacts = query.exclude_facts === 'true' || query.exclude_facts === '1';
 
     // Archived nodes (decayed, or tombstones of a merge) are excluded (#2233): the list
-    // is what the console offers to browse and to merge with.
+    // is what the console offers to browse and to merge with. The text search also
+    // matches aliases, so a node is found by a name it was merged from.
     const result = await pool.query<KgNodeListRow>(
       `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity,
               aliases, identity_source
        FROM kg_nodes
        WHERE archived_at IS NULL
          AND ($1::text IS NULL OR type = $1)
+         AND (NOT $4::boolean OR type <> 'fact')
          AND (
            $2::text IS NULL
            OR label ILIKE '%' || $2 || '%'
            OR properties::text ILIKE '%' || $2 || '%'
+           OR EXISTS (SELECT 1 FROM unnest(aliases) AS a(alias) WHERE a.alias ILIKE '%' || $2 || '%')
          )
        ORDER BY last_confirmed_at DESC
        LIMIT $3`,
-      [typeFilter || null, searchQuery || null, limit],
+      [typeFilter || null, searchQuery || null, limit, excludeFacts],
     );
 
     return reply.send({
@@ -234,8 +255,10 @@ export async function knowledgeGraphRoutes(
       return reply.status(400).send({ error: 'Invalid node_id: must be a valid UUID.' });
     }
 
+    // Merge tombstones (#2233) are never drawn or traversed through; only the focal node
+    // itself (the CTE anchor) may be one, so the 404 node_merged below can name the survivor.
     const nodeResult = nodeId
-      ? await pool.query<KgNodeRow & { archived_at?: string | null }>(
+      ? await pool.query<KgGraphNodeRow>(
           // visited tracks the set of node IDs already expanded, preventing the same
           // node from being re-expanded when reached at a different depth (which UNION
           // alone can't prevent because depth is part of each row's identity).
@@ -245,25 +268,29 @@ export async function knowledgeGraphRoutes(
              WHERE id = $1::uuid
              UNION ALL
              SELECT
-               CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END AS id,
+               o.id,
                t.depth + 1,
-               t.visited || CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END
+               t.visited || o.id
              FROM traversal t
              JOIN kg_edges e ON e.source_node_id = t.id OR e.target_node_id = t.id
+             JOIN kg_nodes o ON o.id = CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END
              WHERE t.depth < $2
-               AND NOT (CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END = ANY(t.visited))
+               AND NOT (o.id = ANY(t.visited))
+               AND ${notMergeTombstone('o')}
            )
            SELECT DISTINCT n.id, n.type, n.label, n.properties, n.confidence, n.decay_class, n.source, n.created_at, n.last_confirmed_at, n.sensitivity,
-                  n.archived_at
+                  n.aliases, n.archived_at
            FROM traversal t
            JOIN kg_nodes n ON n.id = t.id
            ORDER BY n.last_confirmed_at DESC
            LIMIT $3`,
           [nodeId, depth, limit],
         )
-      : await pool.query<KgNodeRow>(
-          `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity
-           FROM kg_nodes
+      : await pool.query<KgGraphNodeRow>(
+          `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity,
+                  aliases, archived_at
+           FROM kg_nodes n
+           WHERE ${notMergeTombstone('n')}
            ORDER BY last_confirmed_at DESC
            LIMIT $1`,
           [limit],
@@ -271,7 +298,7 @@ export async function knowledgeGraphRoutes(
 
     if (nodeResult.rows.length === 0) {
       // With a focal node_id the CTE anchor is that node itself: zero rows means no
-      // kg_nodes row (including archived — neither query filters archived_at). An
+      // kg_nodes row (including archived — the anchor is never filtered). An
       // isolated node still yields exactly one row (itself) and an empty edge list
       // below — keep that as 200 so callers can tell the two apart (#1881).
       if (nodeId) {
@@ -285,8 +312,7 @@ export async function knowledgeGraphRoutes(
     // survivor instead of drawing the tombstone. An archived node without merged_into
     // (decayed) keeps the behaviour above — it is still drawn.
     if (nodeId) {
-      const focal = nodeResult.rows.find((row) => row.id === nodeId) as
-        (KgNodeRow & { archived_at?: string | null }) | undefined;
+      const focal = nodeResult.rows.find((row) => row.id === nodeId);
       const mergedInto = focal?.properties?.merged_into;
       if (focal?.archived_at && typeof mergedInto === 'string' && mergedInto.length > 0) {
         logger.debug({ nodeId, mergedInto }, 'kg: graph node was merged away');
@@ -294,6 +320,7 @@ export async function knowledgeGraphRoutes(
           error: `Node ${nodeId} was merged into ${mergedInto}.`,
           code: 'node_merged',
           mergedInto,
+          label: focal.label,
         });
       }
     }
@@ -323,6 +350,8 @@ export async function knowledgeGraphRoutes(
         createdAt: row.created_at,
         lastConfirmedAt: row.last_confirmed_at,
         sensitivity: row.sensitivity,
+        aliases: row.aliases ?? [],
+        archived: row.archived_at !== null && row.archived_at !== undefined,
       })),
       edges: edgeResult.rows.map((row) => ({
         id: row.id,
@@ -400,7 +429,7 @@ export async function knowledgeGraphRoutes(
       const mapped = mergeErrorResponse(err);
       if (mapped) return reply.status(mapped.status).send(mapped.body);
       logger.error({ err, survivorId, absorbedId, dryRun }, 'POST /api/kg/nodes/merge failed');
-      return reply.status(500).send({ error: 'Failed to merge nodes.' });
+      return reply.status(500).send({ error: dryRun ? 'Failed to preview node merge.' : 'Failed to merge nodes.' });
     }
   });
 

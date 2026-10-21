@@ -15,7 +15,7 @@ import { EmbeddingService } from '../../src/memory/embedding.js';
 import { createSilentLogger } from '../../src/logger.js';
 import type { EventBus } from '../../src/bus/bus.js';
 import type { BusEvent } from '../../src/bus/events.js';
-import { NodeMergeService } from '../../src/kg-merge/service.js';
+import { NodeMergeService, type Embedder, type NodeMergeServiceDeps } from '../../src/kg-merge/service.js';
 import { InvalidResolutionError, MergeBlockedError, StalePreviewError } from '../../src/kg-merge/errors.js';
 import { requireCuriaTestDatabase } from './require-test-db.js';
 
@@ -39,6 +39,12 @@ describeIf('KG node merge (#2233)', () => {
   let publish: ReturnType<typeof vi.fn>;
   let onContactMerged: ReturnType<typeof vi.fn<(primaryId: string, secondaryId: string, mergedAt: Date) => void>>;
   let service: NodeMergeService;
+  let baseDeps: NodeMergeServiceDeps;
+
+  /** A service like `service`, with some dependencies swapped. */
+  function serviceWith(overrides: Partial<NodeMergeServiceDeps>): NodeMergeService {
+    return new NodeMergeService({ ...baseDeps, ...overrides });
+  }
 
   // -- fixture helpers ------------------------------------------------------
 
@@ -209,13 +215,14 @@ describeIf('KG node merge (#2233)', () => {
     onContactMerged = vi.fn<(primaryId: string, secondaryId: string, mergedAt: Date) => void>();
     const logger = createSilentLogger();
     const contactService = ContactService.createWithPostgres(pool, undefined, logger, { onContactMerged });
-    service = new NodeMergeService({
+    baseDeps = {
       pool,
       contactService,
       bus: { publish } as unknown as EventBus,
       logger,
       embedder: EmbeddingService.createForTesting(),
-    });
+    };
+    service = new NodeMergeService(baseDeps);
   });
 
   afterEach(async () => {
@@ -471,6 +478,127 @@ describeIf('KG node merge (#2233)', () => {
     expect((await nodeRow(a))!.archived_at).toBeNull();
     expect(await factsOf(a)).toHaveLength(1);
     expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('re-checks the token under the row locks: a write between the check and BEGIN is refused', async () => {
+    const s = await node('person', 'Locked S');
+    const a = await node('person', 'Locked A');
+    const preview = await service.preview(s, a);
+
+    // The embedder runs after the unlocked token check and before BEGIN — the window a
+    // concurrent writer could use. Write to the graph there, as such a writer would.
+    const real = EmbeddingService.createForTesting();
+    let injected: string | null = null;
+    const racingEmbedder: Embedder = {
+      embed: async (text: string) => {
+        injected = await fact(a, 'Learned while the merge was embedding');
+        return real.embed(text);
+      },
+    };
+    const racing = serviceWith({ embedder: racingEmbedder });
+
+    await expect(racing.apply({
+      survivorId: s, absorbedId: a, planToken: preview.planToken, resolutions: { label: 'absorbed' }, actor: null,
+    })).rejects.toBeInstanceOf(StalePreviewError);
+    expect(injected).not.toBeNull();
+    // Nothing the merge would write was written.
+    expect((await nodeRow(a))!.archived_at).toBeNull();
+    expect((await nodeRow(s))!.label).toBe(`Locked S ${runId}`);
+    expect((await factsOf(a)).map(f => f.id)).toEqual([injected]);
+    expect(await factsOf(s)).toEqual([]);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('discards the connection when ROLLBACK itself fails, and writes nothing', async () => {
+    const s = await node('person', 'Rollback Fails S');
+    const a = await node('person', 'Rollback Fails A');
+    const preview = await service.preview(s, a);
+
+    // A pool whose transaction client cannot roll back; the failure that needs the
+    // rollback is the same under-lock staleness as above.
+    let release: ReturnType<typeof vi.fn> | null = null;
+    const brokenPool = {
+      query: pool.query.bind(pool),
+      connect: async () => {
+        const client = await pool.connect();
+        const realQuery = client.query.bind(client) as (...args: unknown[]) => unknown;
+        client.query = ((...args: unknown[]) => (args[0] === 'ROLLBACK'
+          ? Promise.reject(new Error('kgmerge test: rollback failed'))
+          : realQuery(...args))) as typeof client.query;
+        const realRelease = client.release.bind(client);
+        release = vi.fn((err?: Error | boolean) => realRelease(err));
+        client.release = release as typeof client.release;
+        return client;
+      },
+    } as unknown as pg.Pool;
+    const real = EmbeddingService.createForTesting();
+    const broken = serviceWith({
+      pool: brokenPool,
+      embedder: { embed: async (text: string) => { await fact(a, 'Races the rollback test'); return real.embed(text); } },
+    });
+
+    await expect(broken.apply({
+      survivorId: s, absorbedId: a, planToken: preview.planToken, resolutions: { label: 'absorbed' }, actor: null,
+    })).rejects.toBeInstanceOf(StalePreviewError);
+    expect(release).not.toBeNull();
+    expect(release!).toHaveBeenCalledTimes(1);
+    expect(release!.mock.calls[0]![0]).toBeInstanceOf(Error);
+    expect((await nodeRow(a))!.archived_at).toBeNull();
+    expect((await nodeRow(s))!.label).toBe(`Rollback Fails S ${runId}`);
+  });
+
+  it('reports a lost audit event as a warning without undoing the merge', async () => {
+    const s = await node('person', 'Audit S');
+    const a = await node('person', 'Audit A');
+    const preview = await service.preview(s, a);
+    const failingPublish = vi.fn().mockRejectedValue(new Error('bus down'));
+    const result = await serviceWith({ bus: { publish: failingPublish } as unknown as EventBus })
+      .apply({ survivorId: s, absorbedId: a, planToken: preview.planToken, resolutions: {}, actor: null });
+    expect(failingPublish).toHaveBeenCalledTimes(1);
+    expect(result.warnings).toEqual(['audit_event_not_recorded']);
+    expect((await nodeRow(a))!.archived_at).not.toBeNull();
+  });
+
+  it('treats an invalid embedding like a failed embed: merged, old embedding kept, warned', async () => {
+    const s = await node('person', 'Embedding S');
+    const a = await node('person', 'Embedding A');
+    const preview = await service.preview(s, a);
+    const result = await serviceWith({ embedder: { embed: async () => [0.1, Number.NaN, 0.3] } })
+      .apply({ survivorId: s, absorbedId: a, planToken: preview.planToken, resolutions: { label: 'absorbed' }, actor: null });
+    expect(result.warnings).toEqual(['embedding_not_refreshed']);
+    const survivor = await nodeRow(s);
+    expect(survivor!.label).toBe(`Embedding A ${runId}`);
+    expect(survivor!.embedding).toBeNull();
+  });
+
+  it('folded contacts that disagree where the survivor holds nothing: earliest field wins, deny wins', async () => {
+    // Only organization contacts may share a node (idx_contacts_kg_node_unique), so the
+    // several-contacts fold is an organization node absorbed into a person.
+    const s = await node('person', 'Disagree S', { identitySource: 'contact' });
+    const a = await node('organization', 'Disagree A');
+    const cs = await contact({ displayName: 'Disagree S', kgNodeId: s });
+    const granting = await contact({ displayName: 'Jane D.', kgNodeId: a, kind: 'organization', title: 'CTO' });
+    const denying = await contact({ displayName: 'J. Doe', kgNodeId: a, kind: 'organization', title: 'VP Eng' });
+    await pool.query(`UPDATE contacts SET created_at = $2 WHERE id = $1`, [granting, T1]);
+    await pool.query(`UPDATE contacts SET created_at = $2 WHERE id = $1`, [denying, T2]);
+    await pool.query(
+      `INSERT INTO contact_auth_overrides (contact_id, permission, granted) VALUES ($1, 'calendar.write', true), ($2, 'calendar.write', false)`,
+      [granting, denying],
+    );
+
+    const preview = await service.preview(s, a);
+    expect(preview.warnings.find(w => w.code === 'contacts_disagree')!.details).toEqual([
+      "Title: 'CTO' (Jane D.) kept over 'VP Eng' (J. Doe)",
+      'calendar.write: denied kept over granted',
+    ]);
+    await service.apply({ survivorId: s, absorbedId: a, planToken: preview.planToken, resolutions: {}, actor: null });
+
+    expect(await contactRow(cs)).toMatchObject({ title: 'CTO' });
+    const active = await pool.query<{ permission: string; granted: boolean }>(
+      `SELECT permission, granted FROM contact_auth_overrides WHERE contact_id = $1 AND revoked_at IS NULL`,
+      [cs],
+    );
+    expect(active.rows).toEqual([{ permission: 'calendar.write', granted: false }]);
   });
 
   // -- 7. failure mid-transaction -------------------------------------------

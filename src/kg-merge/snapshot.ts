@@ -3,8 +3,9 @@
 // Spec: docs/wip/2026-10-21-kg-node-merge-design.md §7. Called twice per apply: once on
 // the pool without locks (fast stale check), then on the transaction's client with
 // `forUpdate`, which locks both nodes (ordered by id, so two merges touching the same
-// nodes queue instead of deadlocking) and every linked contact. FOR UPDATE on the node
-// rows also blocks concurrent edge inserts against them — the FK check takes KEY SHARE.
+// nodes queue instead of deadlocking), every linked contact, then every linked fact node.
+// FOR UPDATE on the node rows also blocks concurrent edge inserts against them — the FK
+// check takes KEY SHARE.
 //
 // Every array is sorted deterministically: the plan token hashes this object.
 
@@ -311,7 +312,10 @@ export async function loadMergeSnapshot(
   const factIds = [...new Set([...survivorSide.factLinks.keys(), ...absorbedSide.factLinks.keys()])];
   const factNodes = new Map<string, SnapshotNode>();
   if (factIds.length > 0) {
-    const factRows = await q.query<PgNodeRow>(NODES_SQL, [factIds]);
+    // Under forUpdate the fact rows are locked too — after the entity nodes and contacts,
+    // ordered by id like every other lock here — so a concurrent fact edit cannot slip in
+    // between the token check and the executor's fact updates and deletes.
+    const factRows = await q.query<PgNodeRow>(options.forUpdate ? NODES_FOR_UPDATE_SQL : NODES_SQL, [factIds]);
     for (const r of factRows.rows) factNodes.set(r.id, rowToSnapshotNode(r));
   }
   const toFacts = (links: Map<string, string[]>): SnapshotFact[] =>
@@ -322,8 +326,8 @@ export async function loadMergeSnapshot(
 
   // Would the absorbed label collide with a third node if chosen? Only label-tier live
   // nodes of the survivor's type are in idx_kg_nodes_unique.
-  const owner = await q.query<{ id: string }>(
-    `SELECT id FROM kg_nodes
+  const owner = await q.query<{ id: string; label: string; type: string }>(
+    `SELECT id, label, type FROM kg_nodes
      WHERE lower(label) = lower($1) AND type = $2 AND identity_source = 'label'
        AND archived_at IS NULL AND type <> 'fact' AND id <> ALL($3::uuid[])
      ORDER BY id LIMIT 1`,
@@ -333,6 +337,6 @@ export async function loadMergeSnapshot(
   return {
     survivor: { ...survivorSide.side, facts: toFacts(survivorSide.factLinks) },
     absorbed: { ...absorbedSide.side, facts: toFacts(absorbedSide.factLinks) },
-    absorbedLabelOwnerId: owner.rows[0]?.id ?? null,
+    absorbedLabelOwner: owner.rows[0] ? { id: owner.rows[0].id, label: owner.rows[0].label, type: owner.rows[0].type } : null,
   };
 }

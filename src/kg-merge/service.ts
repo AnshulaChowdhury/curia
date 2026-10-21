@@ -14,6 +14,7 @@ import { createKgNodesMerged } from '../bus/events.js';
 import type { ContactService } from '../contacts/contact-service.js';
 import type { TaskOriginator } from '../contacts/types.js';
 import type { Logger } from '../logger.js';
+import { EMBEDDING_DIMENSIONS } from '../memory/types.js';
 import { isUuid } from '../util/uuid.js';
 import { InvalidResolutionError, NodeNotFoundError, StalePreviewError } from './errors.js';
 import { executeMerge, type ExecutionOutcome } from './executor.js';
@@ -62,6 +63,17 @@ export interface NodeMergeApi {
   candidates(nodeId: string, limit?: number): Promise<MergeCandidate[]>;
 }
 
+/**
+ * An embedder's output is only written when it is a vector the kg_nodes.embedding column
+ * accepts: an array of EMBEDDING_DIMENSIONS finite numbers. Anything else is treated like
+ * a failed embed call (the survivor keeps its old embedding) rather than failing the merge.
+ */
+export function isUsableEmbedding(value: unknown): value is number[] {
+  return Array.isArray(value)
+    && value.length === EMBEDDING_DIMENSIONS
+    && value.every(v => typeof v === 'number' && Number.isFinite(v));
+}
+
 function validateIds(survivorId: string, absorbedId: string): void {
   if (!isUuid(survivorId) || !isUuid(absorbedId)) {
     throw new InvalidResolutionError('invalid_request', 'survivorId and absorbedId must be valid UUIDs.');
@@ -100,7 +112,16 @@ export class NodeMergeService implements NodeMergeApi {
         warnings.push('embedding_not_refreshed');
       } else {
         try {
-          embedding = await this.deps.embedder.embed(exec.node.label);
+          const candidate: unknown = await this.deps.embedder.embed(exec.node.label);
+          if (isUsableEmbedding(candidate)) {
+            embedding = candidate;
+          } else {
+            log.warn(
+              { length: Array.isArray(candidate) ? candidate.length : null, expected: EMBEDDING_DIMENSIONS },
+              'kg-merge: embedder returned an invalid vector — survivor keeps its old embedding',
+            );
+            warnings.push('embedding_not_refreshed');
+          }
         } catch (err) {
           log.warn({ err }, 'kg-merge: re-embedding the new label failed — survivor keeps its old embedding');
           warnings.push('embedding_not_refreshed');
@@ -111,6 +132,9 @@ export class NodeMergeService implements NodeMergeApi {
     // 4. The transaction.
     let outcome: ExecutionOutcome;
     const client = await this.deps.pool.connect();
+    // Set when ROLLBACK itself fails: the connection's transaction state is unknown, so it
+    // is released with the error and the pool destroys it instead of handing it out again.
+    let brokenConnection: Error | undefined;
     try {
       await client.query('BEGIN');
       const locked = await loadMergeSnapshot(client, survivorId, absorbedId, { forUpdate: true });
@@ -121,7 +145,8 @@ export class NodeMergeService implements NodeMergeApi {
       try {
         await client.query('ROLLBACK');
       } catch (rollbackErr) {
-        log.error({ err: rollbackErr }, 'kg-merge: ROLLBACK failed');
+        log.error({ err: rollbackErr }, 'kg-merge: ROLLBACK failed — discarding the connection');
+        brokenConnection = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
       }
       if (err instanceof StalePreviewError || err instanceof NodeNotFoundError) {
         log.info({ code: err.code }, 'kg-merge: graph changed under the merge — rolled back, nothing written');
@@ -130,18 +155,15 @@ export class NodeMergeService implements NodeMergeApi {
       }
       throw err;
     } finally {
-      client.release();
+      client.release(brokenConnection);
     }
 
-    // 5. After commit.
+    // 5. After commit. announceContactsMerged never throws: it logs its own callback
+    // failures, and the identity refresh is fire-and-forget.
     const contacts = exec.contacts;
     const mergedAt = new Date(exec.mergedAt);
     if (contacts.survivingContactId && (contacts.mergedContactIds.length > 0 || contacts.survivingIsPrincipal)) {
-      try {
-        this.deps.contactService.announceContactsMerged(contacts.survivingContactId, contacts.mergedContactIds, mergedAt);
-      } catch (err) {
-        log.error({ err }, 'kg-merge: post-commit contact notifications failed (merge is committed)');
-      }
+      this.deps.contactService.announceContactsMerged(contacts.survivingContactId, contacts.mergedContactIds, mergedAt);
     }
 
     const summary = { ...exec.summary, contactReferencesRepointed: outcome.contactReferencesRepointed };
@@ -175,6 +197,7 @@ export class NodeMergeService implements NodeMergeApi {
       }));
     } catch (err) {
       log.error({ err }, 'kg-merge: failed to publish kg.nodes_merged — audit trail may be incomplete (merge is committed)');
+      warnings.push('audit_event_not_recorded');
     }
 
     log.info({ summary, contactMerge, warnings }, 'kg-merge: nodes merged');

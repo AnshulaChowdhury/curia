@@ -57,8 +57,10 @@ describe('planNodeMerge — labels and aliases', () => {
 
   it('warns about a label collision with a third node, but only for a label-tier result', () => {
     const { survivor, absorbed } = basicPair({ type: 'organization', label: 'Acme Inc' }, { type: 'event', label: 'Acme' });
-    const plan = planNodeMerge(makeSnapshot(makeSide(survivor), makeSide(absorbed), uid(99)));
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor), makeSide(absorbed), uid(99), 'ACME'));
     expect(plan.preview.warnings.map(w => w.code)).toContain('label_collision');
+    // Human-readable: the third node's label and type, never its id.
+    expect(plan.preview.warnings.find(w => w.code === 'label_collision')!.details).toEqual(['ACME (organization)']);
     expect(plan.preview.blockers).toEqual([]);
 
     // A person survivor that ends up with a contact is contact-anchored: no collision.
@@ -360,6 +362,57 @@ describe('planNodeMerge — contact plan matrix', () => {
     ));
     expect(plan.preview.blockers.map(b => b.code)).toContain('absorbed_has_contacts_incompatible_type');
     expect(plan.preview.suggestedDirection.swap).toBe(true);
+  });
+
+  describe('folded contacts that disagree where the survivor holds nothing (contacts_disagree)', () => {
+    const cs = makeContact({ id: uid(10), kgNodeId: S_ID, displayName: 'Jane Doe', fields: { location: 'Paris' } });
+
+    function disagreePlan(first: { title: string | null; granted: boolean }, second: { title: string | null; granted: boolean }) {
+      const { survivor, absorbed } = basicPair();
+      // Listed newest-first to prove the earliest-created contact wins, not list order.
+      const ca2 = makeContact({
+        id: uid(12), kgNodeId: A_ID, displayName: 'J. Doe', createdAt: T2,
+        fields: { title: second.title, location: 'Lyon' },
+        authOverrides: [{ permission: 'calendar.write', granted: second.granted }],
+      });
+      const ca1 = makeContact({
+        id: uid(11), kgNodeId: A_ID, displayName: 'Jane D.', createdAt: T1,
+        fields: { title: first.title },
+        authOverrides: [{ permission: 'calendar.write', granted: first.granted }],
+      });
+      return planNodeMerge(makeSnapshot(makeSide(survivor, { contacts: [cs] }), makeSide(absorbed, { contacts: [ca2, ca1] })));
+    }
+
+    it('keeps the earliest contact’s field value, lets the deny win, and explains both', () => {
+      const plan = disagreePlan({ title: 'CTO', granted: true }, { title: 'VP Eng', granted: false });
+      expect(plan.contacts.fieldBase.title).toBe('CTO');
+      // The survivor holds a location, so Lyon is an ordinary choosable conflict instead.
+      expect(plan.contacts.fieldBase.location).toBe('Paris');
+      expect(plan.preview.conflicts.contactFields.map(c => c.field)).toEqual(['location']);
+      expect(plan.preview.conflicts.authOverrides).toEqual([]);
+      // The earlier fold carries the grant in, so the deny must be preferred at its fold.
+      expect(plan.contacts.foldOverridePreferences).toEqual([{ permission: 'calendar.write', contactId: uid(12) }]);
+      const warning = plan.preview.warnings.find(w => w.code === 'contacts_disagree');
+      expect(warning).toMatchObject({ requiresAck: false });
+      expect(warning!.details).toEqual([
+        "Title: 'CTO' (Jane D.) kept over 'VP Eng' (J. Doe)",
+        'calendar.write: denied kept over granted',
+      ]);
+    });
+
+    it('needs no fold preference when the first folded contact already denies', () => {
+      const plan = disagreePlan({ title: 'CTO', granted: false }, { title: 'CTO', granted: true });
+      expect(plan.contacts.foldOverridePreferences).toEqual([]);
+      expect(plan.preview.warnings.find(w => w.code === 'contacts_disagree')!.details).toEqual([
+        'calendar.write: denied kept over granted',
+      ]);
+    });
+
+    it('does not warn when the folded contacts agree', () => {
+      const plan = disagreePlan({ title: 'CTO', granted: true }, { title: 'CTO', granted: true });
+      expect(plan.preview.warnings.map(w => w.code)).not.toContain('contacts_disagree');
+      expect(plan.contacts.foldOverridePreferences).toEqual([]);
+    });
   });
 
   it('leaves the survivor contacts alone for other types with no absorbed contacts', () => {

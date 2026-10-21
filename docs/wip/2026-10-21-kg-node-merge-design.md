@@ -572,6 +572,6 @@ round. No migration is needed.
 - `result.contactMerge` is `null` when contacts are only re-pointed (organization survivor). The ids appear in the preview's `contactPlan` and in the audit event.
 - When several folded contacts disagree and the survivor has no value, a denied auth override beats a grant (security-safe) and the earliest-created contact wins a field. A `contacts_disagree` info warning lists each case.
 - Fact rows are locked `FOR UPDATE` in the locked snapshot pass, as are the entity nodes and contacts.
-- Post-commit failures appear in `result.warnings`: `embedding_not_refreshed`, `audit_event_not_recorded` and `identity_refresh_failed`. The console shows them in the success banner.
+- Post-commit failures appear in `result.warnings`: `embedding_not_refreshed` and `audit_event_not_recorded`. The console shows them in the success banner. The contact-merged callbacks and the principal identity refresh log and swallow their own errors, so they cannot be reported.
 - When the merge service is not wired, the routes return 503 `unavailable`.
 - `GET /api/kg/nodes` gained `exclude_facts=true` and alias matching. Graph nodes carry `aliases` and `archived`. Merge tombstones are excluded from graph results, and the `node_merged` 404 carries the absorbed `label`.
