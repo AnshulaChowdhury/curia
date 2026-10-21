@@ -8,6 +8,7 @@ import {
   resolveEmbeddingEndpoint,
   resolveEmbedding,
   describeEmbeddingUnavailable,
+  redactUrlUserinfo,
 } from '../../../src/memory/embedding.js';
 import { createSilentLogger } from '../../../src/logger.js';
 import { OPENAI_TEXT_EMBEDDING_3_SMALL, type EmbeddingProfile } from '../../../src/memory/embedding-profiles.js';
@@ -191,5 +192,20 @@ describe('EmbeddingService — custom endpoint', () => {
 
     expect(JSON.parse(fetchMock.mock.calls[0]![1].body).input).toBe('Instruct: find\nQuery: who is Ada');
     expect(JSON.parse(fetchMock.mock.calls[1]![1].body).input).toBe('Ada Lovelace');
+  });
+});
+
+describe('redactUrlUserinfo', () => {
+  it('drops a user and password from the URL', () => {
+    expect(redactUrlUserinfo('https://user:s3cr%40t@embed.example:8443/v1')).toBe('https://embed.example:8443/v1');
+  });
+
+  it('drops a user with no password', () => {
+    expect(redactUrlUserinfo('http://token@embed.example/v1')).toBe('http://embed.example/v1');
+  });
+
+  it('leaves a URL without userinfo unchanged, including an @ in its path', () => {
+    expect(redactUrlUserinfo('http://localhost:8080/v1')).toBe('http://localhost:8080/v1');
+    expect(redactUrlUserinfo('http://embed.example/v1/@team')).toBe('http://embed.example/v1/@team');
   });
 });

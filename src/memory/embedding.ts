@@ -52,6 +52,11 @@ export function resolveEmbeddingEndpoint(config: {
   };
 }
 
+/** `url` without any `user:password@` part, for a log line. */
+export function redactUrlUserinfo(url: string): string {
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, '$1');
+}
+
 export type EmbeddingResolution =
   | { ok: true; endpoint: EmbeddingEndpoint; profile: EmbeddingProfile }
   | { ok: false; reason: 'no_endpoint' }

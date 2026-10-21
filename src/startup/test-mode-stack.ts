@@ -101,7 +101,8 @@ import { ConversationEntityState } from '../entity-context/conversation-entities
 import { OfficeIdentityService } from '../identity/service.js';
 import type { OfficeIdentity } from '../identity/types.js';
 import { BullpenService } from '../memory/bullpen.js';
-import { EmbeddingService, resolveEmbedding } from '../memory/embedding.js';
+import { EmbeddingService } from '../memory/embedding.js';
+import { resolveKnowledgeGraphEmbedding } from '../memory/embedding-schema.js';
 import { EntityMemory } from '../memory/entity-memory.js';
 import { KnowledgeGraphStore } from '../memory/knowledge-graph.js';
 import { MemoryValidator } from '../memory/validation.js';
@@ -755,7 +756,14 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     const baseMemory = WorkingMemory.createWithPostgres(pool, logger);
     const memory = options.wrapWorkingMemory ? options.wrapWorkingMemory(baseMemory) : baseMemory;
     let entityMemory: EntityMemory | undefined;
-    const embedding = resolveEmbedding({ ...config, openaiApiKey, embeddingApiKey }, yamlConfig.embedding?.profiles);
+    // The same gate as production boot, so the suites never run the knowledge graph on a
+    // database production would refuse.
+    const embedding = await resolveKnowledgeGraphEmbedding(
+      pool, { ...config, openaiApiKey, embeddingApiKey }, yamlConfig.embedding?.profiles, logger,
+    );
+    if (!embedding.ok && embedding.gate === 'schema') {
+      warnings.push(`Entity memory is off: ${embedding.message}`);
+    }
     if (embedding.ok) {
       const embeddingService = EmbeddingService.createWithEndpoint(embedding.endpoint, embedding.profile, logger, bus, modelRegistry);
       const kgStore = KnowledgeGraphStore.createWithPostgres(pool, embeddingService, logger);

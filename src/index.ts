@@ -27,6 +27,7 @@ import { HttpAdapter } from './channels/http/http-adapter.js';
 import { resolveMemoryRetentionSnapshot } from './channels/http/routes/memory-retention.js';
 import { resolveSystemSnapshot } from './channels/http/routes/system.js';
 import { createPool } from './db/connection.js';
+import { CURIA_APPLICATION_NAME, holdInstanceLock } from './db/instance-lock.js';
 import { DbAvailabilityMonitor } from './db/availability-monitor.js';
 import { MemorySampler } from './monitoring/memory-sampler.js';
 import { EventBus } from './bus/bus.js';
@@ -57,7 +58,8 @@ import {
 import { WorkingMemory } from './memory/working-memory.js';
 import { sharedIdentifierSourceIndex } from './agents/identifier-source-index.js';
 import { createIdentifierSources } from './agents/identifier-sources.js';
-import { EmbeddingService, describeEmbeddingUnavailable, resolveEmbedding } from './memory/embedding.js';
+import { EmbeddingService, redactUrlUserinfo } from './memory/embedding.js';
+import { resolveKnowledgeGraphEmbedding } from './memory/embedding-schema.js';
 import { KnowledgeGraphStore } from './memory/knowledge-graph.js';
 import { MemoryValidator } from './memory/validation.js';
 import { EntityMemory } from './memory/entity-memory.js';
@@ -327,7 +329,7 @@ async function main(): Promise<void> {
   // 2. Database — needed by audit logger before the bus can accept events.
   // We probe with SELECT 1 to distinguish a misconfigured URL (fast fail)
   // from a legitimate connection that might be retried later.
-  const pool = createPool(config.databaseUrl, logger);
+  const pool = createPool(config.databaseUrl, logger, { applicationName: CURIA_APPLICATION_NAME });
   try {
     await pool.query('SELECT 1');
     logger.info('Database connected');
@@ -384,6 +386,11 @@ async function main(): Promise<void> {
     logger.fatal({ err }, 'Database migration failed');
     process.exit(1);
   }
+
+  // Instance lock (ADR-051): held for the process's life so maintenance commands such as
+  // pnpm reembed:kg refuse to run beside a live Curia. Advisory only — a failure to take
+  // it, or its loss later, is logged and Curia keeps running.
+  const releaseInstanceLock = await holdInstanceLock(pool, logger);
 
   // Resolve bootstrap/config secrets from the vault now that migrations have run
   // (the `secrets` table exists) and before any consumer reads config (#911).
@@ -635,7 +642,9 @@ async function main(): Promise<void> {
   // and a profile for its model, because the classifier is currently only built inside this
   // branch — see the sensitivity_rules guard below for why it can't be built earlier.
   let sensitivityClassifier: SensitivityClassifier | undefined;
-  const embedding = resolveEmbedding(config, yamlConfig.embedding?.profiles);
+  // The schema gate (ADR-051): a width or model the stored vectors do not match, or an
+  // unfinished re-embed, keeps the knowledge graph off until a person runs the command.
+  const embedding = await resolveKnowledgeGraphEmbedding(pool, config, yamlConfig.embedding?.profiles, logger);
   if (embedding.ok) {
     // Sensitivity classifier — built from the already-merged config (default.yaml +
     // local.yaml, see loadYamlConfig()) so operator overrides in local.yaml actually
@@ -665,14 +674,21 @@ async function main(): Promise<void> {
     entityMemory = new EntityMemory(kgStore, validator, embeddingService, logger, sensitivityClassifier);
     logger.info(
       {
-        embeddingBaseUrl: embedding.endpoint.baseUrl,
+        embeddingBaseUrl: redactUrlUserinfo(embedding.endpoint.baseUrl),
         embeddingModel: embedding.endpoint.model,
         embeddingDimensions: embedding.profile.dimensions,
       },
       'Entity memory initialized with knowledge graph',
     );
+  } else if (embedding.gate === 'config') {
+    logger.warn(`${embedding.message} Entity memory is disabled (knowledge graph unavailable).`);
+  } else if (embedding.err) {
+    logger.error({ err: embedding.err }, `${embedding.message} Entity memory is disabled (knowledge graph unavailable).`);
   } else {
-    logger.warn(`${describeEmbeddingUnavailable(embedding)} — entity memory disabled (knowledge graph unavailable)`);
+    logger.warn(
+      { embeddingSchema: embedding.state },
+      `${embedding.message} Until then entity memory is disabled (knowledge graph unavailable), and the sensitivity classifier and the setup wizard are off with it.`,
+    );
   }
 
   // Bullpen service — Tier 2 inter-agent discussion. Always initialized (no
@@ -3367,6 +3383,12 @@ async function main(): Promise<void> {
       } catch (err) {
         logger.error({ err }, 'Error shutting down temp file store during shutdown');
       }
+    }
+    // The lock's client is checked out, and pool.end() waits for every checked-out client.
+    try {
+      await releaseInstanceLock();
+    } catch (err) {
+      logger.error({ err }, 'Error releasing the instance lock during shutdown');
     }
     try {
       await pool.end();
