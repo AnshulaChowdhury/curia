@@ -11,6 +11,13 @@ import type { EventBus } from '../../../../../src/bus/bus.js';
 import type { EventRouter } from '../../../../../src/channels/http/event-router.js';
 import type { Pool } from 'pg';
 import type { Logger } from '../../../../../src/logger.js';
+import type { NodeMergeApi } from '../../../../../src/kg-merge/service.js';
+import {
+  InvalidResolutionError,
+  MergeBlockedError,
+  NodeNotFoundError,
+  StalePreviewError,
+} from '../../../../../src/kg-merge/errors.js';
 
 const BOOTSTRAP = 'test-bootstrap-secret';
 
@@ -583,5 +590,235 @@ describe('POST /api/kg/contacts/merge — merge lookalikes (#1514)', () => {
     expect(res.json().dryRun).toBe(false);
     expect(res.json().mergedAt).toBe('2024-06-01T00:00:00.000Z');
     expect(mergeContacts).toHaveBeenCalledWith(PRIMARY, SECONDARY, false);
+  });
+});
+
+// ── Node merge routes (#2233) ────────────────────────────────────────────────
+
+const SURVIVOR = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const ABSORBED = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+
+function fakeMergeService(overrides: Partial<NodeMergeApi> = {}): NodeMergeApi {
+  return {
+    preview: vi.fn().mockResolvedValue({ dryRun: true, planToken: 'tok' }),
+    apply: vi.fn().mockResolvedValue({ dryRun: false, survivorId: SURVIVOR, absorbedId: ABSORBED }),
+    candidates: vi.fn().mockResolvedValue([]),
+    ...overrides,
+  } as NodeMergeApi;
+}
+
+async function buildWithMerge(
+  mergeService: NodeMergeApi | undefined,
+  pool: Pool = makeFakePool(),
+  contacts: ContactService = fakeContactService({
+    findContactBySystemRole: vi.fn().mockResolvedValue({ ...BASE_CONTACT, systemRole: 'principal' }),
+  }),
+): Promise<FastifyInstance> {
+  const app = Fastify();
+  await app.register(knowledgeGraphRoutes, {
+    pool,
+    logger: stubLogger,
+    webAppBootstrapSecret: BOOTSTRAP,
+    secureCookies: false,
+    bus: stubBus,
+    eventRouter: stubEventRouter,
+    contactService: contacts,
+    sessions: new Map(),
+    nodeMergeService: mergeService,
+  });
+  return app;
+}
+
+function postMerge(app: FastifyInstance, body: Record<string, unknown>, headers: Record<string, string> = auth) {
+  return app.inject({
+    method: 'POST',
+    url: '/api/kg/nodes/merge',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+describe('POST /api/kg/nodes/merge (#2233)', () => {
+  let app: FastifyInstance;
+  afterEach(async () => {
+    await app?.close();
+  });
+
+  it('requires authentication', async () => {
+    const svc = fakeMergeService();
+    app = await buildWithMerge(svc);
+    const res = await postMerge(app, { survivorId: SURVIVOR, absorbedId: ABSORBED }, {});
+    expect(res.statusCode).toBe(401);
+    expect(svc.preview).not.toHaveBeenCalled();
+  });
+
+  it('defaults to a dry-run preview', async () => {
+    const svc = fakeMergeService();
+    app = await buildWithMerge(svc);
+    const res = await postMerge(app, { survivorId: SURVIVOR, absorbedId: ABSORBED });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ dryRun: true, planToken: 'tok' });
+    expect(svc.preview).toHaveBeenCalledWith(SURVIVOR, ABSORBED);
+    expect(svc.apply).not.toHaveBeenCalled();
+  });
+
+  it('applies with dryRun false, passing parsed resolutions and the console originator', async () => {
+    const svc = fakeMergeService();
+    app = await buildWithMerge(svc);
+    const res = await postMerge(app, {
+      survivorId: SURVIVOR,
+      absorbedId: ABSORBED,
+      dryRun: false,
+      planToken: 'tok',
+      resolutions: { label: 'absorbed', acknowledgements: ['principal_identity_transfer'] },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(svc.apply).toHaveBeenCalledWith(expect.objectContaining({
+      survivorId: SURVIVOR,
+      absorbedId: ABSORBED,
+      planToken: 'tok',
+      resolutions: { label: 'absorbed', acknowledgements: ['principal_identity_transfer'] },
+      actor: expect.objectContaining({ contactId: BASE_CONTACT.id, systemRole: 'principal', channel: 'console' }),
+    }));
+  });
+
+  it.each([
+    [{ survivorId: 'nope', absorbedId: ABSORBED }],
+    [{ survivorId: SURVIVOR, absorbedId: SURVIVOR }],
+    [{ survivorId: SURVIVOR, absorbedId: ABSORBED, dryRun: 'false' }],
+    [{ survivorId: SURVIVOR, absorbedId: ABSORBED, dryRun: false }],
+    [{ survivorId: SURVIVOR, absorbedId: ABSORBED, dryRun: false, planToken: 'tok', resolutions: { label: 'x' } }],
+  ])('rejects a malformed request with 400 invalid_request (%j)', async (body) => {
+    const svc = fakeMergeService();
+    app = await buildWithMerge(svc);
+    const res = await postMerge(app, body);
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe('invalid_request');
+    expect(svc.apply).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [new InvalidResolutionError('ack_required', 'ack'), 400, 'ack_required'],
+    [new InvalidResolutionError('unknown_resolution', 'unknown'), 400, 'unknown_resolution'],
+    [new NodeNotFoundError(ABSORBED), 404, 'node_not_found'],
+    [new StalePreviewError(), 409, 'stale_preview'],
+    [new MergeBlockedError([{ code: 'agent_node', message: 'no' }]), 422, 'blocked'],
+  ])('maps %s to its status and code', async (err, status, code) => {
+    const svc = fakeMergeService({ apply: vi.fn().mockRejectedValue(err) });
+    app = await buildWithMerge(svc);
+    const res = await postMerge(app, { survivorId: SURVIVOR, absorbedId: ABSORBED, dryRun: false, planToken: 'tok' });
+    expect(res.statusCode).toBe(status);
+    expect(res.json().code).toBe(code);
+    if (status === 422) expect(res.json().blockers).toEqual([{ code: 'agent_node', message: 'no' }]);
+  });
+
+  it('maps a missing node on preview to 404 and an unexpected failure to 500', async () => {
+    app = await buildWithMerge(fakeMergeService({ preview: vi.fn().mockRejectedValue(new NodeNotFoundError(SURVIVOR)) }));
+    const notFound = await postMerge(app, { survivorId: SURVIVOR, absorbedId: ABSORBED });
+    expect(notFound.statusCode).toBe(404);
+    expect(notFound.json().code).toBe('node_not_found');
+    await app.close();
+
+    app = await buildWithMerge(fakeMergeService({ preview: vi.fn().mockRejectedValue(new Error('db down')) }));
+    const boom = await postMerge(app, { survivorId: SURVIVOR, absorbedId: ABSORBED });
+    expect(boom.statusCode).toBe(500);
+    expect(boom.json().error).not.toContain('db down');
+  });
+
+  it('answers 503 when no merge service is wired', async () => {
+    app = await buildWithMerge(undefined);
+    const res = await postMerge(app, { survivorId: SURVIVOR, absorbedId: ABSORBED });
+    expect(res.statusCode).toBe(503);
+  });
+});
+
+describe('GET /api/kg/nodes/:id/merge-candidates (#2233)', () => {
+  let app: FastifyInstance;
+  afterEach(async () => {
+    await app?.close();
+  });
+
+  it('requires authentication', async () => {
+    app = await buildWithMerge(fakeMergeService());
+    const res = await app.inject({ method: 'GET', url: `/api/kg/nodes/${SURVIVOR}/merge-candidates` });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('defaults the limit to 8, caps it at 20, and wraps the list', async () => {
+    const candidates = vi.fn().mockResolvedValue([{ node: { id: ABSORBED }, score: 1, reasons: ['same_label'] }]);
+    app = await buildWithMerge(fakeMergeService({ candidates }));
+    const res = await app.inject({ method: 'GET', url: `/api/kg/nodes/${SURVIVOR}/merge-candidates`, headers: auth });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ candidates: [{ node: { id: ABSORBED }, score: 1, reasons: ['same_label'] }] });
+    expect(candidates).toHaveBeenLastCalledWith(SURVIVOR, 8);
+    await app.inject({ method: 'GET', url: `/api/kg/nodes/${SURVIVOR}/merge-candidates?limit=500`, headers: auth });
+    expect(candidates).toHaveBeenLastCalledWith(SURVIVOR, 20);
+  });
+
+  it('rejects a malformed id with 400 and maps a missing node to 404', async () => {
+    app = await buildWithMerge(fakeMergeService({ candidates: vi.fn().mockRejectedValue(new NodeNotFoundError(SURVIVOR)) }));
+    const bad = await app.inject({ method: 'GET', url: '/api/kg/nodes/nope/merge-candidates', headers: auth });
+    expect(bad.statusCode).toBe(400);
+    const missing = await app.inject({ method: 'GET', url: `/api/kg/nodes/${SURVIVOR}/merge-candidates`, headers: auth });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json().code).toBe('node_not_found');
+  });
+});
+
+describe('GET /api/kg/nodes and /api/kg/graph — merge-aware (#2233)', () => {
+  let app: FastifyInstance;
+  afterEach(async () => {
+    await app?.close();
+  });
+
+  const nodeRow = {
+    id: SURVIVOR,
+    type: 'person',
+    label: 'Jane',
+    properties: {},
+    confidence: 0.7,
+    decay_class: 'slow_decay',
+    source: 'test',
+    created_at: '2026-01-01T00:00:00.000Z',
+    last_confirmed_at: '2026-01-01T00:00:00.000Z',
+    sensitivity: 'internal',
+  };
+
+  it('excludes archived nodes and returns aliases and identitySource', async () => {
+    const pool = makeFakePool();
+    vi.mocked(pool.query).mockResolvedValueOnce({
+      rows: [{ ...nodeRow, aliases: ['jd'], identity_source: 'contact' }],
+      rowCount: 1,
+    } as never);
+    app = await buildWithMerge(fakeMergeService(), pool);
+    const res = await app.inject({ method: 'GET', url: '/api/kg/nodes?query=jane', headers: auth });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().nodes[0]).toMatchObject({ aliases: ['jd'], identitySource: 'contact' });
+    const sql = String(vi.mocked(pool.query).mock.calls[0]![0]);
+    expect(sql).toMatch(/archived_at IS NULL/);
+  });
+
+  it('returns 404 node_merged with mergedInto for a merged-away node', async () => {
+    const pool = makeFakePool();
+    vi.mocked(pool.query).mockResolvedValueOnce({
+      rows: [{ ...nodeRow, id: ABSORBED, archived_at: '2026-10-21T00:00:00.000Z', properties: { merged_into: SURVIVOR } }],
+      rowCount: 1,
+    } as never);
+    app = await buildWithMerge(fakeMergeService(), pool);
+    const res = await app.inject({ method: 'GET', url: `/api/kg/graph?node_id=${ABSORBED}`, headers: auth });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ code: 'node_merged', mergedInto: SURVIVOR });
+  });
+
+  it('still draws an archived node that was not merged', async () => {
+    const pool = makeFakePool();
+    vi.mocked(pool.query)
+      .mockResolvedValueOnce({ rows: [{ ...nodeRow, archived_at: '2026-10-21T00:00:00.000Z' }], rowCount: 1 } as never)
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never);
+    app = await buildWithMerge(fakeMergeService(), pool);
+    const res = await app.inject({ method: 'GET', url: `/api/kg/graph?node_id=${SURVIVOR}`, headers: auth });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().nodes).toHaveLength(1);
+    expect(res.json().nodes[0].archived_at).toBeUndefined();
   });
 });

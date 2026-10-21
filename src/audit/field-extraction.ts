@@ -302,6 +302,22 @@ const EXTRACTORS: Readonly<Record<string, Extractor>> = {
     initiator_id: str(p, 'source', fail),
   }),
 
+  // Console node merge (#2233). The survivor is the target — it is the node that still
+  // exists; the absorbed id stays queryable at payload->>'absorbedId'. The principal is
+  // the only console user, so the initiator is the human, identified by contact id when
+  // the console originator resolved.
+  'kg.nodes_merged': (p, fail) => ({
+    action: 'merge',
+    outcome: 'success',
+    target_type: 'kg_node',
+    target_id: str(p, 'survivorId', fail),
+    initiator_type: 'human',
+    initiator_id: typeof p.actor === 'object' && p.actor !== null
+      && typeof (p.actor as Record<string, unknown>).contactId === 'string'
+      ? (p.actor as Record<string, unknown>).contactId as string
+      : 'console',
+  }),
+
   // Spec lists message.held; the event type is reserved but not yet emitted.
   // Keep the mapping ready so structured columns populate the day it ships.
   'message.held': (p, fail) => ({

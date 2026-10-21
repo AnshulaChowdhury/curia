@@ -72,6 +72,7 @@ import type { ToolDiscovery } from './skills/loader.js';
 import { loadMcpServers, loadSkillsConfig, registerMcpProjectedSkills, type McpServerLoadStatus } from './skills/mcp-loader.js';
 import type { McpSession } from './skills/mcp-client.js';
 import { ContactService } from './contacts/contact-service.js';
+import { NodeMergeService } from './kg-merge/service.js';
 import type { ChannelIdentity, Contact, PrincipalEmailRef, PrincipalPrimaryEmailRef } from './contacts/types.js';
 import { ConfidencePipeline } from './contacts/confidence-pipeline.js';
 import { DedupService } from './contacts/dedup-service.js';
@@ -642,6 +643,9 @@ async function main(): Promise<void> {
   // and a profile for its model, because the classifier is currently only built inside this
   // branch — see the sensitivity_rules guard below for why it can't be built earlier.
   let sensitivityClassifier: SensitivityClassifier | undefined;
+  // Hoisted for the KG node merge (#2233), which re-embeds a renamed survivor. Same
+  // availability as entityMemory; without it the merge keeps the old embedding.
+  let embeddingService: EmbeddingService | undefined;
   // The schema gate (ADR-051): a width or model the stored vectors do not match, or an
   // unfinished re-embed, keeps the knowledge graph off until a person runs the command.
   const embedding = await resolveKnowledgeGraphEmbedding(pool, config, yamlConfig.embedding?.profiles, logger);
@@ -662,7 +666,7 @@ async function main(): Promise<void> {
     sensitivityClassifier = SensitivityClassifier.fromRules(yamlConfig.sensitivity_rules);
     logger.info({ ruleCount: yamlConfig.sensitivity_rules.length }, 'Sensitivity classifier loaded');
 
-    const embeddingService = EmbeddingService.createWithEndpoint(
+    embeddingService = EmbeddingService.createWithEndpoint(
       embedding.endpoint,
       embedding.profile,
       logger,
@@ -768,6 +772,16 @@ async function main(): Promise<void> {
 
   // Now that contactService exists, wire up the confidence pipeline.
   confidencePipeline = contactService ? new ConfidencePipeline(contactService, logger) : undefined;
+
+  // KG node merge for the console (#2233). Writes nodes, facts, edges and contacts in one
+  // transaction; publishes kg.nodes_merged through the system layer after commit.
+  const nodeMergeService = new NodeMergeService({
+    pool,
+    contactService,
+    bus,
+    logger,
+    embedder: embeddingService,
+  });
 
   // Authorization config — load role defaults, permissions, and channel trust.
   // These YAML files define the deterministic permission model.
@@ -3212,6 +3226,7 @@ async function main(): Promise<void> {
     identityService: officeIdentityService,
     executiveProfileService,
     contactService,
+    nodeMergeService,
     autonomyService,
     registryService,
     channelRegistryService,

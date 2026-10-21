@@ -12,6 +12,7 @@ import {
   createOutboundNoReply,
   createSystemRestart,
   createDocumentConsoleAction,
+  createKgNodesMerged,
   type BusEvent,
 } from '../../../src/bus/events.js';
 
@@ -184,6 +185,26 @@ describe('Event Types', () => {
     expect(event.type).toBe('document.console_action');
     expect(event.sourceLayer).toBe('system');
     expect(event.payload.action).toBe('update');
+  });
+
+  it('creates a kg.nodes_merged event (#2233)', () => {
+    const event = createKgNodesMerged({
+      survivorId: 's',
+      absorbedId: 'a',
+      survivor: { id: 's', type: 'organization', label: 'Acme' },
+      absorbed: { id: 'a', type: 'event', label: 'Acme Summit' },
+      resultLabel: 'Acme',
+      crossType: true,
+      contactMerge: null,
+      summary: { factsMoved: 1, factsCollapsed: 0, edgesMoved: 2, edgesCollapsed: 0, edgesDropped: 0, conflictsResolved: 0, contactReferencesRepointed: 0 },
+      resolutions: { label: 'survivor', properties: {}, facts: {}, nearDuplicateFacts: {}, contactFields: {}, authOverrides: {}, acknowledgements: [] },
+      actor: null,
+      mergedAt: '2026-10-21T00:00:00.000Z',
+    });
+    expect(event.type).toBe('kg.nodes_merged');
+    expect(event.sourceLayer).toBe('system');
+    expect(event.payload.crossType).toBe(true);
+    expect(event.id).toBeTruthy();
   });
 
   it('type narrows via discriminated union', () => {

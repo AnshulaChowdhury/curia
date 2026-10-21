@@ -25,6 +25,15 @@ import { fetchChatHistoryPage } from '../chat-history-page.js';
 import { AGENT_NAME_RULE, isAgentName } from '../../../agents/agent-name.js';
 import { isUuid } from '../../../util/uuid.js';
 import { validateTaskErrorBudget } from '../../../tasks/task-error-budget.js';
+import type { NodeMergeApi } from '../../../kg-merge/service.js';
+import { DEFAULT_CANDIDATES, MAX_CANDIDATES } from '../../../kg-merge/service.js';
+import { parseResolutions } from '../../../kg-merge/resolve.js';
+import {
+  InvalidResolutionError,
+  MergeBlockedError,
+  NodeNotFoundError,
+  StalePreviewError,
+} from '../../../kg-merge/errors.js';
 
 export interface KnowledgeGraphRouteOptions {
   pool: Pool;
@@ -43,6 +52,10 @@ export interface KnowledgeGraphRouteOptions {
   // Shared session store — created in HttpAdapter, passed to both KG and identity routes
   // so both can accept the curia_session cookie for authentication.
   sessions: SessionStore;
+  // Node merge (#2233): POST /api/kg/nodes/merge and GET /api/kg/nodes/:id/merge-candidates.
+  // Optional so callers that never mount the merge (tests) need not build one; when absent
+  // those two routes answer 503.
+  nodeMergeService?: NodeMergeApi;
 }
 
 // Channel identifier used when the KG web app dispatches messages to the agent layer.
@@ -65,6 +78,12 @@ interface KgNodeRow {
   created_at: string;
   last_confirmed_at: string;
   sensitivity: string;
+}
+
+/** GET /api/kg/nodes also returns the alias list and identity tier (#2233). */
+interface KgNodeListRow extends KgNodeRow {
+  aliases: string[] | null;
+  identity_source: string;
 }
 
 interface KgEdgeRow {
@@ -90,8 +109,7 @@ export async function knowledgeGraphRoutes(
   app: FastifyInstance,
   options: KnowledgeGraphRouteOptions,
 ): Promise<void> {
-  const { pool, logger, webAppBootstrapSecret, secureCookies, bus, eventRouter, contactService, sessions } = options;
-  // sessions is managed by HttpAdapter — no local Map creation needed here.
+  const { pool, logger, webAppBootstrapSecret, secureCookies, bus, eventRouter, contactService, sessions, nodeMergeService } = options;
   // sessions is managed by HttpAdapter — no local Map creation needed here.
 
   // POST /auth — exchanges the bootstrap secret for an HttpOnly session cookie.
@@ -161,10 +179,14 @@ export async function knowledgeGraphRoutes(
     const searchQuery = query.query?.trim();
     const typeFilter = query.type?.trim();
 
-    const result = await pool.query<KgNodeRow>(
-      `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity
+    // Archived nodes (decayed, or tombstones of a merge) are excluded (#2233): the list
+    // is what the console offers to browse and to merge with.
+    const result = await pool.query<KgNodeListRow>(
+      `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity,
+              aliases, identity_source
        FROM kg_nodes
-       WHERE ($1::text IS NULL OR type = $1)
+       WHERE archived_at IS NULL
+         AND ($1::text IS NULL OR type = $1)
          AND (
            $2::text IS NULL
            OR label ILIKE '%' || $2 || '%'
@@ -187,6 +209,8 @@ export async function knowledgeGraphRoutes(
         createdAt: row.created_at,
         lastConfirmedAt: row.last_confirmed_at,
         sensitivity: row.sensitivity,
+        aliases: row.aliases ?? [],
+        identitySource: row.identity_source === 'contact' ? 'contact' : 'label',
       })),
     });
   });
@@ -211,7 +235,7 @@ export async function knowledgeGraphRoutes(
     }
 
     const nodeResult = nodeId
-      ? await pool.query<KgNodeRow>(
+      ? await pool.query<KgNodeRow & { archived_at?: string | null }>(
           // visited tracks the set of node IDs already expanded, preventing the same
           // node from being re-expanded when reached at a different depth (which UNION
           // alone can't prevent because depth is part of each row's identity).
@@ -229,7 +253,8 @@ export async function knowledgeGraphRoutes(
              WHERE t.depth < $2
                AND NOT (CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END = ANY(t.visited))
            )
-           SELECT DISTINCT n.id, n.type, n.label, n.properties, n.confidence, n.decay_class, n.source, n.created_at, n.last_confirmed_at, n.sensitivity
+           SELECT DISTINCT n.id, n.type, n.label, n.properties, n.confidence, n.decay_class, n.source, n.created_at, n.last_confirmed_at, n.sensitivity,
+                  n.archived_at
            FROM traversal t
            JOIN kg_nodes n ON n.id = t.id
            ORDER BY n.last_confirmed_at DESC
@@ -254,6 +279,23 @@ export async function knowledgeGraphRoutes(
         return reply.status(404).send({ error: `Node not found: ${nodeId}` });
       }
       return reply.send({ nodes: [], edges: [] });
+    }
+
+    // A deep link to a node that was merged away (#2233): send the console to the
+    // survivor instead of drawing the tombstone. An archived node without merged_into
+    // (decayed) keeps the behaviour above — it is still drawn.
+    if (nodeId) {
+      const focal = nodeResult.rows.find((row) => row.id === nodeId) as
+        (KgNodeRow & { archived_at?: string | null }) | undefined;
+      const mergedInto = focal?.properties?.merged_into;
+      if (focal?.archived_at && typeof mergedInto === 'string' && mergedInto.length > 0) {
+        logger.debug({ nodeId, mergedInto }, 'kg: graph node was merged away');
+        return reply.status(404).send({
+          error: `Node ${nodeId} was merged into ${mergedInto}.`,
+          code: 'node_merged',
+          mergedInto,
+        });
+      }
     }
 
     const nodeIds = nodeResult.rows.map((row) => row.id);
@@ -294,6 +336,94 @@ export async function knowledgeGraphRoutes(
         lastConfirmedAt: row.last_confirmed_at,
       })),
     });
+  });
+
+  // ── Node merge (#2233, docs/wip/2026-10-21-kg-node-merge-design.md §8) ──────────
+
+  /** Map a merge failure to its HTTP response; null when it is not a merge error. */
+  function mergeErrorResponse(err: unknown): { status: number; body: Record<string, unknown> } | null {
+    if (err instanceof InvalidResolutionError) return { status: 400, body: { error: err.message, code: err.code } };
+    if (err instanceof NodeNotFoundError) return { status: 404, body: { error: err.message, code: err.code } };
+    if (err instanceof StalePreviewError) return { status: 409, body: { error: err.message, code: err.code } };
+    if (err instanceof MergeBlockedError) {
+      return { status: 422, body: { error: err.message, code: err.code, blockers: err.blockers } };
+    }
+    return null;
+  }
+
+  // POST /api/kg/nodes/merge — preview (dryRun, the default) or apply a node merge.
+  app.post('/api/kg/nodes/merge', KG_RATE, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+    if (!nodeMergeService) {
+      return reply.status(503).send({ error: 'Node merge is not available.', code: 'unavailable' });
+    }
+
+    const body = (request.body ?? {}) as {
+      survivorId?: unknown;
+      absorbedId?: unknown;
+      dryRun?: unknown;
+      planToken?: unknown;
+      resolutions?: unknown;
+    };
+    const invalid = (error: string) => reply.status(400).send({ error, code: 'invalid_request' });
+    const survivorId = typeof body.survivorId === 'string' ? body.survivorId.trim() : '';
+    const absorbedId = typeof body.absorbedId === 'string' ? body.absorbedId.trim() : '';
+    if (!isUuid(survivorId) || !isUuid(absorbedId)) {
+      return invalid('survivorId and absorbedId must be valid UUIDs.');
+    }
+    if (survivorId.toLowerCase() === absorbedId.toLowerCase()) {
+      return invalid('survivorId and absorbedId must differ.');
+    }
+    if (body.dryRun !== undefined && typeof body.dryRun !== 'boolean') {
+      return invalid('dryRun must be a boolean.');
+    }
+    const dryRun = body.dryRun !== false;
+
+    try {
+      if (dryRun) {
+        return reply.send(await nodeMergeService.preview(survivorId, absorbedId));
+      }
+      if (typeof body.planToken !== 'string' || body.planToken.trim().length === 0) {
+        return invalid('planToken is required when dryRun is false. Preview the merge first.');
+      }
+      const resolutions = parseResolutions(body.resolutions);
+      const actor = await resolveConsoleOriginator(contactService, logger);
+      const result = await nodeMergeService.apply({
+        survivorId,
+        absorbedId,
+        planToken: body.planToken.trim(),
+        resolutions,
+        actor,
+      });
+      return reply.send(result);
+    } catch (err) {
+      const mapped = mergeErrorResponse(err);
+      if (mapped) return reply.status(mapped.status).send(mapped.body);
+      logger.error({ err, survivorId, absorbedId, dryRun }, 'POST /api/kg/nodes/merge failed');
+      return reply.status(500).send({ error: 'Failed to merge nodes.' });
+    }
+  });
+
+  // GET /api/kg/nodes/:id/merge-candidates?limit=8 — likely duplicates of any type.
+  app.get('/api/kg/nodes/:id/merge-candidates', KG_RATE, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+    if (!nodeMergeService) {
+      return reply.status(503).send({ error: 'Node merge is not available.', code: 'unavailable' });
+    }
+    const { id } = request.params as { id: string };
+    if (!isUuid(id)) {
+      return reply.status(400).send({ error: 'Invalid node id: must be a valid UUID.', code: 'invalid_request' });
+    }
+    const limit = normalizeLimit((request.query as { limit?: string }).limit, DEFAULT_CANDIDATES, MAX_CANDIDATES);
+    try {
+      const candidates = await nodeMergeService.candidates(id, limit);
+      return reply.send({ candidates });
+    } catch (err) {
+      const mapped = mergeErrorResponse(err);
+      if (mapped) return reply.status(mapped.status).send(mapped.body);
+      logger.error({ err, nodeId: id }, 'GET /api/kg/nodes/:id/merge-candidates failed');
+      return reply.status(500).send({ error: 'Failed to load merge candidates.' });
+    }
   });
 
   // tier/kind selectable via the API — 'principal' and kind∈{principal,agent} are structural-only.

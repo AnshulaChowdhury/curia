@@ -71,6 +71,25 @@ describe('extractStructuredFields', () => {
     });
   });
 
+  it('maps kg.nodes_merged to the surviving node, initiated by the principal (#2233)', () => {
+    expect(extractStructuredFields(
+      'kg.nodes_merged',
+      { survivorId: 'node-s', absorbedId: 'node-a', actor: { contactId: 'principal-1', channel: 'console' } },
+      'evt-kg',
+      logger,
+    )).toEqual({
+      action: 'merge',
+      outcome: 'success',
+      target_type: 'kg_node',
+      target_id: 'node-s',
+      initiator_type: 'human',
+      initiator_id: 'principal-1',
+    });
+    // No resolved principal: the console itself is the initiator.
+    expect(extractStructuredFields('kg.nodes_merged', { survivorId: 'node-s', actor: null }, 'evt-kg2', logger).initiator_id)
+      .toBe('console');
+  });
+
   it('writes EXTRACTION_FAILED sentinel and warns on missing mapped fields', () => {
     const warn = vi.spyOn(logger, 'warn');
     const fields = extractStructuredFields(

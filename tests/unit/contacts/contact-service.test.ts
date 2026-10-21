@@ -1561,7 +1561,10 @@ describe('ContactService', () => {
       reattachIdentities(from: string, to: string, client?: unknown): Promise<void>;
       reattachAuthOverrides(from: string, to: string, client?: unknown): Promise<void>;
       reattachDedupExclusions(from: string, to: string, client?: unknown): Promise<unknown>;
-      updateContact(contact: Contact, client?: unknown): Promise<void>;
+      reattachContactReferences(from: string, to: string, client?: unknown): Promise<unknown>;
+      // The fold writes the surviving row through writeMergedContact (#2233), which also
+      // carries the scoring counters updateContact leaves alone.
+      writeMergedContact(id: string, row: Partial<Contact>, client?: unknown): Promise<void>;
       deleteContact(id: string, client?: unknown): Promise<void>;
     }
 
@@ -1582,7 +1585,8 @@ describe('ContactService', () => {
       const reattachIdentities = vi.spyOn(backend, 'reattachIdentities');
       const reattachAuthOverrides = vi.spyOn(backend, 'reattachAuthOverrides');
       const reattachDedupExclusions = vi.spyOn(backend, 'reattachDedupExclusions');
-      const updateContact = vi.spyOn(backend, 'updateContact');
+      const reattachContactReferences = vi.spyOn(backend, 'reattachContactReferences');
+      const writeMergedContact = vi.spyOn(backend, 'writeMergedContact');
       const deleteContact = vi.spyOn(backend, 'deleteContact');
 
       await service.mergeContacts(primary.id, secondary.id, false);
@@ -1591,7 +1595,8 @@ describe('ContactService', () => {
       expect(reattachIdentities).toHaveBeenCalledWith(secondary.id, primary.id, client);
       expect(reattachAuthOverrides).toHaveBeenCalledWith(secondary.id, primary.id, client);
       expect(reattachDedupExclusions).toHaveBeenCalledWith(secondary.id, primary.id, client);
-      expect(updateContact).toHaveBeenCalledWith(expect.objectContaining({ id: primary.id }), client);
+      expect(reattachContactReferences).toHaveBeenCalledWith(secondary.id, primary.id, client);
+      expect(writeMergedContact).toHaveBeenCalledWith(primary.id, expect.objectContaining({ displayName: expect.any(String) }), client);
       expect(deleteContact).toHaveBeenCalledWith(secondary.id, client);
     });
 
@@ -1621,7 +1626,7 @@ describe('ContactService', () => {
       const secondary = await svc.createContact({ displayName: 'Throw Secondary', source: 'test' });
 
       const backend = backendOf(svc);
-      vi.spyOn(backend, 'updateContact').mockRejectedValue(new Error('forced update failure'));
+      vi.spyOn(backend, 'writeMergedContact').mockRejectedValue(new Error('forced update failure'));
       const deleteContact = vi.spyOn(backend, 'deleteContact');
 
       await expect(svc.mergeContacts(primary.id, secondary.id, false))
