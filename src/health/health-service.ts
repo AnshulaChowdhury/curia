@@ -4,15 +4,13 @@
 //   1. getStatus() — run all liveness probes and return the three-state response.
 //      Called by GET /api/health. Runs every request; no cached ok state.
 //   2. runCanaries() — validate external credentials and ping heartbeat URLs.
-//      Called by the daily scheduler job.
-//   3. start() — subscribe to bus events to maintain LlmOutcomeTracker;
-//      register the daily canary job with SchedulerService.
+//      Called by CanarySchedule at health.canary_schedule (#2229).
+//   3. start() — subscribe to bus events to maintain LlmOutcomeTracker.
 
 import type { Pool } from 'pg';
 import type { EventBus } from '../bus/bus.js';
 import type { Logger } from '../logger.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
-import type { SchedulerService } from '../scheduler/scheduler-service.js';
 import type { ModelRoutingConfig } from '../agents/llm/model-router.js';
 import type { McpSession } from '../skills/mcp-client.js';
 import type { McpServerLoadStatus } from '../skills/mcp-loader.js';
@@ -36,8 +34,6 @@ export interface HealthServiceDeps {
   logger: Logger;
   /** Only lastTickAt is accessed — avoids a hard import of the full Scheduler class. */
   scheduler: Pick<Scheduler, 'lastTickAt'>;
-  /** Optional — only needed for canary job registration. Absent in test environments. */
-  schedulerService?: SchedulerService;
   emailAdapter?: EmailAdapterHealth;
   /** Optional Nylas client for the daily Nylas email-grant canary. */
   nylasClient?: NylasClient;
@@ -98,12 +94,12 @@ export class HealthService {
   constructor(private readonly deps: HealthServiceDeps) {}
 
   /**
-   * Subscribe to bus events and register the daily canary job.
-   * Call once at bootstrap — idempotent (subscribing twice would double-count events
-   * but is otherwise safe; the job upsert is idempotent by design).
+   * Subscribe to bus events that feed the LLM outcome tracker.
+   * Call once at bootstrap — subscribing twice would double-count events.
+   * The canaries are scheduled separately, by CanarySchedule.
    */
   async start(): Promise<void> {
-    const { bus, logger, config, schedulerService, modelRoutingConfig } = this.deps;
+    const { bus, logger, modelRoutingConfig } = this.deps;
 
     // Build the reverse map: model string → tier key for LLM outcome tracking.
     // This lets bus event handlers look up the tier from the model name in O(1).
@@ -165,45 +161,6 @@ export class HealthService {
         logger.warn({ err }, 'HealthService: unexpected error in tool.result handler');
       }
     });
-
-    // Intercept the scheduler-fired health-canary task. The scheduler fires an
-    // agent.task event targeting agentId 'health-service' — but no AgentRuntime
-    // handles that agent. We subscribe at the system layer to run the canary directly.
-    bus.subscribe('agent.task', 'system', (event) => {
-      try {
-        // Cast through unknown — only accessing known fields after the guard below
-        const e = event as unknown as { payload: { agentId?: string } };
-        if (e.payload.agentId !== 'health-service') return;
-        void this.runCanaries().catch(err =>
-          logger.error({ err }, 'Health canary run failed'),
-        );
-      } catch (err) {
-        logger.warn({ err }, 'HealthService: unexpected error in agent.task handler');
-      }
-    });
-
-    // Register the daily canary job if a SchedulerService is available.
-    // Absent in test environments — graceful skip prevents startup failures in CI.
-    if (!schedulerService) {
-      logger.debug('HealthService: no schedulerService provided — canary job not registered');
-      return;
-    }
-
-    try {
-      await schedulerService.upsertDeclarativeJob(
-        'health-service',   // sourceAgentId — identifies this code as the registrant
-        'health-service',   // agentId — the "agent" that the scheduler fires the job for
-        {
-          cron: config.canarySchedule,
-          task: 'health-canary',
-          expectedDurationSeconds: 60,
-        },
-      );
-      logger.info({ schedule: config.canarySchedule }, 'Health canary job registered');
-    } catch (err) {
-      // Non-fatal: canaries won't run on schedule, but liveness checks still work.
-      logger.warn({ err }, 'Failed to register health canary job — canaries will not run on schedule');
-    }
   }
 
   /**
@@ -267,7 +224,7 @@ export class HealthService {
 
   /**
    * Run daily credential canaries and ping heartbeat URLs on success.
-   * Called by the scheduler job handler when a 'health-canary' task fires.
+   * Called by CanarySchedule at health.canary_schedule.
    */
   async runCanaries(): Promise<CanaryResult[]> {
     const {

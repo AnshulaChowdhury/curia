@@ -87,10 +87,12 @@ Rationale: a dead Signal socket should not page as a full outage when email stil
 
 ## Daily canary job + heartbeat URLs
 
-The canary job runs daily (default 06:00 server time, configurable via `health.canary_schedule` in `config/default.yaml`) and:
+The canary job runs daily (default 06:00, configurable via `health.canary_schedule` in `config/default.yaml`) and:
 
-1. Checks that each enabled credential/dependency is valid
+1. Checks that each enabled credential/dependency is valid, logging one `Health canary result` line per canary
 2. On success, GETs a heartbeat URL — the monitoring service pages on missed pings
+
+The schedule is read in the `TIMEZONE` the scheduler uses. The job runs on its own in-process timer, not as a `scheduled_jobs` row, so it does not appear in the scheduler's job list. An invalid `health.canary_schedule` fails boot. A run that falls while Curia is down is not replayed after restart; the missed heartbeat is how you find out.
 
 To configure, add URLs to the `health.heartbeats` block in `config/default.yaml`:
 

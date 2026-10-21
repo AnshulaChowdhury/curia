@@ -224,6 +224,7 @@ import { McpRegistryRepo } from './registry/mcp-registry-repo.js';
 import { McpRegistryService } from './registry/mcp-registry-service.js';
 import { reconcileMcpRegistry } from './registry/mcp-reconcile.js';
 import { HealthService } from './health/health-service.js';
+import { CanarySchedule } from './health/canary-schedule.js';
 
 async function main(): Promise<void> {
   // Captured at the very start of main() so the wizard's post-setup polling
@@ -2360,7 +2361,6 @@ async function main(): Promise<void> {
     bus,
     logger,
     scheduler,
-    schedulerService,
     emailAdapter: emailAdapters[0],
     nylasClient: primaryNylasClient,
     nylasCalendarClient,
@@ -2397,6 +2397,18 @@ async function main(): Promise<void> {
     googleWorkspaceConfigPath: undefined, // OAuth env vars, no credential file — canary skipped
   });
   await healthService.start();
+
+  // Health canaries on their own wall-clock timer, not a scheduled_jobs row: no agent
+  // owns them, so the scheduler could never fire one (#2229). Same timezone as the
+  // scheduler, so health.canary_schedule reads like every other cron. Throws on an
+  // invalid schedule, which fails boot.
+  const canarySchedule = new CanarySchedule({
+    cron: healthConfig.canarySchedule,
+    timezone: config.timezone,
+    runCanaries: () => healthService.runCanaries(),
+    logger,
+  });
+  canarySchedule.start();
 
   // Approval delivery (#2159) — one pending approval, one channel, chosen by the agent from
   // the principal's standing preferences via deliver-approval. Absent without an outbound
@@ -3291,6 +3303,11 @@ async function main(): Promise<void> {
       } catch (err) {
         logger.error({ err }, 'Error stopping late delegation sweep during shutdown');
       }
+    }
+    try {
+      canarySchedule.stop();
+    } catch (err) {
+      logger.error({ err }, 'Error stopping health canary schedule during shutdown');
     }
     try {
       approvalExpirySweep.stop();
