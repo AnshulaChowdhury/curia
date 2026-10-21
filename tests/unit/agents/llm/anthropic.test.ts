@@ -476,6 +476,58 @@ describe('AnthropicProvider — claude-haiku-5-5 request shape', () => {
   });
 });
 
+describe('AnthropicProvider — claude-sonnet-5-5 and claude-opus-5-5 request shape', () => {
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockStream.mockReset();
+    mockCreate.mockResolvedValue(makeTextResponse());
+  });
+
+  it('sends Sonnet 5.5 between_tools for NO_REASONING on chat and stream', async () => {
+    mockStream.mockReturnValue(makeStream([
+      { type: 'content_block_delta', delta: { type: 'text_delta', text: 'hi' } },
+    ], makeTextResponse()));
+    const provider = new AnthropicProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    const options = { max_tokens: 200, reasoning: NO_REASONING };
+    await provider.chat({ model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'Hello' }], options });
+    await collectStream(provider.stream({ model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'Hello' }], options }));
+
+    for (const params of [mockCreate.mock.calls[0]![0], mockStream.mock.calls[0]![0]]) {
+      expect(params.thinking).toEqual({ type: 'between_tools' });
+      expect(params).not.toHaveProperty('output_config');
+      expect(params.max_tokens).toBe(200);
+    }
+  });
+
+  it('sends Opus 5.5 no thinking key for NO_REASONING, which it cannot honor', async () => {
+    const provider = new AnthropicProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    await provider.chat({ model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'Hello' }], options: { max_tokens: 200, reasoning: NO_REASONING } });
+
+    const params = mockCreate.mock.calls[0]![0];
+    expect(params).not.toHaveProperty('thinking');
+    expect(params).not.toHaveProperty('output_config');
+  });
+
+  it.each(['claude-sonnet-5-5', 'claude-opus-5-5'])('leaves %s at its adaptive default when reasoning is unset, with room to think', async (model) => {
+    const provider = new AnthropicProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    await provider.chat({ model, messages: [{ role: 'user', content: 'Hello' }], options: { temperature: 0 } });
+
+    const params = mockCreate.mock.calls[0]![0];
+    expect(params).not.toHaveProperty('thinking');
+    expect(params).not.toHaveProperty('temperature');
+    expect(params.max_tokens).toBe(THINKING_MAX_TOKENS);
+  });
+
+  it('sends an Opus 5.5 tier effort as adaptive thinking with that effort', async () => {
+    const provider = new AnthropicProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    await provider.chat({ model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'Hello' }], options: { reasoning: { effort: 'high' } } });
+
+    const params = mockCreate.mock.calls[0]![0];
+    expect(params.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
+    expect(params.output_config).toEqual({ effort: 'high' });
+  });
+});
+
 describe('AnthropicProvider — stream', () => {
   beforeEach(() => {
     mockCreate.mockReset();

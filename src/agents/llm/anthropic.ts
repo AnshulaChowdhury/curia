@@ -289,7 +289,7 @@ export class AnthropicProvider implements LLMProvider {
       }
     }
     if (reasoningEffort === 'none') {
-      createParams.thinking = { type: 'disabled' };
+      createParams.thinking = { type: this.modelRegistry.thinkingOffType(model) };
     } else if (reasoningEffort !== undefined) {
       createParams.thinking = { type: 'adaptive', display: 'summarized' };
       createParams.output_config = { effort: reasoningEffort };
