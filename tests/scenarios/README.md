@@ -311,6 +311,7 @@ known_failure: { issue: "#1234", reason: … }   # optional; reported, not gated
 stub_sets: [human-channels]               # optional; `defaults` always applies
 live_search: true                         # optional; web-search runs for real (Tavily credits)
 identity: style-brief-dry                 # optional; run-level office identity, see Style cases
+autonomy: { score: 84, gating: band }     # optional; run-level autonomy, see Run-level fixtures
 seed:
   contacts:                               # → {{contact:<key>}}
     - key: sam
@@ -360,6 +361,7 @@ inbound:
   thread: brief                           # bullpen only
   content: "Yes"                          # every kind but task-wake
   email: { nylas_message_id: …, account: ops, auto_generated: false }   # email inbound only
+  # email: { to: [dana], cc: [curia] }    # optional envelope; see Email envelopes
   task:                                   # task-wake only, in place of content
     id: 5f1c2d3e-…                        #   a fixed UUID the case's task-* stubs match on
     title: Collect comments on the deck
@@ -426,14 +428,41 @@ the calendar instead of the coordinator. Use the date placeholders smoke uses
 | `{{time:next-monday 09:00}}` | 2026-10-12T09:00:00.000-04:00 |
 | `{{weekday:today}}` | Monday |
 | `{{at:now+60m}}` | an hour from now, same format as `time` |
+| `{{date:workday+2}}` | 2026-10-07 (the second Monday-to-Friday day after today) |
 | `{{timezone}}` | America/Toronto |
 
-A day is `today`, `today±N` or `next-<weekday>[+N]`, where `next-<weekday>` is the first
-one strictly after today. They work in `seed`, `inbound`, `tool_stubs` and
+A day is `today`, `today±N`, `next-<weekday>[+N]` or `workday+N`, where `next-<weekday>` is
+the first one strictly after today and `workday+N` the Nth weekday after it (on a Friday,
+`workday+1` is Monday). They work in `seed`, `inbound`, `tool_stubs` and
 `expected_behaviors`, and resolve once per run against that run's clock, which the run
 records (`clock`) so rating uses the same days. A malformed one is a load error. They are
 refused in `description` and `failure_modes`, which reach the judge as written: say
 "next week" there. Past timestamps (a fact's `last_confirmed_at`) can stay absolute.
+
+The judge sees the run's clock (`## When it ran`: weekday, date, time and timezone), so a
+behavior such as "offers times a week or two out" can be judged against the dates in the
+tool calls. Still put what code can check in a `check`: in practice the judge passes a
+window that a hold outside it breaks (`not_called` with `contains: { start:
+"{{date:today+1}}" }` catches that).
+
+### Email envelopes
+
+By default an email inbound's participants are the sender alone, as if Curia were its only
+recipient. `inbound.email.to` and `cc` set the envelope the email adapter would see. Each
+entry is `curia` (Curia's own address, `curia@example.test`), `principal`, a seeded contact
+key, or an address under `example.test`. `curia` must appear exactly once. From them the
+harness builds the adapter's metadata: the participants, the To list as primary
+recipients, and `curiaRole: 'cc'` when `curia` is in `cc`. The Dispatcher then adds the
+`[OWNER CC — …]` preamble and the thread-participants block, and the CC turn guidance
+fires, as in production. The principal CCing Curia on an email to Dana:
+
+```yaml
+inbound:
+  from: principal
+  channel: email
+  content: "Subject: …"
+  email: { nylas_message_id: m-1, to: [dana], cc: [curia] }
+```
 
 After adding a case, run it (`--case`, a few runs) so the CLI records its stub coverage,
 and commit the updated `stub-coverage.json`.
@@ -520,6 +549,35 @@ judge. Only content is `critical`: brevity must never drop a fact. 40a needs a p
 with a Signal identity in the database the run uses. The design, and the baseline the
 later tone & style PRs compare against, are in
 [docs/wip/2026-10-15-tone-and-style-design.md](../../docs/wip/2026-10-15-tone-and-style-design.md#measurement).
+
+## Run-level fixtures: autonomy
+
+`autonomy: { score, gating }` runs a case at that autonomy score, with that gating's band
+descriptions in the prompt (`tier`, or `band` as production's deployment runs, #2159).
+The stack lays it over the database's autonomy config in memory (`FixtureAutonomyService`,
+`src/startup/test-mode-stack.ts`). Nothing is written. Like `identity:`, it is the run's:
+
+- a case with one is never in the release gate (`release_gate: false`);
+- every case in a selection must agree on it;
+- a wider selection leaves fixture cases out and says so.
+
+Without a fixture, the stack reads the database's score and takes gating from
+`autonomy.gating` (so a curia-deploy `--overlay` gets band descriptions). The fixture
+reaches the prompt and the ExecutionLayer's score reads. Stubbed tools still answer before
+Gate A, so a case scores what the model chooses at that score, not production's refusal.
+
+### Principal-involved scheduling (25a–25n)
+
+The principal CCs or forwards Curia on scheduling, a counterpart sends a booking link, or
+someone the principal knows asks Curia for time. The design and the behaviors are in
+[docs/wip/2026-10-21-principal-scheduling-scenarios-design.md](../../docs/wip/2026-10-21-principal-scheduling-scenarios-design.md).
+All run real delegation, on demand. They form three batches, one stack each:
+
+```bash
+pnpm scenarios --tags ps-core  --model …   # autonomy 84 (band): 25a, 25b, 25d, 25e, 25j–25n
+pnpm scenarios --tags ps-ask   --model …   # autonomy 74 (band): 25c
+pnpm scenarios --tags ps-prefs --model …   # autonomy 84 + identity scheduling-prefs: 25f–25i
+```
 
 ## A deployment's own agents
 

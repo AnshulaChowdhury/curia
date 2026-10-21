@@ -23,6 +23,16 @@ describe('resolveDatePlaceholders', () => {
     expect(resolveDatePlaceholders('{{weekday:today+3}}', TZ, NOW)).toBe('Monday');
   });
 
+  it('counts workday+N in Monday-to-Friday days after today', () => {
+    // NOW is a Friday: the next two workdays are Monday and Tuesday.
+    expect(resolveDatePlaceholders('{{date:workday+1}} {{date:workday+2}} {{date:workday+6}}', TZ, NOW))
+      .toBe('2026-10-05 2026-10-06 2026-10-12');
+    // From a Wednesday, the weekend is skipped only once it is reached.
+    expect(resolveDatePlaceholders('{{date:workday+2}} {{date:workday+3}}', TZ, new Date('2026-10-07T14:00:00Z')))
+      .toBe('2026-10-09 2026-10-12');
+    expect(() => resolveDatePlaceholders('{{date:workday+0}}', TZ, NOW)).toThrow(/unknown day 'workday\+0'/);
+  });
+
   it('renders times the way calendar tools return them, with the local offset', () => {
     expect(resolveDatePlaceholders('{{time:next-wednesday 09:30}}', TZ, NOW)).toBe('2026-10-07T09:30:00.000-04:00');
     // After the DST change the offset follows.

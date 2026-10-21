@@ -727,6 +727,47 @@ export async function resolveSender(
   return { channelId: contact.channel, senderId: contact.identifier };
 }
 
+/**
+ * Curia's own address in a scenario's email envelope (`curia` in inbound.email.to / cc).
+ * The harness Dispatcher takes it as its selfEmail, so the participants block shows "you".
+ */
+export const SCENARIO_CURIA_EMAIL = 'curia@example.test';
+
+/** An inbound email's To and CC as addresses (types.ts: inbound.email.to / cc). */
+export interface ResolvedEnvelope {
+  to: string[];
+  cc: string[];
+}
+
+/** Resolve inbound.email.to / cc tokens to addresses; undefined when the case names neither. */
+export async function resolveEnvelope(scenario: ScenarioCase, stack: TestModeStack): Promise<ResolvedEnvelope | undefined> {
+  const { to, cc } = scenario.inbound.email ?? {};
+  if (to === undefined && cc === undefined) return undefined;
+  let principalEmail: string | undefined;
+  const address = async (token: string): Promise<string> => {
+    if (token === 'curia') return SCENARIO_CURIA_EMAIL;
+    if (token === 'principal') {
+      if (principalEmail === undefined) {
+        if (!stack.principalContactId) throw new Error('No principal contact in this database');
+        const identities = await stack.contactService.getIdentitiesForContact(stack.principalContactId);
+        const email = identities.find(i => i.channel === 'email');
+        if (!email) throw new Error(`Case '${scenario.name}' names the principal in its envelope, but the principal has no email identity in this database.`);
+        principalEmail = email.channelIdentifier;
+      }
+      return principalEmail;
+    }
+    const contact = scenario.seed.contacts.find(c => c.key === token);
+    // The loader allows only curia, principal, a seeded key or an example.test address.
+    return contact ? contact.identifier : token;
+  };
+  const resolveAll = async (tokens: string[] | undefined): Promise<string[]> => {
+    const out: string[] = [];
+    for (const t of tokens ?? []) out.push(await address(t));
+    return out;
+  };
+  return { to: await resolveAll(to), cc: await resolveAll(cc) };
+}
+
 /** A fresh outbound-context service on the stack's pool (the stack does not build one). */
 export function createOutboundContextService(stack: TestModeStack): OutboundContextService {
   return new OutboundContextService(stack.pool, stack.logger);

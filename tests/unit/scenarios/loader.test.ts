@@ -648,3 +648,71 @@ identity:
     expect(() => loadScenarioCase(write('d.yaml', agentOnReply), { identitiesDir: ids })).toThrow(/the reply is the case agent's/);
   });
 });
+
+describe('email envelopes and autonomy fixtures', () => {
+  const CC = `
+name: cc
+release_gate: false
+autonomy: { score: 84, gating: band }
+seed:
+  contacts:
+    - key: dana
+      display_name: Dana Wu
+      tier: known
+      channel: email
+      identifier: dana@lumen.example.test
+inbound:
+  from: principal
+  channel: email
+  content: Let's grab a coffee in a week or two.
+  email:
+    to: [dana]
+    cc: [curia]
+expected_behaviors:
+  - id: replies
+    description: replies on the thread
+    check:
+      called: email-reply
+`;
+
+  it('reads the To and CC lists and the autonomy fixture', () => {
+    const c = loadScenarioCase(write('a.yaml', CC));
+    expect(c.inbound.email?.to).toEqual(['dana']);
+    expect(c.inbound.email?.cc).toEqual(['curia']);
+    expect(c.autonomy).toEqual({ score: 84, gating: 'band' });
+  });
+
+  it('leaves the envelope out when a case names neither list', () => {
+    const c = loadScenarioCase(write('a.yaml', CC.replace('    to: [dana]\n    cc: [curia]\n', '    nylas_message_id: m-1\n')));
+    expect(c.inbound.email?.to).toBeUndefined();
+    expect(c.inbound.email?.cc).toBeUndefined();
+  });
+
+  it.each([
+    ['no curia', 'cc: [principal]', /'curia' must appear exactly once/],
+    ['curia twice', 'cc: [curia, curia]', /'curia' must appear exactly once/],
+    ['an unknown key', 'cc: [curia, priya]', /'priya' is not curia, principal/],
+    ['a real address', 'cc: [curia, someone@gmail.com]', /'someone@gmail.com' is not curia, principal/],
+  ])('rejects an envelope with %s', (_label, cc, error) => {
+    expect(() => loadScenarioCase(write('a.yaml', CC.replace('cc: [curia]', cc)))).toThrow(error);
+  });
+
+  it('accepts the principal, a seeded key and an example.test address', () => {
+    const c = loadScenarioCase(write('a.yaml', CC.replace('cc: [curia]', 'cc: [curia, principal, ops@northwind.example.test]')));
+    expect(c.inbound.email?.cc).toEqual(['curia', 'principal', 'ops@northwind.example.test']);
+  });
+
+  it('keeps a case with an autonomy fixture out of the release gate', () => {
+    expect(() => loadScenarioCase(write('a.yaml', CC.replace('release_gate: false\n', '')))).toThrow(/'autonomy' fixture runs on demand/);
+  });
+
+  it.each([
+    ['a score out of range', 'autonomy: { score: 101, gating: band }', /integer from 0 to 100/],
+    ['a fractional score', 'autonomy: { score: 84.5, gating: band }', /integer from 0 to 100/],
+    ['an unknown gating', 'autonomy: { score: 84, gating: strict }', /'gating' must be one of band, tier/],
+    ['a missing gating', 'autonomy: { score: 84 }', /'gating' must be a non-empty string/],
+    ['an unknown key', 'autonomy: { score: 84, gating: band, band: full }', /unknown key\(s\) band/],
+  ])('rejects an autonomy fixture with %s', (_label, line, error) => {
+    expect(() => loadScenarioCase(write('a.yaml', CC.replace('autonomy: { score: 84, gating: band }', line)))).toThrow(error);
+  });
+});

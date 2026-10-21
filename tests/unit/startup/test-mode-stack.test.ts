@@ -11,6 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../../../src/bus/bus.js';
 import type { ContactService } from '../../../src/contacts/contact-service.js';
+import { AutonomyService } from '../../../src/autonomy/autonomy-service.js';
 import { createLogger } from '../../../src/logger.js';
 import { ExecutionLayer } from '../../../src/skills/execution.js';
 import { ToolRegistry } from '../../../src/skills/registry.js';
@@ -19,6 +20,7 @@ import type { BullpenService } from '../../../src/memory/bullpen.js';
 import {
   createNoSendOutboundGateway,
   createTestModeSecrets,
+  FixtureAutonomyService,
   readOnlyBullpen,
   readOnlyView,
   TEST_MODE_PASSTHROUGH_SECRETS,
@@ -225,5 +227,23 @@ describe('readOnlyBullpen', () => {
     expect(getPendingThreadsForAgent).toHaveBeenCalledOnce();
     expect(markThreadsSeen).not.toHaveBeenCalled();
     expect(recordUnhandledInjection).not.toHaveBeenCalled();
+  });
+});
+
+describe('FixtureAutonomyService', () => {
+  const stored = { score: 95, band: 'full', updated_at: new Date('2026-10-01T00:00:00Z'), updated_by: 'ceo' };
+  const pool = { query: vi.fn(async () => ({ rows: [stored] })) } as unknown as ConstructorParameters<typeof AutonomyService>[0];
+
+  it('reads the fixture score, its band and its gating, not the database row', async () => {
+    const service = new FixtureAutonomyService(pool, logger, { score: 74, gating: 'band' });
+    const config = await service.getConfig();
+    expect(config).toMatchObject({ score: 74, band: 'approval-required', gating: 'band', updatedBy: 'scenario-fixture' });
+    expect(AutonomyService.formatPromptBlock(config!)).toContain('Your current autonomy score is 74');
+  });
+
+  it('describes tier gating as the database would', async () => {
+    const config = await new FixtureAutonomyService(pool, logger, { score: 84, gating: 'tier' }).getConfig();
+    expect(config).toMatchObject({ score: 84, band: 'spot-check' });
+    expect(config?.gating).toBeUndefined();
   });
 });

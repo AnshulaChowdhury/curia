@@ -13,7 +13,9 @@
 //
 // A day is `today`, `today+N`, `today-N`, or `next-<weekday>` — the first such weekday
 // strictly after today (so on a Wednesday, next-wednesday is a week out) — optionally
-// plus days: `next-monday+7` is the Monday after that.
+// plus days: `next-monday+7` is the Monday after that. `workday+N` is the Nth Monday-to-
+// Friday day after today (on a Friday, workday+1 is Monday), for "the next couple of
+// working days" whatever day the suite runs.
 import { DateTime } from 'luxon';
 
 const PLACEHOLDER = /\{\{\s*(date|time|weekday|day|at):([^}]+?)\s*\}\}/g;
@@ -33,7 +35,16 @@ function resolveDay(spec: string, today: DateTime): DateTime {
     const ahead = ((target - today.weekday + 7) % 7) || 7;
     return today.plus({ days: ahead + Number(next[2] ?? 0) });
   }
-  throw new Error(`unknown day '${spec}' — use today, today+N, today-N or next-<weekday>[+N]`);
+  const workday = /^workday\+(\d+)$/.exec(s);
+  if (workday && Number(workday[1]) >= 1) {
+    let day = today;
+    for (let left = Number(workday[1]); left > 0;) {
+      day = day.plus({ days: 1 });
+      if (day.weekday <= 5) left--;
+    }
+    return day;
+  }
+  throw new Error(`unknown day '${spec}' — use today, today+N, today-N, next-<weekday>[+N] or workday+N`);
 }
 
 function resolveOne(kind: string, arg: string, today: DateTime, now: DateTime): string {

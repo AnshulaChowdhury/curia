@@ -1,0 +1,114 @@
+# Case 25i (docs/wip/2026-10-21-principal-scheduling-scenarios-design.md): a standing
+# rule says what "coffee" means for scheduling. Here it lives in the calendar rules and office standing preferences.
+# 25d/25e hold it in calendar rules only, 25f/25g in the office standing preferences only
+# (identity fixture scheduling-prefs), and 25h/25i in both, so the results show which
+# store Curia reads. The "drinks" twin of this case uses the same thread with the other word,
+# so a run that always picks the same time of day passes only one of the pair. Free time
+# next week is open in the daytime and the evening.
+name: cc coffee follows standing rule (both)
+description: >
+  The principal emails Leo Martins, an external contact, and CCs Curia: "Let's grab a coffee next week and catch up properly." The
+  principal's calendar rules and office standing preferences say coffee meetings happen during the workday (weekdays 9 AM to 4 PM,
+  45 minutes, at a café near the office) and that "drinks" means after work (5:30 PM or
+  later, 90 minutes, at a bar or restaurant). Curia should take the scheduling over and
+  offer Leo, on the thread, times that follow the coffee rule. Free time next week is open
+  in the daytime and the evening.
+tags: [principal-scheduling, ps-prefs, calendar, email-cc, standing-rules]
+delegation: real
+release_gate: false
+autonomy: { score: 84, gating: band }
+identity: scheduling-prefs
+stub_sets: [human-channels, calendar-office, calendar-specialist]
+seed:
+  contacts:
+    - key: leo
+      display_name: Leo Martins
+      tier: known
+      kind: person
+      channel: email
+      identifier: leo.martins@harbourview.example.test
+inbound:
+  from: principal
+  channel: email
+  content: |
+    Subject: Good to reconnect
+
+    Leo,
+
+    Great to bump into you at the airport. Let's grab a coffee next week and catch up properly.
+
+    Avery
+  email:
+    nylas_message_id: scenario-msg-25i-leo
+    to: [leo]
+    cc: [curia]
+tool_stubs:
+  # The contacts specialist filling in a contact's organization: a fair write.
+  contact-update:
+    - agent: contacts
+      match: {}
+      return: { contact_id: "{{contact:leo}}", updated_fields: [organization] }
+  # Remembering how the principal knows someone is fair; a write the case allows.
+  memory-store:
+    - match: {}
+      return: { stored: true, action: created, node_id: 0e5d6c7b-1a2b-4c3d-8e9f-0000000000d5, sensitivity: internal }
+  # The principal's stored calendar rules (agents/calendar.yaml loads them at task start).
+  config-store:
+    - agent: calendar
+      match: { action: retrieve, namespace: calendar }
+      return:
+        found: true
+        namespace: calendar
+        key: rules
+        value: '[{"applies_to":"coffee meetings","instruction":"weekdays between 9 AM and 4 PM, 45 minutes, at a café near the office","active":true},{"applies_to":"drinks","instruction":"after work only: start at 5:30 PM or later, 90 minutes, at a bar or restaurant","active":true}]'
+  calendar-find-free-time:
+    - agent: calendar
+      match: {}
+      return:
+        displayTimezone: "{{timezone}}"
+        freeWindows:
+          - { start: "{{time:next-monday 10:00}}", end: "{{time:next-monday 12:00}}" }
+          - { start: "{{time:next-monday 17:30}}", end: "{{time:next-monday 21:00}}" }
+          - { start: "{{time:next-monday+1 13:00}}", end: "{{time:next-monday+1 15:30}}" }
+          - { start: "{{time:next-monday+2 09:00}}", end: "{{time:next-monday+2 11:00}}" }
+          - { start: "{{time:next-monday+2 17:30}}", end: "{{time:next-monday+2 21:00}}" }
+          - { start: "{{time:next-monday+3 14:00}}", end: "{{time:next-monday+3 16:00}}" }
+          - { start: "{{time:next-monday+3 18:00}}", end: "{{time:next-monday+3 21:00}}" }
+expected_behaviors:
+  - id: reads_calendar
+    weight: critical
+    description: The principal's calendar is read before times are offered.
+    check:
+      called: [calendar-find-free-time, calendar-list-events]
+      agent: any
+      success: true
+  - id: reads_rules
+    weight: important
+    description: The calendar specialist reads the stored calendar rules.
+    check:
+      called: config-store
+      agent: calendar
+      with: { action: retrieve, namespace: calendar }
+  - id: answers_leo
+    weight: critical
+    description: Answers Leo on the principal's thread (email-reply to its Message ID).
+    check:
+      called: email-reply
+      with: { reply_to_message_id: scenario-msg-25i-leo }
+  - id: coffee_in_workday
+    weight: critical
+    description: >
+      Every time offered to Leo is on a weekday next week between 9 AM and 4 PM, not an
+      evening slot. If it offers no specific time, it asks Leo for daytime windows.
+  - id: coffee_shape
+    weight: important
+    description: >
+      The coffee runs about 45 minutes (not the 30-minute default), and the venue is a café
+      near the office or left open. Not a bar or a video call.
+  - id: no_question_on_thread
+    weight: critical
+    description: Does not ask the principal on the thread what kind of meeting or when; it applies the rule.
+failure_modes:
+  - Offers an evening slot for coffee
+  - Offers the same 30-minute default it would for any meeting
+  - Asks the principal on the thread what time of day they want

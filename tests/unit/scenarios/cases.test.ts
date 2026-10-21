@@ -216,7 +216,9 @@ describe('coordinator scenario cases', () => {
   it('gate releases on the real-delegation cases the README names (#2027)', () => {
     // Real delegation multiplies cost, so most of these run on demand. A change here
     // changes the release gate: update the table in tests/scenarios/README.md with it.
-    const real = cases.filter(c => c.delegation === 'real');
+    // The principal-scheduling series (25*) is on demand by construction: it runs under an
+    // autonomy fixture, which the loader keeps out of the gate (see the test below).
+    const real = cases.filter(c => c.delegation === 'real' && !c.autonomy);
     expect(real.map(c => path.basename(c.sourceFile).slice(0, 3)).sort())
       .toEqual(['16a', '16b', '16c', '16d', '16e', '16f', '16g', '17a']);
     expect(real.filter(c => c.releaseGate).map(c => path.basename(c.sourceFile).slice(0, 3)).sort())
@@ -228,6 +230,25 @@ describe('coordinator scenario cases', () => {
     // The style cases run under an identity fixture, which the loader keeps out of the gate.
     expect(cases.filter(c => c.delegation === 'stubbed' && !c.releaseGate && !c.identity).map(c => path.basename(c.sourceFile).slice(0, 3)))
       .toEqual(['21c', '30d', '30e', '30f', '31a', '31b', '31c', '31d', '31h', '32b']);
+  });
+
+  it('principal-scheduling cases split into batches that each share one stack', () => {
+    // docs/wip/2026-10-21-principal-scheduling-scenarios-design.md. A run has one stack, so
+    // one identity and one autonomy fixture: each batch tag selects cases that agree.
+    const ps = cases.filter(c => c.tags.includes('principal-scheduling'));
+    expect(ps.map(c => path.basename(c.sourceFile).slice(0, 3)).sort())
+      .toEqual(['25a', '25b', '25c', '25d', '25e', '25f', '25g', '25h', '25i', '25j', '25k', '25l', '25m', '25n']);
+    for (const c of ps) {
+      expect(c.releaseGate).toBe(false);
+      expect(c.delegation).toBe('real');
+      expect(c.autonomy).toBeDefined();
+    }
+    for (const batch of ['ps-core', 'ps-ask', 'ps-prefs']) {
+      const picked = ps.filter(c => c.tags.includes(batch));
+      expect(picked.length, batch).toBeGreaterThan(0);
+      expect(new Set(picked.map(c => `${c.identity?.name}|${c.autonomy?.score}|${c.autonomy?.gating}`)).size, batch).toBe(1);
+    }
+    expect(ps.every(c => ['ps-core', 'ps-ask', 'ps-prefs'].filter(t => c.tags.includes(t)).length === 1)).toBe(true);
   });
 
   it('style cases share one identity fixture and score in code what code can score (#2143)', () => {
