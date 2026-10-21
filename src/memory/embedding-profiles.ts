@@ -3,12 +3,13 @@
  * models, so each model's prefixes and thresholds live together and a model without a
  * profile leaves the knowledge graph off.
  */
+import { createHash } from 'node:crypto';
 
 /** What an embedding is for. A model with task prompts formats each purpose differently. */
 export type EmbeddingPurpose = 'query' | 'document' | 'similarity';
 
 export interface EmbeddingProfile {
-  /** The model name the endpoint is called with, and the value stamped on every vector. */
+  /** The model name the endpoint is called with. Vectors carry `embeddingStamp()`, not this. */
   model: string;
   /** Vector width stored in kg_nodes.embedding. At most HNSW_MAX_DIMENSIONS. */
   dimensions: number;
@@ -48,6 +49,19 @@ export function lookupEmbeddingProfile(
   overrides: Readonly<Record<string, EmbeddingProfile>> | undefined,
 ): EmbeddingProfile | undefined {
   return overrides?.[model] ?? BUILTIN_EMBEDDING_PROFILES[model];
+}
+
+/**
+ * The value stored in kg_nodes.embedding_model beside each vector, and the only value
+ * that stored stamps are compared with. Stored vectors keep the `document` prefix they
+ * were made with, so a non-empty one is part of the stamp. A changed prefix under the
+ * same model name then reads as a model mismatch to the boot gate and `pnpm reembed:kg`.
+ * An empty prefix leaves the stamp as the model name, which migration 102's backfill wrote.
+ */
+export function embeddingStamp(profile: Pick<EmbeddingProfile, 'model' | 'prefixes'>): string {
+  const prefix = profile.prefixes.document;
+  if (prefix === '') return profile.model;
+  return `${profile.model}#document:${createHash('sha256').update(prefix).digest('hex').slice(0, 12)}`;
 }
 
 const PURPOSES: readonly EmbeddingPurpose[] = ['query', 'document', 'similarity'];

@@ -65,6 +65,60 @@ describeIf('Knowledge Graph Integration', () => {
     expect(retrieved!.embedding).toHaveLength(OPENAI_TEXT_EMBEDDING_3_SMALL.dimensions);
   });
 
+  it('stamps each stored vector with the profile model', async () => {
+    const node = await store.createNode({
+      type: 'person',
+      label: 'Stamped Integration Person',
+      properties: {},
+      source: 'integration-test',
+    });
+    createdKgNodeIds.push(node.id);
+
+    const { rows } = await pool.query<{ embedding_model: string | null }>(
+      'SELECT embedding_model FROM kg_nodes WHERE id = $1',
+      [node.id],
+    );
+    expect(rows[0]!.embedding_model).toBe(OPENAI_TEXT_EMBEDDING_3_SMALL.model);
+    expect((await store.getNode(node.id))!.embeddingModel).toBe(OPENAI_TEXT_EMBEDDING_3_SMALL.model);
+  });
+
+  it('leaves a vector from another model out of semantic search', async () => {
+    const label = 'model filter integration probe';
+    const node = await store.createNode({ type: 'concept', label, properties: {}, source: 'integration-test' });
+    createdKgNodeIds.push(node.id);
+    // The fake backend embeds the same text to the same vector, so the probe ranks first.
+    expect((await store.semanticSearch(label, { limit: 1 }))[0]!.node.id).toBe(node.id);
+
+    await pool.query("UPDATE kg_nodes SET embedding_model = 'another-model' WHERE id = $1", [node.id]);
+
+    const ids = (await store.semanticSearch(label, { limit: 50 })).map(r => r.node.id);
+    expect(ids).not.toContain(node.id);
+  });
+
+  it('restamps a node from another model when its label changes', async () => {
+    const node = await store.createNode({ type: 'person', label: 'Restamp probe', properties: {}, source: 'integration-test' });
+    createdKgNodeIds.push(node.id);
+    await pool.query("UPDATE kg_nodes SET embedding_model = 'another-model' WHERE id = $1", [node.id]);
+
+    await store.updateNode(node.id, { label: 'Restamp probe renamed' });
+
+    expect((await store.getNode(node.id))!.embeddingModel).toBe(OPENAI_TEXT_EMBEDDING_3_SMALL.model);
+  });
+
+  it('does not merge a fact into one embedded by another model', async () => {
+    const validator = new MemoryValidator(store, EmbeddingService.createForTesting());
+    const entity = await store.createNode({ type: 'person', label: 'Dedup probe person', properties: {}, source: 'integration-test' });
+    const fact = await store.createNode({ type: 'fact', label: 'Dedup probe lives in Kitchener', properties: {}, source: 'integration-test' });
+    createdKgNodeIds.push(entity.id, fact.id);
+    await store.createEdge({ sourceNodeId: entity.id, targetNodeId: fact.id, type: 'relates_to', properties: {}, source: 'integration-test' });
+    const write = { entityNodeId: entity.id, label: 'Dedup probe lives in Kitchener', source: 'integration-test' };
+    expect((await validator.validate(write)).action).toBe('update');
+
+    await pool.query("UPDATE kg_nodes SET embedding_model = 'another-model' WHERE id = $1", [fact.id]);
+
+    expect((await validator.validate(write)).action).toBe('create');
+  });
+
   it('performs semantic search via pgvector', async () => {
     const node = await store.createNode({
       type: 'concept',

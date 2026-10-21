@@ -2,6 +2,7 @@ import type { KnowledgeGraphStore } from './knowledge-graph.js';
 // Value import (not `import type`) because we call the static method
 // EmbeddingService.cosineSimilarity() at runtime.
 import { EmbeddingService } from './embedding.js';
+import { embeddingStamp } from './embedding-profiles.js';
 import type { StoreFactOptions, ValidationResult } from './types.js';
 
 // Spec line 126: max writes per agent per task
@@ -125,6 +126,8 @@ export class MemoryValidator {
       // Only compare against existing fact nodes that have been embedded
       if (!targetNode || targetNode.type !== 'fact') continue;
       if (!targetNode.embedding) continue;
+      // A vector from another model or document prefix is not comparable (ADR-051).
+      if (targetNode.embeddingModel !== embeddingStamp(this.embeddingService.profile)) continue;
 
       const similarity = EmbeddingService.cosineSimilarity(newEmbedding, targetNode.embedding);
       if (similarity >= dedupThreshold) {

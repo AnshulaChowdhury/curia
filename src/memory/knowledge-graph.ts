@@ -13,7 +13,7 @@ import type {
 } from './types.js';
 import { createNodeId, createEdgeId, SENSITIVITY_LEVELS } from './types.js';
 import { EmbeddingService } from './embedding.js';
-import type { EmbeddingPurpose } from './embedding-profiles.js';
+import { embeddingStamp, type EmbeddingPurpose } from './embedding-profiles.js';
 
 // -- Public option interfaces --
 
@@ -108,7 +108,9 @@ interface KnowledgeGraphBackend {
   semanticSearch(
     queryEmbedding: number[],
     limit: number,
-    filters?: { type?: NodeType; maxSensitivity?: Sensitivity },
+    // embeddingModel is required: a vector from another model must never be ranked
+    // against this query, even while a re-embed has left the table mixed.
+    filters: { embeddingModel: string; type?: NodeType; maxSensitivity?: Sensitivity },
   ): Promise<SearchResult[]>;
   /** List all warned (warned_at IS NOT NULL), non-archived, LABEL-TIER nodes, oldest-first.
    *  Contact-anchored nodes are excluded: they cannot decay, so a "confirm this or lose it"
@@ -176,6 +178,7 @@ export class KnowledgeGraphStore {
       label: options.label,
       properties: { ...options.properties },
       embedding,
+      embeddingModel: embeddingStamp(this.embeddingService.profile),
       temporal: {
         createdAt: now,
         lastConfirmedAt: now,
@@ -232,6 +235,7 @@ export class KnowledgeGraphStore {
       label: options.label,
       properties: { ...options.properties },
       embedding,
+      embeddingModel: embeddingStamp(this.embeddingService.profile),
       temporal: {
         createdAt: now,
         lastConfirmedAt: now,
@@ -285,6 +289,7 @@ export class KnowledgeGraphStore {
       embedding: labelChanged
         ? await this.embeddingService.embed(updates.label!, 'document')
         : existing.embedding,
+      embeddingModel: labelChanged ? embeddingStamp(this.embeddingService.profile) : existing.embeddingModel,
       temporal: {
         ...existing.temporal,
         lastConfirmedAt: new Date(),
@@ -420,6 +425,7 @@ export class KnowledgeGraphStore {
     const limit = options?.limit ?? 10;
     const queryEmbedding = await this.embeddingService.embed(query, options?.purpose ?? 'query');
     return this.backend.semanticSearch(queryEmbedding, limit, {
+      embeddingModel: embeddingStamp(this.embeddingService.profile),
       type: options?.type,
       maxSensitivity: options?.maxSensitivity,
     });
@@ -454,8 +460,8 @@ class PostgresBackend implements KnowledgeGraphBackend {
     this.logger.debug({ nodeId: node.id, type: node.type, sensitivity: node.sensitivity }, 'kg: creating node');
     const embeddingStr = node.embedding ? `[${node.embedding.join(',')}]` : null;
     await this.pool.query(
-      `INSERT INTO kg_nodes (id, type, label, properties, embedding, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity, aliases, identity_source)
-       VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      `INSERT INTO kg_nodes (id, type, label, properties, embedding, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity, aliases, identity_source, embedding_model)
+       VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
       [
         node.id,
         node.type,
@@ -470,6 +476,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
         node.sensitivity,
         node.aliases,
         node.identitySource,
+        embeddingModelFor(node),
       ],
     );
   }
@@ -505,8 +512,8 @@ class PostgresBackend implements KnowledgeGraphBackend {
       // identity_source is hardcoded 'label' rather than parameterised: the ON CONFLICT
       // predicate below must match the narrowed idx_kg_nodes_unique, and an anchored row
       // would not be in that index at all, so the upsert would silently always insert.
-      `INSERT INTO kg_nodes (id, type, label, properties, embedding, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity, aliases, identity_source)
-       VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $9, $10, $11, 'label')
+      `INSERT INTO kg_nodes (id, type, label, properties, embedding, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity, aliases, identity_source, embedding_model)
+       VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $9, $10, $11, 'label', $12)
        ON CONFLICT (lower(label), type) WHERE type != 'fact' AND archived_at IS NULL AND identity_source = 'label'
        DO UPDATE SET
          confidence = GREATEST(kg_nodes.confidence, EXCLUDED.confidence),
@@ -524,6 +531,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
         node.temporal.createdAt,
         node.sensitivity,
         node.aliases,
+        embeddingModelFor(node),
       ],
     );
     const row = result.rows[0];
@@ -554,7 +562,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
     // via KnowledgeGraphStore.updateNode() are durably persisted to the DB.
     await this.pool.query(
       `UPDATE kg_nodes
-       SET label = $1, properties = $2, embedding = $3::vector, last_confirmed_at = $4, confidence = $5, sensitivity = $6, aliases = $7
+       SET label = $1, properties = $2, embedding = $3::vector, last_confirmed_at = $4, confidence = $5, sensitivity = $6, aliases = $7, embedding_model = $9
        WHERE id = $8`,
       [
         node.label,
@@ -565,6 +573,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
         node.sensitivity,
         node.aliases,
         id,
+        embeddingModelFor(node),
       ],
     );
   }
@@ -765,10 +774,10 @@ class PostgresBackend implements KnowledgeGraphBackend {
   async semanticSearch(
     queryEmbedding: number[],
     limit: number,
-    filters?: { type?: NodeType; maxSensitivity?: Sensitivity },
+    filters: { embeddingModel: string; type?: NodeType; maxSensitivity?: Sensitivity },
   ): Promise<SearchResult[]> {
     const embeddingStr = `[${queryEmbedding.join(',')}]`;
-    const params: unknown[] = [embeddingStr, limit];
+    const params: unknown[] = [embeddingStr, limit, filters.embeddingModel];
     const extraClauses: string[] = [];
 
     if (filters?.type) {
@@ -796,6 +805,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
       `SELECT *, 1 - (embedding <=> $1::vector) AS similarity
        FROM kg_nodes
        WHERE embedding IS NOT NULL
+         AND embedding_model = $3
          AND archived_at IS NULL
          ${extraClauses.join('\n         ')}
        ORDER BY embedding <=> $1::vector
@@ -912,6 +922,7 @@ interface PgNodeRow {
   archived_at: Date | null;
   aliases: string[];
   identity_source: string;
+  embedding_model: string | null;
 }
 
 interface PgEdgeRow {
@@ -935,6 +946,7 @@ function pgRowToNode(row: PgNodeRow): KgNode {
     label: row.label,
     properties: row.properties,
     embedding: row.embedding ? parseVector(row.embedding) : undefined,
+    embeddingModel: row.embedding_model ?? undefined,
     temporal: {
       createdAt: row.created_at,
       lastConfirmedAt: row.last_confirmed_at,
@@ -966,6 +978,11 @@ function pgRowToEdge(row: PgEdgeRow): KgEdge {
       source: row.source,
     },
   };
+}
+
+/** The stamp to store beside a node's vector: none without a vector (migration 102's CHECK). */
+function embeddingModelFor(node: KgNode): string | null {
+  return node.embedding ? (node.embeddingModel ?? null) : null;
 }
 
 /** Parse a pgvector string like "[0.1,0.2,0.3]" into a number array */
@@ -1267,7 +1284,7 @@ class InMemoryBackend implements KnowledgeGraphBackend {
   async semanticSearch(
     queryEmbedding: number[],
     limit: number,
-    filters?: { type?: NodeType; maxSensitivity?: Sensitivity },
+    filters: { embeddingModel: string; type?: NodeType; maxSensitivity?: Sensitivity },
   ): Promise<SearchResult[]> {
     const scored: SearchResult[] = [];
     // Pre-compute sensitivity ceiling rank once outside the loop.
@@ -1283,6 +1300,7 @@ class InMemoryBackend implements KnowledgeGraphBackend {
 
     for (const node of this.nodes.values()) {
       if (!node.embedding) continue;
+      if (node.embeddingModel !== filters.embeddingModel) continue;
       // Archived nodes must not appear in semantic search results
       if (this.archivedNodes.has(node.id)) continue;
       // Apply type filter
