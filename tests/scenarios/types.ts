@@ -504,7 +504,7 @@ export interface SuiteResult {
   onDemandSkipped?: string[];
   /** The office identity fixture every case ran under (#2143). Absent: the database's own. */
   identity?: string;
-  /** The autonomy fixture every case ran under, e.g. "84 (band gating)". Absent: the database's own. */
+  /** The autonomy every case ran under, read back from the stack, e.g. "84 (band gating)". */
   autonomy?: string;
   /** Runs each case actually got (a case's `runs` or --runs can differ from the default). */
   runsPerCase: Record<string, number>;

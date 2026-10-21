@@ -20,6 +20,7 @@ import type { BullpenService } from '../../../src/memory/bullpen.js';
 import {
   createNoSendOutboundGateway,
   createTestModeSecrets,
+  autonomyFixtureMismatch,
   FixtureAutonomyService,
   readOnlyBullpen,
   readOnlyView,
@@ -245,5 +246,21 @@ describe('FixtureAutonomyService', () => {
     const config = await new FixtureAutonomyService(pool, logger, { score: 84, gating: 'tier' }).getConfig();
     expect(config).toMatchObject({ score: 84, band: 'spot-check' });
     expect(config?.gating).toBeUndefined();
+  });
+});
+
+describe('autonomyFixtureMismatch', () => {
+  const config = { score: 84, band: 'spot-check' as const, updatedAt: new Date(0), updatedBy: 'x', gating: 'band' as const };
+
+  it('passes when the stack reads the fixture', () => {
+    expect(autonomyFixtureMismatch({ score: 84, gating: 'band' }, config)).toBeNull();
+    expect(autonomyFixtureMismatch({ score: 84, gating: 'tier' }, { ...config, gating: undefined })).toBeNull();
+  });
+
+  it('names what the stack reads when the fixture did not reach it', () => {
+    // A tier config omits gating: the database's own row, as when the fixture was dropped.
+    expect(autonomyFixtureMismatch({ score: 84, gating: 'band' }, { ...config, score: 75, band: 'approval-required', gating: undefined }))
+      .toBe('the stack reads autonomy 75 (tier gating); the fixture asked for 84 (band gating)');
+    expect(autonomyFixtureMismatch({ score: 84, gating: 'band' }, null)).toMatch(/no autonomy config/);
   });
 });

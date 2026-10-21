@@ -818,8 +818,13 @@ function parseAutonomy(raw: Raw, file: string): AutonomyFixture | undefined {
 function validateEnvelope(scenario: ScenarioCase, file: string): void {
   const { to, cc } = scenario.inbound.email ?? {};
   if (to === undefined && cc === undefined) return;
-  if (scenario.inbound.channel !== 'email' && scenario.inbound.from === 'principal') {
-    throw new CaseError(file, `inbound.email.to / cc need channel: email`);
+  // The channel the inbound actually arrives on: the principal's is the case's `channel`
+  // (default cli), a seeded contact's is its own. Any other sender has no email envelope.
+  const { from } = scenario.inbound;
+  const sender = scenario.seed.contacts.find(c => c.key === from);
+  const channel = from === 'principal' ? (scenario.inbound.channel ?? 'cli') : sender?.channel;
+  if (channel !== 'email') {
+    throw new CaseError(file, `inbound.email.to / cc need an email inbound (from '${from}' arrives on ${channel ?? 'no channel'})`);
   }
   const all = [...(to ?? []), ...(cc ?? [])];
   if (all.filter(t => t === 'curia').length !== 1) {

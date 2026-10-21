@@ -697,6 +697,17 @@ expected_behaviors:
     expect(() => loadScenarioCase(write('a.yaml', CC.replace('cc: [curia]', cc)))).toThrow(error);
   });
 
+  it('rejects an envelope on an inbound that does not arrive by email', () => {
+    // The principal on the CLI.
+    expect(() => loadScenarioCase(write('a.yaml', CC.replace('  channel: email\n  content', '  channel: cli\n  content'))))
+      .toThrow(/need an email inbound \(from 'principal' arrives on cli\)/);
+    // A seeded contact whose channel is Signal.
+    const signalContact = CC
+      .replace('      channel: email\n      identifier: dana@lumen.example.test', "      channel: signal\n      identifier: '+15555550100'")
+      .replace('  from: principal\n  channel: email\n', '  from: dana\n');
+    expect(() => loadScenarioCase(write('b.yaml', signalContact))).toThrow(/need an email inbound \(from 'dana' arrives on signal\)/);
+  });
+
   it('accepts the principal, a seeded key and an example.test address', () => {
     const c = loadScenarioCase(write('a.yaml', CC.replace('cc: [curia]', 'cc: [curia, principal, ops@northwind.example.test]')));
     expect(c.inbound.email?.cc).toEqual(['curia', 'principal', 'ops@northwind.example.test']);

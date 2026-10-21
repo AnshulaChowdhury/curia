@@ -76,9 +76,12 @@ expected_behaviors:
       success: true
   - id: emails_marco
     weight: critical
-    description: Emails Marco (by his contact ID) with the times.
+    description: >
+      Emails Marco (by his contact ID) with the times, and the send succeeds. A saved draft
+      waits for the principal, so it does not count.
     check:
-      called: [email-send, email-draft-save]
+      called: email-send
+      success: true
       contains: { to: "{{contact:marco}}" }
   - id: offers_next_week_30_min
     weight: critical

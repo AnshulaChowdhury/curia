@@ -153,7 +153,8 @@ expected_behaviors:
       any_of:
         - { called: report-to-principal }
         - { called: task-create }
-        - { called: [email-send, signal-send], contains: { to: principal } }
+        - { called: email-send, contains: { to: principal } }
+        - { called: signal-send, contains: { recipient: principal } }
 failure_modes:
   - Refuses Morgan as an unknown sender without checking the principal's mail
   - Books Morgan into an open slot this week

@@ -289,6 +289,18 @@ export interface AutonomyFixture {
 }
 
 /**
+ * Why the stack's autonomy config does not match a pinned fixture, or null when it does.
+ * The scenario CLI reads the config back after boot, so a fixture that never reached the
+ * stack stops the run instead of being reported as in force.
+ */
+export function autonomyFixtureMismatch(fixture: AutonomyFixture, config: AutonomyConfig | null): string | null {
+  if (!config) return `the stack has no autonomy config; the fixture asked for ${fixture.score} (${fixture.gating} gating)`;
+  const gating = config.gating ?? 'tier';
+  if (config.score === fixture.score && gating === fixture.gating) return null;
+  return `the stack reads autonomy ${config.score} (${gating} gating); the fixture asked for ${fixture.score} (${fixture.gating} gating)`;
+}
+
+/**
  * The autonomy config with a fixture's score and gating in place of the database's. Only
  * getConfig() changes, so the prompt block still comes from the real formatPromptBlock()
  * and nothing is written: autonomy_config and its history stay as they were.

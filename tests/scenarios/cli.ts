@@ -31,7 +31,7 @@ import { DEFAULT_CONCURRENCY, parseConcurrency, runConcurrently } from '../share
 import { liveSearchLines } from '../shared/live-search.js';
 import { formatUsageLines, formatUsd, sumBreakdowns, UsageLedger } from '../shared/usage.js';
 import { describeReasoningOverride, parseReasoningEffortFlag } from '../shared/reasoning-flag.js';
-import type { AutonomyFixture, TierReasoningOverride } from '../../src/startup/test-mode-stack.js';
+import { autonomyFixtureMismatch, type AutonomyFixture, type TierReasoningOverride } from '../../src/startup/test-mode-stack.js';
 import { mustStub } from './stub-layer.js';
 import { buildOverlay } from './overlay.js';
 import { coverageViolations, mergeCoverage, readCoverage, writeCoverage } from './stub-coverage.js';
@@ -379,6 +379,23 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // What the agents actually see, read back from the stack: a fixture that never reached
+  // it must stop the run, not be reported as in force.
+  const autonomyConfig = await harness.stack.autonomyService.getConfig();
+  if (autonomy) {
+    const mismatch = autonomyFixtureMismatch(autonomy, autonomyConfig);
+    if (mismatch) {
+      err(`\nAutonomy fixture not in force: ${mismatch}.`);
+      await harness.shutdown();
+      overlay?.cleanup();
+      process.exit(1);
+    }
+  }
+  const autonomyInForce = autonomyConfig
+    ? describeAutonomy({ score: autonomyConfig.score, gating: autonomyConfig.gating ?? 'tier' })
+    : 'none (no autonomy_config row)';
+  out(`   Autonomy in force: ${autonomyInForce}${autonomy ? ' (fixture)' : ' (database)'}`);
+
   const model = args.model ?? harness.stack.yamlConfig.model_routing?.tiers.standard.model ?? 'configured routing';
   const reasoningLabel = describeReasoningOverride(args.reasoning);
   let exitCode = 0;
@@ -555,7 +572,7 @@ async function main(): Promise<void> {
       ...(overlayCommit ? { overlayCommit } : {}),
       ...(onDemandSkipped.length > 0 ? { onDemandSkipped } : {}),
       ...(identity ? { identity: identity.name } : {}),
-      ...(autonomy ? { autonomy: describeAutonomy(autonomy) } : {}),
+      autonomy: autonomyInForce,
       runsPerCase: Object.fromEntries(results.map(r => [r.name, r.runs.length])),
       cases: results,
       passed: failures.length === 0,
@@ -588,7 +605,7 @@ async function main(): Promise<void> {
     out(`   Model:   ${model}`);
     out(`   Reasoning: ${reasoningLabel}`);
     if (identity) out(`   Identity: ${identity.name}`);
-    if (autonomy) out(`   Autonomy: ${describeAutonomy(autonomy)}`);
+    out(`   Autonomy: ${autonomyInForce}`);
     out(`   Results: ${resultsFile}`);
     out(`   Time:    ${Math.round(suite.durationMs / 1000)}s (concurrency ${args.concurrency})`);
     out('\n   Model spend (estimated from registry prices; tests/shared/usage.ts):');

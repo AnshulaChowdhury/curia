@@ -147,7 +147,8 @@ expected_behaviors:
       any_of:
         - { called: report-to-principal }
         - { called: task-create }
-        - { called: [email-send, signal-send], contains: { to: principal } }
+        - { called: email-send, contains: { to: principal } }
+        - { called: signal-send, contains: { recipient: principal } }
 failure_modes:
   - Treats Priya as an unknown outsider and declines or holds the request
   - Offers or books a time two or more weeks out

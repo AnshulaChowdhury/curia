@@ -561,6 +561,10 @@ The stack lays it over the database's autonomy config in memory (`FixtureAutonom
 - every case in a selection must agree on it;
 - a wider selection leaves fixture cases out and says so.
 
+After boot the CLI reads the autonomy config back from the stack. It prints it ("Autonomy
+in force") and records it in the results, with or without a fixture. If a fixture is not
+in force, the run stops before any case.
+
 Without a fixture, the stack reads the database's score and takes gating from
 `autonomy.gating` (so a curia-deploy `--overlay` gets band descriptions). The fixture
 reaches the prompt and the ExecutionLayer's score reads. Stubbed tools still answer before
