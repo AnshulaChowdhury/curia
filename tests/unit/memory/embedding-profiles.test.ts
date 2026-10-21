@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   lookupEmbeddingProfile,
   parseEmbeddingProfiles,
+  BUILTIN_EMBEDDING_PROFILES,
   OPENAI_TEXT_EMBEDDING_3_SMALL,
+  QWEN3_EMBEDDING_4B,
 } from '../../../src/memory/embedding-profiles.js';
 
 const SOURCE = 'test';
@@ -52,6 +54,17 @@ describe('parseEmbeddingProfiles', () => {
     });
   });
 
+  it('lets a server id such as Ollama\'s reuse the calibrated Qwen3 profile', () => {
+    const profiles = parseEmbeddingProfiles({ 'qwen3-embedding:4b': { base: 'Qwen3-Embedding-4B' } }, SOURCE);
+    expect(profiles['qwen3-embedding:4b']).toEqual({ ...QWEN3_EMBEDDING_4B, model: 'qwen3-embedding:4b' });
+  });
+
+  it('accepts every built-in profile under the rules an operator profile must meet', () => {
+    for (const name of Object.keys(BUILTIN_EMBEDDING_PROFILES)) {
+      expect(() => parseEmbeddingProfiles({ copy: { base: name } }, SOURCE)).not.toThrow();
+    }
+  });
+
   it('rejects an entry without a base that leaves out a threshold', () => {
     expect(() => parseEmbeddingProfiles(
       { custom: { dimensions: 1024, thresholds: { fact_dedup: 0.8, fuzzy_resolve: 0.7 } } },
@@ -83,5 +96,31 @@ describe('parseEmbeddingProfiles', () => {
 
   it('rejects a section that is not a mapping', () => {
     expect(() => parseEmbeddingProfiles(['custom'], SOURCE)).toThrow(/must be a mapping/);
+  });
+});
+
+// Drift checks: these values are decisions recorded outside the code. OpenAI's are the
+// values every install ran before ADR-051, and Qwen3's are the calibration ADR-051 records.
+describe('built-in profile values', () => {
+  it('keeps OpenAI\'s width and thresholds unchanged', () => {
+    expect(OPENAI_TEXT_EMBEDDING_3_SMALL).toEqual({
+      model: 'text-embedding-3-small',
+      dimensions: 1536,
+      prefixes: { query: '', document: '', similarity: '' },
+      thresholds: { factDedup: 0.92, fuzzyResolve: 0.90, fuzzyAmbiguityFloor: 0.75 },
+    });
+  });
+
+  it('keeps the Qwen3-Embedding-4B calibration from ADR-051', () => {
+    expect(QWEN3_EMBEDDING_4B).toEqual({
+      model: 'Qwen3-Embedding-4B',
+      dimensions: 1536,
+      prefixes: {
+        query: 'Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:',
+        document: '',
+        similarity: '',
+      },
+      thresholds: { factDedup: 0.94, fuzzyResolve: 0.99, fuzzyAmbiguityFloor: 0.80 },
+    });
   });
 });

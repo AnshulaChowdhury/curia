@@ -299,7 +299,7 @@ class OpenAIBackend implements EmbeddingBackend {
   }
 }
 
-function truncateAndNormalize(vector: number[], dimensions: number): number[] {
+export function truncateAndNormalize(vector: number[], dimensions: number): number[] {
   const head = vector.slice(0, dimensions);
   const norm = Math.sqrt(head.reduce((sum, x) => sum + x * x, 0));
   return norm === 0 ? head : head.map(x => x / norm);

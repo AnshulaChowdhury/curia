@@ -35,8 +35,24 @@ export const OPENAI_TEXT_EMBEDDING_3_SMALL: EmbeddingProfile = {
   thresholds: { factDedup: 0.92, fuzzyResolve: 0.90, fuzzyAmbiguityFloor: 0.75 },
 };
 
+/**
+ * A retrieval instruction on `similarity` was tried and stays out: it helps fact dedup but
+ * hurts entity resolution, and one prefix serves both (ADR-051).
+ */
+export const QWEN3_EMBEDDING_4B: EmbeddingProfile = {
+  model: 'Qwen3-Embedding-4B',
+  dimensions: 1536,
+  prefixes: {
+    query: 'Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:',
+    document: '',
+    similarity: '',
+  },
+  thresholds: { factDedup: 0.94, fuzzyResolve: 0.99, fuzzyAmbiguityFloor: 0.80 },
+};
+
 export const BUILTIN_EMBEDDING_PROFILES: Readonly<Record<string, EmbeddingProfile>> = {
   [OPENAI_TEXT_EMBEDDING_3_SMALL.model]: OPENAI_TEXT_EMBEDDING_3_SMALL,
+  [QWEN3_EMBEDDING_4B.model]: QWEN3_EMBEDDING_4B,
 };
 
 /**
