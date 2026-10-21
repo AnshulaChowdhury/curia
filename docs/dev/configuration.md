@@ -398,6 +398,7 @@ embedding:
     "qwen3-embedding:4b":
       base: Qwen3-Embedding-4B
     # A model with no built-in profile gives dimensions and all three thresholds.
+    # Placeholder values: calibrate your own with `pnpm embedding-eval`.
     my-embedding-model:
       dimensions: 1024
       prefixes: { query: "", document: "", similarity: "" }
