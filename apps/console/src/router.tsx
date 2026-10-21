@@ -36,6 +36,7 @@ const ContactsPage = lazy(() => import('./pages/ContactsPage'));
 const JobsPage = lazy(() => import('./pages/JobsPage'));
 const TasksPage = lazy(() => import('./pages/TasksPage'));
 const KgPage = lazy(() => import('./pages/KgPage'));
+const DocumentsPage = lazy(() => import('./pages/DocumentsPage'));
 const ChatPage = lazy(() => import('./pages/ChatPage'));
 
 const rootRoute = createRootRoute({
@@ -255,6 +256,18 @@ const kgRoute = createRoute({
   component: KgPage,
 });
 
+// Memory → Documents (#1821). `path` opens the live document at a path; `id` opens a
+// specific row, which is how archived documents (several may share a path) are addressed.
+const documentsRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/documents',
+  validateSearch: (search: Record<string, unknown>) => ({
+    path: typeof search['path'] === 'string' ? search['path'] : undefined,
+    id: typeof search['id'] === 'string' ? search['id'] : undefined,
+  }),
+  component: DocumentsPage,
+});
+
 const routeTree = rootRoute.addChildren([
   authedRoute.addChildren([
     dashboardRoute,
@@ -270,6 +283,7 @@ const routeTree = rootRoute.addChildren([
     channelsRoute,
     mcpSkillsRoute,
     kgRoute,
+    documentsRoute,
     systemRoute,
     settingsRoute.addChildren([
       personalityRoute,

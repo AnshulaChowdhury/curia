@@ -8,6 +8,7 @@ import {
   IconChat,
   IconMemory,
   IconGraph,
+  IconDocument,
   IconPerson,
   IconChecklist,
   IconClock,
@@ -32,6 +33,7 @@ const ROUTES: Record<string, string> = {
   dashboard: '/',
   chat:     '/chat',
   kg:       '/kg',
+  documents: '/documents',
   contacts: '/contacts',
   tasks:    '/tasks',
   jobs:     '/jobs',
@@ -178,6 +180,13 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
               >
                 <IconGraph />
                 Knowledge Graph
+              </button>
+              <button
+                className={`nav-sub-item${activeView === 'documents' ? ' active' : ''}`}
+                onClick={() => go('documents')}
+              >
+                <IconDocument />
+                Documents
               </button>
               <button
                 className={`nav-sub-item${activeView === 'contacts' ? ' active' : ''}`}

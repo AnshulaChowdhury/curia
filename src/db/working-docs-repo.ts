@@ -36,6 +36,18 @@ export interface WorkingDocRow {
   archivedAt: string | null;
 }
 
+/** Live/archived selector for console reads (#1821). */
+export type WorkingDocStatusFilter = 'live' | 'archived' | 'all';
+
+/** A document row without its body — for listing the store cheaply (#1821). */
+export type WorkingDocSummary = Omit<WorkingDocRow, 'body' | 'sectionVersions'>;
+
+export interface ListWorkingDocSummariesOptions {
+  /** Path prefix (`ls`-on-a-prefix, as `listByPrefix`). Defaults to the whole store. */
+  prefix?: string;
+  status?: WorkingDocStatusFilter;
+}
+
 export interface WorkingDocLinkRow {
   sourcePath: string;
   targetPath: string;
@@ -136,6 +148,35 @@ function stripTypeFromFrontmatter(frontmatter?: Record<string, unknown>): Record
 /** Escape SQL LIKE wildcards so prefix matching is literal. */
 function escapeLikePattern(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
+/**
+ * Normalize a prefix for LIKE matching, keeping a trailing slash: `/projects/x/` must
+ * not match `/projects/xy/…`, but `normalizeDocPath` alone drops the slash.
+ */
+function normalizeLikePrefix(prefix: string | undefined): string {
+  const raw = prefix ?? '/';
+  const normalized = normalizeDocPath(raw);
+  return raw.trim().endsWith('/') && normalized !== '/' ? `${normalized}/` : normalized;
+}
+
+const SUMMARY_COLUMNS = `
+  id, path, type, frontmatter, version, byte_size,
+  task_id, conversation_id, agent_id, created_at, updated_at, archived_at
+`;
+
+/** SQL predicate for a status filter — a fixed string per value, never user input. */
+function statusPredicate(status: WorkingDocStatusFilter): string {
+  if (status === 'live') return 'archived_at IS NULL';
+  if (status === 'archived') return 'archived_at IS NOT NULL';
+  return 'TRUE';
+}
+
+function mapSummaryRow(row: Omit<DbWorkingDocRow, 'body' | 'section_versions'>): WorkingDocSummary {
+  const { body: _body, sectionVersions: _sv, ...summary } = mapRow({ ...row, body: '', section_versions: null });
+  void _body;
+  void _sv;
+  return summary;
 }
 
 export class WorkingDocsRepo {
@@ -663,6 +704,60 @@ export class WorkingDocsRepo {
       targetPath: r.target_path,
       linkKind: r.link_kind as 'markdown' | 'wikilink',
     }));
+  }
+
+  /**
+   * List documents without their bodies (#1821 console tree). Unlike `listByPrefix`,
+   * this can include archived rows — several archived rows may share one path, so
+   * callers identify archived documents by `id`, not path.
+   */
+  async listSummaries(options: ListWorkingDocSummariesOptions = {}): Promise<WorkingDocSummary[]> {
+    const status = options.status ?? 'live';
+    const prefix = normalizeLikePrefix(options.prefix);
+    const { rows } = await this.pool.query<Omit<DbWorkingDocRow, 'body' | 'section_versions'>>(
+      `SELECT ${SUMMARY_COLUMNS}
+       FROM working_documents
+       WHERE path LIKE $1 ESCAPE '\\'
+         AND ${statusPredicate(status)}
+       ORDER BY path ASC, updated_at DESC`,
+      [`${escapeLikePattern(prefix)}%`],
+    );
+    return rows.map(mapSummaryRow);
+  }
+
+  /** Read one document by row id, live or archived (#1821). */
+  async readById(id: string): Promise<WorkingDocRow | null> {
+    const { rows } = await this.pool.query<DbWorkingDocRow>(
+      `SELECT ${DOC_COLUMNS}
+       FROM working_documents
+       WHERE id = $1::uuid`,
+      [id],
+    );
+    const row = rows[0];
+    return row ? mapRow(row) : null;
+  }
+
+  /**
+   * Documents whose path or body contains `query`, case-insensitively (#1821 console
+   * search). Returns whole rows; the caller extracts match context. `strpos` rather
+   * than ILIKE so the query needs no wildcard escaping.
+   */
+  async searchText(
+    query: string,
+    options: { prefix?: string; status?: WorkingDocStatusFilter } = {},
+  ): Promise<WorkingDocRow[]> {
+    const status = options.status ?? 'live';
+    const prefix = normalizeLikePrefix(options.prefix);
+    const { rows } = await this.pool.query<DbWorkingDocRow>(
+      `SELECT ${DOC_COLUMNS}
+       FROM working_documents
+       WHERE path LIKE $1 ESCAPE '\\'
+         AND ${statusPredicate(status)}
+         AND (strpos(lower(path), lower($2)) > 0 OR strpos(lower(body), lower($2)) > 0)
+       ORDER BY updated_at DESC, path ASC`,
+      [`${escapeLikePattern(prefix)}%`, query],
+    );
+    return rows.map(mapRow);
   }
 
   private async replaceLinks(client: PoolClient, sourcePath: string, links: ExtractedLink[]): Promise<void> {

@@ -38,6 +38,7 @@ import { antfarmAssetsRoutes } from './routes/antfarm-assets.js';
 import { messageRoutes } from './routes/messages.js';
 import { consoleRoutes } from './routes/console.js';
 import { knowledgeGraphRoutes } from './routes/kg.js';
+import { documentsRoutes } from './routes/documents.js';
 import { identityRoutes } from './routes/identity.js';
 import { executiveRoutes } from './routes/executive.js';
 import { autonomyRoutes } from './routes/autonomy.js';
@@ -69,6 +70,7 @@ import type { AutonomyService } from '../../autonomy/autonomy-service.js';
 import { type SessionStore } from './session-auth.js';
 import type { Channel } from '../channel.js';
 import type { AuditLogRepo } from '../../audit/audit-log-repo.js';
+import { DEFAULT_SCRATCH_DOC_TTL_DAYS } from '../../agents/document-workspace.js';
 
 /**
  * Minimal HealthService for boot paths where a full HealthService wasn't provided
@@ -158,6 +160,11 @@ export interface HttpAdapterConfig {
    * (console Memory settings, #1376). Read-only snapshot — not hot-reloaded.
    */
   memoryRetention?: MemoryRetentionSnapshot;
+  /**
+   * OKF working-document store for the console Memory → Documents page (#1821).
+   * Mounted only alongside the bootstrap secret, like the KG routes.
+   */
+  workingDocsRepo?: import('../../db/working-docs-repo.js').WorkingDocsRepo;
   /**
    * Read-only system/environment snapshot for GET /api/system (console System
    * settings, #1376). Boot-time facts only — version, runtime, timezone, models.
@@ -270,6 +277,7 @@ export class HttpAdapter implements Channel {
         routeUrl.startsWith('/api/antfarm') ||
         routeUrl.startsWith('/api/autonomy') ||
         routeUrl.startsWith('/api/memory') ||
+        routeUrl.startsWith('/api/documents') ||
         routeUrl.startsWith('/api/system') ||
         routeUrl.startsWith('/api/registry') ||
         routeUrl.startsWith('/api/vault') ||
@@ -466,6 +474,18 @@ export class HttpAdapter implements Channel {
         retention: this.config.memoryRetention,
         webAppBootstrapSecret,
         sessions,
+      });
+    }
+
+    // Documents — console Memory → Documents page over the OKF store (#1821).
+    if (webAppBootstrapSecret && this.config.workingDocsRepo) {
+      await this.app.register(documentsRoutes, {
+        workingDocs: this.config.workingDocsRepo,
+        logger,
+        webAppBootstrapSecret,
+        sessions,
+        // Same effective value DreamEngine purges with, so the derived expiry is honest.
+        scratchTtlDays: this.config.memoryRetention?.scratchTtlDays ?? DEFAULT_SCRATCH_DOC_TTL_DAYS,
       });
     }
 
