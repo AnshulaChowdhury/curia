@@ -177,6 +177,8 @@ describe('ModelRegistry', () => {
       'claude-sonnet-4-6',
       'claude-haiku-4-5',
       'claude-haiku-5-5',
+      'claude-sonnet-5-5',
+      'claude-opus-5-5',
     ])('%s is registered with provider, pricing, contextWindow, and capabilities', (model) => {
       const meta = registry.getModel(model);
       expect(meta).toBeDefined();
@@ -268,6 +270,47 @@ describe('ModelRegistry', () => {
     });
   });
 
+  describe('claude-sonnet-5-5 and claude-opus-5-5 (#2077)', () => {
+    it('record the first-party rates and a 1M context window', () => {
+      expect(registry.getPricing('claude-sonnet-5-5')).toEqual({
+        inputPerMToken: 2.00,
+        outputPerMToken: 10.00,
+        cacheCreationPerMToken: 2.50,
+        cacheReadPerMToken: 0.20,
+      });
+      expect(registry.getPricing('claude-opus-5-5')).toEqual({
+        inputPerMToken: 4.00,
+        outputPerMToken: 20.00,
+        cacheCreationPerMToken: 5.00,
+        cacheReadPerMToken: 0.20,
+      });
+      expect(registry.getModel('claude-sonnet-5-5')!.contextWindow).toBe(1_000_000);
+      expect(registry.getModel('claude-opus-5-5')!.contextWindow).toBe(1_000_000);
+    });
+
+    it.each(['claude-sonnet-5-5', 'claude-opus-5-5'])('%s rejects sampling parameters, thinks by default and binds thinking to the prefix', (model) => {
+      expect(registry.rejectsSamplingParams(model)).toBe(true);
+      expect(registry.thinksByDefault(model)).toBe(true);
+      expect(registry.thinkingBoundToPrefix(model)).toBe(true);
+    });
+
+    it('Sonnet 5.5 honors none and turns thinking off with between_tools', () => {
+      expect(registry.honorsReasoningEffort('claude-sonnet-5-5', 'none')).toBe(true);
+      expect(registry.thinkingOffType('claude-sonnet-5-5')).toBe('between_tools');
+    });
+
+    it('Opus 5.5 does not honor none, because it cannot turn thinking off', () => {
+      expect(registry.honorsReasoningEffort('claude-opus-5-5', 'none')).toBe(false);
+      expect(registry.honorsReasoningEffort('claude-opus-5-5', 'low')).toBe(true);
+      expect(registry.honorsReasoningEffort('claude-opus-5-5', 'max')).toBe(true);
+    });
+
+    it('keeps disabled as the off form for every other model', () => {
+      expect(registry.thinkingOffType('claude-haiku-5-5')).toBe('disabled');
+      expect(registry.thinkingOffType('no-such-model')).toBe('disabled');
+    });
+  });
+
   describe('Embedding models', () => {
     it('text-embedding-3-small is registered with provider openai', () => {
       const meta = registry.getModel('text-embedding-3-small');
@@ -299,6 +342,8 @@ describe('ModelRegistry', () => {
       'claude-sonnet-4-6',
       'claude-haiku-4-5',
       'claude-haiku-5-5',
+      'claude-sonnet-5-5',
+      'claude-opus-5-5',
       'google/gemini-3.1-flash-lite',
       'deepseek/deepseek-chat-v3-0324',
       'deepseek/deepseek-v4-pro',

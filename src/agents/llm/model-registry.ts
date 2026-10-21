@@ -18,7 +18,8 @@ import type { ReasoningEffort } from './sampling-options.js';
 
 // Anthropic effort docs, read 2026-10-20: Haiku 5.5, Sonnet 4.6 and Opus 4.6
 // take low through max (xhigh is left out, ADR-048), and `none` maps to a
-// clean `thinking: disabled`.
+// clean `thinking: disabled`. Sonnet 5.5 takes the same efforts, with `none`
+// sent as `between_tools` (see thinkingOffType).
 const ANTHROPIC_ADAPTIVE: ModelReasoningSupport = {
   control: 'anthropic-adaptive',
   efforts: ['none', 'low', 'medium', 'high', 'max'],
@@ -75,6 +76,14 @@ export interface ModelMetadata {
    */
   thinkingBoundToPrefix?: boolean;
   /**
+   * The `thinking.type` that reasoning effort `none` sends, when it is not
+   * `disabled`. Sonnet 5.5 returns a 400 for `disabled`. Its `between_tools`
+   * turns off thinking before the first response. Anthropic documents short
+   * thinking between tool calls, though none appeared in 16 live requests on
+   * 2026-10-21 (#2077, #2220).
+   */
+  thinkingOffType?: 'between_tools';
+  /**
    * How the model takes a reasoning effort, and which efforts it honors
    * (ADR-048 §2). Absent when Curia sends it no reasoning setting at all: a
    * tier effort on such a model fails at boot, and a call site's effort is not
@@ -87,7 +96,7 @@ export interface ModelMetadata {
 export type ReasoningControl =
   /** OpenRouter's unified `reasoning: { effort }`; `none` is `{ enabled: false }`. */
   | 'openrouter-effort'
-  /** Anthropic adaptive thinking plus `output_config.effort`; `none` is `thinking: disabled`. */
+  /** Anthropic adaptive thinking plus `output_config.effort`. `none` sends the entry's `thinkingOffType`, or `thinking: disabled` when the entry has no `thinkingOffType`. */
   | 'anthropic-adaptive';
 
 export interface ModelReasoningSupport {
@@ -141,6 +150,48 @@ function bedrockClaudeEntries(): Record<string, ModelMetadata> {
 // Each entry and its nested pricing/capabilities objects are frozen at module
 // load time so getModel()/getAllModels() callers cannot mutate registry state.
 const MODEL_REGISTRY: Record<string, ModelMetadata> = {
+  // Claude 5.5 Opus and Sonnet (#2077). Cache writes are the 5-minute rate.
+  //
+  // Opus 5.5 cannot turn thinking off. The API returns a 400 for `disabled` at
+  // every effort, so its `reasoning` entry leaves out `none`. A call site that
+  // sends `none` gets the model's default thinking.
+  //
+  // Do not set Opus 5.5 as the fast-tier model, the standard-tier model, or
+  // either judge's model. The 10-token classifier runs on the fast-tier model.
+  // The drift detector runs on the standard-tier model at 200 tokens and reads a
+  // failed call as no drift. The judges cap their output at 200 to 1,200 tokens.
+  // Opus 5.5 spends those output caps on thinking.
+  'claude-opus-5-5': {
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+    pricing: {
+      inputPerMToken: 4.00,
+      outputPerMToken: 20.00,
+      cacheCreationPerMToken: 5.00,
+      cacheReadPerMToken: 0.20,
+    },
+    capabilities: ['vision', 'coding', 'large_context', 'streaming', 'tools'],
+    rejectsSamplingParams: true,
+    thinksByDefault: true,
+    thinkingBoundToPrefix: true,
+    reasoning: { control: 'anthropic-adaptive', efforts: ['low', 'medium', 'high', 'max'] },
+  },
+  'claude-sonnet-5-5': {
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+    pricing: {
+      inputPerMToken: 2.00,
+      outputPerMToken: 10.00,
+      cacheCreationPerMToken: 2.50,
+      cacheReadPerMToken: 0.20,
+    },
+    capabilities: ['vision', 'coding', 'large_context', 'streaming', 'tools'],
+    rejectsSamplingParams: true,
+    thinksByDefault: true,
+    thinkingBoundToPrefix: true,
+    thinkingOffType: 'between_tools',
+    reasoning: ANTHROPIC_ADAPTIVE,
+  },
   'claude-opus-4-6': {
     provider: 'anthropic',
     contextWindow: 200_000,
@@ -461,6 +512,11 @@ export class ModelRegistry {
   /** True when the model's registry entry lists this effort. False for unknown models. */
   honorsReasoningEffort(modelId: string, effort: ReasoningEffort): boolean {
     return this.reasoningSupport(modelId)?.efforts.includes(effort) === true;
+  }
+
+  /** The `thinking.type` that reasoning effort `none` sends. `disabled` unless the entry names another. */
+  thinkingOffType(modelId: string): 'disabled' | 'between_tools' {
+    return this.getModel(modelId)?.thinkingOffType ?? 'disabled';
   }
 
   /** True when the model rejects thinking sent back after a prefix change. False for unknown models. */
