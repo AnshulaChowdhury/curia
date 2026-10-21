@@ -45,6 +45,12 @@ import { BrowserSession } from './browser-session.js';
 import type { SessionId } from './types.js';
 import { parseProxyConfig, type ProxyConfig } from './proxy-config.js';
 
+// Xvfb screen and browser window geometry. The window must fit inside the screen: a
+// window bigger than its screen is a fingerprint inconsistency no real device shows.
+// The window is kept short of full-screen so screenshots stay a moderate size. (#2221)
+export const SCREEN_SIZE = { width: 1920, height: 1080 } as const;
+export const WINDOW_SIZE = { width: 1440, height: 900 } as const;
+
 interface BrowserServiceOptions {
   logger: Logger;
   /** Session idle TTL in ms. Default: 1_800_000 (30 minutes) — long enough that a multi-page
@@ -68,6 +74,8 @@ interface BrowserServiceOptions {
   proxy?: string;
   /** Context locale (BCP 47). Default 'en-US'. */
   locale?: string;
+  /** Ordered navigator.languages / Accept-Language list. `locale` is always first. */
+  languages?: string[];
   /** IANA timezone for the context, aligned to the principal. */
   timezone?: string;
   /**
@@ -88,6 +96,7 @@ export class BrowserService {
   // the WebRTC-leak launch flag. Undefined → direct egress.
   private proxy: ProxyConfig | undefined;
   private locale: string;
+  private languages: string[];
   private timezone: string | undefined;
   private contextFactory: () => Promise<BrowserContext>;
 
@@ -115,6 +124,8 @@ export class BrowserService {
   private sessions: Map<SessionId, BrowserSession> = new Map();
   private sweepTimer: NodeJS.Timeout | null = null;
   private xvfbProcess: ChildProcess | null = null;
+  // Window manager + panel running on our Xvfb display (see startDesktopSession).
+  private desktopProcesses: ChildProcess[] = [];
 
   constructor(options: BrowserServiceOptions) {
     this.logger = options.logger.child({ service: 'BrowserService' });
@@ -127,6 +138,7 @@ export class BrowserService {
     this.channel = options.channel && options.channel.length > 0 ? options.channel : undefined;
     this.proxy = parseProxyConfig(options.proxy);
     this.locale = options.locale && options.locale.length > 0 ? options.locale : 'en-US';
+    this.languages = [...new Set([this.locale, ...(options.languages ?? [])])];
     this.timezone = options.timezone;
     this.contextFactory = options.contextFactory ?? (() => this.launchPersistentContext());
   }
@@ -150,8 +162,7 @@ export class BrowserService {
       // must clean up after itself for callers that don't call stop() on failure.
       if (this.xvfbProcess) {
         this.logger.error({ err }, 'Persistent context launch failed — killing the Xvfb display started for it');
-        this.xvfbProcess.kill();
-        this.xvfbProcess = null;
+        this.stopDisplay();
       }
       throw err;
     }
@@ -258,10 +269,7 @@ export class BrowserService {
       }
     }
 
-    if (this.xvfbProcess) {
-      this.xvfbProcess.kill();
-      this.xvfbProcess = null;
-    }
+    this.stopDisplay();
 
     this.logger.info('BrowserService stopped');
   }
@@ -438,11 +446,17 @@ export class BrowserService {
    * The proxy (when configured) is spread here so it applies to BOTH the persistent context
    * (launchPersistentContext) and any incognito context (browser.newContext) — routing all
    * browser egress through, e.g., a residential home-network exit. (residential-proxy support)
+   *
+   * viewport and locale are deliberately absent too (#2221). A Playwright viewport is CDP
+   * device-metrics emulation, which also forces `screen` to the viewport size, so the window
+   * read bigger than its own screen. With no viewport, the page takes the real window
+   * (WINDOW_SIZE) on the real Xvfb screen (SCREEN_SIZE). Playwright's `locale` collapses
+   * navigator.languages to one entry; the --lang / --accept-lang launch flags set the
+   * full list natively instead, and they also cover incognito contexts.
    */
   private buildContextOptions(): BrowserContextOptions {
     return {
-      viewport: { width: 1280, height: 720 },
-      locale: this.locale,
+      viewport: null,
       colorScheme: 'light',
       ...(this.timezone ? { timezoneId: this.timezone } : {}),
       ...(this.proxy ? { proxy: this.proxy } : {}),
@@ -499,7 +513,18 @@ export class BrowserService {
         // a browser-process-level flag, so it also covers incognito contexts spun off this
         // launch. Only added when a proxy is set. (residential-proxy support)
         ...(this.proxy ? ['--force-webrtc-ip-handling-policy=disable_non_proxied_udp'] : []),
+        // A desktop-sized window that sits inside the larger Xvfb screen, so
+        // screen >= availHeight >= outerHeight > innerHeight holds the way it does on a
+        // real device. (#2221)
+        `--window-size=${WINDOW_SIZE.width},${WINDOW_SIZE.height}`,
+        // Locale natively: --lang sets the UI/Intl locale, --accept-lang sets
+        // navigator.languages and the Accept-Language header to the same ordered list. (#2221)
+        `--lang=${this.locale}`,
+        `--accept-lang=${this.languages.join(',')}`,
       ],
+      // On Linux, Chrome takes its ICU (Intl) locale from LANG, not --lang, so without
+      // this Intl reports en-US beside an en-CA navigator.language. (#2221)
+      env: { ...process.env, LANG: `${this.locale.replace('-', '_')}.UTF-8` },
       ...this.buildContextOptions(),
     };
 
@@ -569,7 +594,7 @@ export class BrowserService {
     clearStaleX11Lock({ displayNum: 99, logger: this.logger });
 
     this.logger.info('Spawning Xvfb virtual display on :99');
-    this.xvfbProcess = spawn('Xvfb', [':99', '-screen', '0', '1280x720x24'], {
+    this.xvfbProcess = spawn('Xvfb', [':99', '-screen', '0', `${SCREEN_SIZE.width}x${SCREEN_SIZE.height}x24`], {
       stdio: 'ignore',
       detached: false,
     });
@@ -609,6 +634,63 @@ export class BrowserService {
       setTimeout(() => { cleanup(); resolve(); }, 500);
     });
     this.logger.info('Xvfb started on DISPLAY=:99');
+
+    await this.startDesktopSession();
+  }
+
+  /**
+   * Run a window manager and a panel on our Xvfb display (#2221). Bare Xvfb has no work
+   * area, so screen.availHeight equals screen.height — the `noTaskbar` tell CreepJS counts
+   * toward "like headless". openbox publishes _NET_WORKAREA minus the strut tint2's bottom
+   * panel reserves, and Chrome reports that as the available screen.
+   *
+   * Best-effort: without the binaries the browser still works, just with the tell, so a
+   * failure warns instead of failing start().
+   */
+  private async startDesktopSession(): Promise<void> {
+    const programs: Array<[string, string[]]> = [['openbox', ['--sm-disable']], ['tint2', []]];
+    for (const [command, args] of programs) {
+      const proc = await this.spawnDesktopProcess(command, args);
+      // No point starting the panel without a WM: nothing would turn its strut into a work area.
+      if (!proc) return;
+      this.desktopProcesses.push(proc);
+    }
+    this.logger.info('Window manager and panel started on DISPLAY=:99');
+  }
+
+  /** Spawn one desktop program; resolve it if still running after 500ms, else warn and resolve null. */
+  private spawnDesktopProcess(command: string, args: string[]): Promise<ChildProcess | null> {
+    const proc = spawn(command, args, { stdio: 'ignore', detached: false });
+    return new Promise(resolve => {
+      const settle = (result: ChildProcess | null) => {
+        clearTimeout(timer);
+        proc.off('error', onError);
+        proc.off('close', onClose);
+        resolve(result);
+      };
+      const fail = (reason: string) => {
+        this.logger.warn(
+          { command, reason },
+          'Desktop session program failed to start — screen.availHeight will equal screen.height (a headless fingerprint tell); is it installed in the image?',
+        );
+        settle(null);
+      };
+      const onError = (err: Error) => fail(err.message);
+      const onClose = (code: number | null) => fail(`exited during startup (code ${code ?? 'null'})`);
+      proc.once('error', onError);
+      proc.once('close', onClose);
+      const timer = setTimeout(() => settle(proc), 500);
+    });
+  }
+
+  /** Kill the desktop session and the Xvfb display we spawned, if any. */
+  private stopDisplay(): void {
+    for (const proc of this.desktopProcesses) proc.kill();
+    this.desktopProcesses = [];
+    if (this.xvfbProcess) {
+      this.xvfbProcess.kill();
+      this.xvfbProcess = null;
+    }
   }
 }
 

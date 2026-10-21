@@ -16,6 +16,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Added
 
 - **Claude Sonnet 5.5 and Opus 5.5** — now selectable in config. Opus 5.5 cannot serve as the fast-tier or judge model. (#2220)
+- **KG explorer filter panel** — type and sensitivity checklists hide non-matching nodes and filter search results. (#351)
 - **`llm.call` prefix-guard drops** — **public API:** optional `reasoningBlocksDropped`; suites also print serving endpoints. (#2044)
 - **`archive-extract`** — opens zip and gzip attachments within size and path limits. (#2208)
 - **Sign-in details with secrets** — `secret-capture-request` stores login URL and username; `list-user-secrets` returns them. (#2201)
@@ -43,9 +44,11 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Sign-in verification config** — `verification` section sets ask-channel order, expiry and code lifetimes. (#2017)
 - **Scenarios 24a–24d** — sign-in codes by SMS and email, no leaks, lost session. (#2017)
 - **ADR-050** — external verifications are first-class state; spec 03, 15 and 19 updated. (#2017)
+- **AWS Bedrock provider** — tiers can run Claude on Bedrock; opt-in, off by default. (#1766)
 
 ### Changed
 
+- **KG explorer layout** — nodes spread further apart and labels no longer overlap. (#351)
 - **Console registry** — shows optional capabilities beside a tool's required ones. (#2028)
 - **ADR-048 outcomes** — effort A/B found no winner; the standard tier stays at the model default. (#2044)
 - **`file-parse`** — reads XML, text and Markdown, including by filename extension. (#2208)
@@ -96,6 +99,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Security
 
+- **`fast-uri` floor** — raised to `>=4.2.3`, clearing four upstream-only advisories on the resolved 4.2.1. (#2216)
 - **Archive extraction** — bombs, zip-slip, encryption and nested archives fail closed. (#2208)
 - **Sign-in code scrub** — tracked codes become `[sign-in code]` in notes, reports, memory, sends and replies. (#2017)
 - **Browser code guard** — `web-browser` refuses to type or navigate a sign-in code off its own site. (#2017)
@@ -103,6 +107,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Browser fingerprint** — window fits a 1920×1080 screen with a desktop panel. (#2221)
+- **`browser.languages`** — ordered `navigator.languages` and `Accept-Language` list; `locale` goes first. (#2221)
+
+- **`ceo-inbox-draft-compose`** — recipients follow subject and body, so order-enforcing endpoints stop dropping the To line. (#2209)
 - **Optional capabilities** — a non-array declaration is dropped so the registry drawer still opens. (#2028)
 - **WIP citation scan** — XML fixtures are scanned like other text. (#2208)
 - **Shadow pairing** — a shadow pairs only with a send within 72 hours; each send scores one shadow. (#2195)
