@@ -297,9 +297,14 @@ export class AnthropicProvider implements LLMProvider {
 
     // Thinking counts against max_tokens. A request that will think and set no
     // cap gets room for it; one with a small cap on a model that thinks by
-    // default should have sent `none`, so say so.
+    // default should have sent `none`, so say so. Sonnet 5.5's `between_tools`
+    // skips thinking before its first response but still writes short thinking
+    // blocks between tool calls, so a call with tools at `none` gets the room too.
     const willThink = reasoningEffort === undefined ? thinksByDefault : reasoningEffort !== 'none';
-    if (willThink && callerMaxTokens === undefined) {
+    const thinksBetweenTools = reasoningEffort === 'none'
+      && this.modelRegistry.thinkingOffType(model) === 'between_tools'
+      && tools !== undefined && tools.length > 0;
+    if ((willThink || thinksBetweenTools) && callerMaxTokens === undefined) {
       createParams.max_tokens = Math.max(createParams.max_tokens, THINKING_MAX_TOKENS);
     } else if (willThink && callerMaxTokens !== undefined && callerMaxTokens < MIN_THINKING_MAX_TOKENS) {
       this.logger.warn(

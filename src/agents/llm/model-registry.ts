@@ -77,8 +77,9 @@ export interface ModelMetadata {
   thinkingBoundToPrefix?: boolean;
   /**
    * The `thinking.type` that reasoning effort `none` sends, when it is not
-   * `disabled`. Sonnet 5.5 returns a 400 for `disabled` and turns thinking off
-   * with `between_tools` (#2077).
+   * `disabled`. Sonnet 5.5 returns a 400 for `disabled`. Its `between_tools`
+   * turns off thinking before the first response, but the model still writes
+   * short thinking blocks between tool calls (#2077).
    */
   thinkingOffType?: 'between_tools';
   /**
