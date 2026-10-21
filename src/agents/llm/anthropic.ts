@@ -302,10 +302,10 @@ export class AnthropicProvider implements LLMProvider {
     // thinking between tool calls, though none appeared in 16 live requests on
     // 2026-10-21, so a call with tools at `none` gets the room as a precaution.
     const willThink = reasoningEffort === undefined ? thinksByDefault : reasoningEffort !== 'none';
-    const thinksBetweenTools = reasoningEffort === 'none'
+    const needsThinkingRoom = willThink || (reasoningEffort === 'none'
       && this.modelRegistry.thinkingOffType(model) === 'between_tools'
-      && tools !== undefined && tools.length > 0;
-    if ((willThink || thinksBetweenTools) && callerMaxTokens === undefined) {
+      && tools !== undefined && tools.length > 0);
+    if (needsThinkingRoom && callerMaxTokens === undefined) {
       createParams.max_tokens = Math.max(createParams.max_tokens, THINKING_MAX_TOKENS);
     } else if (willThink && callerMaxTokens !== undefined && callerMaxTokens < MIN_THINKING_MAX_TOKENS) {
       this.logger.warn(

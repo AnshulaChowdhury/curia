@@ -504,11 +504,14 @@ describe('AnthropicProvider — claude-sonnet-5-5 and claude-opus-5-5 request sh
     const tools = [{ name: 'search', description: 'Search', input_schema: { type: 'object' as const, properties: {} } }];
     await provider.chat({ model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'Hello' }], tools, options: { reasoning: NO_REASONING } });
     await provider.chat({ model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'Hello' }], options: { reasoning: NO_REASONING } });
+    await provider.chat({ model: 'claude-haiku-5-5', messages: [{ role: 'user', content: 'Hello' }], tools, options: { reasoning: NO_REASONING } });
 
-    const [withTools, withoutTools] = [mockCreate.mock.calls[0]![0], mockCreate.mock.calls[1]![0]];
+    const [withTools, withoutTools, haikuWithTools] = [0, 1, 2].map(i => mockCreate.mock.calls[i]![0]);
     expect(withTools.thinking).toEqual({ type: 'between_tools' });
     expect(withTools.max_tokens).toBe(THINKING_MAX_TOKENS);
     expect(withoutTools.max_tokens).toBeLessThan(THINKING_MAX_TOKENS);
+    expect(haikuWithTools.thinking).toEqual({ type: 'disabled' });
+    expect(haikuWithTools.max_tokens).toBeLessThan(THINKING_MAX_TOKENS);
   });
 
   it('sends Opus 5.5 no thinking key for NO_REASONING, which it cannot honor', async () => {
