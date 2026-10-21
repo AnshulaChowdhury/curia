@@ -24,7 +24,7 @@ gone). `mergeEntities` is the wrong foundation for a user-driven merge:
 
 The contact merge also loses data around the contact. A merge cascade-deletes
 `contact_calendars`, `grant_recommendations` and `conversation_resolved_entities`, nulls
-`held_messages`, `tasks.waiting_on_contact_id`, `voice_sessions` and `working_memory`
+`tasks.waiting_on_contact_id`, `voice_sessions` and `working_memory`
 references, leaves `originator.contactId` stale, and never carries the canonical
 attributes (title, organization, timezone, …) across. #1695 made the write sequence
 transactional but did not touch these.
@@ -153,7 +153,7 @@ apply that lacks it (400 `ack_required`) however the client behaves.
 A new `reattachContactReferences(secondaryId, primaryId, client)` re-points, inside the
 merge transaction: `contact_calendars` (demoting the moved rows' `is_primary` when the
 primary already has one), `grant_recommendations` (dropping permissions the primary already
-has), `conversation_resolved_entities`, `held_messages.resolved_contact_id`,
+has), `conversation_resolved_entities`,
 `tasks.waiting_on_contact_id`, `voice_sessions.caller_contact_id`,
 `working_memory.sender_contact_id`, and the `originator.contactId` JSONB field in `tasks`,
 `scheduled_jobs`, `bullpen_threads`, `secret_capture_tokens` and `pending_delegations`. The

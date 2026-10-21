@@ -21,14 +21,14 @@ If `WEB_APP_BOOTSTRAP_SECRET` is missing, the KG API routes are not registered a
 ## API surface
 
 - `GET /api/kg/nodes`
-  - Query params: `query`, `type`, `limit`
-  - Purpose: label/property text search and browsing. Archived nodes (including merge tombstones) are excluded. Each node carries `aliases` and `identitySource`.
+  - Query params: `query`, `type`, `limit`, `exclude_facts`
+  - Purpose: label, alias and property text search and browsing. Archived nodes (including merge tombstones) are excluded; `exclude_facts=true` also drops `fact` nodes. Each node carries `aliases` and `identitySource`.
 
 - `GET /api/kg/graph`
   - Query params: `node_id`, `depth`, `limit`
   - Purpose: neighborhood traversal for a selected node; falls back to recent nodes when no `node_id` is provided.
   - A well-formed `node_id` that names no `kg_nodes` row → `404 { error: "Node not found: <id>" }`. An isolated node (exists, no edges) → `200` with that node in `nodes` and `edges: []` (#1881).
-  - A `node_id` that is an archived merge tombstone → `404 { error, code: "node_merged", mergedInto }` (#2233).
+  - A `node_id` that is an archived merge tombstone → `404 { error, code: "node_merged", mergedInto, label }` (#2233). Merge tombstones and their edges never appear in graph results or traversal. Each graph node carries `aliases` and `archived`.
 
 - `GET /api/kg/nodes/:id/merge-candidates`
   - Query params: `limit` (default 8, max 20)
@@ -86,15 +86,16 @@ A deep link to the absorbed node's id receives `404 node_merged`; the console fo
 | 404 | `node_not_found` | A node is missing or archived |
 | 409 | `stale_preview` | The plan token no longer matches |
 | 422 | `blocked` | One or more blockers (`blockers` lists them) |
+| 503 | `unavailable` | The merge service is not wired on this server |
 
 `GET /api/kg/nodes/:id/merge-candidates` returns `{ candidates: [{ node, score, reasons }] }` for live non-fact nodes of any type: a case-insensitive label or alias match scores 1.0, and an embedding cosine of at least 0.80 scores the similarity.
 
 ### Survivorship (summary)
 
 - **Node.** The survivor keeps its id and type. The label is the user's choice (the other becomes an alias); aliases are unioned and capped at `MAX_ALIASES_PER_ENTITY`; properties are unioned, and a key with different values is a conflict (default: newer `last_confirmed_at`, survivor on a tie). Confidence, `last_confirmed_at` and `sensitivity` take the max (sensitivity never goes down), `decay_class` the most durable, `created_at` the min.
-- **Facts.** Attribute facts with the same value collapse; different values are a conflict (survivor, absorbed or both; a dropped value is appended to `previous_values`). Exact and near-duplicate (cosine at least `DEDUP_SIMILARITY_THRESHOLD`) non-attribute facts collapse. Every other absorbed fact moves to the survivor unchanged, with no re-embedding.
+- **Facts.** Attribute facts with the same value collapse; different values are a conflict (survivor, absorbed or both; a dropped value is appended to `previous_values`, and the kept fact takes the higher sensitivity of the two). Exact and near-duplicate (cosine at least `DEDUP_SIMILARITY_THRESHOLD`) non-attribute facts collapse. Every other absorbed fact moves to the survivor unchanged, with no re-embedding.
 - **Edges.** An edge between the two nodes is dropped, an edge that collides with a survivor edge is collapsed, and the rest are re-pointed.
-- **Contacts.** By survivor type: a `person` survivor folds all contacts into one (see spec 09, *Merging contacts*); an `organization` survivor re-points the absorbed contacts without merging them; any other type refuses an absorbed node that has contacts.
+- **Contacts.** By survivor type: a `person` survivor folds all contacts into one (see spec 09, *Merging contacts*); an `organization` survivor re-points the absorbed contacts without merging them; any other type refuses an absorbed node that has contacts. When several folded contacts disagree and the survivor has no value, a denied override beats a grant and the earliest contact wins a field; a `contacts_disagree` warning lists each case.
 - **Guards.** The agent node blocks a merge on either side; the principal's node cannot be the absorbed side; as survivor it needs the identity-transfer acknowledgement.
 - **Absorbed node.** Archived as a tombstone with `properties.merged_into` and `merged_at`, not deleted.
 

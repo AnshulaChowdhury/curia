@@ -603,7 +603,7 @@ All contact mutations are audit-logged. The Coordinator confirms changes with th
   - `contact_calendars` (moved rows are demoted from `is_primary` when the primary already has a primary calendar);
   - `grant_recommendations` (a permission the primary already has is dropped);
   - `conversation_resolved_entities`;
-  - `held_messages.resolved_contact_id`, `tasks.waiting_on_contact_id`, `voice_sessions.caller_contact_id` and `working_memory.sender_contact_id`;
+  - `tasks.waiting_on_contact_id`, `voice_sessions.caller_contact_id` and `working_memory.sender_contact_id`;
   - the `originator.contactId` field on `tasks`, `scheduled_jobs`, `bullpen_threads`, `secret_capture_tokens` and `pending_delegations`.
 
 A structural contact (principal, agent) is never deleted or downgraded (see *Tier & Kind*). After the commit, the KG nodes are folded best-effort through `EntityMemory.mergeEntities`, and the `contact.merged` event is published.
