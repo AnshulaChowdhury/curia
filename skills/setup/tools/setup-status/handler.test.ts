@@ -282,7 +282,7 @@ describe('setup-status', () => {
       expect(data.tasks.find(t => t.id === 'email')?.status).toBe('done');
       expect(data.tasks.find(t => t.id === 'web_research')?.status).toBe('done');
       expect(data.tasks.find(t => t.id === 'signal')?.status).toBe('pending');
-      expect(data.tasks.find(t => t.id === 'kg_memory')?.status).toBe('pending');
+      expect(data.tasks.find(t => t.id === 'kg_memory')).toBeUndefined();
     });
   });
 });

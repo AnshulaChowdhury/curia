@@ -160,6 +160,9 @@ describe('registry-defaults.yaml on a fresh install (#1974)', () => {
       'contact-set-role', 'contact-set-tier', 'contact-dedup-exclude',
       'scan-grant-recommendations', 'approve-grant-recommendation', 'decline-grant-recommendation',
       'context-bridge-clear',
+      // Fail closed on a missing entityMemory capability instead of gating on a vault key
+      // that an install using its own embedding endpoint never holds (#2023).
+      'query-relationships', 'delete-relationship',
     ]) {
       expect(enabled.tools.has(tool), tool).toBe(true);
     }
@@ -169,7 +172,7 @@ describe('registry-defaults.yaml on a fresh install (#1974)', () => {
     const enabled = await freshInstall('bare');
     const calendar = bundleMembers.get('calendar') ?? [];
     expect(calendar.length).toBeGreaterThan(0);
-    for (const tool of ['web-search', 'query-relationships', 'delete-relationship']) {
+    for (const tool of ['web-search']) {
       expect(toolManifests.get(tool)?.requiresSecrets.length, `${tool} declares requires_secrets`).toBeGreaterThan(0);
       expect(enabled.tools.has(tool), tool).toBe(false);
     }

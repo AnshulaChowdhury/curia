@@ -1203,8 +1203,8 @@ async function main(): Promise<void> {
       // principal grant, resolved above), so they don't sit in contacts/meeting-debrief
       // tool lists failing closed. Gated on the BUILT client rather than vault key names
       // because the key resolves from three sources (channel key, env, legacy key).
-      // entityMemory is deliberately not listed: memory-*/setup-* have always been enabled
-      // without OpenAI and fail closed; the KG relationship tools gate on openai_api_key.
+      // entityMemory is deliberately not listed: the memory-* and setup-* tools are enabled
+      // without an embedding source and fail closed when entity memory is off.
       unavailableCapabilities: new Set(nylasCalendarClient ? [] : ['nylasCalendarClient']),
       defaults: registryDefaults,
       logger,
