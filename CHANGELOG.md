@@ -55,6 +55,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Scenarios 24a–24d** — sign-in codes by SMS and email, no leaks, lost session. (#2017)
 - **ADR-050** — external verifications are first-class state; spec 03, 15 and 19 updated. (#2017)
 - **AWS Bedrock provider** — tiers can run Claude on Bedrock; opt-in, off by default. (#1766)
+- **KG node merge** — merge duplicate or mistyped knowledge-graph nodes from the console, with previewed conflicts. (#2233)
 
 ### Changed
 
@@ -144,6 +145,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Scenario 18 stubs** — a task note or brief on the renewal deadline no longer trips the stub gate. (#2150)
 - **Fork PR CI** — `ci` and Semgrep reach their steps on fork PRs, pulling anonymously without Docker Hub secrets. (#2153)
 - **Approval attribution** — resolve tools record `coordinator`; only reaction decisions count as principal feedback. (#2159)
+- **Contact merge** — keeps calendars, grant recommendations and task or message references instead of dropping them. (#2233)
 
 ### Security
 
