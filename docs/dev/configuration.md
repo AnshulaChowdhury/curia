@@ -29,7 +29,16 @@ model_routing:
   default_tier: standard
 ```
 
-`reasoning.effort` applies to agent turns on that tier; the judges, infra skills, scoring, summarization and voice set their own. Boot fails if the tier's model does not list the effort in the model registry: DeepSeek V4.1 Flash takes `low`, `high` and `max`; Haiku 5.5, Sonnet 4.6 and Opus 4.6 take `none` through `max`; Haiku 4.5 takes no effort setting at all. Unset means the provider's default, so Haiku 5.5 thinks adaptively at `medium`. On those Anthropic models an effort turns on adaptive thinking with summarized display; `none` turns thinking off.
+`reasoning.effort` applies to agent turns on that tier; the judges, infra skills, scoring, summarization and voice set their own. Boot fails if the tier's model does not list the effort in the model registry. Each model lists these efforts:
+
+- DeepSeek V4.1 Flash takes `low`, `high` and `max`.
+- Haiku 5.5, Sonnet 5.5, Sonnet 4.6 and Opus 4.6 take `none` through `max`.
+- Opus 5.5 takes `low` through `max`, because it cannot turn thinking off.
+- Haiku 4.5 takes no effort setting.
+
+Unset means the provider's default, so Haiku 5.5 thinks adaptively at `medium`. On the Anthropic models, an effort turns on adaptive thinking with summarized display. `none` turns thinking off, on the models that accept it.
+
+Do not set Opus 5.5 as the fast-tier model or as either judge's model. The 10-token classifier runs on the fast-tier model. The judges cap their output at 200 to 1,200 tokens. Opus 5.5 spends those output caps on thinking.
 
 ### `channels`
 
