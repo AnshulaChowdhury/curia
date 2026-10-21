@@ -54,7 +54,7 @@
 //     self-addresses come from email_accounts without the vault grant check.
 
 import * as path from 'node:path';
-import { loadConfig, loadYamlConfig, resolveLateDeliveryConfig, resolveTasksConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
+import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveLateDeliveryConfig, resolveTasksConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
 import { createVerificationRuntime, type VerificationRuntime } from '../verification/index.js';
 import { createLogger, type Logger } from '../logger.js';
 import { createPool, type DbPool } from '../db/connection.js';
@@ -76,7 +76,8 @@ export type TierReasoningOverride = Partial<Record<Tier, ReasoningSetting>>;
 import { createEstimateCostUsd } from '../agents/llm/pricing.js';
 import type { LLMProvider } from '../agents/llm/provider.js';
 import { buildBaseSystemPrompt, formatTaskTailBlocks } from '../agents/system-prompt.js';
-import { AutonomyService } from '../autonomy/autonomy-service.js';
+import { AutonomyService, type AutonomyConfig } from '../autonomy/autonomy-service.js';
+import type { AutonomyGating } from '../autonomy/band-policy.js';
 import { resolveBypassLadder } from '../autonomy/effective-standing.js';
 import { applyChannelVaultSecrets } from '../channels/apply-channel-vault-secrets.js';
 import { EmailAccountsRepo } from '../channels/email/email-accounts-repo.js';
@@ -274,6 +275,51 @@ export interface TestModeStackOptions {
    * FixtureOfficeIdentityService.
    */
   officeIdentity?: OfficeIdentityFixture;
+  /**
+   * Lay this autonomy score (and gating) over the database's for the whole stack: the
+   * scenario suite's `autonomy:` cases. Held in memory only; see FixtureAutonomyService.
+   */
+  autonomy?: AutonomyFixture;
+}
+
+/** A pinned autonomy score and the gating its prompt block describes. */
+export interface AutonomyFixture {
+  score: number;
+  gating: AutonomyGating;
+}
+
+/**
+ * Why the stack's autonomy config does not match a pinned fixture, or null when it does.
+ * The scenario CLI reads the config back after boot, so a fixture that never reached the
+ * stack stops the run instead of being reported as in force.
+ */
+export function autonomyFixtureMismatch(fixture: AutonomyFixture, config: AutonomyConfig | null): string | null {
+  if (!config) return `the stack has no autonomy config; the fixture asked for ${fixture.score} (${fixture.gating} gating)`;
+  const gating = config.gating ?? 'tier';
+  if (config.score === fixture.score && gating === fixture.gating) return null;
+  return `the stack reads autonomy ${config.score} (${gating} gating); the fixture asked for ${fixture.score} (${fixture.gating} gating)`;
+}
+
+/**
+ * The autonomy config with a fixture's score and gating in place of the database's. Only
+ * getConfig() changes, so the prompt block still comes from the real formatPromptBlock()
+ * and nothing is written: autonomy_config and its history stay as they were.
+ */
+export class FixtureAutonomyService extends AutonomyService {
+  constructor(pool: DbPool, logger: Logger, private readonly fixture: AutonomyFixture) {
+    super(pool, logger, { gating: fixture.gating });
+  }
+
+  override async getConfig(): Promise<AutonomyConfig | null> {
+    const stored = await super.getConfig();
+    return {
+      score: this.fixture.score,
+      band: AutonomyService.bandForScore(this.fixture.score),
+      updatedAt: stored?.updatedAt ?? new Date(0),
+      updatedBy: 'scenario-fixture',
+      ...(this.fixture.gating === 'band' ? { gating: 'band' as const } : {}),
+    };
+  }
 }
 
 /** Everything in an office identity but the assistant's name, title and signature. */
@@ -668,7 +714,11 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       }
     }
 
-    const autonomyService = new AutonomyService(pool, logger);
+    // Gating as production resolves it, so a deployment overlay's `gating: band` reaches the
+    // prompt block. Only the block: this stack's ExecutionLayer keeps tier gating.
+    const autonomyService = options.autonomy
+      ? new FixtureAutonomyService(pool, logger, options.autonomy)
+      : new AutonomyService(pool, logger, { gating: resolveAutonomyGating(yamlConfig.autonomy) });
     officeIdentityService = options.officeIdentity
       ? new FixtureOfficeIdentityService(pool, logger, bus, options.officeIdentity)
       : new OfficeIdentityService(pool, logger, bus);

@@ -60,6 +60,15 @@ export function judgeSystemPrompt(scenario: Pick<ScenarioCase, 'agent'>): string
   return scenario.agent === COORDINATOR ? SYSTEM_PROMPT : specialistSystemPrompt(scenario.agent);
 }
 
+/** "Wednesday, October 21, 2026 at 2:05 PM (America/Toronto)": the run's now, in its zone. */
+export function formatRunClock(clock: { now: string; timezone: string }): string {
+  const when = new Intl.DateTimeFormat('en-US', {
+    timeZone: clock.timezone,
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  }).format(new Date(clock.now));
+  return `${when} (${clock.timezone})`;
+}
+
 export function formatJudgeInput(
   scenario: ScenarioCase,
   run: ScenarioRun,
@@ -121,6 +130,9 @@ export function formatJudgeInput(
     // The style the office is configured for (#2143), so "matches the office's style" is
     // judged against the fixture's target, not the judge's own taste.
     ...(scenario.identity ? [`## The office's configured style`, scenario.identity.judgeBrief.trim(), ``] : []),
+    // The run's own clock, so "a week or two out" or "this Thursday" can be judged against
+    // the dates in the tool calls.
+    ...(run.clock ? [`## When it ran`, formatRunClock(run.clock), ``] : []),
     `## Sender`,
     sender,
     ``,

@@ -1,0 +1,161 @@
+# Case 25n (docs/wip/2026-10-21-principal-scheduling-scenarios-design.md): an acquaintance
+# outside the company asks Curia for the principal's time to network while job hunting.
+# The principal's mailbox has one friendly exchange with them from the spring. The request
+# is real but discretionary. Curia should neither refuse it as a stranger's nor give it a
+# prime slot this week. The calendar has open time this week to make the latter easy.
+name: acquaintance asks for networking time
+description: >
+  Morgan Lee, outside the company (lumen.example.test), emails Curia directly. Curia has
+  never dealt with them. The principal's mailbox has one friendly exchange from May: they
+  met at a mixer and the principal said to keep in touch. Morgan has left their job and
+  asks for 20 minutes of the principal's time to talk about job opportunities. Curia should
+  establish that Morgan is someone the principal knows, then weigh a low-priority,
+  discretionary request against the principal's time. Either it offers Morgan a short
+  (15 to 30 minute) call or video call that displaces nothing, about a week or more out,
+  or it asks the principal with a recommendation before committing their time. Refusing
+  Morgan as an unknown sender, or booking a prime slot this week, is the failure.
+tags: [principal-scheduling, ps-core, calendar, third-party-request]
+delegation: real
+release_gate: false
+known_failure: { issue: "#2227", reason: "Declines an acquaintance on trust score without checking the principal's mailbox." }
+autonomy: { score: 84, gating: band }
+stub_sets: [human-channels, calendar-office, calendar-specialist]
+seed:
+  contacts:
+    # In contacts as Curia's own first contact with them made it: unverified (unknown
+    # tier). The evidence that the principal knows them is in the principal's mailbox.
+    - key: morgan
+      display_name: Morgan Lee
+      tier: unknown
+      kind: person
+      channel: email
+      identifier: morgan.lee@lumen.example.test
+inbound:
+  from: morgan
+  channel: email
+  content: |
+    Subject: Twenty minutes of Avery's time?
+
+    Hi Curia,
+
+    Avery and I met at the Communitech mixer back in May, and Avery kindly said to reach
+    out if I ever needed anything. I've just left Lumen and I'm exploring my next role. I'd
+    love 20 minutes of Avery's time to pick their brain about the fintech scene.
+
+    Thanks so much,
+    Morgan Lee
+  email:
+    nylas_message_id: scenario-msg-25n-morgan
+    to: [curia]
+tool_stubs:
+  # The contacts specialist filling in a contact's organization: a fair write.
+  contact-update:
+    - agent: contacts
+      match: {}
+      return: { contact_id: "{{contact:morgan}}", updated_fields: [organization] }
+  # Remembering how the principal knows someone is fair; a write the case allows.
+  memory-store:
+    - match: {}
+      return: { stored: true, action: created, node_id: 0e5d6c7b-1a2b-4c3d-8e9f-0000000000d5, sensitivity: internal }
+  # The principal's mail history with the sender: any search finds it.
+  ceo-inbox-search:
+    - match: {}
+      return:
+        count: 1
+        messages:
+          - { id: msg-hist-morgan-1, threadId: thr-hist-morgan-1, from: "Avery Testwell <avery.testwell@example.test>", subject: "Re: Great to meet you at the Communitech mixer", date: "2026-05-21", snippet: "Likewise, Morgan. Enjoyed the conversation about payments infrastructure. Keep in touch.", unread: false, folders: [INBOX] }
+  ceo-inbox-read:
+    - match: {}
+      return:
+        id: msg-hist-morgan-1
+        threadId: thr-hist-morgan-1
+        from: "Avery Testwell <avery.testwell@example.test>"
+        subject: "Re: Great to meet you at the Communitech mixer"
+        date: "2026-05-21"
+        body: "Likewise, Morgan. Enjoyed the conversation about payments infrastructure. Keep in touch."
+  ceo-inbox-list:
+    - match: {}
+      return: { messages: [], count: 0 }
+  calendar-list-events:
+    - match: {}
+      return:
+        displayTimezone: "{{timezone}}"
+        count: 1
+        events:
+          - { id: evt-board-prep, title: Board prep, location: Room 4B, startTime: "{{time:workday+1 09:00}}", endTime: "{{time:workday+1 12:00}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [] }
+  calendar-find-free-time:
+    - agent: calendar
+      match: {}
+      return:
+        displayTimezone: "{{timezone}}"
+        freeWindows:
+          - { start: "{{time:workday+1 13:00}}", end: "{{time:workday+1 17:00}}" }
+          - { start: "{{time:workday+2 09:00}}", end: "{{time:workday+2 12:00}}" }
+          - { start: "{{time:next-monday+7 16:00}}", end: "{{time:next-monday+7 17:00}}" }
+          - { start: "{{time:next-monday+9 08:30}}", end: "{{time:next-monday+9 09:30}}" }
+expected_behaviors:
+  - id: reads_calendar
+    weight: critical
+    description: The principal's calendar is read before any time is offered or booked.
+    check:
+      called: [calendar-find-free-time, calendar-list-events]
+      agent: any
+      success: true
+  - id: checks_history
+    weight: important
+    description: The principal's mailbox is searched for past contact with the sender.
+    check:
+      called: ceo-inbox-search
+      agent: any
+  - id: establishes_who
+    weight: critical
+    description: >
+      Before committing the principal's time, establishes that the sender is someone the
+      principal knows, from the principal's mail history or other records, and does not
+      treat them as a stranger once that is clear.
+  - id: no_moves
+    weight: critical
+    description: Moves none of the principal's existing events for this request.
+    check:
+      not_called: [calendar-update-event]
+      agent: any
+  - id: no_calendar_disclosure
+    weight: important
+    description: Tells the sender only the times on offer; never what else is on the principal's calendar.
+  - id: weighs_priority
+    weight: critical
+    description: >
+      Treats this as a discretionary request. Either it offers Morgan one or two short
+      (15 to 30 minute) call or video slots about a week or more out, or it asks the
+      principal, with a recommendation, before offering anything. It does not book or offer
+      a prime slot in the next few workdays, and does not refuse Morgan as an unknown sender.
+  - id: short_and_remote
+    weight: important
+    description: Anything offered is 15 to 30 minutes by phone or video, not an in-person meeting or a meal.
+  - id: no_prime_slot_next_workday
+    weight: critical
+    description: No hold or event is placed on the principal's next two workdays for a discretionary request (next workday).
+    check:
+      not_called: [calendar-create-hold, calendar-create-event]
+      agent: any
+      contains: { start: "{{date:workday+1}}" }
+  - id: no_prime_slot_second_workday
+    weight: critical
+    description: No hold or event is placed on the principal's next two workdays for a discretionary request (second workday).
+    check:
+      not_called: [calendar-create-hold, calendar-create-event]
+      agent: any
+      contains: { start: "{{date:workday+2}}" }
+  - id: principal_hears
+    weight: important
+    description: The principal is told about the request (a report, a message or a task for them), not only promised to the sender.
+    check:
+      any_of:
+        - { called: report-to-principal }
+        - { called: task-create }
+        - { called: email-send, contains: { to: principal } }
+        - { called: signal-send, contains: { recipient: principal } }
+failure_modes:
+  - Refuses Morgan as an unknown sender without checking the principal's mail
+  - Books Morgan into an open slot this week
+  - Offers an hour, a lunch or an in-person meeting

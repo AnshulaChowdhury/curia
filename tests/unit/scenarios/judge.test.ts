@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { emptyBreakdown, UsageLedger } from '../../shared/usage.js';
-import { createJudge, extractJsonObject, formatJudgeInput, judgeRun, meterJudgeResponse, parseJudgeResponse } from '../../scenarios/judge.js';
+import { createJudge, extractJsonObject, formatJudgeInput, formatRunClock, judgeRun, meterJudgeResponse, parseJudgeResponse } from '../../scenarios/judge.js';
 import type { ExpectedBehavior, ScenarioCase, ScenarioRun } from '../../scenarios/types.js';
 
 const behaviors: ExpectedBehavior[] = [
@@ -70,6 +70,36 @@ describe('formatJudgeInput', () => {
     expect(reply).toBeGreaterThan(-1);
     expect(note).toBeGreaterThan(reply);
     expect(text.slice(note)).toContain('Dana asked whether the CFO joins.');
+  });
+});
+
+describe('formatJudgeInput with the run clock', () => {
+  const scenario: ScenarioCase = {
+    name: 'clock', description: 'Coffee in a week or two.', tags: [], agent: 'coordinator', delegation: 'stubbed', releaseGate: true, sourceFile: 'x.yaml',
+    seed: { contacts: [], outboundContext: [], bullpen: [], verifications: [], principalIdentities: [] },
+    inbound: { from: 'principal', content: 'Coffee in a week or two?' },
+    toolStubs: {}, explicitStubTools: [], ownStubTools: [], expectedBehaviors: behaviors, failureModes: [],
+  };
+  const run: ScenarioRun = {
+    runIndex: 0, inboundContent: 'Coffee in a week or two?', refs: {}, durationMs: 1, unstubbedCalls: 0, usage: emptyBreakdown(), providerRetries: [],
+    reply: 'Sent Dana three times.', toolCalls: [],
+  };
+
+  it('formats the run clock in its own timezone', () => {
+    expect(formatRunClock({ now: '2026-10-21T18:05:00.000Z', timezone: 'America/Toronto' }))
+      .toBe('Wednesday, October 21, 2026 at 2:05 PM (America/Toronto)');
+  });
+
+  it('tells the judge when the run happened, before the transcript', () => {
+    const text = formatJudgeInput(scenario, { ...run, clock: { now: '2026-10-21T18:05:00.000Z', timezone: 'America/Toronto' } }, behaviors);
+    const when = text.indexOf('## When it ran');
+    expect(when).toBeGreaterThan(-1);
+    expect(when).toBeLessThan(text.indexOf('## Tool calls'));
+    expect(text.slice(when)).toContain('Wednesday, October 21, 2026');
+  });
+
+  it('says nothing about time for a run without a clock', () => {
+    expect(formatJudgeInput(scenario, run, behaviors)).not.toContain('## When it ran');
   });
 });
 

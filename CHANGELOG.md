@@ -25,6 +25,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`llm.call` reasoning fields** — **public API:** optional `reasoningTokens`, `reasoningEffort`, `upstreamProvider` on the bus event. (#2044)
 - **Suite reasoning metrics** — smoke and scenarios print reasoning tokens and latency p50/p90 per agent. (#2044)
 - **Style scenarios** — seven cases score reply length, filler and register under a fixed office identity. (#2143)
+- **Principal scheduling scenarios** — fourteen on-demand cases for CC'd, forwarded and booking-link scheduling requests.
+- **Scenario harness** — CC'd email envelopes, per-case autonomy score, `workday+N` dates, and the run date for the judge.
 - **Report queue** — new `principal.report` bus event and `reports` tools collect digest items. (#2159)
 - **Weekly fallback digest** — sent when queued items go a week unreported. (#2159)
 - **`deliver-approval`** — sends a pending approval on one chosen channel; undelivered ones email after 15 minutes. (#2159)
@@ -107,6 +109,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Test-mode autonomy gating** — suites now describe autonomy bands per `autonomy.gating`, as production does.
 - **Browser fingerprint** — window fits a 1920×1080 screen with a desktop panel. (#2221)
 - **`browser.languages`** — ordered `navigator.languages` and `Accept-Language` list; `locale` goes first. (#2221)
 

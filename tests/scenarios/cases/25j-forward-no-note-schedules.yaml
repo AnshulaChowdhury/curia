@@ -1,0 +1,100 @@
+# Case 25j (docs/wip/2026-10-21-principal-scheduling-scenarios-design.md): the principal
+# forwards Curia an email asking to meet and adds nothing. No guidance covers a bare
+# forward, and PRINCIPAL_REPLY_SHAPED (src/agents/prompts/turn-guidance.ts) leans toward
+# asking what the principal means. Curia should run with it: the forward is the request.
+name: forward with no note schedules the meeting
+description: >
+  The principal forwards Curia an email from Marco Bellini, a known contact. Marco asks for
+  30 minutes next week to walk the principal through pilot results. The principal adds no
+  note. Curia should treat the forward as "please set this up". It should check the
+  calendar, email Marco offering two or three 30-minute times next week (a call or video
+  call), and let the principal know briefly that it is handling it. Asking the principal
+  what they want done, or only summarizing the email, is the failure.
+tags: [principal-scheduling, ps-core, calendar, email-forward]
+delegation: real
+release_gate: false
+known_failure: { issue: "#2227", reason: "Treats a bare forward as FYI and asks the principal instead of reaching the counterpart." }
+autonomy: { score: 84, gating: band }
+stub_sets: [human-channels, calendar-office, calendar-specialist]
+seed:
+  contacts:
+    - key: marco
+      display_name: Marco Bellini
+      tier: known
+      kind: person
+      channel: email
+      identifier: marco.bellini@pilotwave.example.test
+inbound:
+  from: principal
+  channel: email
+  content: |
+    Subject: Fwd: Pilot results walkthrough
+
+    ---------- Forwarded message ---------
+    From: Marco Bellini <marco.bellini@pilotwave.example.test>
+    Date: {{day:today-1}}
+    Subject: Pilot results walkthrough
+    To: Avery Testwell <avery.testwell@example.test>
+
+    Hi Avery,
+
+    The six-week pilot wrapped on Friday and the numbers look strong: a 31% cut in manual
+    reconciliation time across both sites. I'd love 30 minutes next week to walk you
+    through the results and talk about what a broader rollout could look like.
+
+    Best,
+    Marco
+  email:
+    nylas_message_id: scenario-msg-25j-fwd-marco
+    to: [curia]
+tool_stubs:
+  # The contacts specialist filling in a contact's organization: a fair write.
+  contact-update:
+    - agent: contacts
+      match: {}
+      return: { contact_id: "{{contact:marco}}", updated_fields: [organization] }
+  # Remembering how the principal knows someone is fair; a write the case allows.
+  memory-store:
+    - match: {}
+      return: { stored: true, action: created, node_id: 0e5d6c7b-1a2b-4c3d-8e9f-0000000000d5, sensitivity: internal }
+  calendar-find-free-time:
+    - agent: calendar
+      match: {}
+      return:
+        displayTimezone: "{{timezone}}"
+        freeWindows:
+          - { start: "{{time:next-monday 10:00}}", end: "{{time:next-monday 11:30}}" }
+          - { start: "{{time:next-monday+1 14:00}}", end: "{{time:next-monday+1 16:00}}" }
+          - { start: "{{time:next-monday+3 09:30}}", end: "{{time:next-monday+3 11:00}}" }
+expected_behaviors:
+  - id: reads_calendar
+    weight: critical
+    description: The principal's calendar is read before times are offered.
+    check:
+      called: [calendar-find-free-time, calendar-list-events]
+      agent: any
+      success: true
+  - id: emails_marco
+    weight: critical
+    description: >
+      Emails Marco (by his contact ID) with the times, and the send succeeds. A saved draft
+      waits for the principal, so it does not count.
+    check:
+      called: email-send
+      success: true
+      contains: { to: "{{contact:marco}}" }
+  - id: offers_next_week_30_min
+    weight: critical
+    description: Offers Marco two or three 30-minute times next week, by call or video call.
+  - id: does_not_ask_what_to_do
+    weight: critical
+    description: >
+      Does not ask the principal what they want done with the forward, and does not stop at
+      a summary of Marco's email.
+  - id: tells_principal
+    weight: important
+    description: Tells the principal briefly that it has reached out to Marco with times.
+failure_modes:
+  - Replies to the principal "What would you like me to do with this?"
+  - Summarizes Marco's email and stops
+  - Drafts a reply for the principal to send instead of reaching Marco

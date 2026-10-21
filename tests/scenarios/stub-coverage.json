@@ -1,6 +1,18 @@
 {
   "_note": "Written by tests/scenarios/cli.ts after each case. unstubbed is the MAX over that measurement's runs: the worst run is the one that reveals a hole in the stub table. Checked by tests/unit/scenarios/cases.test.ts.",
   "cases": {
+    "acquaintance asks for networking time": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:14:48.419Z"
+    },
+    "booking link on a cc thread books through it": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:14:48.419Z"
+    },
     "bullpen mention stays on thread": {
       "unstubbed": 0,
       "runs": 5,
@@ -91,11 +103,65 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-14T16:53:34.402Z"
     },
+    "cc coffee follows standing rule (prefs)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:18:11.249Z"
+    },
+    "cc coffee follows standing rule (rules)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:14:48.419Z"
+    },
+    "cc coffee in a week or two": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:14:48.419Z"
+    },
+    "cc drinks follows standing rule (both)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:18:11.249Z"
+    },
+    "cc drinks follows standing rule (prefs)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:18:11.249Z"
+    },
+    "cc drinks follows standing rule (rules)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:14:48.419Z"
+    },
+    "cc move things around asks first at approval band": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:09:02.030Z"
+    },
+    "cc move things around to make room": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:32:52.736Z"
+    },
     "cold outreach creates a contact": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "colleague asks for time on a sensitive matter": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:14:48.419Z"
     },
     "contacts ambiguous name with a wrong role": {
       "unstubbed": 0,
@@ -228,6 +294,18 @@
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "forward with no note schedules the meeting": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:14:48.419Z"
+    },
+    "forwarded google booking page books through it": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T20:14:48.419Z"
     },
     "google doc bare id read": {
       "unstubbed": 0,
@@ -553,6 +631,30 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
     },
+    "signin code never leaks": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:40:59.805Z"
+    },
+    "signin email code from inbox": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:39:20.723Z"
+    },
+    "signin session gone": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:41:52.048Z"
+    },
+    "signin sms code over signal": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:37:35.219Z"
+    },
     "style debrief prompt": {
       "unstubbed": 0,
       "runs": 5,
@@ -631,29 +733,11 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
     },
-    "signin code never leaks": {
+    "cc coffee follows standing rule (both)": {
       "unstubbed": 0,
-      "runs": 3,
+      "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-20T13:40:59.805Z"
-    },
-    "signin email code from inbox": {
-      "unstubbed": 0,
-      "runs": 2,
-      "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-20T13:39:20.723Z"
-    },
-    "signin session gone": {
-      "unstubbed": 0,
-      "runs": 2,
-      "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-20T13:41:52.048Z"
-    },
-    "signin sms code over signal": {
-      "unstubbed": 0,
-      "runs": 2,
-      "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-20T13:37:35.219Z"
+      "recordedAt": "2026-10-21T20:24:03.051Z"
     }
   }
 }
