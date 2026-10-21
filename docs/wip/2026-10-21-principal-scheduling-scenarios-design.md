@@ -99,6 +99,20 @@ dates loosely. So every timing rule that can be stated as a date is also a code 
 `not_called` hold or event with `contains: { start: "{{date:…}}" }`. The judge keeps what
 needs reading: offered times in prose, venue, length, tone.
 
+### Lesson from review: confirm a fixture is in force
+
+In the first measurement the autonomy fixture never reached the stack, so every case ran
+at the test database's 75 with tier gating. A spread in the CLI escaped TypeScript's
+excess-property check. The CLI now reads the config back after boot and refuses to run
+if a fixture is not in force (#2228). The cases were re-run and #2227 was corrected.
+
+Two stub flaws also surfaced on re-runs:
+- 25k/25l's booking page returned "Confirmed" for any browser call after opening it,
+  reading included. Read-only actions now show the page; only actions that act on it
+  book.
+- 25b counted Curia releasing its own holds as deleting the principal's events.
+  `nothing_deleted` now checks the seeded `evt-` ids only.
+
 ## Cases (`tests/scenarios/cases/25*`)
 
 All are coordinator cases with `delegation: real`. A timing hint can be lost in either hop:
@@ -184,7 +198,7 @@ It is drafted from the results:
   don't regress.
 
 Filed as #2227 after the first measurement (2026-10-21). The pronoun guessing the runs
-surfaced is #2226. Cases 25b, 25c, 25j, 25l, 25m and 25n carry `known_failure` markers
+surfaced is #2226. Cases 25b, 25c, 25j, 25k, 25l, 25m and 25n carry `known_failure` markers
 for #2227. Remove them in the PR that fixes it.
 
 ## Calls made here (not discussed)
