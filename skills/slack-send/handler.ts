@@ -15,7 +15,7 @@
 import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
 import { registerOutboundContext } from '../../src/dispatch/context-bridge-parse.js';
 import { boundTaskFromMetadata } from '../../src/agents/resumable-task.js';
-import { isPrincipalDirectedSend } from '../../src/skills/_shared/principal-directed.js';
+import { isPrincipalDirectedSend, originatorOption, relayDeferredData } from '../../src/skills/_shared/principal-directed.js';
 import {
   RECIPIENT_REFERENCE_SKILLS,
   findRetiredRecipientField,
@@ -96,7 +96,7 @@ export class SlackSendHandler implements ToolHandler {
       // Overload: put U… in slackChannelId even though that field's type doc
       // describes D…/C…/G… conversation ids. chat.postMessage accepts a user
       // id as channel and opens/uses the IM (same precedent as
-      // approval-channel-notify.ts). Principal eligibility / blocked-contact
+      // src/autonomy/approval-delivery.ts). Principal eligibility / blocked-contact
       // resolve from slackUserId (also the U…), never from slackChannelId alone.
       const result = await ctx.outboundGateway.send(
         {
@@ -109,6 +109,12 @@ export class SlackSendHandler implements ToolHandler {
           taskEventId: ctx.taskEventId,
           conversationId: ctx.conversationId,
           principalDirected: isPrincipalDirectedSend(ctx),
+          // Counted against the outside contact who started this work (#1320).
+          ...originatorOption(ctx),
+          // An approve-action replay: the principal approved this exact send (#2159).
+          humanApproved: ctx.humanApproved,
+          // Used only if band review holds this send (#2159): approval replays this skill with this input.
+          holdRecipe: { toolName: 'slack-send', partialPayload: ctx.input, description: `Slack message to ${identityName ?? destination}` },
         },
       );
 
@@ -119,7 +125,9 @@ export class SlackSendHandler implements ToolHandler {
         };
       }
 
-      await registerOutboundContext(ctx.outboundContext, contextBridgeRaw, {
+      // A relay held for the digest never reached the principal: nothing for a reply to bind to (#1320).
+
+      if (!result.deferredToDigest) await registerOutboundContext(ctx.outboundContext, contextBridgeRaw, {
         channelId: 'slack',
         content: message,
         agentId: ctx.agentId ?? 'coordinator',
@@ -135,6 +143,8 @@ export class SlackSendHandler implements ToolHandler {
           ...(contactId ? { contact_id: contactId } : {}),
           ...(identityName ? { recipient_identity: identityName } : {}),
           channel: 'slack',
+          // Held by the relay budget for the principal's digest (#1320).
+          ...relayDeferredData(result),
         },
       };
     } catch (err) {

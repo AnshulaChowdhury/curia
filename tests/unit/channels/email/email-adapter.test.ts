@@ -133,6 +133,20 @@ describe('EmailAdapter — sendOutboundReply', () => {
     void adapter.start();
   });
 
+  it('sends an approved relay as humanApproved, so it is not reviewed again (#2159)', async () => {
+    const humanMessage = makeMockMessage({ from: [{ email: CEO_EMAIL }], to: [{ email: SELF_EMAIL }] });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([humanMessage]);
+
+    await triggerOutbound(createOutboundMessage({
+      conversationId: 'email:thread-abc', channelId: 'email', content: 'Approved reply.', parentEventId: 'task-1', principalApproved: true,
+    }));
+
+    expect(mocks.outboundGateway.send).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ humanApproved: true }),
+    );
+  });
+
   it('sends reply to from address when the latest thread message is from the human', async () => {
     // Latest message is from the human — normal first-reply scenario
     const humanMessage = makeMockMessage({
@@ -908,7 +922,9 @@ describe('EmailAdapter — sendWithGatedDraftFallback gated-fallback', () => {
 
     expect(mocks.outboundGateway.send).toHaveBeenCalledWith(
       expect.objectContaining({ to: CEO_EMAIL }),
-      expect.objectContaining({ taskEventId: 'task-evt-1', conversationId: 'email:thread-abc' }),
+      // postTurn: a relayed reply is sent after the agent's turn ended, so a held approval
+      // needs the coordinator woken to deliver it (#2159).
+      expect.objectContaining({ taskEventId: 'task-evt-1', conversationId: 'email:thread-abc', postTurn: true }),
     );
 
     await adapter.stop();

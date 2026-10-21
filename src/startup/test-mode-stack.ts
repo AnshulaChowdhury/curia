@@ -54,7 +54,8 @@
 //     self-addresses come from email_accounts without the vault grant check.
 
 import * as path from 'node:path';
-import { loadConfig, loadYamlConfig, resolveLateDeliveryConfig, resolveTasksConfig, type Config, type YamlConfig } from '../config.js';
+import { loadConfig, loadYamlConfig, resolveLateDeliveryConfig, resolveTasksConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
+import { createVerificationRuntime, type VerificationRuntime } from '../verification/index.js';
 import { createLogger, type Logger } from '../logger.js';
 import { createPool, type DbPool } from '../db/connection.js';
 import { EventBus } from '../bus/bus.js';
@@ -67,7 +68,11 @@ import { AnthropicProvider } from '../agents/llm/anthropic.js';
 import { OpenRouterProvider } from '../agents/llm/openrouter.js';
 import { BedrockProvider } from '../agents/llm/bedrock.js';
 import { ModelRegistry } from '../agents/llm/model-registry.js';
-import { ModelRouter, type ModelRoutingConfig } from '../agents/llm/model-router.js';
+import { ModelRouter, type ModelRoutingConfig, type Tier, type TierConfig } from '../agents/llm/model-router.js';
+import type { ReasoningSetting } from '../agents/llm/sampling-options.js';
+
+/** Per-tier reasoning settings laid over model_routing (the suites' --reasoning-effort). */
+export type TierReasoningOverride = Partial<Record<Tier, ReasoningSetting>>;
 import { createEstimateCostUsd } from '../agents/llm/pricing.js';
 import type { LLMProvider } from '../agents/llm/provider.js';
 import { buildBaseSystemPrompt, formatTaskTailBlocks } from '../agents/system-prompt.js';
@@ -93,6 +98,7 @@ import { bootstrapAgentIdentity } from '../entity-context/bootstrap.js';
 import { EntityContextAssembler } from '../entity-context/assembler.js';
 import { ConversationEntityState } from '../entity-context/conversation-entities.js';
 import { OfficeIdentityService } from '../identity/service.js';
+import type { OfficeIdentity } from '../identity/types.js';
 import { BullpenService } from '../memory/bullpen.js';
 import { EmbeddingService } from '../memory/embedding.js';
 import { EntityMemory } from '../memory/entity-memory.js';
@@ -176,6 +182,12 @@ export interface TestModeStackOptions {
    */
   model?: string;
   /**
+   * Reasoning settings laid over the routing's tiers (the suites' --reasoning-effort,
+   * ADR-048). A tier left out keeps its configured setting. ModelRouter validates each
+   * against its tier's model, as at a real boot.
+   */
+  reasoning?: TierReasoningOverride;
+  /**
    * Which agents/tools/skills load. 'registry' (default) is what production would load
    * on its next boot: the enabled rows in tool_registry / skill_registry /
    * agent_registry, plus any core default (config/registry-defaults.yaml) that has no
@@ -214,6 +226,13 @@ export interface TestModeStackOptions {
    */
   wrapOutboundContext?: (service: OutboundContextService) => OutboundContextService;
   /**
+   * Narrow the sign-in verification runtime (#2017) before the ExecutionLayer and the agents
+   * receive it, and before `verification` on the stack exposes it. The scenario suite
+   * narrows it to the calling run's rows: production's listActive() spans the whole table,
+   * so every run would otherwise see every other run's seeded verifications.
+   */
+  wrapVerification?: (runtime: VerificationRuntime) => VerificationRuntime;
+  /**
    * Wire production's `delegate` dispatch claims (pending_delegations: the in-flight
    * refusal and the running claim, #1858 / #1893), as src/index.ts does when late
    * delivery is enabled. Off by default: the rows name the caller's conversations, and
@@ -228,6 +247,13 @@ export interface TestModeStackOptions {
    * subscribes here.
    */
   observeBus?: (bus: EventBus) => void;
+  /**
+   * Which browser session ids read as alive in the per-turn sign-in verification block
+   * (#2017). There is no browser service in this stack, so without it every session reads
+   * as gone; a suite that seeds a verification and stubs `web-browser` passes the ids its
+   * stub honours.
+   */
+  browserSessionAlive?: (sessionId: string) => boolean;
   /** Override for fixtures. Default <repo>/agents and <repo>/skills. */
   agentsDir?: string;
   skillsDir?: string;
@@ -242,6 +268,37 @@ export interface TestModeStackOptions {
    * deployment's own servers, for the scenario suite's --overlay.
    */
   mcpSnapshotDirs?: string[];
+  /**
+   * Lay this over the database's office identity for the whole stack: the scenario
+   * suite's style cases (#2143) run under one fixed tone. Held in memory only; see
+   * FixtureOfficeIdentityService.
+   */
+  officeIdentity?: OfficeIdentityFixture;
+}
+
+/** Everything in an office identity but the assistant's name, title and signature. */
+export type OfficeIdentityFixture = Omit<OfficeIdentity, 'assistant'>;
+
+/**
+ * The office identity with a fixture laid over the database's. Only get() changes, so
+ * every agent's block still comes from the real compileSystemPromptBlock(), and nothing
+ * is written: the database's identity and its history stay as they were. The assistant
+ * stays the database's, so bootstrapAgentIdentity finds the same agent contact.
+ */
+class FixtureOfficeIdentityService extends OfficeIdentityService {
+  constructor(pool: DbPool, logger: Logger, bus: EventBus, private readonly fixture: OfficeIdentityFixture) {
+    super(pool, logger, bus);
+  }
+
+  override async initialize(): Promise<void> {
+    await super.initialize();
+    // At boot, not as a prompt that renders "undefined" in every case.
+    this.validateIdentity(this.get());
+  }
+
+  override get(): OfficeIdentity {
+    return { ...super.get(), ...this.fixture };
+  }
 }
 
 export interface TestModeStack {
@@ -263,6 +320,11 @@ export interface TestModeStack {
   autonomyService: AutonomyService;
   /** The real service. Agents only read it (see header); seed threads through it. */
   bullpenService: BullpenService;
+  /**
+   * The sign-in verification runtime the ExecutionLayer and agents use (#2017) — the wrapped
+   * one when wrapVerification was given. A caller that builds its own Dispatcher passes this.
+   */
+  verification: VerificationRuntime;
   agentContactId: string | undefined;
   principalContactId: string | undefined;
   /**
@@ -471,7 +533,7 @@ export function readOnlyView<T extends object>(target: T, readMethods: readonly 
 }
 
 const AUTONOMY_READS = ['getConfig', 'getHistory', 'getHistoryPaginated', 'getScoredActionCount'] as const;
-const OFFICE_IDENTITY_READS = ['get', 'compileSystemPromptBlock', 'history'] as const;
+const OFFICE_IDENTITY_READS = ['get', 'compileSystemPromptBlock', 'compileWritesAsBlock', 'history'] as const;
 
 /** Methods AgentRuntime calls on its ExecutionLayer. A wrapper must keep all of them. */
 const EXECUTION_LAYER_METHODS = [
@@ -481,20 +543,37 @@ const EXECUTION_LAYER_METHODS = [
   'provenanceSourceText',
 ] as const;
 
-function routingFor(yamlConfig: YamlConfig, model: string | undefined, modelRegistry: ModelRegistry): ModelRoutingConfig {
+/**
+ * The routing a test-mode stack boots with: the configured model_routing, with
+ * --model replacing every tier's model and --reasoning-effort laid over the
+ * tiers it names. ModelRouter validates the result as at a real boot.
+ */
+export function routingFor(
+  yamlConfig: YamlConfig,
+  model: string | undefined,
+  reasoning: TierReasoningOverride | undefined,
+  modelRegistry: ModelRegistry,
+): ModelRoutingConfig {
   const configured = yamlConfig.model_routing;
   if (!configured) {
     throw new Error('model_routing config section is required in config/default.yaml');
   }
-  if (!model) return configured;
-  if (!modelRegistry.isKnownModel(model)) {
+  if (model && !modelRegistry.isKnownModel(model)) {
     throw new Error(
       `Unknown model '${model}'. Known models: ${Object.keys(modelRegistry.getAllModels()).sort().join(', ')}`,
     );
   }
+  // --model replaces every tier, configured reasoning included: that setting was
+  // validated against the configured model, not this one.
+  const tier = (name: Tier): TierConfig => {
+    const base: TierConfig = model ? { model } : configured.tiers[name];
+    const override = reasoning?.[name];
+    return override ? { ...base, reasoning: override } : base;
+  };
+  if (!model && !reasoning) return configured;
   return {
     ...configured,
-    tiers: { fast: { model }, standard: { model }, powerful: { model } },
+    tiers: { fast: tier('fast'), standard: tier('standard'), powerful: tier('powerful') },
   };
 }
 
@@ -590,12 +669,14 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     }
 
     const autonomyService = new AutonomyService(pool, logger);
-    officeIdentityService = new OfficeIdentityService(pool, logger, bus);
+    officeIdentityService = options.officeIdentity
+      ? new FixtureOfficeIdentityService(pool, logger, bus, options.officeIdentity)
+      : new OfficeIdentityService(pool, logger, bus);
     await officeIdentityService.initialize();
 
     // ── LLM providers ──────────────────────────────────────────────────────
     const modelRegistry = new ModelRegistry(logger);
-    const routing = routingFor(yamlConfig, options.model, modelRegistry);
+    const routing = routingFor(yamlConfig, options.model, options.reasoning, modelRegistry);
     const modelRouter = new ModelRouter(routing, modelRegistry, logger);
     const estimateCostUsd = createEstimateCostUsd(modelRegistry, routing.tiers.standard.model);
     const providerRegistry = new Map<string, LLMProvider>();
@@ -744,6 +825,13 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
           releaseRunning: (delegateEventId) => releaseRunningDelegation(pool, delegateEventId),
         }
       : undefined;
+    // Delegated sign-in verification (#2017), wired like src/index.ts so the default-deny
+    // scrub runs under test. No channel adapters start in this stack, so no channel is
+    // enabled and askChannel() is always null; nothing here asks the principal anything.
+    const baseVerification = createVerificationRuntime(
+      pool, logger, resolveVerificationConfig(yamlConfig.verification), principalIdentities, new Set<string>(),
+    );
+    const verification = options.wrapVerification ? options.wrapVerification(baseVerification) : baseVerification;
     const baseExecutionLayer = new ExecutionLayer(toolRegistry, logger, {
       bus,
       agentRegistry,
@@ -769,6 +857,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings,
       principalIdentities,
       skillRegistry,
+      verification,
       ...(outboundContextService ? { outboundContextService } : {}),
       ...(openDelegationLookup ? { openDelegationLookup } : {}),
     });
@@ -805,6 +894,9 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       principalPrimaryEmail,
       agentContactId,
       principalContactId: principalContact?.id,
+      // The per-turn sign-in verification block (#2017), same gating as production.
+      verification,
+      browserSessionAlive: options.browserSessionAlive,
       defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs,
       lateDelivery: { ttlMinutes: lateDelivery.ttlMinutes, sweepIntervalMinutes: lateDelivery.sweepIntervalMinutes },
       bullpenService: readOnlyBullpen(
@@ -860,6 +952,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       officeIdentityService: identityService,
       autonomyService,
       bullpenService,
+      verification,
       agentContactId,
       principalContactId: principalContact?.id,
       llmProviders: providerRegistry,

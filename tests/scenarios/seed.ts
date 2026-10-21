@@ -20,10 +20,14 @@ import {
 import type { PrincipalBacklogSource } from '../../src/dispatch/principal-backlog.js';
 import type { BullpenService } from '../../src/memory/bullpen.js';
 import type { TestModeStack } from '../../src/startup/test-mode-stack.js';
+import { registrableDomain } from '../../src/verification/domain.js';
+import type { VerificationRuntime } from '../../src/verification/index.js';
+import type { Verification } from '../../src/verification/types.js';
 import { cleanupConversation, sweepConversations } from '../shared/turn-capture.js';
 import { resolvePlaceholders } from './loader.js';
 import { SCENARIO_DELEGATE_PREFIX } from './stub-layer.js';
-import type { ScenarioCase, SeedContact } from './types.js';
+import type { DbPool } from '../../src/db/connection.js';
+import type { ScenarioCase, SeedContact, SeedPrincipalIdentity } from './types.js';
 
 /**
  * Stamped into `notes` on every seeded contact — contacts have no source column, and
@@ -55,6 +59,10 @@ export class SeedScope {
   readonly threadIds = new Set<string>();
   /** Conversations real specialists ran in for this run (#2027); cleaned with the run's own. */
   readonly specialistConversations = new Set<string>();
+  /** Sign-in verifications the run seeded (#2017), plus any opened during it. */
+  readonly verificationIds = new Set<string>();
+  /** Browser session ids the run's verification block reads as alive (#2017). */
+  readonly aliveSessions = new Set<string>();
   /** What the run says is waiting on the principal (`seed.backlog`); none when unset. */
   backlog: PrincipalBacklogCounts | undefined;
   /**
@@ -68,6 +76,8 @@ export class SeedScope {
     this.entryIds.clear();
     this.threadIds.clear();
     this.specialistConversations.clear();
+    this.verificationIds.clear();
+    this.aliveSessions.clear();
     this.backlog = undefined;
     this.errors.length = 0;
   }
@@ -160,6 +170,73 @@ export function scopedOutboundContext(real: OutboundContextService, currentScope
   });
 }
 
+/**
+ * The sign-in verification runtime narrowed to the calling run's rows (#2017): what the
+ * coordinator's "## Sign-in verifications" block, the Dispatcher's code tracking and the
+ * ExecutionLayer read. listActive() is production's (it also persists lazy expiry and keeps
+ * the code tracker's TTL in step with the whole table), filtered to the run's ids; any
+ * other id reads as unknown. A verification opened during a run joins the run's scope.
+ * The code tracker is the real one, shared by every run: cases that seed one site never
+ * overlap (seedConflictKeys), and a tracked value only scrubs.
+ */
+export function scopedVerification(real: VerificationRuntime, currentScope: CurrentScope): VerificationRuntime {
+  const owning = (id: string): SeedScope | undefined => {
+    const scope = currentScope();
+    return scope?.verificationIds.has(id) ? scope : undefined;
+  };
+  const owned = (v: Verification | null): Verification | null => (v && owning(v.id) ? v : null);
+  const service = Object.assign(Object.create(real.service) as VerificationRuntime['service'], {
+    get: async (id: string) => (owning(id) ? real.service.get(id) : null),
+    liveForTask: async (taskId: string, now?: Date) => owned(await real.service.liveForTask(taskId, now)),
+    open: async () => { throw new Error('scenario harness: open verifications through the runtime, not its service'); },
+    listActive: async () => { throw new Error('scenario harness: list verifications through the runtime, not its service'); },
+    close: async () => { throw new Error('scenario harness: close verifications through the runtime, not its service'); },
+  });
+  return {
+    service,
+    tracker: real.tracker,
+    open: async (input) => {
+      const scope = currentScope();
+      if (!scope) throw new Error('scenario harness: a verification was opened outside every run');
+      // Another run's pending row, or a real instance's, for the same site: production
+      // would reuse it, which here would hand this run someone else's challenge. Refuse
+      // before open(): its reuse rewrites the row's session, page domain, delivery and
+      // expiry, so refusing afterwards would already have changed the other run's row.
+      const site = registrableDomain(input.site);
+      const foreign = site === null
+        ? undefined
+        : (await real.listActive()).find(v => v.status === 'pending' && v.site === site && !scope.verificationIds.has(v.id));
+      if (foreign) {
+        throw new Error(`scenario harness: ${foreign.site} already has a pending verification outside this run`);
+      }
+      const result = await real.open(input);
+      // Backstop: a row that turned pending between the check and the open.
+      if (result.reused && !scope.verificationIds.has(result.verification.id)) {
+        throw new Error(`scenario harness: ${result.verification.site} already has a pending verification outside this run`);
+      }
+      scope.verificationIds.add(result.verification.id);
+      return result;
+    },
+    listActive: async (now?: Date) => {
+      const scope = currentScope();
+      if (!scope) return [];
+      try {
+        return (await real.listActive(now)).filter(v => scope.verificationIds.has(v.id));
+      } catch (err) {
+        scope.errors.push(`verification read failed: ${err instanceof Error ? err.message : String(err)}`);
+        throw err;
+      }
+    },
+    close: async (id, status) => (owning(id) ? real.close(id, status) : null),
+    askChannel: () => real.askChannel(),
+  };
+}
+
+/** The browser sessions the calling run's verification block reads as alive (#2017). */
+export function scopedBrowserSessionAlive(currentScope: CurrentScope): (sessionId: string) => boolean {
+  return (sessionId) => currentScope()?.aliveSessions.has(sessionId) ?? false;
+}
+
 /** Nothing waiting: what a run without `seed.backlog`, or any call outside a run, sees. */
 const NO_BACKLOG: PrincipalBacklogCounts = { decayWarnings: 0, pendingApprovals: 0, principalTasks: 0 };
 
@@ -200,6 +277,9 @@ export interface SeededRun {
   contacts: Array<{ id: string; kgNodeId: string | null }>;
   entryIds: string[];
   threads: Map<string, { threadId: string; messageId: string; topic: string; participants: string[] }>;
+  verificationIds: string[];
+  /** Principal identities this run added (seed.principal_identities), and only those. */
+  principalIdentityIds: string[];
 }
 
 export interface SeedDeps {
@@ -208,17 +288,69 @@ export interface SeedDeps {
   scope: SeedScope;
 }
 
+/** conversation_id of a seeded verification: where the sign-in was "requested". */
+const SCENARIO_VERIFICATION_ORIGIN = `${SCENARIO_ENTRY_ORIGIN}verification-`;
+
+/**
+ * `contact_channel_identities.label` of every principal identity the suite adds. Cleanup
+ * and the sweep delete only rows carrying it, so the principal's own identities survive.
+ */
+export const SCENARIO_IDENTITY_LABEL = 'scenario-fixture (#2017)';
+
+/**
+ * Give the principal `identity` for the run, unless they already have an active identity on
+ * that channel (theirs is then used as it is). Returns the added row's id, or null when
+ * nothing was added. A raw insert, not ContactService.linkIdentity: that refreshes the
+ * principal's identity list every agent's prompt is built from, mid-suite, for every run.
+ */
+export async function seedPrincipalIdentity(
+  pool: DbPool,
+  principalContactId: string,
+  identity: SeedPrincipalIdentity,
+): Promise<string | null> {
+  const existing = await pool.query<{ id: string }>(
+    `SELECT id FROM contact_channel_identities WHERE contact_id = $1 AND channel = $2 AND status = 'active'`,
+    [principalContactId, identity.channel],
+  );
+  if (existing.rows.length > 0) return null;
+  const added = await pool.query<{ id: string }>(
+    `INSERT INTO contact_channel_identities
+       (contact_id, channel, channel_identifier, label, verified, verified_at, source, status)
+     VALUES ($1, $2, $3, $4, true, now(), 'ceo_stated', 'active')
+     RETURNING id`,
+    [principalContactId, identity.channel, identity.identifier, SCENARIO_IDENTITY_LABEL],
+  );
+  return added.rows[0]!.id;
+}
+
+/** Remove principal identities a run added: only these ids, and only rows carrying the marker. */
+export async function removeSeededPrincipalIdentities(pool: DbPool, ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  await pool.query(
+    `DELETE FROM contact_channel_identities WHERE id = ANY($1::uuid[]) AND label = $2`,
+    [ids, SCENARIO_IDENTITY_LABEL],
+  );
+}
+
 /**
  * Create the case's rows. On any failure, removes what it already created before
  * rethrowing, so a half-seeded run never leaks into the next.
  */
 export async function seedRun(scenario: ScenarioCase, deps: SeedDeps): Promise<SeededRun> {
   const { stack, outboundContext, scope } = deps;
-  const seeded: SeededRun = { refs: new Map(), contacts: [], entryIds: [], threads: new Map() };
+  const seeded: SeededRun = {
+    refs: new Map(), contacts: [], entryIds: [], threads: new Map(), verificationIds: [], principalIdentityIds: [],
+  };
   if (stack.principalContactId) seeded.refs.set('principal_contact_id', stack.principalContactId);
 
   scope.backlog = scenario.seed.backlog;
   try {
+    for (const identity of scenario.seed.principalIdentities) {
+      if (!stack.principalContactId) throw new Error('No principal contact in this database');
+      const added = await seedPrincipalIdentity(stack.pool, stack.principalContactId, identity);
+      if (added) seeded.principalIdentityIds.push(added);
+    }
+
     for (const contact of scenario.seed.contacts) {
       const created = await seedContact(stack, contact);
       seeded.contacts.push(created);
@@ -272,6 +404,38 @@ export async function seedRun(scenario: ScenarioCase, deps: SeedDeps): Promise<S
       });
       scope.threadIds.add(opened.thread.id);
       seeded.refs.set(`thread:${thread.key}`, opened.thread.id);
+    }
+
+    for (const raw of scenario.seed.verifications) {
+      const v = resolvePlaceholders(raw, seeded.refs);
+      // Through the runtime the run's agents see (the scoped view), so the row joins the
+      // run's scope, and a pending row the site already has elsewhere fails the seed.
+      const { verification } = await stack.verification.open({
+        purpose: 'sign_in',
+        kind: 'code',
+        delivery: v.delivery,
+        site: v.site,
+        pageDomain: v.pageDomain,
+        browserSessionId: v.browserSessionId,
+        ...(v.taskId ? { taskId: v.taskId } : {}),
+        conversationId: `${SCENARIO_VERIFICATION_ORIGIN}${v.key}`,
+      });
+      seeded.verificationIds.push(verification.id);
+      seeded.refs.set(`verification:${v.key}`, verification.id);
+      if (v.sessionAlive) scope.aliveSessions.add(v.browserSessionId);
+      // Backdate the request, keep production's expiry after it, and close a non-pending
+      // row: an expired one at its expiry (as listActive persists it), any other now.
+      await stack.pool.query(
+        `UPDATE verifications
+            SET requested_at = now() - make_interval(mins => $2),
+                expires_at = now() - make_interval(mins => $2) + make_interval(mins => $3),
+                status = $4,
+                resolved_at = CASE $4 WHEN 'pending' THEN NULL
+                                      WHEN 'expired' THEN now() - make_interval(mins => $2) + make_interval(mins => $3)
+                                      ELSE now() END
+          WHERE id = $1`,
+        [verification.id, v.requestedMinutesAgo, stack.verification.service.config.defaultExpiryMinutes, v.status],
+      );
     }
   } catch (err) {
     // Keep the seed error as the cause; a cleanup failure on top of it is attached, not
@@ -409,6 +573,13 @@ export async function sweepLeftovers(stack: TestModeStack): Promise<Record<strin
   await count('bullpen_threads',
     `DELETE FROM bullpen_threads WHERE source_message_id LIKE $1`,
     [`${SCENARIO_THREAD_MARKER}%`]);
+  await count('principal_identities',
+    `DELETE FROM contact_channel_identities WHERE label = $1`,
+    [SCENARIO_IDENTITY_LABEL]);
+  // Seeded verifications (scenario-origin-verification-…), and any opened in a run's conversation.
+  await count('verifications',
+    `DELETE FROM verifications WHERE conversation_id LIKE ANY($1::text[])`,
+    [[`${SCENARIO_VERIFICATION_ORIGIN}%`, ...SCENARIO_CONVERSATION_PREFIXES.map(p => `${p}%`)]]);
   const conversations = await sweepConversations(stack.pool, SCENARIO_CONVERSATION_PREFIXES);
   for (const [table, rows] of Object.entries(conversations)) {
     if (rows > 0) removed[table] = rows;
@@ -423,10 +594,18 @@ export async function sweepLeftovers(stack: TestModeStack): Promise<Record<strin
  * real contact read. Cases with a key in common never run at the same time.
  */
 export function seedConflictKeys(scenario: ScenarioCase): string[] {
-  return scenario.seed.contacts.flatMap(c => [
-    `identity:${c.channel}:${c.identifier.toLowerCase()}`,
-    `name:${c.displayName.trim().toLowerCase()}`,
-  ]);
+  return [
+    ...scenario.seed.contacts.flatMap(c => [
+      `identity:${c.channel}:${c.identifier.toLowerCase()}`,
+      `name:${c.displayName.trim().toLowerCase()}`,
+    ]),
+    // One pending verification per site (#2017). Every seeded row is opened as pending
+    // before its status is set, so two runs seeding one site collide whatever the status.
+    ...scenario.seed.verifications.map(v => `verification-site:${registrableDomain(v.site) ?? v.site.toLowerCase()}`),
+    // A principal identity a run adds is visible to every run while it lasts, and a second
+    // case adding one on the same channel could remove the first's mid-run.
+    ...scenario.seed.principalIdentities.map(p => `principal-identity:${p.channel}`),
+  ];
 }
 
 /** Conversation ids a run uses (harness.ts); the sweep finds leftovers by them. */
@@ -452,6 +631,11 @@ export async function cleanupRun(
   if (entryIds.length > 0) {
     await attempt(() => stack.pool.query(`DELETE FROM outbound_context WHERE id = ANY($1::uuid[])`, [entryIds]));
   }
+  const verificationIds = [...new Set([...seeded.verificationIds, ...scope.verificationIds])];
+  if (verificationIds.length > 0) {
+    await attempt(() => stack.pool.query(`DELETE FROM verifications WHERE id = ANY($1::uuid[])`, [verificationIds]));
+  }
+  await attempt(() => removeSeededPrincipalIdentities(stack.pool, seeded.principalIdentityIds));
   const threadIds = [...seeded.threads.values()].map(t => t.threadId);
   if (threadIds.length > 0) {
     // Messages and read watermarks cascade.

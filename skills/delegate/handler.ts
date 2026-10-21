@@ -60,6 +60,7 @@ import {
 } from '../../src/agents/prompts/delegate-result-guidance.js';
 import { shapeSpecialistAnswer } from '../../src/agents/specialist-answer.js';
 import { buildInboundEmailIdentifierBlock, preambleAccountLabel, sanitizeNylasMessageId } from '../../src/dispatch/email-metadata.js';
+import { CEO_INBOX_AGENT, trackInboxCodes } from '../../src/verification/track-codes.js';
 import {
   parseSpecialistDeclineMarker,
   SPECIALIST_DECLINE_REASON,
@@ -347,6 +348,7 @@ function formatStructuredFailureMessage(agent: string, reason: AgentResponseFail
       return `Specialist '${agent}' could not complete the task`;
   }
 }
+
 
 export class DelegateHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -927,6 +929,12 @@ export class DelegateHandler implements ToolHandler {
             message: decline.message,
           },
         };
+      }
+
+      // A sign-in code the principal's inbox specialist read out of an email is tracked
+      // here, before the result reaches the coordinator or any store (#2017).
+      if (agent === CEO_INBOX_AGENT && ctx.verification) {
+        await trackInboxCodes(ctx.verification, response, ctx.log, { targetAgent: agent });
       }
 
       // Pull contact IDs out before the execution layer strips the

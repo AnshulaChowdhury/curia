@@ -183,6 +183,97 @@ describe('loadScenarioCase', () => {
     expect(() => loadScenarioCase(write('bad-backlog.yaml', body))).toThrow(error);
   });
 
+  it('parses seed.verifications and resolves {{verification:key}} (#2017)', () => {
+    const body = VALID
+      .replace('seed:\n', [
+        'seed:',
+        '  verifications:',
+        '    - key: otp',
+        '      site: example-insurer.ca',
+        '      page_domain: login.example-insurer.ca',
+        '      delivery: sms',
+        '      browser_session_id: s-1',
+        `      task: ${WAKE_TASK_ID}`,
+        '      requested_minutes_ago: 3',
+        '    - key: old',
+        '      site: aircanada.com',
+        '      page_domain: aircanada.com',
+        '      delivery: email',
+        '      browser_session_id: s-9',
+        '      status: expired',
+        '',
+      ].join('\n'))
+      .replace('contains: { task: "{{entry:offsite}}" }', 'contains: { task: "{{entry:offsite}} {{verification:otp}}" }');
+    const c = loadScenarioCase(write('verif.yaml', body));
+    expect(c.seed.verifications).toEqual([
+      {
+        key: 'otp', site: 'example-insurer.ca', pageDomain: 'login.example-insurer.ca', delivery: 'sms',
+        browserSessionId: 's-1', taskId: WAKE_TASK_ID, status: 'pending', requestedMinutesAgo: 3, sessionAlive: true,
+      },
+      {
+        key: 'old', site: 'aircanada.com', pageDomain: 'aircanada.com', delivery: 'email',
+        browserSessionId: 's-9', status: 'expired', requestedMinutesAgo: 15, sessionAlive: false,
+      },
+    ]);
+    const resolved = resolvePlaceholders(c.expectedBehaviors[0]!.check, new Map([
+      ['entry:offsite', 'e-1'], ['verification:otp', 'v-1'],
+    ]));
+    expect(resolved).toMatchObject({ contains: { task: 'e-1 v-1' } });
+    // A case without the kind has none, and every other case keeps loading.
+    expect(loadScenarioCase(write('none.yaml', VALID)).seed.verifications).toEqual([]);
+  });
+
+  it.each([
+    ['an unknown delivery', 'delivery: voice', /delivery must be one of email, sms, app/],
+    ['an unknown status', 'status: waiting', /status must be one of pending, expired, satisfied, abandoned/],
+    ['a misspelled key', 'session: s-1', /unknown key\(s\) session/],
+    ['a task that is not a UUID', 'task: t-1', /'task' must be a UUID/],
+  ])('rejects a seeded verification with %s', (_label, extra, error) => {
+    const body = VALID.replace('seed:\n', [
+      'seed:',
+      '  verifications:',
+      '    - key: otp',
+      '      site: example.ca',
+      '      page_domain: example.ca',
+      '      browser_session_id: s-1',
+      ...(extra.startsWith('delivery') ? [] : ['      delivery: sms']),
+      `      ${extra}`,
+      '',
+    ].join('\n'));
+    expect(() => loadScenarioCase(write('bad-verif.yaml', body))).toThrow(error);
+  });
+
+  it('rejects two seeded verifications for one site', () => {
+    const row = (key: string, status: string) => [
+      `    - key: ${key}`, '      site: example.ca', '      page_domain: login.example.ca',
+      '      delivery: sms', `      browser_session_id: s-${key}`, `      status: ${status}`,
+    ];
+    const body = VALID.replace('seed:\n', ['seed:', '  verifications:', ...row('a', 'pending'), ...row('b', 'expired'), ''].join('\n'));
+    expect(() => loadScenarioCase(write('two.yaml', body))).toThrow(/at most one verification per site/);
+  });
+
+  it('parses seed.principal_identities (#2017)', () => {
+    const body = VALID.replace('seed:\n', 'seed:\n  principal_identities:\n    - { channel: signal, identifier: "+15555550142" }\n');
+    const c = loadScenarioCase(write('pid.yaml', body));
+    expect(c.seed.principalIdentities).toEqual([{ channel: 'signal', identifier: '+15555550142' }]);
+    expect(loadScenarioCase(write('none.yaml', VALID)).seed.principalIdentities).toEqual([]);
+  });
+
+  it.each([
+    ['a local channel the principal needs no identity on', '{ channel: cli, identifier: x }', /needs no identity/],
+    ['two on one channel', '{ channel: signal, identifier: "+1" }\n    - { channel: signal, identifier: "+2" }', /at most one per channel/],
+    ['an unknown key', '{ channel: signal, identifier: "+1", verified: true }', /unknown key\(s\) verified/],
+    ['an email outside example.test', '{ channel: email, identifier: a@gmail.com }', /under example.test/],
+  ])('rejects a principal identity with %s', (_label, entry, error) => {
+    const body = VALID.replace('seed:\n', `seed:\n  principal_identities:\n    - ${entry}\n`);
+    expect(() => loadScenarioCase(write('bad-pid.yaml', body))).toThrow(error);
+  });
+
+  it('rejects a placeholder for an unseeded verification', () => {
+    const body = VALID.replace('{{entry:offsite}}', '{{verification:missing}}');
+    expect(() => loadScenarioCase(write('bad-ref.yaml', body))).toThrow(/names no seeded verification/);
+  });
+
   it('requires a bullpen inbound to name a seeded thread', () => {
     const body = VALID.replace('from: principal', 'from: bullpen');
     expect(() => loadScenarioCase(write('b.yaml', body))).toThrow(/needs 'thread'/);
@@ -480,5 +571,80 @@ describe('loadScenarioCase: principal_note checks (prompt trim PR 5)', () => {
   it('rejects an unknown value and note_contains on absent', () => {
     expect(() => loadScenarioCase(write('bad1.yaml', withCheck('      principal_note: maybe\n')))).toThrow(/present or absent/);
     expect(() => loadScenarioCase(write('bad2.yaml', withCheck('      principal_note: absent\n      note_contains: [Sam]\n')))).toThrow(/needs principal_note: present/);
+  });
+});
+
+describe('text checks and identity fixtures (#2143)', () => {
+  const STYLE = `
+name: style
+release_gate: false
+identity: brief
+inbound:
+  from: principal
+  content: Did Dana confirm?
+expected_behaviors:
+  - id: short
+    description: brief
+    check:
+      text: reply
+      max_words: 40
+      excludes: ['!']
+  - id: short_send
+    description: brief send
+    check:
+      text: { tool: signal-send, arg: message }
+      max_words: 60
+`;
+  const FIXTURE = `
+judge_brief: Dry and brief.
+identity:
+  tone: { style: Dry and brief., verbosity: 15 }
+  behavioralPreferences: [Keep it short]
+  constraints: [Never impersonate the principal]
+`;
+  function identities(body = FIXTURE): string {
+    const ids = path.join(dir, 'identities');
+    mkdirSync(ids, { recursive: true });
+    writeFileSync(path.join(ids, 'brief.yaml'), body);
+    return ids;
+  }
+
+  it('parses a text check on the reply or on a tool argument', () => {
+    const c = loadScenarioCase(write('a.yaml', STYLE), { identitiesDir: identities() });
+    expect(c.expectedBehaviors[0]!.check).toEqual({ kind: 'text', of: 'reply', maxWords: 40, excludes: ['!'] });
+    expect(c.expectedBehaviors[1]!.check).toEqual({ kind: 'text', of: { tool: 'signal-send', arg: 'message' }, maxWords: 60 });
+  });
+
+  it('attaches the identity fixture, judge brief included', () => {
+    const c = loadScenarioCase(write('a.yaml', STYLE), { identitiesDir: identities() });
+    expect(c.identity?.name).toBe('brief');
+    expect(c.identity?.judgeBrief).toBe('Dry and brief.');
+    expect(c.identity?.config.tone.verbosity).toBe(15);
+  });
+
+  it('keeps a case with an identity fixture out of the release gate', () => {
+    const ids = identities();
+    expect(() => loadScenarioCase(write('a.yaml', STYLE.replace('release_gate: false\n', '')), { identitiesDir: ids }))
+      .toThrow(/set release_gate: false/);
+  });
+
+  it('rejects a fixture that leaves part of the identity to the database', () => {
+    const partial = FIXTURE.replace(/  constraints:.*\n/, '');
+    expect(() => loadScenarioCase(write('a.yaml', STYLE), { identitiesDir: identities(partial) })).toThrow(/missing constraints/);
+    const scalar = FIXTURE.replace('constraints: [Never impersonate the principal]', 'constraints: Never impersonate the principal');
+    expect(() => loadScenarioCase(write('a.yaml', STYLE), { identitiesDir: identities(scalar) })).toThrow(/'constraints' must be a list of strings/);
+    const withAssistant = FIXTURE + '  assistant: { name: X, title: Y, emailSignature: Z }\n';
+    expect(() => loadScenarioCase(write('a.yaml', STYLE), { identitiesDir: identities(withAssistant) })).toThrow(/unknown key\(s\) assistant/);
+  });
+
+  it('rejects a missing fixture and malformed text checks', () => {
+    expect(() => loadScenarioCase(write('a.yaml', STYLE), { identitiesDir: path.join(dir, 'none') })).toThrow(/identity 'brief' could not be read/);
+    const ids = identities();
+    const bare = STYLE.replace("      max_words: 40\n      excludes: ['!']\n", '');
+    expect(() => loadScenarioCase(write('b.yaml', bare), { identitiesDir: ids })).toThrow(/needs max_words, excludes or both/);
+    const badPattern = STYLE.replace("excludes: ['!']", "excludes: ['(']");
+    expect(() => loadScenarioCase(write('c.yaml', badPattern), { identitiesDir: ids })).toThrow(/invalid pattern/);
+    const agentOnReply = STYLE.replace('      text: reply\n', '      text: reply\n      agent: calendar\n');
+    expect(() => loadScenarioCase(write('d.yaml', agentOnReply), { identitiesDir: ids })).toThrow(/the reply is the case agent's/);
   });
 });

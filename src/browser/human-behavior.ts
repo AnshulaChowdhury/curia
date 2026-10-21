@@ -225,6 +225,76 @@ export async function humanClick(page: Page, locator: Locator, opts: BehaviorOpt
 }
 
 /**
+ * Focus a text field before typing (#2201): humanClick, unless an element over the field
+ * would take the click. A floating label or placeholder overlay (Gigya-style sign-in forms)
+ * sits on the input itself, so humanClick's recenter-and-retry never clears it and costs two
+ * full click timeouts; keystrokes only need focus. A trial click (actionability and hit-target
+ * checks, no click) finds the overlay in about two seconds, and the field is then focused
+ * directly. The fallback runs only when the cover is the field's own decoration, the field is
+ * editable, and focus actually lands on it; otherwise the click error surfaces as before.
+ */
+export async function humanFocusField(page: Page, locator: Locator, opts: BehaviorOptions = {}): Promise<void> {
+  try {
+    await locator.click({ trial: true, timeout: 2000 });
+  } catch (err) {
+    if (isPointerInterception(err) && (await focusCoveredField(locator, opts))) return;
+    // Not covered (slow to render, detached, disabled...): humanClick reports it properly.
+  }
+  try {
+    await humanClick(page, locator, opts);
+  } catch (err) {
+    // An overlay that appeared after the trial click.
+    if (isPointerInterception(err) && (await focusCoveredField(locator, opts))) return;
+    throw err;
+  }
+}
+
+/** The slice of DOM the decoration check uses (this project compiles without the DOM lib). */
+interface HitNode {
+  closest(selector: string): (HitNode & { control?: unknown }) | null;
+}
+interface FieldNode {
+  parentElement: { contains(node: unknown): boolean } | null;
+  getBoundingClientRect(): { left: number; top: number; width: number; height: number };
+  getRootNode(): unknown;
+}
+
+/**
+ * Focus a field an overlay covers. True only when the element on top of the field is the
+ * field's own decoration (its <label>, or something inside the field's wrapper that is not a
+ * dialog), the field is editable, and focus lands on it. A consent dialog or modal over the
+ * field is a real block: typing behind it would hide that from the agent (#2201 review).
+ */
+async function focusCoveredField(locator: Locator, opts: BehaviorOptions): Promise<boolean> {
+  try {
+    // The click point Playwright tested is the field's center; check what sits there.
+    const coveredByDecoration = await locator.evaluate((node) => {
+      const el = node as unknown as FieldNode;
+      const r = el.getBoundingClientRect();
+      const root = el.getRootNode() as { elementFromPoint(x: number, y: number): HitNode | null };
+      const hit = root.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (!hit || (hit as unknown) === node) return true;
+      if (hit.closest('dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]')) return false;
+      const label = hit.closest('label');
+      if (label && label.control === node) return true;
+      return el.parentElement !== null && el.parentElement.contains(hit);
+    });
+    if (!coveredByDecoration) {
+      opts.log?.debug('humanFocusField: the field is covered by something other than its own label — not focusing it');
+      return false;
+    }
+    if (!(await locator.isEditable({ timeout: 1000 }))) return false;
+    opts.log?.debug('humanFocusField: an overlay covers the field — focusing it directly');
+    await locator.focus({ timeout: 2000 });
+    // getRootNode, not document: a field inside a shadow root is its root's activeElement.
+    return await locator.evaluate((el) => (el.getRootNode() as unknown as { activeElement: unknown }).activeElement === el);
+  } catch (err) {
+    opts.log?.debug({ err }, 'humanFocusField: direct focus failed — surfacing the click error');
+    return false;
+  }
+}
+
+/**
  * True when a click failed because another element (a sticky bar, overlay, ad, or modal)
  * covers the target's click point. Playwright phrases this as "intercepts pointer events" in
  * the timeout error's call log — matching that phrase is the only signal it exposes for this

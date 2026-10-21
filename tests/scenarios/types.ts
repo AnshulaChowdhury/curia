@@ -4,6 +4,8 @@
 // (#2025), with seeded state and stubbed tools, run N times on the production prompt.
 // Behaviors are scored per run, either in code (`check`) or by the LLM judge (no `check`).
 import type { PrincipalBacklogCounts } from '../../src/agents/prompts/backlog-line.js';
+import type { OfficeIdentityFixture } from '../../src/startup/test-mode-stack.js';
+import type { VerificationDelivery, VerificationStatus } from '../../src/verification/types.js';
 import type { LiveSearchTally } from '../shared/live-search.js';
 import type { ObservedToolCall } from '../shared/turn-capture.js';
 import type { UsageBreakdown } from '../shared/usage.js';
@@ -83,11 +85,21 @@ export type BehaviorCheck =
    */
   | { kind: 'principal_note'; is: 'present' | 'absent'; contains?: string[] }
   /**
+   * Limits on text the agent wrote (#2143): its reply, or one argument of every call it
+   * made to a tool (the `message` of a `signal-send`). `maxWords` caps the word count;
+   * `excludes` are case-insensitive regexes none may match. Silence, or no call to read,
+   * is a miss: an empty message is not a short one.
+   */
+  | { kind: 'text'; of: TextSource; agent?: CheckAgent; maxWords?: number; excludes?: string[] }
+  /**
    * Passes when any alternative passes. For a behavior the platform accepts in more
    * than one shape — e.g. delegate links an entry from `outbound_entry_id` or from its
    * id quoted in the brief (#1972).
    */
   | { kind: 'any_of'; checks: BehaviorCheck[] };
+
+/** What a `text` check reads: the reply, or one argument of each call to a tool. */
+export type TextSource = 'reply' | { tool: string; arg: string };
 
 export interface ExpectedBehavior {
   id: string;
@@ -138,6 +150,48 @@ export interface SeedBullpenThread {
   participants: string[];
   content: string;
   mentionedAgentIds: string[];
+}
+
+/**
+ * A sign-in verification (#2017): a site waiting on a code, as the coordinator's per-turn
+ * "## Sign-in verifications" block and the Dispatcher's code tracking read it. Referenced
+ * as `{{verification:<key>}}` (the row's id).
+ */
+export interface SeedVerification {
+  key: string;
+  /** The site the principal asked about (stored as its registrable domain). */
+  site: string;
+  /** The page showing the challenge, often an identity provider. */
+  pageDomain: string;
+  delivery: VerificationDelivery;
+  browserSessionId: string;
+  /** The backlog task the errand belongs to, a fixed UUID the case's task stubs match on. */
+  taskId?: string;
+  /** Default `pending`. A closed row is still in the block for its recent window. */
+  status: VerificationStatus;
+  /**
+   * Backdates the request; the expiry stays the configured 10 minutes after it, and a
+   * closed row closes at its expiry. Default 1 for a pending row, 15 for any other (so an
+   * `expired` one really is past its expiry).
+   */
+  requestedMinutesAgo: number;
+  /**
+   * Whether the block reads the browser session as alive. There is no browser in a run
+   * (`web-browser` is stubbed), so this is what the case says the stub honours. Default:
+   * alive while pending, gone otherwise.
+   */
+  sessionAlive: boolean;
+}
+
+/**
+ * A channel identity the principal needs for the run (#2017): a case that sends as the
+ * principal on a channel the database's principal may have no identity on. Seeding adds a
+ * verified, active one only when the principal has no active identity on the channel, and
+ * cleanup removes only that row.
+ */
+export interface SeedPrincipalIdentity {
+  channel: string;
+  identifier: string;
 }
 
 /**
@@ -242,6 +296,8 @@ export interface ScenarioCase {
     contacts: SeedContact[];
     outboundContext: SeedOutboundEntry[];
     bullpen: SeedBullpenThread[];
+    verifications: SeedVerification[];
+    principalIdentities: SeedPrincipalIdentity[];
     /**
      * What is waiting on the principal on this run's principal turn (prompt trim PR 7):
      * the counts the Dispatcher's backlog line reports. Absent means nothing is waiting.
@@ -269,8 +325,25 @@ export interface ScenarioCase {
   liveSearch?: true;
   expectedBehaviors: ExpectedBehavior[];
   failureModes: string[];
+  /**
+   * The office identity fixture the case runs under (#2143), from
+   * tests/scenarios/identities/<name>.yaml. The stack is the run's, so every case in a
+   * run shares one identity; such a case is never in the release gate.
+   */
+  identity?: IdentityFixture;
   /** File the case came from, for messages. */
   sourceFile: string;
+}
+
+/** A run-level office identity (tests/scenarios/identities/). */
+export interface IdentityFixture {
+  name: string;
+  /**
+   * The style the fixture sets, in plain words, for the judge. Kept apart from `config` so
+   * the judge reads the same target whatever shape the identity takes.
+   */
+  judgeBrief: string;
+  config: OfficeIdentityFixture;
 }
 
 // ── Execution ─────────────────────────────────────────────────────────────
@@ -407,11 +480,15 @@ export interface CaseResult {
 export interface SuiteResult {
   timestamp: string;
   model: string;
+  /** The --reasoning-effort arm, e.g. "standard=low (other tiers as configured)" (ADR-048). Absent in older results. */
+  reasoning?: string;
   commit?: string;
   /** With --overlay: the deployment repo's commit, whose agents and cases ran. */
   overlayCommit?: string;
   /** Cases marked release_gate: false that this run left out (#2027). */
   onDemandSkipped?: string[];
+  /** The office identity fixture every case ran under (#2143). Absent: the database's own. */
+  identity?: string;
   /** Runs each case actually got (a case's `runs` or --runs can differ from the default). */
   runsPerCase: Record<string, number>;
   cases: CaseResult[];

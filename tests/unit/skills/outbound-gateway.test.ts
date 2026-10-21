@@ -9,6 +9,8 @@ import type { BusEvent } from '../../../src/bus/events.js';
 import type { AutonomyService, AutonomyConfig } from '../../../src/autonomy/autonomy-service.js';
 import type { PiiRedactor } from '../../../src/dispatch/pii-redactor.js';
 import type { ActionLogRepo } from '../../../src/autonomy/action-log-repo.js';
+import type { BandSendReview } from '../../../src/dispatch/band-send-review.js';
+import type { OutboundQueueRepo } from '../../../src/skills/outbound-queue-repo.js';
 import { readFile, realpath } from 'node:fs/promises';
 
 vi.mock('node:fs/promises', () => ({
@@ -653,7 +655,7 @@ describe('OutboundGateway', () => {
 
       await gateway.send(baseRequest);
 
-      // Two bus.publish calls: outbound.blocked + outbound.notification (#206)
+      // Two bus.publish calls: outbound.blocked + the principal.report digest item (#2159)
       expect(mocks.bus.publish).toHaveBeenCalledTimes(2);
       // bus.publish(layer, event) — event is the second argument (index 1)
       const blockedEvent = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls[0][1] as BusEvent;
@@ -665,9 +667,9 @@ describe('OutboundGateway', () => {
       }
     });
 
-    it('publishes outbound.notification event for CEO alert when filter rejects', async () => {
-      // The CEO notification routes through the bus as an outbound.notification event
-      // so it goes through the same safety pipeline as regular outbound messages (#206).
+    it('queues a digest item, not an email, when the filter rejects', async () => {
+      // Block notices are FYIs (#1051): since #2159 they go to the principal's digest
+      // queue as principal.report items instead of a standalone email.
       (mocks.contentFilter.check as ReturnType<typeof vi.fn>).mockResolvedValue({
         passed: false,
         findings: [{ rule: 'secret-pattern', detail: 'API key detected' }],
@@ -685,14 +687,16 @@ describe('OutboundGateway', () => {
 
       await gateway.send(baseRequest);
 
-      // The second bus.publish call is the outbound.notification event
+      // The second bus.publish call is the principal.report item
       const notificationEvent = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls[1][1] as BusEvent;
-      expect(notificationEvent.type).toBe('outbound.notification');
-      if (notificationEvent.type === 'outbound.notification') {
-        expect(notificationEvent.payload.notificationType).toBe('blocked_content');
-        expect(notificationEvent.payload.ceoEmail).toBe('ceo@example.com');
-        expect(notificationEvent.payload.subject).toMatch(/blocked/i);
+      expect(notificationEvent.type).toBe('principal.report');
+      if (notificationEvent.type === 'principal.report') {
+        expect(notificationEvent.payload.source).toBe('blocked_content');
+        expect(notificationEvent.payload.urgency).toBe('digest');
+        expect(notificationEvent.payload.summary).toMatch(/blocked/i);
       }
+      const publishedTypes = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls.map((c) => (c[1] as BusEvent).type);
+      expect(publishedTypes).not.toContain('outbound.notification');
       // nylasClient.sendMessage must NOT be called — the gateway no longer sends
       // the notification directly; the EmailAdapter handles delivery.
       expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
@@ -721,14 +725,14 @@ describe('OutboundGateway', () => {
       await gateway.send({ ...baseRequest, body: sensitiveBody });
 
       const notificationEvent = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls[1][1] as BusEvent;
-      expect(notificationEvent.type).toBe('outbound.notification');
-      if (notificationEvent.type === 'outbound.notification') {
+      expect(notificationEvent.type).toBe('principal.report');
+      if (notificationEvent.type === 'principal.report') {
         // Must NOT contain the blocked content
-        expect(notificationEvent.payload.body).not.toContain(sensitiveBody);
+        expect(notificationEvent.payload.summary).not.toContain(sensitiveBody);
         // Must NOT contain the detailed rule finding (could include key value)
-        expect(notificationEvent.payload.body).not.toContain('sk-ant-abcdefghijklmnopqrst1234567890AB');
-        // MUST contain a block ID so the CEO can cross-reference with logs
-        expect(notificationEvent.payload.blockId).toMatch(/^block_/);
+        expect(notificationEvent.payload.summary).not.toContain('sk-ant-abcdefghijklmnopqrst1234567890AB');
+        // MUST contain a block ID so the principal can cross-reference with logs
+        expect(notificationEvent.payload.summary).toMatch(/block_/);
       }
     });
 
@@ -760,14 +764,14 @@ describe('OutboundGateway', () => {
       const blockedEvent = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls[0][1] as BusEvent;
       const notificationEvent = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls[1][1] as BusEvent;
       expect(blockedEvent.type).toBe('outbound.blocked');
-      expect(notificationEvent.type).toBe('outbound.notification');
-      if (notificationEvent.type === 'outbound.notification' && blockedEvent.type === 'outbound.blocked') {
-        // The judge's abstract reason IS surfaced (gives the CEO something to act on).
-        expect(notificationEvent.payload.body).toContain(judgeReason);
-        // A timestamp is present, explicitly labelled UTC.
-        expect(notificationEvent.payload.body).toMatch(/Time: .+\(UTC\)/);
-        // The audit event ID ties the alert to the full audit record.
-        expect(notificationEvent.payload.body).toContain(blockedEvent.id);
+      expect(notificationEvent.type).toBe('principal.report');
+      if (notificationEvent.type === 'principal.report' && blockedEvent.type === 'outbound.blocked') {
+        // The judge's abstract reason IS surfaced (gives the principal something to act on).
+        expect(notificationEvent.payload.summary).toContain(judgeReason);
+        // The item's own audit row carries the time; it is threaded to the block event.
+        expect(notificationEvent.parentEventId).toBe(blockedEvent.id);
+        // The audit event ID ties the item to the full audit record.
+        expect(notificationEvent.payload.summary).toContain(blockedEvent.id);
       }
     });
 
@@ -794,16 +798,16 @@ describe('OutboundGateway', () => {
       await gateway.send(baseRequest);
 
       const notificationEvent = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls[1][1] as BusEvent;
-      expect(notificationEvent.type).toBe('outbound.notification');
-      if (notificationEvent.type === 'outbound.notification') {
-        // The matched secret must never reach the notification...
-        expect(notificationEvent.payload.body).not.toContain(secretFragment);
-        // ...but the rule name is fine and tells the CEO which class of rule fired.
-        expect(notificationEvent.payload.body).toContain('secret-pattern');
+      expect(notificationEvent.type).toBe('principal.report');
+      if (notificationEvent.type === 'principal.report') {
+        // The matched secret must never reach the digest item...
+        expect(notificationEvent.payload.summary).not.toContain(secretFragment);
+        // ...but the rule name is fine and tells the principal which class of rule fired.
+        expect(notificationEvent.payload.summary).toContain('secret-pattern');
       }
     });
 
-    it('fails closed when filter crashes — blocks send and publishes notification', async () => {
+    it('fails closed when filter crashes — blocks send and queues a digest item', async () => {
       // If the content filter itself throws, we must treat it as blocked (fail-closed).
       // A crashing filter is a security anomaly; we'd rather miss a send than let
       // potentially dangerous content through an unchecked pipeline.
@@ -824,10 +828,10 @@ describe('OutboundGateway', () => {
 
       // Filter crash must block the send
       expect(result.success).toBe(false);
-      // CEO notification is published to the bus as outbound.notification
+      // The block is queued for the principal's digest (#2159)
       const publishCalls = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls;
       const notificationCalls = publishCalls.filter(
-        (call: unknown[]) => (call[1] as BusEvent).type === 'outbound.notification',
+        (call: unknown[]) => (call[1] as BusEvent).type === 'principal.report',
       );
       expect(notificationCalls).toHaveLength(1);
     });
@@ -2305,6 +2309,43 @@ describe('OutboundGateway.sendEmailDraft', () => {
     expect(nylasClient.sendDraft).not.toHaveBeenCalled();
   });
 
+  it('queues a blocked draft for the digest instead of emailing the principal (#2159)', async () => {
+    const { gateway, contentFilter, bus } = makeGateway();
+    (contentFilter.check as ReturnType<typeof vi.fn>).mockResolvedValue({
+      passed: false,
+      findings: [{ rule: 'secret-pattern', detail: 'Key detected: sk-ant-secretsecret' }],
+    });
+
+    await gateway.sendEmailDraft(DRAFT_ID, 'joseph', DRAFT_META);
+
+    const events = (bus.publish as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1] as BusEvent);
+    expect(events.map((e) => e.type)).not.toContain('outbound.notification');
+    const report = events.find((e) => e.type === 'principal.report');
+    expect(report).toBeDefined();
+    if (report?.type === 'principal.report') {
+      expect(report.payload.source).toBe('blocked_content');
+      expect(report.payload.summary).toContain(DRAFT_ID);
+      expect(report.payload.summary).toContain('secret-pattern');
+      // A Stage-1 detail can embed the matched fragment; it never reaches the digest.
+      expect(report.payload.summary).not.toContain('sk-ant-secretsecret');
+    }
+  });
+
+  it('still blocks the draft when queueing the notice fails', async () => {
+    const { gateway, contentFilter, bus } = makeGateway();
+    (contentFilter.check as ReturnType<typeof vi.fn>).mockResolvedValue({
+      passed: false,
+      findings: [{ rule: 'secret-pattern', detail: 'Key detected' }],
+    });
+    (bus.publish as ReturnType<typeof vi.fn>).mockImplementation(async (_layer: string, event: BusEvent) => {
+      if (event.type === 'principal.report') throw new Error('bus down');
+    });
+
+    const result = await gateway.sendEmailDraft(DRAFT_ID, 'joseph', DRAFT_META);
+
+    expect(result.success).toBe(false);
+  });
+
   it('returns the judge\'s abstract reason and rule name on a draft LLM-judge block (#1158)', async () => {
     // Mirror of the send() LLM-judge test: a Stage-2 judge block on the draft path
     // must surface the judge's abstract reason (safe — it never quotes the offending
@@ -2613,7 +2654,17 @@ function makeActionLogRepo() {
     bindDeliveryMessage: vi.fn().mockResolvedValue(true),
     findPendingByDeliveryMessage: vi.fn().mockResolvedValue(null),
     findPendingByShortRef: vi.fn().mockResolvedValue(null),
+    insertSampled: vi.fn().mockResolvedValue(1),
+    findApprovalNumber: vi.fn().mockResolvedValue(null),
   } as unknown as ActionLogRepo;
+}
+
+/** An action log whose pending insert returns row 7, numbered `n` (#2159 Phase 3). */
+function makeNumberedActionLogRepo(n: number) {
+  const repo = makeActionLogRepo();
+  vi.mocked(repo.insert).mockResolvedValue(7);
+  vi.mocked(repo.findApprovalNumber).mockResolvedValue(n);
+  return repo;
 }
 
 describe('gated draft-fallback (two-step pattern)', () => {
@@ -2768,72 +2819,10 @@ describe('gated draft-fallback (two-step pattern)', () => {
     expect(actionLogRepo.insert).not.toHaveBeenCalled();
   });
 
-  it('notifies CEO when autonomy gate blocks a send and actionLogRepo + taskEventId are present', async () => {
-    // Bug fix: gateway-level gate blocks must notify the CEO — previously only the
-    // execution-layer ApprovalTriggerService sent notifications, leaving gateway blocks silent.
+  // #2159: the gate writes the row and notifies no one; the agent delivers it on one channel.
+  it('queues one digest mention, sends no notification, and tells the agent to deliver it', async () => {
     const mocks = createMocks();
     const actionLogRepo = makeActionLogRepo();
-
-    const gateway = new OutboundGateway({
-      nylasClients: new Map([['curia', mocks.nylasClient]]),
-      contactService: mocks.contactService,
-      contentFilter: mocks.contentFilter,
-      bus: mocks.bus,
-      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
-      logger: mocks.logger,
-      autonomyService: makeAutonomyService(65),
-      actionLogRepo,
-    });
-
-    await gateway.send(
-      { channel: 'email', to: 'recipient@example.com', subject: 'Hello', body: 'Hi!' },
-      { taskEventId: 'task-123', conversationId: 'conv-456', reExecRecipe: TEST_RECIPE },
-    );
-
-    const publishCalls = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls;
-    const notificationCalls = publishCalls.filter(
-      (call: unknown[]) => (call[1] as BusEvent).type === 'outbound.notification',
-    );
-    expect(notificationCalls).toHaveLength(1);
-    const notificationEvent = notificationCalls[0]![1] as BusEvent;
-    if (notificationEvent.type === 'outbound.notification') {
-      expect(notificationEvent.payload.notificationType).toBe('approval_requested');
-      expect(notificationEvent.payload.ceoEmail).toBe('ceo@example.com');
-    }
-  });
-
-  it('calls setNotificationSentAt with the row id after successful notification', async () => {
-    const mocks = createMocks();
-    const actionLogRepo = makeActionLogRepo();
-    // insert returns row id 42 so we can assert setNotificationSentAt is called with 42
-    (actionLogRepo.insert as ReturnType<typeof vi.fn>).mockResolvedValue(42);
-
-    const gateway = new OutboundGateway({
-      nylasClients: new Map([['curia', mocks.nylasClient]]),
-      contactService: mocks.contactService,
-      contentFilter: mocks.contentFilter,
-      bus: mocks.bus,
-      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
-      logger: mocks.logger,
-      autonomyService: makeAutonomyService(65),
-      actionLogRepo,
-    });
-
-    await gateway.send(
-      { channel: 'email', to: 'recipient@example.com', subject: 'Hello', body: 'Hi!' },
-      { taskEventId: 'task-123', reExecRecipe: TEST_RECIPE },
-    );
-
-    expect(actionLogRepo.setNotificationSentAt).toHaveBeenCalledOnce();
-    expect(actionLogRepo.setNotificationSentAt).toHaveBeenCalledWith(42);
-  });
-
-  it('does not throw and still returns gated result when sendNotification fails', async () => {
-    // sendNotification() has an internal try-catch, so a bus.publish failure must not
-    // surface as a gateway error — the send is still blocked and gated: true is returned.
-    const mocks = createMocks();
-    const actionLogRepo = makeActionLogRepo();
-    (mocks.bus.publish as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Bus error'));
 
     const gateway = new OutboundGateway({
       nylasClients: new Map([['curia', mocks.nylasClient]]),
@@ -2848,14 +2837,214 @@ describe('gated draft-fallback (two-step pattern)', () => {
 
     const result = await gateway.send(
       { channel: 'email', to: 'recipient@example.com', subject: 'Hello', body: 'Hi!' },
+      { taskEventId: 'task-123', conversationId: 'conv-456', reExecRecipe: TEST_RECIPE },
+    );
+
+    const events = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1] as BusEvent);
+    expect(events.map((e) => e.type)).not.toContain('outbound.notification');
+    const reports = events.filter((e) => e.type === 'principal.report');
+    expect(reports).toHaveLength(1);
+    if (reports[0]?.type === 'principal.report') {
+      expect(reports[0].payload).toMatchObject({ source: 'approval_pending', actionShortRef: result.actionRef, conversationId: 'conv-456' });
+    }
+    expect(result.blockedReason).toContain('deliver-approval');
+    expect(result.blockedReason).toContain(`ref: ${result.actionRef}`);
+    expect(actionLogRepo.setNotificationSentAt).not.toHaveBeenCalled();
+  });
+
+  it('wakes the coordinator to deliver an approval held after the turn ended (relayed reply)', async () => {
+    const mocks = createMocks();
+    const gateway = new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+      logger: mocks.logger,
+      autonomyService: makeAutonomyService(65),
+      actionLogRepo: makeActionLogRepo(),
+    });
+
+    const result = await gateway.send(
+      { channel: 'email', to: 'recipient@example.com', subject: 'Hello', body: 'Hi!' },
+      { taskEventId: 'task-123', reExecRecipe: TEST_RECIPE, postTurn: true },
+    );
+
+    const events = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1] as BusEvent);
+    const wakes = events.filter((e) => e.type === 'agent.task');
+    expect(wakes).toHaveLength(1);
+    if (wakes[0]?.type === 'agent.task') {
+      expect(wakes[0].payload).toMatchObject({ agentId: 'coordinator', conversationId: `approval-delivery:${result.actionRef}` });
+      expect(wakes[0].payload.content).toContain('deliver-approval');
+      expect(wakes[0].parentEventId).toBe('task-123');
+    }
+  });
+
+  it('does not wake anyone for a send made inside an agent turn', async () => {
+    const mocks = createMocks();
+    const gateway = new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+      logger: mocks.logger,
+      autonomyService: makeAutonomyService(65),
+      actionLogRepo: makeActionLogRepo(),
+    });
+
+    await gateway.send(
+      { channel: 'email', to: 'recipient@example.com', subject: 'Hello', body: 'Hi!' },
       { taskEventId: 'task-123', reExecRecipe: TEST_RECIPE },
     );
 
-    // Gate must still fire correctly despite the notification failure
+    const events = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1] as BusEvent);
+    expect(events.some((e) => e.type === 'agent.task')).toBe(false);
+  });
+
+  it('registers what the principal is shown with approval delivery', async () => {
+    const mocks = createMocks();
+    const registerDisplay = vi.fn();
+    const gateway = new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+      logger: mocks.logger,
+      autonomyService: makeAutonomyService(65),
+      actionLogRepo: makeActionLogRepo(),
+    });
+    gateway.setApprovalDelivery({ registerDisplay } as never);
+
+    const result = await gateway.send(
+      { channel: 'email', to: 'recipient@example.com', subject: 'Hello', body: 'Hi!' },
+      { taskEventId: 'task-123', reExecRecipe: TEST_RECIPE },
+    );
+
+    expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({
+      preamble: TEST_RECIPE.description,
+      payload: expect.objectContaining({ to: 'recipient@example.com', subject: 'Hello' }),
+    }));
+  });
+
+  // #2159 Phase 3: the principal answers by number. The gate reads it back by row id, shows
+  // it, and tells the agent; the ref stays, since deliver-approval is keyed on it.
+  it('registers and quotes the approval number read back after the insert', async () => {
+    const mocks = createMocks();
+    const registerDisplay = vi.fn();
+    const actionLogRepo = makeNumberedActionLogRepo(3);
+    const gateway = new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+      logger: mocks.logger,
+      autonomyService: makeAutonomyService(65),
+      actionLogRepo,
+    });
+    gateway.setApprovalDelivery({ registerDisplay } as never);
+
+    const result = await gateway.send(
+      { channel: 'email', to: 'recipient@example.com', subject: 'Hello', body: 'Hi!' },
+      { taskEventId: 'task-123', reExecRecipe: TEST_RECIPE },
+    );
+
+    expect(actionLogRepo.findApprovalNumber).toHaveBeenCalledWith(7);
+    expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({ approvalNumber: 3 }));
+    expect(result.actionRef).toMatch(/^[0-9a-f]{8}$/);
+    expect(result.blockedReason).toContain('approval 3');
+    expect(result.blockedReason).toContain(`ref: ${result.actionRef}`);
+  });
+
+  it('keeps the held send gated, unnumbered, when the number cannot be read back', async () => {
+    const mocks = createMocks();
+    const registerDisplay = vi.fn();
+    const actionLogRepo = makeActionLogRepo();
+    vi.mocked(actionLogRepo.findApprovalNumber).mockRejectedValue(new Error('db blip'));
+    const gateway = new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+      logger: mocks.logger,
+      autonomyService: makeAutonomyService(65),
+      actionLogRepo,
+    });
+    gateway.setApprovalDelivery({ registerDisplay } as never);
+
+    const result = await gateway.send(
+      { channel: 'email', to: 'recipient@example.com', subject: 'Hello', body: 'Hi!' },
+      { taskEventId: 'task-123', reExecRecipe: TEST_RECIPE },
+    );
+
+    expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.stringMatching(/^[0-9a-f]{8}$/) });
+    expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({ approvalNumber: null }));
+    expect(result.blockedReason).not.toMatch(/approval \d/);
+  });
+
+  it('numbers an export-gate approval the same way', async () => {
+    const mocks = createMocks();
+    const registerDisplay = vi.fn();
+    const actionLogRepo = makeNumberedActionLogRepo(6);
+    const exportControlService = {
+      evaluateGatewayAttachments: vi.fn().mockResolvedValue({
+        outcome: { action: 'approval_required', code: 'bulk_export', message: 'This export needs the principal\'s approval.' },
+        items: [{ label: 'board.pdf', sensitivity: 'confidential' }],
+      }),
+    };
+    const gateway = new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+      logger: mocks.logger,
+      actionLogRepo,
+      exportControlService: exportControlService as never,
+    });
+    gateway.setApprovalDelivery({ registerDisplay } as never);
+
+    const result = await gateway.send(
+      {
+        channel: 'email', to: 'recipient@example.com', subject: 'Board pack', body: 'Attached.',
+        attachments: [{ fileUrl: 'file:///tmp/board.pdf', filename: 'board.pdf', contentType: 'application/pdf' }],
+      },
+      { taskEventId: 'task-123', reExecRecipe: TEST_RECIPE },
+    );
+
+    expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.stringMatching(/^[0-9a-f]{8}$/) });
+    expect(actionLogRepo.findApprovalNumber).toHaveBeenCalledWith(7);
+    expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({ approvalNumber: 6 }));
+    expect(result.blockedReason).toContain('approval 6');
+    expect(result.blockedReason).toContain(`ref: ${result.actionRef}`);
+  });
+
+  it('still returns the gated result when the digest mention fails to queue', async () => {
+    const mocks = createMocks();
+    (mocks.bus.publish as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Bus error'));
+
+    const gateway = new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+      logger: mocks.logger,
+      autonomyService: makeAutonomyService(65),
+      actionLogRepo: makeActionLogRepo(),
+    });
+
+    const result = await gateway.send(
+      { channel: 'email', to: 'recipient@example.com', subject: 'Hello', body: 'Hi!' },
+      { taskEventId: 'task-123', reExecRecipe: TEST_RECIPE },
+    );
+
     expect(result.success).toBe(false);
     expect(result.gated).toBe(true);
-    // Notification failed → setNotificationSentAt must NOT be called
-    expect(actionLogRepo.setNotificationSentAt).not.toHaveBeenCalled();
+    expect(result.actionRef).toMatch(/^[0-9a-f]{8}$/);
   });
 
   it('returns undefined actionRef when insert throws (no phantom reference)', async () => {
@@ -3463,17 +3652,52 @@ describe('OutboundGateway — principal mailbox and email signature', () => {
     expect(draftHtml()).toContain('Alex Curia<br>\nDigital EA');
   });
 
-  it('does not sign twice when the body already ends with the signature', async () => {
-    const { gateway, sentHtml } = makeGateway({ persona: PERSONA });
-    await gateway.send(email({ body: 'Tuesday at 10 works.\n\nAlex Curia\n**Digital EA**' }));
-    expect(sentHtml()).not.toContain('<p>--');
-    expect(sentHtml().match(/Alex Curia/g)).toHaveLength(1);
+  // #2138: the model's sign-off gives way to the configured signature, whatever its form.
+  const SIGNATURE_HTML = '--<br>\nAlex Curia<br>\nDigital EA';
+  it.each([
+    ['exactly the signature', 'Alex Curia\n**Digital EA**'],
+    ['first name over a signature line', 'Alex\nDigital EA'],
+    ['name over a title the signature lacks', 'Alex Curia\nOffice of the CEO'],
+    ['a bare first name', 'Alex'],
+  ])('signs once when the body ends with %s', async (_label, signOff) => {
+    const persona = { ...PERSONA, title: 'Office of the CEO' };
+    const { gateway, mocks, sentHtml } = makeGateway({ persona });
+    await gateway.send(email({ body: `Tuesday at 10 works.\n\n${signOff}` }));
+    const html = sentHtml();
+    expect(html).toContain(SIGNATURE_HTML);
+    expect(html.match(/Alex/g)).toHaveLength(1);
+    const delivered = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .map(call => call[1] as { type: string; payload: { content?: string } })
+      .find(event => event.type === 'outbound.delivered');
+    expect(delivered?.payload.content).toBe('Tuesday at 10 works.');
   });
 
-  it('still signs below a short sign-off', async () => {
+  it('keeps a valediction above the signature', async () => {
     const { gateway, sentHtml } = makeGateway({ persona: PERSONA });
     await gateway.send(email({ body: 'Tuesday at 10 works.\n\nBest,\nAlex' }));
-    expect(sentHtml()).toContain('--<br>\nAlex Curia<br>\nDigital EA');
+    expect(sentHtml()).toContain('Best,');
+    expect(sentHtml()).toContain(SIGNATURE_HTML);
+    expect(sentHtml().match(/Alex/g)).toHaveLength(1);
+  });
+
+  it('signs below a last line that mentions the name in a sentence', async () => {
+    const { gateway, sentHtml } = makeGateway({ persona: PERSONA });
+    await gateway.send(email({ body: 'Tuesday at 10 works.\n\nAlex will follow up Monday.' }));
+    expect(sentHtml()).toContain('Alex will follow up Monday.');
+    expect(sentHtml()).toContain(SIGNATURE_HTML);
+  });
+
+  it('drops the model\'s sign-off from a draft', async () => {
+    const { gateway, draftHtml } = makeGateway({ persona: PERSONA });
+    await gateway.createEmailDraft(email({ accountId: 'curia', body: 'Tuesday at 10 works.\n\nAlex\nDigital EA' }));
+    expect(draftHtml()).toContain(SIGNATURE_HTML);
+    expect(draftHtml().match(/Alex/g)).toHaveLength(1);
+  });
+
+  it('keeps the model\'s sign-off where the gateway does not sign', async () => {
+    const { gateway, draftHtml } = makeGateway({ persona: PERSONA });
+    await gateway.createEmailDraft(email({ accountId: 'joseph', body: 'Tuesday at 10 works.\n\nAlex Curia' }));
+    expect(draftHtml()).toContain('Alex Curia');
   });
 
   it('does not sign system notifications', async () => {
@@ -3492,5 +3716,484 @@ describe('OutboundGateway — principal mailbox and email signature', () => {
     const { gateway, sentHtml } = makeGateway();
     await gateway.send({ ...email(), signature: 'Injected' });
     expect(sentHtml()).not.toContain('Injected');
+  });
+});
+
+describe('band review (#2159)', () => {
+  let mocks: ReturnType<typeof createMocks>;
+  beforeEach(() => {
+    mocks = createMocks();
+  });
+
+  const emailReq = { channel: 'email' as const, to: 'joel@example.com', subject: 'Forms', body: 'Hi Joel. I am out of office until the 13th.' };
+
+  function makeBandGateway(opts: { review: ReturnType<typeof vi.fn>; score: number; gating?: 'band' | 'tier'; actionLogRepo?: ActionLogRepo }) {
+    return new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('principal@example.com')],
+      logger: mocks.logger,
+      autonomyService: makeAutonomyService(opts.score),
+      actionLogRepo: opts.actionLogRepo ?? makeActionLogRepo(),
+      gating: opts.gating ?? 'band',
+      bandReview: { review: opts.review as unknown as BandSendReview['review'] },
+    });
+  }
+
+  function publishedOfType(bus: EventBus, type: string): Array<{ type: string; payload: Record<string, unknown> }> {
+    return vi.mocked(bus.publish).mock.calls
+      .map(([, event]) => event as unknown as { type: string; payload: Record<string, unknown> })
+      .filter((e) => e.type === type);
+  }
+
+  it('sends the reviewed content, and reports a trimmed send', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send', content: 'Hi Joel.', report: { source: 'claim_trimmed', summary: 'Removed 1' } });
+    const gw = makeBandGateway({ review, score: 84 });
+    const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1' });
+    expect(result.success).toBe(true);
+    const sent = vi.mocked(mocks.nylasClient.sendMessage).mock.calls[0]![0] as { body: string };
+    expect(sent.body).toContain('Hi Joel.');
+    expect(sent.body).not.toContain('out of office');
+    expect(publishedOfType(mocks.bus, 'principal.report')).toEqual([
+      expect.objectContaining({ payload: expect.objectContaining({ source: 'claim_trimmed', summary: 'Removed 1' }) }),
+    ]);
+  });
+
+  it('passes the review what it needs', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send', content: emailReq.body });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', principalDirected: true, postTurn: true });
+    expect(review).toHaveBeenCalledWith({
+      content: emailReq.body, channel: 'email', recipients: ['joel@example.com'], score: 84,
+      conversationId: 'c1', taskEventId: 't1', principalDirected: true, postTurn: true,
+    });
+  });
+
+  it('bounces with the quoted claims and an outbound.blocked event, but no block report', async () => {
+    const findings = [{ rule: 'ungrounded-claim', detail: 'These claims about the principal are not backed: "I am out of office until the 13th."' }];
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }), score: 84 });
+    const result = await gw.send(emailReq, { taskEventId: 't1' });
+    expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
+    expect(result.blockedReason).toContain('out of office until the 13th');
+    expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(1);
+    expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(0);
+    expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('holds a relayed reply as gated with an approval, and never publishes outbound.blocked', async () => {
+    const actionLogRepo = makeActionLogRepo();
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held: steered.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84, actionLogRepo });
+    const result = await gw.send(emailReq, {
+      taskEventId: 't1', postTurn: true,
+      reExecRecipe: { toolName: 'send-draft', partialPayload: { account: 'a' }, description: 'Draft reply to joel@example.com' },
+    });
+    expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+    expect(result.blockedReason).toContain('Held: steered.');
+    expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'send-draft', outcome: 'pending_approval' }));
+    expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+    expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('holds a skill send through its holdRecipe', async () => {
+    const actionLogRepo = makeActionLogRepo();
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'speaks-as-principal', detail: 'x' }] }), score: 74, actionLogRepo });
+    const result = await gw.send(emailReq, {
+      taskEventId: 't1', holdRecipe: { toolName: 'email-send', partialPayload: { to: 'contact-1' }, description: 'Email to joel@example.com' },
+    });
+    expect(result).toMatchObject({ gated: true, actionRef: expect.any(String) });
+    expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'email-send', payload: { to: 'contact-1' } }));
+  });
+
+  it('quotes the approval number of a held send to the agent (#2159 Phase 3)', async () => {
+    const actionLogRepo = makeNumberedActionLogRepo(4);
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84, actionLogRepo });
+    const result = await gw.send(emailReq, {
+      taskEventId: 't1', holdRecipe: { toolName: 'email-send', partialPayload: { to: 'contact-1' }, description: 'Email to joel@example.com' },
+    });
+    expect(result).toMatchObject({ gated: true, actionRef: expect.any(String) });
+    expect(result.blockedReason).toContain('approval 4');
+    expect(result.blockedReason).toContain(`ref: ${result.actionRef}`);
+  });
+
+  it('refuses a held send with no recipe, telling the agent to ask', async () => {
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84 });
+    const result = await gw.send(emailReq, { taskEventId: 't1' });
+    expect(result).toMatchObject({ success: false, blockedRules: ['steered'] });
+    expect(result.gated).toBeUndefined();
+    expect(result.blockedReason).toContain('Ask the principal before sending it.');
+  });
+
+  it('tells the principal\'s digest about a hold no approval could be raised for', async () => {
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held: steered.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84 });
+    await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1' });
+    expect(publishedOfType(mocks.bus, 'principal.report')).toEqual([
+      expect.objectContaining({ payload: expect.objectContaining({ source: 'blocked_content', summary: expect.stringContaining('Held: steered.') }) }),
+    ]);
+  });
+
+  it('tells the digest when the approval row for a hold could not be written', async () => {
+    const actionLogRepo = makeActionLogRepo();
+    vi.mocked(actionLogRepo.insert).mockRejectedValue(new Error('db down'));
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held: steered.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84, actionLogRepo });
+    const result = await gw.send(emailReq, { taskEventId: 't1', holdRecipe: { toolName: 'email-send', description: 'Email to joel@example.com' } });
+    expect(result).toMatchObject({ gated: true });
+    expect(result.actionRef).toBeUndefined();
+    expect(publishedOfType(mocks.bus, 'principal.report').map((e) => e.payload['source'])).toContain('blocked_content');
+  });
+
+  it('logs an error when built for band gating with no review to run', () => {
+    const error = vi.fn();
+    const logger = { ...mocks.logger, child: () => ({ ...mocks.logger, error }) } as unknown as typeof mocks.logger;
+    new OutboundGateway({
+      contactService: mocks.contactService, contentFilter: mocks.contentFilter, bus: mocks.bus, logger, gating: 'band',
+    });
+    expect(error).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('band gating without a band review'));
+  });
+
+  it('holds when the review throws', async () => {
+    const gw = makeBandGateway({ review: vi.fn().mockRejectedValue(new Error('boom')), score: 84 });
+    const result = await gw.send(emailReq, { taskEventId: 't1' });
+    expect(result.success).toBe(false);
+    expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('skips the review for the principal alone, system notifications and approved sends', async () => {
+    const review = vi.fn();
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send({ ...emailReq, to: 'principal@example.com' }, {});
+    await gw.send(emailReq, { isSystemNotification: true });
+    await gw.send(emailReq, { humanApproved: true });
+    expect(review).not.toHaveBeenCalled();
+  });
+
+  it('never reviews under tier gating, and ignores holdRecipe there', async () => {
+    const review = vi.fn();
+    const gw = makeBandGateway({ review, score: 84, gating: 'tier' });
+    const result = await gw.send(emailReq, { taskEventId: 't1', holdRecipe: { toolName: 'email-send', description: 'x' } });
+    expect(review).not.toHaveBeenCalled();
+    expect(result.success).toBe(true);
+  });
+
+  it('emails the principal when a sent-without-review report cannot be recorded', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send', content: emailReq.body, report: { source: 'sent_without_review', summary: 'Sent unreviewed' } });
+    const gw = makeBandGateway({ review, score: 84 });
+    vi.mocked(mocks.bus.publish).mockImplementation(async (_layer, event) => {
+      if ((event as { type: string }).type === 'principal.report') throw new Error('audit down');
+    });
+    await gw.send(emailReq, { taskEventId: 't1' });
+    const recipients = vi.mocked(mocks.nylasClient.sendMessage).mock.calls.map((c) => (c[0] as { to: Array<{ email: string }> }).to[0]!.email);
+    expect(recipients).toEqual(['joel@example.com', 'principal@example.com']);
+  });
+
+  describe('sendEmailDraft', () => {
+    const draftMeta = { recipientEmail: 'joel@example.com', body: 'Hi Joel. I am out of office until the 13th.', subject: 'Forms' };
+
+    function withDraftClient() {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+    }
+
+    it('reviews an autonomous draft send and bounces it', async () => {
+      withDraftClient();
+      const findings = [{ rule: 'ungrounded-claim', detail: 'not backed: "I am out of office until the 13th."' }];
+      const review = vi.fn().mockResolvedValue({ kind: 'bounce', findings });
+      const gw = makeBandGateway({ review, score: 84 });
+      const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, { taskEventId: 't1', conversationId: 'c1' });
+      expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
+      expect(review).toHaveBeenCalledWith(expect.objectContaining({ content: draftMeta.body, channel: 'email', score: 84 }));
+    });
+
+    it('holds a draft the review would trim: a stored draft cannot be edited', async () => {
+      withDraftClient();
+      const review = vi.fn().mockResolvedValue({ kind: 'send', content: 'Hi Joel.', report: { source: 'claim_trimmed', summary: 'x' } });
+      const gw = makeBandGateway({ review, score: 84 });
+      const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, {
+        taskEventId: 't1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft to joel@example.com' },
+      });
+      expect(result).toMatchObject({ success: false, gated: true });
+      expect((mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft).not.toHaveBeenCalled();
+    });
+
+    it('sends a draft the review passes', async () => {
+      withDraftClient();
+      const review = vi.fn().mockResolvedValue({ kind: 'send', content: draftMeta.body });
+      const gw = makeBandGateway({ review, score: 84 });
+      const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, { taskEventId: 't1' });
+      expect(result.success).toBe(true);
+    });
+
+    it('skips the review when the principal directed this draft send', async () => {
+      withDraftClient();
+      const review = vi.fn();
+      const gw = makeBandGateway({ review, score: 84 });
+      await gw.sendEmailDraft('d1', 'curia', draftMeta, { humanApproved: true, principalDirected: true });
+      expect(review).not.toHaveBeenCalled();
+    });
+
+    it('reviews a draft a woken task sends, though send-draft always marks it humanApproved', async () => {
+      // send-draft passes humanApproved on every call (its own task-origin check is the
+      // gate), so humanApproved does not mean the principal read this draft.
+      withDraftClient();
+      const review = vi.fn().mockResolvedValue({ kind: 'send', content: draftMeta.body });
+      const gw = makeBandGateway({ review, score: 84 });
+      await gw.sendEmailDraft('d1', 'curia', draftMeta, { humanApproved: true, principalDirected: false, taskEventId: 't1' });
+      expect(review).toHaveBeenCalledWith(expect.objectContaining({ principalDirected: false }));
+    });
+  });
+});
+
+describe('spot-check pool (#2159 Phase 3)', () => {
+  let mocks: ReturnType<typeof createMocks>;
+  beforeEach(() => {
+    mocks = createMocks();
+  });
+
+  const danaReq = { channel: 'email' as const, to: 'dana@example.com', subject: 'Payment schedule', body: 'Hi Dana. The schedule is attached.' };
+
+  function makePoolGateway(opts: {
+    actionLogRepo?: ActionLogRepo;
+    review?: ReturnType<typeof vi.fn>;
+    outboundQueue?: OutboundQueueRepo;
+  } = {}) {
+    return new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('principal@example.com')],
+      logger: mocks.logger,
+      autonomyService: makeAutonomyService(85),
+      actionLogRepo: opts.actionLogRepo ?? makeActionLogRepo(),
+      ...(opts.review
+        ? { gating: 'band' as const, bandReview: { review: opts.review as unknown as BandSendReview['review'] } }
+        : {}),
+      ...(opts.outboundQueue
+        ? { outboundQueue: opts.outboundQueue, outboundQueueReadiness: new Map([['email', () => false]]) }
+        : {}),
+    });
+  }
+
+  function sampledRows(repo: ActionLogRepo): Array<Record<string, unknown>> {
+    return vi.mocked(repo.insertSampled).mock.calls.map((c) => c[0] as unknown as Record<string, unknown>);
+  }
+
+  it('records an autonomous email send to a first contact', async () => {
+    const actionLogRepo = makeActionLogRepo();
+    const gw = makePoolGateway({ actionLogRepo });
+    const result = await gw.send(danaReq, { taskEventId: 't1', conversationId: 'c1' });
+    expect(result.success).toBe(true);
+    expect(sampledRows(actionLogRepo)).toEqual([{
+      taskId: 't1',
+      conversationId: 'c1',
+      toolName: 'email-send',
+      actionRisk: 'medium',
+      summary: 'Emailed dana@example.com: "Payment schedule"',
+      signals: { firstContact: true },
+    }]);
+  });
+
+  it('uses the calling skill as the tool name, and no firstContact for a known contact', async () => {
+    vi.mocked(mocks.contactService.resolveByChannelIdentity).mockResolvedValue({
+      contactId: 'contact-dana', displayName: 'Dana', role: null, tier: 'known', kind: 'person', kgNodeId: null, verified: true,
+    } as unknown as Awaited<ReturnType<ContactService['resolveByChannelIdentity']>>);
+    // A long-standing contact: created a month ago.
+    (mocks.contactService as unknown as { getContact: ReturnType<typeof vi.fn> }).getContact = vi.fn().mockResolvedValue({
+      id: 'contact-dana', createdAt: new Date(Date.now() - 30 * 86_400_000),
+    });
+    const actionLogRepo = makeActionLogRepo();
+    const gw = makePoolGateway({ actionLogRepo });
+    await gw.send(danaReq, { taskEventId: 't1', exportContext: { toolName: 'email-reply' } });
+    expect(sampledRows(actionLogRepo)).toEqual([expect.objectContaining({ toolName: 'email-reply', signals: {} })]);
+  });
+
+  // firstContact (#2159 Phase 3 review): send skills address recipients by contact UUID
+  // (ADR-047), so a first-time recipient already HAS a contact, created moments before by
+  // contact-create. The signal is "the contact is new", not "there is no contact".
+  describe('firstContact', () => {
+    const HOUR = 3_600_000;
+    function withContactCreated(msAgo: number) {
+      vi.mocked(mocks.contactService.resolveByChannelIdentity).mockResolvedValue({
+        contactId: 'contact-dana', displayName: 'Dana', role: null, tier: 'known', kind: 'person', kgNodeId: null, verified: true,
+      } as unknown as Awaited<ReturnType<ContactService['resolveByChannelIdentity']>>);
+      (mocks.contactService as unknown as { getContact: ReturnType<typeof vi.fn> }).getContact = vi.fn().mockResolvedValue({
+        id: 'contact-dana', createdAt: new Date(Date.now() - msAgo),
+      });
+    }
+
+    it('is true for a contact created an hour ago', async () => {
+      withContactCreated(HOUR);
+      const actionLogRepo = makeActionLogRepo();
+      await makePoolGateway({ actionLogRepo }).send(danaReq, { taskEventId: 't1' });
+      expect(sampledRows(actionLogRepo)).toEqual([expect.objectContaining({ signals: { firstContact: true } })]);
+      expect((mocks.contactService as unknown as { getContact: ReturnType<typeof vi.fn> }).getContact).toHaveBeenCalledWith('contact-dana');
+    });
+
+    it('is false for a contact created ten days ago', async () => {
+      withContactCreated(10 * 24 * HOUR);
+      const actionLogRepo = makeActionLogRepo();
+      await makePoolGateway({ actionLogRepo }).send(danaReq, { taskEventId: 't1' });
+      expect(sampledRows(actionLogRepo)).toEqual([expect.objectContaining({ signals: {} })]);
+    });
+
+    it('is false for a Signal group, which no contact stands for', async () => {
+      const signalClient = { send: vi.fn().mockResolvedValue({ timestamp: 1 }), isConnected: () => true };
+      const actionLogRepo = makeActionLogRepo();
+      const gw = new OutboundGateway({
+        signalClient: signalClient as unknown as import('../../../src/channels/signal/signal-rpc-client.js').SignalRpcClient,
+        signalPhoneNumber: '+15555550000',
+        contactService: mocks.contactService, contentFilter: mocks.contentFilter, bus: mocks.bus, logger: mocks.logger,
+        actionLogRepo,
+      });
+      const result = await gw.send({ channel: 'signal', groupId: 'group-abc', message: 'Agenda attached.' }, { taskEventId: 't1' });
+      expect(result.success).toBe(true);
+      expect(sampledRows(actionLogRepo)).toEqual([expect.objectContaining({ signals: {} })]);
+    });
+
+    it('is false, with a warning, when the contact lookup throws', async () => {
+      const warn = vi.fn();
+      const child = { ...mocks.logger, warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+      mocks.logger = { ...mocks.logger, child: () => child } as unknown as typeof mocks.logger;
+      withContactCreated(HOUR);
+      (mocks.contactService as unknown as { getContact: ReturnType<typeof vi.fn> }).getContact = vi.fn().mockRejectedValue(new Error('db down'));
+      const actionLogRepo = makeActionLogRepo();
+      await makePoolGateway({ actionLogRepo }).send(danaReq, { taskEventId: 't1' });
+      expect(sampledRows(actionLogRepo)).toEqual([expect.objectContaining({ signals: {} })]);
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({ contactId: 'contact-dana' }), expect.stringContaining('first contact'));
+    });
+
+    it('is false when resolving the recipient failed outright', async () => {
+      vi.mocked(mocks.contactService.resolveByChannelIdentity).mockRejectedValue(new Error('db down'));
+      const actionLogRepo = makeActionLogRepo();
+      await makePoolGateway({ actionLogRepo }).send(danaReq, { taskEventId: 't1' });
+      expect(sampledRows(actionLogRepo)).toEqual([expect.objectContaining({ signals: {} })]);
+    });
+
+    it('applies to a draft send too', async () => {
+      withContactCreated(HOUR);
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const actionLogRepo = makeActionLogRepo();
+      await makePoolGateway({ actionLogRepo }).sendEmailDraft(
+        'd1', 'curia', { recipientEmail: 'dana@example.com', body: 'Hi Dana.', subject: 'Payment schedule' },
+        { humanApproved: true, principalDirected: false, taskEventId: 't1' },
+      );
+      expect(sampledRows(actionLogRepo)).toEqual([expect.objectContaining({ toolName: 'send-draft', signals: { firstContact: true } })]);
+    });
+  });
+
+  it('records nothing for system notices, approved, principal-directed, principal-only or queued sends', async () => {
+    const actionLogRepo = makeActionLogRepo();
+    const gw = makePoolGateway({ actionLogRepo });
+    await gw.send(danaReq, { taskEventId: 't1', isSystemNotification: true });
+    await gw.send(danaReq, { taskEventId: 't1', humanApproved: true });
+    await gw.send(danaReq, { taskEventId: 't1', principalDirected: true });
+    await gw.send({ ...danaReq, to: 'principal@example.com' }, { taskEventId: 't1' });
+    expect(actionLogRepo.insertSampled).not.toHaveBeenCalled();
+
+    const outboundQueue = {
+      enqueue: vi.fn().mockResolvedValue({ id: 'q-1' }),
+      listPending: vi.fn(), deleteByIds: vi.fn(), deleteExpired: vi.fn(), countPending: vi.fn(),
+    } as unknown as OutboundQueueRepo;
+    const queuedRepo = makeActionLogRepo();
+    const queuedGw = makePoolGateway({ actionLogRepo: queuedRepo, outboundQueue });
+    const queued = await queuedGw.send(danaReq, { taskEventId: 't1' });
+    expect(queued.queued).toBe(true);
+    expect(queuedRepo.insertSampled).not.toHaveBeenCalled();
+  });
+
+  it('records the band review outcome: trimmed, unreviewed, speaks as principal', async () => {
+    const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+      [{ kind: 'send', content: 'Hi Dana.', report: { source: 'claim_trimmed', summary: 'Removed 1' }, signals: { bounced: true } }, { review: 'trimmed' }],
+      [{ kind: 'send', content: danaReq.body, report: { source: 'sent_without_review', summary: 'Sent unreviewed' } }, { review: 'unreviewed' }],
+      [{ kind: 'send', content: danaReq.body, signals: { speaksAsPrincipal: true } }, { speaksAsPrincipal: true }],
+      [{ kind: 'send', content: danaReq.body, signals: { bounced: true } }, { review: 'bounced' }],
+    ];
+    for (const [decision, expected] of cases) {
+      const actionLogRepo = makeActionLogRepo();
+      const gw = makePoolGateway({ actionLogRepo, review: vi.fn().mockResolvedValue(decision) });
+      await gw.send(danaReq, { taskEventId: 't1' });
+      expect(sampledRows(actionLogRepo)).toEqual([
+        expect.objectContaining({ signals: { firstContact: true, ...expected } }),
+      ]);
+    }
+  });
+
+  it('still reports success, and logs an error with context, when the pool row cannot be written', async () => {
+    const error = vi.fn();
+    const child = { ...mocks.logger, warn: vi.fn(), info: vi.fn(), error, debug: vi.fn() };
+    mocks.logger = { ...mocks.logger, child: () => child } as unknown as typeof mocks.logger;
+    const actionLogRepo = makeActionLogRepo();
+    // A pg error carries a SQLSTATE code; it is what tells a full disk from a bad column.
+    vi.mocked(actionLogRepo.insertSampled).mockRejectedValue(Object.assign(new Error('db down'), { code: '53100' }));
+    const gw = makePoolGateway({ actionLogRepo });
+    const result = await gw.send(danaReq, { taskEventId: 't1', exportContext: { toolName: 'email-reply' } });
+    expect(result.success).toBe(true);
+    expect(error).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'email', toolName: 'email-reply', taskEventId: 't1', code: '53100' }),
+      expect.stringContaining('spot checks'),
+    );
+  });
+
+  it('warns once, at construction, when no actionLogRepo is wired', async () => {
+    const warn = vi.fn();
+    const child = { ...mocks.logger, warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const spyLogger = { ...mocks.logger, child: () => child } as unknown as typeof mocks.logger;
+    const gw = new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService, contentFilter: mocks.contentFilter, bus: mocks.bus, logger: spyLogger,
+    });
+    const poolWarnings = () => warn.mock.calls.filter((c) => String(c[1]).includes('spot-check pool disabled: no actionLogRepo'));
+    expect(poolWarnings()).toHaveLength(1);
+    // Not per send.
+    await gw.send(danaReq, { taskEventId: 't1' });
+    await gw.send(danaReq, { taskEventId: 't2' });
+    expect(poolWarnings()).toHaveLength(1);
+
+    warn.mockClear();
+    mocks.logger = spyLogger;
+    makePoolGateway({ actionLogRepo: makeActionLogRepo() });
+    expect(poolWarnings()).toHaveLength(0);
+  });
+
+  it('labels chat sends by channel with the first line of the message', async () => {
+    const signalClient = { send: vi.fn().mockResolvedValue({ timestamp: 1 }), isConnected: () => true };
+    const actionLogRepo = makeActionLogRepo();
+    const gw = new OutboundGateway({
+      signalClient: signalClient as unknown as import('../../../src/channels/signal/signal-rpc-client.js').SignalRpcClient,
+      signalPhoneNumber: '+15555550000',
+      contactService: mocks.contactService, contentFilter: mocks.contentFilter, bus: mocks.bus, logger: mocks.logger,
+      actionLogRepo,
+    });
+    await gw.send({ channel: 'signal', recipient: '+15555550100', message: '\nRunning ten minutes late.\nSee you soon.' }, { taskEventId: 't1' });
+    expect(sampledRows(actionLogRepo)).toEqual([
+      expect.objectContaining({ toolName: 'signal-send', summary: 'Sent a Signal message to +15555550100: "Running ten minutes late."' }),
+    ]);
+  });
+
+  describe('sendEmailDraft', () => {
+    const draftMeta = { recipientEmail: 'dana@example.com', body: 'Hi Dana. The schedule is attached.', subject: 'Payment schedule' };
+    function withDraftClient() {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+    }
+
+    it('records an autonomous draft send as send-draft', async () => {
+      withDraftClient();
+      const actionLogRepo = makeActionLogRepo();
+      const gw = makePoolGateway({ actionLogRepo });
+      // send-draft passes humanApproved on every call; it does not mean the principal read it.
+      const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, { humanApproved: true, principalDirected: false, taskEventId: 't1' });
+      expect(result.success).toBe(true);
+      expect(sampledRows(actionLogRepo)).toEqual([expect.objectContaining({
+        taskId: 't1', toolName: 'send-draft', summary: 'Emailed dana@example.com: "Payment schedule"', signals: { firstContact: true },
+      })]);
+    });
+
+    it('records nothing for a principal-directed draft send', async () => {
+      withDraftClient();
+      const actionLogRepo = makeActionLogRepo();
+      const gw = makePoolGateway({ actionLogRepo });
+      await gw.sendEmailDraft('d1', 'curia', draftMeta, { humanApproved: true, principalDirected: true, taskEventId: 't1' });
+      expect(actionLogRepo.insertSampled).not.toHaveBeenCalled();
+    });
   });
 });

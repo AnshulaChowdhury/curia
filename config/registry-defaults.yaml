@@ -34,6 +34,7 @@ skills:
   - bullpen
   - executive-profile
   - setup
+  - reports
   # NOTE: tasks = heartbeat + task-*/plan/checkpoint; documents = doc-* workspace.
   # NOTE: ceo-inbox / learning / diagnostics skill bundles excluded — enable alongside
   #        their agents. Enabling one enrolls its member tools on the next boot.
@@ -56,7 +57,10 @@ tools:
   - delegate
   - async-offramp
   - file-parse
+  - archive-extract
   - request-clarification
+  # Delegated sign-in verification (#2017): coordinator-only code-screen tracking.
+  - verification
   - drive-download-file
   - image-generate
   # Personal vault (agent-captured user.* secrets)

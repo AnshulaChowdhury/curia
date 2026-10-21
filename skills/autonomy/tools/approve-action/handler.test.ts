@@ -99,7 +99,7 @@ describe('ApproveActionHandler', () => {
     }));
 
     // Verify approval transition
-    expect(repo.resolveRow).toHaveBeenCalledWith(10, 'approved', 'ceo');
+    expect(repo.resolveRow).toHaveBeenCalledWith(10, 'approved', 'coordinator');
 
     // Verify re-execution
     expect(execLayer.invoke).toHaveBeenCalledOnce();
@@ -260,5 +260,152 @@ describe('ApproveActionHandler', () => {
     expect(rejectStaleApproval).toHaveBeenCalledWith(10);
     expect(repo.resolveRow).not.toHaveBeenCalled();
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  // #2159 Phase 3: "approve 3" passes the approval number through short_ref; resolvePending
+  // resolves it to the one live row carrying that number, and that row is what re-runs.
+  it('approves and re-executes the row numbered 3 when short_ref is "3"', async () => {
+    const numbered = { ...PENDING_ROW, id: 33, shortRef: 'a3f7c12b', approvalNumber: 3, payload: { title: 'Board sync' } };
+    const repo = makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: numbered }) });
+    const execLayer = makeMockExecutionLayer();
+    const handler = new ApproveActionHandler();
+
+    const result = await handler.execute(makeCtx({
+      input: { short_ref: '3' }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+    }));
+
+    expect(result.success).toBe(true);
+    expect(repo.resolvePending).toHaveBeenCalledWith('3');
+    expect(repo.resolveRow).toHaveBeenCalledWith(33, 'approved', 'coordinator');
+    const invokeArgs = (execLayer.invoke as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(invokeArgs[1]).toEqual({ title: 'Board sync' });
+  });
+
+  it('forwards a number that matches no live approval as an error, re-running nothing', async () => {
+    const repo = makeMockRepo({
+      resolvePending: vi.fn().mockResolvedValue({ found: false, reason: 'not_found', error: 'No approval request found with number 9' }),
+    });
+    const execLayer = makeMockExecutionLayer();
+    const result = await new ApproveActionHandler().execute(makeCtx({
+      input: { short_ref: '9' }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+    }));
+    expect(result).toEqual({ success: false, error: 'No approval request found with number 9' });
+    expect(repo.resolveRow).not.toHaveBeenCalled();
+    expect(execLayer.invoke).not.toHaveBeenCalled();
+  });
+
+  // Review fix F1 (#2159 Phase 3): a model may relay "approve 3" as the JSON number 3. Reading
+  // only strings dropped it to undefined, and resolvePending(undefined) then picked the SOLE
+  // pending approval, which could be a different one. A present short_ref must never fall back.
+  describe('short_ref input handling', () => {
+    const SOLE = { ...PENDING_ROW, id: 50, shortRef: 'b5e1d9a0', approvalNumber: 5 };
+    const NUMBERED = { ...PENDING_ROW, id: 33, shortRef: 'a3f7c12b', approvalNumber: 3 };
+    // resolvePending stand-in: no ref means "the sole pending row", '3' means approval 3.
+    function routingRepo(): ActionLogRepo {
+      return makeMockRepo({
+        resolvePending: vi.fn().mockImplementation(async (ref?: string) => {
+          if (ref === undefined) return { found: true, row: SOLE };
+          if (ref === '3') return { found: true, row: NUMBERED };
+          return { found: false, reason: 'not_found', error: `No approval request found with number ${ref}` };
+        }),
+      });
+    }
+
+    it('resolves a numeric short_ref (3) to approval 3, not the sole pending row', async () => {
+      const repo = routingRepo();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { short_ref: 3 }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(true);
+      expect(repo.resolvePending).toHaveBeenCalledWith('3');
+      expect(repo.resolveRow).toHaveBeenCalledWith(33, 'approved', 'coordinator');
+    });
+
+    it.each([
+      ['an empty string', ''],
+      ['whitespace', '   '],
+      ['an object', {}],
+      ['a boolean', true],
+      ['a negative number', -1],
+      ['a fractional number', 2.5],
+      ['NaN', Number.NaN],
+      ['Infinity', Number.POSITIVE_INFINITY],
+    ])('fails closed on %s, resolving nothing', async (_label, shortRef) => {
+      const repo = routingRepo();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { short_ref: shortRef }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/short_ref/);
+      expect(repo.resolvePending).not.toHaveBeenCalled();
+      expect(repo.resolveRow).not.toHaveBeenCalled();
+      expect(execLayer.invoke).not.toHaveBeenCalled();
+    });
+
+    // Q1: a reference under the wrong key must not read as "no reference" and fall back to
+    // the sole pending approval.
+    it('fails closed on a reference passed under another key, resolving nothing', async () => {
+      const repo = routingRepo();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { number: 3 }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain('short_ref');
+      expect(repo.resolvePending).not.toHaveBeenCalled();
+      expect(execLayer.invoke).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the sole pending row only when short_ref is null', async () => {
+      const repo = routingRepo();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { short_ref: null }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(true);
+      expect(repo.resolvePending).toHaveBeenCalledWith(undefined);
+      expect(repo.resolveRow).toHaveBeenCalledWith(50, 'approved', 'coordinator');
+    });
+  });
+
+  // Review fix F5 (#2159 Phase 3): the confirmation names the approval the way the principal saw
+  // it: "Approval 3" when the row has a number, the short_ref only for rows without one.
+  describe('confirmation label', () => {
+    it('names a numbered approval as "Approval N"', async () => {
+      const numbered = { ...PENDING_ROW, id: 33, shortRef: 'a3f7c12b', approvalNumber: 3 };
+      const repo = makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: numbered }) });
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { short_ref: '3' }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: makeMockExecutionLayer(),
+      }));
+      expect(result.success).toBe(true);
+      expect((result as { data: { approved: string } }).data.approved).toBe('Approval 3');
+    });
+
+    it('names an unnumbered approval by its reference', async () => {
+      const repo = makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: { ...PENDING_ROW, approvalNumber: null } }) });
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: repo, bus: makeMockBus(), executionLayer: makeMockExecutionLayer(),
+      }));
+      expect(result.success).toBe(true);
+      expect((result as { data: { approved: string } }).data.approved).toBe('cal-1');
+    });
+
+    it('names a numbered approval as "Approval N" when it was already resolved', async () => {
+      const numbered = { ...PENDING_ROW, id: 33, shortRef: 'a3f7c12b', approvalNumber: 3 };
+      const repo = makeMockRepo({
+        resolvePending: vi.fn().mockResolvedValue({ found: true, row: numbered }),
+        resolveRow: vi.fn().mockResolvedValue(false),
+      });
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { short_ref: '3' }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: makeMockExecutionLayer(),
+      }));
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toContain('Approval 3');
+        expect(result.error).not.toContain('a3f7c12b');
+      }
+    });
   });
 });

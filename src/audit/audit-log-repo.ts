@@ -58,6 +58,12 @@ export interface TimelineAuditQuery {
   after?: { timestamp: Date; id: string };
 }
 
+/** A page keyed on audit_log.seq (#2159). seq is a decimal string: BIGINT exceeds JS number precision. */
+export interface SeqPage {
+  rows: Array<{ seq: string; row: AuditLogRow }>;
+  hasMore: boolean;
+}
+
 /** Same filter shape as {@link TimelineAuditQuery}. */
 export type EventTypesAuditQuery = TimelineAuditQuery;
 
@@ -289,6 +295,42 @@ export class AuditLogRepo {
   }
 
   /**
+   * Rows of one event type strictly after `afterSeq` (null: from the start), in seq order.
+   *
+   * seq is the hash-chain key, assigned under a transaction-scoped advisory lock (migration
+   * 080, src/audit/logger.ts), so it follows commit order: a row committed later always has
+   * a higher seq. That makes it a safe resume cursor where timestamp is not — an event's
+   * timestamp is set when it is built, before it waits on the lock (#2159).
+   */
+  async findByEventTypeAfterSeq(eventType: string, afterSeq: string | null, limit: number): Promise<SeqPage> {
+    const capped = Math.min(Math.max(limit, 1), MAX_LIMIT);
+    const result = await this.pool.query(
+      `SELECT ${SELECT_COLUMNS}, seq::text AS seq
+       FROM audit_log
+       WHERE event_type = $1
+         AND ($2::bigint IS NULL OR seq > $2::bigint)
+       ORDER BY seq ASC
+       LIMIT $3`,
+      [eventType, afterSeq, capped + 1],
+    );
+    const hasMore = result.rows.length > capped;
+    const rows = (hasMore ? result.rows.slice(0, capped) : result.rows).map((r: Record<string, unknown>) => ({
+      seq: String(r.seq),
+      row: mapRow(r),
+    }));
+    return { rows, hasMore };
+  }
+
+  /** True when a row of `eventType` has exactly this seq — lets a cursor be checked as real. */
+  async hasEventAtSeq(eventType: string, seq: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT true AS exists FROM audit_log WHERE event_type = $1 AND seq = $2::bigint LIMIT 1`,
+      [eventType, seq],
+    );
+    return result.rows.length > 0;
+  }
+
+  /**
    * Fetch a single audit row by its event id. Returns null when no row matches.
    * Used by the diagnostics agent to anchor a causal-chain trace on one event.
    */
@@ -318,6 +360,31 @@ export class AuditLogRepo {
        ORDER BY timestamp ASC, id ASC
        LIMIT $2`,
       [parentEventId, limit],
+    );
+    return result.rows.map(mapRow);
+  }
+
+  /**
+   * The tool results of the given agent turns, newest first (#2159: the band brief's evidence).
+   * A tool.result is the child of its tool.invoke, which is the child of the agent.task
+   * (runtime.ts), so this walks two levels. Both levels use idx_audit_log_parent_event_id.
+   * Newest first so the limit keeps the lookups closest to the send.
+   */
+  async findToolResultsForTasks(taskEventIds: readonly string[], limit: number): Promise<AuditLogRow[]> {
+    if (taskEventIds.length === 0) return [];
+    const clamped = Math.min(Math.max(limit, 1), MAX_LIMIT);
+    const result = await this.pool.query(
+      `SELECT ${SELECT_COLUMNS}
+       FROM audit_log
+       WHERE event_type = ANY(ARRAY['tool.result', 'skill.result']::text[])
+         AND parent_event_id IN (
+           SELECT id::text FROM audit_log
+           WHERE parent_event_id = ANY($1::text[])
+             AND event_type = ANY(ARRAY['tool.invoke', 'skill.invoke']::text[])
+         )
+       ORDER BY timestamp DESC, id DESC
+       LIMIT $2`,
+      [[...taskEventIds], clamped],
     );
     return result.rows.map(mapRow);
   }

@@ -6,6 +6,7 @@ import { CONFIG_NAMESPACE } from '../../../ceo-inbox/tools/ceo-inbox-sent-observ
 import {
   COMPLETION_CANDIDATES_KEY,
   COMPLETION_DIGEST_KEY,
+  COMPLETION_DIGEST_HIGH_WATER_KEY,
   COMPLETION_DIGEST_MAX_AGE_MS,
   usableCompletionDigestCreatedAt,
   type CompletionCandidateMap,
@@ -204,9 +205,130 @@ describe('TaskCompletionFromSentHandler', () => {
     expect(payload.ceoEmail).toBe('ceo@example.com');
     expect(payload.body).toContain('### Task completion from sent mail');
     // Both the undo (auto-completed) and a confirm item's reply commands are inlined.
-    expect(payload.body).toContain('undo completion 11111111-1111-4111-8111-111111111111');
-    expect(payload.body).toContain('dismiss completion 11111111-1111-4111-8111-111111111111');
-    expect(payload.body).toContain('confirm completion 22222222-2222-4222-8222-222222222222');
+    // Replies are by item number (#2159 Phase 3); the persisted numbers match the ones sent.
+    const undoN = digest['11111111-1111-4111-8111-111111111111'].n as number;
+    const confirmN = digest['22222222-2222-4222-8222-222222222222'].n as number;
+    expect(undoN).toBeGreaterThan(0);
+    expect(new Set([undoN, confirmN, digest['33333333-3333-4333-8333-333333333333'].n]).size).toBe(3);
+    expect(payload.body).toContain(`Reply \`undo task ${undoN}\` or \`dismiss task ${undoN}\`.`);
+    expect(payload.body).toContain(`Reply \`confirm task ${confirmN}\` or \`dismiss task ${confirmN}\`.`);
+    expect(payload.body).not.toContain('11111111-1111-4111-8111-111111111111');
+  });
+
+  it('numbers a new item around the numbers already in the digest and keeps a retried item number', async () => {
+    const ctx = makeCtx();
+    const taskId = '33333333-3333-4333-8333-333333333333';
+    ctx.__mem.__values.set(
+      COMPLETION_CANDIDATES_KEY,
+      JSON.stringify({ [taskId]: CANDIDATE_MAP[taskId]! }),
+    );
+    ctx.__mem.__values.set(
+      COMPLETION_DIGEST_KEY,
+      JSON.stringify({
+        keep: { kind: 'confirm', taskId: 'keep', taskTitle: 'K', note: 'n', n: 1, createdAt: new Date().toISOString() },
+        [taskId]: { kind: 'confirm', taskId, taskTitle: 'Maybe related', note: 'old', n: 3, createdAt: new Date().toISOString() },
+      }),
+    );
+    const result = await handler.execute(ctx);
+    expect(result.success).toBe(true);
+    const digest = JSON.parse(ctx.__mem.__values.get(COMPLETION_DIGEST_KEY)!);
+    expect(digest.keep.n).toBe(1);
+    // A rewrite of an already-numbered item must not renumber it.
+    expect(digest[taskId].n).toBe(3);
+    expect(ctx.__sendNotification.mock.calls[0]![0].body).toContain('`confirm task 3`');
+  });
+
+  it('numbers new items above the live max, in processing order, so a stale number never hits a new item', async () => {
+    const ctx = makeCtx();
+    const a = '33333333-3333-4333-8333-333333333333';
+    const b = '22222222-2222-4222-8222-222222222222';
+    // 3333 is queued first, so it must be numbered (and listed) first even though its key sorts later.
+    ctx.__mem.__values.set(
+      COMPLETION_CANDIDATES_KEY,
+      JSON.stringify({ [a]: CANDIDATE_MAP[a]!, [b]: CANDIDATE_MAP[b]! }),
+    );
+    ctx.__mem.__values.set(
+      COMPLETION_DIGEST_KEY,
+      JSON.stringify({
+        keep: { kind: 'confirm', taskId: 'keep', taskTitle: 'K', note: 'n', n: 1, createdAt: new Date().toISOString() },
+        other: { kind: 'confirm', taskId: 'other', taskTitle: 'O', note: 'n', n: 5, createdAt: new Date().toISOString() },
+      }),
+    );
+    expect((await handler.execute(ctx)).success).toBe(true);
+    const digest = JSON.parse(ctx.__mem.__values.get(COMPLETION_DIGEST_KEY)!);
+    expect(digest[a].n).toBe(6);
+    expect(digest[b].n).toBe(7);
+    const body = ctx.__sendNotification.mock.calls[0]![0].body as string;
+    expect(body.indexOf('6. ')).toBeGreaterThan(-1);
+    expect(body.indexOf('6. ')).toBeLessThan(body.indexOf('7. '));
+  });
+
+  it('numbers above the stored high-water mark after the top item was resolved, and advances it', async () => {
+    // Items 1-3 were shown, then "confirm task 3" resolved the top one: the digest holds 1 and 2,
+    // the mark still says 3. A late or repeated "confirm task 3" must not land on the new item.
+    const ctx = makeCtx();
+    const taskId = '33333333-3333-4333-8333-333333333333';
+    ctx.__mem.__values.set(COMPLETION_CANDIDATES_KEY, JSON.stringify({ [taskId]: CANDIDATE_MAP[taskId]! }));
+    ctx.__mem.__values.set(
+      COMPLETION_DIGEST_KEY,
+      JSON.stringify({
+        keep: { kind: 'confirm', taskId: 'keep', taskTitle: 'K', note: 'n', n: 1, createdAt: new Date().toISOString() },
+        other: { kind: 'confirm', taskId: 'other', taskTitle: 'O', note: 'n', n: 2, createdAt: new Date().toISOString() },
+      }),
+    );
+    ctx.__mem.__values.set(COMPLETION_DIGEST_HIGH_WATER_KEY, '3');
+    expect((await handler.execute(ctx)).success).toBe(true);
+    const digest = JSON.parse(ctx.__mem.__values.get(COMPLETION_DIGEST_KEY)!);
+    expect(digest[taskId].n).toBe(4);
+    expect(ctx.__mem.__values.get(COMPLETION_DIGEST_HIGH_WATER_KEY)).toBe('4');
+    expect(ctx.__sendNotification.mock.calls[0]![0].body).toContain('`confirm task 4`');
+  });
+
+  it('restarts numbering at 1 once the digest is empty, whatever the mark says', async () => {
+    const ctx = makeCtx();
+    const taskId = '33333333-3333-4333-8333-333333333333';
+    ctx.__mem.__values.set(COMPLETION_CANDIDATES_KEY, JSON.stringify({ [taskId]: CANDIDATE_MAP[taskId]! }));
+    ctx.__mem.__values.set(COMPLETION_DIGEST_HIGH_WATER_KEY, '5');
+    expect((await handler.execute(ctx)).success).toBe(true);
+    const digest = JSON.parse(ctx.__mem.__values.get(COMPLETION_DIGEST_KEY)!);
+    expect(digest[taskId].n).toBe(1);
+    expect(ctx.__mem.__values.get(COMPLETION_DIGEST_HIGH_WATER_KEY)).toBe('1');
+  });
+
+  it('does not publish the digest, complete, consume or notify when the high-water mark write soft-rejects', async () => {
+    const ctx = makeCtx();
+    (ctx.__mem.storeFact as ReturnType<typeof vi.fn>).mockImplementation(
+      async (p: { label: string; properties?: Record<string, unknown> }) => {
+        if (p.label === COMPLETION_DIGEST_HIGH_WATER_KEY) return { stored: false, action: 'conflict' as const };
+        ctx.__mem.__values.set(p.label, String(p.properties?.value ?? ''));
+        return { stored: true, action: 'created' as const };
+      },
+    );
+    expect((await handler.execute(ctx)).success).toBe(true);
+    // Publishing items numbered above a mark that never landed is the reuse this mark prevents.
+    expect(ctx.__mem.__values.has(COMPLETION_DIGEST_KEY)).toBe(false);
+    expect(ctx.__completed).toEqual([]);
+    expect(ctx.__sendNotification).not.toHaveBeenCalled();
+    expect(JSON.parse(ctx.__mem.__values.get(COMPLETION_CANDIDATES_KEY)!)).toEqual(CANDIDATE_MAP);
+  });
+
+  it('numbers above an aged-out top item even with no stored mark, and records it in the mark', async () => {
+    const ctx = makeCtx();
+    const taskId = '33333333-3333-4333-8333-333333333333';
+    ctx.__mem.__values.set(COMPLETION_CANDIDATES_KEY, JSON.stringify({ [taskId]: CANDIDATE_MAP[taskId]! }));
+    ctx.__mem.__values.set(
+      COMPLETION_DIGEST_KEY,
+      JSON.stringify({
+        keep: { kind: 'confirm', taskId: 'keep', taskTitle: 'K', note: 'n', n: 1, createdAt: new Date().toISOString() },
+        // Shown as 2, now past the 90-day window: this write prunes it.
+        old: { kind: 'confirm', taskId: 'old', taskTitle: 'O', note: 'n', n: 2, createdAt: new Date(Date.now() - COMPLETION_DIGEST_MAX_AGE_MS - 86_400_000).toISOString() },
+      }),
+    );
+    expect((await handler.execute(ctx)).success).toBe(true);
+    const digest = JSON.parse(ctx.__mem.__values.get(COMPLETION_DIGEST_KEY)!);
+    expect(digest.old).toBeUndefined();
+    expect(digest[taskId].n).toBe(3);
+    expect(ctx.__mem.__values.get(COMPLETION_DIGEST_HIGH_WATER_KEY)).toBe('3');
   });
 
   it('keeps an existing digest createdAt when the same task is written again', async () => {
@@ -416,8 +538,8 @@ describe('TaskCompletionFromSentHandler', () => {
     expect(ctx.__sendNotification).toHaveBeenCalledTimes(1);
     const body = ctx.__sendNotification.mock.calls[0]![0].body as string;
     // ...but it carries ONLY the confirm item, not the failed undo.
-    expect(body).toContain('confirm completion 33333333-3333-4333-8333-333333333333');
-    expect(body).not.toContain('undo completion 11111111-1111-4111-8111-111111111111');
+    expect(body).toMatch(/Reply `confirm task \d+` or `dismiss task \d+`\./);
+    expect(body).not.toMatch(/`undo task \d+`/);
   });
 
   it('DOUBLE-RUN: a digest soft-reject blocks completion entirely; a later successful run completes it with the undo note durable (Finding 6)', async () => {

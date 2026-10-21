@@ -10,12 +10,14 @@ import type { Tier } from './llm/model-router.js';
 import { ContextBudget } from './llm/context-budget.js';
 import { DEFAULT_SAFETY_MARGIN } from './llm/token-estimator.js';
 import type { ModelRegistry } from './llm/model-registry.js';
-import { parseTemperature } from './llm/sampling-options.js';
+import { sentTemperature, type ReasoningSetting } from './llm/sampling-options.js';
+import { llmCallReasoningFields } from './llm/llm-call-reasoning.js';
 import { createHash } from 'node:crypto';
 import { buildLlmArchiveResponse } from '../audit/llm-archive-response.js';
 import type { Logger } from '../logger.js';
 import type { WorkingMemory } from '../memory/working-memory.js';
-import { historyForLlm, LLM_FAILURE_TURN_CONTENT, LLM_FAILURE_USER_MESSAGE } from '../memory/llm-failure-turn.js';
+import { historyForLlm, llmFailureTurnContent, LLM_FAILURE_USER_MESSAGE } from '../memory/llm-failure-turn.js';
+import { renderBudgetExhaustedVerificationReply } from './prompts/verification-block.js';
 import {
   CONTACT_RECENT_HISTORY_TIER,
   contactRecentHistoryApplies,
@@ -32,7 +34,8 @@ import { sanitizeOutput } from '../skills/sanitize.js';
 import { prepareAgentResponseContent } from '../dispatch/no-reply.js';
 import { splitRelayNote } from './principal-note.js';
 import { stripOutboundContextPreamble } from '../dispatch/outbound-context.js';
-import { parseTurnGuidanceKeys, renderTurnGuidance } from './prompts/turn-guidance.js';
+import { parseTurnGuidanceKeys, renderTurnGuidance, verificationCodeReceivedLines } from './prompts/turn-guidance.js';
+import { turnLengthReminder } from '../identity/length.js';
 import { parsePrincipalBacklog, renderBacklogLine } from './prompts/backlog-line.js';
 import { renderSenderLine, UNRESOLVED_SENDER_HEAD } from './prompts/sender-line.js';
 import { classifySkillError, formatTaskError } from '../errors/classify.js';
@@ -159,6 +162,14 @@ import {
 } from './resolved-entities.js';
 import type { ConversationEntityState } from '../entity-context/conversation-entities.js';
 
+/**
+ * Request options for an agent turn: the tier's reasoning setting, when it has
+ * one (ADR-048 §3). Nothing otherwise, so the provider default applies.
+ */
+function agentTurnOptions(reasoning: ReasoningSetting | undefined): { options?: Record<string, unknown> } {
+  return reasoning !== undefined ? { options: { reasoning } } : {};
+}
+
 export interface AgentConfig {
   agentId: string;
   systemPrompt: string;
@@ -179,6 +190,10 @@ export interface AgentConfig {
   /** Provider instance for the fallback model. May differ from the primary provider
    *  when the primary and fallback tiers are served by different providers. */
   fallbackProvider?: LLMProvider;
+  /** Reasoning setting for this agent's turns, from its tier (ADR-048 §3). Unset = provider default. */
+  reasoning?: ReasoningSetting;
+  /** The fallback tier's own reasoning setting, sent when the fallback model serves a turn. */
+  fallbackReasoning?: ReasoningSetting;
   bus: EventBus;
   logger: Logger;
   /** Optional working memory for conversation persistence across turns. */
@@ -201,6 +216,13 @@ export interface AgentConfig {
   /** Optional autonomy service — when provided, the autonomy block is injected
    *  into the effective system prompt on every task. Only the coordinator receives this. */
   autonomyService?: AutonomyService;
+  /** Delegated sign-in verifications (#2017). When provided, the live verifications are
+   *  injected into the coordinator's and ceo-inbox's system string on every turn
+   *  (src/agents/system-prompt.ts). Granted to those two agents only. */
+  verification?: import('../verification/index.js').VerificationRuntime;
+  /** Whether a browser session id is still live, for the verification block. Absent when
+   *  no browser service runs, in which case every session reads as gone. */
+  browserSessionAlive?: (sessionId: string) => boolean;
   /** Optional identity service — when provided, the freshly-compiled identity block is
    *  PREPENDED to the system prompt as a preamble (above the body) on every task turn.
    *  This enables hot-reload: identity changes via the API or file watcher take effect
@@ -445,6 +467,51 @@ export class AgentRuntime {
     }
   }
 
+  /**
+   * The reply's length limit for this turn's channel (#2143), from the Detail setting: the
+   * one line of style guidance placed next to generation. Only an agent that renders the
+   * identity block has the service. A channel with no length row (console chat, cli,
+   * internal) gets none, and so does a scheduler turn: its reply goes nowhere, and a send
+   * it makes follows the block's per-channel table. Never fatal: a bad identity loses the
+   * reminder, not the turn.
+   */
+  private lengthReminder(taskEvent: AgentTaskEvent): string | null {
+    const identity = this.config.officeIdentityService;
+    if (!identity) return null;
+    try {
+      const { verbosity } = identity.get().tone;
+      if (typeof verbosity !== 'number' || !Number.isFinite(verbosity)) return null;
+      return turnLengthReminder(taskEvent.payload.channelId, verbosity);
+    } catch (err) {
+      this.config.logger.error({ err, agentId: this.config.agentId }, 'Length reminder failed — turn continues without it');
+      return null;
+    }
+  }
+
+  /**
+   * The named verification-code-received lines (#2017): each pending sms/app verification
+   * that now holds a tracked value, which the dispatcher registered from this message. An
+   * expired row is the verification block's job ("Expired but session alive: try the code"). Empty (so the generic text renders) without a runtime, with no
+   * such row, or when the lookup fails; never the digits.
+   */
+  private async verificationCodeReceivedLines(conversationId: string): Promise<string[]> {
+    const verification = this.config.verification;
+    if (!verification) return [];
+    try {
+      const tracked = new Set(verification.tracker.trackedIds());
+      const rows = (await verification.listActive()).filter(
+        (v) => (v.delivery === 'sms' || v.delivery === 'app') && v.status === 'pending' && tracked.has(v.id),
+      );
+      return verificationCodeReceivedLines(rows);
+    } catch (err) {
+      this.config.logger.warn(
+        { err, agentId: this.config.agentId, conversationId },
+        'Could not name the verification a relayed sign-in code is for — using the generic guidance',
+      );
+      return [];
+    }
+  }
+
   private async processTask(taskEvent: AgentTaskEvent): Promise<void> {
     const { agentId, provider, bus, logger, memory, executionLayer, skillToolDefs } = this.config;
     const originalContent = taskEvent.payload.content;
@@ -458,9 +525,17 @@ export class AgentRuntime {
     if (taskEvent.payload.channelId === 'scheduler' && !taskEvent.payload.toolAllowlist?.length) {
       turnGuidanceKeys.push('scheduler-delivery');
     }
-    // The backlog line (prompt trim PR 7) closes the guidance; re-validated like the keys.
+    // The backlog line (prompt trim PR 7) follows the guidance; re-validated like the keys.
     const backlog = parsePrincipalBacklog(taskEvent.payload.principalBacklog);
-    const turnGuidance = renderTurnGuidance(turnGuidanceKeys, backlog ? renderBacklogLine(backlog) : null);
+    const named = turnGuidanceKeys.includes('verification-code-received')
+      ? { 'verification-code-received': await this.verificationCodeReceivedLines(taskEvent.payload.conversationId) }
+      : undefined;
+    const turnGuidance = renderTurnGuidance(
+      turnGuidanceKeys,
+      backlog ? renderBacklogLine(backlog) : null,
+      this.lengthReminder(taskEvent),
+      named,
+    );
     let promptContent = turnGuidance ? `${turnGuidance}\n\n${originalContent}` : originalContent;
     const { conversationId } = taskEvent.payload;
 
@@ -2893,6 +2968,7 @@ export class AgentRuntime {
         const response = await provider.chat({
           messages,
           ...(modelForCall !== undefined ? { model: modelForCall } : {}),
+          ...agentTurnOptions(this.config.reasoning),
         });
         // Recorded like any other call (#1990): the raw text, including a rejected
         // draft and anything outside the reply block, is otherwise kept nowhere.
@@ -3065,8 +3141,10 @@ export class AgentRuntime {
 
       // Pure parse (no warn) — the provider already warned on invalid values.
       // null means the request omitted temperature (agent calls today always do).
-      const parsed = parseTemperature(params.options);
-      const temperature = parsed.kind === 'set' ? parsed.value : null;
+      const temperature = sentTemperature(
+        params.options,
+        this.config.modelRegistry?.rejectsSamplingParams(response.provenance.requestedModel) ?? false,
+      );
 
       const event = createLlmCall({
         agentId,
@@ -3085,6 +3163,7 @@ export class AgentRuntime {
         promptHash,
         responseHash,
         temperature,
+        ...llmCallReasoningFields(response.usage, response.provenance),
         parentEventId: taskEvent.id,
         // Typed non-persisted archive — AuditLogger writes llm_call_archive atomically.
         archive: {
@@ -3176,7 +3255,11 @@ export class AgentRuntime {
     // set only modelName (e.g. unit tests) still reach the provider without error.
     const modelForCall = this.config.resolvedModel ?? this.config.modelName;
     const callStartMs = Date.now();
-    const response = await provider.chat({ ...params, ...(modelForCall !== undefined ? { model: modelForCall } : {}) });
+    const response = await provider.chat({
+      ...params,
+      ...(modelForCall !== undefined ? { model: modelForCall } : {}),
+      ...agentTurnOptions(this.config.reasoning),
+    });
     const latencyMs = Date.now() - callStartMs;
     if (response.type !== 'error') {
       // LLM call succeeded — reset consecutive error counter and publish telemetry
@@ -3212,7 +3295,12 @@ export class AgentRuntime {
         let fallbackResponse: LLMResponse;
         const fallbackStartMs = Date.now();
         try {
-          fallbackResponse = await this.config.fallbackProvider.chat({ ...params, model: this.config.fallbackModel });
+          // The fallback tier's own reasoning setting, not the primary's (ADR-048 §3).
+          fallbackResponse = await this.config.fallbackProvider.chat({
+            ...params,
+            model: this.config.fallbackModel,
+            ...agentTurnOptions(this.config.fallbackReasoning),
+          });
         } catch (err) {
           // Provider threw synchronously (network failure, misconfiguration, etc.) —
           // normalize into AgentError so the audit trail stays complete.
@@ -3317,7 +3405,11 @@ export class AgentRuntime {
       await new Promise(resolve => setTimeout(resolve, backoffMs));
 
       const retryStartMs = Date.now();
-      const retryResponse = await provider.chat({ ...params, ...(modelForCall !== undefined ? { model: modelForCall } : {}) });
+      const retryResponse = await provider.chat({
+        ...params,
+        ...(modelForCall !== undefined ? { model: modelForCall } : {}),
+        ...agentTurnOptions(this.config.reasoning),
+      });
       const retryLatencyMs = Date.now() - retryStartMs;
       if (retryResponse.type !== 'error') {
         // Retry succeeded — reset consecutive error counter and publish telemetry
@@ -3432,9 +3524,53 @@ export class AgentRuntime {
       timestamp: new Date(),
     };
     await this.publishAgentError(agentErr, taskEvent);
+    // A sign-in this task left waiting on a code is still finishable: say so instead of
+    // the generic failure, which hid the live challenge (#2201). Only to the principal's side
+    // in a private thread: the reply names the site and deadline, and a group thread or an
+    // outside sender sharing the conversation must not learn either.
+    const verificationReply = this.budgetReplyReachesPrincipalAlone(taskEvent)
+      ? await this.pendingVerificationBudgetReply(taskEvent.payload.conversationId)
+      : null;
     // Forward handoff so failedSkills from this run reach agent.response(isError)
     // and the scheduler can persist them (#1830 / maxConsecutiveErrors path).
-    await this.sendErrorResponse(taskEvent, agentErr, handoff);
+    await this.sendErrorResponse(taskEvent, agentErr, handoff, verificationReply ?? undefined);
+  }
+
+  /** True when the budget reply is read by the principal's side alone (#2201): the same
+   *  audience rule as the delegation-failure reply, plus a one-to-one thread. */
+  private budgetReplyReachesPrincipalAlone(taskEvent: AgentTaskEvent): boolean {
+    const { channelId, conversationId, metadata } = taskEvent.payload;
+    const audience = delegationFailureAudience({
+      originator: parseTaskOriginator(metadata?.originator),
+      channelId,
+      delegated: isDelegatedSpecialistTask(metadata),
+    });
+    return audience.audience === 'principal'
+      && contactRecentHistoryAudienceIsPrivate({ channelId, conversationId, metadata, selfEmails: this.config.selfEmails });
+  }
+
+  /**
+   * The budget-exhausted reply naming this conversation's pending sign-in verifications
+   * (#2201), or null when there are none, the runtime has no verification source, or the
+   * lookup fails (the generic reply is then used; the lookup must never fail the reply).
+   */
+  private async pendingVerificationBudgetReply(conversationId: string): Promise<string | null> {
+    const verification = this.config.verification;
+    if (!verification) return null;
+    try {
+      const alive = this.config.browserSessionAlive ?? (() => false);
+      const items = (await verification.listActive()).map((v) => ({ ...v, sessionAlive: alive(v.browserSessionId) }));
+      return renderBudgetExhaustedVerificationReply(items, {
+        conversationId,
+        timezone: this.config.timezone?.trim() || 'UTC',
+      });
+    } catch (err) {
+      this.config.logger.warn(
+        { err, agentId: this.config.agentId, conversationId },
+        'Could not check pending sign-in verifications for the budget reply — using the generic reply',
+      );
+      return null;
+    }
   }
 
   /**
@@ -3574,6 +3710,8 @@ export class AgentRuntime {
       failedSkills: Array<{ name: string; error: string }>;
       failedSkillsOmittedRef: { count: number };
     },
+    /** User-facing text replacing the generic failure message (#2201). */
+    content: string = LLM_FAILURE_USER_MESSAGE,
   ): Promise<void> {
     const { agentId, bus } = this.config;
     const { conversationId } = taskEvent.payload;
@@ -3590,7 +3728,7 @@ export class AgentRuntime {
     const responseEvent = createAgentResponse({
       agentId,
       conversationId,
-      content: LLM_FAILURE_USER_MESSAGE,
+      content,
       // Mark as an error response so consumers (e.g. the delegate skill) can distinguish
       // a failure from a real specialist result and surface it as { success: false }.
       isError: true,
@@ -3603,7 +3741,7 @@ export class AgentRuntime {
     // error reply — maybeSummarize inside addTurn can issue an LLM call (#1767).
     // Must not throw: a memory failure here would re-enter handleTask's catch
     // and double-publish.
-    await this.persistLlmFailureTurn(conversationId, taskEvent.payload.content, taskEvent.payload.channelId);
+    await this.persistLlmFailureTurn(conversationId, taskEvent.payload.content, taskEvent.payload.channelId, content);
   }
 
   /**
@@ -3676,6 +3814,7 @@ export class AgentRuntime {
     conversationId: string,
     expectedUserContent: string,
     channelId: string,
+    message: string = LLM_FAILURE_USER_MESSAGE,
   ): Promise<void> {
     const { memory, agentId, logger } = this.config;
     if (!memory) return;
@@ -3693,7 +3832,7 @@ export class AgentRuntime {
       }
       await memory.addTurn(conversationId, agentId, {
         role: 'assistant',
-        content: LLM_FAILURE_TURN_CONTENT,
+        content: llmFailureTurnContent(message),
       }, {
         channelId,
       });

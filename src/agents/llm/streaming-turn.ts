@@ -43,6 +43,7 @@ import type {
   LLMResponse,
   LLMStreamEvent,
   Message,
+  ReasoningContent,
   ToolCall,
   ToolDefinition,
 } from './provider.js';
@@ -143,6 +144,12 @@ export interface StreamingTurnConfig {
   /** Placeholder tool_result content when invokeTool is missing. */
   missingInvokeToolResult?: string;
   /**
+   * Extra request options for provider.stream() (the signal is added). Voice
+   * sends NO_REASONING here: it is latency-bound and never inherits a tier's
+   * reasoning setting (ADR-048 §3). Ignored on the openStream path.
+   */
+  requestOptions?: Record<string, unknown>;
+  /**
    * Custom per-round stream source. Text AgentRuntime passes a chatWithRetry
    * adapter here so retry/fallback/telemetry stay on the chat path while the
    * tool loop is shared (#1563 / ADR-038).
@@ -221,6 +228,7 @@ export async function* llmResponseAsStream(
       type: 'tool_use',
       toolCalls: response.toolCalls,
       content: response.content,
+      ...(response.reasoningBlocks?.length ? { reasoningBlocks: response.reasoningBlocks } : {}),
       usage: response.usage,
       provenance: response.provenance,
       ...(response.reasoning ? { reasoning: response.reasoning } : {}),
@@ -307,10 +315,10 @@ export async function runStreamingToolLoop(
           messages: streamParams.messages,
           tools: streamParams.tools,
           model: streamParams.model,
-          options: { signal },
+          options: { ...config.requestOptions, signal },
         });
 
-    let toolUse: { toolCalls: ToolCall[]; content?: string } | undefined;
+    let toolUse: { toolCalls: ToolCall[]; content?: string; reasoningBlocks?: ReasoningContent[] } | undefined;
     let messageEnd: { content: string } | undefined;
     let streamError: AgentError | undefined;
 
@@ -325,7 +333,7 @@ export async function runStreamingToolLoop(
           await config.hooks.onTextDelta(event.text);
         }
       } else if (event.type === 'tool_use') {
-        toolUse = { toolCalls: event.toolCalls, content: event.content };
+        toolUse = { toolCalls: event.toolCalls, content: event.content, reasoningBlocks: event.reasoningBlocks };
         break;
       } else if (event.type === 'message_end') {
         messageEnd = { content: event.content };
@@ -419,9 +427,10 @@ export async function runStreamingToolLoop(
       }
 
       // Assistant turn must carry tool_use blocks so the following tool_result
-      // blocks can reference their ids (Anthropic requirement).
+      // blocks can reference their ids (Anthropic requirement), and the reasoning
+      // that chose them so the next round sees it (ADR-048 §1).
       workingMessages.push(
-        buildAssistantToolUseMessage(toolUse.toolCalls, toolUse.content),
+        buildAssistantToolUseMessage(toolUse.toolCalls, toolUse.content, toolUse.reasoningBlocks),
       );
 
       const toolResults: Array<{ id: string; content: string; isError?: boolean }> = [];

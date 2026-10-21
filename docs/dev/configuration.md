@@ -11,6 +11,26 @@ Changes to `default.yaml` take effect on restart. Changes to `.env` also require
 
 ## `config/default.yaml` — full reference
 
+### `model_routing`
+
+Maps each capability tier to a model (ADR-014). The provider follows from the model registry.
+
+```yaml
+model_routing:
+  tiers:
+    fast:
+      model: claude-haiku-5-5
+    standard:
+      model: claude-sonnet-4-6
+      # reasoning:            # Optional (ADR-048). Unset = the model's own default.
+      #   effort: low         # none | low | medium | high | max
+    powerful:
+      model: claude-opus-4-6
+  default_tier: standard
+```
+
+`reasoning.effort` applies to agent turns on that tier; the judges, infra skills, scoring, summarization and voice set their own. Boot fails if the tier's model does not list the effort in the model registry: DeepSeek V4.1 Flash takes `low`, `high` and `max`; Haiku 5.5, Sonnet 4.6 and Opus 4.6 take `none` through `max`; Haiku 4.5 takes no effort setting at all. Unset means the provider's default, so Haiku 5.5 thinks adaptively at `medium`. On those Anthropic models an effort turns on adaptive thinking with summarized display; `none` turns thinking off.
+
 ### `channels`
 
 Controls which channel adapters activate at startup.
@@ -172,17 +192,69 @@ scheduler:
 
 ---
 
+### `autonomy.gating`
+
+Which policy decides when Curia asks first (#2159, [ADR-049](../adr/049-band-driven-autonomy.md)).
+
+```yaml
+autonomy:
+  gating: tier   # or band
+```
+
+- `tier` (the default): contact tier gates consequential actions (Gate C) and what a recipient may be told (Stage 2.5 of the outbound filter).
+- `band`: the autonomy score decides. The escalation judge reviews each send for an outsider steering Curia, for statements in the principal's voice, and for claims about the principal that the drafting turn did not look up. `contact-data-leak` and Stage 2.5 are off.
+
+`band` needs the escalation judge: config load refuses `gating: band` with `escalation.judge.enabled: false`. The judge's brief has its own timeout, `escalation.judge.review_timeout_ms` (default 15000, between 250 and 2147483647), longer than the classifiers' `timeout_ms` because it reads the turn's evidence. The live gating is logged at boot. See [spec 14](../specs/14-autonomy-engine.md#band-gating-2159).
+
 ### `autonomy.approval_expiry`
 
-How often pending approvals past their `expires_at` are marked expired.
+How often the approval sweep runs.
 
 ```yaml
 autonomy:
   approval_expiry:
-    sweep_interval_minutes: 60
+    sweep_interval_minutes: 15
 ```
 
-The sweep is a system interval, not a scheduled agent job: no agent turn and no LLM call (#2013). Each tick expires stale `pending_approval` rows and sends the principal one batched email about any high or critical ones. With no principal email on file, or no outbound gateway, the rows still expire and the email is skipped with a warning. The first tick runs a minute after startup, then every interval, so frequent restarts never starve it. Validated at startup as a positive integer within the Node.js timer limit.
+The sweep is a system interval, not a scheduled agent job, so it uses no agent turn and no LLM call (#2013). Each tick does two things:
+
+1. It delivers, once, any pending approval no agent delivered within 15 minutes. It uses email first, then each of the principal's other channels in turn. At the default interval that is 15–30 minutes after the approval was raised.
+2. It marks stale `pending_approval` rows expired and queues a digest item for each (#2159).
+
+The first tick runs a minute after startup and then every interval, so frequent restarts never starve it. The value is validated at startup as a positive integer within the Node.js timer limit.
+
+### `autonomy.report_fallback`
+
+The weekly summary for installs whose digest jobs don't report queued items.
+
+```yaml
+autonomy:
+  report_fallback:
+    max_age_days: 7
+    check_interval_hours: 24
+```
+
+Notes, block notices and approval mentions go to the principal's digest queue (`principal.report`, #2159). Digest jobs read the queue with `list-principal-reports` and acknowledge it with `ack-principal-reports`. Once the oldest unacknowledged item is older than `max_age_days`, this check emails a numbered summary itself. It acknowledges only after the send succeeds. Both values must be positive integers.
+
+---
+
+### `verification`
+
+Delegated sign-in with external verification (a code the site sends the principal; [ADR-050](../adr/050-external-verifications-as-first-class-state.md)). Every field is optional; the defaults are shown.
+
+```yaml
+verification:
+  askChannelOrder: [signal, sms, slack, email]  # where to ask the principal for an SMS/app code: first enabled channel with a verified principal identity
+  defaultExpiryMinutes: 10        # a pending verification is treated as expired after this (a hint, not a cliff)
+  recentWindowMinutes: 120        # a closed verification still counts as recent, and still tracks codes, for this long
+  codeTtlMinutesAfterClose: 120   # a tracked code value is scrubbed this long after its verification closes
+  emailWaitSeconds: 180           # how long ceo-inbox waits for an emailed code before the coordinator asks the principal
+  identityProviderDomains: [b2clogin.com, ciamlogin.com, microsoftonline.com, okta.com, auth0.com, onelogin.com, pingidentity.com, pingone.com, duosecurity.com]
+```
+
+`askChannelOrder` takes `signal`, `sms`, `slack` and `email`, and the configured order alone decides where to ask. The channel the errand arrived on plays no part, because the principal often hands things over by email or voice to be done later. The four numbers must be positive integers. A bad value fails at startup.
+
+`identityProviderDomains` decides which embedded frame may receive a sign-in code. When the sign-in page's own frame has no code input, a child frame that holds one becomes the verification's page domain only if it is on the top page's own domain (never the site the model names) or one of these providers, and only if it is the sole such frame. Otherwise the top page stays the destination, and a code typed into any other frame is refused. Each entry must be a bare registrable domain (`okta.com`, not `https://login.okta.com`). Setting the list replaces the default, so repeat the defaults when you add a provider.
 
 ---
 

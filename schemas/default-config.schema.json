@@ -231,7 +231,8 @@
           "properties": {
             "enabled": { "type": "boolean" },
             "model": { "type": "string" },
-            "timeout_ms": { "type": "integer", "minimum": 250 }
+            "timeout_ms": { "type": "integer", "minimum": 250 },
+            "review_timeout_ms": { "type": "integer", "minimum": 250 }
           }
         }
       }
@@ -284,9 +285,10 @@
             "batchSize": { "type": "integer", "minimum": 1 },
             "minScoredActions": { "type": "integer", "minimum": 1 },
             "halfLifeDays": { "type": "number", "minimum": 1 },
-            "weakExpiredWeight": { "type": "number", "minimum": 0, "maximum": 1 },
+            "weakExpiredWeight": { "description": "Retired in #2159: accepted and ignored, so configs that still set it keep booting. Safe to remove." },
             "ceoCooldownDays": { "type": "integer", "minimum": 0 },
             "errorRateThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
+            "errorRateWindowDays": { "type": "integer", "minimum": 1 },
             "unparseableAfterDays": { "type": "integer", "minimum": 0 }
           }
         }
@@ -387,6 +389,26 @@
         }
       }
     },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "askChannelOrder": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["signal", "sms", "slack", "email"] },
+          "uniqueItems": true
+        },
+        "defaultExpiryMinutes": { "type": "integer", "minimum": 1 },
+        "recentWindowMinutes": { "type": "integer", "minimum": 1 },
+        "codeTtlMinutesAfterClose": { "type": "integer", "minimum": 1 },
+        "emailWaitSeconds": { "type": "integer", "minimum": 1 },
+        "identityProviderDomains": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
     "debrief": {
       "type": "object",
       "additionalProperties": false,
@@ -450,6 +472,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "gating": { "type": "string", "enum": ["band", "tier"] },
         "bypass_ladder": {
           "type": "object",
           "additionalProperties": false,
@@ -479,6 +502,23 @@
           "description": "System-interval sweep that expires stale pending approvals (#2013).",
           "properties": {
             "sweep_interval_minutes": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "report_fallback": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Weekly summary of unreported digest items for installs with no digest job (#2159).",
+          "properties": {
+            "max_age_days": { "type": "integer", "minimum": 1 },
+            "check_interval_hours": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "relay_budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Cap on immediate relays to the principal that one outside contact can cause (#1320).",
+          "properties": {
+            "per_hour": { "type": "integer", "minimum": 0 }
           }
         }
       }
@@ -521,7 +561,16 @@
       "required": ["model"],
       "additionalProperties": false,
       "properties": {
-        "model": { "type": "string", "minLength": 1 }
+        "model": { "type": "string", "minLength": 1 },
+        "reasoning": {
+          "description": "Reasoning effort for agent turns on this tier (ADR-048). Unset means the provider default. The effort must be one the model's registry entry lists; boot fails otherwise.",
+          "type": "object",
+          "required": ["effort"],
+          "additionalProperties": false,
+          "properties": {
+            "effort": { "type": "string", "enum": ["none", "low", "medium", "high", "max"] }
+          }
+        }
       }
     }
   }

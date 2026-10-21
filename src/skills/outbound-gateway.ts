@@ -36,7 +36,7 @@ import { TelnyxSendError } from '../channels/sms/sms-client.js';
 import { TELNYX_ERROR_OPTED_OUT } from '../channels/sms/types.js';
 import type { ContactService } from '../contacts/contact-service.js';
 import { classifyEmailSender } from '../contacts/contact-service.js';
-import type { ContactTier, ChannelIdentity } from '../contacts/types.js';
+import type { ContactTier, ChannelIdentity, TaskOriginator } from '../contacts/types.js';
 import {
   isPrincipalIdentity,
   computePrincipalIsSoleRecipient,
@@ -47,21 +47,21 @@ import type { OutboundContentFilter, FilterRecipient } from '../dispatch/outboun
 import type { PiiRedactor } from '../dispatch/pii-redactor.js';
 import type { EventBus } from '../bus/bus.js';
 import type { Logger } from '../logger.js';
-import { createOutboundBlocked, createOutboundDelivered, createOutboundNotification, createAutonomySendBlocked } from '../bus/events.js';
+import { createOutboundBlocked, createOutboundDelivered, createOutboundNotification, createAutonomySendBlocked, createAutonomyRelayDeferred, createPrincipalReport } from '../bus/events.js';
 import type { ChannelReconnectEvent } from '../bus/events.js';
 import { AutonomyService } from '../autonomy/autonomy-service.js';
 import { markdownToMrkdwn } from '../format/markdown-to-mrkdwn.js';
 import type { ActionLogRepo } from '../autonomy/action-log-repo.js';
-import { generateShortRef } from '../autonomy/approval-trigger.js';
-import {
-  buildApprovalNotificationBody,
-  enrichGatewayApprovalPayload,
-  resolveNotificationRecipientTier,
-} from '../autonomy/approval-notification.js';
-import { deliverApprovalToChatChannels } from '../autonomy/approval-channel-notify.js';
+import { approvalAdvisory, buildApprovalDeliveryWake, generateShortRef, readApprovalNumber } from '../autonomy/approval-trigger.js';
+import { enrichGatewayApprovalPayload } from '../autonomy/approval-notification.js';
+import type { ApprovalDelivery } from '../autonomy/approval-delivery.js';
+import type { AutonomyGating } from '../autonomy/band-policy.js';
+import { budgetedOriginator, type RelayBudget } from '../autonomy/relay-budget.js';
+import { isUuid } from '../util/uuid.js';
+import { BAND_RULES, type BandReviewReport, type BandReviewSignals, type BandSendReview } from '../dispatch/band-send-review.js';
 import type { OutboundNotificationPayload } from '../bus/events.js';
 import { markdownToHtml } from '../format/markdown-to-html.js';
-import { bodyEndsWithSignature, emailSignatureHtml, emailSignatureText } from '../channels/email/signature.js';
+import { bodyEndsWithSignature, emailSignatureHtml, emailSignatureText, stripModelSignOff } from '../channels/email/signature.js';
 import type { AgentPersona } from './types.js';
 import { scrubPii } from '../pii/scrubber.js';
 import type { ExportControlService } from '../security/export-controls.js';
@@ -179,6 +179,12 @@ export interface OutboundSendResult {
    * Permanent failures (opt-out, validation) must leave this unset/false.
    */
   queueable?: boolean;
+  /**
+   * True when the relay budget held this send for the principal's digest instead of sending
+   * it (#1320). `success` is true: the message is kept, and the caller must not re-send it
+   * another way.
+   */
+  deferredToDigest?: boolean;
 }
 
 /** Result from createEmailDraft() — extends send result with the Nylas draft ID. */
@@ -331,6 +337,27 @@ export interface OutboundGatewayConfig {
    * (or the underlying client). Absent channels are never auto-queued.
    */
   outboundQueueReadiness?: ReadonlyMap<string, () => boolean>;
+
+  /**
+   * Which policy reviews sends (#2159). Under 'band', a send that passes the content
+   * filter is reviewed by `bandReview` (the escalation judge's brief) before dispatch.
+   * Default 'tier': no band review, today's behavior.
+   */
+  gating?: AutonomyGating;
+  /** The band review (#2159). Used only when gating is 'band'. */
+  bandReview?: Pick<BandSendReview, 'review'>;
+  /**
+   * Caps the immediate messages to the principal that one outside contact can cause (#1320).
+   * Absent: no cap.
+   */
+  relayBudget?: RelayBudget;
+}
+
+/** What a band hold replays on approval: the same shape as reExecRecipe (#2159). */
+interface SendRecipe {
+  toolName: string;
+  partialPayload?: Record<string, unknown>;
+  description: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +385,32 @@ function redactId(value: string): string {
 }
 
 /**
+ * A relay originator's contact id, safe for logs (#1320). An unresolved sender's id is its raw
+ * address or number (stampOriginator), so it is redacted like any other recipient id.
+ */
+function loggableContactId(contactId: string): string {
+  return isUuid(contactId) ? contactId : redactId(contactId);
+}
+
+/**
+ * The once-per-window relay-budget notice (#1320), addressed exactly as the held relay was:
+ * same channel, account and principal address, with the body replaced and any threading or
+ * attachments dropped, so nothing of the held message rides along.
+ */
+function relayNoticeRequest(request: OutboundSendRequest, text: string, subject: string): OutboundSendRequest {
+  switch (request.channel) {
+    case 'email':
+      return { channel: 'email', to: request.to, subject, body: text, ...(request.accountId ? { accountId: request.accountId } : {}) };
+    case 'slack':
+      return { channel: 'slack', slackChannelId: request.slackChannelId, ...(request.slackUserId ? { slackUserId: request.slackUserId } : {}), message: text };
+    case 'sms':
+      return { channel: 'sms', recipient: request.recipient, message: text };
+    case 'signal':
+      return { channel: 'signal', ...(request.recipient ? { recipient: request.recipient } : {}), message: text };
+  }
+}
+
+/**
  * Build a principal-safe summary of WHY an outbound message was blocked, for the
  * principal notification body. The summary gives the principal something actionable without
  * re-leaking the offending content into their mailbox (and through the email
@@ -382,7 +435,15 @@ function buildBlockReasonSummary(findings: Array<{ rule: string; detail: string 
   return findings
     .map((f) => {
       // principal-note-markup's detail is fixed text that tells the agent where the note goes.
-      const showDetail = (f.rule.startsWith('llm-judge-') || f.rule === 'disclosure-tier-gate' || f.rule === 'principal-note-markup') && f.detail;
+      // A band bounce's detail quotes the agent's own sentences, which it needs to fix the
+      // message (#2159); it never carries a matched secret or a third party's data.
+      const showDetail = (
+        f.rule.startsWith('llm-judge-')
+        || f.rule === 'disclosure-tier-gate'
+        || f.rule === 'principal-note-markup'
+        || f.rule === BAND_RULES.ungrounded
+        || f.rule === BAND_RULES.unneeded
+      ) && f.detail;
       return showDetail ? `${f.rule}: ${f.detail}` : f.rule;
     })
     .join('\n');
@@ -495,6 +556,27 @@ export class UnknownEmailAccountError extends Error {
   }
 }
 
+// How a spot-check summary names each kind of send (#2159 Phase 3), e.g. 'Emailed dana@example.com'.
+const SENT_VERB: Record<OutboundSendRequest['channel'], string> = {
+  email: 'Emailed', signal: 'Sent a Signal message to', sms: 'Texted', slack: 'Sent a Slack message to',
+};
+// A recipient whose contact is younger than this counts as a first contact (#2159 Phase 3).
+const FIRST_CONTACT_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** What the spot-check pool needs to know about a send's primary recipient. */
+interface FirstContactProbe {
+  /** A person (an address or a DM), not a group or channel id. */
+  person: boolean;
+  /** The contact Step 1 resolved, or undefined when none matched. */
+  contactId: string | undefined;
+  /** Step 1's contact lookup threw, so contactId says nothing. */
+  lookupFailed: boolean;
+}
+/** First line, at most 80 characters: enough to recognise the message on a phone. */
+function truncatePreview(text: string): string {
+  const line = text.split('\n').find((l) => l.trim() !== '')?.trim() ?? '';
+  return line.length > 80 ? `${line.slice(0, 77)}...` : line;
+}
+
 // ---------------------------------------------------------------------------
 // OutboundGateway
 // ---------------------------------------------------------------------------
@@ -523,10 +605,15 @@ export class OutboundGateway {
   private readonly autonomyService?: AutonomyService;
   private readonly piiRedactor?: PiiRedactor;
   private readonly actionLogRepo?: ActionLogRepo;
+  /** Set after construction (setApprovalDelivery) — ApprovalDelivery sends through this gateway. */
+  private approvalDelivery?: Pick<ApprovalDelivery, 'registerDisplay'>;
   private readonly confidencePipeline?: import('../contacts/confidence-pipeline.js').ConfidencePipeline;
   private readonly exportControlService?: ExportControlService;
   private readonly outboundQueue?: OutboundQueueRepo;
   private readonly outboundQueueReadiness: Map<string, () => boolean>;
+  private readonly gating: AutonomyGating;
+  private readonly bandReview?: Pick<BandSendReview, 'review'>;
+  private readonly relayBudget?: RelayBudget;
   private flushInFlight = new Set<string>();
   /** Backoff timers for HTTP channels that queued on a transient failure (#1380). */
   private flushRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -554,6 +641,19 @@ export class OutboundGateway {
     this.exportControlService = config.exportControlService;
     this.outboundQueue = config.outboundQueue;
     this.outboundQueueReadiness = new Map(config.outboundQueueReadiness ?? []);
+    this.gating = config.gating ?? 'tier';
+    this.bandReview = config.bandReview;
+    this.relayBudget = config.relayBudget;
+    if (this.gating === 'band' && !this.bandReview) {
+      // The filter turns contact-data-leak and Stage 2.5 off under band; without the review
+      // that replaces them, sends would go out with no disclosure review at all.
+      this.log.error({ gating: this.gating }, 'outbound-gateway: band gating without a band review — sends get no disclosure review');
+    }
+    if (!this.actionLogRepo) {
+      // Once here rather than per send: without the repo no autonomous send reaches the
+      // spot-check pool (#2159 Phase 3), and that should not be invisible.
+      this.log.warn({ actionLogRepo: false }, 'outbound-gateway: spot-check pool disabled: no actionLogRepo');
+    }
   }
 
   /**
@@ -638,6 +738,12 @@ export class OutboundGateway {
        * { gated: true } without an actionRef. Adapters without a re-execution
        * path (e.g. Signal today) simply omit this field.
        */
+      /**
+       * True when no agent turn is waiting on this send — a dispatcher-relayed reply (#2159).
+       * A held approval then wakes the coordinator to deliver it, since nobody reads the
+       * blocked result's advisory.
+       */
+      postTurn?: boolean;
       reExecRecipe?: {
         /** Registered skill name to invoke on approval (e.g. 'send-draft'). */
         toolName: string;
@@ -673,8 +779,20 @@ export class OutboundGateway {
        * The principal directed this send. Send skills compute it with
        * isPrincipalDirectedSend(). It lifts only the Stage 2.5 disclosure gate;
        * every other check still runs. Omitted means the gate applies (#1870).
+       * Under band gating it narrows the band review to grounding (#2159).
        */
       principalDirected?: boolean;
+      /**
+       * What to replay on approval if band review holds this send (#2159). Same shape as
+       * reExecRecipe; used only by the band hold, so tier gating never writes approval rows
+       * for it. Falls back to reExecRecipe when absent.
+       */
+      holdRecipe?: SendRecipe;
+      /**
+       * Who started the work this send belongs to: the task's originator, which send skills
+       * pass through. Used only by the relay budget (#1320). Omitted: never budgeted.
+       */
+      originator?: TaskOriginator;
     },
   ): Promise<OutboundSendResult> {
     // ------------------------------------------------------------------
@@ -745,136 +863,22 @@ export class OutboundGateway {
         // When present, write a pending_approval row so approve-action can invoke the
         // correct skill on principal approval. DB failure must NOT cause fail-open — the send
         // stays blocked even if the row can't be written (actionRef will be absent).
-        let actionRef: string | undefined;
-        const actionLogRepo = this.actionLogRepo;
-        if (actionLogRepo && options?.taskEventId && options?.reExecRecipe) {
-          const recipe = options.reExecRecipe;
-
-          // Hoist expiresAt so both the insert row and the notification body use the
-          // same value — if the 48h window ever changes, only one line needs updating.
-          const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
-          // Hoist candidateRef before the try block so the notification body can
-          // reference it directly — avoiding a fragile dependency on the outer-scope
-          // actionRef variable which is only set after insert() confirms success.
-          const candidateRef = generateShortRef();
-          let rowId: number | undefined;
-          try {
-            // Only assign actionRef after insert confirms the DB row exists to
-            // prevent phantom refs if insert throws.
-            rowId = await actionLogRepo.insert({
-              taskId: options.taskEventId,
-              conversationId: options.conversationId ?? undefined,
-              toolName: recipe.toolName,
-              actionRisk: 'medium',
-              outcome: 'pending_approval',
-              shortRef: candidateRef,
-              description: recipe.description,
-              payload: recipe.partialPayload ?? {},
-              expiresAt,
-            });
-            // Only commit actionRef now that the row actually exists in the DB
-            actionRef = candidateRef;
-          } catch (err) {
-            this.log.error(
-              { err, channel: request.channel, taskEventId: options.taskEventId },
-              'outbound-gateway: failed to write action_log row during gate — send is still blocked, actionRef will be absent',
-            );
-            // actionRef remains undefined — send is still blocked below
-          }
-
-          // Notify principal (best-effort) — mirrors ApprovalTriggerService.request() pattern.
-          // sendNotification() has its own try-catch and returns false on failure, so it
-          // never throws. Only stamp notification_sent_at if the publish succeeded.
-          // setNotificationSentAt is wrapped separately so a DB failure there does not
-          // discard the fact that the insert (and the notification delivery) succeeded.
-          const principalEmail = this.principalIdentities.find((id) => id.channel === 'email')?.channelIdentifier;
-          if (rowId !== undefined) {
-            const notificationPayload = enrichGatewayApprovalPayload(
-              withoutRecipientReferences(recipe.partialPayload ?? {}),
-              request.channel === 'email'
-                ? { to: request.to, cc: request.cc?.join(', '), subject: request.subject, body: request.body }
-                : request.channel === 'slack'
-                  // `recipient` is the field the approval renderer shows (#2033).
-                  ? { slackChannelId: request.slackChannelId, recipient: request.slackUserId ?? request.slackChannelId, message: request.message }
-                  : { recipient: request.recipient, message: request.message },
-            );
-            const extraLines = [
-              `Autonomy score: ${autonomyConfig.score} (threshold: ${sendThreshold})`,
-            ];
-
-            if (principalEmail) {
-              const recipientTier = await resolveNotificationRecipientTier(
-                this.contactService,
-                principalEmail,
-                this.log,
-              );
-              const sent = await this.sendNotification({
-                notificationType: 'approval_requested',
-                ceoEmail: principalEmail,
-                subject: `Approval needed — ${recipe.description}`,
-                body: buildApprovalNotificationBody({
-                  preamble: recipe.description,
-                  shortRef: candidateRef,
-                  expiresAt,
-                  toolName: recipe.toolName,
-                  payload: notificationPayload,
-                  recipientTier,
-                  logger: this.log,
-                  ceoEmail: principalEmail,
-                  extraLines,
-                  callToAction:
-                    'Reply with the reference to approve, deny, or dismiss this request.',
-                }),
-              });
-              if (sent) {
-                try {
-                  await actionLogRepo.setNotificationSentAt(rowId);
-                } catch (err) {
-                  // Non-fatal: the pending_approval row exists and gating is correct.
-                  // Only notification_sent_at is missing — the principal still received the alert.
-                  this.log.warn(
-                    { err, rowId, taskEventId: options.taskEventId },
-                    'outbound-gateway: setNotificationSentAt failed after successful notification — notification_sent_at will be null',
-                  );
-                }
-              }
-            } else {
-              // Row was written but no principal email identity configured — email skipped.
-              // Slack/Signal DMs below may still deliver. Surface misconfig in alerting.
-              this.log.error(
-                { rowId, taskEventId: options.taskEventId },
-                'outbound-gateway: pending_approval row written but principal email notification skipped — no principal email identity configured',
-              );
-            }
-
-            // Slack/Signal DMs for reaction→approval correlation (#1479).
-            const chatBody = buildApprovalNotificationBody({
-              preamble: recipe.description,
-              shortRef: candidateRef,
-              expiresAt,
-              toolName: recipe.toolName,
-              payload: notificationPayload,
-              recipientTier: 'principal',
-              extraLines,
-              callToAction: 'React 👍 to approve or 👎 to deny this request.',
-            });
-            await deliverApprovalToChatChannels({
-              outboundGateway: this,
-              actionLogRepo,
-              actionLogId: rowId,
-              body: chatBody,
-              principalIdentities: this.principalIdentities,
-              logger: this.log,
-            });
-          }
+        let raised: { shortRef: string; approvalNumber: number | null } | undefined;
+        if (options?.taskEventId && options?.reExecRecipe) {
+          raised = await this.raiseSendApproval(
+            request,
+            options.reExecRecipe,
+            { taskEventId: options.taskEventId, conversationId: options.conversationId, postTurn: options.postTurn },
+            [`Autonomy score: ${autonomyConfig.score} (threshold: ${sendThreshold})`],
+          );
         }
 
-        if (actionRef) {
+        if (raised) {
           return {
             success: false,
             gated: true,
-            actionRef,
-            blockedReason: `Autonomy score ${autonomyConfig.score} is below send threshold ${sendThreshold}`,
+            actionRef: raised.shortRef,
+            blockedReason: `Autonomy score ${autonomyConfig.score} is below send threshold ${sendThreshold}. ${approvalAdvisory(raised.shortRef, undefined, raised.approvalNumber)}`,
           };
         }
 
@@ -1069,11 +1073,12 @@ export class OutboundGateway {
           );
           const itemSummary = ExportControlServiceClass.formatItemSummary(items);
           let actionRef: string | undefined;
+          let rowId: number | undefined;
           if (this.actionLogRepo && options?.taskEventId && options?.reExecRecipe) {
             const recipe = options.reExecRecipe;
             const candidateRef = generateShortRef();
             try {
-              await this.actionLogRepo.insert({
+              rowId = await this.actionLogRepo.insert({
                 taskId: options.taskEventId,
                 conversationId: options.conversationId ?? undefined,
                 toolName: recipe.toolName,
@@ -1089,57 +1094,34 @@ export class OutboundGateway {
               this.log.error({ err }, 'outbound-gateway: failed to write export-gate action_log row');
             }
           }
-          const principalEmail = this.principalIdentities.find((id) => id.channel === 'email')?.channelIdentifier;
-          if (principalEmail && options?.reExecRecipe) {
-            const recipe = options.reExecRecipe;
-            const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
-            try {
-              const recipientTier = await resolveNotificationRecipientTier(
-                this.contactService,
-                principalEmail,
-                this.log,
-              );
-              await this.sendNotification({
-                notificationType: 'approval_requested',
-                ceoEmail: principalEmail,
-                subject: `Approval needed — ${recipe.description}`,
-                body: buildApprovalNotificationBody({
-                  preamble: outcome.message,
-                  shortRef: actionRef ?? 'pending',
-                  expiresAt,
-                  toolName: recipe.toolName,
-                  payload: {
-                    ...withoutRecipientReferences(recipe.partialPayload ?? {}),
-                    // The display shows the resolved addresses; the stored payload keeps the references.
-                    ...(request.channel === 'email'
-                      ? { to: request.to, ...(request.cc && request.cc.length > 0 ? { cc: request.cc.join(', ') } : {}) }
-                      : {}),
-                    export_items: items.map((i) => ({
-                      node_id: i.nodeId,
-                      label: i.label,
-                      sensitivity: i.sensitivity,
-                    })),
-                  },
-                  recipientTier,
-                  logger: this.log,
-                  ceoEmail: principalEmail,
-                  extraLines: [`Items:\n${itemSummary}`],
-                  callToAction:
-                    'Reply with the reference to approve, deny, or dismiss this request.',
-                }),
-              }, options?.parentEventId);
-            } catch (err) {
-              this.log.error(
-                { err, channel: request.channel, taskEventId: options?.taskEventId },
-                'outbound-gateway: export-gate approval notification failed — send still blocked',
-              );
-            }
+          // As at the score gate (raiseSendApproval): the number insert() allocated, read back
+          // by row id (#2159 Phase 3). actionRef and rowId are set together.
+          const approvalNumber = actionRef && this.actionLogRepo && rowId !== undefined
+            ? await readApprovalNumber(this.actionLogRepo, rowId, this.log)
+            : null;
+          // As at the score gate: no notification (#2159); the agent delivers it.
+          if (actionRef && options?.reExecRecipe) {
+            this.approvalDelivery?.registerDisplay(actionRef, {
+              preamble: outcome.message,
+              payload: {
+                ...withoutRecipientReferences(options.reExecRecipe.partialPayload ?? {}),
+                // The display shows the resolved addresses; the stored payload keeps the references.
+                ...(request.channel === 'email'
+                  ? { to: request.to, ...(request.cc && request.cc.length > 0 ? { cc: request.cc.join(', ') } : {}) }
+                  : {}),
+                export_items: items.map((i) => ({ node_id: i.nodeId, label: i.label, sensitivity: i.sensitivity })),
+              },
+              extraLines: [`Items:\n${itemSummary}`],
+              approvalNumber,
+            });
+            // actionRef is set only after an insert that required taskEventId, so it is present.
+            await this.queueApprovalMention(actionRef, options.reExecRecipe.description, options.taskEventId ?? options.parentEventId ?? '', options.conversationId ?? undefined);
           }
           return {
             success: false,
             gated: true,
             actionRef,
-            blockedReason: `${outcome.message}\n\n${itemSummary}`,
+            blockedReason: `${outcome.message}\n\n${itemSummary}${actionRef ? `\n\n${approvalAdvisory(actionRef, undefined, approvalNumber)}` : ''}`,
           };
         }
 
@@ -1297,66 +1279,29 @@ export class OutboundGateway {
         );
       }
 
-      // Publish an outbound.notification event so the principal alert routes through the
-      // standard safety pipeline via EmailAdapter, rather than bypassing the content
-      // filter with a direct dispatchEmail() call (#206).
+      // Queue an FYI for the principal's digest (#2159). Block notices used to be emailed
+      // on their own; they are informational (#1051) — the agent already has the reason and
+      // may rewrite and retry — so they wait for the digest like other notices.
       //
-      // Recursion safety (two layers):
-      //   1. The notification body is a hardcoded template addressed to ceoEmail (in the
-      //      content filter allowlist), so the filter always passes under normal operation.
-      //   2. The EmailAdapter passes skipNotificationOnBlock: true when calling send() for
-      //      a notification delivery. If the filter is broken (crash → fail-closed), this
-      //      flag prevents send() from re-publishing outbound.notification, breaking the
-      //      cycle: send → block → sendNotification → EmailAdapter → send(skip) → block → stop.
-      const principalEmailForBlock = this.principalIdentities.find((id) => id.channel === 'email')?.channelIdentifier;
-      if (principalEmailForBlock && !options?.skipNotificationOnBlock) {
-        // sendNotification() catches errors internally — await is safe and ensures
-        // the bus.publish call completes before we return the blocked result.
-        await this.sendNotification(
-          {
-            notificationType: 'blocked_content',
-            ceoEmail: principalEmailForBlock,
-            // Softened from a call-to-action to informational (#1051): the agent now
-            // receives the block reason in the skill result and may self-correct and
-            // resend on its own. The audit log remains the ground truth; this alert is
-            // an FYI, not a task the principal must action.
-            subject: 'FYI — outbound message blocked',
-            body: [
-              'An outbound message was blocked by the content filter.',
-              'The agent received the reason and may rewrite the message and retry on its own.',
-              '',
-              `Reason: ${reasonSummary}`,
-              // blockedEvent.timestamp is the audit row's own clock. No principal
-              // timezone is plumbed into the gateway (it is infrastructure, not a
-              // skill with ctx.timezone), so we stamp UTC explicitly rather than
-              // emit an ambiguous bare timestamp.
-              `Time: ${blockedEvent.timestamp.toISOString()} (UTC)`,
-              `Channel: ${request.channel}`,
-              ...unmatchedRecipientNotificationLines(recipientId, unmatched),
-              '',
-              `Block ID: ${blockId}`,
-              `Audit event ID: ${blockedEvent.id}`,
-              '',
-              'Search the audit log by the audit event ID above for the full record.',
-            ].join('\n'),
-            blockId,
-            originalChannel: request.channel,
-            originalRecipientId: recipientId,
-          },
+      // skipNotificationOnBlock is still honoured: the EmailAdapter sets it when delivering a
+      // system notification, and a blocked notification must not report itself (#206).
+      if (!options?.skipNotificationOnBlock) {
+        await this.queueBlockReport(
+          [
+            `Outbound ${request.channel} message blocked by the content filter. The agent was told why and may rewrite it and retry.`,
+            `Reason: ${reasonSummary}`,
+            ...unmatchedRecipientNotificationLines(recipientId, unmatched),
+            `Block ${blockId}; audit event ${blockedEvent.id}.`,
+          ].join('\n'),
+          options?.conversationId,
           blockedEvent.id,
         );
-      } else if (options?.skipNotificationOnBlock) {
-        // This branch fires when a notification delivery itself gets blocked by the
-        // content filter (e.g. the filter is in a broken state). The recursion guard
-        // prevents an infinite loop. The principal will not receive this alert.
+      } else {
+        // A system notification's own delivery was blocked (e.g. the filter is in a broken
+        // state). The principal will not hear about this block; the audit log has it.
         this.log.error(
           { blockId, channel: request.channel },
           'outbound-gateway: notification delivery was blocked by content filter — recursion guard active, principal will NOT receive this alert',
-        );
-      } else if (!options?.skipNotificationOnBlock) {
-        this.log.error(
-          { blockId, channel: request.channel, recipientId: redactId(recipientId) },
-          'outbound-gateway: principal notification skipped — no principal email identity configured. Block recorded in audit log only.',
         );
       }
       // Surface the principal-safe reason summary and the rule name(s) to the
@@ -1377,6 +1322,85 @@ export class OutboundGateway {
     }
 
     // ------------------------------------------------------------------
+    // Step 2.4: Relay budget (#1320)
+    // ------------------------------------------------------------------
+    // An outside contact can only cause so many immediate messages to the principal. Sends to
+    // the principal alone skip the band review below, so this is the only limit on them. Over
+    // budget, the relay goes to the digest. Runs after the content filter, so blocked content is
+    // never queued and the digest gets redacted text. An email with attachments is never held:
+    // a digest item carries text only, so the files would be lost.
+    const carriesAttachments = request.channel === 'email' && (request.attachments?.length ?? 0) > 0;
+    const relayOriginator = principalIsSoleRecipient && this.relayBudget && !carriesAttachments
+      ? budgetedOriginator(options)
+      : null;
+    // The originator whose slot this send took. Given back below if the send then fails, so a
+    // relay that never reached the principal doesn't count against the contact.
+    let relaySlot: string | null = null;
+    if (relayOriginator) {
+      if (this.relayBudget!.tryAcquire(relayOriginator.contactId) === 'allowed') {
+        relaySlot = relayOriginator.contactId;
+      } else {
+        const deferred = await this.deferRelay(request, redactedBody, redactedSubject, relayOriginator, options);
+        if (deferred) return deferred;
+        // The digest item could not be recorded: deliver after all. Noise beats a lost message.
+      }
+    } else if (
+      principalIsSoleRecipient && this.relayBudget && !options?.originator && options?.taskEventId
+      && !options.isSystemNotification && !options.humanApproved && !options.principalDirected && !options.postTurn
+    ) {
+      // A skill send (it has a task, and it isn't an adapter relay or a system notice) with no
+      // originator. Every send skill should pass one; without it the budget can't count this send.
+      this.log.warn(
+        { channel: request.channel, taskEventId: options.taskEventId },
+        'outbound-gateway: send to the principal alone has no originator — the relay budget cannot count it',
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 2.5: Band review (#2159) — under band gating, the judge's brief replaces Stage 2.5.
+    // ------------------------------------------------------------------
+    // Skipped for system notifications, for sends the principal approved (they read this
+    // exact message), and for the principal alone (nobody else reads it).
+    let bandReport: BandReviewReport | undefined;
+    let bandSignals: BandReviewSignals | undefined;
+    if (
+      this.gating === 'band' && this.bandReview
+      && !options?.isSystemNotification && !options?.humanApproved && !principalIsSoleRecipient
+    ) {
+      const people = this.personRecipients(request);
+      const outcome = await this.runBandReview({
+        request,
+        content: redactedBody,
+        recipients: people.length > 0 ? people : [recipientId],
+        editable: true,
+        options,
+      });
+      if (outcome.result) return outcome.result;
+      redactedBody = outcome.content;
+      bandReport = outcome.report;
+      bandSignals = outcome.signals;
+    }
+
+    // Spot-check pool (#2159 Phase 3): a send Curia made on its own. Not a system notice, a
+    // send the principal approved or directed, or a message to the principal alone.
+    const sampled = !options?.isSystemNotification && !options?.humanApproved
+      && options?.principalDirected !== true && !principalIsSoleRecipient;
+    const sampleArgs = {
+      channel: request.channel,
+      toolName: options?.exportContext?.toolName ?? `${request.channel}-send`,
+      recipientLabel: this.personRecipients(request).join(', ') || recipientId,
+      recipient: {
+        // A Signal group or Slack channel is never a first contact: no contact stands for it.
+        person: recipientId.length > 0
+          && this.personRecipients(request).some((id) => id.toLowerCase() === recipientId.toLowerCase()),
+        contactId: recipientContactId,
+        lookupFailed: recipientTierUnresolved,
+      },
+      band: { report: bandReport, signals: bandSignals },
+      options,
+    };
+
+    // ------------------------------------------------------------------
     // Step 3: Channel dispatch + contact promotion
     // ------------------------------------------------------------------
     // After a successful send, promote the recipient contact from provisional →
@@ -1394,9 +1418,7 @@ export class OutboundGateway {
       const toSend: EmailSendRequest = { ...request, body: redactedBody, subject: redactedSubject };
       delete toSend.recipientSource;
       delete toSend.recipientDisplayName;
-      delete toSend.signature;
-      const signature = this.emailSignatureFor(toSend, options?.isSystemNotification === true);
-      if (signature) toSend.signature = signature;
+      this.signEmail(toSend, options?.isSystemNotification === true);
       if (options?.recipientSource === 'email_participant') {
         toSend.recipientSource = 'email_participant';
         const fromName = options.recipientDisplayName?.trim();
@@ -1414,7 +1436,8 @@ export class OutboundGateway {
           channel: 'email',
           recipientId,
           recipientContactId,
-          content: redactedBody,
+          // Without the model's sign-off when signEmail dropped it: what was sent.
+          content: toSend.body,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1430,7 +1453,10 @@ export class OutboundGateway {
             }
             : {}),
         });
+        if (sampled) await this.recordSentAction({ ...sampleArgs, preview: toSend.subject || toSend.body });
       }
+      if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
       return result;
     }
 
@@ -1450,7 +1476,10 @@ export class OutboundGateway {
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
         });
+        if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
+      if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
       return result;
     }
 
@@ -1469,7 +1498,10 @@ export class OutboundGateway {
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
         });
+        if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
+      if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
       return result;
     }
 
@@ -1495,7 +1527,10 @@ export class OutboundGateway {
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
         });
+        if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
+      if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
       return result;
     }
   }
@@ -1698,6 +1733,500 @@ export class OutboundGateway {
         'outbound-gateway: failed to publish outbound.notification event',
       );
       return false;
+    }
+  }
+
+  /**
+   * Give the gateway the approval-delivery service (#2159). Set after construction because
+   * ApprovalDelivery sends through this gateway; without it the gate sites still write rows
+   * and the delivered approval renders the stored payload.
+   */
+  setApprovalDelivery(approvalDelivery: Pick<ApprovalDelivery, 'registerDisplay'>): void {
+    this.approvalDelivery = approvalDelivery;
+  }
+
+  /**
+   * Write a pending_approval row for a held send, register what the principal will be shown,
+   * queue its one digest mention, and wake the coordinator for a relayed reply (#2159).
+   * Nobody is notified here: the agent that tried the send delivers the approval on one
+   * channel with deliver-approval. Returns the short ref and approval number (#2159 Phase 3;
+   * null when the row has none), or undefined when there is no action log or the row could not
+   * be written (the send stays held either way).
+   */
+  private async raiseSendApproval(
+    request: OutboundSendRequest,
+    recipe: SendRecipe,
+    ctx: { taskEventId: string; conversationId?: string | null; postTurn?: boolean },
+    extraLines: string[],
+  ): Promise<{ shortRef: string; approvalNumber: number | null } | undefined> {
+    const actionLogRepo = this.actionLogRepo;
+    if (!actionLogRepo) {
+      this.log.warn({ channel: request.channel }, 'outbound-gateway: no action log wired — a held send cannot raise an approval');
+      return undefined;
+    }
+    // Hoist candidateRef so the display registration names the row the insert wrote.
+    const candidateRef = generateShortRef();
+    let rowId: number;
+    try {
+      rowId = await actionLogRepo.insert({
+        taskId: ctx.taskEventId,
+        conversationId: ctx.conversationId ?? undefined,
+        toolName: recipe.toolName,
+        actionRisk: 'medium',
+        outcome: 'pending_approval',
+        shortRef: candidateRef,
+        description: recipe.description,
+        payload: recipe.partialPayload ?? {},
+        expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+      });
+    } catch (err) {
+      this.log.error(
+        { err, channel: request.channel, taskEventId: ctx.taskEventId },
+        'outbound-gateway: failed to write action_log row for a held send — send is still blocked, actionRef will be absent',
+      );
+      return undefined;
+    }
+    // insert() allocated the number inside its transaction but returns only the id.
+    const approvalNumber = await readApprovalNumber(actionLogRepo, rowId, this.log);
+    // Show the principal the resolved recipients, not the stored contact references (#2033).
+    const displayPayload = enrichGatewayApprovalPayload(
+      withoutRecipientReferences(recipe.partialPayload ?? {}),
+      request.channel === 'email'
+        ? { to: request.to, cc: request.cc?.join(', '), subject: request.subject, body: request.body }
+        : request.channel === 'slack'
+          // `recipient` is the field the approval renderer shows (#2033).
+          ? { slackChannelId: request.slackChannelId, recipient: request.slackUserId ?? request.slackChannelId, message: request.message }
+          : { recipient: request.recipient, message: request.message },
+    );
+    this.approvalDelivery?.registerDisplay(candidateRef, {
+      preamble: recipe.description,
+      payload: displayPayload,
+      extraLines,
+      approvalNumber,
+    });
+    await this.queueApprovalMention(candidateRef, recipe.description, ctx.taskEventId, ctx.conversationId ?? undefined);
+    if (ctx.postTurn) {
+      await this.wakeCoordinatorToDeliver(candidateRef, recipe.description, ctx.taskEventId);
+    }
+    return { shortRef: candidateRef, approvalNumber };
+  }
+
+  /**
+   * Whether a send went to someone Curia has not dealt with before, for the spot-check pool
+   * (#2159 Phase 3). Send skills address recipients by contact UUID (ADR-047), so a
+   * first-time recipient normally already has a contact, made moments earlier by
+   * contact-create. "First contact" therefore means a person recipient whose contact is
+   * under a day old, or who has no contact at all. A group or channel is never one, and
+   * neither is a recipient whose lookup failed: an outage is not evidence of novelty.
+   * Never throws.
+   */
+  private async isFirstContact(recipient: FirstContactProbe): Promise<boolean> {
+    if (!recipient.person || recipient.lookupFailed) return false;
+    if (recipient.contactId === undefined) return true;
+    try {
+      const contact = await this.contactService.getContact(recipient.contactId);
+      // Resolved a moment ago but gone now (merged or deleted): no contact exists, which
+      // is the no-contact case above.
+      if (!contact) return true;
+      return Date.now() - contact.createdAt.getTime() < FIRST_CONTACT_WINDOW_MS;
+    } catch (err) {
+      this.log.warn(
+        { err, contactId: recipient.contactId },
+        'outbound-gateway: could not read the recipient contact for the spot-check first contact signal — recording it as not a first contact',
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Put an autonomous send in the spot-check pool (#2159 Phase 3). Not for system notices,
+   * principal-approved or principal-directed sends, or the principal alone: those are not
+   * Curia acting on its own. Never throws; the send has already gone out.
+   */
+  private async recordSentAction(args: {
+    channel: OutboundSendRequest['channel'];
+    toolName: string;
+    recipientLabel: string;
+    preview: string;
+    /** The send's primary recipient, as Step 1 resolved it; decides the firstContact signal. */
+    recipient: FirstContactProbe;
+    band: { report?: BandReviewReport; signals?: BandReviewSignals } | undefined;
+    options: { taskEventId?: string; parentEventId?: string; conversationId?: string | null } | undefined;
+  }): Promise<void> {
+    if (!this.actionLogRepo) return;
+    const { band } = args;
+    const firstContact = await this.isFirstContact(args.recipient);
+    // One review outcome per row, most telling first: a trim or an unreviewed send says
+    // more than a bounce the drafter then fixed.
+    const review = band?.report?.source === 'claim_trimmed' ? 'trimmed'
+      : band?.report?.source === 'sent_without_review' ? 'unreviewed'
+        : band?.signals?.bounced ? 'bounced' : undefined;
+    try {
+      await this.actionLogRepo.insertSampled({
+        taskId: args.options?.taskEventId ?? args.options?.parentEventId ?? 'system',
+        ...(args.options?.conversationId ? { conversationId: args.options.conversationId } : {}),
+        toolName: args.toolName,
+        actionRisk: 'medium',
+        summary: `${SENT_VERB[args.channel]} ${args.recipientLabel}: "${truncatePreview(args.preview)}"`,
+        signals: {
+          ...(firstContact ? { firstContact: true } : {}),
+          ...(band?.signals?.speaksAsPrincipal ? { speaksAsPrincipal: true } : {}),
+          ...(review ? { review } : {}),
+        },
+      });
+    } catch (err) {
+      // error, like the gateway's other action_log insert failures: a pool that silently
+      // stops filling starves the spot check. The pg SQLSTATE code, when there is one, tells
+      // a schema problem from an outage. Not rethrown: the send has already gone out.
+      const code = (err as { code?: unknown } | null)?.code;
+      this.log.error(
+        {
+          err, channel: args.channel, toolName: args.toolName, taskEventId: args.options?.taskEventId,
+          ...(typeof code === 'string' ? { code } : {}),
+        },
+        'outbound-gateway: could not record the send for spot checks — it went out, but will not be sampled',
+      );
+    }
+  }
+
+  /**
+   * Step 2.5 under band gating (#2159): ask the band review, and act on its decision.
+   * Returns `result` when the send must not go out (bounce or hold), otherwise the content
+   * to send — trimmed when the review cut unverified statements — and any report item to
+   * publish once it is delivered. `editable` is false for a stored draft, which cannot be
+   * trimmed: a trimmed decision holds it instead.
+   */
+  private async runBandReview(args: {
+    request: OutboundSendRequest;
+    content: string;
+    recipients: readonly string[];
+    editable: boolean;
+    options: {
+      taskEventId?: string;
+      conversationId?: string | null;
+      parentEventId?: string;
+      postTurn?: boolean;
+      principalDirected?: boolean;
+      holdRecipe?: SendRecipe;
+      reExecRecipe?: SendRecipe;
+    } | undefined;
+  }): Promise<{ result?: OutboundSendResult; content: string; report?: BandReviewReport; signals?: BandReviewSignals }> {
+    const { request, content, recipients, editable, options } = args;
+    const score = await this.bandScore();
+    let decision: Awaited<ReturnType<BandSendReview['review']>>;
+    try {
+      decision = await this.bandReview!.review({
+        content,
+        channel: request.channel,
+        recipients,
+        score,
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        ...(options?.taskEventId ? { taskEventId: options.taskEventId } : {}),
+        principalDirected: options?.principalDirected === true,
+        postTurn: options?.postTurn === true,
+      });
+    } catch (err) {
+      // BandSendReview is not meant to throw; if it does, the send was not reviewed. Hold.
+      this.log.error({ err, channel: request.channel }, 'outbound-gateway: band review threw — holding the send');
+      const reason = 'Held for the principal: the send review failed.';
+      decision = { kind: 'hold', reason, findings: [{ rule: BAND_RULES.unreviewed, detail: reason }] };
+    }
+
+    if (decision.kind === 'send' && !editable && decision.content !== content) {
+      const reason = 'Held for the principal: the draft states things about the principal that nothing looked up supports, and a saved draft cannot be trimmed.';
+      decision = { kind: 'hold', reason, findings: [{ rule: BAND_RULES.ungrounded, detail: reason }] };
+    }
+
+    if (decision.kind === 'send') {
+      return {
+        content: decision.content,
+        ...(decision.report ? { report: decision.report } : {}),
+        ...(decision.signals ? { signals: decision.signals } : {}),
+      };
+    }
+
+    if (decision.kind === 'bounce') {
+      // Published so the dispatcher's relay rewrite (#1355) sees it, and for audit. No block
+      // report: a bounce is between Curia and its own drafter.
+      const blockId = `block_${randomUUID()}`;
+      try {
+        await this.bus.publish('dispatch', createOutboundBlocked({
+          blockId,
+          conversationId: options?.conversationId ?? '',
+          channelId: request.channel,
+          content,
+          recipientId: recipients[0] ?? '',
+          reason: decision.findings.map((f) => `${f.rule}: ${f.detail}`).join('; '),
+          findings: decision.findings,
+          parentEventId: options?.parentEventId ?? '',
+        }));
+      } catch (err) {
+        this.log.warn({ err, blockId }, 'outbound-gateway: failed to publish outbound.blocked for a band bounce — the send is still bounced');
+      }
+      return {
+        content,
+        result: {
+          success: false,
+          blockedReason: buildBlockReasonSummary(decision.findings),
+          blockedRules: decision.findings.map((f) => f.rule),
+        },
+      };
+    }
+
+    // Hold. Never publish outbound.blocked here: on a relay it would start the #1355
+    // rewrite loop, and this message needs the principal, not a rewrite.
+    const rule = decision.findings[0]?.rule ?? BAND_RULES.unreviewed;
+    const recipe = options?.holdRecipe ?? options?.reExecRecipe;
+    this.log.info({ channel: request.channel, rule, hasRecipe: recipe !== undefined }, 'outbound-gateway: band review held the send');
+    // A hold with no approval behind it reaches nobody unless it is reported: the agent may
+    // be gone (a relayed reply), and nothing else records it. The digest gets it then.
+    const reportUnapprovedHold = async (why: string): Promise<void> => {
+      this.log.warn({ channel: request.channel, rule, why }, 'outbound-gateway: band hold raised no approval — reporting it to the digest');
+      await this.queueBlockReport(
+        [
+          `Outbound ${request.channel} message to ${recipients.join(', ')} was held by the send review, and no approval request could be raised (${why}).`,
+          `Reason: ${decision.reason}`,
+        ].join('\n'),
+        options?.conversationId ?? undefined,
+        options?.taskEventId ?? options?.parentEventId ?? 'system',
+      );
+    };
+    if (recipe && options?.taskEventId) {
+      const raised = await this.raiseSendApproval(
+        request,
+        recipe,
+        { taskEventId: options.taskEventId, conversationId: options.conversationId, postTurn: options.postTurn },
+        [`Held by the send review: ${decision.reason}`],
+      );
+      if (!raised) await reportUnapprovedHold('the approval row could not be written');
+      return {
+        content,
+        result: {
+          success: false,
+          gated: true,
+          ...(raised ? { actionRef: raised.shortRef } : {}),
+          blockedReason: raised
+            ? `${decision.reason} ${approvalAdvisory(raised.shortRef, undefined, raised.approvalNumber)}`
+            : `${decision.reason} No approval request could be recorded — ask the principal before sending it.`,
+        },
+      };
+    }
+    await reportUnapprovedHold(recipe ? 'the send has no task to attach it to' : 'this send has no way to replay it');
+    return {
+      content,
+      result: { success: false, blockedReason: `${decision.reason} Ask the principal before sending it.`, blockedRules: [rule] },
+    };
+  }
+
+  /** The live score for band review. Unreadable counts as 0: below 80, failures hold. */
+  private async bandScore(): Promise<number> {
+    if (!this.autonomyService) return 0;
+    try {
+      const config = await this.autonomyService.getConfig();
+      if (config === null) {
+        this.log.warn('outbound-gateway: no autonomy score for band review — reviewing as score 0');
+        return 0;
+      }
+      return config.score;
+    } catch (err) {
+      this.log.warn({ err }, 'outbound-gateway: autonomy score unreadable for band review — reviewing as score 0');
+      return 0;
+    }
+  }
+
+  /**
+   * Publish a band report item once its send is delivered (#2159). A "sent without review"
+   * item is then the only record that nothing checked the message, so if it cannot be
+   * recorded the principal is emailed directly.
+   */
+  private async publishBandReport(
+    report: BandReviewReport,
+    options: { taskEventId?: string; parentEventId?: string; conversationId?: string | null } | undefined,
+  ): Promise<void> {
+    try {
+      await this.bus.publish('dispatch', createPrincipalReport({
+        summary: report.summary,
+        urgency: 'digest',
+        source: report.source,
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        parentEventId: options?.taskEventId ?? options?.parentEventId ?? 'system',
+        sourceLayer: 'dispatch',
+      }));
+    } catch (err) {
+      this.log.error({ err, source: report.source }, 'outbound-gateway: failed to record a band report item');
+      if (report.source === 'sent_without_review') {
+        await this.emailPrincipal('Curia: a message went out without review', report.summary);
+      }
+    }
+  }
+
+  /**
+   * Hold an over-budget relay for the principal's digest (#1320): record the digest item, send
+   * the once-per-window notice, log and audit it. Returns null when the digest item could not be
+   * recorded, so the caller delivers the relay instead of losing it. Never throws.
+   */
+  private async deferRelay(
+    request: OutboundSendRequest,
+    body: string,
+    subject: string | undefined,
+    originator: TaskOriginator,
+    options: { taskEventId?: string; parentEventId?: string; conversationId?: string } | undefined,
+  ): Promise<OutboundSendResult | null> {
+    const name = await this.originatorName(originator.contactId);
+    const summary = [
+      `Held for your digest (relay limit reached for ${name ?? 'a contact'}):`,
+      ...(request.channel === 'email' && subject ? [`Subject: ${subject}`] : []),
+      body,
+    ].join('\n');
+    try {
+      await this.bus.publish('dispatch', createPrincipalReport({
+        summary,
+        urgency: 'digest',
+        source: 'relay_deferred',
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        parentEventId: options?.taskEventId ?? options?.parentEventId ?? 'system',
+        sourceLayer: 'dispatch',
+      }));
+    } catch (err) {
+      this.log.error(
+        { err, originatorContactId: loggableContactId(originator.contactId), channel: request.channel },
+        'outbound-gateway: relay over budget, but its digest item could not be recorded — delivering it now',
+      );
+      return null;
+    }
+
+    // Marked only once delivered: a notice that failed is tried again on the next deferral.
+    const noticeSent = this.relayBudget!.noticeDue(originator.contactId)
+      ? await this.sendRelayNotice(request, name ?? 'A contact', options)
+      : false;
+    if (noticeSent) this.relayBudget!.markNotified(originator.contactId);
+    const tier = originator.tier ?? 'unknown';
+    this.log.warn(
+      { originatorContactId: loggableContactId(originator.contactId), tier, channel: request.channel, count: this.relayBudget!.count(originator.contactId), noticeSent },
+      'outbound-gateway: relay budget reached — relay held for the digest',
+    );
+    try {
+      await this.bus.publish('dispatch', createAutonomyRelayDeferred({
+        originatorContactId: originator.contactId,
+        tier,
+        channel: request.channel,
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        ...(options?.taskEventId ? { taskEventId: options.taskEventId } : {}),
+        noticeSent,
+      }, options?.taskEventId));
+    } catch (err) {
+      // The relay is already safe in the digest; only the audit row is missing.
+      this.log.error({ err, originatorContactId: loggableContactId(originator.contactId) }, 'AUDIT FAILURE: autonomy.relay_deferred could not be published');
+    }
+    return { success: true, deferredToDigest: true };
+  }
+
+  /** The once-per-window "holding them for your digest" line (#1320). True if delivered. Never throws. */
+  private async sendRelayNotice(
+    request: OutboundSendRequest,
+    name: string,
+    options: { taskEventId?: string; conversationId?: string } | undefined,
+  ): Promise<boolean> {
+    const notice = relayNoticeRequest(request, `${name} has more updates. I'm holding them for your digest, or ask me for them anytime.`, `Holding updates from ${name}`);
+    try {
+      // A system notification: never budgeted, so this cannot recurse into another deferral.
+      const result = await this.send(notice, {
+        isSystemNotification: true,
+        skipNotificationOnBlock: true,
+        ...(options?.taskEventId ? { taskEventId: options.taskEventId } : {}),
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+      });
+      if (!result.success) {
+        this.log.warn({ channel: request.channel, reason: result.blockedReason }, 'outbound-gateway: relay-budget notice was not delivered');
+      }
+      return result.success;
+    } catch (err) {
+      this.log.warn({ err, channel: request.channel }, 'outbound-gateway: relay-budget notice threw');
+      return false;
+    }
+  }
+
+  /**
+   * The originator's display name, or null when there is none or the lookup fails. Never throws.
+   * An unresolved sender has no contact: stampOriginator uses its raw address as the id, and that
+   * address is the best name the principal can be given.
+   */
+  private async originatorName(contactId: string): Promise<string | null> {
+    // Trimmed before the check: isUuid() is a type guard, and narrows a non-UUID string to never.
+    const raw = contactId.trim();
+    if (!isUuid(contactId)) return raw || null;
+    try {
+      const name = (await this.contactService.getContact(contactId))?.displayName?.trim();
+      return name ? name : null;
+    } catch (err) {
+      this.log.warn({ err, contactId }, 'outbound-gateway: could not look up the relay originator\'s name');
+      return null;
+    }
+  }
+
+  /** Email the principal directly, as a system notification. Never throws. */
+  private async emailPrincipal(subject: string, body: string): Promise<void> {
+    const to = this.principalIdentities.find((i) => i.channel === 'email' && i.verified && i.status === 'active')?.channelIdentifier;
+    if (!to) {
+      this.log.error({ subject }, 'outbound-gateway: no verified principal email to notify — the notice is only in this log');
+      return;
+    }
+    try {
+      const result = await this.send({ channel: 'email', to, subject, body }, { isSystemNotification: true, skipNotificationOnBlock: true });
+      if (!result.success) {
+        this.log.error({ subject, reason: result.blockedReason }, 'outbound-gateway: principal notice was not delivered');
+      }
+    } catch (err) {
+      this.log.error({ err, subject }, 'outbound-gateway: principal notice threw');
+    }
+  }
+
+  /** Wake the coordinator to deliver an approval nobody is there to deliver (#2159). Never throws. */
+  private async wakeCoordinatorToDeliver(shortRef: string, description: string, taskEventId: string): Promise<void> {
+    try {
+      await this.bus.publish('dispatch', buildApprovalDeliveryWake(shortRef, description, taskEventId));
+    } catch (err) {
+      this.log.error({ err, shortRef }, 'outbound-gateway: could not wake the coordinator — the expiry sweep will deliver the approval');
+    }
+  }
+
+  /** Queue a gate-raised approval's one digest mention (#2159). Never throws. */
+  private async queueApprovalMention(shortRef: string, description: string, taskEventId: string, conversationId: string | undefined): Promise<void> {
+    try {
+      await this.bus.publish('dispatch', createPrincipalReport({
+        summary: `Waiting for your approval: ${description}`,
+        urgency: 'digest',
+        source: 'approval_pending',
+        ...(conversationId ? { conversationId } : {}),
+        actionShortRef: shortRef,
+        parentEventId: taskEventId,
+        sourceLayer: 'dispatch',
+      }));
+    } catch (err) {
+      this.log.error({ err, shortRef }, 'outbound-gateway: failed to queue the approval mention — the approval still exists');
+    }
+  }
+
+  /**
+   * Queue a content-filter block notice for the principal's digest (#2159). The summary must
+   * already obey buildBlockReasonSummary's per-rule contract: never a Stage-1 rule's matched
+   * fragment. Never throws — the block itself has already happened and is in the audit log.
+   */
+  private async queueBlockReport(summary: string, conversationId: string | undefined, blockedEventId: string): Promise<void> {
+    try {
+      await this.bus.publish('dispatch', createPrincipalReport({
+        summary,
+        urgency: 'digest',
+        source: 'blocked_content',
+        ...(conversationId ? { conversationId } : {}),
+        parentEventId: blockedEventId,
+        sourceLayer: 'dispatch',
+      }));
+    } catch (err) {
+      this.log.error(
+        { err, blockedEventId },
+        'outbound-gateway: failed to queue the block notice — the block is only in the audit log',
+      );
     }
   }
 
@@ -2474,24 +3003,27 @@ export class OutboundGateway {
     }
 
     const toDraft: EmailSendRequest = { ...request };
-    delete toDraft.signature;
-    const signature = this.emailSignatureFor(toDraft, false);
-    if (signature) toDraft.signature = signature;
+    this.signEmail(toDraft, false);
     return this.dispatchEmailDraft(toDraft);
   }
 
   /**
-   * The signature for an email the gateway is about to send or draft, or undefined.
-   * Not on system notifications (alerts and principal notes, which the assistant does
-   * not write as a letter), not from the principal's own mailbox (it would sign as the
-   * assistant in the principal's name), and not twice when the body already ends with it.
+   * Signs an email the gateway is about to send or draft: sets its signature and drops
+   * the sign-off the model wrote at the end of the body, so the configured signature is
+   * the only one (#2138). Not on system notifications (alerts and principal notes, which
+   * the assistant does not write as a letter), not from the principal's own mailbox (it
+   * would sign as the assistant in the principal's name), and not twice when the body is
+   * nothing but the signature.
    */
-  private emailSignatureFor(request: EmailSendRequest, isSystemNotification: boolean): string | undefined {
-    if (isSystemNotification) return undefined;
-    if (this.isPrincipalMailbox(request.accountId)) return undefined;
+  private signEmail(request: EmailSendRequest, isSystemNotification: boolean): void {
+    delete request.signature;
+    if (isSystemNotification) return;
+    if (this.isPrincipalMailbox(request.accountId)) return;
     const signature = emailSignatureText(this.agentPersona);
-    if (!signature || bodyEndsWithSignature(request.body, signature)) return undefined;
-    return signature;
+    if (!signature || !this.agentPersona) return;
+    request.body = stripModelSignOff(request.body, this.agentPersona, signature);
+    if (bodyEndsWithSignature(request.body, signature)) return;
+    request.signature = signature;
   }
 
   /**
@@ -2523,7 +3055,15 @@ export class OutboundGateway {
     draftId: string,
     accountId: string | undefined,
     draftMeta: { recipientEmail: string; body: string; subject: string; allRecipients?: string[] },
-    options?: { humanApproved?: boolean; principalDirected?: boolean; conversationId?: string; taskEventId?: string; parentEventId?: string },
+    options?: {
+      humanApproved?: boolean;
+      principalDirected?: boolean;
+      conversationId?: string;
+      taskEventId?: string;
+      parentEventId?: string;
+      /** What to replay on approval if band review holds this draft (#2159). */
+      holdRecipe?: SendRecipe;
+    },
   ): Promise<OutboundSendResult> {
     // ------------------------------------------------------------------
     // Step 0: Autonomy gate
@@ -2705,43 +3245,17 @@ export class OutboundGateway {
         );
       }
 
-      const principalEmailForDraftBlock = this.principalIdentities.find((id) => id.channel === 'email')?.channelIdentifier;
-      if (principalEmailForDraftBlock) {
-        await this.sendNotification(
-          {
-            notificationType: 'blocked_content',
-            ceoEmail: principalEmailForDraftBlock,
-            // Softened from a call-to-action to informational (#1158, matching #1051):
-            // the agent now receives the block reason in the skill result and may
-            // self-correct and resend on its own. This alert is an FYI, not a task.
-            subject: 'FYI — outbound draft blocked',
-            body: [
-              'A draft send was blocked by the content filter.',
-              'The agent received the reason and may rewrite the draft and retry on its own.',
-              '',
-              `Reason: ${reasonSummary}`,
-              `Time: ${blockedEvent.timestamp.toISOString()} (UTC)`,
-              'Channel: email (draft)',
-              ...unmatchedRecipientNotificationLines(recipientEmail, unmatched),
-              '',
-              `Draft ID: ${draftId}`,
-              `Block ID: ${blockId}`,
-              `Audit event ID: ${blockedEvent.id}`,
-              '',
-              'Search the audit log by the audit event ID above for the full record.',
-            ].join('\n'),
-            blockId,
-            originalChannel: 'email',
-            originalRecipientId: recipientEmail,
-          },
-          blockedEvent.id,
-        );
-      } else {
-        this.log.error(
-          { blockId, draftId, recipientId: redactId(recipientEmail) },
-          'outbound-gateway: principal notification skipped for blocked draft — no principal email identity configured',
-        );
-      }
+      // Queued for the principal's digest, not emailed (#2159; informational since #1158).
+      await this.queueBlockReport(
+        [
+          'Email draft send blocked by the content filter. The agent was told why and may rewrite it and retry.',
+          `Reason: ${reasonSummary}`,
+          ...unmatchedRecipientNotificationLines(recipientEmail, unmatched),
+          `Draft ${draftId}; block ${blockId}; audit event ${blockedEvent.id}.`,
+        ].join('\n'),
+        options?.conversationId,
+        blockedEvent.id,
+      );
       // Surface the principal-safe reason summary and rule name(s) to the caller so
       // the agent's tool loop can address the root cause and retry (#1158). reasonSummary
       // obeys buildBlockReasonSummary's per-rule contract — only an LLM-judge finding's
@@ -2755,6 +3269,35 @@ export class OutboundGateway {
         },
         unmatched,
       );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 2.5: Band review (#2159) — as in send(). A stored draft cannot be trimmed, so a
+    // review that would cut statements holds it instead.
+    // ------------------------------------------------------------------
+    // Keyed on principalDirected, not humanApproved: send-draft sets humanApproved on every
+    // call (its task-origin check is its gate), so it does not mean the principal read this
+    // draft. A live principal turn or an explicit approval did; a woken task did not. This
+    // is also when tier gating skips Stage 2.5.
+    let bandReport: BandReviewReport | undefined;
+    let bandSignals: BandReviewSignals | undefined;
+    if (this.gating === 'band' && this.bandReview && !options?.principalDirected && !draftPrincipalSole) {
+      const outcome = await this.runBandReview({
+        request: {
+          channel: 'email',
+          to: recipientEmail,
+          subject: draftMeta.subject,
+          body,
+          ...(draftEnvelope.length > 1 ? { cc: draftEnvelope.filter((r) => r !== recipientEmail) } : {}),
+        },
+        content: body,
+        recipients: draftEnvelope,
+        editable: false,
+        options,
+      });
+      if (outcome.result) return outcome.result;
+      bandReport = outcome.report;
+      bandSignals = outcome.signals;
     }
 
     // ------------------------------------------------------------------
@@ -2801,6 +3344,21 @@ export class OutboundGateway {
       taskEventId: options?.taskEventId,
       parentEventId: options?.parentEventId,
     });
+    // Spot-check pool (#2159 Phase 3). Keyed on principalDirected, not humanApproved, for
+    // the reason given at the band review above: send-draft sets humanApproved on every call.
+    if (options?.principalDirected !== true && !draftPrincipalSole) {
+      await this.recordSentAction({
+        channel: 'email',
+        toolName: 'send-draft',
+        recipientLabel: draftEnvelope.join(', '),
+        preview: draftMeta.subject || body,
+        // A draft's recipient is always an email address, so always a person.
+        recipient: { person: true, contactId: recipientContactIdForDraft, lookupFailed: recipientTierUnresolvedForDraft },
+        band: { report: bandReport, signals: bandSignals },
+        options,
+      });
+    }
+    if (bandReport) await this.publishBandReport(bandReport, options);
 
     return { success: true, messageId: sentMessage.id };
   }

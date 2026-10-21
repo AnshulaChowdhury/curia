@@ -26,6 +26,7 @@ import {
   buildShadowJudgePrompt,
   parseShadowJudgeResult,
   SHADOW_SCRATCH_PREFIX,
+  shadowDraftPath,
   type ShadowJudgePair,
   type ShadowSnapshot,
 } from '../../../_shared/shadow-draft.js';
@@ -52,6 +53,10 @@ export const BACKFILL_BEFORE_KEY = 'sent_observe.backfill_before';
  *  watermark jumps to backfill_target + 1 only once the drain reaches its oldest sub-window, so the
  *  watermark never sits above an un-drained message. */
 export const BACKFILL_TARGET_KEY = 'sent_observe.backfill_target';
+/** When the current run of consecutive watermark holds began (ms epoch), or EPOCH when the last
+ *  run advanced (#2191). The watermark itself can't measure a hold: it stays fixed on idle days
+ *  and for the whole of a backfill drain, by design. */
+export const HELD_SINCE_KEY = 'sent_observe.held_since';
 export const PENDING_DIFFS_PATH = `${VOICE_LEARNING_SCRATCH_PREFIX}/pending-diffs.md`;
 export const PENDING_DIFFS_TYPE = 'voice-pending-diffs';
 
@@ -65,6 +70,20 @@ export const EVIDENCE_RETENTION_DAYS = 90;
 
 /** Idle backoff when a run finds nothing — 2 hours (t2125 pattern). */
 const IDLE_BACKOFF_MS = 2 * 60 * 60 * 1000;
+
+/** Most shadow pairs judged per run. Overflow pairs stay unreconciled and retry next run. */
+export const MAX_JUDGE_PAIRS = 40;
+
+/** Pairs per judge call (#2191). Each chunk is parsed all-or-nothing on its own, so one bad
+ *  response holds back at most this many pairs. A single 40-pair call with a 1500-token cap
+ *  truncated every day from 2026-09-17: the standard-tier model spends output tokens on
+ *  reasoning, the strict parse rejected the cut-off JSON, the watermark held, and the next run
+ *  retried the same oversized batch. Small chunks shrink the retry set as chunks land. */
+export const JUDGE_CHUNK_SIZE = 8;
+
+/** A watermark held longer than this logs at error, not warn (#2191). The cron is daily, so
+ *  this is about three consecutive failed runs. */
+const HELD_WATERMARK_ERROR_DAYS = 3;
 
 /** Safety ceiling on messages scanned per run — a daily Sent volume never reaches
  *  this, but it bounds a runaway mailbox. Truncation is handled by holding the
@@ -120,39 +139,88 @@ function isoToUnixSeconds(iso: string): number | null {
 
 /** Strip a leading Re:/Fwd: and normalize whitespace/case for loose subject comparison. */
 
+/** Latest a send may land after shadow capture and still count as the reply to the punted
+ *  message (#2195). In the #2191 investigation a send 7 days out was a later follow-up. */
+export const SHADOW_SEND_WINDOW_SEC = 72 * 60 * 60;
+
+/** Clock skew tolerated between capture and send, mirroring matchDraftToSent. */
+const SHADOW_SKEW_SEC = 120;
+
 /**
- * Pick the send that corresponds to a shadow draft (#1426). The principal's reply to a punted message
- * near-always shares its thread, and an unmatched shadow is simply retried on later runs (then
- * TTL-swept after 7 idle days), so a simple two-rule match is enough:
- *   (a) exact `id === sourceMessageId` fast path;
- *   (b) otherwise the nearest-in-time same-thread send at/after capture (2-min clock skew,
- *       mirroring matchDraftToSent).
- * Newest-first iteration would otherwise score the shadow against a newer, unrelated same-thread
- * send. Returns null when no eligible send exists (the shadow retries next run).
+ * Pair shadow drafts with the sends that answered them (#1426, #2195). The principal's reply to a
+ * punted message near-always shares its thread, so each shadow takes the nearest same-thread send
+ * at or after capture, within SHADOW_SEND_WINDOW_SEC. A shadow whose capture time can't be parsed
+ * is never paired: the window can't be checked.
+ *
+ * Each send answers at most one shadow, the one captured closest before it. When two shadows on a
+ * thread precede one reply, the earlier one is returned in `superseded` instead of scoring one
+ * decision twice; the caller marks it so it can't pair with a later follow-up either. A shadow
+ * with no send in the window retries on later runs and is TTL-swept after 7 idle days.
+ *
+ * There is no `id === sourceMessageId` match: the source id is an inbound message, never a Sent id.
+ * Returns pairs in `shadows` order.
  */
-function selectShadowSend(
-  shadow: ShadowSnapshot,
+function pairShadowsToSends(
+  shadows: ShadowSnapshot[],
   messages: NylasMessageSummary[],
-): NylasMessageSummary | null {
-  const exact = messages.find((m) => m.id === shadow.sourceMessageId);
-  if (exact) return exact;
-
-  const createdSec = isoToUnixSeconds(shadow.createdAt);
-  const SKEW_SEC = 120;
-
-  // Nearest same-thread send at/after capture (newest when capture time is unparseable).
-  let best: NylasMessageSummary | null = null;
-  let bestDelta = Number.POSITIVE_INFINITY;
-  for (const m of messages) {
-    if (!(shadow.threadId && m.threadId && shadow.threadId === m.threadId)) continue;
-    if (createdSec !== null && m.date + SKEW_SEC < createdSec) continue;
-    const delta = createdSec !== null ? Math.abs(m.date - createdSec) : -m.date;
-    if (delta < bestDelta) {
-      best = m;
-      bestDelta = delta;
+): {
+  pairs: Array<{ shadow: ShadowSnapshot; send: NylasMessageSummary }>;
+  superseded: Array<{ shadow: ShadowSnapshot; by: ShadowSnapshot }>;
+} {
+  const candidates: Array<{ shadow: ShadowSnapshot; send: NylasMessageSummary; createdSec: number }> = [];
+  for (const shadow of shadows) {
+    const createdSec = isoToUnixSeconds(shadow.createdAt);
+    if (createdSec === null || !shadow.threadId) continue;
+    let best: NylasMessageSummary | null = null;
+    for (const m of messages) {
+      if (m.threadId !== shadow.threadId) continue;
+      if (m.date + SHADOW_SKEW_SEC < createdSec) continue;
+      if (m.date > createdSec + SHADOW_SEND_WINDOW_SEC) continue;
+      if (!best || m.date < best.date) best = m;
     }
+    if (best) candidates.push({ shadow, send: best, createdSec });
   }
-  return best;
+
+  // Per send, keep the latest-captured shadow. Ties go to the first in `shadows` order.
+  const winnerBySend = new Map<string, (typeof candidates)[number]>();
+  for (const c of candidates) {
+    const current = winnerBySend.get(c.send.id);
+    if (!current || c.createdSec > current.createdSec) winnerBySend.set(c.send.id, c);
+  }
+  const pairs: Array<{ shadow: ShadowSnapshot; send: NylasMessageSummary }> = [];
+  const superseded: Array<{ shadow: ShadowSnapshot; by: ShadowSnapshot }> = [];
+  for (const c of candidates) {
+    const winner = winnerBySend.get(c.send.id)!;
+    if (winner === c) pairs.push({ shadow: c.shadow, send: c.send });
+    else superseded.push({ shadow: c.shadow, by: winner.shadow });
+  }
+  return { pairs, superseded };
+}
+
+/** Stamp a shadow doc superseded so parseShadowDoc skips it from now on (#2195). Retries a
+ *  version conflict like appendAndTrimDoc; returns false when the doc is gone or every attempt
+ *  lost the race. */
+async function markShadowSuperseded(
+  ctx: ToolContext,
+  shadow: ShadowSnapshot,
+  by: ShadowSnapshot,
+): Promise<boolean> {
+  const repo = ctx.workingDocs!;
+  const path = shadowDraftPath(shadow.sourceMessageId);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const doc = await repo.read(path);
+    if (!doc) return false;
+    const upd = await repo.update(path, {
+      frontmatter: {
+        ...doc.frontmatter,
+        superseded_at: new Date().toISOString(),
+        superseded_by: by.sourceMessageId,
+      },
+      expectedVersion: doc.version,
+    });
+    if (upd.ok) return true;
+  }
+  return false;
 }
 
 async function ensureDoc(
@@ -363,6 +431,16 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
     let draftEvidenceComplete = true;
     let taskCandidates = 0;
     let shadowReconciled = 0;
+    // Shadow pairs held back this run, by cause (#2191). They go into the result and the run log:
+    // for a month, a reconcile that failed every day showed up only as success with
+    // shadow_reconciled 0.
+    let shadowJudgeFailed = 0;
+    let shadowDeferred = 0;
+    let shadowFetchFailed = 0;
+    let shadowRecordFailed = 0;
+    // Shadows left unscored because a later shadow on the thread took their reply (#2195).
+    let shadowSuperseded = 0;
+    let shadowSupersedeFailed = 0;
     let maxDate = watermark;
     // Oldest message actually processed this run. Diagnostics only: it's surfaced as
     // `oldestScannedAt` in the truncation warning so an operator can see where the
@@ -381,11 +459,10 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
     const shadows = shadowDocs
       .map((d) => parseShadowDoc(d))
       .filter((s): s is NonNullable<typeof s> => s !== null);
-    // (shadow, sent) pairs collected during the message loop below, judged in a
-    // single batched LLM call after the loop instead of one call per pair.
+    // (shadow, sent) pairs collected during the message loop below, judged in chunked LLM
+    // calls after the loop instead of one call per pair.
     // Idempotency across runs is the shadow doc's reconciled_at marker (parseShadowDoc returns
-    // null once set); within a run each shadow doc is yielded once by listByPrefix, so no in-run
-    // claim set is needed — two distinct shadows answered by one principal send are both scored.
+    // null once set); within a run pairShadowsToSends gives each send to at most one shadow.
     const judgePairs: ShadowJudgePair[] = [];
 
     // Full sent bodies fetched during the message loop (for draft diffs), keyed by
@@ -449,9 +526,32 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
     // below can hold the watermark too.
     let shadowReconcileOk = true;
     if (ctx.actionLogRepo) {
-      for (const shadow of shadows) {
-        const send = selectShadowSend(shadow, messages);
-        if (!send) continue;
+      const { pairs, superseded } = pairShadowsToSends(shadows, messages);
+
+      // A failed mark logs but does NOT hold the watermark: on a retry the winning shadow is
+      // already reconciled, so the loser would pair with the very send it lost.
+      for (const { shadow, by } of superseded) {
+        if (await markShadowSuperseded(ctx, shadow, by)) {
+          shadowSuperseded += 1;
+        } else {
+          shadowSupersedeFailed += 1;
+          ctx.log.warn(
+            { sourceMessageId: shadow.sourceMessageId, supersededBy: by.sourceMessageId },
+            'sent-observe: could not mark shadow superseded — it may pair with a later send',
+          );
+        }
+      }
+
+      for (const { shadow, send } of pairs) {
+        // Cap pairs BEFORE fetching bodies: past the per-run judge limit a pair would be fetched
+        // only to be dropped, and each fetch is a sequential Nylas call against the tool timeout.
+        // Overflow shadows keep reconciled_at unset; hold the watermark so their sends are
+        // re-observed next run.
+        if (judgePairs.length >= MAX_JUDGE_PAIRS) {
+          shadowDeferred += 1;
+          shadowReconcileOk = false;
+          continue;
+        }
 
         // Finding 7: never judge against a truncated snippet — the LLM would write a false
         // competence score. If the full sent body can't be fetched, don't push the pair and
@@ -469,12 +569,13 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
               { err, messageId: send.id, sourceMessageId: shadow.sourceMessageId },
               'ceo-inbox-sent-observe: getMessage failed for shadow reconcile — not scoring, holding watermark',
             );
+            shadowFetchFailed += 1;
             shadowReconcileOk = false;
             continue;
           }
         }
-        // Don't score inline — collect the pair and judge everything in one batched LLM
-        // call after this loop (see below).
+        // Don't score inline — collect the pair and judge it in the chunked LLM calls after
+        // this loop (see below).
         judgePairs.push({
           sourceMessageId: shadow.sourceMessageId,
           subject: send.subject || shadow.subject,
@@ -482,102 +583,136 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
           sentBody,
         });
       }
-    }
-
-    // Shadow-draft competence reconcile (#1419 / ADR-029): ONE LLM call per run over up to 40
-    // pairs. A failed batch leaves those shadow docs' reconciled_at unset — but the stored
-    // watermark is maxDate+1, so the carrying Sent message is only re-fetched next run if we
-    // HOLD the watermark. shadowReconcileOk tracks that: anything short of a clean, complete
-    // response flips it false and the watermark-advance guard below blocks the advance. Retry is
-    // idempotent because already-reconciled shadows are skipped (parseShadowDoc returns null once
-    // reconciled_at is set) and diff/completion matching is idempotent via the matched/asked sets.
-    if (judgePairs.length > 0 && ctx.infraLlm && ctx.actionLogRepo) {
-      const MAX_JUDGE = 40;
-      const batch = judgePairs.slice(0, MAX_JUDGE);
-      if (judgePairs.length > MAX_JUDGE) {
-        // Overflow pairs stay unreconciled (reconciled_at unset) and retry next run; hold the
-        // watermark so their carrying sends are re-observed.
-        shadowReconcileOk = false;
+      if (shadowDeferred > 0) {
         ctx.log.warn(
-          { total: judgePairs.length, judged: MAX_JUDGE, dropped: judgePairs.length - MAX_JUDGE },
-          'sent-observe: more than 40 shadow pairs — judging the first 40, the rest retry next run',
+          { judged: judgePairs.length, deferred: shadowDeferred, max: MAX_JUDGE_PAIRS },
+          'sent-observe: more shadow pairs than the per-run judge limit — the rest retry next run',
         );
       }
+    }
 
-      const res = await ctx.infraLlm.extract(buildShadowJudgePrompt(batch), { maxTokens: 1500 });
-      const judged = res.ok
-        ? parseShadowJudgeResult(res.text, batch.map((p) => p.sourceMessageId))
-        : null;
+    // Shadow-draft competence reconcile (#1419 / ADR-029): the pairs are judged in chunks of
+    // JUDGE_CHUNK_SIZE, the calls run concurrently to stay inside the tool timeout. A failed chunk
+    // leaves its shadow docs' reconciled_at unset — but the stored watermark is maxDate+1, so the
+    // carrying Sent message is only re-fetched next run if we HOLD the watermark.
+    // shadowReconcileOk tracks that: anything short of a clean, complete response for a chunk
+    // flips it false and the watermark-advance guard below blocks the advance. The chunks that
+    // did land are stamped, so the retry set shrinks run over run instead of repeating the same
+    // failing batch (#2191). Retry is idempotent because already-reconciled shadows are skipped
+    // (parseShadowDoc returns null once reconciled_at is set) and diff/completion matching is
+    // idempotent via the matched/asked sets.
+    if (judgePairs.length > 0 && ctx.infraLlm && ctx.actionLogRepo) {
+      const infraLlm = ctx.infraLlm;
+      const chunks: ShadowJudgePair[][] = [];
+      for (let i = 0; i < judgePairs.length; i += JUDGE_CHUNK_SIZE) {
+        chunks.push(judgePairs.slice(i, i + JUDGE_CHUNK_SIZE));
+      }
 
-      // All-or-nothing: an LLM error, or a malformed / duplicate-id / incomplete response, fails
-      // the WHOLE batch — write no rows, hold the watermark, retry next run.
-      if (judged === null) {
-        shadowReconcileOk = false;
-        ctx.log.warn(
-          { count: batch.length, error: res.ok ? 'malformed-or-incomplete-response' : res.error },
-          'sent-observe: shadow judge failed or returned an unusable response — holding watermark',
-        );
-      } else {
-        // Clean response — per-pair idempotent insert (#1432: migration-074 unique index is the
-        // durable dedup) + reconciled_at mark (the efficiency guard that lets the watermark advance
-        // and skips re-judging next run). A per-pair insert/mark failure holds the watermark for
-        // that pair (it re-judges next run) without discarding the pairs that did land.
-        for (const pair of batch) {
-          const j = judged.get(pair.sourceMessageId)!; // strict parse guarantees exact coverage
-          try {
-            // Idempotent insert (#1432): the migration-074 partial unique index guarantees one
-            // 'shadow_evaluated' row per source_message_id, so a re-run after a failed mark can't
-            // double-score. A null return means the row already exists (recorded on a prior run) —
-            // that's not an error; we still fall through to mark reconciled_at so the re-run
-            // converges. Only a THROW holds the watermark.
-            await ctx.actionLogRepo.insertShadowEvaluated({
-              taskId: ctx.taskEventId ?? `shadow:${j.sourceMessageId}`,
-              conversationId: ctx.conversationId,
-              toolName: 'shadow-draft-eval',
-              actionRisk: 'none',
-              outcome: 'shadow_evaluated',
-              taskSummary: `Shadow vs sent (${j.sourceMessageId}): ${j.reason}`,
-              payload: { shadow: true, source_message_id: j.sourceMessageId, competence_reason: j.reason },
-              competenceFlag: j.sameDecision ? 1 : 0,
-              scoredBy: 'shadow-reconciler',
+      // No maxTokens override: the infraLlm default leaves room for the model's reasoning
+      // tokens, which the old 1500 cap did not (#2191).
+      const verdicts = await Promise.all(
+        chunks.map(async (chunk, chunkIndex) => {
+          const res = await infraLlm.extract(buildShadowJudgePrompt(chunk));
+          const judged = res.ok
+            ? parseShadowJudgeResult(res.text, chunk.map((p) => p.sourceMessageId))
+            : null;
+          return {
+            chunk,
+            chunkIndex,
+            judged,
+            error: res.ok ? 'malformed-or-incomplete-response' : res.error,
+            // Diagnostics for a rejected response without logging its text (the reasons
+            // paraphrase email content): a reply that doesn't end in ']' was cut off, one that
+            // does dropped or rewrote an id.
+            responseChars: res.ok ? res.text.length : null,
+            endsWithBracket: res.ok ? res.text.trimEnd().endsWith(']') : null,
+          };
+        }),
+      );
+
+      for (const { chunk: batch, chunkIndex, judged, error, responseChars, endsWithBracket } of verdicts) {
+        // All-or-nothing per chunk: an LLM error, or a malformed / duplicate-id / incomplete
+        // response, fails that WHOLE chunk — write none of its rows, hold the watermark, retry next
+        // run. Other chunks are unaffected.
+        if (judged === null) {
+          shadowJudgeFailed += batch.length;
+          shadowReconcileOk = false;
+          ctx.log.warn(
+            {
+              chunkIndex,
+              chunkCount: chunks.length,
+              sourceMessageIds: batch.map((p) => p.sourceMessageId),
+              error,
+              responseChars,
+              endsWithBracket,
+            },
+            'sent-observe: shadow judge failed or returned an unusable response — holding watermark',
+          );
+        } else {
+          // Clean response — per-pair idempotent insert (#1432: migration-074 unique index is the
+          // durable dedup) + reconciled_at mark (the efficiency guard that lets the watermark advance
+          // and skips re-judging next run). A per-pair insert/mark failure holds the watermark for
+          // that pair (it re-judges next run) without discarding the pairs that did land.
+          for (const pair of batch) {
+            const j = judged.get(pair.sourceMessageId)!; // strict parse guarantees exact coverage
+            try {
+              // Idempotent insert (#1432): the migration-074 partial unique index guarantees one
+              // 'shadow_evaluated' row per source_message_id, so a re-run after a failed mark can't
+              // double-score. A null return means the row already exists (recorded on a prior run) —
+              // that's not an error; we still fall through to mark reconciled_at so the re-run
+              // converges. Only a THROW holds the watermark.
+              await ctx.actionLogRepo.insertShadowEvaluated({
+                taskId: ctx.taskEventId ?? `shadow:${j.sourceMessageId}`,
+                conversationId: ctx.conversationId,
+                toolName: 'shadow-draft-eval',
+                actionRisk: 'none',
+                outcome: 'shadow_evaluated',
+                taskSummary: `Shadow vs sent (${j.sourceMessageId}): ${j.reason}`,
+                payload: { shadow: true, source_message_id: j.sourceMessageId, competence_reason: j.reason },
+                competenceFlag: j.sameDecision ? 1 : 0,
+                scoredBy: 'shadow-reconciler',
+              });
+            } catch (err) {
+              shadowRecordFailed += 1;
+              shadowReconcileOk = false;
+              ctx.log.error(
+                { err, sourceMessageId: j.sourceMessageId },
+                'sent-observe: shadow competence insert failed — holding watermark',
+              );
+              continue;
+            }
+
+            // Insert succeeded — durably mark the shadow doc reconciled so retry skips it.
+            const path = `${SHADOW_SCRATCH_PREFIX}/${j.sourceMessageId}.md`;
+            const doc = await ctx.workingDocs.read(path);
+            if (!doc) {
+              shadowRecordFailed += 1;
+              shadowReconcileOk = false;
+              ctx.log.warn(
+                { sourceMessageId: j.sourceMessageId },
+                'sent-observe: shadow doc missing at mark time — holding watermark',
+              );
+              continue;
+            }
+            // The autonomy_action_log row inserted above is the authoritative competence signal
+            // for scoring (dedup'd by the #1432 unique index). This frontmatter competence_flag
+            // is informational only — it may reflect a later re-judge that a deduped (ON CONFLICT
+            // DO NOTHING) DB row never recorded, so don't treat it as a source of truth.
+            const upd = await ctx.workingDocs.update(path, {
+              frontmatter: { ...doc.frontmatter, reconciled_at: new Date().toISOString(), competence_flag: j.sameDecision ? 1 : 0 },
+              expectedVersion: doc.version,
             });
-          } catch (err) {
-            shadowReconcileOk = false;
-            ctx.log.error(
-              { err, sourceMessageId: j.sourceMessageId },
-              'sent-observe: shadow competence insert failed — holding watermark',
-            );
-            continue;
+            if (!upd.ok) {
+              shadowRecordFailed += 1;
+              shadowReconcileOk = false;
+              ctx.log.warn(
+                { sourceMessageId: j.sourceMessageId },
+                'sent-observe: shadow doc mark update conflict — holding watermark',
+              );
+              continue;
+            }
+            shadowReconciled += 1;
           }
-
-          // Insert succeeded — durably mark the shadow doc reconciled so retry skips it.
-          const path = `${SHADOW_SCRATCH_PREFIX}/${j.sourceMessageId}.md`;
-          const doc = await ctx.workingDocs.read(path);
-          if (!doc) {
-            shadowReconcileOk = false;
-            ctx.log.warn(
-              { sourceMessageId: j.sourceMessageId },
-              'sent-observe: shadow doc missing at mark time — holding watermark',
-            );
-            continue;
-          }
-          // The autonomy_action_log row inserted above is the authoritative competence signal
-          // for scoring (dedup'd by the #1432 unique index). This frontmatter competence_flag
-          // is informational only — it may reflect a later re-judge that a deduped (ON CONFLICT
-          // DO NOTHING) DB row never recorded, so don't treat it as a source of truth.
-          const upd = await ctx.workingDocs.update(path, {
-            frontmatter: { ...doc.frontmatter, reconciled_at: new Date().toISOString(), competence_flag: j.sameDecision ? 1 : 0 },
-            expectedVersion: doc.version,
-          });
-          if (!upd.ok) {
-            shadowReconcileOk = false;
-            ctx.log.warn(
-              { sourceMessageId: j.sourceMessageId },
-              'sent-observe: shadow doc mark update conflict — holding watermark',
-            );
-            continue;
-          }
-          shadowReconciled += 1;
         }
       }
     }
@@ -714,6 +849,12 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
     let watermarkAdvancedTo: number | null = null;
     // True after this run if a drain is still underway (fed to the caller/logs).
     let backfillStillActive = backfillActive;
+    const heldSinceRaw = await store.get(CONFIG_NAMESPACE, HELD_SINCE_KEY);
+    const heldSinceMs = heldSinceRaw && heldSinceRaw !== EPOCH ? Number(heldSinceRaw) : Number.NaN;
+    if (advanceOk && Number.isFinite(heldSinceMs)) {
+      // A clean run ends the hold. A soft-rejected clear only risks one early escalation later.
+      await store.set(CONFIG_NAMESPACE, HELD_SINCE_KEY, EPOCH);
+    }
     if (advanceOk) {
       if (backfillActive) {
         if (messages.length > 0 && truncated) {
@@ -808,17 +949,31 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
           : !shadowReconcileOk
             ? 'ceo-inbox-sent-observe: shadow reconcile failed — holding watermark for retry'
             : 'ceo-inbox-sent-observe: guard write failed — holding watermark for retry';
-      ctx.log.warn(
-        {
-          path: PENDING_DIFFS_PATH,
-          evidencePersisted,
-          shadowReconcileOk,
-          draftEvidenceComplete,
-          matchedGuardPersisted,
-          askedGuardPersisted,
-        },
-        holdReason,
-      );
+      // One held run is routine (it retries tomorrow); a watermark held for days is a stuck
+      // observer. #2191 sat at warn for a month, so escalate once the hold outlives a few runs.
+      // Measured from the first held run, not from the watermark (see HELD_SINCE_KEY).
+      if (!Number.isFinite(heldSinceMs)) {
+        await store.set(CONFIG_NAMESPACE, HELD_SINCE_KEY, String(nowMs));
+      }
+      const heldDays = Number.isFinite(heldSinceMs) ? (nowMs - heldSinceMs) / 86_400_000 : 0;
+      const holdFields = {
+        path: PENDING_DIFFS_PATH,
+        evidencePersisted,
+        shadowReconcileOk,
+        draftEvidenceComplete,
+        matchedGuardPersisted,
+        askedGuardPersisted,
+        heldDays: Math.round(heldDays),
+        shadowJudgeFailed,
+        shadowDeferred,
+        shadowFetchFailed,
+        shadowRecordFailed,
+      };
+      if (heldDays > HELD_WATERMARK_ERROR_DAYS) {
+        ctx.log.error(holdFields, `${holdReason} (watermark held ${Math.round(heldDays)} days)`);
+      } else {
+        ctx.log.warn(holdFields, holdReason);
+      }
     }
 
     // Truncation is loud until the backlog is drained (#1431). With a real floor it means a drain is
@@ -865,7 +1020,14 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
         draftMatches,
         taskCandidates,
         shadowReconciled,
+        shadowJudgeFailed,
+        shadowDeferred,
+        shadowFetchFailed,
+        shadowRecordFailed,
+        shadowSuperseded,
+        shadowSupersedeFailed,
         watermarkAdvancedTo,
+        watermarkHeld: messages.length > 0 && !advanceOk,
         backfillStillActive,
       },
       'ceo-inbox-sent-observe: run complete',
@@ -878,7 +1040,17 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
         draft_matches: draftMatches,
         task_candidates: taskCandidates,
         shadow_reconciled: shadowReconciled,
+        // Shadow pairs held back this run, by cause (#2191); each retries next run.
+        shadow_judge_failed: shadowJudgeFailed,
+        shadow_deferred: shadowDeferred,
+        shadow_fetch_failed: shadowFetchFailed,
+        shadow_record_failed: shadowRecordFailed,
+        // Shadows a later shadow on the same thread superseded (#2195); never scored.
+        shadow_superseded: shadowSuperseded,
+        shadow_supersede_failed: shadowSupersedeFailed,
         watermark_advanced_to: watermarkAdvancedTo,
+        // True when this run saw mail but kept the watermark so it re-observes it next run.
+        watermark_held: messages.length > 0 && !advanceOk,
         backfill_active: backfillStillActive,
         // True when the open-task set exceeded the pagination safety ceiling, so task-completion
         // matching this run considered only a partial set (#1433).

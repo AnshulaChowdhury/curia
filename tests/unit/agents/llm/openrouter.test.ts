@@ -5,10 +5,12 @@
 // vi.mock to stub the SDK, and createSilentLogger for silent logging.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { OpenRouterProvider, usageFromOpenRouter } from '../../../../src/agents/llm/openrouter.js';
+import { mergeReasoningDetailDeltas, OpenRouterProvider, upstreamProviderFrom, usageFromOpenRouter } from '../../../../src/agents/llm/openrouter.js';
+import { buildAssistantToolUseMessage, buildUserToolResultMessage } from '../../../../src/agents/llm/tool-loop-messages.js';
+import { buildLlmArchiveResponse } from '../../../../src/audit/llm-archive-response.js';
 import { ModelRegistry } from '../../../../src/agents/llm/model-registry.js';
 import { createSilentLogger } from '../../../../src/logger.js';
-import type { LLMStreamEvent } from '../../../../src/agents/llm/provider.js';
+import type { LLMResponse, LLMStreamEvent, Message } from '../../../../src/agents/llm/provider.js';
 
 // vi.mock is hoisted above variable declarations, so mockCreate must be
 // declared with vi.hoisted() to be available inside the mock factory.
@@ -93,7 +95,6 @@ describe('OpenRouterProvider', () => {
       outputTokens: 5,
       cacheCreationInputTokens: 0,
       cacheReadInputTokens: 0,
-      reasoningTokens: 0,
     });
 
     // Provenance
@@ -499,7 +500,6 @@ describe('usageFromOpenRouter', () => {
       outputTokens: 60,
       cacheCreationInputTokens: 0,
       cacheReadInputTokens: 10318,
-      reasoningTokens: 0,
     });
   });
 
@@ -519,7 +519,6 @@ describe('usageFromOpenRouter', () => {
       outputTokens: 5,
       cacheCreationInputTokens: 0,
       cacheReadInputTokens: 0,
-      reasoningTokens: 0,
     });
   });
 
@@ -535,13 +534,22 @@ describe('usageFromOpenRouter', () => {
     expect(usage.cacheCreationInputTokens).toBe(8);
   });
 
+  it('leaves reasoningTokens unset when the response reports no count, and keeps a reported zero', () => {
+    expect(usageFromOpenRouter({ prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 })).not.toHaveProperty('reasoningTokens');
+    expect(usageFromOpenRouter({
+      prompt_tokens: 3,
+      completion_tokens: 1,
+      total_tokens: 4,
+      completion_tokens_details: { reasoning_tokens: 0 },
+    }).reasoningTokens).toBe(0);
+  });
+
   it('returns zeros for missing usage', () => {
     expect(usageFromOpenRouter(undefined)).toEqual({
       inputTokens: 0,
       outputTokens: 0,
       cacheCreationInputTokens: 0,
       cacheReadInputTokens: 0,
-      reasoningTokens: 0,
     });
   });
 
@@ -635,7 +643,6 @@ describe('OpenRouterProvider — cache usage', () => {
       outputTokens: 40,
       cacheCreationInputTokens: 600,
       cacheReadInputTokens: 4000,
-      reasoningTokens: 0,
     });
   });
 });
@@ -685,7 +692,7 @@ describe('OpenRouterProvider — stream', () => {
       {
         type: 'message_end',
         content: 'hello',
-        usage: { inputTokens: 12, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, reasoningTokens: 0 },
+        usage: { inputTokens: 12, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
         provenance: { requestedModel: 'openai/gpt-4o', actualModel: 'openai/gpt-4o', providerRequestId: 'chatcmpl-stream-123' },
       },
     ]);
@@ -753,7 +760,7 @@ describe('OpenRouterProvider — stream', () => {
       type: 'tool_use',
       toolCalls: [{ id: 'call_1', name: 'search', input: { query: 'curia' } }],
       content: 'Checking. ',
-      usage: { inputTokens: 22, outputTokens: 8, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, reasoningTokens: 0 },
+      usage: { inputTokens: 22, outputTokens: 8, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
       provenance: { requestedModel: 'openai/gpt-4o', actualModel: 'openai/gpt-4o', providerRequestId: 'chatcmpl-stream-tool' },
     });
   });
@@ -1125,7 +1132,16 @@ describe('OpenRouterProvider — reasoning (#2042)', () => {
       for (const result of [chat, streamed]) {
         expect(result).toMatchObject({ reasoningOmitted: 'encrypted', usage: { reasoningTokens: 8 } });
         expect(result && 'reasoning' in result ? result.reasoning : undefined).toBeUndefined();
-        expect(JSON.stringify(result)).not.toContain('CIPHERTEXT-DO-NOT-STORE');
+        // The ciphertext rides on reasoningBlocks for pass-back to the same
+        // model (ADR-048 §1); what the archive stores never contains it.
+        if (result?.type === 'tool_use') {
+          expect(JSON.stringify(result.reasoningBlocks)).toContain('CIPHERTEXT-DO-NOT-STORE');
+        } else {
+          expect(JSON.stringify(result)).not.toContain('CIPHERTEXT-DO-NOT-STORE');
+        }
+        if (result && result.type !== 'error' && result.type !== 'text_delta') {
+          expect(JSON.stringify(buildLlmArchiveResponse(result))).not.toContain('CIPHERTEXT-DO-NOT-STORE');
+        }
       }
     });
 
@@ -1189,5 +1205,248 @@ describe('OpenRouterProvider — reasoning (#2042)', () => {
     expect(omissionWarns).toHaveLength(2);
     expect(omissionWarns[0]?.[0]).toMatchObject({ model: 'deepseek/deepseek-v4-pro-0813', reasoningOmitted: 'empty' });
     expect(omissionWarns[1]?.[0]).toMatchObject({ model: 'deepseek/deepseek-v4-pro', reasoningOmitted: 'encrypted' });
+  });
+});
+
+describe('OpenRouterProvider — upstream endpoint (ADR-048 §5)', () => {
+  beforeEach(() => {
+    mockCreate.mockReset();
+  });
+
+  it('reads the provider field defensively', () => {
+    expect(upstreamProviderFrom({ provider: 'CoreWeave' })).toBe('CoreWeave');
+    expect(upstreamProviderFrom({ provider: '' })).toBeUndefined();
+    expect(upstreamProviderFrom({ provider: 7 })).toBeUndefined();
+    expect(upstreamProviderFrom({})).toBeUndefined();
+  });
+
+  it('carries the response provider on chat() provenance', async () => {
+    mockCreate.mockResolvedValue({ ...makeTextResponse(), provider: 'DeepSeek' });
+    const provider = new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    const result = await provider.chat({ messages: [{ role: 'user', content: 'Hi' }], model: 'google/gemini-2.0-flash-001' });
+    expect(result.type === 'text' && result.provenance.upstreamProvider).toBe('DeepSeek');
+  });
+
+  it('omits upstreamProvider when the response has none', async () => {
+    mockCreate.mockResolvedValue(makeTextResponse());
+    const provider = new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    const result = await provider.chat({ messages: [{ role: 'user', content: 'Hi' }], model: 'google/gemini-2.0-flash-001' });
+    expect(result.type === 'text' && 'upstreamProvider' in result.provenance).toBe(false);
+  });
+
+  it('carries the provider from stream chunks', async () => {
+    mockCreate.mockResolvedValue(makeStream([
+      {
+        id: 'gen-1',
+        model: 'deepseek/deepseek-v4.1-flash',
+        provider: 'CoreWeave',
+        choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: 'stop', logprobs: null }],
+        usage: null,
+        object: 'chat.completion.chunk',
+        created: 1700000000,
+      },
+      {
+        id: 'gen-1',
+        model: 'deepseek/deepseek-v4.1-flash',
+        choices: [],
+        usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+        object: 'chat.completion.chunk',
+        created: 1700000000,
+      },
+    ]));
+    const provider = new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    const events = await collectStream(provider.stream({
+      messages: [{ role: 'user', content: 'Hi' }],
+      model: 'deepseek/deepseek-v4.1-flash',
+    }));
+    const end = events.at(-1);
+    expect(end?.type === 'message_end' && end.provenance.upstreamProvider).toBe('CoreWeave');
+  });
+});
+
+describe('OpenRouterProvider — reasoning pass-back (ADR-048 §1)', () => {
+  beforeEach(() => {
+    mockCreate.mockReset();
+  });
+
+  const MODEL = 'deepseek/deepseek-v4.1-flash';
+  const tools = [{ name: 'lookup', description: 'Look up', input_schema: { type: 'object' as const, properties: {} } }];
+  // What a non-streamed response carries: one text entry with a signature, one encrypted entry.
+  const details = [
+    { type: 'reasoning.text', text: 'Check the calendar first.', signature: 'sig-1', id: 'r1', format: 'unknown', index: 0 },
+    { type: 'reasoning.encrypted', data: 'ENCRYPTED', id: 'r2', format: 'unknown', index: 1 },
+  ];
+
+  function toolCallResponse(extra: Record<string, unknown>) {
+    return {
+      id: 'gen-1',
+      model: MODEL,
+      choices: [{
+        index: 0,
+        finish_reason: 'tool_calls' as const,
+        message: {
+          role: 'assistant' as const,
+          content: null,
+          refusal: null,
+          tool_calls: [{ id: 'call_1', type: 'function' as const, function: { name: 'lookup', arguments: '{}' } }],
+          ...extra,
+        },
+        logprobs: null,
+      }],
+      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+      object: 'chat.completion' as const,
+      created: 1700000000,
+    };
+  }
+
+  function nextMessages(result: LLMResponse): Message[] {
+    if (result.type !== 'tool_use') throw new Error(`expected tool_use, got ${result.type}`);
+    return [
+      { role: 'user', content: 'Plan my day' },
+      buildAssistantToolUseMessage(result.toolCalls, result.content, result.reasoningBlocks),
+      buildUserToolResultMessage([{ id: 'call_1', content: 'result' }]),
+    ];
+  }
+
+  function sentAssistant(callIndex: number): Record<string, unknown> {
+    const params = mockCreate.mock.calls[callIndex]![0] as { messages: Array<Record<string, unknown>> };
+    return params.messages.find((m) => m.role === 'assistant')!;
+  }
+
+  it('sends reasoning_details back unmodified on the next request', async () => {
+    const provider = new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    mockCreate.mockResolvedValueOnce(toolCallResponse({ reasoning: 'Check the calendar first.', reasoning_details: details }));
+    const first = await provider.chat({ messages: [{ role: 'user', content: 'Plan my day' }], tools, model: MODEL });
+
+    mockCreate.mockResolvedValueOnce(makeTextResponse());
+    await provider.chat({ messages: nextMessages(first), tools, model: MODEL });
+    const assistant = sentAssistant(1);
+    expect(assistant.reasoning_details).toEqual(details);
+    expect(assistant).not.toHaveProperty('reasoning');
+    expect(assistant.tool_calls).toHaveLength(1);
+  });
+
+  it('falls back to the bare reasoning string when no details came', async () => {
+    const provider = new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    mockCreate.mockResolvedValueOnce(toolCallResponse({ reasoning: 'Only a string.' }));
+    const first = await provider.chat({ messages: [{ role: 'user', content: 'Plan my day' }], tools, model: MODEL });
+
+    mockCreate.mockResolvedValueOnce(makeTextResponse());
+    await provider.chat({ messages: nextMessages(first), tools, model: MODEL });
+    expect(sentAssistant(1).reasoning).toBe('Only a string.');
+    expect(sentAssistant(1)).not.toHaveProperty('reasoning_details');
+  });
+
+  it('sends nothing extra when the turn carried no reasoning', async () => {
+    const provider = new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    mockCreate.mockResolvedValueOnce(toolCallResponse({}));
+    const first = await provider.chat({ messages: [{ role: 'user', content: 'Plan my day' }], tools, model: MODEL });
+    expect(first.type === 'tool_use' && first.reasoningBlocks).toBeUndefined();
+
+    mockCreate.mockResolvedValueOnce(makeTextResponse());
+    await provider.chat({ messages: nextMessages(first), tools, model: MODEL });
+    expect(sentAssistant(1)).not.toHaveProperty('reasoning_details');
+    expect(sentAssistant(1)).not.toHaveProperty('reasoning');
+  });
+
+  it('drops reasoning written by another model', async () => {
+    const provider = new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    mockCreate.mockResolvedValueOnce(toolCallResponse({ reasoning_details: details }));
+    const first = await provider.chat({ messages: [{ role: 'user', content: 'Plan my day' }], tools, model: MODEL });
+
+    mockCreate.mockResolvedValueOnce(makeTextResponse());
+    await provider.chat({ messages: nextMessages(first), tools, model: 'openai/gpt-4o' });
+    expect(sentAssistant(1)).not.toHaveProperty('reasoning_details');
+  });
+
+  it('rebuilds streamed reasoning_details into the non-streamed shape', async () => {
+    const chunk = (delta: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+      id: 'gen-2',
+      model: MODEL,
+      choices: [{ index: 0, delta, finish_reason: null, logprobs: null }],
+      usage: null,
+      object: 'chat.completion.chunk',
+      created: 1700000000,
+      ...extra,
+    });
+    mockCreate.mockResolvedValueOnce(makeStream([
+      chunk({ reasoning_details: [{ type: 'reasoning.text', text: 'Check the ', id: 'r1', format: 'unknown', index: 0, signature: null }] }),
+      chunk({ reasoning_details: [{ type: 'reasoning.text', text: 'calendar first.', index: 0, format: 'unknown', signature: null }] }),
+      chunk({ reasoning_details: [{ type: 'reasoning.text', text: '', index: 0, signature: 'sig-1' }] }),
+      chunk({ reasoning_details: [{ type: 'reasoning.encrypted', data: 'ENCRY', id: 'r2', format: 'unknown', index: 1 }] }),
+      chunk({ reasoning_details: [{ type: 'reasoning.encrypted', data: 'PTED', index: 1 }] }),
+      chunk({ tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'lookup', arguments: '{}' } }] }),
+      { id: 'gen-2', model: MODEL, choices: [], usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 }, object: 'chat.completion.chunk', created: 1700000000 },
+    ]));
+    const provider = new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    const events = await collectStream(provider.stream({ messages: [{ role: 'user', content: 'Plan my day' }], tools, model: MODEL }));
+    const toolUse = events.at(-1);
+    expect(toolUse?.type).toBe('tool_use');
+    if (toolUse?.type !== 'tool_use') return;
+    expect(toolUse.reasoningBlocks).toEqual([{ type: 'reasoning', provider: 'openrouter', model: MODEL, data: { reasoning_details: details } }]);
+  });
+
+  it('merges fragments by id when there is no index, and by type otherwise', () => {
+    const merged: Array<Record<string, unknown>> = [];
+    mergeReasoningDetailDeltas(merged, [{ type: 'reasoning.summary', summary: 'A', id: 's1' }]);
+    mergeReasoningDetailDeltas(merged, [{ type: 'reasoning.summary', summary: 'B', id: 's1' }]);
+    mergeReasoningDetailDeltas(merged, [{ type: 'reasoning.text', text: 'x' }]);
+    mergeReasoningDetailDeltas(merged, [{ type: 'reasoning.text', text: 'y' }]);
+    mergeReasoningDetailDeltas(merged, 'not an array');
+    expect(merged).toEqual([
+      { type: 'reasoning.summary', summary: 'AB', id: 's1' },
+      { type: 'reasoning.text', text: 'xy' },
+    ]);
+  });
+});
+
+describe('OpenRouterProvider — reasoning effort (ADR-048 §2)', () => {
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockCreate.mockResolvedValue(makeTextResponse());
+  });
+
+  const provider = (registry = new ModelRegistry(createSilentLogger())) => new OpenRouterProvider('test-key', createSilentLogger(), registry);
+  const sent = () => mockCreate.mock.calls[0]![0] as Record<string, unknown>;
+
+  it('sends no reasoning key when unset', async () => {
+    const result = await provider().chat({ model: 'deepseek/deepseek-v4.1-flash', messages: [{ role: 'user', content: 'Hi' }] });
+    expect(sent()).not.toHaveProperty('reasoning');
+    expect(result.type === 'text' && 'reasoningEffort' in result.provenance).toBe(false);
+  });
+
+  it('sends reasoning.effort for an effort the model lists, and records it', async () => {
+    const result = await provider().chat({ model: 'deepseek/deepseek-v4.1-flash', messages: [{ role: 'user', content: 'Hi' }], options: { reasoning: { effort: 'low' } } });
+    expect(sent().reasoning).toEqual({ effort: 'low' });
+    expect(result.type === 'text' && result.provenance.reasoningEffort).toBe('low');
+  });
+
+  it('leaves out an effort the model does not list, so the judges on Gemini are unchanged', async () => {
+    const result = await provider().chat({ model: 'google/gemini-3.1-flash-lite', messages: [{ role: 'user', content: 'Hi' }], options: { reasoning: { effort: 'none' } } });
+    expect(sent()).not.toHaveProperty('reasoning');
+    expect(result.type === 'text' && 'reasoningEffort' in result.provenance).toBe(false);
+  });
+
+  it('sends nothing to a model with no reasoning entry', async () => {
+    await provider().chat({ model: 'openai/gpt-4o', messages: [{ role: 'user', content: 'Hi' }], options: { reasoning: { effort: 'low' } } });
+    expect(sent()).not.toHaveProperty('reasoning');
+  });
+
+  it('maps none to enabled: false where a model lists it', async () => {
+    const registry = new ModelRegistry(createSilentLogger());
+    vi.spyOn(registry, 'honorsReasoningEffort').mockReturnValue(true);
+    await provider(registry).chat({ model: 'deepseek/deepseek-v4.1-flash', messages: [{ role: 'user', content: 'Hi' }], options: { reasoning: { effort: 'none' } } });
+    expect(sent().reasoning).toEqual({ enabled: false });
+  });
+
+  it('sends the effort on streamed requests and records it', async () => {
+    mockCreate.mockResolvedValueOnce(makeStream([
+      { id: 'gen-3', model: 'deepseek/deepseek-v4.1-flash', choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: 'stop', logprobs: null }], usage: null, object: 'chat.completion.chunk', created: 1700000000 },
+      { id: 'gen-3', model: 'deepseek/deepseek-v4.1-flash', choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }, object: 'chat.completion.chunk', created: 1700000000 },
+    ]));
+    const events = await collectStream(provider().stream({ model: 'deepseek/deepseek-v4.1-flash', messages: [{ role: 'user', content: 'Hi' }], options: { reasoning: { effort: 'max' } } }));
+    expect(sent().reasoning).toEqual({ effort: 'max' });
+    const end = events.at(-1);
+    expect(end?.type === 'message_end' && end.provenance.reasoningEffort).toBe('max');
   });
 });

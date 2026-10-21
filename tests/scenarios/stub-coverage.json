@@ -361,6 +361,12 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
     },
+    "no tool booking takes a route": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-17T02:15:48.877Z"
+    },
     "no-reply automated notification": {
       "unstubbed": 0,
       "runs": 5,
@@ -375,9 +381,9 @@
     },
     "non-principal note for principal": {
       "unstubbed": 0,
-      "runs": 5,
+      "runs": 10,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-10T20:12:43.727Z"
+      "recordedAt": "2026-10-17T04:08:14.379Z"
     },
     "paused delegate no redelegate": {
       "unstubbed": 0,
@@ -547,6 +553,48 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
     },
+    "style debrief prompt": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style email reply third party": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style inbox draft keeps principal voice": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style morning brief email": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style scheduled recap signal": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style scheduled request email": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style signal reply brief": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
     "sweep-on-close closing result": {
       "unstubbed": 0,
       "runs": 5,
@@ -582,6 +630,30 @@
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "signin code never leaks": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:40:59.805Z"
+    },
+    "signin email code from inbox": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:39:20.723Z"
+    },
+    "signin session gone": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:41:52.048Z"
+    },
+    "signin sms code over signal": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:37:35.219Z"
     }
   }
 }

@@ -5,6 +5,7 @@ import pino from 'pino';
 import { CeoInboxArchiveHandler } from './handler.js';
 import { ExecutionLayer } from '../../../../src/skills/execution.js';
 import { ToolRegistry } from '../../../../src/skills/registry.js';
+import { sanitizeObjectOutput } from '../../../../src/skills/sanitize.js';
 import type { ToolContext, ToolManifest } from '../../../../src/skills/types.js';
 
 const logger = pino({ level: 'silent' });
@@ -59,6 +60,69 @@ describe('CeoInboxArchiveHandler', () => {
     expect(calls(fetchSpy)).toEqual(['GET /messages/19a2b3c4d5e6f708', 'PUT /messages/19a2b3c4d5e6f708']);
     const putBody = JSON.parse(String((fetchSpy.mock.calls[1]![1] as RequestInit).body));
     expect(putBody).toEqual({ folders: ['Label_3'] });
+  });
+
+  // The spot-check pool (#2159) reads these so a triage sample is gradable; the message is
+  // already fetched, so they cost no extra call.
+  it('returns the subject and sender of the message it archived', async () => {
+    fetchSpy
+      .mockResolvedValueOnce(jsonResponse({
+        id: 'm1', folders: ['INBOX'], subject: 'Statement ready',
+        from: [{ name: 'Billing', email: 'billing@example.com' }],
+      }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'm1', folders: [] }));
+
+    const result = await new CeoInboxArchiveHandler().execute(buildCtx({ message_id: '19a2b3c4d5e6f708' }));
+
+    expect(result).toEqual({
+      success: true,
+      data: { message_id: '19a2b3c4d5e6f708', subject: 'Statement ready', from: 'Billing (billing@example.com)' },
+    });
+  });
+
+  // Every skill result goes through sanitizeObjectOutput, which strips "<...>" as a tag. The
+  // sender is rendered "Name (email)" so the address survives to the agent and the digest.
+  it('reports a sender whose address survives the output sanitizer', async () => {
+    fetchSpy
+      .mockResolvedValueOnce(jsonResponse({
+        id: 'm1', folders: ['INBOX'], subject: 'Statement ready',
+        from: [{ name: 'Billing', email: 'billing@example.com' }],
+      }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'm1', folders: [] }));
+
+    const result = await new CeoInboxArchiveHandler().execute(buildCtx({ message_id: '19a2b3c4d5e6f708' }));
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const sanitized = sanitizeObjectOutput(result.data) as Record<string, unknown>;
+    expect(sanitized['from']).toContain('billing@example.com');
+  });
+
+  // already_archived marks the no-op, so the spot-check pool does not ask the principal to
+  // grade an action that changed nothing (#2159).
+  it('returns the subject and sender, marked already_archived, when the message was already archived', async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({
+      id: 'm1', folders: ['Label_3'], subject: 'Statement ready',
+      from: [{ email: 'billing@example.com' }],
+    }));
+
+    const result = await new CeoInboxArchiveHandler().execute(buildCtx({ message_id: '19a2b3c4d5e6f708' }));
+
+    expect(result).toEqual({
+      success: true,
+      data: { message_id: '19a2b3c4d5e6f708', subject: 'Statement ready', from: 'billing@example.com', already_archived: true },
+    });
+    expect(calls(fetchSpy)).toEqual(['GET /messages/19a2b3c4d5e6f708']);
+  });
+
+  it('omits a subject or sender the message does not have', async () => {
+    fetchSpy
+      .mockResolvedValueOnce(jsonResponse({ id: 'm1', folders: ['INBOX'] }))
+      .mockResolvedValueOnce(jsonResponse({ id: 'm1', folders: [] }));
+
+    const result = await new CeoInboxArchiveHandler().execute(buildCtx({ message_id: '19a2b3c4d5e6f708' }));
+
+    expect(result).toEqual({ success: true, data: { message_id: '19a2b3c4d5e6f708' } });
   });
 
   // The two malformed IDs from the prod audit_log behind #2083.

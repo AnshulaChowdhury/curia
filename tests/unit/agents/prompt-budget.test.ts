@@ -74,14 +74,39 @@ interface AgentBudget {
 // 6,157 → 3,715 chars, ~3,092 tokens always-on.
 // Bullpen split (#2126): the polymorphic bullpen tool became bullpen-post, -reply, -read
 // and -close; 76,983 bytes over 69 local tools.
+// Report queue (#2159): report-to-principal pinned as a tool (the reports bundle stays
+// unpinned; digest jobs activate it): 77,637 bytes over 70 local tools.
+// deliver-approval added to the pinned autonomy bundle (#2159): approvals go out on one
+// channel the coordinator chooses, replacing code fan-out: 78,226 bytes over 71 local tools.
+// #2159 Phase 3 numbering: resolve-learning-digest takes `number` and list-learning-digest returns
+// `n`, so the principal replies "confirm 2" instead of quoting a task id: +119 bytes, 78,345 over 71 local tools.
+// #2159 Phase 3 approval numbers: approve-, deny- and dismiss-action's short_ref takes the
+// approval number ("approve 3"), and list-pending-actions returns `number` and says to pass it:
+// +124 bytes, 78,469 over 71 local tools.
+// #2159 Phase 3 review fix F3: approve-, deny- and dismiss-action say they answer approvals
+// ('Approval N') only, not learning items ('task N'), and resolve-learning-digest's `number` names
+// the 'confirm/undo/dismiss task N' it comes from: +202 bytes, 78,671 over 71 local tools. The
+// budget rises by exactly that delta (78,543 + 202).
+// verification pinned as a tool (#2017): delegated sign-in opens and closes code verifications:
+// 79,530 bytes over 72 local tools, measured after merging #2159's numbering changes.
+// #2201 sign-in follow-ups: secret-capture-request takes login_url, username and details_only,
+// list-user-secrets returns details, verification open returns next_step (the guidance itself
+// rides in the tool results, not the descriptions): +263 bytes, 79,793 over 72 local tools. The
+// budget rises by exactly that delta.
+// archive-extract pinned, and file-parse's description now covers XML, text, Markdown and the
+// filename argument (#2208): +1,831 bytes, 81,624 over 73 local tools. The budget rises by
+// exactly that delta.
 const AGENT_BUDGETS: AgentBudget[] = [
-  { agent: 'coordinator', alwaysOnPromptTokens: 3_200, localToolDefinitionBytes: 77_000, allowMcpPins: false, rosterTokens: 500 },
+  { agent: 'coordinator', alwaysOnPromptTokens: 3_200, localToolDefinitionBytes: 81_624, allowMcpPins: false, rosterTokens: 500 },
   // Specialists, trimmed per ADR-046 in #2025 (baseline log, final phase).
   // calendar: YAML 28,727 → 23,897 chars (~7,187 → ~5,984 tokens always-on); 24,370 bytes over 19 local tools.
   { agent: 'calendar', alwaysOnPromptTokens: 6_200, localToolDefinitionBytes: 25_000, allowMcpPins: false },
   // ceo-inbox: YAML 60,090 → 49,037 chars (~16,416 → ~13,653 tokens always-on with its SKILL.md bodies),
   // its task-wake steps now riding on the wake; 43,469 bytes over 41 local tools.
-  { agent: 'ceo-inbox', alwaysOnPromptTokens: 14_100, localToolDefinitionBytes: 44_800, allowMcpPins: false },
+  // archive-extract plus the longer file-parse description (#2208) is +1,831 bytes, the same
+  // delta as the coordinator. Measured 45,301 bytes over 45 local tools; the prior total sat
+  // under the 44,800 ceiling.
+  { agent: 'ceo-inbox', alwaysOnPromptTokens: 14_100, localToolDefinitionBytes: 45_301, allowMcpPins: false },
   // contacts: YAML 15,595 → 11,423 chars (~4,831 → ~3,788 tokens always-on with its SKILL.md bodies);
   // 35,311 bytes over its local tools.
   { agent: 'contacts', alwaysOnPromptTokens: 3_900, localToolDefinitionBytes: 36_400, allowMcpPins: false },

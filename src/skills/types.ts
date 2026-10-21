@@ -274,6 +274,8 @@ export interface ToolContext {
    *  Provides read/write access to the autonomy_action_log table for approval lifecycle
    *  management. Used by approve-action, deny-action, dismiss-action, list-pending-actions. */
   actionLogRepo?: import('../autonomy/action-log-repo.js').ActionLogRepo;
+  /** Sends one pending approval on one chosen channel (#2159). Declared by deliver-approval. */
+  approvalDelivery?: import('../autonomy/approval-delivery.js').ApprovalDelivery;
   /** Audit log repo — available to skills declaring 'auditLogRepo' in capabilities. */
   auditLogRepo?: import('../audit/audit-log-repo.js').AuditLogRepo;
   /** Diagnostics read repo — available to skills declaring 'diagnosticsRepo' in capabilities.
@@ -331,6 +333,9 @@ export interface ToolContext {
    *  to skills declaring 'userSecretIndex' in capabilities AND on the execution-layer
    *  allowlist (#1497). Backed by SecretsService.listUserNames(), not list(). */
   listUserSecretNames?: () => Promise<string[]>;
+  /** Non-secret sign-in details (login URL, username) per `user.*` key (#2201). Granted with
+   *  listUserSecretNames under the same 'userSecretIndex' capability and allowlist. */
+  listUserSecretDetails?: () => Promise<Map<string, import('../secrets/user-secret-details.js').UserSecretDetails>>;
   /** Operator-facing origin of the console (e.g. "https://curia.example.com"), used by the
    *  capture skills to build the magic-link URL. Undefined in local dev — fall back to
    *  http://localhost:{httpPort}. Sourced from config.appOrigin. */
@@ -351,6 +356,10 @@ export interface ToolContext {
   /** Shared sensitivity classifier — available to skills declaring 'sensitivityClassifier'.
    *  Classifies free text against config sensitivity_rules. */
   sensitivityClassifier?: import('../memory/sensitivity.js').SensitivityClassifier;
+  /** Delegated sign-in verification (#2017) — available to skills declaring 'verification'.
+   *  Use `verification.listActive()` / `verification.close()`, not the raw service's, so the
+   *  code tracker's TTL stays in step with the table. */
+  verification?: import('../verification/index.js').VerificationRuntime;
   /** Where an identifier an agent enters may have come from (#2061, ADR-047): the messages
    *  people sent in this task's conversation and the results of source tools read in it.
    *  Set by the agent runtime and the voice bridge; absent on calls outside a task (approval

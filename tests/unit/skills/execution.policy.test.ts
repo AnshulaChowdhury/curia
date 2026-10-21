@@ -18,6 +18,7 @@ import type { EventBus } from '../../../src/bus/bus.js';
 import type { OutboundGateway } from '../../../src/skills/outbound-gateway.js';
 import type { SchedulerService } from '../../../src/scheduler/scheduler-service.js';
 import type { AutonomyService, AutonomyConfig } from '../../../src/autonomy/autonomy-service.js';
+import { AutonomyService as RealAutonomyService } from '../../../src/autonomy/autonomy-service.js';
 import type { SecretsService } from '../../../src/secrets/secrets-service.js';
 import type { ApprovalTriggerService, ApprovalRequestResult } from '../../../src/autonomy/approval-trigger.js';
 import type { EscalationJudge } from '../../../src/autonomy/escalation-judge.js';
@@ -27,6 +28,9 @@ import type { ContactService } from '../../../src/contacts/contact-service.js';
 import { SensitivityClassifier } from '../../../src/memory/sensitivity.js';
 import { emailAccountIdFromInput, replyToMessageIdFromInput } from '../../../src/channels/email/account-id.js';
 import { UnknownEmailAccountError } from '../../../src/skills/outbound-gateway.js';
+import type { ActionLogRepo } from '../../../src/autonomy/action-log-repo.js';
+import { buildDescription } from '../../../src/autonomy/approval-trigger.js';
+import { registerMcpServerTools, type McpToolSession } from '../../../src/skills/mcp-loader.js';
 
 const logger = pino({ level: 'silent' });
 
@@ -3358,7 +3362,7 @@ describe('approval trigger on gate block', () => {
     const registry = new ToolRegistry();
     registry.register(makeRiskyManifest('send-email', 'medium'), makeHandler('no'));
 
-    const trigger = makeApprovalTrigger({ created: true, shortRef: 'email-1', notificationSent: true });
+    const trigger = makeApprovalTrigger({ created: true, shortRef: 'email-1', approvalNumber: null });
     const mockBus = { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus;
 
     const layer = new ExecutionLayer(registry, logger, {
@@ -3374,15 +3378,34 @@ describe('approval trigger on gate block', () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error).toContain('email-1');
-      expect(result.error).toContain('approval request has been sent');
+      expect(result.error).toContain('deliver-approval');
     }
     expect(trigger.request).toHaveBeenCalledOnce();
+  });
+
+  // #2159 Phase 3: the agent is told the number the principal will answer with.
+  it('Gate B quotes the approval number in the advisory when the approval has one', async () => {
+    const registry = new ToolRegistry();
+    registry.register(makeRiskyManifest('send-email', 'medium'), makeHandler('no'));
+    const layer = new ExecutionLayer(registry, logger, {
+      autonomyService: makeAutonomyService(65),
+      bus: { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus,
+      approvalTrigger: makeApprovalTrigger({ created: true, shortRef: 'a3f7c12b', approvalNumber: 3 }),
+    });
+
+    const result = await layer.invoke('send-email', { to: 'a@b.com' }, undefined, { taskEventId: 'task-1' });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain('approval 3');
+      expect(result.error).toContain('ref: a3f7c12b');
+    }
   });
 
   it('shows the approver the resolved recipient of a send by reference, and stores the reference (#2033)', async () => {
     const registry = new ToolRegistry();
     registry.register(makeRiskyManifest('email-send', 'medium'), makeHandler('no'));
-    const trigger = makeApprovalTrigger({ created: true, shortRef: 'email-2', notificationSent: true });
+    const trigger = makeApprovalTrigger({ created: true, shortRef: 'email-2', approvalNumber: null });
     const ref = '44444444-4444-4444-8444-444444444444';
     const opsRef = '77777777-7777-4777-8777-777777777777';
     const entry = (id: string, displayName: string, address: string) => ({
@@ -3424,7 +3447,7 @@ describe('approval trigger on gate block', () => {
       registry.register(makeRiskyManifest('signal-send', 'medium'), handler);
       registry.register(makeRiskyManifest('sms-send', 'medium'), handler);
       registry.register(makeRiskyManifest('slack-send', 'medium'), handler);
-      const trigger = makeApprovalTrigger({ created: true, shortRef: 'x', notificationSent: true });
+      const trigger = makeApprovalTrigger({ created: true, shortRef: 'x', approvalNumber: null });
       const layer = new ExecutionLayer(registry, logger, {
         autonomyService: makeAutonomyService(65), // Gate B would file an approval
         bus: { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus,
@@ -3517,7 +3540,7 @@ describe('approval trigger on gate block', () => {
       const registry = new ToolRegistry();
       // medium (not the manifest's real low) so Gate B holds it at score 65.
       registry.register(makeRiskyManifest('email-draft-save', 'medium'), makeHandler('should not run'));
-      const trigger = makeApprovalTrigger({ created: true, shortRef: 'x', notificationSent: true });
+      const trigger = makeApprovalTrigger({ created: true, shortRef: 'x', approvalNumber: null });
       const layer = new ExecutionLayer(registry, logger, {
         autonomyService: makeAutonomyService(65),
         bus: { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus,
@@ -3605,7 +3628,7 @@ describe('approval trigger on gate block', () => {
     const handler = makeHandler('should not run');
     registry.register(makeRiskyManifest('calendar-respond-to-invite', 'medium'), handler);
 
-    const trigger = makeApprovalTrigger({ created: true, shortRef: 'rsvp-1', notificationSent: true });
+    const trigger = makeApprovalTrigger({ created: true, shortRef: 'rsvp-1', approvalNumber: null });
     const mockBus = { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus;
 
     const layer = new ExecutionLayer(registry, logger, {
@@ -3622,7 +3645,7 @@ describe('approval trigger on gate block', () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error).toContain('rsvp-1');
-      expect(result.error).toContain('approval request has been sent');
+      expect(result.error).toContain('deliver-approval');
     }
     expect(handler.execute).not.toHaveBeenCalled();
     expect(trigger.request).toHaveBeenCalledWith(expect.objectContaining({
@@ -3638,7 +3661,7 @@ describe('approval trigger on gate block', () => {
     const registry = new ToolRegistry();
     registry.register(makeRiskyManifest('store-fact', 'low'), makeHandler('no'));
 
-    const trigger = makeApprovalTrigger({ created: true, shortRef: 'mem-1', notificationSent: true });
+    const trigger = makeApprovalTrigger({ created: true, shortRef: 'mem-1', approvalNumber: null });
     const mockBus = { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus;
 
     const layer = new ExecutionLayer(registry, logger, {
@@ -3654,7 +3677,7 @@ describe('approval trigger on gate block', () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error).toContain('mem-1');
-      expect(result.error).toContain('approval request has been sent');
+      expect(result.error).toContain('deliver-approval');
     }
     expect(trigger.request).toHaveBeenCalledOnce();
   });
@@ -3683,11 +3706,12 @@ describe('approval trigger on gate block', () => {
     }
   });
 
-  it('includes notification failure note when notificationSent is false', async () => {
+  // #2159: the gate creates the row and tells the agent to deliver it on one channel.
+  it('tells the agent to deliver the new approval itself, naming the ref', async () => {
     const registry = new ToolRegistry();
     registry.register(makeRiskyManifest('send-email', 'medium'), makeHandler('no'));
 
-    const trigger = makeApprovalTrigger({ created: true, shortRef: 'email-1', notificationSent: false });
+    const trigger = makeApprovalTrigger({ created: true, shortRef: 'email-1', approvalNumber: null });
     const mockBus = { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus;
 
     const layer = new ExecutionLayer(registry, logger, {
@@ -3702,7 +3726,27 @@ describe('approval trigger on gate block', () => {
 
     expect(result.success).toBe(false);
     if (!result.success) {
-      expect(result.error).toContain('notification could not be delivered');
+      expect(result.error).toContain('ref: email-1');
+      expect(result.error).toContain('deliver-approval');
+      expect(result.error).not.toContain('has been sent to the principal');
+    }
+  });
+
+  it('tells a specialist to hand the approval ref to the coordinator', async () => {
+    const registry = new ToolRegistry();
+    registry.register(makeRiskyManifest('send-email', 'medium'), makeHandler('no'));
+    const layer = new ExecutionLayer(registry, logger, {
+      autonomyService: makeAutonomyService(65),
+      bus: { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus,
+      approvalTrigger: makeApprovalTrigger({ created: true, shortRef: 'cal-9', approvalNumber: null }),
+    });
+
+    const result = await layer.invoke('send-email', {}, undefined, { taskEventId: 'task-1', agentId: 'calendar' });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toMatch(/tell the coordinator/i);
+      expect(result.error).toContain('cal-9');
     }
   });
 
@@ -3734,7 +3778,7 @@ describe('approval trigger on gate block', () => {
     const registry = new ToolRegistry();
     registry.register(makeRiskyManifest('send-email', 'medium'), makeHandler('no'));
 
-    const trigger = makeApprovalTrigger({ created: true, shortRef: 'email-1', notificationSent: true });
+    const trigger = makeApprovalTrigger({ created: true, shortRef: 'email-1', approvalNumber: null });
     const mockBus = { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus;
 
     const layer = new ExecutionLayer(registry, logger, {
@@ -3758,7 +3802,7 @@ describe('approval trigger on gate block', () => {
     const registry = new ToolRegistry();
     registry.register(makeRiskyManifest('store-fact', 'low'), makeHandler('no'));
 
-    const trigger = makeApprovalTrigger({ created: true, shortRef: 'mem-1', notificationSent: true });
+    const trigger = makeApprovalTrigger({ created: true, shortRef: 'mem-1', approvalNumber: null });
     const mockBus = { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus;
 
     const layer = new ExecutionLayer(registry, logger, {
@@ -4490,3 +4534,377 @@ describe('userSecretIndex capability (listUserSecretNames)', () => {
 function makeBus(): EventBus {
   return { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus;
 }
+
+// ---------------------------------------------------------------------------
+// Gate C under band gating (#2159): the score decides; tier only flags an outsider steering.
+// ---------------------------------------------------------------------------
+
+describe('Gate C — band gating (#2159)', () => {
+  function bandOriginator(tier: ContactTier | null, systemRole: TaskOriginator['systemRole'] = null) {
+    return {
+      taskEventId: 'task-1',
+      taskMetadata: {
+        originator: { contactId: 'contact-abc', systemRole, channel: 'email', initiatedAt: new Date().toISOString(), tier },
+      },
+    };
+  }
+
+  function makeBandLayer(score: number, review = vi.fn(), bus = makeBus(), evidence: { unavailable: boolean } = { unavailable: false }) {
+    const registry = new ToolRegistry();
+    const sendEvidence = { collect: vi.fn().mockResolvedValue({ ...evidence, toolResults: [] }) };
+    const classifyAction = vi.fn();
+    const escalationJudge = { isEnabled: () => true, review, classifyAction } as unknown as EscalationJudge;
+    const layer = new ExecutionLayer(registry, logger, {
+      autonomyService: makeAutonomyService(score), bus, escalationJudge, gating: 'band', sendEvidence,
+    });
+    return { registry, layer, bus, classifyAction };
+  }
+
+  function reports(bus: EventBus): Array<{ payload: { source: string; summary: string } }> {
+    return vi.mocked(bus.publish).mock.calls
+      .map(([, e]) => e as unknown as { type: string; payload: { source: string; summary: string } })
+      .filter((e) => e.type === 'principal.report');
+  }
+
+  it('leaves sends to the gateway\'s review at every band: no judge call, no early report', async () => {
+    for (const score of [84, 74]) {
+      const review = vi.fn();
+      const { registry, layer, bus, classifyAction } = makeBandLayer(score, review);
+      registry.register(makeRiskyManifest('email-send', 'medium'), makeHandler({ sent: true }));
+      const result = await layer.invoke('email-send', {}, undefined, bandOriginator('known'));
+      expect(result.success).toBe(true);
+      expect(review).not.toHaveBeenCalled();
+      expect(classifyAction).not.toHaveBeenCalled();
+      expect(reports(bus)).toEqual([]);
+    }
+  });
+
+  it('asks purpose for a calendar write steered by an unknown contact at 84, and holds it', async () => {
+    const review = vi.fn().mockResolvedValue({ ok: true, purpose: 'steered', reason: 'x' });
+    const { registry, layer } = makeBandLayer(84, review);
+    registry.register(makeRiskyManifest('calendar-create-event', 'high'), makeHandler('should not run'));
+    const result = await layer.invoke('calendar-create-event', {}, undefined, bandOriginator('unknown'));
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("needs the principal's approval");
+    expect(review.mock.calls[0]![0].questions).toEqual(['purpose']);
+  });
+
+  it('lets a serving calendar write from a known contact through at 84, and reports it', async () => {
+    const review = vi.fn().mockResolvedValue({ ok: true, purpose: 'serving', reason: 'x' });
+    const { registry, layer, bus } = makeBandLayer(84, review);
+    registry.register(makeRiskyManifest('calendar-create-event', 'high'), makeHandler({ ok: true }));
+    expect((await layer.invoke('calendar-create-event', {}, undefined, bandOriginator('known'))).success).toBe(true);
+    expect(reports(bus).map((r) => r.payload.summary)).toEqual([
+      'Went ahead with calendar-create-event on a request from a known contact without asking first.',
+    ]);
+  });
+
+  it('asks first at 74 when a non-send action speaks for the principal', async () => {
+    const review = vi.fn().mockResolvedValue({ ok: true, purpose: 'serving', speaksAsPrincipal: true, reason: 'commits' });
+    const { registry, layer } = makeBandLayer(74, review);
+    registry.register(makeRiskyManifest('calendar-create-event', 'high'), makeHandler('should not run'));
+    // Score 74 < 80 is below Gate B's high-risk floor, so use a medium-risk calendar action.
+    registry.register(makeRiskyManifest('calendar-respond', 'medium'), makeHandler('should not run'));
+    const result = await layer.invoke('calendar-respond', {}, undefined, bandOriginator('trusted'));
+    expect(result.success).toBe(false);
+    expect(review.mock.calls[0]![0].questions).toEqual(['purpose', 'speaks-as-principal']);
+  });
+
+  it('reviews a scheduler-originated action at 74 too: the band decides, not the originator', async () => {
+    const review = vi.fn().mockResolvedValue({ ok: true, purpose: 'serving', speaksAsPrincipal: true, reason: 'commits' });
+    const { registry, layer } = makeBandLayer(74, review);
+    registry.register(makeRiskyManifest('calendar-respond', 'medium'), makeHandler('should not run'));
+    expect((await layer.invoke('calendar-respond', {}, undefined, bandOriginator(null, 'system'))).success).toBe(false);
+  });
+
+  it('leaves a low-risk internal write by a trusted originator alone below 80', async () => {
+    const review = vi.fn();
+    const { registry, layer } = makeBandLayer(74, review);
+    registry.register(makeRiskyManifest('memory-store', 'low'), makeHandler({ ok: true }));
+    expect((await layer.invoke('memory-store', {}, undefined, bandOriginator('trusted'))).success).toBe(true);
+    expect(review).not.toHaveBeenCalled();
+  });
+
+  it('holds when the judge fails, at 84 as well as 74: purpose is an outsider\'s only check here', async () => {
+    for (const score of [84, 74]) {
+      const { registry, layer } = makeBandLayer(score, vi.fn().mockResolvedValue({ ok: false, failure: 'unreachable' }));
+      registry.register(makeRiskyManifest('calendar-respond', 'medium'), makeHandler('should not run'));
+      expect((await layer.invoke('calendar-respond', {}, undefined, bandOriginator('unknown'))).success).toBe(false);
+    }
+  });
+
+  it('holds when the drafting turn\'s evidence cannot be read, without asking the judge', async () => {
+    const review = vi.fn();
+    const { registry, layer } = makeBandLayer(84, review, makeBus(), { unavailable: true });
+    registry.register(makeRiskyManifest('calendar-respond', 'medium'), makeHandler('should not run'));
+    expect((await layer.invoke('calendar-respond', {}, undefined, bandOriginator('unknown'))).success).toBe(false);
+    expect(review).not.toHaveBeenCalled();
+  });
+
+  it('says "an unknown contact" in the digest', async () => {
+    const review = vi.fn().mockResolvedValue({ ok: true, purpose: 'serving', reason: 'x' });
+    const { registry, layer, bus } = makeBandLayer(84, review);
+    registry.register(makeRiskyManifest('calendar-respond', 'medium'), makeHandler({ ok: true }));
+    await layer.invoke('calendar-respond', {}, undefined, bandOriginator('unknown'));
+    expect(reports(bus)[0]!.payload.summary).toContain('from an unknown contact');
+  });
+
+  it('keeps the KG-write block for unknown senders (#1290)', async () => {
+    const { registry, layer } = makeBandLayer(95);
+    registry.register(makeRiskyManifest('memory-store', 'low'), makeHandler('x'));
+    expect((await layer.invoke('memory-store', {}, undefined, bandOriginator('unknown'))).success).toBe(false);
+  });
+
+  it('keeps failing closed for an external originator with no tier (#1059)', async () => {
+    const { registry, layer } = makeBandLayer(95);
+    registry.register(makeRiskyManifest('email-send', 'medium'), makeHandler('x'));
+    const meta = { taskMetadata: { originator: { contactId: 'c', systemRole: null, channel: 'email', initiatedAt: new Date().toISOString() } } };
+    expect((await layer.invoke('email-send', {}, undefined, meta)).success).toBe(false);
+  });
+
+  it('never calls review under tier gating', async () => {
+    const registry = new ToolRegistry();
+    const review = vi.fn();
+    const classifyAction = vi.fn().mockResolvedValue({ decision: 'allow', actionClass: 'reversible-external', isThirdPartyFacing: false, reason: 'x' });
+    const layer = new ExecutionLayer(registry, logger, {
+      autonomyService: makeAutonomyService(100),
+      escalationJudge: { isEnabled: () => true, review, classifyAction } as unknown as EscalationJudge,
+    });
+    registry.register(makeRiskyManifest('email-send', 'medium'), makeHandler('should not run'));
+    const result = await layer.invoke('email-send', {}, undefined, bandOriginator('unknown'));
+    expect(result.success).toBe(false);
+    expect(review).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spot-check pool (#2159 Phase 3): successful autonomous non-send actions are recorded.
+// ---------------------------------------------------------------------------
+
+describe('spot-check pool — execution layer (#2159 Phase 3)', () => {
+  const agentTurn = {
+    taskEventId: 'task-1',
+    conversationId: 'conv-1',
+    taskMetadata: {
+      originator: { contactId: 'agent-calendar', systemRole: 'agent' as const, channel: 'internal', initiatedAt: new Date().toISOString() },
+    },
+  };
+
+  function makeSampleRepo() {
+    return { insertSampled: vi.fn().mockResolvedValue(1) } as unknown as ActionLogRepo;
+  }
+
+  function makePoolLayer(opts: { score?: number; band?: boolean; review?: ReturnType<typeof vi.fn>; bus?: EventBus; logger?: typeof logger } = {}) {
+    const registry = new ToolRegistry();
+    const actionLogRepo = makeSampleRepo();
+    const bus = opts.bus ?? makeBus();
+    const layer = new ExecutionLayer(registry, opts.logger ?? logger, {
+      autonomyService: makeAutonomyService(opts.score ?? 85),
+      bus,
+      actionLogRepo,
+      ...(opts.band
+        ? {
+          gating: 'band' as const,
+          escalationJudge: { isEnabled: () => true, review: opts.review ?? vi.fn(), classifyAction: vi.fn() } as unknown as EscalationJudge,
+          sendEvidence: { collect: vi.fn().mockResolvedValue({ unavailable: false, toolResults: [] }) },
+        }
+        : {}),
+    });
+    return { registry, layer, actionLogRepo, bus };
+  }
+
+  it('records a successful high-risk action on an agent turn', async () => {
+    const { registry, layer, actionLogRepo } = makePoolLayer();
+    registry.register(makeRiskyManifest('calendar-create-event', 'high'), makeHandler({ ok: true }));
+    const input = { title: 'Board prep with Priya' };
+    const result = await layer.invoke('calendar-create-event', input, undefined, agentTurn);
+    expect(result.success).toBe(true);
+    expect(vi.mocked(actionLogRepo.insertSampled).mock.calls).toEqual([[{
+      taskId: 'task-1',
+      conversationId: 'conv-1',
+      toolName: 'calendar-create-event',
+      actionRisk: 'high',
+      summary: buildDescription('calendar-create-event', input),
+      signals: {},
+      // The repo keeps it when small, so a later spot check can say what the action touched.
+      input,
+    }]]);
+  });
+
+  it('never records a tool loaded from an MCP server, while a native tool at the same risk is recorded', async () => {
+    // An MCP tool inherits its server's action_risk, so a read on a medium-risk server would
+    // otherwise land in the pool as "Run <tool>". Registered through the real MCP loader path.
+    const { registry, layer, actionLogRepo } = makePoolLayer();
+    const session = {
+      serverId: 'docs-server',
+      client: { callTool: vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'doc body' }] }) },
+    };
+    registerMcpServerTools({
+      serverEntry: { name: 'docs-server', transport: 'sse', url: 'https://mcp.example.com', action_risk: 'medium' },
+      session: session as unknown as McpToolSession,
+      tools: [{ name: 'get_doc_content', inputSchema: { type: 'object', properties: {} } }],
+      resolvedFixedInputs: {},
+      registry,
+      logger,
+    });
+    registry.register(makeRiskyManifest('executive-profile-update', 'medium'), makeHandler({ ok: true }));
+
+    expect((await layer.invoke('get_doc_content', {}, undefined, agentTurn)).success).toBe(true);
+    expect(session.client.callTool).toHaveBeenCalled();
+    expect((await layer.invoke('executive-profile-update', { field: 'title' }, undefined, agentTurn)).success).toBe(true);
+    expect(vi.mocked(actionLogRepo.insertSampled).mock.calls.map(([row]) => row.toolName)).toEqual(['executive-profile-update']);
+  });
+
+  it('marks mail triage, which is sampled at low risk', async () => {
+    const { registry, layer, actionLogRepo } = makePoolLayer();
+    registry.register(makeRiskyManifest('ceo-inbox-archive', 'low'), makeHandler({ ok: true }));
+    await layer.invoke('ceo-inbox-archive', { message_id: 'm1' }, undefined, agentTurn);
+    expect(vi.mocked(actionLogRepo.insertSampled).mock.calls[0]![0]).toMatchObject({ toolName: 'ceo-inbox-archive', actionRisk: 'low', signals: { triage: true } });
+  });
+
+  it('names the email a triage tool touched, from the subject and sender in its result', async () => {
+    const { registry, layer, actionLogRepo } = makePoolLayer();
+    registry.register(
+      makeRiskyManifest('ceo-inbox-archive', 'low'),
+      makeHandler({ message_id: 'm1', subject: 'Statement ready', from: 'Billing (billing@example.com)' }),
+    );
+    await layer.invoke('ceo-inbox-archive', { message_id: 'm1' }, undefined, agentTurn);
+    expect(vi.mocked(actionLogRepo.insertSampled).mock.calls[0]![0]).toMatchObject({
+      summary: 'Archive an email: "Statement ready" from Billing (billing@example.com)',
+      email: { subject: 'Statement ready', from: 'Billing (billing@example.com)' },
+    });
+  });
+
+  it('does not record a triage call that changed nothing (already archived)', async () => {
+    const { registry, layer, actionLogRepo } = makePoolLayer();
+    registry.register(
+      makeRiskyManifest('ceo-inbox-archive', 'low'),
+      makeHandler({ message_id: 'm1', subject: 'Statement ready', already_archived: true }),
+    );
+    expect((await layer.invoke('ceo-inbox-archive', { message_id: 'm1' }, undefined, agentTurn)).success).toBe(true);
+    expect(actionLogRepo.insertSampled).not.toHaveBeenCalled();
+  });
+
+  it('keeps the plain triage summary when the result has no subject', async () => {
+    const { registry, layer, actionLogRepo } = makePoolLayer();
+    registry.register(makeRiskyManifest('ceo-inbox-archive', 'low'), makeHandler({ message_id: 'm1' }));
+    await layer.invoke('ceo-inbox-archive', { message_id: 'm1' }, undefined, agentTurn);
+    const recorded = vi.mocked(actionLogRepo.insertSampled).mock.calls[0]![0];
+    expect(recorded.summary).toBe('Archive an email');
+    expect(recorded).not.toHaveProperty('email');
+  });
+
+  it('records nothing for a low-risk write, a failure, an approved re-run, a live principal turn or a send', async () => {
+    const { registry, layer, actionLogRepo } = makePoolLayer();
+    registry.register(makeRiskyManifest('contact-update', 'low'), makeHandler({ ok: true }));
+    registry.register(makeRiskyManifest('calendar-create-event', 'high'), makeHandler({ ok: true }));
+    registry.register(makeRiskyManifest('calendar-delete-event', 'high'), {
+      execute: vi.fn().mockResolvedValue({ success: false, error: 'not found' }),
+    });
+    registry.register(makeRiskyManifest('email-send', 'medium'), makeHandler({ sent: true }));
+
+    expect((await layer.invoke('contact-update', {}, undefined, agentTurn)).success).toBe(true);
+    expect((await layer.invoke('calendar-delete-event', {}, undefined, agentTurn)).success).toBe(false);
+    expect((await layer.invoke('calendar-create-event', {}, undefined, { ...agentTurn, humanApproved: true })).success).toBe(true);
+    expect((await layer.invoke('calendar-create-event', {}, undefined, {
+      taskEventId: 'task-2',
+      liveTurn: true,
+      taskMetadata: {
+        originator: { contactId: 'primary-user', systemRole: 'principal' as const, channel: 'cli', initiatedAt: new Date().toISOString() },
+      },
+    })).success).toBe(true);
+    expect((await layer.invoke('email-send', {}, undefined, agentTurn)).success).toBe(true);
+    expect(actionLogRepo.insertSampled).not.toHaveBeenCalled();
+  });
+
+  it('marks an action band gating let through where the tier would have asked', async () => {
+    // A known contact is below trusted, so band Gate C asks purpose; the judge says serving.
+    const review = vi.fn().mockResolvedValue({ ok: true, purpose: 'serving', reason: 'x' });
+    const { registry, layer, actionLogRepo, bus } = makePoolLayer({ band: true, score: 85, review });
+    registry.register(makeRiskyManifest('executive-profile-update', 'medium'), makeHandler({ ok: true }));
+    const result = await layer.invoke('executive-profile-update', { field: 'title' }, undefined, {
+      taskEventId: 'task-1',
+      taskMetadata: {
+        originator: { contactId: 'contact-sam', systemRole: null, channel: 'email', initiatedAt: new Date().toISOString(), tier: 'known' as const },
+      },
+    });
+    expect(result.success).toBe(true);
+    // The digest item and the pool signal come from the same decision.
+    const sources = vi.mocked(bus.publish).mock.calls.map(([, e]) => (e as unknown as { payload: { source?: string } }).payload.source);
+    expect(sources).toContain('gate_proceeded');
+    expect(vi.mocked(actionLogRepo.insertSampled).mock.calls[0]![0]).toMatchObject({
+      toolName: 'executive-profile-update', signals: { gateProceeded: true },
+    });
+  });
+
+  it('warns once, at construction, when no actionLogRepo is wired', async () => {
+    const warn = vi.fn();
+    const spyLogger = {
+      ...logger,
+      warn,
+      child: () => ({ warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() }),
+    } as unknown as typeof logger;
+    const registry = new ToolRegistry();
+    const layer = new ExecutionLayer(registry, spyLogger, { autonomyService: makeAutonomyService(85), bus: makeBus() });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![1]).toContain('spot-check pool disabled: no actionLogRepo');
+    // Not per call: a sampled action on an unwired layer adds nothing.
+    registry.register(makeRiskyManifest('calendar-create-event', 'high'), makeHandler({ ok: true }));
+    expect((await layer.invoke('calendar-create-event', {}, undefined, agentTurn)).success).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    const wiredWarn = vi.fn();
+    new ExecutionLayer(new ToolRegistry(), { ...spyLogger, warn: wiredWarn } as unknown as typeof logger, { actionLogRepo: makeSampleRepo() });
+    expect(wiredWarn).not.toHaveBeenCalled();
+  });
+
+  it('still returns the tool result when deciding whether to sample throws', async () => {
+    // isSampledTool → minScoreForActionRisk throws on a risk label it does not know. The
+    // action has already run by then, so a throw must not turn its success into a failure.
+    const error = vi.fn();
+    const spyLogger = {
+      ...logger,
+      child: () => ({ warn: vi.fn(), info: vi.fn(), error, debug: vi.fn() }),
+    } as unknown as typeof logger;
+    const { registry, layer, actionLogRepo } = makePoolLayer({ logger: spyLogger });
+    let ran = false;
+    registry.register(makeRiskyManifest('calendar-create-event', 'high'), {
+      execute: vi.fn(async (): Promise<ToolResult> => { ran = true; return { success: true, data: { ok: true } }; }),
+    });
+    const original = RealAutonomyService.minScoreForActionRisk.bind(RealAutonomyService);
+    // Real behaviour for the gates before the handler; throw only once the action has run.
+    const spy = vi.spyOn(RealAutonomyService, 'minScoreForActionRisk').mockImplementation((risk) => {
+      if (ran) throw new Error('Unknown action_risk label: "bogus"');
+      return original(risk);
+    });
+    try {
+      const result = await layer.invoke('calendar-create-event', {}, undefined, agentTurn);
+      expect(result).toEqual({ success: true, data: { ok: true } });
+      expect(actionLogRepo.insertSampled).not.toHaveBeenCalled();
+      expect(error).toHaveBeenCalledWith(
+        expect.objectContaining({ toolName: 'calendar-create-event' }),
+        expect.stringContaining('spot checks'),
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('still returns the tool result, and logs an error with context, when the pool row cannot be written', async () => {
+    const error = vi.fn();
+    const spyLogger = {
+      ...logger,
+      child: () => ({ warn: vi.fn(), info: vi.fn(), error, debug: vi.fn() }),
+    } as unknown as typeof logger;
+    const { registry, layer, actionLogRepo } = makePoolLayer({ logger: spyLogger });
+    // A pg error carries a SQLSTATE code; it is what tells a full disk from a bad column.
+    vi.mocked(actionLogRepo.insertSampled).mockRejectedValue(Object.assign(new Error('db down'), { code: '53100' }));
+    registry.register(makeRiskyManifest('calendar-create-event', 'high'), makeHandler({ ok: true }));
+    const result = await layer.invoke('calendar-create-event', {}, undefined, agentTurn);
+    expect(result).toEqual({ success: true, data: { ok: true } });
+    expect(error).toHaveBeenCalledWith(
+      expect.objectContaining({ toolName: 'calendar-create-event', taskEventId: 'task-1', code: '53100' }),
+      expect.stringContaining('spot checks'),
+    );
+  });
+});

@@ -35,6 +35,7 @@ pnpm scenarios --case "sweep-on-close" --runs 2 --model deepseek/deepseek-v4.1-f
 | Flag | Meaning |
 |---|---|
 | `--model <id>` | Route every agent to this model (registry id). Default: the configured `model_routing`. |
+| `--reasoning-effort <e>` | Reasoning effort for agent turns (ADR-048): `low` sets every tier; `fast=none,standard=low` sets only the tiers named. Boot fails if a tier's model does not list the effort. The run header and results record the arm. |
 | `--case <text>` | Only cases whose name contains this text (case-insensitive). |
 | `--tags a,b` | Only cases with one of these tags. |
 | `--runs <n>` | Runs per case, overriding the case's `runs` and the default of 5. |
@@ -179,6 +180,8 @@ seeded rows, stubs, model calls and spend are found through its own case context
 | Sender contacts | `ContactService.createContact` + `linkIdentity` | Tagged in `notes`, deleted with their KG node after the run. A leftover from a crashed run is only removed if it carries the tag. |
 | Outbound-context entries | `OutboundContextService.register`, backdated to `sent_minutes_ago` | The Dispatcher's `getActive()` returns only this run's entries, each read through the real `getEntry` SQL. Deleted after the run. |
 | Bullpen threads | `BullpenService.openThread` | Runtimes see only this run's threads (the `wrapBullpenService` stack option). Deleted after the run. |
+| Sign-in verifications (#2017) | the verification runtime's `open`, then backdated (and closed, for a non-pending `status`) | The coordinator's "## Sign-in verifications" block, the Dispatcher's code tracking and the ExecutionLayer see only the run's rows (`scopedVerification`, the `wrapVerification` stack option), and only the run's sessions read as alive (`browserSessionAlive`). Cases seeding one site never run at once (one pending row per site). Deleted after the run. |
+| Principal identities (#2017) | `seed.principal_identities`: a verified, active identity for the principal, added only when they have no active one on that channel | Labelled `scenario-fixture (#2017)`; cleanup deletes only the row its run added, and the sweep only labelled rows. Cases adding one on the same channel never run at once. A raw insert, so the principal's identity list in every agent's prompt (read at boot) is unchanged. |
 | The principal backlog (prompt trim PR 7) | `seed.backlog` counts | The Dispatcher's backlog line reads the run's own counts (`scopedPrincipalBacklog`), never the shared tables. A case stubs the list tools to show the items its counts promise. |
 | Scheduler jobs | the `scheduler-list` stub | Never written to the database. Within a run, a later list replays that run's stubbed creates, edits and cancels onto the stub. |
 | The run's conversation | | `working_memory`, `conversation_checkpoints` and `conversation_resolved_entities` rows are deleted. |
@@ -191,7 +194,7 @@ seeded rows, stubs, model calls and spend are found through its own case context
 
 **Interrupted runs.** Every fixture carries a marker: contacts a `notes` tag, their KG
 nodes `source = 'scenario-test'` (the suite mints each fixture's node itself, so a contact
-never adopts a real node), entries a `scenario-origin-` conversation id (or, registered
+never adopts a real node), entries and verifications a `scenario-origin-` conversation id (or, registered
 during a run, the run's or a specialist's), threads a `scenario:` `source_message_id`,
 specialist conversations a `scenario-delegate-` id, and delegation claims those
 conversations. On Ctrl-C/SIGTERM, and at every start-up, the CLI sweeps anything carrying
@@ -307,6 +310,7 @@ timeout_seconds: 300                      # optional
 known_failure: { issue: "#1234", reason: … }   # optional; reported, not gated
 stub_sets: [human-channels]               # optional; `defaults` always applies
 live_search: true                         # optional; web-search runs for real (Tavily credits)
+identity: style-brief-dry                 # optional; run-level office identity, see Style cases
 seed:
   contacts:                               # → {{contact:<key>}}
     - key: sam
@@ -335,6 +339,18 @@ seed:
       participants: [research-analyst, coordinator]
       content: Opening message.
       mentions: []
+  verifications:                          # → {{verification:<key>}} (the row's id), #2017
+    - key: otp
+      site: example-insurer.ca            # the site the principal asked about
+      page_domain: login.example-insurer.ca   # the page showing the challenge
+      delivery: sms                       # email | sms | app
+      browser_session_id: s-1             # the session the case stubs web-browser on
+      task: 7a3c9e21-…                    # optional; a fixed UUID the task stubs match
+      status: pending                     # optional; pending | expired | satisfied | abandoned
+      requested_minutes_ago: 3            # optional; default 1 if pending, else 15
+      session_alive: true                 # optional; default: alive while pending
+  principal_identities:                   # optional; for an inbound as the principal on a channel
+    - { channel: signal, identifier: "+15555550142" }   # the database's principal may lack (#2017)
   backlog:                                # optional; what the backlog line reports on a principal turn
     pending_approvals: 1                  #   decay_warnings, pending_approvals, principal_tasks;
     decay_warnings: 0                     #   absent counts are 0, and one must be positive
@@ -371,6 +387,7 @@ expected_behaviors:
       max: 1                              #     | reply_excludes_internal_names: true
       success: true                       #     | briefed: <agent> + brief_contains: [..]
       returns: { outbound_entry: { status: released } }   # | any_of: [checks]
+                                          #     | text: reply | {tool, arg} + max_words / excludes
 failure_modes:
   - Replies "Done!" without delegating
 ```
@@ -388,6 +405,11 @@ can read another agent's (`agent: calendar`) or every agent's (`agent: any`). `b
 <agent>` passes when a real run of that specialist received a brief containing every string
 in `brief_contains`: the brief after the delegate handler's additions, such as the
 `Message ID:` and `Account:` lines (#1909) or a resume's rebuilt brief.
+
+`text` (#2143) limits what the agent wrote: `text: reply` reads its reply, `text: { tool:
+signal-send, arg: message }` reads that argument of every call it made to the tool, and
+each one must pass. `max_words` caps the word count; `excludes` lists case-insensitive
+regexes none may match. Silence, or no call to read, is a miss.
 
 `{{principal_contact_id}}` resolves too. A placeholder that names nothing the case seeds is
 a load error.
@@ -470,6 +492,34 @@ pnpm scenarios --tags specialist-calendar --runs 5 --coverage /tmp/ab.json --mod
 
 Pass a scratch `--coverage` for A/B runs, so only a clean run of the branch writes the
 committed record.
+
+## Style cases
+
+The seven style cases, 40a–40g (#2143, tag `style`), measure how Curia writes: length,
+filler and register, under a brief, dry office identity. Run them as a group:
+
+```bash
+pnpm scenarios --tags style --model deepseek/deepseek-v4.1-flash
+```
+
+A case's `identity: <name>` names a fixture in `identities/`: everything in the office
+identity but the assistant (tone, standing preferences, constraints), and
+a `judge_brief` the judge sees as "The office's configured style". The stack lays the
+fixture over the database's identity in memory: every agent's block still comes from the
+real renderer, and nothing is written to the identity history.
+
+One stack serves a whole run, so a run has one identity. A case with a fixture runs only
+in a selection of fixture cases alone, and all of them must name the same fixture:
+- it is never in the release gate (the loader requires `release_gate: false`), and an
+  unfiltered run leaves it out even with `--on-demand`;
+- a wider selection that also picks ordinary cases (`--tags ceo-inbox`,
+  `--tags specialist-ceo-inbox`) leaves it out and says so.
+
+Length and filler are scored in code (`text` checks), register and kept content by the
+judge. Only content is `critical`: brevity must never drop a fact. 40a needs a principal
+with a Signal identity in the database the run uses. The design, and the baseline the
+later tone & style PRs compare against, are in
+[docs/wip/2026-10-15-tone-and-style-design.md](../../docs/wip/2026-10-15-tone-and-style-design.md#measurement).
 
 ## A deployment's own agents
 

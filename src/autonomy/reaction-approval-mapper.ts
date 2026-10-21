@@ -21,7 +21,7 @@ import type { ContactService } from '../contacts/contact-service.js';
 import type { ChannelIdentity } from '../contacts/types.js';
 import { isPrincipalIdentity } from '../contacts/principal-recipient.js';
 import type { ActionLogRepo } from './action-log-repo.js';
-import type { ActionLogRow } from './action-log-types.js';
+import { RESOLVED_BY, type ActionLogRow } from './action-log-types.js';
 import type { ExecutionLayer } from '../skills/execution.js';
 import {
   DEFAULT_REACTION_INTENTS,
@@ -29,8 +29,56 @@ import {
   type ReactionIntentConfig,
 } from './reaction-intent.js';
 
-/** Matches `Reference: <8-hex>` from approval notification bodies. */
-const REFERENCE_RE = /\bReference:\s*([0-9a-f]{8})\b/i;
+/**
+ * The fingerprint of an approval notification (buildApprovalNotificationBody): the identifier
+ * line, `Approval <n>` for numbered approvals (#2159 Phase 3) or `Reference: <8-hex>` for ones
+ * raised before migration 098, directly followed by its `Expires: <ISO-8601>` line. Group 1 is
+ * the short_ref, group 2 the number, group 3 the expiry exactly as rendered.
+ *
+ * Deliberately strict: case-sensitive, whole lines, single spaces, and the Expires line
+ * required. An ordinary message that merely mentions an approval ("Sent you approval 3", a
+ * spot-check line ending "for approval", "the approval 2-day window") must never bind, or a
+ * principal 👍 meant as an acknowledgement would approve something they were not shown. The
+ * format is a contract with approval-notification.ts, which says so where it renders it.
+ *
+ * Global (`g`) for matchAll, which works on a copy and never touches this regex's lastIndex.
+ *
+ * @internal exported so a test can pin it against buildApprovalNotificationBody's output.
+ */
+export const APPROVAL_FINGERPRINT_RE =
+  /^(?:Reference: ([0-9a-f]{8})|Approval (\d{1,3}))\nExpires: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)$/gm;
+
+/**
+ * Loose look-alike of the fingerprint's identifier line: any line STARTING with `Approval <digit>` or
+ * `Reference: <8-hex>`. Used only to decide how loudly to log a message that did not bind (never to
+ * bind). On its own it is ordinary coordinator prose ("Approval 3: email Dana") and logs at debug.
+ */
+const APPROVAL_LOOKALIKE_RE = /^(?:Approval \d|Reference: [0-9a-f]{8})/m;
+
+/**
+ * A look-alike identifier line with an `Expires:` line DIRECTLY under it: shaped like a
+ * notification's fingerprint, so a message matching this but not the strict regex is a near-miss.
+ * Adjacency matters: a debrief listing pending approvals has both kinds of line, but with other
+ * lines between them, and that is ordinary prose.
+ */
+const NEAR_MISS_RE = /^(?:Approval \d|Reference: [0-9a-f]{8})[^\n]*\nExpires:/m;
+
+/**
+ * The approval a delivered body identifies, taken from the LAST fingerprint. The detail block
+ * (message bodies, subjects, descriptions) holds agent and third-party text and sits above the
+ * real fingerprint, which only the fixed call to action follows. A body that forges a
+ * fingerprint for another approval must not redirect this notification's binding to it.
+ */
+function lastApprovalIdentifier(
+  content: string,
+): ({ shortRef: string } | { approvalNumber: number }) & { expires: string } | null {
+  let last: RegExpExecArray | null = null;
+  for (const match of content.matchAll(APPROVAL_FINGERPRINT_RE)) last = match;
+  if (!last || !last[3]) return null;
+  const expires = last[3];
+  if (last[1]) return { shortRef: last[1], expires };
+  return last[2] ? { approvalNumber: Number(last[2]), expires } : null;
+}
 
 export const UNRECOGNIZED_REACTION_HINT =
   "That reaction isn't recognized for approvals. React 👍 to approve or 👎 to reject.";
@@ -73,7 +121,7 @@ export class ReactionApprovalMapper {
     });
 
     // Secondary binding path: when an outbound approval message is delivered
-    // with a body that embeds `Reference: <short_ref>`, bind its provider
+    // with a body that embeds `Approval <n>` or `Reference: <short_ref>`, bind its provider
     // message id so a later reaction can correlate without channel branching.
     this.bus.subscribe('outbound.delivered', 'dispatch', async (event) => {
       await this.handleDelivered(event as OutboundDeliveredEvent);
@@ -141,25 +189,89 @@ export class ReactionApprovalMapper {
 
   /** @internal exported for tests */
   async handleDelivered(event: OutboundDeliveredEvent): Promise<void> {
-    const { channel, messageId, content } = event.payload;
+    const { channel, messageId, content, recipientId } = event.payload;
     if (!messageId || !content) return;
 
-    const match = REFERENCE_RE.exec(content);
-    if (!match?.[1]) return;
+    // Approvals are delivered only to the principal's own identities. A notification-shaped
+    // message sent anywhere else (a group, a third party) is not one the principal answers by
+    // reaction, so it never binds.
+    if (!isPrincipalIdentity(channel, recipientId, this.principalIdentities)) {
+      if (APPROVAL_LOOKALIKE_RE.test(content)) {
+        this.log.debug(
+          { channel, messageId },
+          'reaction-approval: approval-shaped message delivered to a recipient that is not a principal identity — not binding',
+        );
+      }
+      return;
+    }
 
-    const shortRef = match[1]!.toLowerCase();
-    const row = await this.actionLogRepo.findPendingByShortRef(shortRef);
-    if (!row) return;
+    const identifier = lastApprovalIdentifier(content);
+    if (!identifier) {
+      // Real notifications always carry the strict fingerprint. A near-miss (an identifier-like
+      // line with an Expires line directly under it, yet no strict match) means the renderer and
+      // this regex drifted apart (reactions silently stop working) or someone is imitating a
+      // notification: warn. A look-alike line otherwise is ordinary coordinator prose
+      // ("Approval 3: email Dana", or a debrief listing approvals and their expiries): debug.
+      if (APPROVAL_LOOKALIKE_RE.test(content)) {
+        if (NEAR_MISS_RE.test(content)) {
+          this.log.warn(
+            { channel, messageId },
+            'reaction-approval: near-miss approval notification to the principal fails the strict fingerprint — not binding',
+          );
+        } else {
+          this.log.debug(
+            { channel, messageId },
+            'reaction-approval: approval mentioned without a notification fingerprint — not binding',
+          );
+        }
+      }
+      return;
+    }
 
     try {
+      // A number resolves only among live approvals of the last 7 days, where it is unique.
+      const row = 'approvalNumber' in identifier
+        ? await this.actionLogRepo.findPendingByApprovalNumber(identifier.approvalNumber)
+        : await this.actionLogRepo.findPendingByShortRef(identifier.shortRef);
+      if (!row) {
+        // Normal for a notification about an approval that was resolved or expired before delivery.
+        this.log.debug(
+          { ...identifier, channel, messageId },
+          'reaction-approval: no live approval matches the delivered fingerprint — not binding',
+        );
+        return;
+      }
+
+      // The fingerprint must carry THIS approval's own expiry, exactly as the notification renders
+      // it (approval-delivery passes row.expiresAt to buildApprovalNotificationBody, which prints
+      // toISOString()). Numbers are small and reused, so "Approval 1" with any well-formed Expires
+      // line would otherwise bind whichever live approval holds 1 today: forged or echoed text
+      // sent to the principal could then turn a habitual 👍 into approving something they never
+      // saw. A row with no expiry cannot be matched and never binds.
+      if (row.expiresAt?.toISOString() !== identifier.expires) {
+        this.log.warn(
+          {
+            ...identifier,
+            rowExpiresAt: row.expiresAt?.toISOString() ?? null,
+            actionLogId: row.id,
+            channel,
+            messageId,
+          },
+          'reaction-approval: fingerprint expiry does not match the live approval — not binding',
+        );
+        return;
+      }
+
       await this.actionLogRepo.bindDeliveryMessage(row.id, channel, messageId);
       this.log.info(
-        { actionLogId: row.id, shortRef, channel, messageId },
+        { actionLogId: row.id, shortRef: row.shortRef, approvalNumber: row.approvalNumber, channel, messageId },
         'reaction-approval: bound delivered message to pending approval',
       );
     } catch (err) {
+      // A failed lookup or bind leaves the message unbound: a reaction on it is then ignored,
+      // and the principal can still answer by reply.
       this.log.warn(
-        { err, actionLogId: row.id, channel, messageId },
+        { err, ...identifier, channel, messageId },
         'reaction-approval: failed to bind delivered message',
       );
     }
@@ -245,7 +357,7 @@ export class ReactionApprovalMapper {
       }
     }
 
-    const transitioned = await this.actionLogRepo.resolveRow(row.id, 'approved', 'ceo');
+    const transitioned = await this.actionLogRepo.resolveRow(row.id, 'approved', RESOLVED_BY.principal);
     if (!transitioned) {
       this.log.warn(
         { rowId: row.id, shortRef: row.shortRef },
@@ -298,7 +410,7 @@ export class ReactionApprovalMapper {
     channelId: string,
     parentEventId: string,
   ): Promise<void> {
-    const transitioned = await this.actionLogRepo.resolveRow(row.id, 'denied', 'ceo');
+    const transitioned = await this.actionLogRepo.resolveRow(row.id, 'denied', RESOLVED_BY.principal);
     if (!transitioned) {
       this.log.warn(
         { rowId: row.id, shortRef: row.shortRef },

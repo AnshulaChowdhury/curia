@@ -43,7 +43,7 @@ import { loadConfig } from '../../src/config.js';
 import { BullpenDispatcher } from '../../src/dispatch/bullpen-dispatcher.js';
 import { Dispatcher } from '../../src/dispatch/dispatcher.js';
 import { formatTaskWakeContent } from '../../src/scheduler/wake-disposition.js';
-import { createTestModeStack, type TestModeStack } from '../../src/startup/test-mode-stack.js';
+import { createTestModeStack, type OfficeIdentityFixture, type TestModeStack, type TierReasoningOverride } from '../../src/startup/test-mode-stack.js';
 import {
   closeAttempt,
   createCaseContext,
@@ -74,9 +74,11 @@ import {
   createOutboundContextService,
   deletePendingDelegations,
   resolveSender,
+  scopedBrowserSessionAlive,
   scopedBullpen,
   scopedOutboundContext,
   scopedPrincipalBacklog,
+  scopedVerification,
   SeedScope,
   describeError,
   seedRun,
@@ -234,7 +236,13 @@ export interface StackSources {
   mcpSnapshotDirs?: string[];
 }
 
-export async function createScenarioHarness(options: { model?: string } & StackSources = {}): Promise<ScenarioHarness> {
+/**
+ * `officeIdentity`: the run's identity fixture (#2143). One stack serves every case in a
+ * run, so the identity is the run's, never a case's.
+ */
+export async function createScenarioHarness(
+  options: { model?: string; reasoning?: TierReasoningOverride; officeIdentity?: OfficeIdentityFixture } & StackSources = {},
+): Promise<ScenarioHarness> {
   const context = createCaseContext<ScenarioRunState>();
   const currentScope = (): SeedScope | undefined => context.current()?.scope;
   const config = loadConfig();
@@ -262,10 +270,12 @@ export async function createScenarioHarness(options: { model?: string } & StackS
   const stack = await createTestModeStack({
     config: { ...config, databaseUrl: withApplicationName(config.databaseUrl) },
     model: options.model,
+    ...(options.reasoning ? { reasoning: options.reasoning } : {}),
     ...(options.agentsDir ? { agentsDir: options.agentsDir } : {}),
     ...(options.skillsDir ? { skillsDir: options.skillsDir } : {}),
     ...(options.configDir ? { configDir: options.configDir } : {}),
     ...(options.mcpSnapshotDirs ? { mcpSnapshotDirs: options.mcpSnapshotDirs } : {}),
+    ...(options.officeIdentity ? { officeIdentity: options.officeIdentity } : {}),
     wrapExecutionLayer: (layer) => controller.wrap(layer),
     wrapBullpenService: (bullpen) => scopedBullpen(bullpen, currentScope),
     // Times each model call against its run, and refuses a cancelled run's calls.
@@ -275,6 +285,11 @@ export async function createScenarioHarness(options: { model?: string } & StackS
     // For real delegation (#2027): delegate links and settles the run's own entries, and
     // its dispatch claims are production's. Both only ever see this suite's rows.
     wrapOutboundContext: (service) => scopedOutboundContext(service, currentScope),
+    // Sign-in verifications (#2017): the block, the code tracking and the ExecutionLayer
+    // see only the run's seeded rows, and the run's seeded sessions read as alive (there
+    // is no browser; web-browser is stubbed).
+    wrapVerification: (runtime) => scopedVerification(runtime, currentScope),
+    browserSessionAlive: scopedBrowserSessionAlive(currentScope),
     delegationClaims: true,
     observeBus: (bus) => {
       delegationCapture = createDelegationCapture(
@@ -304,7 +319,8 @@ export async function createScenarioHarness(options: { model?: string } & StackS
   const outboundContext = createOutboundContextService(stack);
 
   // Production's Dispatcher, given an outbound-context service so it injects the
-  // block — narrowed to the run's own entries — and the run's own backlog counts.
+  // block — narrowed to the run's own entries — the run's own backlog counts, and the
+  // run's own verifications, so a principal's relayed code is tracked as in production.
   new Dispatcher({
     bus,
     logger,
@@ -312,6 +328,7 @@ export async function createScenarioHarness(options: { model?: string } & StackS
     channelPolicies: undefined,
     outboundContextService: scopedOutboundContext(outboundContext, currentScope),
     principalBacklog: scopedPrincipalBacklog(currentScope),
+    verification: stack.verification,
   }).register();
   // Bullpen mentions reach the coordinator the way they do in production.
   new BullpenDispatcher(bus, logger, stack.bullpenService, stack.agentRegistry).register();

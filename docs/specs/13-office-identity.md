@@ -17,7 +17,11 @@ The key principle:
 
 > **Character is a property of the office, not of each agent.**
 
-Specialist agents do not have personalities. They have task-specific posture. Only the Coordinator expresses the office identity outward.
+The office has one voice, and every agent that writes outward uses it (#2143). The
+coordinator gets the identity block as who it is; every other agent gets the same contract
+in writes-as mode (see [Specialists](#specialists)), because its own YAML already says what
+it is. Until #2143, specialist agents had no identity block at all, and messages they wrote
+to the principal or to third parties carried no tone, length or standing preferences.
 
 ---
 
@@ -63,14 +67,16 @@ below.
 |-------|------|---------|
 | `assistant.name` | string | External-facing name used in all outbound communication |
 | `assistant.title` | string | Role title used in email signatures and introductions |
-| `assistant.email_signature` | multiline string | Full email sign-off block. The outbound gateway adds it below every email it sends or drafts, except system notifications and mail from the principal's own mailbox; empty means name and title (prompt trim PR 6) |
-| `tone.baseline` | string[] (1–3 items) | Tone descriptors chosen from the predefined set; compiled to "Your tone is X, Y, and Z." Stored as a string array, validated at the application layer — not a DB enum, so the set can be extended without a migration |
-| `tone.verbosity` | integer 0–100 | 0 = tersest, 100 = most thorough; `compileSystemPromptBlock()` translates to prose guidance |
-| `tone.directness` | integer 0–100 | 0 = most hedged, 100 = most direct; compiled to prose guidance |
-| `behavioral_preferences` | string[] | Ordered list of behavioral rules compiled into system prompt |
-| `decision_style.external_actions` | enum | Risk posture for actions that affect the outside world |
-| `decision_style.internal_analysis` | enum | Risk posture for internal analysis and synthesis |
+| `assistant.email_signature` | multiline string | Full email sign-off block. The outbound gateway adds it below every email it sends or drafts, except system notifications and mail from the principal's own mailbox; empty means name and title (prompt trim PR 6). A sign-off the model wrote at the end of the body (lines naming only the assistant's name, title or signature lines) is dropped first, so the signature appears once (#2138) |
+| `tone.style` | string (1–800 chars) | How the assistant sounds, in the operator's words, usually started from a console template that ends in an example line (`Sounds like: "…"`). Rendered verbatim (#2143) |
+| `tone.verbosity` | integer 0–100 | The Detail slider. 0 = tersest, 100 = most thorough; `compileSystemPromptBlock()` translates it to length guidance |
+| `behavioral_preferences` | string[] | Ordered list of standing preferences compiled into the system prompt |
 | `constraints` | string[] | Hard rules placed before all other identity content; cannot be overridden |
+
+**Removed in #2143:** `tone.baseline` (1–3 tone words), `tone.directness` and
+`decision_style`. Tone words gave the model nothing to imitate; directness became the
+written style plus a fixed honesty line; decision style duplicated the autonomy level
+(spec 14), which owns act-vs-ask. `PUT /api/identity` rejects all three by name.
 
 ---
 
@@ -99,6 +105,14 @@ CREATE TABLE office_identity_current (
 );
 ```
 
+**Legacy rows.** Rows written before #2143 still hold the removed fields. Every read of a
+stored config (load, reload, `history()`, the audit diff) goes through
+`normalizeIdentity()` (`src/identity/normalize.ts`): a row with no `tone.style` gets one
+built from its tone words and directness ("Candid, warm and direct. State positions
+plainly; avoid softening language."), or the default style when it had no words, and the
+legacy keys are always dropped. Nothing is written back; the next save persists the new
+shape.
+
 **Load precedence at startup:**
 
 1. If `office_identity_current` exists → load from DB.
@@ -125,36 +139,12 @@ interface OfficeIdentity {
     emailSignature: string;
   };
   tone: {
-    // 1–3 words from BASELINE_TONE_OPTIONS. Validated at the application layer.
-    // Not a DB enum — extend BASELINE_TONE_OPTIONS without a migration.
-    baseline: string[];
+    style: string;       // 1–800 chars, the operator's words; rendered verbatim
     verbosity: number;   // 0–100; 0 = tersest, 100 = most thorough
-    directness: number;  // 0–100; 0 = most hedged, 100 = most direct
   };
   behavioralPreferences: string[];
-  decisionStyle: {
-    externalActions: 'conservative' | 'balanced' | 'proactive';
-    internalAnalysis: 'conservative' | 'balanced' | 'proactive';
-  };
   constraints: string[];
 }
-
-// Predefined set for tone.baseline. Validated at the application layer.
-// To add a new word: extend this constant and bump the app — no migration needed.
-const BASELINE_TONE_OPTIONS = [
-  // Warmth / Relationship
-  'warm', 'friendly', 'approachable', 'personable', 'empathetic',
-  'encouraging', 'gracious', 'caring',
-  // Efficiency / Edge
-  'direct', 'blunt', 'candid', 'frank', 'matter-of-fact', 'no-nonsense',
-  // Energy / Register
-  'energetic', 'calm', 'composed', 'enthusiastic', 'steady', 'measured',
-  // Personality / Color
-  'playful', 'witty', 'dry', 'charming', 'diplomatic', 'tactful',
-  'thoughtful', 'curious',
-  // Authority / Gravitas
-  'confident', 'assured', 'polished', 'authoritative', 'professional',
-] as const;
 
 interface OfficeIdentityVersion {
   id: number;
@@ -190,47 +180,114 @@ This method produces the block injected into the coordinator's system prompt on 
 
 1. Hard constraints (from `constraints[]`) — labeled clearly, placed first
 2. Identity header (name, title)
-3. Tone guidance (baseline + verbosity + directness)
-4. Decision style guidance
-5. Behavioral preferences (ordered list)
+3. **How you sound:** the operator's `tone.style`, then a fixed register line ("Match the
+   register of any example lines above, not their content."), which stops the model
+   reusing a template's example sentence word for word
+4. **Length:** the Detail band's limit per channel (below), an exception for content that
+   needs the space, and a fixed content line: "Say what is there, not what isn't, and don't
+   explain your own next steps or repeat your instructions." (#2143)
+5. A fixed honesty line: "Whatever your tone, say plainly when you are unsure or don't know
+   something." Code-owned, so no style text can talk the model out of calibrated
+   uncertainty
+6. Standing preferences (ordered list)
 
-`tone.verbosity` and `tone.directness` are scalar integers. The compiler maps them to prose guidance using approximate bands — these are guidelines, not hard cutoffs:
+There is no decision posture: the autonomy level (spec 14) owns act-vs-ask.
 
-| Score | Verbosity guidance | Directness guidance |
-|-------|--------------------|---------------------|
-| 0–25 | Keep responses as brief as possible; omit context unless asked | Be measured; acknowledge uncertainty with appropriate qualification |
-| 26–50 | Default to concise responses; expand when detail is clearly needed | Lean toward directness but hedge where genuinely uncertain |
-| 51–75 | Adapt response length to what the situation calls for | Be direct; minimize unnecessary hedging and qualification |
-| 76–100 | Default to thorough explanations; err toward more context | State positions plainly; avoid softening language |
+Tone data that cannot be rendered (a non-string or empty style, or a verbosity outside
+0–100; stored rows are not re-validated on read) is logged at error, and sections 3 and 4
+are left out. Everything else still renders: throwing would drop the whole block,
+hard constraints included.
 
-`tone.baseline` maps to a short prose descriptor: `direct` → "clear and efficient", `balanced` → "professional but warm", `warm` → "friendly and relationship-forward".
+`tone.verbosity` (the Detail slider) maps to a limit per channel. One table in
+`src/identity/length.ts` serves the block, the per-turn reminder below, and the console's
+Detail preview (`GET /api/identity` returns it as `lengthLimits`):
 
-Example output (default config — baseline: `["warm", "direct"]`, verbosity: `50`, directness: `75`):
+| Band (verbosity) | Signal, SMS and Slack | Email | Voice calls |
+|---|---|---|---|
+| Brief (0–25) | 1–2 sentences. The answer or outcome only. | Under ~80 words. No warm-up line, no closing summary. | One sentence. |
+| Concise (26–50) | 1–3 sentences. | Under ~150 words. | 1–2 sentences. |
+| Adaptive (51–75) | Short paragraphs, as the situation needs. | Under ~250 words. | 2–3 sentences. |
+| Thorough (76–100) | Thorough; context included. | Thorough; context included. | A few sentences, then offer more. |
+
+Every band ends with "Go longer only when you are asked for detail or the content itself
+needs the space (six meetings are six lines).", so brevity never drops required content.
+
+**Per-turn reminder.** The runtime closes a reply turn's guidance with the reply channel's
+limit ("This reply goes out on Signal: 1–2 sentences. The answer or outcome only."), the
+most salient position available, in the user message so the cached system prefix is not
+split. The channel-to-row map is explicit: a channel with no row (console chat, `cli`,
+internal and scheduler turns) gets no reminder, never a guessed limit. A scheduled run's
+reply goes nowhere, so its delivery guidance carries the content rule instead.
+
+**Markers.** The block's fixed lines (register, honesty, length exception, content line)
+and every reminder are prompt-exfiltration marker sources (`TRIGGER_GUIDANCE_MARKER_SOURCES`).
+The operator's `tone.style` is not: it holds example lines Curia is meant to imitate.
+
+Example output (default config — the "Warm & personable" template, verbosity `50`):
 
 ```
 ## Identity & Communication Contract
 
 **Hard constraints (non-negotiable):**
-- Never impersonate the CEO
+- Never impersonate the principal
 - Always identify as an AI assistant when asked directly
 
 **Who you are:**
-You are Alex Curia, Executive Assistant to the CEO.
+You are Alex Curia, Digital EA.
 
-**Communication style:**
-Your tone is warm and direct.
-Adapt response length to what the situation calls for.
-Be direct; minimize unnecessary hedging and qualification.
+**How you sound:**
+Warm and personable, but brief. Friendly in a few words, never gushing; the point comes first.
+Sounds like: "All set: Thursday's call is now at 3. Enjoy the long weekend."
+Match the register of any example lines above, not their content.
 
-**Decision posture:**
-For external actions, be conservative — verify before acting.
-For internal analysis, be proactive — surface insights without being asked.
+**Length (Detail: Concise):**
+- Signal, SMS and Slack: 1–3 sentences.
+- Email: Under ~150 words.
+- Voice calls: 1–2 sentences.
+Go longer only when you are asked for detail or the content itself needs the space (six meetings are six lines).
+Say what is there, not what isn't, and don't explain your own next steps or repeat your instructions.
+Whatever your tone, say plainly when you are unsure or don't know something.
 
-**Behavioral preferences:**
+**Standing preferences:**
 - Be concise unless detail is explicitly requested
 - Prioritize signal over noise — surface only what's actionable or strategic
 - Escalate ambiguity before taking external action
 ```
+
+---
+
+## Specialists
+
+Every agent other than the coordinator gets `compileWritesAsBlock()`: the same block, with
+section 2 replaced by:
+
+```
+**Who you write as:**
+Anything you write for the principal or for anyone outside the office goes out from
+<name>, <title>, and follows the contract below.
+Anything written in the principal's own name (drafts, posts, essays) follows the
+principal's voice, not this contract.
+Results you return to the coordinator or another agent are not covered; include
+everything they need.
+```
+
+- **No opt-in flag.** Core and deployment agents can't be told apart at runtime (a
+  deployment's image copies its agents into the same directory), and no agent needs to
+  opt out yet. The two scoping sentences do the flag's job:
+  - **Writing as the principal.** ceo-inbox drafts in the principal's voice from
+    `executive-profile-get`; so do a deployment's essay or social-media agents. They keep
+    that voice. Scenario 40e guards it.
+  - **Reporting to the coordinator.** A result a specialist returns is not shortened by a
+    length limit meant for the principal.
+- **Standing preferences are included on purpose:** a rule about what a recap contains
+  binds whichever agent writes the recap.
+- **A separate method, not a parameter,** so a stub that only knows the coordinator block
+  fails to compile instead of quietly serving it to specialists.
+- **No per-turn length reminder** reaches a specialist: delegated, bullpen and scheduled
+  tasks arrive on channels with no length row.
+- **The voice runtime** keeps the coordinator block.
+- **The prompt budget** counts only YAML prompts and SKILL.md bodies, so the block, about
+  400 tokens for the default identity, is not budgeted.
 
 ---
 
@@ -261,16 +318,16 @@ system_prompt: |
 
 The `behavioralPreferences` array is populated through three paths:
 
-1. **Form wizard at `/setup`** — step 5 ("Posture") includes a free-form
+1. **Form wizard at `/setup`** — step 5 ("Autonomy & preferences") includes a free-form
    textarea. Submitting step 6 calls `PUT /api/identity` with the wizard's
    compiled identity payload, including any new preferences **appended** to
    the existing array. See [spec 18 — Onboarding](18-onboarding.md#layer-2--form-wizard-at-setup).
 
-2. **Console Settings → Posture** (`/settings/posture`, #1376) — post-setup
-   editor that replaces the full `behavioralPreferences` list (and
-   `decisionStyle`) via `PUT /api/identity` with `changedBy: 'api'`. Persona
-   fields are preserved via read-modify-write so Assistant and Posture pages
-   do not clobber each other.
+2. **Console Settings → Standing preferences** (`/settings/posture`, #1376) — post-setup
+   editor that replaces the full `behavioralPreferences` list via `PUT /api/identity`
+   with `changedBy: 'api'`. The other fields are preserved via read-modify-write so the
+   Personality and Standing preferences pages do not clobber each other. The route keeps
+   its old name so existing links work; the page held decision-posture cards until #2143.
 
 3. **`behavioral-preferences-update` skill** — invoked by the `setup-wizard`
    specialist agent during the in-chat onboarding conversation (and any

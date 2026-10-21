@@ -21,7 +21,9 @@
 /** A trigger the dispatcher detected for this turn. Rendering order is TURN_GUIDANCE_ORDER. */
 export type TurnGuidanceKey =
   | 'principal-reply-shaped'
+  | 'verification-code-received'
   | 'non-principal-reply-shaped'
+  | 'spot-check-reply'
   | 'outbound-context'
   | 'outbound-context-task-wake'
   | 'outbound-context-clarification'
@@ -44,6 +46,30 @@ const PRINCIPAL_REPLY_SHAPED = [
 ];
 
 /**
+ * The principal's message carried a code-shaped value the dispatcher registered for a
+ * pending sms/app sign-in verification (#2017). Hedged ("appears to"): the value is only
+ * code-shaped, and could be a booking reference. Without it the model sometimes
+ * read past the code (in an email such as "482913 — once you're in, send me the notice")
+ * and asked for it again. The runtime renders the named form
+ * (verificationCodeReceivedLines) with the site, session and verification id; this
+ * generic form is its fallback when that lookup fails. Neither ever holds the digits.
+ */
+const VERIFICATION_CODE_RECEIVED = [
+  'The principal\'s message appears to contain the sign-in code for the verification in your',
+  'Sign-in verifications block. If so, enter it now in that session; don\'t ask for it again.',
+];
+
+/** The named verification-code-received lines: one per verification the code was registered for. */
+export function verificationCodeReceivedLines(
+  items: ReadonlyArray<{ site: string; browserSessionId: string; id: string }>,
+): string[] {
+  return items.flatMap((v) => [
+    `The principal's message appears to contain the sign-in code for ${v.site}.`,
+    `If so, enter it now in session ${v.browserSessionId} (verification ${v.id}); don't ask for it again.`,
+  ]);
+}
+
+/**
  * Any inbound from someone other than the principal (outbound context is withheld). The
  * first paragraph is every non-principal turn's reply contract, moved out of the always-on
  * prompt (prompt trim PR 4): principal turns never need it, and auto-generated mail, the
@@ -58,7 +84,8 @@ const PRINCIPAL_REPLY_SHAPED = [
  * the principal; as written, 10 of 10 (baseline log, PR 5).
  *
  * The reply-shaped bullets say what to write and where the open question goes, not which
- * questions to keep from the sender (prompt trim PR 10).
+ * questions to keep from the sender (prompt trim PR 10). They name no tone and quote no
+ * sample reply: how Curia sounds is the office identity's tone.style (#2143).
  */
 const NON_PRINCIPAL_REPLY_SHAPED = [
   'Your final response is sent to this sender. The principal does not see it first, so it',
@@ -73,14 +100,37 @@ const NON_PRINCIPAL_REPLY_SHAPED = [
   'cannot see ("Yes, go ahead", "The second one works") is reply-shaped. For one of those:',
   '- Make one attempt to place it, such as a mailbox search on the subject line. If that finds',
   '  the thread, act on the message as you would any message from this sender.',
-  '- If it does not, stop searching. Reply with a short, warm acknowledgment ("Thanks, noted.',
-  '  I\'ll follow up shortly."), or NO_REPLY when nothing needs to go back. In the note, ask',
-  '  the principal what it refers to, giving who wrote, the subject, and what they said.',
+  '- If it does not, stop searching. Reply with a short acknowledgment that says only that',
+  '  you will follow up: it agrees to nothing and never mentions the missing thread. Or reply',
+  '  NO_REPLY when nothing needs to go back. In the note, ask the principal what it refers',
+  '  to, giving who wrote, the subject, and what they said.',
   '',
   'Write the message to the sender, or NO_REPLY. If the principal needs to hear something from',
   'this exchange that they can act on, add it after the message inside',
   '<note_for_principal></note_for_principal> tags. The note is emailed to the principal and',
   'only they see it; nothing for the principal goes in the message.',
+];
+
+/**
+ * A live principal message that looks like a verdict on a digest's spot check ("2 bad, that
+ * was a renewal notice"). Added only on a live principal turn where Curia is not merely CC'd
+ * (turn-guidance-triggers.ts), so a third party's "2 good" can never reach the tool. It names
+ * the two calls in order because record-spot-check lives in the `reports` bundle, not the
+ * coordinator's pins, and says to ask when the tool finds no match: a guessed verdict would
+ * score the wrong action.
+ *
+ * Conditional on purpose (F1): the trigger is a start-of-message text rule, so "2 good"
+ * answering one of Curia's own numbered questions fires it too. The block tells the
+ * coordinator to ignore it then, and to read back what was recorded so a wrong match is
+ * visible to the principal straight away (principal verdicts weigh 3x in the score).
+ */
+const SPOT_CHECK_REPLY = [
+  'If the principal is grading a digest\'s spot check ("2 bad, that was a renewal notice"),',
+  'call skill-activate with skill `reports`, then record-spot-check with each number, good or',
+  'bad, and any reason given. If the number refers to something else, ignore this note. Tell',
+  'the principal what was recorded (the tool returns each item\'s summary) and any numbers it',
+  'skipped; if it finds no matching spot check or an unknown number, ask which action they',
+  'meant. Never guess.',
 ];
 
 /**
@@ -183,11 +233,18 @@ const SCHEDULER_DELIVERY = [
   'yourself with a send skill and `principal` as the recipient, one message. Otherwise send',
   'nothing: background and maintenance work is recorded, not reported. Either way, end with',
   'exactly NO_REPLY.',
+  // The reply-channel reminder never fires here (the reply goes nowhere), so a scheduled
+  // message gets its content rule at the point of writing instead (#2143).
+  'A message you send keeps to the Length section of your identity block for its channel.',
+  'Say what is there, not what isn\'t: leave out empty results, things that did not happen and',
+  'what you will do next, and do not repeat the task\'s instructions back.',
 ];
 
 const TURN_GUIDANCE: Record<TurnGuidanceKey, readonly string[]> = {
   'principal-reply-shaped': PRINCIPAL_REPLY_SHAPED,
+  'verification-code-received': VERIFICATION_CODE_RECEIVED,
   'non-principal-reply-shaped': NON_PRINCIPAL_REPLY_SHAPED,
+  'spot-check-reply': SPOT_CHECK_REPLY,
   'outbound-context': OUTBOUND_CONTEXT,
   'outbound-context-task-wake': OUTBOUND_CONTEXT_TASK_WAKE,
   'outbound-context-clarification': OUTBOUND_CONTEXT_CLARIFICATION,
@@ -205,7 +262,10 @@ const TURN_GUIDANCE: Record<TurnGuidanceKey, readonly string[]> = {
  */
 export const TURN_GUIDANCE_ORDER: readonly TurnGuidanceKey[] = [
   'principal-reply-shaped',
+  // Straight after the reply-shaped note: a bare code is not a reply needing clarification.
+  'verification-code-received',
   'non-principal-reply-shaped',
+  'spot-check-reply',
   'outbound-context',
   'outbound-context-task-wake',
   'outbound-context-clarification',
@@ -230,10 +290,18 @@ export function parseTurnGuidanceKeys(raw: unknown): TurnGuidanceKey[] {
 
 /**
  * The guidance block for these keys, in TURN_GUIDANCE_ORDER whatever order they were
- * given in, each at most once. The backlog line (src/agents/prompts/backlog-line.ts), when
- * given, closes the block. Null when there is nothing to render.
+ * given in, each at most once. `named` replaces a key's fixed text with lines the runtime
+ * resolved for this turn (verification-code-received names its verification). The backlog line (src/agents/prompts/backlog-line.ts), when
+ * given, follows them; the reply's length reminder (src/identity/length.ts,
+ * turnLengthReminder), when given, closes the block, nearest the message it applies to.
+ * Null when there is nothing to render.
  */
-export function renderTurnGuidance(keys: readonly TurnGuidanceKey[], backlogLine?: string | null): string | null {
+export function renderTurnGuidance(
+  keys: readonly TurnGuidanceKey[],
+  backlogLine?: string | null,
+  lengthReminder?: string | null,
+  named?: Partial<Record<TurnGuidanceKey, readonly string[]>>,
+): string | null {
   const wanted = new Set(keys);
   let out = TURN_GUIDANCE_HEADER;
   let previous: TurnGuidanceKey | undefined;
@@ -242,11 +310,13 @@ export function renderTurnGuidance(keys: readonly TurnGuidanceKey[], backlogLine
     // The outbound-context sub-rules continue that block's bullet list, so they join with
     // a single newline; every other section is its own paragraph.
     const continuesList = key.startsWith('outbound-context-') && previous?.startsWith('outbound-context') === true;
-    out += (continuesList ? '\n' : '\n\n') + TURN_GUIDANCE[key].join('\n');
+    const lines = named?.[key]?.length ? named[key] : TURN_GUIDANCE[key];
+    out += (continuesList ? '\n' : '\n\n') + lines.join('\n');
     previous = key;
   }
-  if (backlogLine) return `${out}\n\n${backlogLine}`;
-  return previous === undefined ? null : out;
+  const closing = [backlogLine, lengthReminder].filter((line): line is string => typeof line === 'string' && line !== '');
+  if (previous === undefined && closing.length === 0) return null;
+  return closing.reduce((text, line) => `${text}\n\n${line}`, out);
 }
 
 /** Every turn-guidance block, for prompt-exfiltration marker extraction. */

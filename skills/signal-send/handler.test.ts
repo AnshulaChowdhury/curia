@@ -243,8 +243,32 @@ describe('SignalSendHandler', () => {
     }
     expect(gateway.send).toHaveBeenCalledWith(
       expect.objectContaining({ channel: 'signal', recipient: '+14155551234', message: 'hello' }),
-      { taskEventId: undefined, conversationId: undefined, principalDirected: false },
+      {
+        taskEventId: undefined, conversationId: undefined, principalDirected: false,
+        // Replayed on approval if band review holds the send (#2159).
+        holdRecipe: { toolName: 'signal-send', partialPayload: ctx.input, description: expect.stringMatching(/^Signal message to /) },
+      },
     );
+  });
+
+  it('passes an approved replay on as humanApproved, so band review does not hold it again (#2159)', async () => {
+    const gateway = { send: vi.fn().mockResolvedValue({ success: true }) };
+    const ctx = makeCtx({ input: { recipient: BOB_ID, message: 'hello' }, gateway });
+    Object.assign(ctx, { humanApproved: true });
+    await handler.execute(ctx);
+    expect(gateway.send).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ humanApproved: true }));
+  });
+
+  it('passes an approved group replay on as humanApproved (#2159)', async () => {
+    const gateway = {
+      send: vi.fn().mockResolvedValue({ success: true }),
+      getSignalGroupMembers: vi.fn().mockResolvedValue(['+14155551234']),
+    };
+    const contactService = { resolveByChannelIdentity: vi.fn().mockResolvedValue({ contactId: 'c1', tier: 'known' }) };
+    const ctx = makeCtx({ input: { group_id: 'grpABC==', message: 'team update' }, gateway, contactService });
+    Object.assign(ctx, { humanApproved: true });
+    await handler.execute(ctx);
+    expect(gateway.send).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ humanApproved: true }));
   });
 
   it('marks the send principalDirected on a live principal turn (#1870)', async () => {
@@ -294,7 +318,10 @@ describe('SignalSendHandler', () => {
     }
     expect(gateway.send).toHaveBeenCalledWith(
       expect.objectContaining({ channel: 'signal', groupId: 'grpABC==', message: 'team update' }),
-      { taskEventId: undefined, conversationId: undefined, principalDirected: false },
+      {
+        taskEventId: undefined, conversationId: undefined, principalDirected: false,
+        holdRecipe: { toolName: 'signal-send', partialPayload: ctx.input, description: 'Signal message to a group' },
+      },
     );
   });
 
@@ -472,5 +499,21 @@ describe('SignalSendHandler', () => {
       const result = await handler.execute(ctx);
       expect(result.success).toBe(true);
     });
+  });
+});
+
+describe('signal-send relay budget (#1320)', () => {
+  const OUTSIDER = { originator: { contactId: 'dana-contact', systemRole: null, channel: 'email', initiatedAt: '2026-10-19T12:00:00Z', tier: 'known' } };
+
+  it('passes the task originator to the gateway and surfaces a relay-budget deferral', async () => {
+    const send = vi.fn().mockResolvedValue({ success: true, deferredToDigest: true });
+    const outboundContext = { register: vi.fn().mockResolvedValue('entry-1'), release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6 };
+    const ctx = { ...makeCtx({ input: { recipient: 'principal', message: 'Hello' }, gateway: { send } }), taskMetadata: OUTSIDER, outboundContext } as unknown as ToolContext;
+    const result = await new SignalSendHandler().execute(ctx);
+    expect(send).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ originator: OUTSIDER.originator }));
+    expect(result.success).toBe(true);
+    // Nothing reached the principal, so no reply should bind to it.
+    expect(outboundContext.register).not.toHaveBeenCalled();
+    if (result.success) expect(result.data).toMatchObject({ deferred_to_digest: true, note: expect.stringMatching(/digest/) });
   });
 });

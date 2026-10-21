@@ -106,6 +106,13 @@ describe('EmailReplyHandler', () => {
       expect.objectContaining({ to: 'alice@example.com', replyToMessageId: 'nylas-msg-1' }),
       expect.not.objectContaining({ recipientSource: 'email_participant' }),
     );
+    // Replayed on approval if band review holds the send (#2159).
+    expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        holdRecipe: { toolName: 'email-reply', partialPayload: ctx.input, description: 'Email reply to alice@example.com — "Re: Project update"' },
+      }),
+    );
   });
 
   it('passes email_participant when auth passes and the sender is not an owned mailbox (#2071)', async () => {
@@ -683,5 +690,24 @@ describe('EmailReplyHandler', () => {
         expect(ctx.outboundGateway!.resolveRecipientReference).not.toHaveBeenCalled();
       }
     });
+  });
+});
+
+describe('email-reply relay budget (#1320)', () => {
+  const OUTSIDER = { originator: { contactId: 'dana-contact', systemRole: null, channel: 'email', initiatedAt: '2026-10-19T12:00:00Z', tier: 'known' } };
+
+  it('passes the task originator to the gateway and surfaces a relay-budget deferral', async () => {
+    const ctx = makeCtx({ reply_to_message_id: 'nylas-msg-1', body: 'Dana confirmed.' }, { taskMetadata: OUTSIDER });
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, deferredToDigest: true });
+    const outboundContext = { register: vi.fn().mockResolvedValue('entry-1'), release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6 };
+    (ctx as unknown as Record<string, unknown>).outboundContext = outboundContext;
+
+    const result = await new EmailReplyHandler().execute(ctx);
+
+    expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ originator: OUTSIDER.originator }));
+    expect(result.success).toBe(true);
+    // Nothing reached the principal, so no reply should bind to it.
+    expect(outboundContext.register).not.toHaveBeenCalled();
+    if (result.success) expect(result.data).toMatchObject({ deferred_to_digest: true, note: expect.stringMatching(/digest/) });
   });
 });

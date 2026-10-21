@@ -55,6 +55,13 @@ export interface ActionLogRow {
   expiresAt: Date | null;
   parentActionId: number | null;
   shortRef: string | null;
+  /**
+   * The small number the principal types to answer a pending approval ("approve 3"), in place
+   * of shortRef (#2159 Phase 3). Allocated at insert, unique among rows of the last 7 days.
+   * Null on non-approval rows, on approvals raised before migration 098, and when all 999
+   * numbers were in use (the approval then falls back to its shortRef).
+   */
+  approvalNumber: number | null;
   description: string | null;
   /**
    * Hinted recipients pinned at approval time. Null on older rows and on
@@ -63,6 +70,17 @@ export interface ActionLogRow {
   sendResolution?: SendRecipientPin[] | null;
 
   createdAt: Date;
+}
+
+/**
+ * How a pending approval is named back to the principal: `Approval <n>` when the row has a number
+ * (#2159 Phase 3, the only identifier its notification showed), otherwise its short_ref (what an
+ * unnumbered notification showed; approval-delivery renders `shortRef ?? id`, mirrored here).
+ * Confirmations and errors must never name a reference the principal was not shown.
+ */
+export function approvalLabel(row: Pick<ActionLogRow, 'approvalNumber' | 'shortRef' | 'id'>): string {
+  if (row.approvalNumber != null) return `Approval ${row.approvalNumber}`;
+  return row.shortRef ?? String(row.id);
 }
 
 /** Fields required to insert a new autonomy_action_log row. */
@@ -112,10 +130,25 @@ export interface ScoringFlags {
 export const DETERMINISTIC_SCORES: Record<string, ScoringFlags> = {
   approved:            { competenceFlag: 1, commitmentFlag: 1, compatibility: 1,    scoredBy: 'deterministic' },
   denied:              { competenceFlag: 0, commitmentFlag: null, compatibility: 0, scoredBy: 'deterministic' },
-  expired:             { competenceFlag: null, commitmentFlag: 1, compatibility: 0, scoredBy: 'deterministic' },
+  // An approval that lapsed says nothing about Curia's judgement: the principal may simply not have seen it (#2159 Phase 3).
+  expired:             { competenceFlag: null, commitmentFlag: null, compatibility: null, scoredBy: 'deterministic' },
   resolved_externally: { competenceFlag: 1, commitmentFlag: 1, compatibility: null, scoredBy: 'deterministic' },
   rejected:            { competenceFlag: 0, commitmentFlag: 1, compatibility: null, scoredBy: 'deterministic' },
 };
+
+/**
+ * Who resolved a pending approval (autonomy_action_log.resolved_by). Only `principal`
+ * counts as the principal's own feedback in the scoring pass (#2159). Rows written
+ * before #2159 carry 'ceo' for every tool and reaction resolution.
+ */
+export const RESOLVED_BY = {
+  /** The principal acted directly, e.g. a 👍/👎 reaction on the approval message. */
+  principal: 'principal',
+  /** An agent called a resolve tool on its own reading of the conversation. */
+  coordinator: 'coordinator',
+  /** Expiry sweep or gate rejection. */
+  system: 'system',
+} as const;
 
 /** Result of resolving a short_ref to a pending_approval row. */
 export type ResolveResult =
@@ -124,3 +157,11 @@ export type ResolveResult =
   | { found: false; reason: 'ambiguous'; error: string; pending: ActionLogRow[] }
   | { found: false; reason: 'expired'; error: string }
   | { found: false; reason: 'already_resolved'; error: string };
+
+/**
+ * Appended to every error for a reference that matched nothing usable (not found, expired,
+ * already resolved), and by approve-/deny-/dismiss-action to an unusable reference. A retry
+ * with no reference falls back to the sole pending approval, which may not be the one the
+ * principal named, so the coordinator is told to ask instead.
+ */
+export const NO_REF_RETRY_GUIDANCE = 'Do not retry without a reference; ask the principal which approval they meant.';

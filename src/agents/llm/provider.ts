@@ -7,6 +7,7 @@
 // Adding a new provider: implement LLMProvider, wire it in the DI layer.
 
 import type { AgentError } from '../../errors/types.js';
+import type { ReasoningEffort } from './sampling-options.js';
 
 /**
  * Content block types for multi-turn tool-use conversations.
@@ -59,7 +60,28 @@ export interface ImageContent {
       };
 }
 
-export type ContentBlock = TextContent | ToolUseContent | ToolResultContent | ImageContent;
+/**
+ * Reasoning a provider returned beside tool calls, carried back verbatim on the
+ * next request of the same tool loop (ADR-048 §1). `data` is provider-native and
+ * opaque: OpenRouter's `reasoning_details` (or bare `reasoning` string), or one
+ * Anthropic `thinking` / `redacted_thinking` block. Never rebuilt from the
+ * archive, which stores only a marker for it.
+ */
+export interface ReasoningContent {
+  type: 'reasoning';
+  provider: 'openrouter' | 'anthropic';
+  /** Model the request named. A provider drops blocks from any other model. */
+  model: string;
+  data: unknown;
+  /**
+   * Anthropic only: hash of the request this block answered (system, tools and
+   * every message, as sent). Set for models whose thinking is bound to the
+   * request prefix, so a later request can tell when the block went stale.
+   */
+  prefixHash?: string;
+}
+
+export type ContentBlock = TextContent | ToolUseContent | ToolResultContent | ImageContent | ReasoningContent;
 
 export interface Message {
   role: 'system' | 'user' | 'assistant';
@@ -107,6 +129,23 @@ export interface LLMCallProvenance {
   actualModel: string;
   /** Anthropic: response.id (msg_xxx) — shown in Anthropic's console for support correlation. */
   providerRequestId: string;
+  /**
+   * OpenRouter only: the upstream endpoint that served the call (the response's
+   * top-level `provider`). Reasoning differs by endpoint at the same effort, so
+   * measurements are comparable only within one (ADR-048).
+   */
+  upstreamProvider?: string;
+  /**
+   * The reasoning effort the request actually carried, after the provider
+   * checked it against the model (ADR-048 §5). Absent when it sent none.
+   */
+  reasoningEffort?: ReasoningEffort;
+  /**
+   * Passed-back reasoning blocks the provider dropped from this request because
+   * the request prefix changed since they were written (ADR-048 §1, prefix
+   * guard). Absent when it dropped none.
+   */
+  reasoningBlocksDropped?: number;
 }
 
 // Import and re-export ToolDefinition from the canonical location in skills/types.ts
@@ -139,12 +178,12 @@ export interface ToolResult {
 // Error paths omit provenance: when the API fails there is no response body to extract from.
 export type LLMResponse =
   | ({ type: 'text'; content: string; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
-  | ({ type: 'tool_use'; toolCalls: ToolCall[]; content?: string; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
+  | ({ type: 'tool_use'; toolCalls: ToolCall[]; content?: string; reasoningBlocks?: ReasoningContent[]; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
   | { type: 'error'; error: AgentError; usage?: LLMUsage };
 
 export type LLMStreamEvent =
   | { type: 'text_delta'; text: string }
-  | ({ type: 'tool_use'; toolCalls: ToolCall[]; content?: string; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
+  | ({ type: 'tool_use'; toolCalls: ToolCall[]; content?: string; reasoningBlocks?: ReasoningContent[]; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
   | ({ type: 'message_end'; content: string; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
   | { type: 'error'; error: AgentError; usage?: LLMUsage };
 

@@ -16,13 +16,14 @@
 //   5. Streaming uses OpenRouter's OpenAI-compatible chunk protocol.
 
 import OpenAI from 'openai';
-import type { ChatCompletionMessageParam, ChatCompletionTool, ChatCompletion } from 'openai/resources/chat/completions/completions.js';
+import type { ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, ChatCompletionTool, ChatCompletion } from 'openai/resources/chat/completions/completions.js';
 import type { CompletionUsage } from 'openai/resources/completions.js';
-import type { LLMProvider, LLMResponse, LLMStreamEvent, LLMUsage, LLMCallProvenance, LLMReasoning, Message, ContentBlock, ToolCall, ToolDefinition, ToolResult, ReasoningOmission } from './provider.js';
+import type { LLMProvider, LLMResponse, LLMStreamEvent, LLMUsage, LLMCallProvenance, LLMReasoning, Message, ContentBlock, ReasoningContent, ToolCall, ToolDefinition, ToolResult, ReasoningOmission } from './provider.js';
 import type { Logger } from '../../logger.js';
 import { classifyError } from '../../errors/classify.js';
 import type { ModelRegistry } from './model-registry.js';
-import { resolveTemperature } from './sampling-options.js';
+import { logUnsentReasoningEffort, resolveReasoning, resolveTemperature, type ReasoningEffort } from './sampling-options.js';
+import { sendableReasoningBlocks } from './reasoning-blocks.js';
 
 /**
  * Best-effort message extraction, mirroring classify.ts's own logic so the
@@ -96,6 +97,16 @@ function extractOpenRouterProviderError(
   return { providerName, detail };
 }
 
+/**
+ * OpenRouter's top-level `provider` field names the upstream endpoint that
+ * served the call (e.g. 'DeepSeek', 'CoreWeave'). The OpenAI SDK types do not
+ * declare it, so read it defensively from the response body or a stream chunk.
+ */
+export function upstreamProviderFrom(carrier: object): string | undefined {
+  const value = (carrier as { provider?: unknown }).provider;
+  return typeof value === 'string' && value ? value : undefined;
+}
+
 /** Non-negative integer count, or 0 for anything else (absent, null, malformed). */
 function tokenCount(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
@@ -118,13 +129,15 @@ export function usageFromOpenRouter(usage: CompletionUsage | null | undefined): 
   const cacheCreationInputTokens = tokenCount(details.cache_write_tokens);
   // reasoning_tokens is a subset of completion_tokens, so it stays inside
   // outputTokens. The split is what lets an archive explain a large bill.
-  const reasoningTokens = tokenCount(usage?.completion_tokens_details?.reasoning_tokens);
+  // Left unset when the response carries no count, so llm.call records null
+  // ("not reported") rather than a reported zero.
+  const rawReasoningTokens = usage?.completion_tokens_details?.reasoning_tokens;
   return {
     inputTokens: Math.max(0, promptTokens - cacheReadInputTokens - cacheCreationInputTokens),
     outputTokens: tokenCount(usage?.completion_tokens),
     cacheCreationInputTokens,
     cacheReadInputTokens,
-    reasoningTokens,
+    ...(typeof rawReasoningTokens === 'number' ? { reasoningTokens: tokenCount(rawReasoningTokens) } : {}),
   };
 }
 
@@ -224,6 +237,87 @@ function reasoningFromCarrier(
   return reasoningFieldsFromParts(direct, state, usage, model, logger);
 }
 
+/**
+ * The reasoning an OpenRouter response carried, kept verbatim so the next
+ * request of the tool loop can send it back (ADR-048 §1). `reasoning_details`
+ * is preferred; a bare `reasoning` string is kept only when no details came.
+ */
+export interface OpenRouterReasoningData {
+  reasoning_details?: unknown[];
+  reasoning?: string;
+}
+
+/**
+ * OpenRouter's unified reasoning parameter, which the SDK type does not declare.
+ * `none` is sent as `{ enabled: false }` (ADR-048 §2).
+ */
+type OpenRouterReasoningParam = { effort: Exclude<ReasoningEffort, 'none'> } | { enabled: false };
+
+/** An assistant message carrying passed-back reasoning, which the SDK type does not declare. */
+type AssistantMessageWithReasoning = ChatCompletionAssistantMessageParam & OpenRouterReasoningData;
+
+// Streamed reasoning_details fragments concatenate these fields; every other
+// field (type, id, format, index, signature) takes the latest non-null value.
+const CONCATENATED_DETAIL_FIELDS = new Set(['text', 'summary', 'data']);
+
+function detailTarget(
+  details: Array<Record<string, unknown>>,
+  fragment: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (typeof fragment.index === 'number') return details.find((d) => d.index === fragment.index);
+  if (typeof fragment.id === 'string' && fragment.id) return details.find((d) => d.id === fragment.id);
+  const last = details[details.length - 1];
+  return last !== undefined && last.type === fragment.type ? last : undefined;
+}
+
+/**
+ * Fold one chunk's `delta.reasoning_details` into the array the non-streamed
+ * response would have carried. Fragments of one entry share an `index` (or,
+ * failing that, an `id`); their text, summary and data concatenate.
+ */
+export function mergeReasoningDetailDeltas(details: Array<Record<string, unknown>>, deltas: unknown): void {
+  if (!Array.isArray(deltas)) return;
+  for (const raw of deltas) {
+    if (typeof raw !== 'object' || raw === null) continue;
+    const fragment = raw as Record<string, unknown>;
+    const target = detailTarget(details, fragment);
+    if (!target) {
+      details.push({ ...fragment });
+      continue;
+    }
+    for (const [key, value] of Object.entries(fragment)) {
+      if (value === null || value === undefined) continue;
+      const existing = target[key];
+      target[key] = CONCATENATED_DETAIL_FIELDS.has(key) && typeof value === 'string' && typeof existing === 'string'
+        ? existing + value
+        : value;
+    }
+  }
+}
+
+/** The reasoning block for a tool_use response, or none when it carried no reasoning. */
+function openRouterReasoningBlocks(details: unknown, direct: string, model: string): ReasoningContent[] {
+  const data: OpenRouterReasoningData = {};
+  if (Array.isArray(details) && details.length > 0) data.reasoning_details = details;
+  else if (direct) data.reasoning = direct;
+  else return [];
+  return [{ type: 'reasoning', provider: 'openrouter', model, data }];
+}
+
+/** The fields an assistant message sends back, from this model's reasoning blocks. */
+function reasoningFieldsForRequest(blocks: readonly ReasoningContent[]): OpenRouterReasoningData {
+  const details: unknown[] = [];
+  const direct: string[] = [];
+  for (const block of blocks) {
+    const data = block.data as OpenRouterReasoningData;
+    if (Array.isArray(data.reasoning_details)) details.push(...data.reasoning_details);
+    else if (typeof data.reasoning === 'string') direct.push(data.reasoning);
+  }
+  if (details.length > 0) return { reasoning_details: details };
+  if (direct.length > 0) return { reasoning: direct.join('') };
+  return {};
+}
+
 export class OpenRouterProvider implements LLMProvider {
   id = 'openrouter';
   private client: OpenAI;
@@ -255,6 +349,8 @@ export class OpenRouterProvider implements LLMProvider {
     createParams: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
     model: string;
     signal?: AbortSignal;
+    /** The effort the request carries, when it sends one. */
+    reasoningEffort?: ReasoningEffort;
   } {
     // Extract and concatenate all system messages into a single system role
     // entry. The OpenAI API accepts system messages inline (unlike Anthropic),
@@ -276,6 +372,13 @@ export class OpenRouterProvider implements LLMProvider {
       })
       .filter(Boolean)
       .join('\n\n');
+
+    // Prefer the explicit model param; fall back to options.model for backward compatibility.
+    const optionsModel = typeof options?.model === 'string' ? options.model : undefined;
+    const model = modelOverride ?? optionsModel;
+    if (!model) {
+      throw new Error(`OpenRouterProvider.${operation}() requires a model — no model was provided and no default is configured`);
+    }
 
     // Build the OpenAI message array from our provider-neutral Message type.
     const conversationMessages: ChatCompletionMessageParam[] = [];
@@ -307,7 +410,9 @@ export class OpenRouterProvider implements LLMProvider {
         const textContent = textBlocks.map(b => b.text).join('') || null;
 
         if (toolUseBlocks.length > 0) {
-          conversationMessages.push({
+          // Reasoning this model wrote beside the calls goes back unmodified
+          // (ADR-048 §1); DeepSeek documents it as required whenever tools are sent.
+          const assistant: AssistantMessageWithReasoning = {
             role: 'assistant',
             content: textContent,
             tool_calls: toolUseBlocks.map(b => ({
@@ -318,7 +423,9 @@ export class OpenRouterProvider implements LLMProvider {
                 arguments: JSON.stringify(b.input),
               },
             })),
-          });
+            ...reasoningFieldsForRequest(sendableReasoningBlocks(m.content, 'openrouter', model, this.logger)),
+          };
+          conversationMessages.push(assistant);
         } else {
           conversationMessages.push({
             role: 'assistant',
@@ -336,7 +443,8 @@ export class OpenRouterProvider implements LLMProvider {
       const toolResultBlocks = m.content.filter(
         (b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result',
       );
-      const otherBlocks = m.content.filter(b => b.type !== 'tool_result');
+      // Reasoning blocks belong to assistant turns only; skip any here.
+      const otherBlocks = m.content.filter(b => b.type !== 'tool_result' && b.type !== 'reasoning');
 
       // Push tool_result blocks as tool-role messages first.
       for (const tr of toolResultBlocks) {
@@ -391,13 +499,6 @@ export class OpenRouterProvider implements LLMProvider {
       }
     }
 
-    // Prefer the explicit model param; fall back to options.model for backward compatibility.
-    const optionsModel = typeof options?.model === 'string' ? options.model : undefined;
-    const model = modelOverride ?? optionsModel;
-    if (!model) {
-      throw new Error(`OpenRouterProvider.${operation}() requires a model — no model was provided and no default is configured`);
-    }
-
     // Per-model output cap from the registry. Fall back to 4096 for unknown models.
     const modelMeta = this.modelRegistry.getModel(model);
     const modelMaxTokens = modelMeta?.maxOutputTokens ?? 4096;
@@ -422,6 +523,24 @@ export class OpenRouterProvider implements LLMProvider {
       createParams.temperature = temperature;
     }
 
+    // Reasoning effort (ADR-048 §2). Unset sends no key, so the model keeps its
+    // own default. An effort the model's registry entry does not list is left
+    // out: tiers are validated at boot, so this is a call site's `none` on a
+    // model that cannot turn reasoning off cleanly.
+    let reasoningEffort: ReasoningEffort | undefined;
+    const requestedEffort = resolveReasoning(options, this.logger);
+    if (requestedEffort !== undefined) {
+      if (this.modelRegistry.honorsReasoningEffort(model, requestedEffort)) {
+        const reasoning: OpenRouterReasoningParam = requestedEffort === 'none'
+          ? { enabled: false }
+          : { effort: requestedEffort };
+        (createParams as typeof createParams & { reasoning?: OpenRouterReasoningParam }).reasoning = reasoning;
+        reasoningEffort = requestedEffort;
+      } else {
+        logUnsentReasoningEffort(this.logger, model, requestedEffort, this.modelRegistry.reasoningSupport(model)?.efforts);
+      }
+    }
+
     // Only attach the tools array when tools are provided — the API rejects
     // an empty tools array, so we omit the key entirely when there are none.
     if (tools && tools.length > 0) {
@@ -438,18 +557,25 @@ export class OpenRouterProvider implements LLMProvider {
     // Honor an optional AbortSignal passed via options.signal so callers can
     // cancel an in-flight request instead of orphaning it.
     const signal = options?.signal instanceof AbortSignal ? options.signal : undefined;
-    return { createParams, model, signal };
+    return { createParams, model, signal, ...(reasoningEffort !== undefined ? { reasoningEffort } : {}) };
   }
 
   private usageFromCompletion(response: ChatCompletion): LLMUsage {
     return usageFromOpenRouter(response.usage);
   }
 
-  private provenanceFromCompletion(response: ChatCompletion, requestedModel: string): LLMCallProvenance {
+  private provenanceFromCompletion(
+    response: ChatCompletion,
+    requestedModel: string,
+    reasoningEffort: ReasoningEffort | undefined,
+  ): LLMCallProvenance {
+    const upstreamProvider = upstreamProviderFrom(response);
     return {
       requestedModel,
       actualModel: response.model,
       providerRequestId: response.id,
+      ...(upstreamProvider !== undefined ? { upstreamProvider } : {}),
+      ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     };
   }
 
@@ -509,7 +635,7 @@ export class OpenRouterProvider implements LLMProvider {
     try {
       const built = this.buildCreateParams(params, 'chat');
       model = built.model;
-      const { createParams, signal } = built;
+      const { createParams, signal, reasoningEffort } = built;
       const response: ChatCompletion = await this.client.chat.completions.create(createParams, signal ? { signal } : undefined);
 
       // Extract the first choice — OpenRouter always returns at least one.
@@ -543,7 +669,7 @@ export class OpenRouterProvider implements LLMProvider {
       }
 
       const usage = this.usageFromCompletion(response);
-      const provenance = this.provenanceFromCompletion(response, model);
+      const provenance = this.provenanceFromCompletion(response, model, reasoningEffort);
       const reasoning = reasoningFromCarrier(
         choice.message,
         usage,
@@ -566,11 +692,18 @@ export class OpenRouterProvider implements LLMProvider {
           input: this.parseToolCallInput(tc.function.name, tc.function.arguments),
         }));
 
+        const carrier = choice.message as { reasoning?: unknown; reasoning_details?: unknown };
+        const reasoningBlocks = openRouterReasoningBlocks(
+          carrier.reasoning_details,
+          typeof carrier.reasoning === 'string' ? carrier.reasoning : '',
+          model,
+        );
         return {
           type: 'tool_use',
           toolCalls: mappedToolCalls,
           // Preserve text content alongside tool calls if present.
           content: choice.message.content ?? undefined,
+          ...(reasoningBlocks.length > 0 ? { reasoningBlocks } : {}),
           usage,
           provenance,
           ...reasoning,
@@ -628,7 +761,7 @@ export class OpenRouterProvider implements LLMProvider {
     try {
       const built = this.buildCreateParams(params, 'stream');
       model = built.model;
-      const { createParams, signal } = built;
+      const { createParams, signal, reasoningEffort } = built;
       const streamParams: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
         ...createParams,
         stream: true,
@@ -643,20 +776,23 @@ export class OpenRouterProvider implements LLMProvider {
         outputTokens: 0,
         cacheCreationInputTokens: 0,
         cacheReadInputTokens: 0,
-        reasoningTokens: 0,
       };
       let providerRequestId = '';
       let actualModel = model;
+      let upstreamProvider: string | undefined;
       let seenChunk = false;
       let finishReason: string | null = null;
       const toolCallDeltas = new Map<number, PendingToolCall>();
       let reasoningDirect = '';
       const reasoningState = emptyReasoningState();
+      // The raw details, rebuilt for pass-back; reasoningState only holds readable text.
+      const reasoningDetails: Array<Record<string, unknown>> = [];
 
       for await (const chunk of stream) {
         seenChunk = true;
         providerRequestId = chunk.id || providerRequestId;
         actualModel = chunk.model || actualModel;
+        upstreamProvider = upstreamProviderFrom(chunk) ?? upstreamProvider;
 
         if (chunk.usage) {
           usage = usageFromOpenRouter(chunk.usage);
@@ -673,6 +809,7 @@ export class OpenRouterProvider implements LLMProvider {
           const delta = choice.delta as { reasoning?: unknown; reasoning_details?: unknown };
           if (typeof delta.reasoning === 'string') reasoningDirect += delta.reasoning;
           absorbReasoningDetails(reasoningState, delta.reasoning_details);
+          mergeReasoningDetailDeltas(reasoningDetails, delta.reasoning_details);
 
           for (const toolCallDelta of choice.delta.tool_calls ?? []) {
             const pending = toolCallDeltas.get(toolCallDelta.index) ?? { name: '', arguments: '' };
@@ -713,6 +850,8 @@ export class OpenRouterProvider implements LLMProvider {
         requestedModel: model,
         actualModel,
         providerRequestId,
+        ...(upstreamProvider !== undefined ? { upstreamProvider } : {}),
+        ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
       };
       const reasoning = reasoningFieldsFromParts(
         reasoningDirect,
@@ -738,10 +877,12 @@ export class OpenRouterProvider implements LLMProvider {
         });
 
       if (toolCalls.length > 0) {
+        const reasoningBlocks = openRouterReasoningBlocks(reasoningDetails, reasoningDirect, model);
         yield {
           type: 'tool_use',
           toolCalls,
           content: content || undefined,
+          ...(reasoningBlocks.length > 0 ? { reasoningBlocks } : {}),
           usage,
           provenance,
           ...reasoning,

@@ -7,6 +7,10 @@ import {
   PENDING_DIFFS_PATH,
   BACKFILL_BEFORE_KEY,
   BACKFILL_TARGET_KEY,
+  HELD_SINCE_KEY,
+  MAX_JUDGE_PAIRS,
+  JUDGE_CHUNK_SIZE,
+  SHADOW_SEND_WINDOW_SEC,
 } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { EntityMemory } from '../../../../src/memory/entity-memory.js';
@@ -1293,6 +1297,202 @@ describe('CeoInboxSentObserveHandler', () => {
     expect((result as { data: { shadow_reconciled: number } }).data.shadow_reconciled).toBe(1);
   });
 
+  describe('#2195 shadow pairing bounds', () => {
+    const common = {
+      thread_id: 'thread-1',
+      subject: 'Re: Hello',
+      from: [{ email: 'ceo@example.com' }],
+      to: [{ email: 'alice@example.com' }],
+      cc: [],
+      unread: false,
+      folders: ['SENT'],
+      attachments: [],
+    };
+    // 2024-07-03T00:00:00Z
+    const CAPTURE_SEC = 1_719_964_800;
+
+    function shadowDoc(id: string, createdAt: string) {
+      return {
+        path: shadowDraftPath(id),
+        type: SHADOW_DOC_TYPE,
+        frontmatter: {
+          source_message_id: id,
+          thread_id: 'thread-1',
+          subject: 'Re: Hello',
+          recipients: ['alice@example.com'],
+          created_at: createdAt,
+        },
+        body: `shadow ${id}`,
+      };
+    }
+
+    function serveSend(id: string, date: number): void {
+      mockFetch.mockImplementation(async (url: Parameters<typeof fetch>[0]) => {
+        const u = String(url);
+        if (u.includes(`/messages/${id}`)) {
+          return new Response(
+            JSON.stringify({ data: { ...common, id, date, body: '<p>reply</p>', snippet: 'reply', bcc: [], labels: [] } }),
+            { status: 200 },
+          );
+        }
+        if (u.includes('/messages?')) {
+          return new Response(JSON.stringify({ data: [{ ...common, id, snippet: 'reply', date }] }), { status: 200 });
+        }
+        throw new Error(`unexpected ${u}`);
+      });
+    }
+
+    it('never pairs a send that lands after the window', async () => {
+      // One second past the window: a later follow-up on the thread, not the reply to the punt.
+      serveSend('msg-late', CAPTURE_SEC + SHADOW_SEND_WINDOW_SEC + 1);
+      const extract = vi.fn();
+      const ctx = buildCtx({
+        force: true,
+        nowMs: 1_721_000_000_000,
+        infraLlm: { extract, classify: vi.fn() } as unknown as InfraLlm,
+        withActionLogRepo: true,
+        snapshots: [shadowDoc('src-1', '2024-07-03T00:00:00.000Z')],
+        tasks: [],
+      });
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(true);
+
+      expect(extract).not.toHaveBeenCalled();
+      expect(ctx.__actionLog).toHaveLength(0);
+      // Left unreconciled, so it ages out on the idle-TTL sweep as before.
+      expect(ctx.__docs.get(shadowDraftPath('src-1'))?.frontmatter.reconciled_at).toBeUndefined();
+      const data = (result as { data: { shadow_reconciled: number; watermark_held: boolean } }).data;
+      expect(data.shadow_reconciled).toBe(0);
+      expect(data.watermark_held).toBe(false);
+    });
+
+    it('pairs a send inside the window', async () => {
+      serveSend('msg-in', CAPTURE_SEC + SHADOW_SEND_WINDOW_SEC);
+      const extract = vi.fn(async () => ({
+        ok: true as const,
+        text: '[{"source_message_id":"src-1","same_decision":true,"reason":"same"}]',
+      }));
+      const ctx = buildCtx({
+        force: true,
+        nowMs: 1_721_000_000_000,
+        infraLlm: { extract, classify: vi.fn() } as unknown as InfraLlm,
+        withActionLogRepo: true,
+        snapshots: [shadowDoc('src-1', '2024-07-03T00:00:00.000Z')],
+        tasks: [],
+      });
+
+      const result = await handler.execute(ctx);
+      expect((result as { data: { shadow_reconciled: number } }).data.shadow_reconciled).toBe(1);
+    });
+
+    it('scores one send against only the shadow captured closest before it', async () => {
+      // src-early and src-late were captured an hour apart on thread-1; one reply follows both.
+      serveSend('msg-reply', CAPTURE_SEC + 2 * 3600);
+      let capturedPrompt = '';
+      const extract = vi.fn(async (prompt: string) => {
+        capturedPrompt = prompt;
+        return {
+          ok: true as const,
+          text: '[{"source_message_id":"src-late","same_decision":true,"reason":"same"}]',
+        };
+      });
+      const ctx = buildCtx({
+        force: true,
+        nowMs: 1_721_000_000_000,
+        infraLlm: { extract, classify: vi.fn() } as unknown as InfraLlm,
+        withActionLogRepo: true,
+        snapshots: [
+          shadowDoc('src-early', '2024-07-03T00:00:00.000Z'),
+          shadowDoc('src-late', '2024-07-03T01:00:00.000Z'),
+        ],
+        tasks: [],
+      });
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(true);
+
+      expect(extract).toHaveBeenCalledTimes(1);
+      expect(capturedPrompt).toContain('src-late');
+      expect(capturedPrompt).not.toContain('src-early');
+      expect(ctx.__actionLog).toHaveLength(1);
+      expect(ctx.__docs.get(shadowDraftPath('src-late'))?.frontmatter.reconciled_at).toBeTruthy();
+      expect(ctx.__docs.get(shadowDraftPath('src-early'))?.frontmatter.reconciled_at).toBeUndefined();
+      const early = ctx.__docs.get(shadowDraftPath('src-early'))?.frontmatter;
+      expect(early?.superseded_at).toBeTruthy();
+      expect(early?.superseded_by).toBe('src-late');
+      const data = (result as { data: { shadow_reconciled: number; shadow_superseded: number } }).data;
+      expect(data.shadow_reconciled).toBe(1);
+      expect(data.shadow_superseded).toBe(1);
+    });
+
+    function twoShadowCtx(extract: ReturnType<typeof vi.fn>) {
+      return buildCtx({
+        force: true,
+        nowMs: 1_721_000_000_000,
+        infraLlm: { extract, classify: vi.fn() } as unknown as InfraLlm,
+        withActionLogRepo: true,
+        snapshots: [
+          shadowDoc('src-early', '2024-07-03T00:00:00.000Z'),
+          shadowDoc('src-late', '2024-07-03T01:00:00.000Z'),
+        ],
+        tasks: [],
+      });
+    }
+
+    it('never pairs a superseded shadow with a later follow-up', async () => {
+      const extract = vi.fn(async () => ({
+        ok: true as const,
+        text: '[{"source_message_id":"src-late","same_decision":true,"reason":"same"}]',
+      }));
+      const ctx = twoShadowCtx(extract);
+
+      serveSend('msg-reply', CAPTURE_SEC + 2 * 3600);
+      await handler.execute(ctx);
+      expect(ctx.__actionLog).toHaveLength(1);
+
+      // A follow-up on the thread a day later, inside src-early's window. Before the superseded
+      // mark, src-early would pair with it on this run.
+      serveSend('msg-followup', CAPTURE_SEC + 24 * 3600);
+      const r2 = await handler.execute(ctx);
+      expect(r2.success).toBe(true);
+      expect(extract).toHaveBeenCalledTimes(1);
+      expect(ctx.__actionLog).toHaveLength(1);
+      expect((r2 as { data: { shadow_reconciled: number } }).data.shadow_reconciled).toBe(0);
+    });
+
+    it('does not hold the watermark when the superseded mark fails', async () => {
+      const extract = vi.fn(async () => ({
+        ok: true as const,
+        text: '[{"source_message_id":"src-late","same_decision":true,"reason":"same"}]',
+      }));
+      const ctx = twoShadowCtx(extract);
+      serveSend('msg-reply', CAPTURE_SEC + 2 * 3600);
+
+      const realUpdate = ctx.workingDocs!.update;
+      ctx.workingDocs!.update = vi.fn(async (path: string, params: { frontmatter?: Record<string, unknown>; body?: string; expectedVersion: number }) => {
+        if (path === shadowDraftPath('src-early')) {
+          return { ok: false as const, conflict: true as const, document: ctx.__docs.get(path)! };
+        }
+        return realUpdate(path, params);
+      }) as typeof realUpdate;
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(true);
+      const data = (result as {
+        data: { shadow_reconciled: number; shadow_supersede_failed: number; watermark_held: boolean; watermark_advanced_to: number | null };
+      }).data;
+      expect(data.shadow_reconciled).toBe(1);
+      expect(data.shadow_supersede_failed).toBe(1);
+      expect(data.watermark_held).toBe(false);
+      expect(data.watermark_advanced_to).toBe(CAPTURE_SEC + 2 * 3600 + 1);
+      expect(ctx.log.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ sourceMessageId: 'src-early', supersededBy: 'src-late' }),
+        expect.stringContaining('could not mark shadow superseded'),
+      );
+    });
+  });
+
   it('holds the watermark and skips scoring when the sent body cannot be fetched (F7)', async () => {
     // The shadow matches a send, but fetching its full body fails. We must NOT score a
     // truncated snippet — the pair is dropped, the shadow left unclaimed, watermark held.
@@ -1444,6 +1644,215 @@ describe('CeoInboxSentObserveHandler', () => {
     expect(ctx.__mem.__values.get(WATERMARK_KEY)).toBeUndefined();
     const shadowDoc = ctx.__docs.get(shadowDraftPath('src-1'));
     expect(shadowDoc?.frontmatter.reconciled_at).toBeUndefined();
+  });
+
+  describe('#2191 chunked shadow judge', () => {
+    // n shadows, each on its own thread, each answered by one send. Bodies are served for every
+    // send; `fetchedBodies` records which ones the handler pulled.
+    function setupShadows(n: number): {
+      snapshots: NonNullable<NonNullable<Parameters<typeof buildCtx>[0]>['snapshots']>;
+      fetchedBodies: string[];
+    } {
+      const sends = Array.from({ length: n }, (_, i) => ({
+        id: `msg-sent-${i}`,
+        thread_id: `thread-${i}`,
+        subject: `Re: Topic ${i}`,
+        from: [{ email: 'ceo@example.com' }],
+        to: [{ email: 'alice@example.com' }],
+        cc: [],
+        snippet: `reply ${i}`,
+        date: 1_720_000_500 + i,
+        unread: false,
+        folders: ['SENT'],
+        attachments: [],
+      }));
+      const fetchedBodies: string[] = [];
+      mockFetch.mockImplementation(async (url: Parameters<typeof fetch>[0]) => {
+        const u = String(url);
+        const single = u.match(/\/messages\/(msg-sent-\d+)/);
+        if (single) {
+          fetchedBodies.push(single[1]!);
+          const send = sends.find((s) => s.id === single[1])!;
+          return new Response(
+            JSON.stringify({ data: { ...send, body: `<p>${send.snippet}</p>`, bcc: [], labels: [] } }),
+            { status: 200 },
+          );
+        }
+        if (u.includes('/messages?')) {
+          return new Response(JSON.stringify({ data: sends }), { status: 200 });
+        }
+        throw new Error(`unexpected ${u}`);
+      });
+      const snapshots = sends.map((_, i) => ({
+        path: shadowDraftPath(`src-${i}`),
+        type: SHADOW_DOC_TYPE,
+        frontmatter: {
+          source_message_id: `src-${i}`,
+          thread_id: `thread-${i}`,
+          subject: `Re: Topic ${i}`,
+          recipients: ['alice@example.com'],
+          created_at: '2024-07-03T00:00:00.000Z',
+        },
+        body: `shadow ${i}`,
+      }));
+      return { snapshots, fetchedBodies };
+    }
+
+    /** Answer every pair named in the prompt as same_decision. */
+    function verdictsFor(prompt: string): string {
+      const ids = [...prompt.matchAll(/source_message_id: (\S+)\)/g)].map((m) => m[1]!);
+      return JSON.stringify(ids.map((id) => ({ source_message_id: id, same_decision: true, reason: 'same' })));
+    }
+
+    it('judges in chunks, without a token cap, and a failed chunk holds back only its own pairs', async () => {
+      const { snapshots } = setupShadows(10);
+      // 10 pairs → chunks of 8 and 2. The second chunk (src-8, src-9) comes back truncated, which
+      // is what the 1500-token cap did every day from 2026-09-17.
+      const extract = vi.fn(async (prompt: string, _opts?: unknown) =>
+        prompt.includes('source_message_id: src-9)')
+          ? { ok: true as const, text: '[{"source_message_id":"src-8","same_deci' }
+          : { ok: true as const, text: verdictsFor(prompt) },
+      );
+      const nowMs = 1_720_000_000_000 + 5 * 86_400_000;
+      const ctx = buildCtx({
+        // Held for five days already: this hold must log at error, not warn.
+        seed: { [WATERMARK_KEY]: '1720000000', [HELD_SINCE_KEY]: String(nowMs - 5 * 86_400_000) },
+        force: true,
+        nowMs,
+        infraLlm: { extract, classify: vi.fn() } as unknown as InfraLlm,
+        withActionLogRepo: true,
+        snapshots,
+        tasks: [],
+      });
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(true);
+
+      expect(extract).toHaveBeenCalledTimes(2);
+      // No maxTokens override: the infraLlm default leaves room for reasoning tokens.
+      for (const call of extract.mock.calls) expect(call[1]).toBeUndefined();
+
+      // The clean chunk landed and is stamped, so the next run retries only the failed two.
+      expect(ctx.__actionLog).toHaveLength(8);
+      for (let i = 0; i < 8; i++) {
+        expect(ctx.__docs.get(shadowDraftPath(`src-${i}`))?.frontmatter.reconciled_at).toBeTruthy();
+      }
+      for (const i of [8, 9]) {
+        expect(ctx.__docs.get(shadowDraftPath(`src-${i}`))?.frontmatter.reconciled_at).toBeUndefined();
+      }
+      const data = (result as {
+        data: { watermark_advanced_to: number | null; shadow_reconciled: number; shadow_judge_failed: number; watermark_held: boolean };
+      }).data;
+      expect(data.shadow_reconciled).toBe(8);
+      expect(data.watermark_advanced_to).toBeNull();
+      // The failure is visible in the result, not only in a warn log.
+      expect(data.shadow_judge_failed).toBe(2);
+      expect(data.watermark_held).toBe(true);
+      // The failed chunk's log names its pairs; the long hold escalates to error.
+      expect(ctx.log.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ sourceMessageIds: ['src-8', 'src-9'], endsWithBracket: false }),
+        expect.stringContaining('shadow judge failed'),
+      );
+      expect(ctx.log.error).toHaveBeenCalledWith(
+        expect.objectContaining({ heldDays: 5, shadowJudgeFailed: 2 }),
+        expect.stringContaining('watermark held 5 days'),
+      );
+    });
+
+    it('stops fetching sent bodies at the per-run judge limit and holds the watermark for the rest', async () => {
+      const { snapshots, fetchedBodies } = setupShadows(MAX_JUDGE_PAIRS + 1);
+      const extract = vi.fn(async (prompt: string) => ({ ok: true as const, text: verdictsFor(prompt) }));
+      const ctx = buildCtx({
+        force: true,
+        nowMs: 1_720_100_000_000,
+        infraLlm: { extract, classify: vi.fn() } as unknown as InfraLlm,
+        withActionLogRepo: true,
+        snapshots,
+        tasks: [],
+      });
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(true);
+
+      expect(fetchedBodies).toHaveLength(MAX_JUDGE_PAIRS);
+      expect(extract).toHaveBeenCalledTimes(Math.ceil(MAX_JUDGE_PAIRS / JUDGE_CHUNK_SIZE));
+      expect(ctx.__actionLog).toHaveLength(MAX_JUDGE_PAIRS);
+      const data = (result as { data: { watermark_advanced_to: number | null; shadow_deferred: number; watermark_held: boolean } }).data;
+      // The deferred shadow's send must be re-observed next run.
+      expect(data.watermark_advanced_to).toBeNull();
+      expect(data.shadow_deferred).toBe(1);
+      expect(data.watermark_held).toBe(true);
+    });
+  });
+
+  describe('#2191 hold escalation', () => {
+    // One send on thread-1 answering shadow src-1; `judgeOk` decides whether the run holds.
+    function setupOneShadow(judgeOk: boolean): {
+      snapshots: NonNullable<NonNullable<Parameters<typeof buildCtx>[0]>['snapshots']>;
+      infraLlm: InfraLlm;
+    } {
+      const send = {
+        id: 'msg-sent-1', thread_id: 'thread-1', subject: 'Re: Hello',
+        from: [{ email: 'ceo@example.com' }], to: [{ email: 'alice@example.com' }], cc: [],
+        snippet: 'Thanks Alice', date: 1_720_000_500, unread: false, folders: ['SENT'], attachments: [],
+      };
+      mockFetch.mockImplementation(async (url: Parameters<typeof fetch>[0]) => {
+        const u = String(url);
+        if (u.includes('/messages/msg-sent-1')) {
+          return new Response(JSON.stringify({ data: { ...send, body: '<p>Thanks</p>', bcc: [], labels: [] } }), { status: 200 });
+        }
+        if (u.includes('/messages?')) return new Response(JSON.stringify({ data: [send] }), { status: 200 });
+        throw new Error(`unexpected ${u}`);
+      });
+      const extract = vi.fn(async () =>
+        judgeOk
+          ? { ok: true as const, text: '[{"source_message_id":"src-1","same_decision":true,"reason":"same"}]' }
+          : { ok: false as const, error: 'llm unavailable' },
+      );
+      return {
+        infraLlm: { extract, classify: vi.fn() } as unknown as InfraLlm,
+        snapshots: [{
+          path: shadowDraftPath('src-1'),
+          type: SHADOW_DOC_TYPE,
+          frontmatter: { source_message_id: 'src-1', thread_id: 'thread-1', subject: 'Re: Hello', recipients: [], created_at: '2024-07-03T00:00:00.000Z' },
+          body: 'shadow',
+        }],
+      };
+    }
+
+    // The watermark stays fixed on idle days and through a drain, so an old watermark alone is
+    // not a long hold. The first held run starts the clock and logs at warn.
+    it('logs a first hold at warn even when the watermark is old, and starts the clock', async () => {
+      const { snapshots, infraLlm } = setupOneShadow(false);
+      const nowMs = 1_720_000_000_000 + 10 * 86_400_000;
+      const ctx = buildCtx({
+        seed: { [WATERMARK_KEY]: '1720000000' },
+        force: true, nowMs, infraLlm, withActionLogRepo: true, snapshots, tasks: [],
+      });
+
+      await handler.execute(ctx);
+
+      expect(ctx.log.error).not.toHaveBeenCalled();
+      expect(ctx.log.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ heldDays: 0 }),
+        expect.stringContaining('shadow reconcile failed'),
+      );
+      expect(ctx.__mem.__values.get(HELD_SINCE_KEY)).toBe(String(nowMs));
+    });
+
+    it('clears the hold clock on a run that advances', async () => {
+      const { snapshots, infraLlm } = setupOneShadow(true);
+      const nowMs = 1_720_100_000_000;
+      const ctx = buildCtx({
+        seed: { [HELD_SINCE_KEY]: String(nowMs - 2 * 86_400_000) },
+        force: true, nowMs, infraLlm, withActionLogRepo: true, snapshots, tasks: [],
+      });
+
+      const result = await handler.execute(ctx);
+
+      expect((result as { data: { watermark_held: boolean } }).data.watermark_held).toBe(false);
+      expect(ctx.__mem.__values.get(HELD_SINCE_KEY)).toBe('0');
+    });
   });
 
   it('skips when idle backoff is active', async () => {

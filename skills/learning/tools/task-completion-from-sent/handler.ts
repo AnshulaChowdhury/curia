@@ -11,9 +11,12 @@ import { ConfigStore } from '../../../../src/memory/config-store.js';
 import {
   readCompletionCandidates,
   writeCompletionCandidates,
-  readCompletionDigest,
+  readNumberedCompletionDigest,
   writeCompletionDigest,
+  writeDigestHighWater,
+  maxDigestNumber,
   pruneExpiredCompletionDigest,
+  assignDigestNumbers,
   usableCompletionDigestCreatedAt,
   composeUndoNote,
   composeConfirmNote,
@@ -200,15 +203,23 @@ export class TaskCompletionFromSentHandler implements ToolHandler {
     // removals already computed in `remaining`) retries next run rather than persisting a
     // candidate-queue state that doesn't match what was actually recorded.
     let digestStored = true;
+    // The map as written, with every item's number — the notification must quote these exact numbers.
+    let numberedDigest: CompletionDigestMap = {};
     if (digestAdds.length > 0) {
-      // Drop aged siblings as part of the write this run already owns. Do not write
+      // Number the stored items BEFORE pruning (so legacy numbers match what the readers derive),
+      // then drop aged siblings as part of the write this run already owns. Do not write
       // solely to prune — that race belongs to a read that should stay a read.
-      const digestMap: CompletionDigestMap = pruneExpiredCompletionDigest(
-        await readCompletionDigest(store, ctx.log),
-        Date.now(),
-        ctx.log,
-      );
+      // The high-water mark keeps a resolved top item's number out of reuse. An empty digest is
+      // the one point numbering restarts at 1 (highWater 0). The floor also takes the stored items'
+      // numbers BEFORE pruning, so an aged-out top item's number is not handed out again either.
+      const { map: storedNumbered, highWater } = await readNumberedCompletionDigest(store, ctx.log);
+      const floor = Math.max(highWater, maxDigestNumber(storedNumbered));
+      const digestMap: CompletionDigestMap = pruneExpiredCompletionDigest(storedNumbered, Date.now(), ctx.log);
       const nowIso = new Date().toISOString();
+      // New items are numbered here, above the floor, in processing order. They share `nowIso`,
+      // so leaving this to assignDigestNumbers would order them by task id and the notification
+      // would read "3, 2".
+      let nextN = floor + 1;
       for (const item of digestAdds) {
         // Keep a usable original clock when this task is already on the digest (a retry
         // overwrites the note identically). A missing clock, or one that is not a
@@ -216,14 +227,30 @@ export class TaskCompletionFromSentHandler implements ToolHandler {
         // This does not retrofit the pre-#1936 backlog: a task that is already done is
         // skipped above and never reaches this write. dismiss_completion clears those.
         const createdAt = usableCompletionDigestCreatedAt(digestMap[item.taskId]?.createdAt) ?? nowIso;
-        digestMap[item.taskId] = { ...item, createdAt };
+        // A retried item keeps its number (the principal may already hold it).
+        const n = digestMap[item.taskId]?.n ?? nextN++;
+        digestMap[item.taskId] = { ...item, createdAt, n };
       }
-      digestStored = await writeCompletionDigest(store, digestMap);
-      if (!digestStored) {
+      numberedDigest = assignDigestNumbers(digestMap, floor);
+      // Advance the mark BEFORE the digest write: if the digest write then fails, the mark has only
+      // skipped numbers (harmless). A mark that won't store blocks the digest write the same way a
+      // digest soft-reject does: publishing numbers above a mark that never landed would let the
+      // next run reissue them, so nothing is completed, consumed or announced and all retry.
+      const newHighWater = Math.max(floor, maxDigestNumber(numberedDigest));
+      if (!(await writeDigestHighWater(store, newHighWater))) {
+        digestStored = false;
         ctx.log.warn(
-          {},
-          'task-completion-from-sent: digest write soft-rejected — digest not durable, so no completions were applied and no candidates consumed; all retry next run',
+          { highWater: newHighWater },
+          'task-completion-from-sent: digest high-water mark write soft-rejected — digest not written, so no completions were applied and no candidates consumed; all retry next run',
         );
+      } else {
+        digestStored = await writeCompletionDigest(store, numberedDigest);
+        if (!digestStored) {
+          ctx.log.warn(
+            {},
+            'task-completion-from-sent: digest write soft-rejected — digest not durable, so no completions were applied and no candidates consumed; all retry next run',
+          );
+        }
       }
     }
 
@@ -231,7 +258,7 @@ export class TaskCompletionFromSentHandler implements ToolHandler {
     // it safe to actually complete the tasks.
     // Track which auto-completes actually landed this run so the notification below only tells the
     // principal to "undo" tasks that were really marked done — a completeTask that threw leaves the task
-    // active, and an "undo completion <id>" line for it would be a lie (the principal reply path would
+    // active, and an "undo task <n>" line for it would be a lie (the principal reply path would
     // then find a non-done task and either fail loud or falsely report "already reopened").
     const completedTaskIds = new Set<string>();
     if (digestStored) {
@@ -266,9 +293,11 @@ export class TaskCompletionFromSentHandler implements ToolHandler {
     // run — an undo whose completeTask threw is still in `digestAdds`/the durable digest (which
     // self-heals next run), but must NOT be announced as done. Gated on digestStored (the durable
     // digest the reply resolves against) and non-empty. Best-effort — notify never fails the run.
-    const notifyItems = digestAdds.filter(
-      (i) => i.kind === 'confirm' || completedTaskIds.has(i.taskId),
-    );
+    // Take the items from the numbered map that was written, not from `digestAdds`, so the numbers
+    // in the message are the ones persisted.
+    const notifyItems = digestAdds
+      .filter((i) => i.kind === 'confirm' || completedTaskIds.has(i.taskId))
+      .map((i) => numberedDigest[i.taskId] ?? i);
     if (digestStored && notifyItems.length > 0) {
       await notifyLearningProposal(ctx, buildCompletionDigestNotification(notifyItems));
     }

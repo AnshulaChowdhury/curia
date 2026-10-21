@@ -92,7 +92,11 @@ describe('EmailSendHandler', () => {
     }
     expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(
       expect.objectContaining({ channel: 'email', to: 'alice@example.com', subject: 'Hello', body: 'Hi there' }),
-      { taskEventId: undefined, conversationId: undefined, principalDirected: false },
+      {
+        taskEventId: undefined, conversationId: undefined, principalDirected: false,
+        // Replayed on approval if band review holds the send (#2159).
+        holdRecipe: { toolName: 'email-send', partialPayload: ctx.input, description: 'Email to alice@example.com — "Hello"' },
+      },
     );
   });
 
@@ -466,5 +470,22 @@ describe('EmailSendHandler', () => {
       expect(result.success).toBe(true);
       expect(ctx.outboundGateway!.send).toHaveBeenCalled();
     });
+  });
+});
+
+describe('email-send relay budget (#1320)', () => {
+  const OUTSIDER = { originator: { contactId: 'dana-contact', systemRole: null, channel: 'email', initiatedAt: '2026-10-19T12:00:00Z', tier: 'known' } };
+
+  it('passes the task originator to the gateway and surfaces a relay-budget deferral', async () => {
+    const ctx = makeCtx({ to: 'principal', subject: 'Update', body: 'Hello' }, { taskMetadata: OUTSIDER });
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, deferredToDigest: true });
+    const outboundContext = { register: vi.fn().mockResolvedValue('entry-1'), release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6 };
+    (ctx as unknown as Record<string, unknown>).outboundContext = outboundContext;
+    const result = await new EmailSendHandler().execute(ctx);
+    expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ originator: OUTSIDER.originator }));
+    expect(result.success).toBe(true);
+    // Nothing reached the principal, so no reply should bind to it.
+    expect(outboundContext.register).not.toHaveBeenCalled();
+    if (result.success) expect(result.data).toMatchObject({ deferred_to_digest: true, note: expect.stringMatching(/digest/) });
   });
 });

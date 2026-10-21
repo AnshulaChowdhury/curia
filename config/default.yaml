@@ -2,10 +2,13 @@
 # Agents declare a tier (fast | standard | powerful) — this config maps each
 # tier to a concrete model. The provider is resolved from the model registry.
 # Change these values to upgrade all agents of a tier in one place.
+# A tier may also set `reasoning: { effort: none | low | medium | high | max }`
+# for agent turns (ADR-048); unset means the model's own default. Boot fails
+# if the tier's model does not list the effort in the model registry.
 model_routing:
   tiers:
     fast:
-      model: claude-haiku-4-5
+      model: claude-haiku-5-5
     standard:
       model: claude-sonnet-4-6
     powerful:
@@ -197,6 +200,23 @@ contextBridge:
   channelDefaultExpiryHours:
     email: 72
 
+# Delegated sign-in with external verification (#2017).
+# When a site asks the principal for a code (email, SMS or authenticator app), Curia asks
+# them on the first channel in askChannelOrder that is enabled and has a verified principal
+# identity, never the channel the errand came in on. Valid channels: signal, sms, slack, email.
+verification:
+  askChannelOrder: [signal, sms, slack, email]
+  defaultExpiryMinutes: 10        # a pending verification is treated as expired after this (a hint, not a cliff)
+  recentWindowMinutes: 120        # a closed verification still counts as recent for this long
+  codeTtlMinutesAfterClose: 120   # a tracked code value is kept this long after its verification closes
+  emailWaitSeconds: 180           # how long to wait for an emailed code before asking the principal
+  # Identity providers whose embedded sign-in frame may receive a sign-in code: a child
+  # frame holding the code input becomes the verification's page_domain only on the sign-in
+  # page's own domain (the top page's) or one of these. Kept short and well-known on purpose;
+  # a deployment extends it
+  # by setting this list (the setting replaces the default, so repeat these entries).
+  identityProviderDomains: [b2clogin.com, ciamlogin.com, microsoftonline.com, okta.com, auth0.com, onelogin.com, pingidentity.com, pingone.com, duosecurity.com]
+
 # Meeting debrief agent configuration (spec §17-meeting-debrief.md).
 # Controls the proactive debrief prompt sent after external meetings end.
 # The agent itself is defined in agents/meeting-debrief.yaml.
@@ -293,7 +313,7 @@ filter:
     enabled: true
     # Recommended: use a different vendor/family than the agent tiers for model diversity
     # (an attack tuned for the coordinator should not also fool the reviewer).
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     timeout_ms: 5000
     failMode: split   # split (default) | open | closed — see src/config.ts
   # Identity gate (#1818). A non-principal send is checked for an unconfirmed-name
@@ -311,8 +331,10 @@ filter:
 escalation:
   judge:
     enabled: true
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     timeout_ms: 5000
+    # The band brief (#2159) reads the drafting turn's evidence; it needs longer than a one-word classification.
+    review_timeout_ms: 15000
 
 # Audit log hardening (spec 10 / #1383).
 # llm_call_archive stores redacted full prompts/responses keyed to llm.call rows.
@@ -364,9 +386,9 @@ dreaming:
     batchSize: 50                 # max rows scored per pass
     minScoredActions: 30          # minimum before any adjustment fires
     halfLifeDays: 30              # time-decay half-life for weighting
-    weakExpiredWeight: 0.3        # reduced weight for 'expired' compatibility signal
     ceoCooldownDays: 7            # days after CEO set-autonomy before auto-adjust resumes
     errorRateThreshold: 0.20      # competence error rate that blocks score increases
+    errorRateWindowDays: 90       # that rate covers the last 30 competence rows, none older than this
     unparseableAfterDays: 3       # parse failures retry this many days, then dead-letter
 
 # Sensitivity classification rules for KG nodes (issue #200).
@@ -532,14 +554,34 @@ tasks:
 #   >= derived_child   : same-task wake AND derived child keep lineage standing
 # See docs/specs/14-autonomy-engine.md (Effective standing / bypass ladder).
 autonomy:
+  # Which policy decides when Curia asks first (#2159, ADR-049).
+  #   tier — contact tier gates consequential actions (Gate C) and disclosures (Stage 2.5).
+  #   band — the autonomy band decides; the escalation judge reviews sends for an
+  #          outsider steering Curia, claims in the principal's voice, and grounding.
+  # Ships as tier. Flip to band in local.yaml; the default changes after a clean week.
+  gating: tier
+
   bypass_ladder:
     same_task: 70      # posture B floor — must not drop below 60
     derived_child: 90  # posture D floor
 
-  # Expires pending approvals past expires_at and emails the principal about
-  # high/critical ones (#2013). A system interval: no agent turn, no LLM call.
+  # Expires pending approvals past expires_at and queues a digest item for each
+  # (#2013, #2159), and emails any approval no agent delivered within 15 minutes.
+  # A system interval: no agent turn, no LLM call.
   approval_expiry:
-    sweep_interval_minutes: 60
+    sweep_interval_minutes: 15
+
+  # Weekly summary of unreported digest items, for installs with no digest job
+  # (#2159). Sends once the oldest unreported item passes max_age_days.
+  report_fallback:
+    max_age_days: 7
+    check_interval_hours: 24
+
+  # Cap on immediate messages to the principal that one outside contact (tier known
+  # or below) can cause (#1320). Over the cap, the relay goes to the digest and the
+  # principal gets one line saying more is waiting. 0 turns the cap off.
+  relay_budget:
+    per_hour: 3
 
   # Emoji → approval intent for inbound.reaction (#1479). Channel-agnostic —
   # Slack shortcodes and unicode glyphs both listed. Adapters never map intent.

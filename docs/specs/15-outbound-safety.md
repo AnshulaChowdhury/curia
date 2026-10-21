@@ -29,8 +29,10 @@ the CEO, or exfiltrate internal data to an external party.
 | Threat | Example | Defence |
 |---|---|---|
 | **Prompt injection via inbound email** | Attacker email instructs LLM to dump system prompt in reply | Content filter — Stage 1 (deterministic) + Stage 2 (LLM-as-judge) |
-| **Accidental context leakage** | LLM naturally includes a third party's email address in a reply | Content filter — contact data leakage rule |
-| **Over-disclosure to an untrusted recipient** | Reply shares the CEO's availability or another contact's details with an unknown-tier recipient | Content filter — Stage 2.5 tier-keyed disclosure gate (escalation judge) |
+| **Accidental context leakage** | LLM naturally includes a third party's email address in a reply | Content filter — contact data leakage rule (`autonomy.gating: tier`); band send review's *necessity* question (`band`) |
+| **Over-disclosure to an untrusted recipient** | Reply shares the CEO's availability or another contact's details with an unknown-tier recipient | Content filter — Stage 2.5 tier-keyed disclosure gate (`tier`); band send review (`band`, [spec 14](14-autonomy-engine.md#band-gating-2159)) |
+| **A false claim in the principal's voice** | Reply tells a counterparty the principal is away when they are not | Band send review's *grounding* question (`band` only) |
+| **A sign-in code written down or sent on** | A one-time code the principal relays lands in a task note, a report, memory, a document or a message | Sign-in code scrub — tracked values replaced by `[sign-in code]` in every tool input and every reply (below) |
 | **Skill-layer bypass** | Prompt injection tricks LLM into calling `email-send` directly, circumventing the dispatcher filter | Outbound gateway — all `nylasClient.sendMessage()` calls go through it |
 | **Impersonation of CEO** | Attacker sends email claiming to be the CEO, triggers a high-sensitivity action | Caller verification — cross-channel challenge/response for elevated skills |
 | **Display name spoofing** | Reply-To header set to `Jane Doe <attacker@evil.com>` | Display name sanitization — strip or flag mismatched display names |
@@ -50,8 +52,9 @@ message must pass through it regardless of origin.
 **Pipeline (in order):**
 1. **Blocked contact check** — reject immediately if the recipient is blocked
 2. **Content filter** — run the two-stage filter pipeline (see below)
-3. **Channel dispatch** — route to the appropriate channel client (`email` → Nylas, etc.)
-4. **Audit emission** — on successful wire-level delivery, emit `outbound.delivered`
+3. **Relay budget** — a send to the principal alone that an outside contact caused counts against that contact's hourly budget; over it, the message goes to the principal's digest instead (#1320, spec 14)
+4. **Channel dispatch** — route to the appropriate channel client (`email` → Nylas, etc.)
+5. **Audit emission** — on successful wire-level delivery, emit `outbound.delivered`
 
 The gateway fails closed: if the content filter crashes, the message is blocked. A channel
 client failure returns a structured error; it does not silently drop the message.
@@ -156,6 +159,8 @@ the token for visibility; it does not block.
 
 A multi-stage pipeline that runs on every outbound message to an external recipient: Stage 1 (deterministic rules), Stage 2 (LLM audience-leak judge), and Stage 2.5 (tier-keyed disclosure gate). Each stage can block; later stages run only if earlier ones pass.
 
+Under `autonomy.gating: band` (#2159, [ADR-049](../adr/049-band-driven-autonomy.md)) the `contact-data-leak` rule and Stage 2.5 are off, and the gateway's band send review runs after Stage 2 instead; see [spec 14 → Band gating](14-autonomy-engine.md#band-gating-2159). Everything below about those two applies under `tier`, the default.
+
 ### Stage 1: Deterministic Rules (implemented)
 
 Fast, zero-cost pattern matching. Any finding from Stage 1 blocks immediately — Stage 2 is skipped.
@@ -192,7 +197,7 @@ value — so the secret does not re-leak into the `outbound.blocked` audit event
   the SOLE recipient (a private channel). The judge model therefore only ever sees messages
   with at least one non-principal recipient, and the prompt does not reason about the
   principal-sole case. Principal + third parties → judge runs.
-- **Model.** Configurable via `filter.llmJudge.model` (default `claude-haiku-4-5`).
+- **Model.** Configurable via `filter.llmJudge.model` (default `claude-haiku-5-5`).
   Operators are strongly encouraged to use a different vendor/family than the agent tiers
   so an attack crafted for the coordinator cannot also fool the reviewer.
 - **Failure handling** (`filter.llmJudge.failMode`, default `split`): a judge that is
@@ -231,7 +236,7 @@ the blocked body onto `outbound.no_reply.abandonedContent`. There is no review-a
 resend flow yet (see *What's Not Here Yet*), so a false positive currently means the agent's send
 is dropped and must be re-requested.
 
-### Stage 2.5: Escalation Judge — tier-keyed disclosure gate (implemented)
+### Stage 2.5: Escalation Judge — tier-keyed disclosure gate (implemented; `autonomy.gating: tier` only)
 
 Stages 1 and 2 catch *leaked internal content*. Stage 2.5 catches *over-disclosure to a recipient who isn't trusted enough to receive it* — sharing the principal's availability with an unknown sender, or another contact's details with someone who has no business seeing them. It runs only if Stages 1 and 2 both pass (#948, #949).
 
@@ -265,6 +270,18 @@ raw plus its URL- and HTML-encoded variants — from the returned page content, 
 and any error messages, so a hostile page cannot reflect the injected credential back into the
 model's context. Screenshots are suppressed on any action that fills a secret, since an image
 cannot be value-redacted. See [spec 03 — Output Sanitization](03-tools-and-execution.md#output-sanitization).
+
+### Sign-in code scrub (#2017)
+
+A one-time sign-in code is not something the content filter can catch. Stage 1 `SECRET_PATTERNS` do not match a six-digit code, and the Stage 2 judge is skipped when the principal is the sole recipient and fails open when unreachable. So the judge is no longer the only line for these codes, and the scrub below does not depend on it. It exists because a delegated sign-in ([ADR-050](../adr/050-external-verifications-as-first-class-state.md)) legitimately moves a code through the coordinator, and the code must go only into the challenge that asked for it.
+
+An in-memory tracker holds the code values of live sign-in verifications (registered when `web-browser` types one, when the principal relays one on an inbound while an `sms` or `app` verification is open, and when ceo-inbox returns one for an `email` verification). Every tracked value is then **replaced with `[sign-in code]`, not blocked**, on three paths:
+
+- **Tool inputs.** The execution layer scrubs every string of every tool's input, default-deny, except `web-browser` ([spec 03](03-tools-and-execution.md#sign-in-code-scrub-2017)). That covers progress notes, scheduled-job payloads, documents, reports to the principal, memory writes and every send skill. A send containing a code goes out with `[sign-in code]` in its place; the turn does not fail.
+- **Replies.** The dispatcher scrubs the coordinator's reply and its note for the principal once, at the top of `handleAgentResponse`, so every relay path built from them (rewrites, approvals, bullpen filing, no-reply audit records) carries the scrubbed text. **This is a deliberate deviation from the design's "outbound filter Stage 1" placement.** Stage 1 only blocks, and the principal chose replace-not-block, so the rule lives where the reply is still editable. Stage 1 is unchanged.
+- **Extraction.** The checkpoint transcript is scrubbed before fact and relationship extraction, so a code never becomes a knowledge-graph fact.
+
+The raw stored message record (working memory, `audit_log`, `llm_call_archive`) is not scrubbed: the principal accepts single-use codes there. Over-capture within the narrow window of an open verification is accepted (a stray 6–8 character number in the code reply is masked); under-capture is the failure to avoid. The tracker is in memory, so a restart drops tracked values.
 
 ### Bulk Export Gates (#201)
 

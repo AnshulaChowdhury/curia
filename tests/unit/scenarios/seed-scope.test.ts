@@ -3,15 +3,30 @@ import { describe, expect, it } from 'vitest';
 import type { BullpenService } from '../../../src/memory/bullpen.js';
 import type { OutboundContextRow, OutboundContextService } from '../../../src/dispatch/outbound-context.js';
 import { createCaseContext, newAttempt, type CaseAttempt } from '../../shared/case-scope.js';
-import { scopedBullpen, scopedOutboundContext, scopedPrincipalBacklog, SeedScope, seedConflictKeys } from '../../scenarios/seed.js';
+import type { VerificationRuntime } from '../../../src/verification/index.js';
+import type { Verification } from '../../../src/verification/types.js';
+import {
+  scopedBrowserSessionAlive,
+  scopedBullpen,
+  scopedOutboundContext,
+  scopedPrincipalBacklog,
+  scopedVerification,
+  SCENARIO_IDENTITY_LABEL,
+  removeSeededPrincipalIdentities,
+  SeedScope,
+  seedConflictKeys,
+  seedPrincipalIdentity,
+} from '../../scenarios/seed.js';
+import type { DbPool } from '../../../src/db/connection.js';
 import type { ScenarioCase } from '../../scenarios/types.js';
 
 type RunState = CaseAttempt & { scope: SeedScope };
 
-function run(label: string, threadIds: string[], entryIds: string[] = []): RunState {
+function run(label: string, threadIds: string[], entryIds: string[] = [], verificationIds: string[] = []): RunState {
   const scope = new SeedScope();
   for (const id of threadIds) scope.threadIds.add(id);
   for (const id of entryIds) scope.entryIds.add(id);
+  for (const id of verificationIds) scope.verificationIds.add(id);
   return { ...newAttempt(label), scope };
 }
 
@@ -121,14 +136,165 @@ describe('scopedOutboundContext: the ExecutionLayer\'s view (#2027)', () => {
   });
 });
 
+describe('scopedVerification (#2017)', () => {
+  const context = createCaseContext<RunState>();
+  const currentScope = () => context.current()?.scope;
+  const row = (id: string, site: string, status: Verification['status'] = 'pending') =>
+    ({ id, site, status, delivery: 'sms', browserSessionId: `s-${id}` }) as unknown as Verification;
+
+  function fakeRuntime() {
+    const rows = new Map([['v-a', row('v-a', 'a.ca')], ['v-real', row('v-real', 'real.ca')]]);
+    const closed: string[] = [];
+    const opened: string[] = [];
+    let listed = 0;
+    const real = {
+      service: {
+        config: { emailWaitSeconds: 180 },
+        get: async (id: string) => rows.get(id) ?? null,
+        liveForTask: async () => rows.get('v-real')!,
+      },
+      tracker: {},
+      open: async (input: { site: string }) => {
+        opened.push(input.site);
+        const existing = [...rows.values()].find(r => r.site === input.site && r.status === 'pending');
+        if (existing) return { verification: existing, reused: true };
+        rows.set('v-new', row('v-new', input.site));
+        return { verification: rows.get('v-new')!, reused: false };
+      },
+      listActive: async () => { listed++; return [...rows.values()]; },
+      close: async (id: string) => { closed.push(id); return rows.get(id) ?? null; },
+      askChannel: () => 'signal',
+    } as unknown as VerificationRuntime;
+    return { view: scopedVerification(real, currentScope), closed, opened, listed: () => listed };
+  }
+  const openInput = (site: string) =>
+    ({ purpose: 'sign_in', kind: 'code', delivery: 'sms', site, pageDomain: site, browserSessionId: 's' }) as const;
+
+  it('lists only the run\'s rows, through production\'s listActive, and nothing outside a run', async () => {
+    const { view, listed } = fakeRuntime();
+    const ids = await context.run(run('A', [], [], ['v-a']), async () => (await view.listActive()).map(v => v.id));
+    expect(ids).toEqual(['v-a']);
+    expect(listed()).toBe(1);
+    expect(await view.listActive()).toEqual([]);
+    expect(view.service.config.emailWaitSeconds).toBe(180);
+    expect(view.askChannel()).toBe('signal');
+  });
+
+  it('reads and closes only the run\'s rows', async () => {
+    const { view, closed } = fakeRuntime();
+    await context.run(run('A', [], [], ['v-a']), async () => {
+      expect(await view.service.get('v-real')).toBeNull();
+      expect(await view.service.liveForTask('t-1')).toBeNull();
+      expect(await view.close('v-real', 'satisfied')).toBeNull();
+      expect(await view.close('v-a', 'satisfied')).toMatchObject({ id: 'v-a' });
+    });
+    expect(closed).toEqual(['v-a']);
+    await expect(view.service.listActive()).rejects.toThrow(/through the runtime/);
+  });
+
+  it('adds an opened row to the run, and refuses another\'s pending row for the site', async () => {
+    const { view } = fakeRuntime();
+    const state = run('A', [], [], []);
+    await context.run(state, async () => {
+      expect((await view.open(openInput('new.ca'))).verification.id).toBe('v-new');
+      await expect(view.open(openInput('real.ca'))).rejects.toThrow(/already has a pending verification outside this run/);
+    });
+    expect([...state.scope.verificationIds]).toEqual(['v-new']);
+    await expect(view.open(openInput('x.ca'))).rejects.toThrow(/outside every run/);
+  });
+
+  it('refuses another\'s pending row for the site before production open touches it', async () => {
+    // Production's reuse refreshes the row's session, page domain, delivery and expiry, so
+    // refusing only after open() would already have rewritten another run's challenge.
+    const { view, opened } = fakeRuntime();
+    await context.run(run('A', [], [], ['v-a']), async () => {
+      await expect(view.open(openInput('real.ca'))).rejects.toThrow(/already has a pending verification outside this run/);
+      // Matched by registrable domain, so a URL or subdomain for the site is refused too.
+      await expect(view.open(openInput('https://login.real.ca/mfa'))).rejects.toThrow(/outside this run/);
+      // The run's own pending row is reused through production as before.
+      expect((await view.open(openInput('a.ca'))).reused).toBe(true);
+    });
+    expect(opened).toEqual(['a.ca']);
+  });
+
+  it('reads only the run\'s seeded sessions as alive', async () => {
+    const alive = scopedBrowserSessionAlive(currentScope);
+    const state = run('A', [], [], []);
+    state.scope.aliveSessions.add('s-1');
+    expect(await context.run(state, async () => [alive('s-1'), alive('s-2')])).toEqual([true, false]);
+    expect(alive('s-1')).toBe(false);
+  });
+});
+
+describe('seed.principal_identities (#2017)', () => {
+  /** A pool over an in-memory identity table: just the three statements the seed issues. */
+  function fakePool(rows: Array<{ id: string; contact_id: string; channel: string; status: string; label: string | null }>) {
+    const pool = {
+      query: async (sql: string, params: unknown[]) => {
+        if (sql.startsWith('SELECT')) {
+          const [contactId, channel] = params as [string, string];
+          return { rows: rows.filter(r => r.contact_id === contactId && r.channel === channel && r.status === 'active') };
+        }
+        if (sql.startsWith('INSERT')) {
+          const [contactId, channel, , label] = params as [string, string, string, string];
+          const row = { id: `i-${rows.length}`, contact_id: contactId, channel, status: 'active', label };
+          rows.push(row);
+          return { rows: [{ id: row.id }] };
+        }
+        const [ids, label] = params as [string[], string];
+        const before = rows.length;
+        rows.splice(0, rows.length, ...rows.filter(r => !(ids.includes(r.id) && r.label === label)));
+        return { rows: [], rowCount: before - rows.length };
+      },
+    } as unknown as DbPool;
+    return pool;
+  }
+
+  it('adds a marked, verified identity only when the principal has none on the channel, and removes only that one', async () => {
+    const rows = [{ id: 'real-email', contact_id: 'p', channel: 'email', status: 'active', label: 'primary' }];
+    const pool = fakePool(rows);
+    const added = await seedPrincipalIdentity(pool, 'p', { channel: 'signal', identifier: '+15555550142' });
+    expect(added).toBe('i-1');
+    expect(rows[1]).toMatchObject({ channel: 'signal', label: SCENARIO_IDENTITY_LABEL });
+    // The principal's own identity on a channel is used as it is.
+    expect(await seedPrincipalIdentity(pool, 'p', { channel: 'email', identifier: 'x@example.test' })).toBeNull();
+    expect(rows).toHaveLength(2);
+
+    await removeSeededPrincipalIdentities(pool, ['i-1', 'real-email']);
+    expect(rows.map(r => r.id)).toEqual(['real-email']);
+  });
+
+  it('names the channel, so two cases adding an identity there never overlap', () => {
+    const scenario = { seed: { contacts: [], verifications: [], principalIdentities: [{ channel: 'signal', identifier: '+1' }] } } as unknown as ScenarioCase;
+    expect(seedConflictKeys(scenario)).toEqual(['principal-identity:signal']);
+  });
+});
+
 describe('seedConflictKeys', () => {
-  const scenario = (contacts: Array<{ displayName: string; identifier: string }>) => ({
-    seed: { contacts: contacts.map((c, i) => ({ key: `c${i}`, tier: 'known', channel: 'email', ...c })), outboundContext: [], bullpen: [] },
+  const scenario = (
+    contacts: Array<{ displayName: string; identifier: string }>,
+    verifications: Array<{ site: string; status: string }> = [],
+  ) => ({
+    seed: {
+      contacts: contacts.map((c, i) => ({ key: `c${i}`, tier: 'known', channel: 'email', ...c })),
+      outboundContext: [],
+      bullpen: [],
+      verifications,
+      principalIdentities: [],
+    },
   }) as unknown as ScenarioCase;
 
   it('names each seeded identity and display name, case-insensitively', () => {
     expect(seedConflictKeys(scenario([{ displayName: 'Priya Shah', identifier: 'Priya@Example.test' }])))
       .toEqual(['identity:email:priya@example.test', 'name:priya shah']);
     expect(seedConflictKeys(scenario([]))).toEqual([]);
+  });
+
+  it('names the site of each seeded verification, whatever its status, by registrable domain (#2017)', () => {
+    // Seeding opens every row as pending first, so an expired one collides too.
+    expect(seedConflictKeys(scenario([], [
+      { site: 'Login.Example-Insurer.ca', status: 'pending' },
+      { site: 'aircanada.com', status: 'expired' },
+    ]))).toEqual(['verification-site:example-insurer.ca', 'verification-site:aircanada.com']);
   });
 });

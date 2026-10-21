@@ -3,6 +3,7 @@ import type { ErrorType } from '../errors/types.js';
 import type { ContactTier, DedupConfidence, SystemRole, TrustLevel } from '../contacts/types.js';
 import type { Sensitivity, NodeType } from '../memory/types.js';
 import type { ActionRisk } from '../skills/types.js';
+import type { ReasoningEffort } from '../agents/llm/sampling-options.js';
 
 // -- Base event shape --
 // Every event on the bus shares these fields; parentEventId forms the causal chain.
@@ -220,6 +221,12 @@ interface OutboundMessagePayload {
    * Set by the dispatcher after content-filter retries are exhausted (#1355).
    */
   contentBlockSalvage?: boolean;
+  /**
+   * True when the principal approved this exact text (#2159). Set only by the
+   * dispatcher-relay skill, which approve-action re-invokes. Adapters send it as
+   * humanApproved, so band review does not hold an approved reply a second time.
+   */
+  principalApproved?: boolean;
 }
 
 // OutboundDeliveredPayload — emitted by OutboundGateway after a successful
@@ -351,28 +358,28 @@ interface OutboundNoReplyPayload {
 // dispatchEmail() bypass. See #206.
 //
 // notificationType discriminates between alert categories:
-//   - 'blocked_content': principal alert that an outbound message was blocked by the content filter
+//   - 'blocked_content': no longer emitted (#2159: block notices go to the digest queue); kept for historical audit rows
 //   - 'contact_rate_limited': principal alert that contact auto-creation was throttled due to rate limits
 //   - 'approval_requested':   principal alert that an autonomy gate blocked a skill and approval is needed
-//   - 'approval_expired':     principal alert that pending approvals expired without response (ApprovalExpirySweep, #2013)
+//   - 'approval_expired':     no longer emitted (#2159: expiries go to the digest queue); kept for historical audit rows
 //   - 'schedule_suspended': principal alert that a scheduled job was auto-suspended after consecutive failures (#538)
 //   - 'schedule_recovered': principal alert that a stuck job was auto-recovered (reset to pending or suspended) (#207)
 //   - 'learning_proposal':  principal alert surfacing a learning-digest item (voice-guide proposal or sent-mail
 //                           task-completion undo/confirm) event-driven when produced, after #1464 removed
 //                           the scheduled digest that used to surface them (#1466)
 //   - 'database_unavailable': principal alert that Postgres has been unreachable for >5 minutes (#1381)
-//   - 'principal_note':     a note for the principal cut out of a reply to someone else (prompt trim PR 5)
+//   - 'principal_note':     no longer emitted (#2159: notes go to the digest queue); kept for historical audit rows
 export interface OutboundNotificationPayload {
   notificationType:
-    | 'blocked_content'
+    | 'blocked_content'         // no longer emitted (#2159); kept for historical audit rows
     | 'contact_rate_limited'
     | 'approval_requested'
-    | 'approval_expired'        // batched expiry notification (ApprovalExpirySweep, #2013)
+    | 'approval_expired'        // no longer emitted (#2159); kept for historical audit rows
     | 'schedule_suspended'      // scheduled job auto-suspended after consecutive failures (#538)
     | 'schedule_recovered'      // stuck job auto-recovered after exceeding timeout threshold (#207)
     | 'learning_proposal'       // learning-digest item surfaced event-driven when produced (#1466)
     | 'database_unavailable'  // Postgres unreachable beyond escalation threshold (#1381)
-    | 'principal_note';       // note for the principal from a reply to someone else (prompt trim PR 5)
+    | 'principal_note';       // no longer emitted (#2159); kept for historical audit rows
   /** Recipient email for this notification (always the principal email today). */
   ceoEmail: string;
   subject: string;
@@ -657,6 +664,27 @@ interface LlmCallPayload {
    * cannot become ambiguous in audit_log.
    */
   temperature?: number | null;
+  /**
+   * Reasoning tokens the provider reported, a subset of `outputTokens`.
+   * `null` when the provider reported no count. Optional for test fixtures,
+   * like `temperature` (ADR-048).
+   */
+  reasoningTokens?: number | null;
+  /**
+   * Reasoning effort sent on the provider request. `null` means the request
+   * sent none, so the provider default applied.
+   */
+  reasoningEffort?: ReasoningEffort | null;
+  /**
+   * Upstream endpoint that served an OpenRouter call (OpenRouter's `provider`
+   * field, e.g. 'DeepSeek' or 'CoreWeave'). `null` for other providers.
+   */
+  upstreamProvider?: string | null;
+  /**
+   * Passed-back reasoning blocks the provider dropped from this request because
+   * the request prefix changed (ADR-048 §1, prefix guard). 0 when none.
+   */
+  reasoningBlocksDropped?: number;
 }
 
 // ModelFallbackEngagedPayload — emitted by the agent runtime when the primary
@@ -900,6 +928,20 @@ interface AutonomySendBlockedPayload {
   requiredScore: number;
   agentId?: string;
   taskEventId?: string;
+}
+
+// AutonomyRelayDeferredPayload — published by the outbound gateway when a relay to the
+// principal that an outside contact caused was over that contact's relay budget and went to
+// the digest instead (#1320). Names the originator, never the message.
+export interface AutonomyRelayDeferredPayload {
+  originatorContactId: string;
+  /** The originator's tier; a missing tier is reported as 'unknown'. */
+  tier: ContactTier;
+  channel: string;
+  conversationId?: string;
+  taskEventId?: string;
+  /** Whether the once-per-window "holding them for your digest" line went out with it. */
+  noticeSent: boolean;
 }
 
 // HumanDecisionPayload — emitted by the dispatch layer when a human approves, denies, or
@@ -1493,6 +1535,42 @@ export interface DelegationPrincipalNoteEvent extends BaseEvent {
   payload: DelegationPrincipalNotePayload;
 }
 
+// PrincipalReportPayload — an item for the principal's next digest (#2159): something Curia
+// did on the principal's behalf, a notice (a note cut from a reply, a blocked send), or an
+// approval waiting or expired. Recorded in audit_log only; ReportQueue reads it back for
+// the digest and the weekly fallback. Never delivered on its own — the digest carries it.
+export type PrincipalReportUrgency = 'digest' | 'now';
+/** What produced the item. Agents use 'agent'; system paths name themselves. */
+export type PrincipalReportSource =
+  | 'agent'
+  | 'principal_note'
+  | 'blocked_content'
+  | 'approval_pending'
+  | 'approval_expired'
+  | 'gate_proceeded'       // band gating let through an action the tier policy would have held (#2159)
+  | 'sent_without_review'  // the judge was unavailable at 80+, so the send went out unreviewed (#2159)
+  | 'claim_trimmed'        // unverified statements were cut from a send after one bounce (#2159)
+  | 'relay_deferred';      // an outside contact used up their relay budget; the relay waits here (#1320)
+export interface PrincipalReportPayload {
+  /** One or two sentences, written for the principal. */
+  summary: string;
+  /** 'now' marks an item the principal was also pinged about directly. */
+  urgency: PrincipalReportUrgency;
+  source: PrincipalReportSource;
+  /** The thread or task this concerns, when there is one. */
+  conversationId?: string;
+  /** e.g. a console task URL. */
+  link?: string;
+  /** The approval's short_ref, for approval_* items. */
+  actionShortRef?: string;
+}
+
+export interface PrincipalReportEvent extends BaseEvent {
+  type: 'principal.report';
+  sourceLayer: 'dispatch' | 'system' | 'execution';
+  payload: PrincipalReportPayload;
+}
+
 // SecretCapturedEvent — published by the capture endpoint (trusted system infra) when a
 // one-time link is redeemed (#972). sourceLayer 'system' because the capture endpoint
 // self-authorizes via the token and writes to the vault, like the scheduler emitting its
@@ -1517,6 +1595,14 @@ export interface AutonomySendBlockedEvent extends BaseEvent {
   type: 'autonomy.send_blocked';
   sourceLayer: 'dispatch';
   payload: AutonomySendBlockedPayload;
+}
+
+// AutonomyRelayDeferredEvent — the gateway held a relay to the principal for the digest
+// because its outside originator was over the relay budget (#1320).
+export interface AutonomyRelayDeferredEvent extends BaseEvent {
+  type: 'autonomy.relay_deferred';
+  sourceLayer: 'dispatch';
+  payload: AutonomyRelayDeferredPayload;
 }
 
 interface ConversationCheckpointPayload {
@@ -1733,8 +1819,10 @@ export type BusEvent =
   | DelegationLateResolvedEvent // #1799: a late specialist response was delivered, recorded, or lost
   | DelegationRequesterContextEvent // #1859: identity evidence rendered into a delegated specialist prompt
   | DelegationPrincipalNoteEvent // #1990: a sender reply's note for the principal, kept out of the reply
+  | PrincipalReportEvent     // #2159: an item for the principal's digest (report queue)
   | AutonomyToolBlockedEvent  // Autonomy Phase 2: skill blocked by action_risk gate
   | AutonomySendBlockedEvent   // Autonomy Phase 2: outbound send blocked by score < 70 gate
+  | AutonomyRelayDeferredEvent // #1320: a relay to the principal went to the digest (relay budget)
   | EmbeddingCallEvent         // #654: embedding API call cost telemetry
   | EmbeddingErrorEvent        // #434: failed embedding call — used by HealthService for health tracking
   | TaskCreatedEvent           // Tasks v1: task created via task-create skill (#835)
@@ -2419,6 +2507,23 @@ export function createDelegationPrincipalNote(
   };
 }
 
+export function createPrincipalReport(
+  // sourceLayer is the publishing layer: dispatch for the dispatcher, gateway and report
+  // tools; system for interval jobs such as the approval expiry sweep; execution for Gate C
+  // under band gating (#2159).
+  payload: PrincipalReportPayload & { parentEventId: string; sourceLayer: 'dispatch' | 'system' | 'execution' },
+): PrincipalReportEvent {
+  const { parentEventId, sourceLayer, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'principal.report',
+    sourceLayer,
+    payload: rest,
+    parentEventId,
+  };
+}
+
 export function createAutonomySkillBlocked(
   payload: AutonomySkillBlockedPayload,
   parentEventId?: string,
@@ -2441,6 +2546,20 @@ export function createAutonomySendBlocked(
     id: randomUUID(),
     timestamp: new Date(),
     type: 'autonomy.send_blocked',
+    sourceLayer: 'dispatch',
+    payload,
+    parentEventId,
+  };
+}
+
+export function createAutonomyRelayDeferred(
+  payload: AutonomyRelayDeferredPayload,
+  parentEventId?: string,
+): AutonomyRelayDeferredEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'autonomy.relay_deferred',
     sourceLayer: 'dispatch',
     payload,
     parentEventId,

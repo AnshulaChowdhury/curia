@@ -24,6 +24,7 @@ import type { AgentRegistry } from '../agents/agent-registry.js';
 import type { LLMProvider, LLMUsage, ToolDefinition } from '../agents/llm/provider.js';
 import type { ModelRouter, Tier } from '../agents/llm/model-router.js';
 import type { ModelRegistry } from '../agents/llm/model-registry.js';
+import type { ReasoningSetting } from '../agents/llm/sampling-options.js';
 import { DEFAULT_SAFETY_MARGIN } from '../agents/llm/token-estimator.js';
 import { AutonomyService } from '../autonomy/autonomy-service.js';
 import type { OfficeIdentityService } from '../identity/service.js';
@@ -46,6 +47,7 @@ import type { ConversationEntityState } from '../entity-context/conversation-ent
 import type { WorkingDocsRepo } from '../db/working-docs-repo.js';
 import type { TaskRepo } from '../db/task-repo.js';
 import { DEFAULT_ERROR_BUDGET } from '../errors/types.js';
+import type { VerificationRuntime } from '../verification/index.js';
 
 /** Discovery tools injected for agents with `allow_discovery: true`. */
 const DISCOVERY_TOOLS = ['tool-registry', 'skill-activate'] as const;
@@ -94,6 +96,10 @@ export interface AgentModelBinding {
   tier: Tier;
   fallbackModel: string;
   fallbackProvider: LLMProvider;
+  /** The primary tier's reasoning setting for agent turns (ADR-048 §3). */
+  reasoning?: ReasoningSetting;
+  /** The fallback tier's own setting, used when the fallback model serves a turn. */
+  fallbackReasoning?: ReasoningSetting;
 }
 
 /**
@@ -150,6 +156,8 @@ export function resolveAgentModelBinding(agentConfig: AgentYamlConfig, deps: Mod
     tier: resolved.tier,
     fallbackModel: fallbackResolved.model,
     fallbackProvider,
+    ...(resolved.reasoning !== undefined ? { reasoning: resolved.reasoning } : {}),
+    ...(fallbackResolved.reasoning !== undefined ? { fallbackReasoning: fallbackResolved.reasoning } : {}),
   };
 }
 
@@ -202,6 +210,8 @@ export type SystemPromptSourceContext = Pick<
   | 'principalIdentities'
   | 'principalPrimaryEmail'
   | 'agentContactId'
+  | 'verification'
+  | 'browserSessionAlive'
 >;
 
 /**
@@ -221,6 +231,8 @@ export const SYSTEM_PROMPT_SOURCE_CONTEXT_KEYS = [
   'principalIdentities',
   'principalPrimaryEmail',
   'agentContactId',
+  'verification',
+  'browserSessionAlive',
 ] as const satisfies readonly (keyof SystemPromptSourceContext)[];
 
 type UnlistedSourceContextKey = Exclude<
@@ -259,9 +271,11 @@ export function resolveSystemPromptSources(
     // All agents receive the per-turn time block. Specialists need a reliable "now"
     // too — scheduled agents make time-sensitive decisions (backoff gates, date math).
     timezone: ctx.timezone,
-    // Coordinator-only: the identity block is prepended per turn, so identity
-    // hot-reloads (file watcher or API PUT) apply on the next turn without a restart.
-    officeIdentityService: isCoordinator ? ctx.officeIdentityService : undefined,
+    // Every agent (#2143): the office has one voice, and every agent that writes outward
+    // uses it. The coordinator gets the identity block, every other agent the writes-as
+    // block (buildBaseSystemPrompt). Prepended per turn, so identity edits apply on the
+    // next turn without a restart.
+    officeIdentityService: ctx.officeIdentityService,
     // Coordinator-only: specialists operate in a trust-elevated context (tasks arrive
     // from the coordinator after the security layer has evaluated the sender). The
     // runtime states that contract on delegated tasks (#1871); withholding this
@@ -282,6 +296,10 @@ export function resolveSystemPromptSources(
     // Coordinator-only own contact ID in "## Your Contact Details". Specialists keep
     // the ${agent_contact_id} bootstrap placeholder.
     agentContactId: isCoordinator ? ctx.agentContactId : undefined,
+    // Live sign-in verifications (#2017): coordinator and ceo-inbox only. ceo-inbox reads the
+    // code emails; no other agent is told a sign-in is in flight.
+    verification: isCoordinator || agentConfig.name === 'ceo-inbox' ? ctx.verification : undefined,
+    browserSessionAlive: isCoordinator || agentConfig.name === 'ceo-inbox' ? ctx.browserSessionAlive : undefined,
     // Map YAML snake_case to AgentConfig camelCase, defaulting omitted fields.
     errorBudget: agentConfig.error_budget ? {
       maxTurns: agentConfig.error_budget.max_turns ?? DEFAULT_ERROR_BUDGET.maxTurns,
@@ -315,6 +333,10 @@ export interface AgentAssemblyContext {
   principalPrimaryEmail: PrincipalPrimaryEmailRef;
   agentContactId?: string;
   principalContactId?: string;
+  /** Delegated sign-in verifications (#2017); injected per turn into the coordinator and ceo-inbox. */
+  verification?: VerificationRuntime;
+  /** True while a browser session id is live. Absent when no browser service runs. */
+  browserSessionAlive?: (sessionId: string) => boolean;
   defaultDelegateTimeoutMs?: number;
   lateDelivery: { ttlMinutes: number; sweepIntervalMinutes: number };
   bullpenService?: BullpenService;
@@ -426,6 +448,8 @@ export function assembleAgent(agentConfig: AgentYamlConfig, ctx: AgentAssemblyCo
     tier: binding.tier,
     fallbackModel: binding.fallbackModel,
     fallbackProvider: binding.fallbackProvider,
+    ...(binding.reasoning !== undefined ? { reasoning: binding.reasoning } : {}),
+    ...(binding.fallbackReasoning !== undefined ? { fallbackReasoning: binding.fallbackReasoning } : {}),
     bus: ctx.bus,
     logger,
     memory: ctx.memory,

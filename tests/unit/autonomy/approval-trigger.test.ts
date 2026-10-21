@@ -2,14 +2,16 @@
 //
 // Tests are structured in two groups:
 //   1. Pure functions (generateShortRef, buildDescription) — no mocks needed
-//   2. request() method — mocks ActionLogRepo and OutboundGateway
+//   2. request() method — mocks ActionLogRepo, the bus and ApprovalDelivery. It notifies no
+//      one: the agent delivers the approval on one channel (#2159).
 
 import { describe, it, expect, vi } from 'vitest';
-import { generateShortRef, buildDescription, ApprovalTriggerService } from '../../../src/autonomy/approval-trigger.js';
+import { generateShortRef, buildDescription, approvalAdvisory, ApprovalTriggerService } from '../../../src/autonomy/approval-trigger.js';
 import type { ActionLogRepo } from '../../../src/autonomy/action-log-repo.js';
-import type { OutboundGateway } from '../../../src/skills/outbound-gateway.js';
-import type { ContactService } from '../../../src/contacts/contact-service.js';
-import { createSilentLogger } from '../../../src/logger.js';
+import type { ApprovalDelivery } from '../../../src/autonomy/approval-delivery.js';
+import type { EventBus } from '../../../src/bus/bus.js';
+import type { BusEvent, PrincipalReportEvent } from '../../../src/bus/events.js';
+import type { Logger } from '../../../src/logger.js';
 
 describe('generateShortRef', () => {
   it('returns an 8-char lowercase hex string', () => {
@@ -50,6 +52,36 @@ describe('buildDescription', () => {
     expect(desc).toContain('Dana prefers mornings');
   });
 
+  // Spot-check pool tools (#2159 Phase 3): a pool summary of "Run ceo-inbox-archive" tells
+  // the principal nothing, and the row's description is fixed once written.
+  it.each([
+    ['ceo-inbox-archive', { message_id: 'm-1' }, 'Archive an email'],
+    ['email-archive', { message_id: 'm-1', account: 'work' }, 'Archive an email'],
+    ['ceo-inbox-label', { message_id: 'm-1' }, 'Label an email'],
+    ['email-label', { message_id: 'm-1' }, 'Label an email'],
+    ['contact-merge', { primary_contact_id: 'a', secondary_contact_id: 'b' }, 'Merge contacts'],
+    ['contact-set-tier', { contact_id: 'a', tier: 'trusted' }, 'Change a contact\'s trust tier'],
+    ['contact-set-role', { contact_id: 'a', role: 'Board member' }, 'Change a contact\'s role'],
+    ['executive-profile-update', { writing_voice: { tone: ['warm'] } }, 'Update the principal\'s profile'],
+    ['calendar-create-hold', { calendarId: 'c1', start: 's', end: 'e' }, 'Place a calendar hold'],
+  ])('describes %s', (tool, input, expected) => {
+    expect(buildDescription(tool, input)).toBe(expected);
+  });
+
+  it('appends the labels applied by a label tool', () => {
+    expect(buildDescription('ceo-inbox-label', { message_id: 'm-1', labels: ['🚨 Urgent', 'BOARD'] }))
+      .toBe('Label an email: 🚨 Urgent, BOARD');
+    expect(buildDescription('email-label', { message_id: 'm-1', label: 'Receipts' }))
+      .toBe('Label an email: Receipts');
+  });
+
+  it('appends a calendar hold\'s title', () => {
+    expect(buildDescription('calendar-create-hold', { calendarId: 'c1', title: 'Hold: Q4 review' }))
+      .toBe('Place a calendar hold: Hold: Q4 review');
+    expect(buildDescription('calendar-create-hold', { calendarId: 'c1', subject: 'Intro with Sam' }))
+      .toBe('Place a calendar hold: Intro with Sam');
+  });
+
   it('falls back to "Run {skill_name}" for unknown skills', () => {
     const desc = buildDescription('some-unknown-skill', {});
     expect(desc).toBe('Run some-unknown-skill');
@@ -85,40 +117,27 @@ function makeMockRepo(overrides?: Partial<ActionLogRepo>): ActionLogRepo {
   return {
     findPendingByTaskAndSkill: vi.fn().mockResolvedValue(null),
     insert: vi.fn().mockResolvedValue(1),
-    setNotificationSentAt: vi.fn().mockResolvedValue(undefined),
+    findApprovalNumber: vi.fn().mockResolvedValue(null),
     ...overrides,
   } as unknown as ActionLogRepo;
 }
 
-function makeMockGateway(overrides?: Partial<OutboundGateway>): OutboundGateway {
-  return {
-    sendNotification: vi.fn().mockResolvedValue(true),
-    ...overrides,
-  } as unknown as OutboundGateway;
+function makeService(repo: ActionLogRepo, opts: { publishThrows?: boolean } = {}) {
+  const published: BusEvent[] = [];
+  const bus = {
+    publish: vi.fn(async (_layer: string, event: BusEvent) => {
+      if (opts.publishThrows) throw new Error('bus down');
+      published.push(event);
+    }),
+  } as unknown as EventBus;
+  const approvalDelivery = { registerDisplay: vi.fn() } as unknown as ApprovalDelivery;
+  const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger;
+  const service = new ApprovalTriggerService(repo, logger, bus, approvalDelivery);
+  return { service, bus, published, approvalDelivery, logger };
 }
 
-function makeMockContactService(tier: 'principal' | 'trusted' | 'known' | null = 'principal'): ContactService {
-  return {
-    resolveByChannelIdentity: vi.fn().mockResolvedValue(
-      tier ? { tier } : null,
-    ),
-  } as unknown as ContactService;
-}
-
-function makeService(
-  repo: ActionLogRepo,
-  gateway: OutboundGateway | undefined,
-  ceoEmail?: string,
-  contactService?: ContactService,
-): ApprovalTriggerService {
-  return new ApprovalTriggerService(
-    repo,
-    gateway,
-    createSilentLogger(),
-    ceoEmail,
-    contactService,
-  );
-}
+const reports = (events: BusEvent[]) =>
+  events.filter((e): e is PrincipalReportEvent => e.type === 'principal.report');
 
 const BASE_OPTS = {
   taskId: 'task-1',
@@ -130,185 +149,143 @@ const BASE_OPTS = {
   requiredScore: 80,
 };
 
+describe('approvalAdvisory', () => {
+  it('tells the agent to deliver the approval itself, on one channel', () => {
+    const text = approvalAdvisory('abcd1234');
+    expect(text).toContain('ref: abcd1234');
+    expect(text).toContain('deliver-approval');
+    expect(text).toMatch(/standing preferences/);
+  });
+
+  // deliver-approval is the coordinator's tool; a specialist hands the ref back instead.
+  it('tells a specialist to hand the ref to the coordinator', () => {
+    const text = approvalAdvisory('abcd1234', 'calendar');
+    expect(text).toContain('ref: abcd1234');
+    expect(text).toMatch(/tell the coordinator/i);
+    expect(approvalAdvisory('abcd1234', 'coordinator')).not.toMatch(/tell the coordinator/i);
+  });
+
+  // #2159 Phase 3: the principal answers by number, so the agent should know it. The ref
+  // stays: deliver-approval is keyed on it.
+  it('quotes the approval number when there is one, and keeps the ref', () => {
+    const text = approvalAdvisory('abcd1234', undefined, 3);
+    expect(text).toContain('approval 3');
+    expect(text).toContain('ref: abcd1234');
+    const specialist = approvalAdvisory('abcd1234', 'calendar', 3);
+    expect(specialist).toContain('approval 3');
+    expect(specialist).toContain('abcd1234');
+  });
+
+  it('reads as before without a number', () => {
+    expect(approvalAdvisory('abcd1234', undefined, null)).toBe(approvalAdvisory('abcd1234'));
+    expect(approvalAdvisory('abcd1234', 'calendar', null)).toBe(approvalAdvisory('abcd1234', 'calendar'));
+  });
+});
+
 describe('ApprovalTriggerService.request()', () => {
-  it('creates row, generates short_ref, sends notification, returns created: true', async () => {
+  it('creates the row, queues one digest mention, and notifies no one (#2159)', async () => {
     const repo = makeMockRepo();
-    const gateway = makeMockGateway();
-    const contactService = makeMockContactService('principal');
-    const service = makeService(repo, gateway, 'ceo@example.com', contactService);
+    const { service, bus, published } = makeService(repo);
 
     const result = await service.request(BASE_OPTS);
 
-    expect(result).toMatchObject({
-      created: true,
-      shortRef: expect.stringMatching(/^[0-9a-f]{8}$/),
-      notificationSent: true,
-    });
+    expect(result).toEqual({ created: true, shortRef: expect.stringMatching(/^[0-9a-f]{8}$/), approvalNumber: null });
     expect(repo.insert).toHaveBeenCalledOnce();
-    expect(repo.setNotificationSentAt).toHaveBeenCalledWith(1);
-    expect(gateway.sendNotification).toHaveBeenCalledOnce();
-    // Verify notification payload — type, recipient, subject, and required body fields
-    const notifPayload = (gateway.sendNotification as ReturnType<typeof vi.fn>).mock.calls[0]![0];
-    expect(notifPayload.notificationType).toBe('approval_requested');
-    expect(notifPayload.ceoEmail).toBe('ceo@example.com');
-    expect(notifPayload.subject).toContain('Approval needed');
-    // Body must contain the actual short_ref that was generated
-    if (result.created) {
-      expect(notifPayload.body).toContain(result.shortRef);
-    }
-    expect(notifPayload.body).toMatch(/Expires:/);          // expiry line
-    expect(notifPayload.body).toContain('Reply to approve'); // call to action
-  });
-
-  it('includes action detail in notification body for principal recipient', async () => {
-    const repo = makeMockRepo();
-    const gateway = makeMockGateway();
-    const contactService = makeMockContactService('principal');
-    const service = makeService(repo, gateway, 'ceo@example.com', contactService);
-
-    await service.request({
-      ...BASE_OPTS,
-      toolName: 'signal-send',
-      input: {
-        recipient: '+15550142',
-        message: 'Confirming Thursday at 3pm.',
-      },
+    // The only thing published is the digest item: no email, no chat DM.
+    expect((bus.publish as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(1);
+    const [item] = reports(published);
+    expect(item!.parentEventId).toBe('task-1');
+    expect(item!.payload).toEqual({
+      summary: 'Waiting for your approval: Create calendar event: Lunch with Dana',
+      urgency: 'digest',
+      source: 'approval_pending',
+      conversationId: 'conv-1',
+      actionShortRef: result.created ? result.shortRef : '',
     });
-
-    const notifPayload = (gateway.sendNotification as ReturnType<typeof vi.fn>).mock.calls[0]![0];
-    expect(notifPayload.body).toContain('To: +15550142');
-    expect(notifPayload.body).toContain('Message: Confirming Thursday at 3pm.');
   });
 
-  it('shows displayInput to the principal but stores the agent input for re-execution (#2033)', async () => {
+  it('registers the display for delivery: displayInput shown, agent input stored (#2033)', async () => {
     const repo = makeMockRepo();
-    const gateway = makeMockGateway();
-    const service = makeService(repo, gateway, 'ceo@example.com', makeMockContactService('principal'));
+    const { service, approvalDelivery } = makeService(repo);
     const input = { recipient: '22222222-2222-4222-8222-222222222222', message: 'Confirming Thursday.' };
 
-    await service.request({
+    const result = await service.request({
       ...BASE_OPTS,
       toolName: 'signal-send',
       input,
       displayInput: { ...input, recipient: '+15550142 (contact "Alex Vendor")' },
     });
 
-    const notifPayload = (gateway.sendNotification as ReturnType<typeof vi.fn>).mock.calls[0]![0];
-    expect(notifPayload.body).toContain('To: +15550142');
-    expect(notifPayload.body).not.toContain('22222222-2222');
+    expect(approvalDelivery.registerDisplay).toHaveBeenCalledWith(result.created ? result.shortRef : '', {
+      preamble: expect.stringContaining('Curia wanted to send Signal message'),
+      payload: { ...input, recipient: '+15550142 (contact "Alex Vendor")' },
+      approvalNumber: null,
+    });
     // Approval re-runs the skill with the reference, which it re-resolves then.
     expect((repo.insert as ReturnType<typeof vi.fn>).mock.calls[0]![0].payload).toEqual(input);
   });
 
-  it('omits action detail when notification recipient is below principal tier', async () => {
-    const repo = makeMockRepo();
-    const gateway = makeMockGateway();
-    const contactService = makeMockContactService('trusted');
-    const service = makeService(repo, gateway, 'ceo@example.com', contactService);
-
-    await service.request({
-      ...BASE_OPTS,
-      toolName: 'signal-send',
-      input: {
-        recipient: '+15550142',
-        message: 'Secret message body',
-      },
+  // #2159 Phase 3: insert() allocates the number; the service reads it back by row id.
+  it('returns the approval number read back after insert, and registers it for display', async () => {
+    const repo = makeMockRepo({
+      insert: vi.fn().mockResolvedValue(55),
+      findApprovalNumber: vi.fn().mockResolvedValue(3),
     });
+    const { service, approvalDelivery } = makeService(repo);
 
-    const notifPayload = (gateway.sendNotification as ReturnType<typeof vi.fn>).mock.calls[0]![0];
-    expect(notifPayload.body).not.toContain('Secret message body');
-    expect(notifPayload.body).not.toContain('To: +15550142');
-    expect(notifPayload.body).toContain('Reference:');
+    const result = await service.request(BASE_OPTS);
+
+    expect(repo.findApprovalNumber).toHaveBeenCalledWith(55);
+    expect(result).toEqual({ created: true, shortRef: expect.stringMatching(/^[0-9a-f]{8}$/), approvalNumber: 3 });
+    expect(approvalDelivery.registerDisplay).toHaveBeenCalledWith(
+      result.created ? result.shortRef : '',
+      expect.objectContaining({ approvalNumber: 3 }),
+    );
   });
 
-  it('returns duplicate when matching pending row exists', async () => {
+  // The row exists and works by its reference; a failed read must not lose the approval.
+  it('still creates the approval, unnumbered, when the number cannot be read back', async () => {
+    const repo = makeMockRepo({ findApprovalNumber: vi.fn().mockRejectedValue(new Error('db blip')) });
+    const { service, logger } = makeService(repo);
+
+    const result = await service.request(BASE_OPTS);
+
+    expect(result).toMatchObject({ created: true, approvalNumber: null });
+    expect(logger.warn).toHaveBeenCalled();
+  });
+
+  it('uses the gate reason as the preamble when one is given', async () => {
+    const { service, approvalDelivery } = makeService(makeMockRepo());
+
+    await service.request({ ...BASE_OPTS, reason: "The contact's tier requires approval." });
+
+    expect(approvalDelivery.registerDisplay).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      preamble: "The contact's tier requires approval.",
+    }));
+  });
+
+  it('returns duplicate when matching pending row exists, without a second mention', async () => {
     const repo = makeMockRepo({
       findPendingByTaskAndSkill: vi.fn().mockResolvedValue({ shortRef: 'cal-1' }),
     });
-    const gateway = makeMockGateway();
-    const service = new ApprovalTriggerService(repo, gateway, createSilentLogger(), 'ceo@example.com');
+    const { service, bus, approvalDelivery } = makeService(repo);
 
     const result = await service.request(BASE_OPTS);
 
-    expect(result).toEqual({
-      created: false,
-      reason: 'duplicate',
-      existingShortRef: 'cal-1',
-    });
+    expect(result).toEqual({ created: false, reason: 'duplicate', existingShortRef: 'cal-1' });
     expect(repo.insert).not.toHaveBeenCalled();
-    expect(gateway.sendNotification).not.toHaveBeenCalled();
+    expect(bus.publish).not.toHaveBeenCalled();
+    expect(approvalDelivery.registerDisplay).not.toHaveBeenCalled();
   });
 
-  it('allows different payloads for same skill in same task', async () => {
-    const repo = makeMockRepo({
-      findPendingByTaskAndSkill: vi.fn().mockResolvedValue(null),
-    });
-    const gateway = makeMockGateway();
-    const service = new ApprovalTriggerService(repo, gateway, createSilentLogger(), 'ceo@example.com');
-
-    const result = await service.request({
-      ...BASE_OPTS,
-      input: { title: 'Dinner with Bob' },
-    });
-
-    expect(result).toMatchObject({
-      created: true,
-      shortRef: expect.stringMatching(/^[0-9a-f]{8}$/),
-      notificationSent: true,
-    });
-  });
-
-  it('handles notification failure gracefully', async () => {
+  it('still creates the approval when the digest mention fails to queue', async () => {
     const repo = makeMockRepo();
-    // sendNotification() catches publish errors internally and returns false rather than throwing
-    const gateway = makeMockGateway({
-      sendNotification: vi.fn().mockResolvedValue(false),
-    });
-    const service = new ApprovalTriggerService(repo, gateway, createSilentLogger(), 'ceo@example.com');
+    const { service, logger } = makeService(repo, { publishThrows: true });
 
     const result = await service.request(BASE_OPTS);
 
-    expect(result).toMatchObject({
-      created: true,
-      shortRef: expect.stringMatching(/^[0-9a-f]{8}$/),
-      notificationSent: false,
-    });
-    // Row was still inserted
-    expect(repo.insert).toHaveBeenCalledOnce();
-    // setNotificationSentAt was NOT called (notification failed)
-    expect(repo.setNotificationSentAt).not.toHaveBeenCalled();
-  });
-
-  it('skips notification when ceoEmail is not configured', async () => {
-    const repo = makeMockRepo();
-    const gateway = makeMockGateway();
-    // No ceoEmail
-    const service = new ApprovalTriggerService(repo, gateway, createSilentLogger());
-
-    const result = await service.request(BASE_OPTS);
-
-    expect(result).toMatchObject({
-      created: true,
-      shortRef: expect.stringMatching(/^[0-9a-f]{8}$/),
-      notificationSent: false,
-    });
-    expect(repo.insert).toHaveBeenCalledOnce();
-    expect(gateway.sendNotification).not.toHaveBeenCalled();
-  });
-
-  it('creates row successfully when outboundGateway is undefined', async () => {
-    const repo = makeMockRepo();
-    // No gateway at all — row creation must not depend on the outbound stack
-    const service = new ApprovalTriggerService(repo, undefined, createSilentLogger(), 'ceo@example.com');
-
-    const result = await service.request(BASE_OPTS);
-
-    expect(result).toMatchObject({
-      created: true,
-      shortRef: expect.stringMatching(/^[0-9a-f]{8}$/),
-      notificationSent: false,
-    });
-    expect(repo.insert).toHaveBeenCalledOnce();
+    expect(result.created).toBe(true);
+    expect(logger.error).toHaveBeenCalled();
   });
 
   it('retries on unique_violation (23505) and succeeds with a new random ref', async () => {
@@ -316,16 +293,11 @@ describe('ApprovalTriggerService.request()', () => {
     const insertMock = vi.fn()
       .mockRejectedValueOnce(Object.assign(new Error('unique_violation'), { code: '23505' }))
       .mockResolvedValueOnce(2);
-    const repo = makeMockRepo({ insert: insertMock });
-    const gateway = makeMockGateway();
-    const service = new ApprovalTriggerService(repo, gateway, createSilentLogger(), 'ceo@example.com');
+    const { service } = makeService(makeMockRepo({ insert: insertMock }));
 
     const result = await service.request(BASE_OPTS);
 
     expect(result.created).toBe(true);
-    if (result.created) {
-      expect(result.shortRef).toMatch(/^[0-9a-f]{8}$/);
-    }
     expect(insertMock).toHaveBeenCalledTimes(2);
     // Each attempt uses a freshly generated ref — the two insert calls get different short_refs
     const ref1 = insertMock.mock.calls[0]![0].shortRef as string;
@@ -337,9 +309,7 @@ describe('ApprovalTriggerService.request()', () => {
     const insertMock = vi.fn().mockRejectedValue(
       Object.assign(new Error('unique_violation'), { code: '23505' }),
     );
-    const repo = makeMockRepo({ insert: insertMock });
-    const gateway = makeMockGateway();
-    const service = new ApprovalTriggerService(repo, gateway, createSilentLogger(), 'ceo@example.com');
+    const { service } = makeService(makeMockRepo({ insert: insertMock }));
 
     await expect(service.request(BASE_OPTS)).rejects.toThrow('failed to insert after 3 attempts');
     expect(insertMock).toHaveBeenCalledTimes(3);
@@ -351,8 +321,7 @@ describe('ApprovalTriggerService.request()', () => {
     vi.setSystemTime(FIXED_NOW);
     try {
       const repo = makeMockRepo();
-      const gateway = makeMockGateway();
-      const service = new ApprovalTriggerService(repo, gateway, createSilentLogger(), 'ceo@example.com');
+      const { service } = makeService(repo);
 
       await service.request(BASE_OPTS);
 

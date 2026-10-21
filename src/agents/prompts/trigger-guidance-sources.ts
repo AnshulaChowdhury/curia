@@ -9,6 +9,7 @@
 import { BACKLOG_INSTRUCTION_LINES, PRINCIPAL_TASK_ANSWER_LINES } from './backlog-line.js';
 import { BULLPEN_REPLY_RULE } from './bullpen-reply-rule.js';
 import { CEO_INBOX_WAKE_GUIDANCE } from './ceo-inbox-wake-guidance.js';
+import { NO_MATCHING_TOOL_NEXT_STEP_LINES, WEB_FETCH_NOT_FOUND_LINES } from './dead-end-guidance.js';
 import { DAILY_DEBRIEF_RECAP_LINES, WEEKLY_DEBRIEF_RECAP_LINES } from './debrief-recap-instruction.js';
 import {
   CLARIFICATION_NEXT_STEP_LINES,
@@ -18,6 +19,8 @@ import {
   PAUSED_NEXT_STEP_LINES,
 } from './delegate-result-guidance.js';
 import { TURN_GUIDANCE_TEXTS } from './turn-guidance.js';
+import { HONESTY_LINE, REGISTER_LINE, WRITES_AS_SCOPE_LINES } from '../../identity/service.js';
+import { CONTENT_LINE, LENGTH_EXCEPTION, TURN_LENGTH_REMINDER_TEXTS } from '../../identity/length.js';
 
 /** Newline-joined guidance texts, one marker per line once extracted. */
 export const TRIGGER_GUIDANCE_MARKER_SOURCES: readonly string[] = [
@@ -34,4 +37,13 @@ export const TRIGGER_GUIDANCE_MARKER_SOURCES: readonly string[] = [
   WEEKLY_DEBRIEF_RECAP_LINES.join('\n'),
   // ceo-inbox's task-wake steps (#2025).
   ...Object.values(CEO_INBOX_WAKE_GUIDANCE),
+  // Empty-handed lookups: tool-registry's next_step and web-fetch's 404 (#2149).
+  NO_MATCHING_TOOL_NEXT_STEP_LINES.join('\n'),
+  WEB_FETCH_NOT_FOUND_LINES.join('\n'),
+  // The identity block's fixed lines, and the per-turn length reminders (#2143). The block
+  // is injected at runtime, so its text is not in any agent's prompt template. The
+  // operator's tone.style is deliberately not a source: it holds example lines Curia is
+  // meant to imitate. Band texts shorter than the marker floor are skipped by extraction.
+  [REGISTER_LINE, HONESTY_LINE, LENGTH_EXCEPTION, CONTENT_LINE, ...WRITES_AS_SCOPE_LINES].join('\n'),
+  ...TURN_LENGTH_REMINDER_TEXTS,
 ];

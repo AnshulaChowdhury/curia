@@ -15,7 +15,113 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **`llm.call` prefix-guard drops** — **public API:** optional `reasoningBlocksDropped`; suites also print serving endpoints. (#2044)
+- **`archive-extract`** — opens zip and gzip attachments within size and path limits. (#2208)
+- **Sign-in details with secrets** — `secret-capture-request` stores login URL and username; `list-user-secrets` returns them. (#2201)
+- **`listUserSecretDetails` capability** — new `ToolContext` field returning non-secret sign-in details per `user.*` key. (#2201)
+- **Tier reasoning effort** — **public API (config):** `model_routing.tiers.<tier>.reasoning.effort` for agent turns, validated at boot. (#2044)
+- **`llm.call` reasoning fields** — **public API:** optional `reasoningTokens`, `reasoningEffort`, `upstreamProvider` on the bus event. (#2044)
+- **Suite reasoning metrics** — smoke and scenarios print reasoning tokens and latency p50/p90 per agent. (#2044)
+- **Style scenarios** — seven cases score reply length, filler and register under a fixed office identity. (#2143)
+- **Report queue** — new `principal.report` bus event and `reports` tools collect digest items. (#2159)
+- **Weekly fallback digest** — sent when queued items go a week unreported. (#2159)
+- **`deliver-approval`** — sends a pending approval on one chosen channel; undelivered ones email after 15 minutes. (#2159)
+- **`approvalDelivery` capability** — new `ToolContext` field for tools that deliver approvals. (#2159)
+- **Autonomy gating setting** — `autonomy.gating: band | tier` chooses score-driven or contact-tier gates; ships as `tier`. (#2159)
+- **Judge brief** — escalation judge answers purpose, speaks-as-principal, grounding and necessity from the turn's lookups. (#2159)
+- **ADR-049** — band-driven autonomy replaces the tier escalation policy. (#2159)
+- **Spot-check pool** — autonomous sends and actions are logged for sampling; never graded by the LLM judge. (#2159)
+- **Relay budget** — caps hourly immediate principal messages per outside contact; extras go to the digest. (#1320)
+- **`autonomy.relay_deferred` event** — new bus event and `relay_deferred` digest source when the relay budget holds a message. (#1320)
+- **Spot checks in the digest** — up to three weighted samples of autonomous actions, numbered, never IDs. (#2159)
+- **`list-spot-checks`** — returns the digest's spot-check block and remembers which number means which action. (#2159)
+- **`record-spot-check`** — the principal answers spot checks by number; verdicts feed the autonomy score. (#2159)
+- **Spot-check verdict trigger** — a principal reply starting "2 bad" points the coordinator at record-spot-check. (#2159)
+- **`approval_number`** — new nullable column on `autonomy_action_log` (migration 098). (#2159)
+- **`verification` tool** — coordinator tracks pending sign-in codes per site in a new `verifications` table. (#2017)
+- **Sign-in verification config** — `verification` section sets ask-channel order, expiry and code lifetimes. (#2017)
+- **Scenarios 24a–24d** — sign-in codes by SMS and email, no leaks, lost session. (#2017)
+- **ADR-050** — external verifications are first-class state; spec 03, 15 and 19 updated. (#2017)
 - **AWS Bedrock provider** — tiers can run Claude on Bedrock; opt-in, off by default. (#1766)
+
+### Changed
+
+- **Console registry** — shows optional capabilities beside a tool's required ones. (#2028)
+- **ADR-048 outcomes** — effort A/B found no winner; the standard tier stays at the model default. (#2044)
+- **`file-parse`** — reads XML, text and Markdown, including by filename extension. (#2208)
+- **Inbox attachments** — zip and gzip files are extracted before they are parsed. (#2208)
+- **Prompt budgets** — coordinator and ceo-inbox rise to fit archive-extract. (#2208)
+- **`verification` open** — result now says the next step; email codes go through ceo-inbox. (#2201)
+- **Haiku 5.5 agent turns** — unset reasoning now uses the model default, so fast-tier agents think. (#2044)
+- **Non-agent LLM calls** — judges, infra, scoring, summarization and voice state no reasoning explicitly. (#2044)
+- **Reasoning pass-back** — tool loops hand each model its own reasoning back next step; the archive keeps markers. (#2044)
+- **ADR-048 amended** — unset reasoning means provider default; Haiku 5.5 adaptive thinking; stale thinking dropped. (#2044)
+- **Prompt tone directives** — "warm" and sample sentences removed; the office identity alone sets tone. (#2143)
+- **Specialist agents** — now get the office identity block, scoped so drafts in the principal's voice keep it. (#2143)
+- **`inspect-prompts.ts`** — snapshot gains `office_identity_writes_as_block` for curia-deploy's eval harness. (#2143)
+- **Detail setting** — now concrete per-channel length limits, repeated as a reminder on each reply. (#2143)
+- **Identity block** — tells Curia to say what is there, not what isn't, and skip narration. (#2143)
+- **Console Detail preview** — shows each channel's length limit at the current setting. (#2143)
+- **Principal notices** — notes, block notices and expired approvals go to the digest, not email. (#2159)
+- **`principal.report` (public API)** — three new sources; the execution layer may now publish it. (#2159)
+- **Band send review** — under `band`, sends are fact-checked; unverified claims bounce once, then trimmed or held. (#2159)
+- **Outbound filter** — under `band`, `contact-data-leak` and the tier disclosure table are off. (#2159)
+- **Relayed replies** — a held reply raises an approval on every channel, not only email. (#2159)
+- **`outbound.message` (public API)** — new `principalApproved` flag; approved relays are not held twice. (#2159)
+- **Gate C** — under `band`, the score decides; tier only matters when the judge sees steering. (#2159)
+- **Band descriptions** — under `band`, the injected autonomy guidance matches the new band table. (#2159)
+- **Approval delivery** — one message on the principal's preferred channel, not email, Signal and Slack. (#2159)
+- **One-channel standing preference** — fresh installs seed it: Signal, then SMS, then email. (#2159)
+- **Approval expiry sweep** — runs every 15 minutes, doubling as the approval-delivery safety net. (#2159)
+- **Tone & style** — a written style with starter templates replaces tone words and directness. (#2143)
+- **Identity API (breaking)** — `tone.style` replaces `tone.baseline` and `tone.directness`; legacy fields are rejected. (#2143)
+- **Stored identities** — old tone settings become a written style on read; nothing is rewritten. (#2143)
+- **Setup wizard** — step 5 asks for an autonomy level instead of a decision posture. (#2143)
+- **Proactive analysis** — no longer implied by default; add "volunteer observations" to your style to keep it. (#2143)
+- **Haiku 5.5** — default fast tier and both judges move to `claude-haiku-5-5`, without thinking or temperature. (#2077)
+- **Judge token caps** — leak and escalation judge verdict caps raised for Haiku 5.5's longer verdicts. (#2077)
+- **Autonomy scoring** — principal verdicts weigh triple; expired approvals no longer count against the score. (#2159)
+- **`ceo-inbox-archive` / `ceo-inbox-label`** — results now include the email's subject and sender. (#2159)
+- **Approvals and learning items** — answered by short numbers ("approve 3", "confirm task 2"), not IDs. (#2159)
+- **Approval tools** — `short_ref` accepts the approval number; `list-pending-actions` and `list-learning-digest` return numbers. (#2159)
+- **Shadow drafts** — still judged and recorded, but no longer count toward the autonomy score. ADR-029. (#2191)
+- **Error-rate guard** — its last-30 window now also stops at 90 days (`errorRateWindowDays`). (#2191)
+- **Task reply binding** — skipped while a sign-in verification is pending for that task. (#2017)
+- **Coordinator tool budget** — raised 78,745 → 79,600 for the `verification` tool. (#2017)
+
+### Removed
+
+- **Decision posture** — gone from identity, wizard and console; the autonomy level decides act-vs-ask. (#2143)
+- **`weakExpiredWeight`** — scoring setting retired and ignored if set; safe to delete from configs. (#2159)
+
+### Security
+
+- **Archive extraction** — bombs, zip-slip, encryption and nested archives fail closed. (#2208)
+- **Sign-in code scrub** — tracked codes become `[sign-in code]` in notes, reports, memory, sends and replies. (#2017)
+- **Browser code guard** — `web-browser` refuses to type or navigate a sign-in code off its own site. (#2017)
+- **Digest tools** — tasks an outside contact started can't read or acknowledge the principal's digest. (#1320)
+
+### Fixed
+
+- **Optional capabilities** — a non-array declaration is dropped so the registry drawer still opens. (#2028)
+- **WIP citation scan** — XML fixtures are scanned like other text. (#2208)
+- **Shadow pairing** — a shadow pairs only with a send within 72 hours; each send scores one shadow. (#2195)
+- **Budget-exhausted sign-ins** — turn-limit replies name the waiting sign-in instead of a generic error. (#2201)
+- **`web-browser` type** — fields covered by a floating label are focused directly instead of failing. (#2201)
+- **Autonomy scoring** — successful re-executions of approved actions no longer judged blind; past verdicts cleared. (#2196)
+- **`ceo-inbox-sent-observe`** — shadow pairs judged in small chunks; held-back pairs and long holds now reported. (#2191)
+- **Integration test cleanup** — contacts and knowledge-graph suites delete only their own rows, ending parallel FK races. (#2183)
+- **Email signature** — the model's own sign-off is replaced by the configured signature, so emails sign once. (#2138)
+- **Requests no tool can do** — an empty `tool-registry` search says to reach whoever can, not research around it. (#2149)
+- **`web-fetch`** — a 404 warns that guessed paths miss too, ending runs of guessed venue pages. (#2149)
+- **Scenario 18 stubs** — a task note or brief on the renewal deadline no longer trips the stub gate. (#2150)
+- **Fork PR CI** — `ci` and Semgrep reach their steps on fork PRs, pulling anonymously without Docker Hub secrets. (#2153)
+- **Approval attribution** — resolve tools record `coordinator`; only reaction decisions count as principal feedback. (#2159)
+
+### Security
+
+- **Approval reactions** — a 👍 binds only to the principal's own notification, matching that approval's number and expiry. (#2159)
+- **Approval references** — an unreadable or mis-keyed `short_ref` fails closed instead of picking the sole pending approval. (#2159)
 
 ## [0.44.0] — 2026-10-16 — "WALL-E"
 

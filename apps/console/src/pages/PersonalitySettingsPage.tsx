@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { apiFetch } from '../api';
 import { SettingsLayout } from './SettingsPage';
-import { TonePillGrid, AssistantToneSliders } from '../components/settings/ToneFields';
+import { ToneStyleField, DetailSlider } from '../components/settings/ToneFields';
 import {
   ChangeNoteField,
   ConfigHistory,
@@ -9,7 +9,7 @@ import {
   type ConfigHistoryEntry,
 } from '../components/settings/ConfigHistory';
 import type { LocalIdentity } from './wizard-utils';
-import { validateNonEmptyName } from './wizard-utils';
+import { validateNonEmptyName, validateToneStyle, type LengthLimits } from './wizard-utils';
 
 interface VersionMeta {
   version: number;
@@ -31,6 +31,7 @@ function PersonalitySection() {
   const [identityHistoryError, setIdentityHistoryError] = useState<string | null>(null);
   const [nameError, setNameError] = useState('');
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [lengthLimits, setLengthLimits] = useState<LengthLimits | null>(null);
 
   const loadIdentityHistory = useCallback(async () => {
     setIdentityHistoryError(null);
@@ -72,9 +73,10 @@ function PersonalitySection() {
       try {
         const res = await apiFetch('/api/identity');
         if (!res.ok) throw new Error(await errorMessage(res));
-        const data = await res.json() as { identity: LocalIdentity };
+        const data = await res.json() as { identity: LocalIdentity; lengthLimits?: LengthLimits };
         setIdentity(data.identity);
         setSavedIdentity(data.identity);
+        setLengthLimits(data.lengthLimits ?? null);
       } catch (err) {
         setLoadError(err instanceof Error ? err.message : 'Failed to load personality settings');
       }
@@ -89,6 +91,7 @@ function PersonalitySection() {
       setNameError('Assistant name is required.');
       return;
     }
+    if (validateToneStyle(identity.tone.style) !== null) return;
     setNameError('');
     setIdentitySaving(true);
     setIdentityStatus('Saving…');
@@ -105,9 +108,8 @@ function PersonalitySection() {
           emailSignature: identity.assistant.emailSignature.trim(),
         },
         tone: {
-          baseline: identity.tone.baseline,
+          style: identity.tone.style.trim(),
           verbosity: identity.tone.verbosity,
-          directness: identity.tone.directness,
         },
       };
       const res = await apiFetch('/api/identity', {
@@ -209,24 +211,27 @@ function PersonalitySection() {
             />
           </div>
 
-          <TonePillGrid
-            selected={identity.tone.baseline}
-            onChange={baseline => setIdentity({
+          <ToneStyleField
+            value={identity.tone.style}
+            onChange={style => setIdentity({
               ...identity,
-              tone: { ...identity.tone, baseline },
+              tone: { ...identity.tone, style },
             })}
             idPrefix="asst-tone"
           />
-          <AssistantToneSliders
+          {/* A style migrated from tone words has no example line; point at the templates. */}
+          {!identity.tone.style.includes('Sounds like') && (
+            <p className="settings-muted-hint">
+              Tip: your style has no example line. Pick a template above to see one, or add a
+              line like <em>Sounds like: "Done. Thursday's call is now at 3."</em>
+            </p>
+          )}
+          <DetailSlider
             verbosity={identity.tone.verbosity}
-            directness={identity.tone.directness}
-            onVerbosityChange={verbosity => setIdentity({
+            lengthLimits={lengthLimits}
+            onChange={verbosity => setIdentity({
               ...identity,
               tone: { ...identity.tone, verbosity },
-            })}
-            onDirectnessChange={directness => setIdentity({
-              ...identity,
-              tone: { ...identity.tone, directness },
             })}
             idPrefix="asst"
           />
@@ -237,7 +242,7 @@ function PersonalitySection() {
               <button
                 type="button"
                 className="btn btn-primary"
-                disabled={!identityDirty || identitySaving}
+                disabled={!identityDirty || identitySaving || validateToneStyle(identity.tone.style) !== null}
                 onClick={() => void saveIdentity()}
               >
                 Save personality

@@ -3,6 +3,10 @@ import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { parseSensitivityRules, type SensitivityRule } from './memory/sensitivity.js';
 import { parseProxyConfig } from './browser/proxy-config.js';
+import { AUTONOMY_GATINGS, type AutonomyGating } from './autonomy/band-policy.js';
+import type { VerificationConfig } from './verification/types.js';
+import { registrableDomain } from './verification/domain.js';
+import type { TierConfig } from './agents/llm/model-router.js';
 
 // ---------------------------------------------------------------------------
 // Multi-account email config types
@@ -212,6 +216,58 @@ export function resolveLateDeliveryConfig(yaml: YamlConfig['delegate']): LateDel
 }
 
 // ---------------------------------------------------------------------------
+// Delegated sign-in verification config (#2017)
+// ---------------------------------------------------------------------------
+
+/** Channels the principal can be asked on for a sign-in code. */
+export const VERIFICATION_ASK_CHANNELS = ['signal', 'sms', 'slack', 'email'] as const;
+
+const VERIFICATION_NUMERIC_KEYS = [
+  'defaultExpiryMinutes',
+  'recentWindowMinutes',
+  'codeTtlMinutesAfterClose',
+  'emailWaitSeconds',
+] as const;
+
+/**
+ * Identity providers whose embedded sign-in frame may receive a sign-in code. Deliberately
+ * short and well-known; a deployment extends it with verification.identityProviderDomains.
+ */
+export const DEFAULT_IDENTITY_PROVIDER_DOMAINS = [
+  'b2clogin.com',
+  'ciamlogin.com',
+  'microsoftonline.com',
+  'okta.com',
+  'auth0.com',
+  'onelogin.com',
+  'pingidentity.com',
+  'pingone.com',
+  'duosecurity.com',
+] as const;
+
+const DEFAULT_VERIFICATION_CONFIG: VerificationConfig = {
+  askChannelOrder: [...VERIFICATION_ASK_CHANNELS],
+  defaultExpiryMinutes: 10,
+  recentWindowMinutes: 120,
+  codeTtlMinutesAfterClose: 120,
+  emailWaitSeconds: 180,
+  identityProviderDomains: [...DEFAULT_IDENTITY_PROVIDER_DOMAINS],
+};
+
+/** Resolve the optional YAML verification block to a fully-populated config. */
+export function resolveVerificationConfig(yaml: YamlConfig['verification']): VerificationConfig {
+  return {
+    askChannelOrder: [...(yaml?.askChannelOrder ?? DEFAULT_VERIFICATION_CONFIG.askChannelOrder)],
+    defaultExpiryMinutes: yaml?.defaultExpiryMinutes ?? DEFAULT_VERIFICATION_CONFIG.defaultExpiryMinutes,
+    recentWindowMinutes: yaml?.recentWindowMinutes ?? DEFAULT_VERIFICATION_CONFIG.recentWindowMinutes,
+    codeTtlMinutesAfterClose: yaml?.codeTtlMinutesAfterClose ?? DEFAULT_VERIFICATION_CONFIG.codeTtlMinutesAfterClose,
+    emailWaitSeconds: yaml?.emailWaitSeconds ?? DEFAULT_VERIFICATION_CONFIG.emailWaitSeconds,
+    identityProviderDomains: (yaml?.identityProviderDomains ?? DEFAULT_VERIFICATION_CONFIG.identityProviderDomains)
+      .map((d) => d.toLowerCase()),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Approval expiry sweep config (#2013)
 // ---------------------------------------------------------------------------
 
@@ -220,8 +276,10 @@ export interface ApprovalExpiryConfig {
 }
 
 const DEFAULT_APPROVAL_EXPIRY_CONFIG: ApprovalExpiryConfig = {
-  // Matches the hourly coordinator cron this replaced.
-  sweepIntervalMinutes: 60,
+  // Every 15 minutes since #2159: the sweep is also the safety net that delivers approvals no
+  // agent delivered within 15 minutes, so an hourly tick would stretch that to 75. Each tick
+  // is two or three queries.
+  sweepIntervalMinutes: 15,
 };
 
 /** Resolve the optional autonomy.approval_expiry block to a fully-populated config. */
@@ -230,6 +288,51 @@ export function resolveApprovalExpiryConfig(yaml: YamlConfig['autonomy']): Appro
     sweepIntervalMinutes:
       yaml?.approval_expiry?.sweep_interval_minutes ?? DEFAULT_APPROVAL_EXPIRY_CONFIG.sweepIntervalMinutes,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Weekly fallback digest config (#2159)
+// ---------------------------------------------------------------------------
+
+export interface ReportFallbackConfig {
+  /** Send the fallback summary once the oldest unreported item is older than this. */
+  maxAgeDays: number;
+  checkIntervalHours: number;
+}
+
+const DEFAULT_REPORT_FALLBACK_CONFIG: ReportFallbackConfig = {
+  maxAgeDays: 7,
+  checkIntervalHours: 24,
+};
+
+/** Resolve the optional autonomy.report_fallback block to a fully-populated config. */
+export function resolveReportFallbackConfig(yaml: YamlConfig['autonomy']): ReportFallbackConfig {
+  return {
+    maxAgeDays: yaml?.report_fallback?.max_age_days ?? DEFAULT_REPORT_FALLBACK_CONFIG.maxAgeDays,
+    checkIntervalHours:
+      yaml?.report_fallback?.check_interval_hours ?? DEFAULT_REPORT_FALLBACK_CONFIG.checkIntervalHours,
+  };
+}
+
+/** Resolve autonomy.gating. Ships as 'tier' (#2159); prod flips it, then the default changes. */
+export function resolveAutonomyGating(yaml: YamlConfig['autonomy']): AutonomyGating {
+  return yaml?.gating ?? 'tier';
+}
+
+// ---------------------------------------------------------------------------
+// Relay budget (#1320)
+// ---------------------------------------------------------------------------
+
+export interface RelayBudgetConfig {
+  /** Immediate relays to the principal one outside contact may cause per hour. 0 = off. */
+  perHour: number;
+}
+
+const DEFAULT_RELAY_BUDGET_PER_HOUR = 3;
+
+/** Resolve autonomy.relay_budget. Validated in loadYamlConfig. */
+export function resolveRelayBudgetConfig(yaml: YamlConfig['autonomy']): RelayBudgetConfig {
+  return { perHour: yaml?.relay_budget?.per_hour ?? DEFAULT_RELAY_BUDGET_PER_HOUR };
 }
 
 /** Resolve the optional YAML tasks block to a fully-populated config with defaults. */
@@ -501,7 +604,7 @@ export interface YamlConfig {
       /**
        * Model the judge runs on. A dedicated model string (NOT a tier reference)
        * so the judge can use a different vendor independently of the agent tiers.
-       * Validated against the model registry at startup. Default: 'claude-haiku-4-5'.
+       * Validated against the model registry at startup. Default: 'claude-haiku-5-5'.
        */
       model?: string;
       /** Hard timeout for the judge call in ms. Default: 5000. */
@@ -555,11 +658,13 @@ export interface YamlConfig {
       /**
        * Model for the judge. A dedicated string (NOT a tier reference) so it can
        * differ from the coordinator model. Validated against the registry at startup.
-       * Default: 'claude-haiku-4-5'.
+       * Default: 'claude-haiku-5-5'.
        */
       model?: string;
       /** Hard timeout per call in ms. Default: 5000. */
       timeout_ms?: number;
+      /** Timeout for the band brief (#2159), which reads the drafting turn's evidence. Default: 15000. */
+      review_timeout_ms?: number;
       // No failMode — EscalationJudge is hard-coded fail-closed. A local.yaml
       // `failMode` key is deep-merged into the object but ignored by the type and
       // constructor (see #1911). Do not add it here.
@@ -598,9 +703,10 @@ export interface YamlConfig {
       batchSize?: number;
       minScoredActions?: number;
       halfLifeDays?: number;
-      weakExpiredWeight?: number;
       ceoCooldownDays?: number;
       errorRateThreshold?: number;
+      /** Oldest row, in days, the error-rate guard's last-30 window may reach. Default: 90. */
+      errorRateWindowDays?: number;
       /** Days a parse failure may retry before null-flag dead-letter. Default: 3. */
       unparseableAfterDays?: number;
     };
@@ -633,9 +739,9 @@ export interface YamlConfig {
    *  Agents declare a tier in their YAML; the operator controls which model each tier resolves to. */
   model_routing?: {
     tiers: {
-      fast: { model: string };
-      standard: { model: string };
-      powerful: { model: string };
+      fast: TierConfig;
+      standard: TierConfig;
+      powerful: TierConfig;
     };
     default_tier: 'fast' | 'standard' | 'powerful';
   };
@@ -654,6 +760,25 @@ export interface YamlConfig {
      * nor in the built-ins use `defaultExpiryHours`.
      */
     channelDefaultExpiryHours?: Record<string, number>;
+  };
+
+  /** Delegated sign-in verification (#2017). Every field optional; see resolveVerificationConfig. */
+  verification?: {
+    /** Channels to ask the principal on, in preference order. Default: signal, sms, slack, email. */
+    askChannelOrder?: string[];
+    /** Minutes until a pending verification is treated as expired (a hint, not a cliff). Default: 10. */
+    defaultExpiryMinutes?: number;
+    /** Minutes a closed verification still counts as recent. Default: 120. */
+    recentWindowMinutes?: number;
+    /** Minutes a tracked code value lives after its verification closes. Default: 120. */
+    codeTtlMinutesAfterClose?: number;
+    /** Seconds to wait for an emailed code before asking the principal. Default: 180. */
+    emailWaitSeconds?: number;
+    /**
+     * Registrable domains of identity providers whose embedded frame may receive a sign-in
+     * code. Replaces the default list (DEFAULT_IDENTITY_PROVIDER_DOMAINS).
+     */
+    identityProviderDomains?: string[];
   };
 
   /** Meeting debrief agent configuration (spec §17-meeting-debrief.md). */
@@ -749,6 +874,8 @@ export interface YamlConfig {
     };
   };
   autonomy?: {
+    /** band: the score decides and the judge reviews sends; tier: the pre-#2159 contact-tier gates. Default tier. */
+    gating?: AutonomyGating;
     /**
      * Bypass-ladder thresholds (#1125) — raw autonomy scores governing how much LINEAGE
      * standing a heartbeat-woken task inherits. The live score can only ever DOWNGRADE
@@ -774,6 +901,18 @@ export interface YamlConfig {
     approval_expiry?: {
       /** Sweep interval in minutes. Default 60. */
       sweep_interval_minutes?: number;
+    };
+    /** Weekly summary of unreported principal.report items for installs with no digest (#2159). */
+    report_fallback?: {
+      /** Send once the oldest unreported item is older than this many days. Default 7. */
+      max_age_days?: number;
+      /** How often to check, in hours. Default 24. */
+      check_interval_hours?: number;
+    };
+    /** Cap on immediate relays to the principal that one outside contact can cause (#1320). */
+    relay_budget?: {
+      /** Relays per originator per hour; over it, relays go to the digest. 0 turns it off. Default 3. */
+      per_hour?: number;
     };
   };
 }
@@ -1211,14 +1350,14 @@ export function loadYamlConfig(configDir: string): YamlConfig {
       if (autonomyScoring.halfLifeDays !== undefined && (typeof autonomyScoring.halfLifeDays !== 'number' || autonomyScoring.halfLifeDays <= 0)) {
         throw new Error(`dreaming.autonomy_scoring.halfLifeDays must be a positive number, got: ${autonomyScoring.halfLifeDays}`);
       }
-      if (autonomyScoring.weakExpiredWeight !== undefined && (typeof autonomyScoring.weakExpiredWeight !== 'number' || autonomyScoring.weakExpiredWeight < 0 || autonomyScoring.weakExpiredWeight > 1)) {
-        throw new Error(`dreaming.autonomy_scoring.weakExpiredWeight must be a number between 0 and 1, got: ${autonomyScoring.weakExpiredWeight}`);
-      }
       if (autonomyScoring.ceoCooldownDays !== undefined && (!Number.isInteger(autonomyScoring.ceoCooldownDays) || autonomyScoring.ceoCooldownDays < 0)) {
         throw new Error(`dreaming.autonomy_scoring.ceoCooldownDays must be a non-negative integer, got: ${autonomyScoring.ceoCooldownDays}`);
       }
       if (autonomyScoring.errorRateThreshold !== undefined && (typeof autonomyScoring.errorRateThreshold !== 'number' || autonomyScoring.errorRateThreshold < 0 || autonomyScoring.errorRateThreshold > 1)) {
         throw new Error(`dreaming.autonomy_scoring.errorRateThreshold must be a number between 0 and 1, got: ${autonomyScoring.errorRateThreshold}`);
+      }
+      if (autonomyScoring.errorRateWindowDays !== undefined && (!Number.isInteger(autonomyScoring.errorRateWindowDays) || autonomyScoring.errorRateWindowDays <= 0)) {
+        throw new Error(`dreaming.autonomy_scoring.errorRateWindowDays must be a positive integer, got: ${autonomyScoring.errorRateWindowDays}`);
       }
       if (autonomyScoring.unparseableAfterDays !== undefined && (!Number.isInteger(autonomyScoring.unparseableAfterDays) || autonomyScoring.unparseableAfterDays < 0)) {
         throw new Error(`dreaming.autonomy_scoring.unparseableAfterDays must be a non-negative integer, got: ${autonomyScoring.unparseableAfterDays}`);
@@ -1294,6 +1433,59 @@ export function loadYamlConfig(configDir: string): YamlConfig {
             `contextBridge.channelDefaultExpiryHours.${channelId} must be a positive integer, got: ${hours}`,
           );
         }
+      }
+    }
+  }
+
+  // Validate verification if present
+  if (config.verification !== undefined) {
+    // Same root guard as contextBridge: `verification: []` or `verification: 5` must
+    // fail at boot, not fall back to defaults nobody chose.
+    if (
+      config.verification === null ||
+      typeof config.verification !== 'object' ||
+      Array.isArray(config.verification)
+    ) {
+      throw new Error(
+        `verification must be a YAML mapping, got: ${Array.isArray(config.verification) ? 'list' : typeof config.verification}`,
+      );
+    }
+    const { askChannelOrder, identityProviderDomains, ...numeric } = config.verification;
+    if (identityProviderDomains !== undefined) {
+      if (!Array.isArray(identityProviderDomains)) {
+        throw new Error(
+          `verification.identityProviderDomains must be a list of domains, got: ${typeof identityProviderDomains}`,
+        );
+      }
+      for (const entry of identityProviderDomains as unknown[]) {
+        // A bare registrable domain only (okta.com): not a URL, a subdomain, a public
+        // suffix or an IP, so the entry means exactly the provider it names.
+        if (typeof entry !== 'string' || registrableDomain(entry) !== entry.toLowerCase()) {
+          throw new Error(
+            `verification.identityProviderDomains entry ${JSON.stringify(entry)} must be a registrable domain such as okta.com`,
+          );
+        }
+      }
+    }
+    if (askChannelOrder !== undefined) {
+      if (!Array.isArray(askChannelOrder)) {
+        throw new Error(`verification.askChannelOrder must be a list of channel names, got: ${typeof askChannelOrder}`);
+      }
+      if (askChannelOrder.length === 0) {
+        throw new Error('verification.askChannelOrder must not be empty');
+      }
+      for (const channel of askChannelOrder) {
+        if (!(VERIFICATION_ASK_CHANNELS as readonly unknown[]).includes(channel)) {
+          throw new Error(
+            `verification.askChannelOrder contains unknown channel ${JSON.stringify(channel)}; valid: ${VERIFICATION_ASK_CHANNELS.join(', ')}`,
+          );
+        }
+      }
+    }
+    for (const key of VERIFICATION_NUMERIC_KEYS) {
+      const value: unknown = numeric[key];
+      if (value !== undefined && (typeof value !== 'number' || !Number.isInteger(value) || value < 1)) {
+        throw new Error(`verification.${key} must be a positive integer, got: ${String(value)}`);
       }
     }
   }
@@ -1389,6 +1581,46 @@ export function loadYamlConfig(configDir: string): YamlConfig {
     }
     // Reaches setInterval as minutes × 60000; an overflowed delay would fire in a tight loop.
     assertFitsNodeTimer('autonomy.approval_expiry.sweep_interval_minutes', interval, 60_000, 'minutes');
+  }
+
+  // autonomy.gating (#2159): a typo must fail at boot, not silently keep the tier gates.
+  const gating = config.autonomy?.gating;
+  if (gating !== undefined && !AUTONOMY_GATINGS.includes(gating)) {
+    throw new Error(`autonomy.gating must be one of ${AUTONOMY_GATINGS.join(', ')}, got: ${String(gating)}`);
+  }
+  // autonomy.relay_budget (#1320): a bad value must fail at boot, not silently drop the cap.
+  const relayBudget = config.autonomy?.relay_budget;
+  if (relayBudget !== undefined) {
+    if (typeof relayBudget !== 'object' || Array.isArray(relayBudget) || relayBudget === null) {
+      throw new Error(`autonomy.relay_budget must be a YAML mapping, got: ${typeof relayBudget}`);
+    }
+    const perHour = relayBudget.per_hour;
+    if (perHour !== undefined && (!Number.isInteger(perHour) || perHour < 0)) {
+      throw new Error(`autonomy.relay_budget.per_hour must be a non-negative integer, got: ${String(perHour)}`);
+    }
+  }
+  // Band gating reviews every send with the escalation judge. With the judge off, every
+  // review is a failure: up to 5 unreviewed sends an hour at 80+, every send held below.
+  // That is never what an operator means, so refuse the combination at boot.
+  if (gating === 'band' && config.escalation?.judge?.enabled === false) {
+    throw new Error('autonomy.gating: band needs the escalation judge — set escalation.judge.enabled: true, or use autonomy.gating: tier');
+  }
+
+  // Validate autonomy.report_fallback if present (#2159). Same guard: a mis-shaped block
+  // must fail loudly rather than fall back to the defaults.
+  const reportFallback = config.autonomy?.report_fallback;
+  if (reportFallback !== undefined) {
+    if (typeof reportFallback !== 'object' || Array.isArray(reportFallback) || reportFallback === null) {
+      throw new Error(`autonomy.report_fallback must be a YAML mapping, got: ${typeof reportFallback}`);
+    }
+    for (const key of ['max_age_days', 'check_interval_hours'] as const) {
+      const value = reportFallback[key];
+      if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
+        throw new Error(`autonomy.report_fallback.${key} must be a positive integer, got: ${String(value)}`);
+      }
+    }
+    // Reaches setInterval as hours × 3,600,000; an overflowed delay would fire in a tight loop.
+    assertFitsNodeTimer('autonomy.report_fallback.check_interval_hours', reportFallback.check_interval_hours, 3_600_000, 'hours');
   }
 
   // Validate scheduler if present.

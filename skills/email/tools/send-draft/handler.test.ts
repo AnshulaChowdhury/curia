@@ -302,6 +302,15 @@ describe('SendDraftHandler', () => {
         expect.anything(),
         expect.objectContaining({ humanApproved: true, principalDirected: false }),
       );
+      // A woken task's draft send is band-reviewed; a hold replays send-draft (#2159).
+      expect(ctx.outboundGateway!.sendEmailDraft).toHaveBeenCalledWith(
+        'draft-abc123',
+        'personal',
+        expect.anything(),
+        expect.objectContaining({
+          holdRecipe: { toolName: 'send-draft', partialPayload: ctx.input, description: expect.stringMatching(/^Send draft to /) },
+        }),
+      );
     });
 
     it('is true on a live principal turn', async () => {
@@ -555,7 +564,7 @@ describe('SendDraftHandler', () => {
       // Assert: send succeeded and action_log was transitioned
       expect(result.success).toBe(true);
       expect(findPendingByPayloadField).toHaveBeenCalledWith('draft_id', 'draft-abc123');
-      expect(resolveById).toHaveBeenCalledWith(55, 'approved', 'ceo');
+      expect(resolveById).toHaveBeenCalledWith(55, 'approved', 'coordinator');
     });
 
     it('still succeeds when no action_log row exists (pre-existing draft)', async () => {

@@ -1,12 +1,16 @@
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
 import { ConfigStore } from '../../../../src/memory/config-store.js';
+import type { Logger } from '../../../../src/logger.js';
 import { CONFIG_NAMESPACE as VOICE_NS, DISMISSED_KEY } from '../voice-learn/handler.js';
 import {
   readVoiceProposal,
   writeVoiceProposal,
-  readCompletionDigest,
+  readNumberedCompletionDigest,
   writeCompletionDigest,
+  writeDigestHighWater,
+  maxDigestNumber,
   pruneExpiredCompletionDigest,
+  type CompletionDigestItem,
   type CompletionDigestMap,
 } from '../../../_shared/learning-state.js';
 
@@ -56,6 +60,74 @@ export function resolveDigestTaskId(
 
   // No prefix hit — keep the caller id so the existing "No actionable …" path fires.
   return { ok: true, taskId };
+}
+
+/**
+ * Resolve a completion-digest item by the number the principal replied with ("confirm task 2").
+ * `digestMap` must already be numbered (assignDigestNumbers). An unknown number fails closed and
+ * names the valid ones, so the coordinator can ask the principal instead of guessing.
+ */
+export function resolveDigestNumber(
+  digestMap: CompletionDigestMap,
+  n: number,
+): { ok: true; taskId: string } | { ok: false; error: string } {
+  const hit = Object.entries(digestMap).find(([, item]) => item.n === n);
+  if (hit) return { ok: true, taskId: hit[0] };
+  const valid = Object.values(digestMap)
+    .map((item) => item.n)
+    .filter((v): v is number => v !== undefined)
+    .sort((a, b) => a - b);
+  return {
+    ok: false,
+    error:
+      valid.length > 0
+        ? `No digest item is numbered ${n}. Valid numbers: ${valid.join(', ')}. Ask the principal which one they meant.`
+        : `No digest item is numbered ${n}: no completion items are pending. Ask the principal what they meant.`,
+  };
+}
+
+/**
+ * How a success `detail` names the item acted on: its task title, or the note when the title is
+ * blank. Numbers are reused only once the digest empties (the high-water mark covers a resolved top
+ * item until then), so a stale "confirm task 2" can still land on a newer item 2 after that; naming it lets the coordinator read back WHICH task it acted on (review fix F3, #2159).
+ */
+function itemName(item: CompletionDigestItem): string {
+  const title = typeof item.taskTitle === 'string' ? item.taskTitle.trim() : '';
+  return `"${title || item.note.trim()}"`;
+}
+
+/** The `number` input as a positive integer. Accepts a digit string because models relay "2" as text. */
+/**
+ * Drop one resolved item and persist the rest. The mark is advanced to the full numbered map's top
+ * number FIRST: legacy items get their numbers on read and no writer has recorded them yet, so
+ * resolving the derived top item would otherwise free its number for the next new item. A mark that
+ * won't store fails the clear (the item is kept for a retry), so nothing leaves the digest under a
+ * number the writer could hand out again.
+ */
+async function clearDigestItem(
+  store: ConfigStore,
+  digestMap: CompletionDigestMap,
+  highWater: number,
+  taskId: string,
+  log: Logger,
+): Promise<boolean> {
+  const top = maxDigestNumber(digestMap);
+  if (top > highWater && !(await writeDigestHighWater(store, top))) {
+    log.warn({ highWater: top }, 'resolve-learning-digest: high-water mark write soft-rejected — digest item kept for retry');
+    return false;
+  }
+  const { [taskId]: _removed, ...rest } = digestMap;
+  void _removed;
+  return writeCompletionDigest(store, pruneExpiredCompletionDigest(rest, Date.now(), log));
+}
+
+function parseItemNumber(raw: unknown): number | null {
+  if (typeof raw === 'number') return Number.isInteger(raw) && raw > 0 ? raw : null;
+  if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) {
+    const n = Number(raw.trim());
+    return n > 0 ? n : null;
+  }
+  return null;
 }
 
 export class ResolveLearningDigestHandler implements ToolHandler {
@@ -158,13 +230,27 @@ export class ResolveLearningDigestHandler implements ToolHandler {
       return { success: true, data: { resolved: true, detail: 'Dismissed voice guide' } };
     }
 
-    // completion actions
+    // completion actions: the item is named by its notification number (preferred), or by task id.
+    const numberProvided = input.number !== undefined && input.number !== null && input.number !== '';
     const rawTaskId = typeof input.task_id === 'string' ? input.task_id.trim() : '';
-    if (!rawTaskId) return { success: false, error: 'task_id is required for completion actions' };
+    let itemNumber: number | null = null;
+    if (numberProvided) {
+      itemNumber = parseItemNumber(input.number);
+      if (itemNumber === null) {
+        return { success: false, error: 'number must be a positive whole number (the item number from the notification)' };
+      }
+    } else if (!rawTaskId) {
+      return { success: false, error: 'number (or task_id) is required for completion actions' };
+    }
 
     const store = new ConfigStore(ctx.entityMemory, ctx.log);
-    const digestMap = await readCompletionDigest(store, ctx.log);
-    const resolved = resolveDigestTaskId(digestMap, rawTaskId);
+    // Number before resolving, on the full stored map, so legacy entries without `n` get the same
+    // numbers list-learning-digest showed. The clearing writes below persist this numbering.
+    const { map: digestMap, highWater } = await readNumberedCompletionDigest(store, ctx.log);
+    const resolved =
+      itemNumber !== null
+        ? resolveDigestNumber(digestMap, itemNumber)
+        : resolveDigestTaskId(digestMap, rawTaskId);
     if (!resolved.ok) {
       return { success: false, error: resolved.error };
     }
@@ -179,11 +265,9 @@ export class ResolveLearningDigestHandler implements ToolHandler {
     // which mutate a task and must not run against an arbitrary id.
     if (action === 'dismiss_completion') {
       if (!item) {
-        return { success: false, error: `No completion-digest item for task ${rawTaskId}` };
+        return { success: false, error: `No completion-digest item for task ${taskId}` };
       }
-      const { [taskId]: _removed, ...rest } = digestMap;
-      void _removed;
-      const cleared = await writeCompletionDigest(store, pruneExpiredCompletionDigest(rest, Date.now(), ctx.log));
+      const cleared = await clearDigestItem(store, digestMap, highWater, taskId, ctx.log);
       if (!cleared) {
         return {
           success: false,
@@ -194,8 +278,8 @@ export class ResolveLearningDigestHandler implements ToolHandler {
       // completion" string reads as "the task was un-completed" on an undo item.
       const detail =
         item.kind === 'undo'
-          ? `Left task ${taskId} marked done; dropped the undo prompt`
-          : `Dismissed the confirm prompt for task ${taskId}; the task was not completed`;
+          ? `Left ${itemName(item)} marked done; dropped the undo prompt`
+          : `Dismissed the confirm prompt for ${itemName(item)}; the task was not completed`;
       return { success: true, data: { resolved: true, kind: item.kind, detail } };
     }
 
@@ -209,7 +293,7 @@ export class ResolveLearningDigestHandler implements ToolHandler {
       const actual = item ? ` (digest has '${item.kind}')` : '';
       return {
         success: false,
-        error: `No actionable ${expectedKind} item for task ${rawTaskId}${actual}`,
+        error: `No actionable ${expectedKind} item for task ${taskId}${actual}`,
       };
     }
 
@@ -250,16 +334,14 @@ export class ResolveLearningDigestHandler implements ToolHandler {
       // status is 'done' (just reopened) or 'open' (already reopened) — clear the digest item. A
       // soft-reject on the clear only means the item may reappear; a retry re-checks status and
       // clears idempotently.
-      const { [taskId]: _removed, ...rest } = digestMap;
-      void _removed;
-      const cleared = await writeCompletionDigest(store, pruneExpiredCompletionDigest(rest, Date.now(), ctx.log));
+      const cleared = await clearDigestItem(store, digestMap, highWater, taskId, ctx.log);
       if (!cleared) {
         return {
           success: false,
           error: `Task ${taskId} was reopened, but the digest item could not be cleared (transient) and may reappear — retry to clear it.`,
         };
       }
-      return { success: true, data: { resolved: true, detail: `Reopened task ${taskId}` } };
+      return { success: true, data: { resolved: true, detail: `Reopened ${itemName(item)}` } };
     }
 
     if (action === 'confirm_completion') {
@@ -279,16 +361,14 @@ export class ResolveLearningDigestHandler implements ToolHandler {
       // Task completion (if needed) already happened above; a soft-reject on the clear only
       // means the digest item may reappear — completing an already-done task next retry is a
       // no-op (the `task.status !== 'done'` guard above skips it).
-      const { [taskId]: _removed, ...rest } = digestMap;
-      void _removed;
-      const cleared = await writeCompletionDigest(store, pruneExpiredCompletionDigest(rest, Date.now(), ctx.log));
+      const cleared = await clearDigestItem(store, digestMap, highWater, taskId, ctx.log);
       if (!cleared) {
         return {
           success: false,
           error: `Task ${taskId} was confirmed complete, but the digest item could not be cleared (transient) and may reappear — retry to clear it.`,
         };
       }
-      return { success: true, data: { resolved: true, detail: `Confirmed completion ${taskId}` } };
+      return { success: true, data: { resolved: true, detail: `Confirmed completion of ${itemName(item)}` } };
     }
 
     // Unreachable while every DigestAction returns above. A new action that is

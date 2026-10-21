@@ -26,6 +26,7 @@ import { createAgentTask, type ContextBudgetEvent } from '../../../src/bus/event
 import type { ChannelIdentity } from '../../../src/contacts/types.js';
 import type { OfficeIdentityService } from '../../../src/identity/service.js';
 import { createLogger } from '../../../src/logger.js';
+import type { VerificationRuntime } from '../../../src/verification/index.js';
 import type { ExecutionLayer } from '../../../src/skills/execution.js';
 import { ToolRegistry } from '../../../src/skills/registry.js';
 import { SkillRegistry } from '../../../src/skills/skill-registry.js';
@@ -168,6 +169,7 @@ function buildContext(provider: LLMProvider, configs: AgentYamlConfig[]): AgentA
     } as unknown as AutonomyService,
     officeIdentityService: {
       compileSystemPromptBlock: () => '## Identity\nYou are Curia.',
+      compileWritesAsBlock: () => '## Identity\nYou write as Curia.',
     } as unknown as OfficeIdentityService,
     securityContextBlock: '## Security\nPolicy here.',
     timezone: 'America/Toronto',
@@ -233,7 +235,9 @@ describe('assembleAgent', () => {
     expect(specialist.systemPrompt).toContain('LOOKUP SKILL BODY');
 
     const rc = specialist.runtimeConfig;
-    expect(rc.officeIdentityService).toBeUndefined();
+    // Every agent gets the identity service (#2143); buildBaseSystemPrompt gives a
+    // specialist the writes-as block.
+    expect(rc.officeIdentityService).toBe(ctx.officeIdentityService);
     expect(rc.securityContextBlock).toBeUndefined();
     expect(rc.autonomyService).toBeUndefined();
     expect(rc.availableSpecialists).toBeUndefined();
@@ -311,7 +315,7 @@ describe('resolveSystemPromptSources', () => {
   const SOURCE_FIELDS = [
     'agentId', 'systemPrompt', 'officeIdentityService', 'securityContextBlock', 'availableSpecialists',
     'autonomyService', 'timezone', 'channelAccounts', 'agentContactId', 'principalIdentities',
-    'principalPrimaryEmail', 'errorBudget',
+    'principalPrimaryEmail', 'errorBudget', 'verification', 'browserSessionAlive',
   ] as const;
 
   it('is exactly the prompt half of the runtime config assembleAgent builds', () => {
@@ -357,6 +361,20 @@ describe('resolveSystemPromptSources', () => {
     expect(autonomyFor(configs[2]!)).toBe(ctx.autonomyService);
   });
 
+  it('gives the verification runtime and liveness lookup to the coordinator and ceo-inbox only', () => {
+    const configs = [coordinatorYaml(), specialistYaml(), specialistYaml({ name: 'ceo-inbox' })];
+    const verification = {} as unknown as VerificationRuntime;
+    const browserSessionAlive = () => true;
+    const ctx = { ...buildContext(textProvider(), configs), verification, browserSessionAlive };
+    const sourcesFor = (config: AgentYamlConfig) => resolveSystemPromptSources(config, 'body', ctx);
+    expect(sourcesFor(configs[0]!).verification).toBe(verification);
+    expect(sourcesFor(configs[0]!).browserSessionAlive).toBe(browserSessionAlive);
+    expect(sourcesFor(configs[1]!).verification).toBeUndefined();
+    expect(sourcesFor(configs[1]!).browserSessionAlive).toBeUndefined();
+    expect(sourcesFor(configs[2]!).verification).toBe(verification);
+    expect(sourcesFor(configs[2]!).browserSessionAlive).toBe(browserSessionAlive);
+  });
+
   it('reads the roster only through specialistSummary, so a snapshot adapter is enough', () => {
     const ctx = buildContext(textProvider(), [coordinatorYaml()]);
     const sources = resolveSystemPromptSources(coordinatorYaml(), 'body', {
@@ -386,6 +404,55 @@ describe('resolveAgentModelBinding', () => {
       expect((err as AgentAssemblyError).agentName).toBe('coordinator');
       expect((err as AgentAssemblyError).details).toMatchObject({ provider: 'anthropic' });
     }
+  });
+});
+
+describe('tier reasoning on the binding (ADR-048 §3)', () => {
+  it('carries the primary and fallback tiers\' own settings into the runtime config', () => {
+    const configs = [coordinatorYaml()];
+    const ctx = buildContext(textProvider(), configs);
+    const modelRouter = new ModelRouter(
+      {
+        tiers: {
+          fast: { model: 'claude-haiku-5-5' },
+          standard: { model: 'claude-sonnet-4-6', reasoning: { effort: 'low' } },
+          powerful: { model: 'claude-opus-4-6', reasoning: { effort: 'high' } },
+        },
+        default_tier: 'standard',
+      },
+      ctx.models.modelRegistry,
+      ctx.logger,
+    );
+    const models = { ...ctx.models, modelRouter };
+    const binding = resolveAgentModelBinding(configs[0]!, models);
+    expect(binding.reasoning).toEqual({ effort: 'low' });
+    expect(binding.fallbackReasoning).toEqual({ effort: 'high' });
+
+    const [coordinator] = assembleAgents(configs, { ...ctx, models });
+    expect(coordinator!.runtimeConfig.reasoning).toEqual({ effort: 'low' });
+    expect(coordinator!.runtimeConfig.fallbackReasoning).toEqual({ effort: 'high' });
+  });
+
+  it('leaves both unset when the tiers are', () => {
+    const configs = [coordinatorYaml()];
+    const ctx = buildContext(textProvider(), configs);
+    const binding = resolveAgentModelBinding(configs[0]!, ctx.models);
+    expect(binding).not.toHaveProperty('reasoning');
+    expect(binding).not.toHaveProperty('fallbackReasoning');
+  });
+});
+
+describe('identity block per agent (#2143)', () => {
+  it('gives the coordinator the identity block and every other agent the writes-as block', async () => {
+    const configs = [coordinatorYaml(), specialistYaml()];
+    const ctx = buildContext(textProvider(), configs);
+    const [coordinator, specialist] = assembleAgents(configs, ctx);
+    const coordinatorPrompt = await buildBaseSystemPrompt(coordinator!.runtimeConfig, { now: FIXED_NOW, logger: ctx.logger });
+    const specialistPrompt = await buildBaseSystemPrompt(specialist!.runtimeConfig, { now: FIXED_NOW, logger: ctx.logger });
+    expect(coordinatorPrompt).toContain('You are Curia.');
+    expect(coordinatorPrompt).not.toContain('You write as Curia.');
+    expect(specialistPrompt).toContain('You write as Curia.');
+    expect(specialistPrompt).not.toContain('You are Curia.');
   });
 });
 
@@ -478,7 +545,7 @@ describe('stable system prefix across trigger guidance (#1959)', () => {
       channelId: 'signal',
       content: 'Go ahead',
       turnGuidance: inboundTurnGuidance({
-        liveTurn: true, injectedEntryMetadata: [], channelId: 'signal', curiaCc: false, autoGeneratedSuppress: false,
+        liveTurn: true, injectedEntryMetadata: [], channelId: 'signal', curiaCc: false, autoGeneratedSuppress: false, spotCheckReply: false,
       }),
     },
     {
@@ -491,6 +558,7 @@ describe('stable system prefix across trigger guidance (#1959)', () => {
         channelId: 'signal',
         curiaCc: false,
         autoGeneratedSuppress: false,
+        spotCheckReply: false,
       }),
     },
     {
@@ -498,7 +566,7 @@ describe('stable system prefix across trigger guidance (#1959)', () => {
       channelId: 'email',
       content: 'Account: curia\n\nCan we meet Thursday?',
       turnGuidance: inboundTurnGuidance({
-        liveTurn: false, injectedEntryMetadata: [], channelId: 'email', curiaCc: false, autoGeneratedSuppress: false,
+        liveTurn: false, injectedEntryMetadata: [], channelId: 'email', curiaCc: false, autoGeneratedSuppress: false, spotCheckReply: false,
       }),
     },
     {
@@ -506,7 +574,7 @@ describe('stable system prefix across trigger guidance (#1959)', () => {
       channelId: 'email',
       content: '[OWNER CC — this email was addressed to nik@example.com; you were CC\'d, not the primary recipient]\nLooping you in.',
       turnGuidance: inboundTurnGuidance({
-        liveTurn: true, injectedEntryMetadata: [], channelId: 'email', curiaCc: true, autoGeneratedSuppress: false,
+        liveTurn: true, injectedEntryMetadata: [], channelId: 'email', curiaCc: true, autoGeneratedSuppress: false, spotCheckReply: false,
       }),
     },
     {

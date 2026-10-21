@@ -38,7 +38,7 @@ describe('parseJudgeResponse', () => {
 describe('formatJudgeInput', () => {
   const scenario: ScenarioCase = {
     name: 'paused', description: 'Delegate returns paused.', tags: [], agent: 'coordinator', delegation: 'stubbed', releaseGate: true, sourceFile: 'x.yaml',
-    seed: { contacts: [], outboundContext: [], bullpen: [] },
+    seed: { contacts: [], outboundContext: [], bullpen: [], verifications: [], principalIdentities: [] },
     inbound: { from: 'principal', content: 'How is the research going?' },
     toolStubs: {}, explicitStubTools: [], ownStubTools: [], expectedBehaviors: behaviors, failureModes: ['Blames an API outage'],
   };
@@ -73,10 +73,36 @@ describe('formatJudgeInput', () => {
   });
 });
 
+describe('formatJudgeInput with an identity fixture (#2143)', () => {
+  const scenario: ScenarioCase = {
+    name: 'style', description: 'A brief reply.', tags: ['style'], agent: 'coordinator', delegation: 'stubbed', releaseGate: false, sourceFile: 'x.yaml',
+    seed: { contacts: [], outboundContext: [], bullpen: [], verifications: [], principalIdentities: [] },
+    inbound: { from: 'principal', content: 'Did Dana confirm?' },
+    toolStubs: {}, explicitStubTools: [], ownStubTools: [], expectedBehaviors: behaviors, failureModes: [],
+  };
+  const run: ScenarioRun = {
+    runIndex: 0, inboundContent: 'Did Dana confirm?', refs: {}, durationMs: 1, unstubbedCalls: 0, usage: emptyBreakdown(), providerRetries: [],
+    reply: 'Yes, Thursday at 3.', toolCalls: [],
+  };
+
+  it('shows the judge the style the fixture sets, before the transcript', () => {
+    const identity = { name: 'style-brief-dry', judgeBrief: 'Dry and brief. No exclamation marks.', config: {} as never };
+    const text = formatJudgeInput({ ...scenario, identity }, run, behaviors);
+    const style = text.indexOf("## The office's configured style");
+    expect(style).toBeGreaterThan(-1);
+    expect(style).toBeLessThan(text.indexOf('## Final reply'));
+    expect(text.slice(style)).toContain('Dry and brief. No exclamation marks.');
+  });
+
+  it('says nothing about style without a fixture', () => {
+    expect(formatJudgeInput(scenario, run, behaviors)).not.toContain('configured style');
+  });
+});
+
 describe('formatJudgeInput with real delegation (#2027)', () => {
   const scenario: ScenarioCase = {
     name: 'real', description: 'Calendar really runs.', tags: [], agent: 'coordinator', delegation: 'real', releaseGate: true, sourceFile: 'x.yaml',
-    seed: { contacts: [], outboundContext: [], bullpen: [] },
+    seed: { contacts: [], outboundContext: [], bullpen: [], verifications: [], principalIdentities: [] },
     inbound: { from: 'principal', content: "What's on tomorrow?" },
     toolStubs: {}, explicitStubTools: [], ownStubTools: [], expectedBehaviors: behaviors, failureModes: [],
   };
@@ -121,7 +147,7 @@ describe('extractJsonObject', () => {
 describe('judgeRun', () => {
   const scenario = {
     name: 'x', description: '', tags: [], agent: 'coordinator', delegation: 'stubbed', releaseGate: true, sourceFile: 'x.yaml',
-    seed: { contacts: [], outboundContext: [], bullpen: [] },
+    seed: { contacts: [], outboundContext: [], bullpen: [], verifications: [], principalIdentities: [] },
     inbound: { from: 'principal', content: 'hi' },
     toolStubs: {}, explicitStubTools: [], ownStubTools: [], expectedBehaviors: behaviors, failureModes: [],
   } as ScenarioCase;

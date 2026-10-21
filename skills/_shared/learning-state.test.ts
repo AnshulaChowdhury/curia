@@ -4,12 +4,16 @@ import {
   LEARNING_STATE_NAMESPACE,
   COMPLETION_CANDIDATES_KEY,
   COMPLETION_DIGEST_KEY,
+  COMPLETION_DIGEST_HIGH_WATER_KEY,
   VOICE_PROPOSAL_KEY,
   ASKED_TASK_IDS_KEY,
   readCompletionCandidates,
   writeCompletionCandidates,
   readCompletionDigest,
   writeCompletionDigest,
+  readDigestHighWater,
+  writeDigestHighWater,
+  readNumberedCompletionDigest,
   readVoiceProposal,
   writeVoiceProposal,
   readIdSet,
@@ -17,6 +21,7 @@ import {
   composeUndoNote,
   composeConfirmNote,
   digestMapToItems,
+  assignDigestNumbers,
   COMPLETION_DIGEST_MAX_AGE_DAYS,
   COMPLETION_DIGEST_MAX_AGE_MS,
   isCompletionDigestItemExpired,
@@ -372,5 +377,133 @@ describe('learning-state config accessors', () => {
       .toBe('Marked *Ship* done — you emailed a@x (2026-07-01). Undo?');
     expect(composeConfirmNote({ taskTitle: 'Ship', recipient: 'a@x' }))
       .toBe('Did emailing a@x complete *Ship*?');
+  });
+
+  describe('assignDigestNumbers (#2159 Phase 3 numbering)', () => {
+    const item = (taskId: string, extra: Partial<CompletionDigestItem> = {}): CompletionDigestItem => ({
+      kind: 'confirm',
+      taskId,
+      taskTitle: taskId,
+      note: 'n',
+      ...extra,
+    });
+
+    it('gives an unnumbered entry max+1 (never a gap number) and keeps existing numbers', () => {
+      const map: CompletionDigestMap = { a: item('a', { n: 1 }), b: item('b'), c: item('c', { n: 3 }) };
+      const out = assignDigestNumbers(map);
+      expect(out.a!.n).toBe(1);
+      expect(out.b!.n).toBe(4);
+      expect(out.c!.n).toBe(3);
+    });
+
+    it('numbers unnumbered entries in createdAt order, then by key', () => {
+      const map: CompletionDigestMap = {
+        z: item('z', { createdAt: '2026-01-01T00:00:00.000Z' }),
+        b: item('b', { createdAt: '2026-02-01T00:00:00.000Z' }),
+        a: item('a', { createdAt: '2026-02-01T00:00:00.000Z' }),
+        // No usable clock sorts after the dated ones.
+        m: item('m'),
+      };
+      const out = assignDigestNumbers(map);
+      expect([out.z!.n, out.a!.n, out.b!.n, out.m!.n]).toEqual([1, 2, 3, 4]);
+    });
+
+    it('is stable: a resolved number is not reused while items are live, the others keep theirs', () => {
+      const map: CompletionDigestMap = assignDigestNumbers({
+        a: item('a', { n: 1 }),
+        c: item('c', { n: 3 }),
+        b: item('b', { n: 2 }),
+      });
+      const { a: _resolved, ...rest } = map;
+      void _resolved;
+      const out = assignDigestNumbers({ ...rest, d: item('d') });
+      // A stale "confirm 1" must not hit the new item, so d goes above the live max.
+      expect(out.d!.n).toBe(4);
+      expect(out.b!.n).toBe(2);
+      expect(out.c!.n).toBe(3);
+    });
+
+    it('numbers above the high-water mark, so resolving the top item does not free its number', () => {
+      // Items 1-3 were shown and "confirm task 3" resolved the top one. The mark still says 3,
+      // so a late or repeated "confirm task 3" cannot land on the next new item.
+      const out = assignDigestNumbers({ a: item('a', { n: 1 }), b: item('b', { n: 2 }), d: item('d') }, 3);
+      expect(out.d!.n).toBe(4);
+      expect(out.a!.n).toBe(1);
+      expect(out.b!.n).toBe(2);
+    });
+
+    it('restarts at 1 only when no numbered item remains', () => {
+      expect(assignDigestNumbers({ d: item('d') }).d!.n).toBe(1);
+    });
+
+    it('is pure and idempotent', () => {
+      const map: CompletionDigestMap = { a: item('a'), b: item('b') };
+      const out = assignDigestNumbers(map);
+      expect(map.a!.n).toBeUndefined();
+      expect(assignDigestNumbers(out)).toEqual(out);
+    });
+
+    it('renumbers a duplicate or invalid stored n rather than letting two items share a number', () => {
+      const map = {
+        a: item('a', { n: 1, createdAt: '2026-01-01T00:00:00.000Z' }),
+        b: item('b', { n: 1, createdAt: '2026-01-02T00:00:00.000Z' }),
+        c: item('c', { n: 0 }),
+      } as CompletionDigestMap;
+      const out = assignDigestNumbers(map);
+      const numbers = Object.values(out).map((i) => i.n);
+      expect(new Set(numbers).size).toBe(3);
+      expect(out.a!.n).toBe(1);
+      // Repairs are deterministic and above the live max (createdAt order, no clock last).
+      expect(out.b!.n).toBe(2);
+      expect(out.c!.n).toBe(3);
+    });
+
+    it('round-trips the high-water mark and reads 0 when none is stored', async () => {
+      const { store, values } = fakeStore();
+      expect(await readDigestHighWater(store)).toBe(0);
+      expect(await writeDigestHighWater(store, 7)).toBe(true);
+      expect(values.get(COMPLETION_DIGEST_HIGH_WATER_KEY)).toBe('7');
+      expect(await readDigestHighWater(store)).toBe(7);
+    });
+
+    it('reads a corrupt high-water mark as 0 and warns', async () => {
+      const { logger, warnCalls } = fakeLogger();
+      for (const raw of ['not json', '-2', '1.5', '"3"']) {
+        const { store } = fakeStore({ [COMPLETION_DIGEST_HIGH_WATER_KEY]: raw });
+        expect(await readDigestHighWater(store, logger)).toBe(0);
+      }
+      expect(warnCalls).toHaveLength(4);
+      expect(warnCalls[0]![0]).toMatchObject({ key: COMPLETION_DIGEST_HIGH_WATER_KEY });
+    });
+
+    it('readNumberedCompletionDigest numbers above the stored mark, and ignores the mark on an empty digest', async () => {
+      const { store } = fakeStore({
+        [COMPLETION_DIGEST_KEY]: JSON.stringify({
+          a: { kind: 'undo', taskId: 'a', taskTitle: 'A', note: 'n', n: 1 },
+          // A junk n is repaired; it must get the number the writer would give it: above the mark.
+          b: { kind: 'undo', taskId: 'b', taskTitle: 'B', note: 'n', n: 'two' },
+        }),
+        [COMPLETION_DIGEST_HIGH_WATER_KEY]: '4',
+      });
+      const { map, highWater } = await readNumberedCompletionDigest(store);
+      expect(highWater).toBe(4);
+      expect(map.a!.n).toBe(1);
+      expect(map.b!.n).toBe(5);
+
+      const empty = fakeStore({ [COMPLETION_DIGEST_HIGH_WATER_KEY]: '4' });
+      expect(await readNumberedCompletionDigest(empty.store)).toEqual({ map: {}, highWater: 0 });
+    });
+
+    it('readCompletionDigest keeps a stored n and drops a non-positive-integer one', async () => {
+      const { store } = fakeStore({
+        [COMPLETION_DIGEST_KEY]: JSON.stringify({
+          a: { kind: 'undo', taskId: 'a', taskTitle: 'A', note: 'n', n: 4 },
+          b: { kind: 'undo', taskId: 'b', taskTitle: 'B', note: 'n', n: 'two' },
+        }),
+      });
+      const map = await readCompletionDigest(store);
+      expect(map.a!.n).toBe(4);
+      expect(map.b!.n).toBeUndefined();
+    });
   });
 });

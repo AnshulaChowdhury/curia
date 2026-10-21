@@ -6,6 +6,8 @@ import type { AutonomyService } from '../../../src/autonomy/autonomy-service.js'
 import type { LLMProvider } from '../../../src/agents/llm/provider.js';
 import { createSilentLogger } from '../../../src/logger.js';
 import type { ActionLogRow } from '../../../src/autonomy/action-log-types.js';
+import { DETERMINISTIC_SCORES } from '../../../src/autonomy/action-log-types.js';
+import { NO_REASONING } from '../../../src/agents/llm/sampling-options.js';
 
 function makeRow(overrides: Partial<ActionLogRow>): ActionLogRow {
   return {
@@ -27,6 +29,7 @@ function makeRow(overrides: Partial<ActionLogRow>): ActionLogRow {
     expiresAt: null,
     parentActionId: null,
     shortRef: null,
+    approvalNumber: null,
     description: null,
     createdAt: new Date(),
     ...overrides,
@@ -88,9 +91,9 @@ const defaultConfig = {
   batchSize: 50,
   minScoredActions: 30,
   halfLifeDays: 30,
-  weakExpiredWeight: 0.3,
   ceoCooldownDays: 7,
   errorRateThreshold: 0.20,
+  errorRateWindowDays: 90,
   unparseableAfterDays: 3,
 };
 
@@ -124,6 +127,86 @@ describe('AutonomyScoringPass', () => {
         compatibility: 0,
         scoredBy: 'deterministic',
       });
+    });
+
+    // #2159: only the principal's own decisions are feedback.
+    it('scores a coordinator-resolved approval as no signal', async () => {
+      const row = makeRow({ id: 20, outcome: 'approved', resolvedBy: 'coordinator' });
+      const repo = makeRepo({ findUnscoredTerminal: vi.fn().mockResolvedValue([row]) });
+      const pass = new AutonomyScoringPass(repo, makeAutonomyService(), makeLlmProvider(), createSilentLogger(), defaultConfig);
+
+      await pass.run();
+
+      expect(repo.updateScoringFlags).toHaveBeenCalledWith(20, {
+        competenceFlag: null,
+        commitmentFlag: null,
+        compatibility: null,
+        scoredBy: 'deterministic-coordinator',
+      });
+    });
+
+    it('scores a coordinator-denied approval as no signal', async () => {
+      const row = makeRow({ id: 21, outcome: 'denied', resolvedBy: 'coordinator' });
+      const repo = makeRepo({ findUnscoredTerminal: vi.fn().mockResolvedValue([row]) });
+      const pass = new AutonomyScoringPass(repo, makeAutonomyService(), makeLlmProvider(), createSilentLogger(), defaultConfig);
+
+      await pass.run();
+
+      expect(repo.updateScoringFlags).toHaveBeenCalledWith(21, expect.objectContaining({
+        competenceFlag: null,
+        scoredBy: 'deterministic-coordinator',
+      }));
+    });
+
+    it('keeps the principal signal for a reaction-resolved approval', async () => {
+      const row = makeRow({ id: 22, outcome: 'approved', resolvedBy: 'principal' });
+      const repo = makeRepo({ findUnscoredTerminal: vi.fn().mockResolvedValue([row]) });
+      const pass = new AutonomyScoringPass(repo, makeAutonomyService(), makeLlmProvider(), createSilentLogger(), defaultConfig);
+
+      await pass.run();
+
+      expect(repo.updateScoringFlags).toHaveBeenCalledWith(22, expect.objectContaining({
+        competenceFlag: 1,
+        scoredBy: 'deterministic',
+      }));
+    });
+
+    // #2196: the re-execution of an approved action has no summary; the parent carries the signal.
+    it('scores a successful re-execution of an approved action as no signal, without the judge', async () => {
+      const row = makeRow({ id: 45, outcome: 'success', parentActionId: 43, taskSummary: null });
+      const repo = makeRepo({ findUnscoredTerminal: vi.fn().mockResolvedValue([row]) });
+      const llm = makeLlmProvider(0, 0, 0);
+      const pass = new AutonomyScoringPass(repo, makeAutonomyService(), llm, createSilentLogger(), defaultConfig);
+
+      const result = await pass.run();
+
+      expect(llm.chat).not.toHaveBeenCalled();
+      expect(result.llmCallsMade).toBe(0);
+      expect(repo.updateScoringFlags).toHaveBeenCalledWith(45, {
+        competenceFlag: null,
+        commitmentFlag: null,
+        compatibility: null,
+        scoredBy: 'deterministic-approved-execution',
+      });
+    });
+
+    it('still judges a failed re-execution of an approved action, with its error as context', async () => {
+      const row = makeRow({ id: 32, outcome: 'failure', parentActionId: 31, taskSummary: 'calendar API returned 403' });
+      const repo = makeRepo({ findUnscoredTerminal: vi.fn().mockResolvedValue([row]) });
+      const llm = makeLlmProvider(0, 1, 1);
+      const pass = new AutonomyScoringPass(repo, makeAutonomyService(), llm, createSilentLogger(), defaultConfig);
+
+      await pass.run();
+
+      expect(llm.chat).toHaveBeenCalledTimes(1);
+      const prompt = vi.mocked(llm.chat).mock.calls[0]![0].messages[1]!.content as string;
+      expect(prompt).toContain('calendar API returned 403');
+      // A background scoring call never inherits reasoning (ADR-048 §3).
+      expect(vi.mocked(llm.chat).mock.calls[0]![0].options).toEqual({ reasoning: NO_REASONING });
+      expect(repo.updateScoringFlags).toHaveBeenCalledWith(32, expect.objectContaining({
+        competenceFlag: 0,
+        scoredBy: 'llm-judge',
+      }));
     });
 
     it('applies deterministic scores for rejected outcome', async () => {
@@ -363,6 +446,27 @@ describe('AutonomyScoringPass', () => {
       expect(changedBy).toBe('system');
     });
 
+    // #2159: coordinator-resolved approvals no longer carry competence, so the recent
+    // window can be empty. That is "no evidence", and must not read as a 0% error rate.
+    it('blocks score increase when there is no recent competence evidence', async () => {
+      const oldDate = new Date(Date.now() - 30 * 86_400_000);
+      const scoredRows = Array.from({ length: 35 }, (_, i) =>
+        makeRow({ id: i + 1, competenceFlag: null, commitmentFlag: 1, compatibility: 1, scoredBy: 'llm-judge', createdAt: new Date(Date.now() - i * 86_400_000) }),
+      );
+      const repo = makeRepo({
+        countScored: vi.fn().mockResolvedValue(35),
+        getRecentCompetenceErrorRate: vi.fn().mockResolvedValue(null),
+        findAllScored: vi.fn().mockResolvedValue(scoredRows),
+      });
+      const svc = makeAutonomyService(75, 'system', oldDate);
+      const pass = new AutonomyScoringPass(repo, svc, makeLlmProvider(), createSilentLogger(), defaultConfig);
+
+      const result = await pass.run();
+
+      expect(svc.setScore).not.toHaveBeenCalled();
+      expect(result.reason).toMatch(/no competence evidence in the last 90d/);
+    });
+
     it('blocks score increase when error rate exceeds threshold', async () => {
       const oldDate = new Date(Date.now() - 30 * 86_400_000);
       const scoredRows = [
@@ -417,5 +521,109 @@ describe('AutonomyScoringPass', () => {
         expect((call as [number])[0]).toBeLessThanOrEqual(75);
       }
     });
+  });
+
+  // #2159 Phase 3: the scorer weights the principal's spot-check verdicts most and
+  // ignores lapsed approvals. computeCapabilityScore is private, so these drive run()
+  // with a mocked repo that clears the sample-size and cooldown guards.
+  describe('principal verdicts and expired approvals (#2159 Phase 3)', () => {
+    async function capabilityFor(rows: ActionLogRow[]): Promise<number | null> {
+      const oldDate = new Date(Date.now() - 30 * 86_400_000); // past the principal cooldown
+      const repo = makeRepo({
+        countScored: vi.fn().mockResolvedValue(rows.length + 100), // above minScoredActions
+        getRecentCompetenceErrorRate: vi.fn().mockResolvedValue(0),
+        findAllScored: vi.fn().mockResolvedValue(rows),
+      });
+      const svc = makeAutonomyService(75, 'system', oldDate);
+      const pass = new AutonomyScoringPass(repo, svc, makeLlmProvider(), createSilentLogger(), defaultConfig);
+      const result = await pass.run();
+      return result.capabilityScore;
+    }
+
+    it('expired approvals score with no signal on any dimension', () => {
+      expect(DETERMINISTIC_SCORES.expired).toEqual({
+        competenceFlag: null,
+        commitmentFlag: null,
+        compatibility: null,
+        scoredBy: 'deterministic',
+      });
+    });
+
+    it('weights a principal verdict three times a judge verdict', async () => {
+      const rows = [
+        makeRow({ id: 1, competenceFlag: 0, scoredBy: 'principal' }),
+        makeRow({ id: 2, competenceFlag: 1, scoredBy: 'llm-judge' }),
+        makeRow({ id: 3, competenceFlag: 1, scoredBy: 'llm-judge' }),
+      ];
+
+      const capability = await capabilityFor(rows);
+
+      // Competence (1 + 1 + 0*3) / (1 + 1 + 3) = 0.4; commitment and compatibility have no data (0.5).
+      expect(capability).not.toBeNull();
+      expect(Math.abs(capability! - (0.45 * 0.4 + 0.35 * 0.5 + 0.20 * 0.5))).toBeLessThan(1e-9);
+    });
+
+    // A mixed set is the real guard: a lone row scores 0.5 whether it is skipped or the
+    // set is empty, so it cannot tell "ignored" from "weighted down" (review finding).
+    it('leaves the capability at the normal rows alone when an old expired row carries flags', async () => {
+      const rows = [
+        makeRow({ id: 1, outcome: 'success', competenceFlag: 1, commitmentFlag: 1, compatibility: 1, scoredBy: 'llm-judge' }),
+        makeRow({ id: 2, outcome: 'expired', commitmentFlag: 1, compatibility: 0, scoredBy: 'deterministic' }),
+      ];
+
+      const capability = await capabilityFor(rows);
+
+      // The normal row alone is 0.45 + 0.35 + 0.20 = 1.0; any weight on the expired row pulls compatibility down.
+      expect(capability).not.toBeNull();
+      expect(Math.abs(capability! - 1.0)).toBeLessThan(1e-9);
+    });
+
+    it('ignores an old expired row that still carries flags', async () => {
+      const rows = [
+        makeRow({ id: 1, outcome: 'expired', commitmentFlag: 1, compatibility: 0, scoredBy: 'deterministic' }),
+      ];
+
+      const capability = await capabilityFor(rows);
+
+      expect(capability).toBeCloseTo(0.5, 9);
+    });
+
+    // #2191: shadow drafts are counterfactual (drafted only for punted messages), not evidence
+    // about actions taken. Mixed set for the same reason as the expired test above.
+    it('leaves a shadow disagreement out of the capability score', async () => {
+      const rows = [
+        makeRow({ id: 1, outcome: 'success', competenceFlag: 1, commitmentFlag: 1, compatibility: 1, scoredBy: 'llm-judge' }),
+        makeRow({ id: 2, outcome: 'shadow_evaluated', competenceFlag: 0, scoredBy: 'shadow-reconciler' }),
+      ];
+
+      const capability = await capabilityFor(rows);
+
+      // Any weight on the shadow row pulls competence below 1.0.
+      expect(capability).not.toBeNull();
+      expect(Math.abs(capability! - 1.0)).toBeLessThan(1e-9);
+    });
+  });
+
+  // #2191: the guard's window is bounded by age as well as count.
+  it('passes the configured age bound to the error-rate window', async () => {
+    const oldDate = new Date(Date.now() - 30 * 86_400_000);
+    const scoredRows = Array.from({ length: 35 }, (_, i) =>
+      makeRow({ id: i + 1, competenceFlag: 1, commitmentFlag: 1, compatibility: 1, scoredBy: 'llm-judge', createdAt: new Date(Date.now() - i * 86_400_000) }),
+    );
+    const getRecentCompetenceErrorRate = vi.fn().mockResolvedValue(0);
+    const repo = makeRepo({
+      countScored: vi.fn().mockResolvedValue(35),
+      getRecentCompetenceErrorRate,
+      findAllScored: vi.fn().mockResolvedValue(scoredRows),
+    });
+    const svc = makeAutonomyService(75, 'system', oldDate);
+    const pass = new AutonomyScoringPass(repo, svc, makeLlmProvider(), createSilentLogger(), {
+      ...defaultConfig,
+      errorRateWindowDays: 45,
+    });
+
+    await pass.run();
+
+    expect(getRecentCompetenceErrorRate).toHaveBeenCalledWith(30, 45);
   });
 });

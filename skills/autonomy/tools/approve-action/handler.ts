@@ -10,6 +10,8 @@
 // only runs in a live principal turn. executionLayer capability is restricted to this skill.
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
+import { RESOLVED_BY, approvalLabel } from '../../../../src/autonomy/action-log-types.js';
+import { parseApprovalRefInput } from '../../../_shared/approval-ref.js';
 import { STALE_SEND_APPROVAL_ERROR } from '../../../../src/skills/_shared/recipient-reference.js';
 import { createHumanDecision } from '../../../../src/bus/events.js';
 import type { TaskOriginator } from '../../../../src/contacts/types.js';
@@ -28,11 +30,15 @@ export class ApproveActionHandler implements ToolHandler {
 
     try {
       // Resolve the pending row
-      const shortRef = typeof ctx.input.short_ref === 'string' && ctx.input.short_ref.trim()
-        ? ctx.input.short_ref.trim()
-        : undefined;
+      // A short_ref that is present but unreadable, or a ref under another key, fails closed here; only an absent one may
+      // fall back to the sole pending approval (#2159 Phase 3, see approval-ref.ts).
+      const parsedRef = parseApprovalRefInput(ctx.input);
+      if (!parsedRef.ok) {
+        ctx.log.warn({ shortRefType: typeof ctx.input.short_ref, inputKeys: Object.keys(ctx.input) }, 'approve-action: unusable or mis-keyed approval reference — refusing to resolve');
+        return { success: false, error: parsedRef.error };
+      }
 
-      const resolved = await ctx.actionLogRepo.resolvePending(shortRef);
+      const resolved = await ctx.actionLogRepo.resolvePending(parsedRef.ref);
       if (!resolved.found) {
         return { success: false, error: resolved.error };
       }
@@ -42,7 +48,7 @@ export class ApproveActionHandler implements ToolHandler {
       // Validate payload exists — re-execution needs the original skill input
       if (!row.payload) {
         ctx.log.error({ rowId: row.id }, 'approve-action: row has null payload — cannot re-execute');
-        return { success: false, error: `Cannot approve request '${row.shortRef}': no stored payload for re-execution` };
+        return { success: false, error: `Cannot approve ${approvalLabel(row)}: no stored payload for re-execution` };
       }
 
       const pins = row.sendResolution;
@@ -61,10 +67,12 @@ export class ApproveActionHandler implements ToolHandler {
       // Step 1: Transition to approved — returns false if another actor resolved first.
       // We MUST check this before re-executing to prevent running a skill that was
       // concurrently denied or dismissed.
-      const transitioned = await ctx.actionLogRepo.resolveRow(row.id, 'approved', 'ceo');
+      // An agent called this tool on its own reading of the conversation, so the row does not
+      // record it as the principal's decision; only reactions do (#2159).
+      const transitioned = await ctx.actionLogRepo.resolveRow(row.id, 'approved', RESOLVED_BY.coordinator);
       if (!transitioned) {
         ctx.log.warn({ rowId: row.id, shortRef: row.shortRef }, 'approve-action: row was already resolved concurrently — aborting re-execution');
-        return { success: false, error: `Request '${row.shortRef}' was already resolved by another action — approval aborted` };
+        return { success: false, error: `${approvalLabel(row)} was already resolved by another action — approval aborted` };
       }
       ctx.log.info({ rowId: row.id, shortRef: row.shortRef }, 'approve-action: row transitioned to approved');
 
@@ -152,7 +160,8 @@ export class ApproveActionHandler implements ToolHandler {
       return {
         success: true,
         data: {
-          approved: row.shortRef,
+          // Named the way the principal saw it: "Approval 3", or the reference for an unnumbered row.
+          approved: approvalLabel(row),
           description: row.description,
           reExecutionSuccess: reResult.success,
           reExecutionResult: reResult.success ? reResult.data : (reResult as { error: string }).error,
