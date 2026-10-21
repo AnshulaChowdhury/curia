@@ -42,6 +42,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Sign-in verification config** — `verification` section sets ask-channel order, expiry and code lifetimes. (#2017)
 - **Scenarios 24a–24d** — sign-in codes by SMS and email, no leaks, lost session. (#2017)
 - **ADR-050** — external verifications are first-class state; spec 03, 15 and 19 updated. (#2017)
+- **AWS Bedrock provider** — tiers can run Claude on Bedrock; opt-in, off by default. (#1766)
 
 ### Changed
 
