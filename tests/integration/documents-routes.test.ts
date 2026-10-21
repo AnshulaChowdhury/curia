@@ -27,6 +27,7 @@ describeIf('console Documents routes (integration)', () => {
   let repo: WorkingDocsRepo;
   let app: FastifyInstance;
   let archivedRow: WorkingDocRow;
+  const registered: string[] = [];
 
   beforeAll(async () => {
     store = await createIsolatedWorkingDocsStore(DATABASE_URL!);
@@ -45,6 +46,10 @@ describeIf('console Documents routes (integration)', () => {
     archivedRow = (await repo.softDelete('/projects/old/gone.md'))!;
 
     app = Fastify();
+    app.addHook('onRoute', (route) => {
+      const methods = Array.isArray(route.method) ? route.method : [route.method];
+      for (const method of methods) registered.push(`${method} ${route.url}`);
+    });
     await app.register(cookie);
     await app.register(documentsRoutes, {
       workingDocs: repo,
@@ -52,6 +57,8 @@ describeIf('console Documents routes (integration)', () => {
       webAppBootstrapSecret: SECRET,
       sessions: new Map(),
       scratchTtlDays: 7,
+      editMaxBytes: 64 * 1024,
+      bus: { publish: async () => {} },
     });
   });
 
@@ -82,9 +89,14 @@ describeIf('console Documents routes (integration)', () => {
       expect(wrong.statusCode).toBe(401);
     });
 
-    it('registers only GET routes', () => {
-      const tree = app.printRoutes({ commonPrefix: false });
-      expect(tree).not.toMatch(/\((?:[^)]*)(POST|PUT|PATCH|DELETE)/);
+    it('writes only through the four mutation routes (#1822)', () => {
+      const writes = registered.filter(r => !r.startsWith('GET ') && !r.startsWith('HEAD ')).sort();
+      expect(writes).toEqual([
+        'POST /api/documents/archive',
+        'POST /api/documents/doc',
+        'POST /api/documents/restore',
+        'PUT /api/documents/doc',
+      ]);
     });
 
     it('leaves the store unchanged after exercising every route', async () => {

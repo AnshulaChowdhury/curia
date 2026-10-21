@@ -145,6 +145,11 @@ export interface ResumableCeilingsConfig {
  * (`livekit` service on the internal Docker network). Browser signaling uses a
  * separate public `wss://` URL from the vault (`channel.voice.livekit_url`).
  */
+/** Default `documentWorkspace.consoleEditMaxBytes` — sits in the gap between prod's 53 KiB and 211 kB documents (#1822). */
+export const DEFAULT_CONSOLE_EDIT_MAX_BYTES = 64 * 1024;
+/** Upper bound for `documentWorkspace.consoleEditMaxBytes`; the save route sizes its body limit from the cap. */
+export const MAX_CONSOLE_EDIT_BYTES = 4 * 1024 * 1024;
+
 export const DEFAULT_VOICE_LIVEKIT_MANAGEMENT_URL = 'http://livekit:7880';
 
 export const DEFAULT_RESUMABLE_CEILINGS: ResumableCeilingsConfig = {
@@ -524,6 +529,12 @@ export interface YamlConfig {
   documentWorkspace?: {
     /** Days of inactivity before `/scratch/<conversation-id>/…` documents are archived by DreamEngine. Default: 7. */
     scratchTtlDays?: number;
+    /**
+     * Largest document (serialized OKF bytes) the console edits in place (#1822). Larger
+     * documents are read-only in the console and edited offline via download + import.
+     * Default: 65536 (64 KiB).
+     */
+    consoleEditMaxBytes?: number;
     /** KG promotion when a planned parent completes (#1241). */
     kgPromotion?: {
       enabled?: boolean;
@@ -1246,6 +1257,15 @@ export function loadYamlConfig(configDir: string): YamlConfig {
       if (!Number.isInteger(scratchTtlDays) || scratchTtlDays < 1 || scratchTtlDays > 36500) {
         throw new Error(
           `documentWorkspace.scratchTtlDays must be a positive integer no greater than 36500, got: ${scratchTtlDays}`,
+        );
+      }
+    }
+
+    if (documentWorkspace.consoleEditMaxBytes !== undefined) {
+      const cap = documentWorkspace.consoleEditMaxBytes;
+      if (!Number.isInteger(cap) || cap < 1024 || cap > MAX_CONSOLE_EDIT_BYTES) {
+        throw new Error(
+          `documentWorkspace.consoleEditMaxBytes must be an integer from 1024 to ${MAX_CONSOLE_EDIT_BYTES}, got: ${String(cap)}`,
         );
       }
     }

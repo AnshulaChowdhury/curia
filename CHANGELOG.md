@@ -16,6 +16,9 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Added
 
 - **Memory → Documents** — console page to browse, view, search and download OKF working documents. (#1821)
+- **Documents editing** — edit, create, archive and restore in the console; stale saves conflict, never overwrite. (#1822)
+- **`document.console_action` bus event** — **public API:** audits each console change to a working document. (#1822)
+- **`documentWorkspace.consoleEditMaxBytes`** — **config:** console edit size cap, default 64 KiB; larger documents are read-only. (#1822)
 - **Claude Sonnet 5.5 and Opus 5.5** — now selectable in config. Opus 5.5 cannot serve as the fast-tier, standard-tier or judge model. (#2220)
 - **KG explorer filter panel** — type and sensitivity checklists hide non-matching nodes and filter search results. (#351)
 - **`llm.call` prefix-guard drops** — **public API:** optional `reasoningBlocksDropped`; suites also print serving endpoints. (#2044)

@@ -28,7 +28,7 @@ import { registerSecurityHeaders } from './security-headers.js';
 import { EventRouter } from './event-router.js';
 import type { SchedulerService } from '../../scheduler/scheduler-service.js';
 import { HealthService } from '../../health/health-service.js';
-import { DEFAULT_HEALTH_CONFIG } from '../../config.js';
+import { DEFAULT_CONSOLE_EDIT_MAX_BYTES, DEFAULT_HEALTH_CONFIG } from '../../config.js';
 import { healthRoutes } from './routes/health.js';
 import { agentRoutes } from './routes/agents.js';
 import { jobRoutes } from './routes/jobs.js';
@@ -165,6 +165,8 @@ export interface HttpAdapterConfig {
    * Mounted only alongside the bootstrap secret, like the KG routes.
    */
   workingDocsRepo?: import('../../db/working-docs-repo.js').WorkingDocsRepo;
+  /** `documentWorkspace.consoleEditMaxBytes` — documents above it are read-only in the console (#1822). */
+  documentsEditMaxBytes?: number;
   /**
    * Read-only system/environment snapshot for GET /api/system (console System
    * settings, #1376). Boot-time facts only — version, runtime, timezone, models.
@@ -486,6 +488,8 @@ export class HttpAdapter implements Channel {
         sessions,
         // Same effective value DreamEngine purges with, so the derived expiry is honest.
         scratchTtlDays: this.config.memoryRetention?.scratchTtlDays ?? DEFAULT_SCRATCH_DOC_TTL_DAYS,
+        editMaxBytes: this.config.documentsEditMaxBytes ?? DEFAULT_CONSOLE_EDIT_MAX_BYTES,
+        bus,
       });
     }
 

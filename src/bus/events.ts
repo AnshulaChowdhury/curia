@@ -628,6 +628,24 @@ interface SystemRestartPayload {
   initiatedBy: string;
 }
 
+// DocumentConsoleActionPayload — the principal changed the OKF working-document store
+// from the console Documents page (#1822). Audit-only: nothing subscribes to act on it;
+// it exists so every console mutation lands in audit_log via the write-ahead hook.
+interface DocumentConsoleActionPayload {
+  action: 'create' | 'update' | 'archive' | 'restore';
+  /** Store path of the document acted on. */
+  path: string;
+  /** working_documents row id. */
+  documentId: string;
+  /** Document version after the action. */
+  version: number;
+  /** Serialized OKF size after the action. */
+  byteSize: number;
+  /** The console session is principal-only (see console-originator.ts). */
+  initiatedBy: 'principal';
+  channel: 'console';
+}
+
 // LlmCallPayload — emitted by the agent runtime after every LLM API call completes.
 // Provides model provenance, token accounting, timing, and content fingerprints for audit.
 // Spec 10 (audit log hardening): required by NIST AI 600-1, EU AI Act Article 12, OWASP LLM10.
@@ -1305,6 +1323,12 @@ export interface SystemRestartEvent extends BaseEvent {
   payload: SystemRestartPayload;
 }
 
+export interface DocumentConsoleActionEvent extends BaseEvent {
+  type: 'document.console_action';
+  sourceLayer: 'system';
+  payload: DocumentConsoleActionPayload;
+}
+
 /**
  * Full redacted LLM I/O for the `llm_call_archive` table. Carried on
  * `llm.call` as a non-persisted top-level field — AuditLogger omits it from
@@ -1805,6 +1829,7 @@ export type BusEvent =
   | ScheduleDriftPausedEvent  // Scheduler: job paused due to intent drift detection
   | ConfigChangeEvent        // System: config object changed (office identity, etc.)
   | SystemRestartEvent       // System: operator-initiated process restart (#1765)
+  | DocumentConsoleActionEvent // System: principal edited the document store from the console (#1822)
   | ConversationCheckpointEvent // Checkpoint pipeline: Dispatch fires after inactivity window
   | CheckpointExtractionSkippedEvent // Checkpoint pipeline: KG extraction skipped for trust policy (#1290)
   | LlmCallEvent             // Spec 10: LLM API call provenance (model, tokens, cost, hashes)
@@ -2705,6 +2730,16 @@ export function createSystemRestart(payload: SystemRestartPayload): SystemRestar
     id: randomUUID(),
     timestamp: new Date(),
     type: 'system.restart',
+    sourceLayer: 'system',
+    payload,
+  };
+}
+
+export function createDocumentConsoleAction(payload: DocumentConsoleActionPayload): DocumentConsoleActionEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'document.console_action',
     sourceLayer: 'system',
     payload,
   };

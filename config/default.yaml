@@ -108,6 +108,9 @@ documentWorkspace:
   # set `ttl_days: 0` on a scratch doc to opt out. `/projects/…` documents are never
   # auto-archived.
   scratchTtlDays: 7
+  # Largest document (serialized OKF bytes) the console Documents page edits in place.
+  # Bigger documents are read-only there: download, edit offline, re-import. 1024–4194304.
+  consoleEditMaxBytes: 65536
   # When a planned parent completes, promote its curated deliverable into the KG via
   # extract-facts / extract-relationships, then archive the project's workspace docs.
   # Per-task override: error_budget.kg_promotion: false skips promotion for that task.

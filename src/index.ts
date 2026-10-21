@@ -3231,8 +3231,9 @@ async function main(): Promise<void> {
     auditLogRepo,
     smsWebhookBridge,
     memoryRetention,
-    // Console Memory → Documents (#1821).
+    // Console Memory → Documents (#1821, #1822).
     workingDocsRepo,
+    documentsEditMaxBytes: yamlConfig.documentWorkspace?.consoleEditMaxBytes,
     system: systemSnapshot,
     // POST /api/system/restart (#1765) — SIGTERM so the graceful shutdown()
     // handler registered below runs. Docker `restart: unless-stopped` brings

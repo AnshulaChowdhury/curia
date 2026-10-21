@@ -24,6 +24,22 @@ describe('extractStructuredFields', () => {
     });
   });
 
+  it('maps document.console_action onto the working document (#1822)', () => {
+    expect(extractStructuredFields(
+      'document.console_action',
+      { action: 'archive', path: '/projects/x/brief.md', initiatedBy: 'principal', channel: 'console' },
+      'evt-doc',
+      logger,
+    )).toEqual({
+      action: 'archive',
+      outcome: 'success',
+      target_type: 'working_document',
+      target_id: '/projects/x/brief.md',
+      initiator_type: 'human',
+      initiator_id: 'principal',
+    });
+  });
+
   it('maps tool.result outcome from result.success', () => {
     expect(extractStructuredFields(
       'tool.result',

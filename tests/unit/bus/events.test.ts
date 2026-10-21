@@ -11,6 +11,7 @@ import {
   createVoiceSessionEnded,
   createOutboundNoReply,
   createSystemRestart,
+  createDocumentConsoleAction,
   type BusEvent,
 } from '../../../src/bus/events.js';
 
@@ -167,6 +168,21 @@ describe('Event Types', () => {
     expect(event.sourceLayer).toBe('system');
     expect(event.payload.bootedAt).toBe('2026-09-10T12:00:00.000Z');
     expect(event.payload.initiatedBy).toBe('operator');
+  });
+
+  it('creates a document.console_action event (#1822)', () => {
+    const event = createDocumentConsoleAction({
+      action: 'update',
+      path: '/projects/x/brief.md',
+      documentId: '00000000-0000-4000-8000-000000000001',
+      version: 3,
+      byteSize: 120,
+      initiatedBy: 'principal',
+      channel: 'console',
+    });
+    expect(event.type).toBe('document.console_action');
+    expect(event.sourceLayer).toBe('system');
+    expect(event.payload.action).toBe('update');
   });
 
   it('type narrows via discriminated union', () => {

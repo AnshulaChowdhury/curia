@@ -98,6 +98,16 @@ const extractToolResult: Extractor = (p, fail) => ({
  * residual dual-vocabulary emitters still get structured columns.
  */
 const EXTRACTORS: Readonly<Record<string, Extractor>> = {
+  // Console Documents page (#1822): the principal acting on one working document.
+  'document.console_action': (p, fail) => ({
+    action: str(p, 'action', fail),
+    outcome: 'success',
+    target_type: 'working_document',
+    target_id: str(p, 'path', fail),
+    initiator_type: 'human',
+    initiator_id: str(p, 'initiatedBy', fail),
+  }),
+
   'inbound.message': (p, fail) => ({
     action: 'receive',
     outcome: 'success',

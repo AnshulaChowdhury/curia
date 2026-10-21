@@ -58,6 +58,11 @@ export type WorkingDocWriteResult =
   | { ok: true; document: WorkingDocRow }
   | { ok: false; conflict: true; document: WorkingDocRow };
 
+export type WorkingDocRestoreResult =
+  | { ok: true; document: WorkingDocRow }
+  | { ok: false; reason: 'not_found' }
+  | { ok: false; reason: 'not_archived' | 'path_in_use'; document?: WorkingDocRow };
+
 export interface CreateWorkingDocParams {
   path: string;
   type: string;
@@ -654,6 +659,43 @@ export class WorkingDocsRepo {
     }
   }
 
+  /**
+   * Soft-delete only if the live document is still at `expectedVersion` (#1822 console
+   * archive). The version predicate is in the UPDATE itself, so an agent write that lands
+   * between the caller's read and this call yields a conflict instead of archiving a
+   * version nobody looked at. Returns null when no live document exists at the path.
+   */
+  async softDeleteAtVersion(path: string, expectedVersion: number): Promise<WorkingDocWriteResult | null> {
+    const normalized = normalizeDocPath(path);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query<DbWorkingDocRow>(
+        `UPDATE working_documents
+         SET archived_at = now(), updated_at = now()
+         WHERE path = $1 AND archived_at IS NULL AND version = $2
+         RETURNING ${DOC_COLUMNS}`,
+        [normalized, expectedVersion],
+      );
+      if (!rows[0]) {
+        await client.query('ROLLBACK');
+        const current = await this.read(normalized);
+        return current ? { ok: false, conflict: true, document: current } : null;
+      }
+      await client.query(`DELETE FROM working_document_links WHERE source_path = $1`, [normalized]);
+      await client.query('COMMIT');
+      const document = mapRow(rows[0]);
+      this.logger.info({ path: normalized, version: expectedVersion }, 'working-docs-repo: soft-deleted document at version');
+      return { ok: true, document };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      this.logger.error({ err, path: normalized }, 'working-docs-repo: softDeleteAtVersion transaction failed');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async softDelete(path: string): Promise<WorkingDocRow | null> {
     const normalized = normalizeDocPath(path);
     const client = await this.pool.connect();
@@ -681,6 +723,63 @@ export class WorkingDocsRepo {
     } catch (err) {
       await client.query('ROLLBACK');
       this.logger.error({ err, path: normalized }, 'working-docs-repo: softDelete transaction failed');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Return an archived row to live (#1822). Refused when another live document now holds
+   * the path — the live-path unique index would reject it anyway; checking first gives the
+   * caller a reason instead of a constraint error. Bumps `version` (a stale editor must not
+   * save over a restore) and rebuilds the outbound links `softDelete` removed.
+   */
+  async restore(id: string): Promise<WorkingDocRestoreResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows: lockedRows } = await client.query<DbWorkingDocRow>(
+        `SELECT ${DOC_COLUMNS} FROM working_documents WHERE id = $1::uuid FOR UPDATE`,
+        [id],
+      );
+      const locked = lockedRows[0];
+      if (!locked) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      if (locked.archived_at === null) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'not_archived', document: mapRow(locked) };
+      }
+      const { rows: liveRows } = await client.query<DbWorkingDocRow>(
+        `SELECT ${DOC_COLUMNS} FROM working_documents WHERE path = $1 AND archived_at IS NULL`,
+        [locked.path],
+      );
+      if (liveRows[0]) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'path_in_use', document: mapRow(liveRows[0]) };
+      }
+      const { rows } = await client.query<DbWorkingDocRow>(
+        `UPDATE working_documents
+            SET archived_at = NULL, version = version + 1, updated_at = now()
+          WHERE id = $1::uuid
+          RETURNING ${DOC_COLUMNS}`,
+        [id],
+      );
+      const restored = mapRow(rows[0]!);
+      await this.replaceLinks(client, restored.path, extractLinks(restored.path, restored.body));
+      await client.query('COMMIT');
+      this.logger.info({ path: restored.path, id }, 'working-docs-repo: restored document');
+      return { ok: true, document: restored };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      // 23505: a concurrent create took the path between the check and the update.
+      if ((err as { code?: string }).code === '23505') {
+        this.logger.warn({ id }, 'working-docs-repo: restore lost a race for its path');
+        return { ok: false, reason: 'path_in_use' };
+      }
+      this.logger.error({ err, id }, 'working-docs-repo: restore transaction failed');
       throw err;
     } finally {
       client.release();

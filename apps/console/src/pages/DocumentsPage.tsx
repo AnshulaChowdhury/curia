@@ -1,6 +1,8 @@
-// DocumentsPage — Memory → Documents: browse, view and search the OKF working-document
-// store (#1821). Navigation is path-based: directories are path prefixes and the
-// frontmatter title is only a hint beside the path.
+// DocumentsPage — Memory → Documents: browse, view, search and edit the OKF working-
+// document store (#1821, #1822). Navigation is path-based: directories are path prefixes
+// and the frontmatter title is only a hint beside the path. Editing is whole-document
+// (frontmatter and body as one OKF text) with optimistic concurrency: a save against a
+// version an agent has since changed shows their text and asks — it never overwrites.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
 import { useNavigate, useSearch } from '@tanstack/react-router';
@@ -37,7 +39,15 @@ interface DocResponse {
   document: DocDetail;
   htmlChunks: string[];
   backlinks: Array<{ sourcePath: string; linkKind: 'markdown' | 'wikilink' }>;
+  /** Live and at or under the console size cap. */
+  editable: boolean;
+  editMaxBytes: number;
+  /** The whole document as OKF text — present only when editable. */
+  okf: string | null;
 }
+
+/** Template for a new document: OKF requires frontmatter with a non-empty type. */
+const NEW_DOC_TEMPLATE = '---\ntype: note\ntitle: \n---\n\n';
 
 type SearchMatch =
   | { id: string; path: string; archived: boolean; kind: 'path' }
@@ -192,13 +202,168 @@ function MetaField({ label, value, mono }: { label: string; value: string | null
   );
 }
 
+/** Send a JSON mutation; returns the status and parsed body (error bodies included). */
+async function sendJson(method: 'POST' | 'PUT', url: string, payload: unknown): Promise<{ status: number; data: DocResponse & { error?: string; conflict?: boolean } }> {
+  const res = await apiFetch(url, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  let data: DocResponse & { error?: string; conflict?: boolean };
+  try {
+    data = await res.json() as DocResponse & { error?: string; conflict?: boolean };
+  } catch {
+    data = { error: `Request failed (${res.status})` } as DocResponse & { error?: string };
+  }
+  return { status: res.status, data };
+}
+
+function DocumentEditor({
+  data, onSaved, onCancel,
+}: {
+  data: DocResponse;
+  onSaved: (next: DocResponse) => void;
+  onCancel: () => void;
+}) {
+  const [text, setText] = useState(data.okf ?? '');
+  const [baseVersion, setBaseVersion] = useState(data.document.version);
+  const [conflict, setConflict] = useState<DocResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const bytes = new TextEncoder().encode(text).length;
+
+  async function save(expectedVersion: number) {
+    setSaving(true);
+    setError(null);
+    try {
+      const { status, data: res } = await sendJson('PUT', '/api/documents/doc', {
+        path: data.document.path, content: text, expectedVersion,
+      });
+      if (status === 200) {
+        onSaved(res);
+      } else if (status === 409 && res.conflict) {
+        setConflict(res);
+      } else {
+        setError(res.error ?? `Save failed (${status})`);
+      }
+    } catch (err) {
+      console.error('[DocumentsPage] save failed:', err);
+      setError(err instanceof Error ? err.message : 'Save failed');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="docs-editor">
+      {conflict && (
+        <div className="docs-conflict" role="alert">
+          <div className="docs-conflict-title">
+            This document changed after you opened it — it is now version {conflict.document.version}
+            {' '}(you loaded {baseVersion}). Nothing was saved.
+          </div>
+          <div className="docs-conflict-label">What is there now:</div>
+          <pre className="docs-conflict-text">{conflict.okf ?? conflict.document.body}</pre>
+          <div className="docs-conflict-actions">
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={() => {
+                setText(conflict.okf ?? '');
+                setBaseVersion(conflict.document.version);
+                setConflict(null);
+              }}
+            >
+              Discard my edits, load theirs
+            </button>
+            <button
+              type="button"
+              className="btn btn-danger btn-sm"
+              disabled={saving || !conflict.editable}
+              onClick={() => {
+                const latest = conflict.document.version;
+                setBaseVersion(latest);
+                setConflict(null);
+                void save(latest);
+              }}
+            >
+              Replace theirs with mine
+            </button>
+          </div>
+        </div>
+      )}
+      <textarea
+        className="docs-editor-text"
+        value={text}
+        onChange={e => setText(e.target.value)}
+        spellCheck={false}
+        aria-label="Document source (OKF: YAML frontmatter and markdown body)"
+      />
+      <div className="docs-editor-footer">
+        <span className={`docs-row-hint${bytes > data.editMaxBytes ? ' docs-over' : ''}`}>
+          {formatBytes(bytes)} of {formatBytes(data.editMaxBytes)} · editing version {baseVersion}
+        </span>
+        {error && <span className="docs-error-inline">{error}</span>}
+        <span className="docs-editor-buttons">
+          <button type="button" className="btn btn-secondary btn-sm" onClick={onCancel} disabled={saving}>Cancel</button>
+          <button type="button" className="btn btn-primary btn-sm" onClick={() => void save(baseVersion)} disabled={saving || conflict !== null}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function DocumentView({
-  data, onOpenPath,
+  data, onOpenPath, onChanged, onArchived, onRestored,
 }: {
   data: DocResponse;
   onOpenPath: (path: string) => void;
+  /** A save replaced this document's content. */
+  onChanged: (next: DocResponse) => void;
+  onArchived: (archived: DocResponse) => void;
+  onRestored: (restored: DocResponse) => void;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const doc = data.document;
+  const live = doc.archivedAt === null;
+
+  async function archive() {
+    if (!window.confirm(`Archive ${doc.path}? It leaves the live store but stays restorable under Archived.`)) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      const { status, data: res } = await sendJson('POST', '/api/documents/archive', { path: doc.path, expectedVersion: doc.version });
+      if (status === 200) onArchived(res);
+      else if (status === 409 && res.conflict) {
+        setActionError(`Not archived: it changed since you opened it (now version ${res.document.version}). Showing the current version.`);
+        onChanged(res);
+      } else setActionError(res.error ?? `Archive failed (${status})`);
+    } catch (err) {
+      console.error('[DocumentsPage] archive failed:', err);
+      setActionError(err instanceof Error ? err.message : 'Archive failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restore() {
+    setBusy(true);
+    setActionError(null);
+    try {
+      const { status, data: res } = await sendJson('POST', '/api/documents/restore', { id: doc.id });
+      if (status === 200) onRestored(res);
+      else setActionError(res.error ?? `Restore failed (${status})`);
+    } catch (err) {
+      console.error('[DocumentsPage] restore failed:', err);
+      setActionError(err instanceof Error ? err.message : 'Restore failed');
+    } finally {
+      setBusy(false);
+    }
+  }
   const frontmatterEntries = Object.entries(doc.frontmatter);
   const downloadHref = `/api/documents/download?${docQuery({ id: doc.id })}`;
 
@@ -228,14 +393,38 @@ function DocumentView({
           )}
         </div>
         <div className="docs-view-actions">
+          {live && data.editable && !editing && (
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => setEditing(true)}>Edit</button>
+          )}
           <a className="btn btn-secondary btn-sm" href={downloadHref} download>
             Download
           </a>
+          {live && !editing && (
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => void archive()} disabled={busy}>Archive</button>
+          )}
+          {!live && (
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => void restore()} disabled={busy}>Restore</button>
+          )}
+          {actionError && <span className="docs-error-inline">{actionError}</span>}
         </div>
+        {live && !data.editable && (
+          <div className="docs-readonly-note">
+            Read-only here: at {formatBytes(doc.byteSize)} this document is over the {formatBytes(data.editMaxBytes)} console
+            editing limit. Download it to view or edit offline.
+          </div>
+        )}
       </div>
 
       <div className="docs-view-columns">
-        <ProgressiveBody key={`${doc.id}:${doc.version}`} chunks={data.htmlChunks} onLinkClick={handleBodyClick} />
+        {editing ? (
+          <DocumentEditor
+            data={data}
+            onSaved={next => { setEditing(false); onChanged(next); }}
+            onCancel={() => setEditing(false)}
+          />
+        ) : (
+          <ProgressiveBody key={`${doc.id}:${doc.version}`} chunks={data.htmlChunks} onLinkClick={handleBodyClick} />
+        )}
 
         <aside className="docs-meta">
           <section>
@@ -287,6 +476,67 @@ function DocumentView({
   );
 }
 
+function CreateDocumentPanel({
+  initialDir, onCreated, onCancel,
+}: {
+  initialDir: string;
+  onCreated: (created: DocResponse) => void;
+  onCancel: () => void;
+}) {
+  const [path, setPath] = useState(`${initialDir}untitled.md`);
+  const [text, setText] = useState(NEW_DOC_TEMPLATE);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  async function create() {
+    setSaving(true);
+    setError(null);
+    try {
+      const { status, data } = await sendJson('POST', '/api/documents/doc', { path: path.trim(), content: text });
+      if (status === 201) onCreated(data);
+      else setError(data.error ?? `Create failed (${status})`);
+    } catch (err) {
+      console.error('[DocumentsPage] create failed:', err);
+      setError(err instanceof Error ? err.message : 'Create failed');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="docs-view">
+      <div className="docs-view-header">
+        <h2 className="docs-view-path">New document</h2>
+        <label className="docs-create-path">
+          <span className="docs-row-hint">Path</span>
+          <input value={path} onChange={e => setPath(e.target.value)} spellCheck={false} aria-label="New document path" />
+        </label>
+      </div>
+      <div className="docs-view-columns">
+        <div className="docs-editor">
+          <textarea
+            className="docs-editor-text"
+            value={text}
+            onChange={e => setText(e.target.value)}
+            spellCheck={false}
+            aria-label="New document source"
+          />
+          <div className="docs-editor-footer">
+            <span className="docs-row-hint">YAML frontmatter needs a <code>type</code>. log.md and index.md are reserved.</span>
+            {error && <span className="docs-error-inline">{error}</span>}
+            <span className="docs-editor-buttons">
+              <button type="button" className="btn btn-secondary btn-sm" onClick={onCancel} disabled={saving}>Cancel</button>
+              <button type="button" className="btn btn-primary btn-sm" onClick={() => void create()} disabled={saving}>
+                {saving ? 'Creating…' : 'Create'}
+              </button>
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function DocumentsPage() {
@@ -311,6 +561,7 @@ export default function DocumentsPage() {
 
   const [detail, setDetail] = useState<DocResponse | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
 
   useEffect(() => {
     document.documentElement.dataset['mobileSidebar'] = mobileOpen ? 'open' : '';
@@ -429,6 +680,7 @@ export default function DocumentsPage() {
   }, [openPath]);
 
   function open(target: Selection) {
+    setCreating(false);
     void navigate({
       to: '/documents',
       search: {
@@ -469,6 +721,9 @@ export default function DocumentsPage() {
             <TopbarSearch placeholder="Search paths and text…" value={query} onChange={setQuery} />
             <TopbarDivider />
             <span className="topbar-meta">{docs.length} document{docs.length === 1 ? '' : 's'}</span>
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => setCreating(true)}>
+              + New document
+            </button>
           </Topbar>
 
           <div className="records-toolbar">
@@ -581,10 +836,36 @@ export default function DocumentsPage() {
             </div>
 
             <div className="docs-detail">
-              {detailError ? (
+              {creating ? (
+                <CreateDocumentPanel
+                  initialDir={prefix}
+                  onCancel={() => setCreating(false)}
+                  onCreated={created => {
+                    setCreating(false);
+                    setDetail(created);
+                    void loadList();
+                    open({ path: created.document.path });
+                  }}
+                />
+              ) : detailError ? (
                 <div className="docs-error">{detailError}</div>
               ) : detail ? (
-                <DocumentView data={detail} onOpenPath={path => open({ path })} />
+                <DocumentView
+                  key={`${detail.document.id}:${detail.document.version}`}
+                  data={detail}
+                  onOpenPath={path => open({ path })}
+                  onChanged={next => { setDetail(next); void loadList(); }}
+                  onArchived={archived => {
+                    setDetail(archived);
+                    void loadList();
+                    open({ id: archived.document.id });
+                  }}
+                  onRestored={restored => {
+                    setDetail(restored);
+                    void loadList();
+                    open({ path: restored.document.path });
+                  }}
+                />
               ) : (
                 <div className="docs-empty-note docs-empty-center">
                   Pick a document to read it. Directories are path prefixes — the same
