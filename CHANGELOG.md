@@ -15,7 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
-- **Claude Sonnet 5.5 and Opus 5.5** — now selectable in config. Opus 5.5 cannot serve as the fast-tier or judge model. (#2220)
+- **Claude Sonnet 5.5 and Opus 5.5** — now selectable in config. Opus 5.5 cannot serve as the fast-tier, standard-tier or judge model. (#2220)
 - **KG explorer filter panel** — type and sensitivity checklists hide non-matching nodes and filter search results. (#351)
 - **`llm.call` prefix-guard drops** — **public API:** optional `reasoningBlocksDropped`; suites also print serving endpoints. (#2044)
 - **`archive-extract`** — opens zip and gzip attachments within size and path limits. (#2208)

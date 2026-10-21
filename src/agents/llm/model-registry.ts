@@ -155,9 +155,11 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
   // every effort, so its `reasoning` entry leaves out `none`. A call site that
   // sends `none` gets the model's default thinking.
   //
-  // Do not set Opus 5.5 as the fast-tier model or as either judge's model. The
-  // 10-token classifier runs on the fast-tier model. The judges cap their output
-  // at 200 to 1,200 tokens. Opus 5.5 spends those output caps on thinking.
+  // Do not set Opus 5.5 as the fast-tier model, the standard-tier model, or
+  // either judge's model. The 10-token classifier runs on the fast-tier model.
+  // The drift detector runs on the standard-tier model at 200 tokens and reads a
+  // failed call as no drift. The judges cap their output at 200 to 1,200 tokens.
+  // Opus 5.5 spends those output caps on thinking.
   'claude-opus-5-5': {
     provider: 'anthropic',
     contextWindow: 1_000_000,
