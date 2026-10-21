@@ -89,11 +89,12 @@ describeIf('console Documents routes (integration)', () => {
       expect(wrong.statusCode).toBe(401);
     });
 
-    it('writes only through the four mutation routes (#1822)', () => {
+    it('writes only through the mutation and import routes (#1822, #1823)', () => {
       const writes = registered.filter(r => !r.startsWith('GET ') && !r.startsWith('HEAD ')).sort();
       expect(writes).toEqual([
         'POST /api/documents/archive',
         'POST /api/documents/doc',
+        'POST /api/documents/import',
         'POST /api/documents/restore',
         'PUT /api/documents/doc',
       ]);

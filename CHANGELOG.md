@@ -19,6 +19,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Documents editing** — edit, create, archive and restore in the console; stale saves conflict, never overwrite. (#1822)
 - **`document.console_action` bus event** — **public API:** audits each console change to a working document. (#1822)
 - **`documentWorkspace.consoleEditMaxBytes`** — **config:** console edit size cap, default 64 KiB; larger documents are read-only. (#1822)
+- **Documents export and import** — OKF zip bundles; import previews first, never overwrites newer versions or deletes. (#1823)
 - **Claude Sonnet 5.5 and Opus 5.5** — now selectable in config. Opus 5.5 cannot serve as the fast-tier, standard-tier or judge model. (#2220)
 - **KG explorer filter panel** — type and sensitivity checklists hide non-matching nodes and filter search results. (#351)
 - **`llm.call` prefix-guard drops** — **public API:** optional `reasoningBlocksDropped`; suites also print serving endpoints. (#2044)
@@ -55,6 +56,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **AWS Bedrock provider** — tiers can run Claude on Bedrock; opt-in, off by default. (#1766)
 
 ### Changed
+
+- **`emitOkfDocument`** — writes the body verbatim instead of appending a trailing newline, so parsing inverts it. (#1823)
 
 - **KG explorer layout** — nodes spread further apart and labels no longer overlap. (#351)
 - **Console registry** — shows optional capabilities beside a tool's required ones. (#2028)

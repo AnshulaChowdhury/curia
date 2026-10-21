@@ -3,8 +3,10 @@
 // and the frontmatter title is only a hint beside the path. Editing is whole-document
 // (frontmatter and body as one OKF text) with optimistic concurrency: a save against a
 // version an agent has since changed shows their text and asks — it never overwrites.
+// Export downloads the store (or a folder) as an OKF zip; import previews a bundle — or
+// one document edited offline — and applies only what the preview showed (#1823).
 
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { MobileMenuContext } from '../context/MobileMenu.js';
 import { Sidebar } from '../components/Sidebar.js';
@@ -321,7 +323,7 @@ function DocumentEditor({
 }
 
 function DocumentView({
-  data, onOpenPath, onChanged, onArchived, onRestored,
+  data, onOpenPath, onChanged, onArchived, onRestored, onUploadEdited, onEditingChange,
 }: {
   data: DocResponse;
   onOpenPath: (path: string) => void;
@@ -332,8 +334,13 @@ function DocumentView({
   onChanged: (next: DocResponse, notices?: string[]) => void;
   onArchived: (archived: DocResponse) => void;
   onRestored: (restored: DocResponse) => void;
+  /** Open the import dialog to upload an offline-edited copy onto this document. */
+  onUploadEdited: (path: string) => void;
+  /** Reports whether the editor is open, so the page can hold off actions that reload this document. */
+  onEditingChange: (editing: boolean) => void;
 }) {
-  const [editing, setEditing] = useState(false);
+  const [editing, setEditingState] = useState(false);
+  const setEditing = (next: boolean) => { setEditingState(next); onEditingChange(next); };
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const doc = data.document;
@@ -417,7 +424,8 @@ function DocumentView({
         {live && !data.editable && (
           <div className="docs-readonly-note">
             Read-only here: at {formatBytes(doc.byteSize)} this document is over the {formatBytes(data.editMaxBytes)} console
-            editing limit. Download it to view or edit offline.
+            editing limit. Download it, edit it offline, then{' '}
+            <button type="button" className="docs-link-btn" onClick={() => onUploadEdited(doc.path)}>upload the edited copy</button>.
           </div>
         )}
       </div>
@@ -544,6 +552,223 @@ function CreateDocumentPanel({
   );
 }
 
+// ── Export / import ───────────────────────────────────────────────────────────
+
+function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+  return (
+    <div className="docs-modal-backdrop" onClick={onClose}>
+      <div className="docs-modal" role="dialog" aria-modal="true" aria-label={title} onClick={e => e.stopPropagation()}>
+        <div className="docs-modal-header">
+          <h2 className="docs-modal-title">{title}</h2>
+          <button type="button" className="drawer-close" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function ExportDialog({ prefix, onClose }: { prefix: string; onClose: () => void }) {
+  const [scope, setScope] = useState<'all' | 'folder'>(prefix === '/' ? 'all' : 'folder');
+  const [includeArchived, setIncludeArchived] = useState(false);
+  const [size, setSize] = useState<{ documentCount: number; byteTotal: number } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const params = new URLSearchParams({ prefix: scope === 'all' ? '/' : prefix, includeArchived: String(includeArchived) });
+  const query = params.toString();
+
+  useEffect(() => {
+    let cancelled = false;
+    setSize(null);
+    apiFetch(`/api/documents/export/preview?${query}`)
+      .then(async res => {
+        if (!res.ok) throw new Error(await errorMessage(res));
+        return res.json() as Promise<{ documentCount: number; byteTotal: number }>;
+      })
+      .then(data => { if (!cancelled) { setSize(data); setError(null); } })
+      .catch((err: unknown) => {
+        console.error('[DocumentsPage] export preview failed:', err);
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Could not size the export');
+      });
+    return () => { cancelled = true; };
+  }, [query]);
+
+  return (
+    <Modal title="Export documents" onClose={onClose}>
+      <div className="docs-modal-body">
+        <label className="docs-radio">
+          <input type="radio" checked={scope === 'all'} onChange={() => setScope('all')} /> Whole workspace
+        </label>
+        {prefix !== '/' && (
+          <label className="docs-radio">
+            <input type="radio" checked={scope === 'folder'} onChange={() => setScope('folder')} /> Only <code>{prefix}</code>
+          </label>
+        )}
+        <label className="docs-radio">
+          <input type="checkbox" checked={includeArchived} onChange={e => setIncludeArchived(e.target.checked)} /> Include archived documents
+        </label>
+        <div className="docs-modal-note">
+          {error ?? (size
+            ? `${size.documentCount} document${size.documentCount === 1 ? '' : 's'} · ${formatBytes(size.byteTotal)} — one OKF file per document plus manifest.json. The export is audited.`
+            : 'Counting…')}
+        </div>
+      </div>
+      <div className="docs-modal-footer">
+        <button type="button" className="btn btn-secondary btn-sm" onClick={onClose}>Cancel</button>
+        <a
+          className={`btn btn-primary btn-sm${!size || size.documentCount === 0 ? ' disabled' : ''}`}
+          href={`/api/documents/export?${query}`}
+          download
+          aria-disabled={!size || size.documentCount === 0}
+          onClick={e => { if (!size || size.documentCount === 0) e.preventDefault(); else window.setTimeout(onClose, 300); }}
+        >
+          Download zip
+        </a>
+      </div>
+    </Modal>
+  );
+}
+
+type ImportAction = 'create' | 'update' | 'unchanged' | 'conflict';
+
+interface ImportPlanView {
+  items: Array<{ name: string; path: string; action: ImportAction; baseVersion: number | null; currentVersion: number | null; reason?: string }>;
+  skipped: Array<{ name: string; reason: string }>;
+  counts: Record<ImportAction | 'skipped', number>;
+  token: string;
+}
+
+interface ImportResultView {
+  created: string[];
+  updated: string[];
+  conflicts: Array<{ path: string; reason: string }>;
+  failed: Array<{ path: string; error: string }>;
+}
+
+const ACTION_LABELS: Record<ImportAction, string> = {
+  create: 'Create', update: 'Update', unchanged: 'Unchanged', conflict: 'Conflict',
+};
+
+function ImportDialog({ targetPath, onClose, onApplied }: { targetPath: string | null; onClose: () => void; onApplied: () => void }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [path, setPath] = useState(targetPath ?? '');
+  const [plan, setPlan] = useState<ImportPlanView | null>(null);
+  const [result, setResult] = useState<ImportResultView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const single = file !== null && file.name.toLowerCase().endsWith('.md');
+
+  async function send(mode: 'preview' | 'apply', token?: string) {
+    if (!file) return;
+    setBusy(true);
+    setError(null);
+    const params = new URLSearchParams({ mode, format: single ? 'md' : 'zip' });
+    if (single) {
+      params.set('path', path.trim());
+      params.set('filename', file.name);
+    }
+    if (token) params.set('planToken', token);
+    try {
+      const res = await apiFetch(`/api/documents/import?${params}`, {
+        method: 'POST',
+        headers: { 'Content-Type': single ? 'text/markdown' : 'application/zip' },
+        body: file,
+      });
+      const data = await res.json() as { plan?: ImportPlanView; result?: ImportResultView; error?: string };
+      if (data.plan) setPlan(data.plan);
+      if (!res.ok) {
+        setError(data.error ?? `Import failed (${res.status})`);
+        return;
+      }
+      if (mode === 'apply' && data.result) {
+        setResult(data.result);
+        onApplied();
+      }
+    } catch (err) {
+      console.error('[DocumentsPage] import failed:', err);
+      setError(err instanceof Error ? err.message : 'Import failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const writes = plan ? plan.counts.create + plan.counts.update : 0;
+
+  return (
+    <Modal title="Import documents" onClose={onClose}>
+      <div className="docs-modal-body">
+        <div className="docs-modal-note">
+          A zip exported from here, or one document (<code>.md</code>) you downloaded and edited. Nothing is written until
+          you confirm the preview. Import only creates and updates — it never archives anything missing from the file.
+        </div>
+        <input
+          type="file"
+          accept=".zip,.md,application/zip,text/markdown"
+          aria-label="Bundle or document to import"
+          onChange={e => { setFile(e.target.files?.[0] ?? null); setPlan(null); setResult(null); setError(null); }}
+        />
+        {single && (
+          <label className="docs-create-path">
+            <span className="docs-row-hint">Import onto</span>
+            <input value={path} onChange={e => { setPath(e.target.value); setPlan(null); }} spellCheck={false} aria-label="Document path to import onto" />
+          </label>
+        )}
+        {error && <div className="docs-error-inline">{error}</div>}
+        {plan && !result && (
+          <>
+            <div className="kg-detail-badges">
+              {(['create', 'update', 'unchanged', 'conflict'] as const).map(a => (
+                <span key={a} className={`docs-badge docs-action-${a}`}>{ACTION_LABELS[a]} {plan.counts[a]}</span>
+              ))}
+              <span className="docs-badge">Skipped {plan.counts.skipped}</span>
+            </div>
+            <div className="docs-plan-list">
+              {plan.items.filter(i => i.action !== 'unchanged').map(item => (
+                <div key={item.name} className="docs-plan-row">
+                  <span className={`docs-badge docs-action-${item.action}`}>{ACTION_LABELS[item.action]}</span>
+                  <span className="docs-plan-path">{item.path}</span>
+                  {item.reason && <span className="docs-row-hint">{item.reason}</span>}
+                </div>
+              ))}
+              {plan.skipped.map(s => (
+                <div key={`skip:${s.name}`} className="docs-plan-row">
+                  <span className="docs-badge">Skipped</span>
+                  <span className="docs-plan-path">{s.name}</span>
+                  <span className="docs-row-hint">{s.reason}</span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+        {result && (
+          <div className="docs-modal-note">
+            Created {result.created.length}, updated {result.updated.length}
+            {result.conflicts.length > 0 && `, ${result.conflicts.length} lost a race and were left as they were`}.
+            {result.failed.length > 0 && (
+              <div className="docs-error-inline">
+                {result.failed.length} failed and were not written: {result.failed.map(f => f.path).join(', ')}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="docs-modal-footer">
+        <button type="button" className="btn btn-secondary btn-sm" onClick={onClose}>{result ? 'Close' : 'Cancel'}</button>
+        {!result && (
+          plan ? (
+            <button type="button" className="btn btn-primary btn-sm" disabled={busy || writes === 0} onClick={() => void send('apply', plan.token)}>
+              {writes === 0 ? 'Nothing to apply' : `Apply ${writes} change${writes === 1 ? '' : 's'}`}
+            </button>
+          ) : (
+            <button type="button" className="btn btn-primary btn-sm" disabled={busy || !file || (single && !path.trim())} onClick={() => void send('preview')}>
+              {busy ? 'Reading…' : 'Preview'}
+            </button>
+          )
+        )}
+      </div>
+    </Modal>
+  );
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function DocumentsPage() {
@@ -571,6 +796,11 @@ export default function DocumentsPage() {
   const [creating, setCreating] = useState(false);
   /** Messages about the last action on the open document; cleared when you navigate. */
   const [notices, setNotices] = useState<string[]>([]);
+  const [exporting, setExporting] = useState(false);
+  /** An open editor holds unsaved text; an import would reload the document under it. */
+  const [editorOpen, setEditorOpen] = useState(false);
+  /** Import dialog: null closed; otherwise the document path a single-file upload targets. */
+  const [importing, setImporting] = useState<{ targetPath: string | null } | null>(null);
 
   useEffect(() => {
     document.documentElement.dataset['mobileSidebar'] = mobileOpen ? 'open' : '';
@@ -677,6 +907,10 @@ export default function DocumentsPage() {
     return () => controller.abort();
   }, [urlPath, urlId, loadDetail]);
 
+  // The view (and any open editor) remounts per document version; start closed.
+  const detailKey = detail ? `${detail.document.id}:${detail.document.version}` : null;
+  useEffect(() => { setEditorOpen(false); }, [detailKey]);
+
   // Reveal the open document in the tree.
   const openPath = detail?.document.path;
   useEffect(() => {
@@ -732,6 +966,16 @@ export default function DocumentsPage() {
             <TopbarSearch placeholder="Search paths and text…" value={query} onChange={setQuery} />
             <TopbarDivider />
             <span className="topbar-meta">{docs.length} document{docs.length === 1 ? '' : 's'}</span>
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setExporting(true)}>Export</button>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              disabled={editorOpen}
+              title={editorOpen ? 'Save or cancel your edit first' : undefined}
+              onClick={() => setImporting({ targetPath: detail && !detail.document.archivedAt ? detail.document.path : null })}
+            >
+              Import
+            </button>
             <button type="button" className="btn btn-primary btn-sm" onClick={() => setCreating(true)}>
               + New document
             </button>
@@ -883,6 +1127,8 @@ export default function DocumentsPage() {
                     void loadList();
                     open({ path: restored.document.path }, restored.warnings);
                   }}
+                  onUploadEdited={path => setImporting({ targetPath: path })}
+                  onEditingChange={setEditorOpen}
                 />
                 </>
               ) : (
@@ -894,6 +1140,18 @@ export default function DocumentsPage() {
             </div>
           </div>
         </main>
+        {exporting && <ExportDialog prefix={prefix} onClose={() => setExporting(false)} />}
+        {importing && (
+          <ImportDialog
+            targetPath={importing.targetPath}
+            onClose={() => setImporting(null)}
+            onApplied={() => {
+              void loadList();
+              if (urlId) void loadDetail({ id: urlId });
+              else if (urlPath) void loadDetail({ path: urlPath });
+            }}
+          />
+        )}
       </div>
     </MobileMenuContext.Provider>
   );

@@ -134,3 +134,14 @@ Intro text.
     expect(edited).toContain('None yet.');
   });
 });
+
+describe('emitOkfDocument / parseOkfDocument are inverses (#1823)', () => {
+  it.each([
+    ['no trailing newline', 'last line'],
+    ['empty', ''],
+    ['leading frontmatter look-alike', '---\nnot: frontmatter\n---\nreal body\n'],
+    ['blank-line start', '\n\nafter blanks'],
+  ])('keeps a body with %s byte-for-byte', (_label, body) => {
+    expect(parseOkfDocument(emitOkfDocument({ type: 'note', frontmatter: { title: 't' }, body })).body).toBe(body);
+  });
+});

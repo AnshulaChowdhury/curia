@@ -628,10 +628,12 @@ interface SystemRestartPayload {
   initiatedBy: string;
 }
 
-// DocumentConsoleActionPayload — the principal changed the OKF working-document store
-// from the console Documents page (#1822). Audit-only: nothing subscribes to act on it.
+// DocumentConsoleActionPayload — the principal changed or bulk-read the OKF working-
+// document store from the console Documents page (#1822, #1823). Audit-only: nothing
+// subscribes to act on it. The store holds sensitive personal content, so an export is
+// audited like a write.
 //
-// Each mutation is recorded in two stages, like tool.invoke / tool.result. `requested` is
+// Each edit is recorded in two stages, like tool.invoke / tool.result. `requested` is
 // published BEFORE the store is touched, and the console refuses the change if it cannot
 // be recorded — so no mutation exists without a durable audit row. `completed` follows a
 // successful write. A `requested` with no matching `completed` is a change that was not
@@ -668,7 +670,36 @@ interface DocumentConsoleCompletedPayload extends DocumentConsoleActorFields {
   byteSize: number;
 }
 
-type DocumentConsoleActionPayload = DocumentConsoleRequestedPayload | DocumentConsoleCompletedPayload;
+interface DocumentConsoleExportPayload extends DocumentConsoleActorFields {
+  action: 'export';
+  /** Path prefix exported — `/` for the whole workspace. */
+  scope: string;
+  includeArchived: boolean;
+  documentCount: number;
+  /** Sum of the exported documents' serialized OKF sizes. */
+  byteTotal: number;
+}
+
+interface DocumentConsoleImportPayload extends DocumentConsoleActorFields {
+  action: 'import';
+  /** `bundle` for a zip, or the target path for a single-document upload. */
+  scope: string;
+  created: number;
+  updated: number;
+  unchanged: number;
+  conflicts: number;
+  /** Planned writes that errored; the rest of the import still landed. */
+  failed: number;
+  skipped: number;
+  /** Serialized OKF bytes written. */
+  byteTotal: number;
+}
+
+type DocumentConsoleActionPayload =
+  | DocumentConsoleRequestedPayload
+  | DocumentConsoleCompletedPayload
+  | DocumentConsoleExportPayload
+  | DocumentConsoleImportPayload;
 
 // LlmCallPayload — emitted by the agent runtime after every LLM API call completes.
 // Provides model provenance, token accounting, timing, and content fingerprints for audit.

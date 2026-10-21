@@ -58,6 +58,10 @@ export function parseOkfDocument(raw: string): ParsedOkfDocument {
 /**
  * Emit an OKF markdown document from structured parts.
  * `type` is written to frontmatter; other conventional keys are preserved.
+ *
+ * The body is written verbatim — no trailing newline is added — so that
+ * `parseOkfDocument(emitOkfDocument(parts)).body === parts.body` for every body. Export
+ * and import depend on that inverse (#1823, #1824).
  */
 export function emitOkfDocument(parts: {
   type: string;
@@ -66,8 +70,7 @@ export function emitOkfDocument(parts: {
 }): string {
   const merged: Record<string, unknown> = { ...(parts.frontmatter ?? {}), type: parts.type };
   const yamlBlock = yaml.dump(merged, { lineWidth: -1, noRefs: true, schema: yaml.JSON_SCHEMA }).trimEnd();
-  const body = parts.body.endsWith('\n') || parts.body.length === 0 ? parts.body : `${parts.body}\n`;
-  return `---\n${yamlBlock}\n---\n${body}`;
+  return `---\n${yamlBlock}\n---\n${parts.body}`;
 }
 
 /** Compute byte size of the serialized OKF document. */

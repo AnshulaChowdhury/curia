@@ -11,6 +11,12 @@
 // directory's log.md the way doc-write does, stamps the principal's edit into the
 // frontmatter, and publishes a `completed` event.
 //
+// Export streams the store (or a subtree) as an OKF zip bundle; import applies one back —
+// dry-run first, additive only, version-guarded (#1823). A bundle import is a faithful
+// restore: no provenance stamp and no log.md lines, so a round trip reproduces the source
+// exactly (#1824). A single re-uploaded document is the offline half of a console edit,
+// so it is stamped and logged like one.
+//
 // The store holds sensitive personal content (medical prep, travel and family logistics),
 // so these routes are only mounted when the bootstrap secret is configured.
 
@@ -30,6 +36,18 @@ import {
 } from '../../../agents/document-workspace.js';
 import { CONSOLE_CHANNEL } from '../console-originator.js';
 import {
+  DEFAULT_BUNDLE_LIMITS,
+  OkfBundleError,
+  parseBundleDocument,
+  readOkfBundle,
+  baseFromDownloadName,
+  writeOkfBundle,
+  type OkfBundleDocumentEntry,
+  type OkfBundleLimits,
+  type OkfBundleSkippedEntry,
+} from '../../../memory/okf-bundle.js';
+import { applyImportPlan, planImport, type ImportBase } from '../../../memory/okf-bundle-import.js';
+import {
   attachmentDisposition,
   documentMatches,
   downloadFilename,
@@ -48,7 +66,16 @@ export interface DocumentsRouteOptions {
   editMaxBytes: number;
   /** Audit sink for document.console_action events. */
   bus: Pick<EventBus, 'publish'>;
+  /** Import extraction caps; defaults to DEFAULT_BUNDLE_LIMITS. */
+  bundleLimits?: OkfBundleLimits;
+  /** Largest import upload (compressed zip or one .md file). */
+  maxImportUploadBytes?: number;
 }
+
+/** Default import upload cap — prod's whole store is 448 kB. */
+export const DEFAULT_MAX_IMPORT_UPLOAD_BYTES = 32 * 1024 * 1024;
+
+const IMPORT_CONTENT_TYPES = ['application/zip', 'application/x-zip-compressed', 'application/octet-stream', 'text/markdown'];
 
 type ConsoleAction = 'create' | 'update' | 'archive' | 'restore';
 
@@ -510,6 +537,230 @@ export async function documentsRoutes(
     } catch (err) {
       logger.error({ err, id }, 'POST /api/documents/restore: restore failed');
       return reply.status(500).send({ error: 'Failed to restore document' });
+    }
+  });
+
+  // ── Export / import (#1823) ────────────────────────────────────────────────
+
+  const bundleLimits = options.bundleLimits ?? DEFAULT_BUNDLE_LIMITS;
+  const maxImportUpload = options.maxImportUploadBytes ?? DEFAULT_MAX_IMPORT_UPLOAD_BYTES;
+
+  // Import bodies arrive raw — a zip, or one .md file. Registered inside this plugin, so
+  // the parser is scoped to these routes and nothing else in the app accepts zips.
+  app.addContentTypeParser(IMPORT_CONTENT_TYPES, { parseAs: 'buffer', bodyLimit: maxImportUpload }, (_req, body, done) => {
+    done(null, body);
+  });
+
+  /** Export scope is a directory: `/projects/x` means `/projects/x/`, never `/projects/xy/`. */
+  function parseExportQuery(query: Query): { scope: string; includeArchived: boolean } | null {
+    const prefix = parsePrefix(query.prefix);
+    if (!prefix) return null;
+    const normalized = normalizeDocPath(prefix);
+    return {
+      scope: normalized === '/' ? '/' : `${normalized}/`,
+      includeArchived: query.includeArchived === 'true',
+    };
+  }
+
+  async function exportSet(scope: string, includeArchived: boolean) {
+    const documents = await workingDocs.listSummaries({ prefix: scope, status: includeArchived ? 'all' : 'live' });
+    return { documents, byteTotal: documents.reduce((sum, d) => sum + d.byteSize, 0) };
+  }
+
+  // -- GET /api/documents/export/preview — what an export would contain, for the confirm dialog --
+
+  app.get('/api/documents/export/preview', READ_RATE, async (request, reply) => {
+    if (!requireAuth(request, reply)) return;
+    const parsed = parseExportQuery(request.query as Query);
+    if (!parsed) return reply.status(400).send({ error: 'prefix must be an absolute path' });
+    try {
+      const { documents, byteTotal } = await exportSet(parsed.scope, parsed.includeArchived);
+      return reply.send({ ...parsed, documentCount: documents.length, byteTotal });
+    } catch (err) {
+      logger.error({ err, scope: parsed.scope }, 'GET /api/documents/export/preview: failed');
+      return reply.status(500).send({ error: 'Failed to size the export' });
+    }
+  });
+
+  // -- GET /api/documents/export — stream the bundle as a zip --
+
+  app.get('/api/documents/export', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+    if (!requireAuth(request, reply)) return;
+    const parsed = parseExportQuery(request.query as Query);
+    if (!parsed) return reply.status(400).send({ error: 'prefix must be an absolute path' });
+    const { scope, includeArchived } = parsed;
+
+    let documents;
+    let byteTotal;
+    try {
+      ({ documents, byteTotal } = await exportSet(scope, includeArchived));
+    } catch (err) {
+      logger.error({ err, scope }, 'GET /api/documents/export: listing failed');
+      return reply.status(500).send({ error: 'Failed to export documents' });
+    }
+
+    // A bulk read of sensitive content: audited before a byte leaves, and refused if the
+    // audit entry cannot be written.
+    try {
+      await bus.publish('system', createDocumentConsoleAction({
+        action: 'export',
+        scope,
+        includeArchived,
+        documentCount: documents.length,
+        byteTotal,
+        initiatedBy: 'principal',
+        channel: CONSOLE_CHANNEL,
+      }));
+    } catch (err) {
+      logger.error({ err, scope }, 'GET /api/documents/export: audit event failed — export refused');
+      return reply.status(500).send({ error: 'The export could not be audited, so it was not started — check the server logs.' });
+    }
+
+    const stream = writeOkfBundle({
+      documents,
+      loadDocument: id => workingDocs.readById(id),
+      toOkf: doc => workingDocs.toOkf(doc),
+      scope,
+      includeArchived,
+    });
+    stream.on('error', (err) => {
+      logger.error({ err, scope }, 'GET /api/documents/export: bundle stream failed mid-download');
+    });
+    const slug = scope === '/' ? 'all' : scope.replace(/^\/|\/$/g, '').replace(/[^a-zA-Z0-9._-]+/g, '-');
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '-');
+    return reply
+      .header('Content-Type', 'application/zip')
+      .header('Content-Disposition', attachmentDisposition(`curia-documents-${slug}-${stamp}.zip`))
+      .header('Cache-Control', 'no-store')
+      .send(stream);
+  });
+
+  // -- POST /api/documents/import — dry-run (mode=preview) or apply a previewed plan --
+
+  app.post('/api/documents/import', {
+    bodyLimit: maxImportUpload,
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    if (!requireAuth(request, reply)) return;
+    const query = request.query as Query;
+    const mode = query.mode;
+    const format = query.format ?? 'zip';
+    if (mode !== 'preview' && mode !== 'apply') return reply.status(400).send({ error: 'mode must be preview or apply' });
+    if (format !== 'zip' && format !== 'md') return reply.status(400).send({ error: 'format must be zip or md' });
+    const upload = request.body;
+    if (!Buffer.isBuffer(upload) || upload.length === 0) {
+      return reply.status(415).send({ error: 'Upload the bundle as application/zip, or one document as text/markdown' });
+    }
+
+    let documents: OkfBundleDocumentEntry[] = [];
+    let skipped: OkfBundleSkippedEntry[] = [];
+    const bases = new Map<string, ImportBase>();
+    let scope = 'bundle';
+
+    if (format === 'md') {
+      // One document edited offline, re-uploaded onto a chosen path. Its base comes from
+      // the download name (`brief.v12.3f2a9c1d.md`: version + row-id prefix) or an
+      // explicit baseVersion.
+      const path = parseDocPath(query.path);
+      if (!path) return reply.status(400).send({ error: 'path must be the absolute .md path to import onto' });
+      if (RESERVED_LEAF_NAMES.has(leafOf(path))) {
+        return reply.status(400).send({ error: `${leafOf(path)} is reserved`, reason: 'reserved' });
+      }
+      scope = path;
+      const name = (query.filename ?? '').trim() || leafOf(path);
+      const explicitBase = query.baseVersion !== undefined && /^\d+$/.test(query.baseVersion)
+        ? Number.parseInt(query.baseVersion, 10)
+        : null;
+      const base = baseFromDownloadName(name) ?? (explicitBase !== null ? { version: explicitBase } : null);
+      if (base !== null) bases.set(path, base);
+      if (upload.length > bundleLimits.maxEntryBytes) {
+        return reply.status(413).send({ error: `The file is over the ${bundleLimits.maxEntryBytes}-byte document limit` });
+      }
+      let content: string | null = null;
+      try {
+        content = new TextDecoder('utf-8', { fatal: true }).decode(upload);
+      } catch {
+        skipped = [{ name, reason: 'not valid UTF-8 text' }];
+      }
+      if (content !== null) {
+        const parsed = parseBundleDocument(content);
+        if ('error' in parsed) skipped = [{ name, reason: parsed.error }];
+        else documents = [{ name, path, content, ...parsed }];
+      }
+    } else {
+      try {
+        const contents = await readOkfBundle(upload, bundleLimits);
+        documents = contents.documents;
+        skipped = contents.skipped;
+        // Key on the entry name, not the manifest's own `path` field, so a manifest can't
+        // vouch for a different document than the one it sits beside.
+        const present = new Set(documents.map(d => d.path));
+        for (const entry of contents.manifest?.documents ?? []) {
+          const path = `/${entry.entry}`;
+          if (entry.archivedAt === null && present.has(path)) bases.set(path, { version: entry.version, id: entry.id });
+        }
+      } catch (err) {
+        if (err instanceof OkfBundleError) {
+          logger.warn({ reason: err.message }, 'POST /api/documents/import: bundle rejected');
+          return reply.status(400).send({ error: `Bundle rejected: ${err.message}` });
+        }
+        logger.error({ err }, 'POST /api/documents/import: reading bundle failed');
+        return reply.status(500).send({ error: 'Failed to read the bundle' });
+      }
+    }
+
+    try {
+      const plan = await planImport(documents, bases, skipped, workingDocs);
+      if (mode === 'preview') return reply.send({ mode, plan });
+
+      if (query.planToken !== plan.token) {
+        return reply.status(409).send({
+          error: 'The store or the file changed since the preview — preview again before applying.',
+          reason: 'plan_changed',
+          plan,
+        });
+      }
+      const single = format === 'md';
+      const result = await applyImportPlan(plan, documents, workingDocs, single ? stampPrincipalEdit : undefined);
+      const written = new Set([...result.created, ...result.updated]);
+      if (single) {
+        for (const path of written) {
+          await appendDirectoryLogEntry(workingDocs, logger, {
+            documentPath: path,
+            operation: 'console-import',
+            summary: `principal imported an offline edit of ${leafOf(path)} in the console`,
+            source: 'console documents',
+          });
+        }
+      }
+      try {
+        await bus.publish('system', createDocumentConsoleAction({
+          action: 'import',
+          scope,
+          created: result.created.length,
+          updated: result.updated.length,
+          unchanged: plan.counts.unchanged,
+          conflicts: plan.counts.conflict + result.conflicts.length,
+          failed: result.failed.length,
+          skipped: plan.counts.skipped,
+          byteTotal: plan.items.filter(i => written.has(i.path)).reduce((sum, i) => sum + i.byteSize, 0),
+          initiatedBy: 'principal',
+          channel: CONSOLE_CHANNEL,
+        }));
+      } catch (err) {
+        logger.error({ err, scope }, 'POST /api/documents/import: imported but audit event failed');
+        return reply.status(500).send({
+          error: 'The import was applied, but its audit entry could not be written — check the server logs.',
+          result,
+        });
+      }
+      if (result.failed.length > 0) {
+        logger.error({ scope, failed: result.failed }, 'POST /api/documents/import: some documents failed to import');
+      }
+      return reply.send({ mode, plan, result });
+    } catch (err) {
+      logger.error({ err, scope }, 'POST /api/documents/import: import failed');
+      return reply.status(500).send({ error: 'Import failed' });
     }
   });
 }
