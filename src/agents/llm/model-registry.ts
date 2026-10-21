@@ -78,8 +78,9 @@ export interface ModelMetadata {
   /**
    * The `thinking.type` that reasoning effort `none` sends, when it is not
    * `disabled`. Sonnet 5.5 returns a 400 for `disabled`. Its `between_tools`
-   * turns off thinking before the first response, but the model still writes
-   * short thinking blocks between tool calls (#2077).
+   * turns off thinking before the first response. Anthropic documents short
+   * thinking between tool calls, though none appeared in 16 live requests on
+   * 2026-10-21 (#2077, #2220).
    */
   thinkingOffType?: 'between_tools';
   /**

@@ -36,7 +36,7 @@ model_routing:
 - Opus 5.5 takes `low` through `max`, because it cannot turn thinking off.
 - Haiku 4.5 takes no effort setting.
 
-Unset means the provider's default, so Haiku 5.5 thinks adaptively at `medium`. On the Anthropic models, an effort turns on adaptive thinking with summarized display. `none` turns thinking off, on the models that accept it. On Sonnet 5.5, `none` turns off thinking before the first response, but the model still writes short thinking blocks between tool calls.
+Unset means the provider's default, so Haiku 5.5 thinks adaptively at `medium`. On the Anthropic models, an effort turns on adaptive thinking with summarized display. `none` turns thinking off, on the models that accept it. On Sonnet 5.5, `none` turns off thinking before the first response. Anthropic documents short thinking between tool calls, though none appeared in 16 live requests on 2026-10-21. Curia gives a Sonnet 5.5 call with tools at `none` the 16,384-token output cap as a precaution.
 
 Do not set Opus 5.5 as the fast-tier model, the standard-tier model, or either judge's model. The 10-token classifier runs on the fast-tier model. The drift detector runs on the standard-tier model at 200 tokens, and it reads a failed call as no drift. The judges cap their output at 200 to 1,200 tokens. Opus 5.5 spends those output caps on thinking.
 
