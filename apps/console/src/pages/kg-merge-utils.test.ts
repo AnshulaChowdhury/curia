@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
+  APPLY_OUTCOME_UNKNOWN_MESSAGE,
+  LABEL_COLLISION_MESSAGE,
   MAX_ALIASES,
+  MERGE_UNAVAILABLE_MESSAGE,
   STALE_PREVIEW_NOTICE,
   applyButtonLabel,
   applyHint,
@@ -11,6 +14,7 @@ import {
   candidateReasonLabel,
   cardFor,
   cardFromSummary,
+  classifyApplyError,
   classifyMergeError,
   conflictCount,
   contactPlanSentence,
@@ -23,20 +27,30 @@ import {
   formatDay,
   formatValue,
   hasContactSection,
+  hasLabelCollision,
   isAgentNode,
+  isLabelAllowed,
+  isLabelCollisionBlock,
   isNodeMergePreview,
   isNodeMergeResult,
+  isPickable,
+  isRetryable,
+  labelCollisionReason,
   labelsDiffer,
   mergeAvailability,
   mergeResolutions,
+  mergeResultNotes,
+  mergeResultWarningText,
   mergeSuccessMessage,
   mergedIntoFrom,
   mergedIntoNotice,
   missingAcknowledgements,
+  outcomeUnknownError,
   plural,
   resultAliases,
   retainAcknowledgements,
   retainValidChoices,
+  searchUrl,
   suggestionText,
   summaryLines,
   swapConflictId,
@@ -193,6 +207,13 @@ describe('mergeAvailability', () => {
     }
   });
 
+  it('disables it for an archived node, with a reason', () => {
+    const a = mergeAvailability(node({ archived: true }));
+    expect(a).toMatchObject({ visible: true, disabled: true });
+    expect(a.reason).toMatch(/archived/i);
+    expect(mergeAvailability(node({ archived: false })).disabled).toBe(false);
+  });
+
   it('enables it otherwise', () => {
     expect(mergeAvailability(node({ properties: { is_agent: 'false' } }))).toEqual({ visible: true, disabled: false, reason: null });
     expect(isAgentNode(node({ properties: {} }))).toBe(false);
@@ -213,6 +234,16 @@ describe('pick step', () => {
       node({ id: S }), node({ id: A }), node({ id: 'f', type: 'fact' }), node({ id: A }), node({ id: 'x' }),
     ], S);
     expect(results.map(n => n.id)).toEqual([A, 'x']);
+  });
+
+  it('never offers an archived node', () => {
+    expect(isPickable(node({ id: A, archived: true }), S)).toBe(false);
+    expect(isPickable(node({ id: A }), S)).toBe(true);
+    expect(filterSearchResults([node({ id: A, archived: true }), node({ id: 'x' })], S).map(n => n.id)).toEqual(['x']);
+  });
+
+  it('asks the server to leave facts out of search results', () => {
+    expect(searchUrl('Acme & co')).toBe('/api/kg/nodes?query=Acme%20%26%20co&limit=20&exclude_facts=true');
   });
 
   it('filters and sorts candidates by score', () => {
@@ -340,6 +371,59 @@ describe('retainValidChoices / mergeResolutions', () => {
     next.conflicts.properties.push({ key: 'hq', survivorValue: 'NYC', absorbedValue: 'SF', default: 'survivor' });
     expect(mergeResolutions({ properties: { website: 'survivor' } }, next).properties)
       .toEqual({ website: 'survivor', hq: 'survivor' });
+  });
+});
+
+// ── Label collision ─────────────────────────────────────────────────────────
+
+const collision = {
+  code: 'label_collision', message: '‘Acme Summit’ cannot be the name: another organization node already uses it.',
+  requiresAck: false, details: ['Acme Summit (organization)'],
+};
+
+describe('label collision', () => {
+  const collided = (over: Partial<NodeMergePreview['result']> = {}) =>
+    preview({ warnings: [collision], result: { ...preview().result, ...over } });
+
+  it('disallows only the absorbed label, and explains why', () => {
+    const p = collided();
+    expect(hasLabelCollision(p)).toBe(true);
+    expect(isLabelAllowed(p, 'survivor')).toBe(true);
+    expect(isLabelAllowed(p, 'absorbed')).toBe(false);
+    expect(labelCollisionReason(p)).toBe('Another organization is already called ‘Acme Summit’.');
+    expect(labelCollisionReason(preview())).toBeNull();
+    expect(isLabelAllowed(preview(), 'absorbed')).toBe(true);
+  });
+
+  it('never defaults to the disallowed label', () => {
+    expect(defaultResolutions(collided({ defaultLabel: 'absorbed' })).label).toBe('survivor');
+    expect(defaultResolutions(preview({ result: { ...preview().result, defaultLabel: 'absorbed' } })).label)
+      .toBe('absorbed');
+  });
+
+  it('drops an earlier absorbed-label choice on re-preview', () => {
+    expect(retainValidChoices({ label: 'absorbed' }, collided()).label).toBeUndefined();
+    expect(retainValidChoices({ label: 'survivor' }, collided()).label).toBe('survivor');
+    expect(mergeResolutions({ label: 'absorbed' }, collided()).label).toBe('survivor');
+  });
+
+  it('drops it after a swap lands on the colliding label', () => {
+    // The user kept the survivor's name; swapping turns that into "absorbed",
+    // which the swapped preview disallows.
+    const choices = swapResolutions({ label: 'survivor' });
+    expect(choices.label).toBe('absorbed');
+    expect(mergeResolutions(choices, collided()).label).toBe('survivor');
+  });
+
+  it('never sends the disallowed label', () => {
+    const p = collided({ defaultLabel: 'absorbed' });
+    expect(buildApplyRequest(p, { label: 'absorbed' }, []).resolutions?.label).toBe('survivor');
+  });
+
+  it('recomputes aliases when the server default is overridden', () => {
+    const p = collided({ defaultLabel: 'absorbed', aliases: ['server'], droppedAliases: [] });
+    const label = mergeResolutions({}, p).label!;
+    expect(resultAliases(p, label).aliases).toEqual(['acme summit', 'acme summit 2026']);
   });
 });
 
@@ -680,12 +764,80 @@ describe('classifyMergeError', () => {
     expect(classifyMergeError(400, {}).message).toBe('The merge request was rejected.');
   });
 
+  it('turns a name-only 422 into a pick-the-other-name message', () => {
+    const e = classifyMergeError(422, {
+      error: 'Merge is blocked', code: 'blocked',
+      blockers: [{ code: 'label_collision', message: '‘X’ cannot be the name' }],
+    });
+    expect(e).toMatchObject({ kind: 'blocked', message: LABEL_COLLISION_MESSAGE });
+    expect(e.message).not.toMatch(/go back/i);
+    expect(isLabelCollisionBlock(e)).toBe(true);
+    const mixed = classifyMergeError(422, {
+      error: 'Merge is blocked', code: 'blocked',
+      blockers: [{ code: 'label_collision', message: 'x' }, { code: 'agent_node', message: 'y' }],
+    });
+    expect(mixed.message).toBe('Merge is blocked');
+    expect(isLabelCollisionBlock(mixed)).toBe(false);
+    expect(isLabelCollisionBlock({ kind: 'blocked', blockers: [] })).toBe(false);
+  });
+
+  it('maps 503 unavailable to a non-retryable error', () => {
+    const e = classifyMergeError(503, { error: 'Node merge is not available.', code: 'unavailable' });
+    expect(e).toEqual({ kind: 'unavailable', code: 'unavailable', message: MERGE_UNAVAILABLE_MESSAGE, blockers: [] });
+    expect(isRetryable(e)).toBe(false);
+  });
+
+  it('says which errors are worth retrying', () => {
+    expect(isRetryable({ kind: 'server' })).toBe(true);
+    expect(isRetryable({ kind: 'invalid' })).toBe(true);
+    for (const kind of ['blocked', 'not_found', 'unavailable', 'unknown'] as const) {
+      expect(isRetryable({ kind })).toBe(false);
+    }
+  });
+
   it('maps 404 and anything else', () => {
     expect(classifyMergeError(404, { code: 'node_not_found' })).toMatchObject({ kind: 'not_found', code: 'node_not_found' });
     expect(classifyMergeError(500, 'oops')).toEqual({
       kind: 'server', code: null, message: 'Merge failed (HTTP 500).', blockers: [],
     });
     expect(classifyMergeError(503, { code: 'made_up' }).code).toBeNull();
+  });
+});
+
+describe('classifyApplyError', () => {
+  const unknown = { kind: 'unknown', code: null, message: APPLY_OUTCOME_UNKNOWN_MESSAGE, blockers: [] };
+
+  it('reports gateway errors and unreadable bodies as an unknown outcome', () => {
+    expect(classifyApplyError(502, { error: 'Bad gateway' })).toEqual(unknown);
+    expect(classifyApplyError(504, { error: 'Timeout' })).toEqual(unknown);
+    expect(classifyApplyError(503, { error: 'Service unavailable' })).toEqual(unknown);
+    expect(classifyApplyError(500, null)).toEqual(unknown);
+    expect(classifyApplyError(422, 'not json')).toEqual(unknown);
+    expect(outcomeUnknownError()).toEqual(unknown);
+  });
+
+  it('defers to classifyMergeError for the server’s own JSON errors', () => {
+    expect(classifyApplyError(503, { error: 'x', code: 'unavailable' }).kind).toBe('unavailable');
+    expect(classifyApplyError(409, { error: 'x', code: 'stale_preview' }).kind).toBe('stale');
+    expect(classifyApplyError(422, { error: 'x', code: 'blocked', blockers: [] }).kind).toBe('blocked');
+    expect(classifyApplyError(500, { error: 'boom' })).toMatchObject({ kind: 'server', message: 'boom' });
+  });
+});
+
+describe('merge result warnings', () => {
+  it('words the known codes and shows unknown ones raw', () => {
+    expect(mergeResultWarningText('embedding_not_refreshed')).toMatch(/similarity suggestions/);
+    expect(mergeResultWarningText('audit_event_not_recorded')).toMatch(/audit log entry could not be written.*server logs/);
+    expect(mergeResultWarningText('identity_refresh_failed')).toMatch(/restart may be needed.*identities/);
+    expect(mergeResultWarningText('brand_new_code')).toBe('brand_new_code');
+  });
+
+  it('lists each distinct warning once, skipping junk', () => {
+    expect(mergeResultNotes(['embedding_not_refreshed', 'embedding_not_refreshed', '', 7, 'x'])).toEqual([
+      mergeResultWarningText('embedding_not_refreshed'), 'x',
+    ]);
+    expect(mergeResultNotes([])).toEqual([]);
+    expect(mergeResultNotes(undefined)).toEqual([]);
   });
 });
 

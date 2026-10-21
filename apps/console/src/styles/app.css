@@ -3041,6 +3041,11 @@ table.records-table tbody tr.active td { background: transparent; }
 .kg-merge-option.is-wide { grid-column: 1 / -1; }
 .kg-merge-option:has(input:focus-visible) { outline: 2px solid var(--app-teal); outline-offset: 2px; }
 .kg-merge-option:has(input:disabled) { cursor: default; }
+/* An option the server would reject (e.g. a name another node already uses). */
+.kg-merge-option.is-unavailable { cursor: not-allowed; border-style: dashed; background: none; }
+.kg-merge-option.is-unavailable:hover { border-color: var(--app-border); background: none; }
+.kg-merge-option.is-unavailable .kg-merge-option-value { color: var(--app-fg-muted); }
+.kg-merge-option-why { font-style: italic; }
 .kg-merge-option input {
   flex: none;
   width: 15px;
@@ -3270,6 +3275,12 @@ table.records-table tbody tr.active td { background: transparent; }
   cursor: pointer;
 }
 .kg-merge-banner-close:hover { background: var(--app-muted); color: var(--app-fg); }
+/* Merge committed, but something after the commit needs attention. */
+.kg-merge-banner.is-warn { border-color: color-mix(in srgb, var(--app-amber) 55%, var(--app-border)); }
+.kg-merge-banner.is-warn::before { background: var(--app-amber); }
+.kg-merge-banner::before { align-self: flex-start; margin-top: 5px; }
+.kg-merge-banner-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.kg-merge-banner-notes { margin: 0; padding-left: 16px; font-size: 12px; color: var(--app-fg-muted); }
 
 @media (max-width: 640px) {
   .kg-merge-pair { grid-template-columns: minmax(0, 1fr); }

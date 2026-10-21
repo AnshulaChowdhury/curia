@@ -16,7 +16,7 @@ import type { ApiKgNode } from './kg-types.js';
 import { MergeNodesDialog } from './MergeNodesDialog.js';
 import type { NodeMergeResult } from './kg-merge-types.js';
 import {
-  applyMergeToNodeList, mergeAvailability, mergedIntoFrom, mergedIntoNotice, mergeSuccessMessage,
+  applyMergeToNodeList, mergeAvailability, mergedIntoFrom, mergedIntoNotice, mergeResultNotes, mergeSuccessMessage,
 } from './kg-merge-utils.js';
 
 // Register fcose layout plugin once at module scope.
@@ -33,6 +33,13 @@ interface ApiKgEdge {
 }
 
 type ColorMode = 'type' | 'sensitivity' | 'decay';
+
+/** The page banner after a merge or a merged-node redirect. */
+interface KgBanner {
+  text: string;
+  /** Follow-up notes (post-commit merge warnings); the banner turns amber when present. */
+  notes?: string[];
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -210,6 +217,11 @@ function nodeToElement(n: ApiKgNode): cytoscape.ElementDefinition {
       source: n.source ?? '',
       createdAt: n.createdAt ?? '',
       lastConfirmedAt: n.lastConfirmedAt ?? '',
+      // Carried so a tapped node (whose data() becomes selectedNode) still has
+      // them for the drawer and the merge dialog.
+      aliases: n.aliases ?? [],
+      archived: n.archived === true,
+      ...(n.identitySource ? { identitySource: n.identitySource } : {}),
       degree: 0, // updated by updateDegrees()
     },
   };
@@ -454,7 +466,7 @@ export default function KgPage() {
   // Node merge (#2233): the node the dialog was opened from, and the page banner
   // shown after a merge or a merged-node redirect.
   const [mergeFrom, setMergeFrom] = useState<ApiKgNode | null>(null);
-  const [banner, setBanner] = useState<string | null>(null);
+  const [banner, setBanner] = useState<KgBanner | null>(null);
 
   // Track color mode in a ref so the cytoscape event handlers can read the
   // latest value without capturing a stale closure.
@@ -576,8 +588,12 @@ export default function KgPage() {
         // Body read can lose a race with a newer click that aborted this controller.
         if (controller.signal.aborted) return { ok: false, aborted: true };
         if (merged && merged.mergedInto !== nodeId && redirects < MAX_MERGE_REDIRECTS) {
-          const label = merged.label ?? (cy.getElementById(nodeId).data('label') as string | undefined) ?? null;
-          setBanner(mergedIntoNotice(label));
+          // Name the node the user opened, not an intermediate hop of a chain
+          // (expandNeighborhood sets its own notice before redirecting).
+          if (redirects === 0) {
+            const label = merged.label ?? (cy.getElementById(nodeId).data('label') as string | undefined) ?? null;
+            setBanner({ text: mergedIntoNotice(label) });
+          }
           return loadNeighborhood(merged.mergedInto, redirects + 1);
         }
         setSelectedNode(null);
@@ -643,7 +659,7 @@ export default function KgPage() {
         }
         if (merged && merged.mergedInto !== nodeId) {
           // Merged since the canvas loaded: follow it to the survivor.
-          setBanner(mergedIntoNotice(merged.label ?? staleLabel));
+          setBanner({ text: mergedIntoNotice(merged.label ?? staleLabel) });
           void loadNeighborhood(merged.mergedInto, 1);
           return;
         }
@@ -841,7 +857,18 @@ export default function KgPage() {
   async function handleMerged(result: NodeMergeResult, labels: { absorbed: string; survivor: string }) {
     setMergeFrom(null);
     setSidebarNodes(prev => applyMergeToNodeList(prev, result));
-    setBanner(mergeSuccessMessage(labels.absorbed, labels.survivor));
+    const notes = mergeResultNotes(result.warnings);
+    setBanner({ text: mergeSuccessMessage(labels.absorbed, labels.survivor), ...(notes.length > 0 ? { notes } : {}) });
+    // Take the archived node off the canvas now (its edges go with it), so it
+    // is gone even if the reload below fails.
+    const cy = cyRef.current;
+    if (cy && !cy.destroyed()) {
+      cy.getElementById(result.absorbedId).remove();
+      cy.getElementById(result.survivorId).data('label', result.node.label);
+      updateDegrees(cy);
+      syncFilter(cy, filterRef.current, setCanvasFacets);
+      setStatus(graphStatus(cy));
+    }
     // Re-render around the survivor; this also selects it and syncs ?node=.
     const loaded = await loadNeighborhood(result.survivorId);
     if (!loaded.ok && !loaded.aborted) {
@@ -849,6 +876,15 @@ export default function KgPage() {
       setSelectedNode(result.node);
       syncUrl(searchRef.current, result.survivorId);
     }
+  }
+
+  // The apply request may or may not have committed (network or gateway
+  // error). Refresh the list and the canvas so the user can see which: if it
+  // did, the reload follows the absorbed node's redirect to the survivor.
+  function handleMergeOutcomeUnknown() {
+    void loadSidebarNodes(searchRef.current);
+    const focusId = selectedNode?.id ?? mergeFrom?.id;
+    if (focusId) void loadNeighborhood(focusId);
   }
 
   // ── Drawer close ───────────────────────────────────────────────────────────
@@ -981,8 +1017,15 @@ export default function KgPage() {
                   {status && <span className="kg-status">{status}</span>}
                 </div>
                 {banner && (
-                  <div className="kg-merge-banner" role="status">
-                    <span>{banner}</span>
+                  <div className={`kg-merge-banner${banner.notes?.length ? ' is-warn' : ''}`} role="status">
+                    <div className="kg-merge-banner-body">
+                      <span>{banner.text}</span>
+                      {banner.notes && banner.notes.length > 0 && (
+                        <ul className="kg-merge-banner-notes">
+                          {banner.notes.map(n => <li key={n}>{n}</li>)}
+                        </ul>
+                      )}
+                    </div>
                     <button
                       className="kg-merge-banner-close"
                       onClick={() => setBanner(null)}
@@ -1013,6 +1056,7 @@ export default function KgPage() {
                   node={mergeFrom}
                   onClose={() => setMergeFrom(null)}
                   onMerged={(result, labels) => void handleMerged(result, labels)}
+                  onOutcomeUnknown={handleMergeOutcomeUnknown}
                 />
               )}
             </div>

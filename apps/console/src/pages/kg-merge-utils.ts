@@ -100,8 +100,11 @@ export interface MergeAvailability {
 }
 
 /** Whether the drawer shows a Merge… button for this node, and if it is usable. */
-export function mergeAvailability(node: Pick<ApiKgNode, 'type' | 'properties'>): MergeAvailability {
+export function mergeAvailability(node: Pick<ApiKgNode, 'type' | 'properties' | 'archived'>): MergeAvailability {
   if (node.type === 'fact') return { visible: false, disabled: true, reason: 'Fact nodes cannot be merged' };
+  if (node.archived === true) {
+    return { visible: true, disabled: true, reason: 'Archived nodes cannot be merged' };
+  }
   if (isAgentNode(node)) {
     return { visible: true, disabled: true, reason: "The agent's own node cannot be merged" };
   }
@@ -117,8 +120,16 @@ export function displayAliases(aliases: readonly string[] | undefined, max = 3):
 }
 
 /** A node can be picked as the other side when it is live, not a fact, and not the start node. */
-export function isPickable(node: Pick<ApiKgNode, 'id' | 'type'>, currentId: string): boolean {
-  return node.id !== currentId && node.type !== 'fact';
+export function isPickable(node: Pick<ApiKgNode, 'id' | 'type' | 'archived'>, currentId: string): boolean {
+  return node.id !== currentId && node.type !== 'fact' && node.archived !== true;
+}
+
+/**
+ * The pick-step search URL. `exclude_facts=true` keeps fact nodes from eating
+ * the result limit; filterSearchResults still drops any that slip through.
+ */
+export function searchUrl(query: string): string {
+  return `/api/kg/nodes?query=${encodeURIComponent(query)}&limit=${SEARCH_LIMIT}&exclude_facts=true`;
 }
 
 /** Search results minus the current node, facts and duplicate ids. */
@@ -233,11 +244,16 @@ function isSide(v: unknown): v is Side {
   return SIDES.includes(v as Side);
 }
 
-/** The preview's pre-selected answer to every conflict (acknowledgements excluded). */
+/**
+ * The preview's pre-selected answer to every conflict (acknowledgements
+ * excluded). A default label the server would reject falls back to the
+ * survivor's.
+ */
 export function defaultResolutions(preview: NodeMergePreview): NodeMergeResolutions {
   const c = preview.conflicts;
+  const defaultLabel = preview.result.defaultLabel;
   return {
-    label: preview.result.defaultLabel,
+    label: isLabelAllowed(preview, defaultLabel) ? defaultLabel : 'survivor',
     properties: Object.fromEntries(c.properties.map(p => [p.key, p.default])),
     facts: Object.fromEntries(c.facts.map(f => [f.id, f.default])),
     nearDuplicateFacts: Object.fromEntries(c.nearDuplicateFacts.map(n => [n.id, n.default])),
@@ -263,7 +279,8 @@ function pick<T extends string>(
 /**
  * Only the choices in `prev` that still make sense for `preview`: the conflict
  * still exists (same deterministic id) and the value is a legal option. The
- * label choice survives only when the two labels still differ.
+ * label choice survives only when the two labels still differ and the chosen
+ * one is still allowed (see isLabelAllowed).
  */
 export function retainValidChoices(prev: NodeMergeResolutions, preview: NodeMergePreview): NodeMergeResolutions {
   const c = preview.conflicts;
@@ -274,7 +291,7 @@ export function retainValidChoices(prev: NodeMergeResolutions, preview: NodeMerg
     contactFields: pick(prev.contactFields, c.contactFields.map(f => f.field), SIDES),
     authOverrides: pick(prev.authOverrides, c.authOverrides.map(a => a.permission), SIDES),
   };
-  if (isSide(prev.label) && labelsDiffer(preview)) out.label = prev.label;
+  if (isSide(prev.label) && labelsDiffer(preview) && isLabelAllowed(preview, prev.label)) out.label = prev.label;
   return out;
 }
 
@@ -447,6 +464,27 @@ export function labelsDiffer(preview: NodeMergePreview): boolean {
   return preview.result.labels.survivor !== preview.result.labels.absorbed;
 }
 
+/**
+ * Another live node of the result's type already carries the absorbed label,
+ * so the server would reject it as the merged name (apply → 422 blocker
+ * `label_collision`). The preview flags this as an info warning.
+ */
+export function hasLabelCollision(preview: NodeMergePreview): boolean {
+  return preview.warnings.some(w => w.code === 'label_collision');
+}
+
+/** Whether `side`'s label may be chosen. The survivor keeps its own label, so it is always allowed. */
+export function isLabelAllowed(preview: NodeMergePreview, side: Side): boolean {
+  return side === 'survivor' || !hasLabelCollision(preview);
+}
+
+/** Why the absorbed label is disabled, for the Name section; null when it is allowed. */
+export function labelCollisionReason(preview: NodeMergePreview): string | null {
+  if (isLabelAllowed(preview, 'absorbed')) return null;
+  const type = typeLabel(preview.result.type).toLowerCase();
+  return `Another ${type} is already called ${quoted(preview.result.labels.absorbed)}.`;
+}
+
 function normAlias(a: string): string {
   return a.trim().toLowerCase();
 }
@@ -608,7 +646,13 @@ export function isNodeMergeResult(body: unknown): body is NodeMergeResult {
     && isRecord(body['node']);
 }
 
-export type MergeErrorKind = 'stale' | 'blocked' | 'not_found' | 'invalid' | 'server';
+/**
+ * `unavailable`: the server has no merge service — nothing to retry.
+ * `unknown`: the apply request may or may not have committed (network error,
+ * gateway error, unreadable body) — the dialog must not present it as a clean
+ * failure.
+ */
+export type MergeErrorKind = 'stale' | 'blocked' | 'not_found' | 'invalid' | 'unavailable' | 'unknown' | 'server';
 
 export interface MergeError {
   kind: MergeErrorKind;
@@ -617,9 +661,25 @@ export interface MergeError {
   blockers: MergeBlocker[];
 }
 
+export const MERGE_UNAVAILABLE_MESSAGE = 'Node merging isn’t available on this server.';
+export const APPLY_OUTCOME_UNKNOWN_MESSAGE = 'We couldn’t confirm whether the merge finished. Reload to check.';
+export const LABEL_COLLISION_MESSAGE = 'That name is already taken. Choose the other name, then merge again.';
+
 const KNOWN_CODES: readonly NodeMergeErrorCode[] = [
   'invalid_request', 'ack_required', 'unknown_resolution', 'node_not_found', 'stale_preview', 'blocked', 'node_merged',
+  'unavailable',
 ];
+
+/** A 422 whose only problem is the chosen name: switching the Name radio fixes it. */
+export function isLabelCollisionBlock(error: Pick<MergeError, 'kind' | 'blockers'>): boolean {
+  return error.kind === 'blocked' && error.blockers.length > 0
+    && error.blockers.every(b => b.code === 'label_collision');
+}
+
+/** Whether "Try again" can help. Blocked, missing, unavailable and unknown-outcome errors cannot. */
+export function isRetryable(error: Pick<MergeError, 'kind'>): boolean {
+  return error.kind === 'server' || error.kind === 'invalid' || error.kind === 'stale';
+}
 
 /** Normalise a non-2xx merge response into something the dialog can render. */
 export function classifyMergeError(status: number, body: unknown): MergeError {
@@ -631,11 +691,15 @@ export function classifyMergeError(status: number, body: unknown): MergeError {
     ? (rec['blockers'] as unknown[]).filter((b): b is MergeBlocker =>
       isRecord(b) && typeof b['code'] === 'string' && typeof b['message'] === 'string')
     : [];
+  if (code === 'unavailable') {
+    return { kind: 'unavailable', code, message: MERGE_UNAVAILABLE_MESSAGE, blockers };
+  }
   if (status === 409 || code === 'stale_preview') {
     return { kind: 'stale', code, message: STALE_PREVIEW_NOTICE, blockers };
   }
   if (status === 422 || code === 'blocked') {
-    return { kind: 'blocked', code, message: serverMessage ?? 'This merge is blocked.', blockers };
+    const blocked: MergeError = { kind: 'blocked', code, message: serverMessage ?? 'This merge is blocked.', blockers };
+    return isLabelCollisionBlock(blocked) ? { ...blocked, message: LABEL_COLLISION_MESSAGE } : blocked;
   }
   if (status === 404) {
     return {
@@ -651,6 +715,28 @@ export function classifyMergeError(status: number, body: unknown): MergeError {
     return { kind: 'invalid', code, message: serverMessage ?? fallback, blockers };
   }
   return { kind: 'server', code, message: serverMessage ?? `Merge failed (HTTP ${status}).`, blockers };
+}
+
+/** The apply request's outcome is unknown: it may have committed. */
+export function outcomeUnknownError(): MergeError {
+  return { kind: 'unknown', code: null, message: APPLY_OUTCOME_UNKNOWN_MESSAGE, blockers: [] };
+}
+
+/**
+ * Classify a non-2xx response to the *apply* request. `body` is the parsed
+ * JSON body, or null when there was none or it was not JSON.
+ *
+ * A gateway error (502, 504, or a 503 that is not the server's own
+ * `unavailable`) or a body that is not the server's JSON means the request may
+ * have reached the server and committed, so the outcome is reported as
+ * unknown rather than as a failure. A network error (fetch rejects) is unknown
+ * too; see outcomeUnknownError.
+ */
+export function classifyApplyError(status: number, body: unknown): MergeError {
+  if (!isRecord(body)) return outcomeUnknownError();
+  if (status === 502 || status === 504) return outcomeUnknownError();
+  if (status === 503 && body['code'] !== 'unavailable') return outcomeUnknownError();
+  return classifyMergeError(status, body);
 }
 
 /**
@@ -672,6 +758,31 @@ export function mergedIntoNotice(label: string | null): string {
 
 export function mergeSuccessMessage(absorbedLabel: string, survivorLabel: string): string {
   return `Merged ${quoted(absorbedLabel)} into ${quoted(survivorLabel)}.`;
+}
+
+/** Friendly text for a post-commit result warning; unknown codes are shown raw. */
+export function mergeResultWarningText(code: string): string {
+  switch (code) {
+    case 'embedding_not_refreshed':
+      return 'The new name may take a while to show up in similarity suggestions.';
+    case 'audit_event_not_recorded':
+      return 'The audit log entry could not be written — check the server logs.';
+    case 'identity_refresh_failed':
+      return 'A restart may be needed for the principal’s identities to refresh.';
+    default:
+      return code;
+  }
+}
+
+/** The success banner's notes: one line per distinct result warning, in order. */
+export function mergeResultNotes(warnings: readonly unknown[] | undefined): string[] {
+  const out: string[] = [];
+  for (const w of warnings ?? []) {
+    if (typeof w !== 'string' || w.trim() === '') continue;
+    const text = mergeResultWarningText(w);
+    if (!out.includes(text)) out.push(text);
+  }
+  return out;
 }
 
 /** The sidebar list after a merge: the absorbed node gone, the survivor refreshed in place. */

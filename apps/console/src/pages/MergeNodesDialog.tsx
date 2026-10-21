@@ -17,7 +17,6 @@ import type {
 import {
   CANDIDATE_LIMIT,
   SEARCH_DEBOUNCE_MS,
-  SEARCH_LIMIT,
   STALE_PREVIEW_NOTICE,
   applyButtonLabel,
   applyHint,
@@ -26,6 +25,7 @@ import {
   canApply,
   candidateReasonLabel,
   cardFor,
+  classifyApplyError,
   classifyMergeError,
   contactPlanSentence,
   crossTypeBanner,
@@ -36,15 +36,20 @@ import {
   formatDay,
   formatValue,
   hasContactSection,
+  isLabelAllowed,
   isNodeMergePreview,
   isNodeMergeResult,
+  isRetryable,
+  labelCollisionReason,
   labelsDiffer,
   mergeResolutions,
+  outcomeUnknownError,
   plural,
   quoted,
   resultAliases,
   retainAcknowledgements,
   retainValidChoices,
+  searchUrl,
   suggestionText,
   summaryLines,
   swapResolutions,
@@ -62,6 +67,12 @@ export interface MergeNodesDialogProps {
   onClose: () => void;
   /** Called after a successful apply. The parent closes the dialog. */
   onMerged: (result: NodeMergeResult, labels: { absorbed: string; survivor: string }) => void;
+  /**
+   * Called when the apply request may or may not have committed (network or
+   * gateway error, unreadable response). The dialog stays open with a notice;
+   * the parent should refresh what it shows so the user can check.
+   */
+  onOutcomeUnknown: () => void;
 }
 
 type Pair = { survivorId: string; absorbedId: string };
@@ -71,6 +82,8 @@ interface ListState<T> {
   status: 'loading' | 'ready' | 'error';
   items: T[];
   error?: string;
+  /** The server has no merge service (503 `unavailable`). */
+  unavailable?: boolean;
 }
 
 function isAbort(err: unknown): boolean {
@@ -179,12 +192,16 @@ interface OptionProps {
   onSelect: () => void;
   children: ReactNode;
   wide?: boolean;
+  /** Set when this option cannot be chosen at all (not merely busy); shown as the tooltip. */
+  unavailableReason?: string | null;
 }
 
-function Option({ name, checked, disabled, onSelect, children, wide }: OptionProps) {
+function Option({ name, checked, disabled, onSelect, children, wide, unavailableReason }: OptionProps) {
+  const cls = `kg-merge-option${checked ? ' is-selected' : ''}${wide ? ' is-wide' : ''}`
+    + `${unavailableReason ? ' is-unavailable' : ''}`;
   return (
-    <label className={`kg-merge-option${checked ? ' is-selected' : ''}${wide ? ' is-wide' : ''}`}>
-      <input type="radio" name={name} checked={checked} disabled={disabled} onChange={onSelect} />
+    <label className={cls} title={unavailableReason ?? undefined}>
+      <input type="radio" name={name} checked={checked} disabled={disabled || !!unavailableReason} onChange={onSelect} />
       <span className="kg-merge-option-body">{children}</span>
     </label>
   );
@@ -204,7 +221,7 @@ function FactBody({ fact }: { fact: MergeFactSummary }) {
 
 // ── Dialog ──────────────────────────────────────────────────────────────────
 
-export function MergeNodesDialog({ node, onClose, onMerged }: MergeNodesDialogProps) {
+export function MergeNodesDialog({ node, onClose, onMerged, onOutcomeUnknown }: MergeNodesDialogProps) {
   const uid = useId();
   const [step, setStep] = useState<'pick' | 'review'>('pick');
 
@@ -258,7 +275,14 @@ export function MergeNodesDialog({ node, onClose, onMerged }: MergeNodesDialogPr
         );
         const body = await readJson(res);
         if (controller.signal.aborted) return;
-        if (!res.ok) throw new Error(errorText(body, res.status));
+        if (!res.ok) {
+          const failure = classifyMergeError(res.status, body);
+          if (failure.kind === 'unavailable') {
+            setCandidates({ status: 'error', items: [], error: failure.message, unavailable: true });
+            return;
+          }
+          throw new Error(errorText(body, res.status));
+        }
         const list = (body as { candidates?: unknown } | null)?.candidates;
         setCandidates({
           status: 'ready',
@@ -283,10 +307,7 @@ export function MergeNodesDialog({ node, onClose, onMerged }: MergeNodesDialogPr
       setSearchState({ query: trimmed, status: 'loading', items: [] });
       void (async () => {
         try {
-          const res = await apiFetch(
-            `/api/kg/nodes?query=${encodeURIComponent(trimmed)}&limit=${SEARCH_LIMIT}`,
-            { signal: controller.signal },
-          );
+          const res = await apiFetch(searchUrl(trimmed), { signal: controller.signal });
           const body = await readJson(res);
           if (controller.signal.aborted) return;
           if (!res.ok) throw new Error(errorText(body, res.status));
@@ -423,11 +444,19 @@ export function MergeNodesDialog({ node, onClose, onMerged }: MergeNodesDialogPr
           onMerged(body, { absorbed: reviewed.absorbed.label, survivor: body.node.label || reviewed.survivor.label });
           return;
         }
+        // A 2xx we cannot read: the merge probably committed.
         console.error('[MergeNodesDialog] unexpected apply response:', body);
-        setApplyError({ kind: 'server', code: null, blockers: [], message: 'The server sent an unexpected response. Reload to check whether the merge happened.' });
+        setApplyError(outcomeUnknownError());
+        onOutcomeUnknown();
         return;
       }
-      const error = classifyMergeError(res.status, body);
+      const error = classifyApplyError(res.status, body);
+      if (error.kind === 'unknown') {
+        console.error('[MergeNodesDialog] apply outcome unknown: HTTP', res.status, body);
+        setApplyError(error);
+        onOutcomeUnknown();
+        return;
+      }
       if (error.kind === 'stale') {
         // Re-preview the same direction, keeping still-valid choices and acks.
         setNotice(STALE_PREVIEW_NOTICE);
@@ -439,9 +468,12 @@ export function MergeNodesDialog({ node, onClose, onMerged }: MergeNodesDialogPr
       }
       setApplyError(error);
     } catch (err) {
-      console.error('[MergeNodesDialog] apply failed:', err);
+      // fetch rejected (network error, dropped connection): the request may
+      // still have reached the server and committed.
+      console.error('[MergeNodesDialog] apply failed, outcome unknown:', err);
       if (mountedRef.current) {
-        setApplyError({ kind: 'server', code: null, blockers: [], message: err instanceof Error ? err.message : 'Merge failed' });
+        setApplyError(outcomeUnknownError());
+        onOutcomeUnknown();
       }
     } finally {
       if (mountedRef.current) setApplying(false);
@@ -525,7 +557,9 @@ export function MergeNodesDialog({ node, onClose, onMerged }: MergeNodesDialogPr
               <p className="kg-merge-empty">Looking for likely duplicates…</p>
             ) : candidates.status === 'error' ? (
               <p className="kg-merge-empty is-error">
-                Couldn’t load suggestions ({candidates.error}). You can still search above.
+                {candidates.unavailable
+                  ? candidates.error
+                  : <>Couldn’t load suggestions ({candidates.error}). You can still search above.</>}
               </p>
             ) : candidates.items.length === 0 ? (
               <p className="kg-merge-empty">No likely duplicates found. Search above to pick a node.</p>
@@ -606,20 +640,25 @@ export function MergeNodesDialog({ node, onClose, onMerged }: MergeNodesDialogPr
             <fieldset className="kg-merge-choice">
               <legend className="kg-merge-sr-only">Name of the merged node</legend>
               <div className="kg-merge-options">
-                {(['survivor', 'absorbed'] as const).map(side => (
-                  <Option
-                    key={side}
-                    name={`${uid}-label`}
-                    checked={labelChoice === side}
-                    disabled={disabled}
-                    onSelect={() => { setChoices(prev => ({ ...prev, label: side })); setApplyError(null); }}
-                  >
-                    <span className={`kg-merge-option-value kg-merge-name kg-merge-side-${side}`}>
-                      {p.result.labels[side]}
-                    </span>
-                    <span className="kg-merge-meta">{side === 'survivor' ? 'Kept node’s name' : 'Merged-in node’s name'}</span>
-                  </Option>
-                ))}
+                {(['survivor', 'absorbed'] as const).map(side => {
+                  const blockedReason = isLabelAllowed(p, side) ? null : labelCollisionReason(p);
+                  return (
+                    <Option
+                      key={side}
+                      name={`${uid}-label`}
+                      checked={labelChoice === side}
+                      disabled={disabled}
+                      unavailableReason={blockedReason}
+                      onSelect={() => { setChoices(prev => ({ ...prev, label: side })); setApplyError(null); }}
+                    >
+                      <span className={`kg-merge-option-value kg-merge-name kg-merge-side-${side}`}>
+                        {p.result.labels[side]}
+                      </span>
+                      <span className="kg-merge-meta">{side === 'survivor' ? 'Kept node’s name' : 'Merged-in node’s name'}</span>
+                      {blockedReason && <span className="kg-merge-meta kg-merge-option-why">{blockedReason}</span>}
+                    </Option>
+                  );
+                })}
               </div>
             </fieldset>
           ) : (
@@ -859,7 +898,11 @@ export function MergeNodesDialog({ node, onClose, onMerged }: MergeNodesDialogPr
         {notice && <div className="kg-merge-callout kg-merge-callout-warn" role="status">{notice}</div>}
 
         {applyError && (
-          <div className="kg-merge-callout kg-merge-callout-danger" role="alert">
+          // An unknown outcome is not a failure — the merge may have committed.
+          <div
+            className={`kg-merge-callout ${applyError.kind === 'unknown' ? 'kg-merge-callout-warn' : 'kg-merge-callout-danger'}`}
+            role="alert"
+          >
             <strong>{applyError.message}</strong>
             {applyError.blockers.length > 0 && (
               <ul className="kg-merge-callout-list">
@@ -878,7 +921,7 @@ export function MergeNodesDialog({ node, onClose, onMerged }: MergeNodesDialogPr
                 {previewError.blockers.map(b => <li key={b.code}>{b.message}</li>)}
               </ul>
             )}
-            {previewError.kind !== 'blocked' && previewError.kind !== 'not_found' && (
+            {isRetryable(previewError) && (
               <button type="button" className="btn btn-secondary btn-sm" onClick={retryPreview} disabled={previewLoading}>
                 Try again
               </button>
@@ -894,16 +937,20 @@ export function MergeNodesDialog({ node, onClose, onMerged }: MergeNodesDialogPr
 
   // ── Footer ───────────────────────────────────────────────────────────────
 
-  const applyLocked = applyError?.kind === 'blocked' || applyError?.kind === 'not_found';
+  // Retrying cannot help a blocked, missing, unavailable or unknown-outcome
+  // apply. A label-collision block unlocks as soon as the user picks the other
+  // name, because changing the Name radio clears applyError.
+  const applyLocked = !!applyError && !isRetryable(applyError);
   const applyEnabled = !!current && !previewLoading && !applying && !applyLocked && canApply(current, acks);
   // The footer repeats outcomes that are shown at the top of the body, since the
   // user usually clicks Merge with the body scrolled to the bottom.
   let status: ReactNode = null;
   if (step === 'review' && !applying) {
     if (applyError) {
-      status = <span className="kg-merge-status-error">{applyError.message}</span>;
+      const cls = applyError.kind === 'unknown' ? 'kg-merge-status-warn' : 'kg-merge-status-error';
+      status = <span className={cls}>{applyError.message}</span>;
     } else if (current && !previewLoading) {
-      const hint = applyLocked ? 'Go back and pick again, or cancel' : applyHint(current, acks);
+      const hint = applyHint(current, acks);
       if (hint) status = hint;
       else if (notice) status = <span className="kg-merge-status-warn">{notice}</span>;
       else status = <span className="kg-merge-ready">Ready to merge</span>;

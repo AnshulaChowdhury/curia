@@ -177,6 +177,11 @@ export interface NodeMergeResult {
   node: ApiKgNode;
   summary: MergeSummaryCounts & { conflictsResolved: number; contactReferencesRepointed: number };
   contactMerge: { survivingContactId: string; mergedContactIds: string[]; repointedContactIds: string[] } | null;
+  /**
+   * Post-commit problems, e.g. 'embedding_not_refreshed',
+   * 'audit_event_not_recorded', 'identity_refresh_failed'. The merge itself
+   * committed.
+   */
   warnings: string[];
 }
 
@@ -209,7 +214,9 @@ export type NodeMergeErrorCode =
   | 'node_not_found'
   | 'stale_preview'
   | 'blocked'
-  | 'node_merged';
+  | 'node_merged'
+  /** 503: the server has no merge service wired. */
+  | 'unavailable';
 
 /** Error body of the merge routes and of the `node_merged` 404 on GET /api/kg/graph. */
 export interface NodeMergeErrorBody {
@@ -217,4 +224,6 @@ export interface NodeMergeErrorBody {
   code?: NodeMergeErrorCode;
   blockers?: MergeBlocker[];
   mergedInto?: string;
+  /** `node_merged` only: the label of the merged-away node. */
+  label?: string;
 }

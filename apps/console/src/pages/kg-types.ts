@@ -13,10 +13,13 @@ export interface ApiKgNode {
   source: string;
   createdAt: string;
   lastConfirmedAt: string;
-  // Served by GET /api/kg/nodes (and the merge endpoints) since the node-merge
-  // work; absent from GET /api/kg/graph payloads, hence optional.
+  // Added by the node-merge work (#2233). GET /api/kg/nodes and GET
+  // /api/kg/graph both serve aliases; identitySource comes from /nodes and the
+  // merge endpoints, archived from /graph. Optional because not every payload
+  // carries every field.
   aliases?: string[];
   identitySource?: 'label' | 'contact';
+  archived?: boolean;
 }
 
 // Badge CSS classes for node type.
