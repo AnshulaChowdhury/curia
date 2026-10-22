@@ -743,7 +743,30 @@ export class OpenRouterProvider implements LLMProvider {
     model: string,
   ): Promise<CreateOutcome> {
     const startedMs = Date.now();
+    // Billed tokens of empty-at-cap attempts before `lastEmpty`.
     let discardedUsage: LLMUsage | undefined;
+    // The latest empty-at-cap response, held so a retry that then errors does
+    // not lose it: its tokens were billed and only a returned response reaches
+    // llm.call.
+    let lastEmpty: { response: ChatCompletion; usage: LLMUsage; attemptMs: number } | undefined;
+
+    const giveUp = (err: unknown, attempts: number): CreateOutcome => {
+      if (!lastEmpty) return { ok: false, err, attempts };
+      // Return what chat() returned before it retried empty responses, so the
+      // caller's empty-response handling runs and every billed token is recorded.
+      this.logger.warn(
+        { err, model, attempts },
+        'OpenRouter retry after an empty max_tokens response failed — returning the empty response',
+      );
+      return {
+        ok: true,
+        response: lastEmpty.response,
+        attempts,
+        failedAttemptsMs: Date.now() - startedMs - lastEmpty.attemptMs,
+        discardedUsage,
+      };
+    };
+
     for (let attempt = 1; ; attempt++) {
       const attemptStartMs = Date.now();
       let response: ChatCompletion;
@@ -754,7 +777,7 @@ export class OpenRouterProvider implements LLMProvider {
         });
       } catch (err) {
         if (attempt >= OPENROUTER_MAX_ATTEMPTS || signal?.aborted || !isRetryableOpenRouterError(err)) {
-          return { ok: false, err, attempts: attempt };
+          return giveUp(err, attempt);
         }
         const delayMs = openRouterRetryDelayMs(err, attempt);
         this.logger.warn(
@@ -762,14 +785,14 @@ export class OpenRouterProvider implements LLMProvider {
           'OpenRouter API call failed — retrying',
         );
         await sleep(delayMs, signal);
-        if (signal?.aborted) return { ok: false, err, attempts: attempt };
+        if (signal?.aborted) return giveUp(err, attempt);
         continue;
       }
 
       if (isEmptyAtOutputCap(response) && attempt < OPENROUTER_MAX_ATTEMPTS && !signal?.aborted) {
-        // Billed even though unusable, so llm.call's tokens and cost include it.
         const usage = usageFromOpenRouter(response.usage);
-        discardedUsage = addUsage(usage, discardedUsage);
+        if (lastEmpty) discardedUsage = addUsage(lastEmpty.usage, discardedUsage);
+        lastEmpty = { response, usage, attemptMs: Date.now() - attemptStartMs };
         this.logger.warn(
           {
             model,
@@ -790,7 +813,8 @@ export class OpenRouterProvider implements LLMProvider {
         response,
         attempts: attempt,
         failedAttemptsMs: attemptStartMs - startedMs,
-        discardedUsage,
+        // Billed even though unusable, so llm.call's tokens and cost include them.
+        discardedUsage: lastEmpty ? addUsage(lastEmpty.usage, discardedUsage) : discardedUsage,
       };
     }
   }

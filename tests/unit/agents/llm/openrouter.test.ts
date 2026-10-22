@@ -1615,6 +1615,22 @@ describe('OpenRouterProvider chat() retries', () => {
     expect(result.type === 'text' && result.usage.outputTokens).toBe(3_000);
   });
 
+  it('falls back to the billed empty response when the retry after it errors', async () => {
+    mockCreate.mockResolvedValueOnce(emptyAtCap(32_768));
+    mockCreate.mockResolvedValueOnce(emptyAtCap(1_000));
+    mockCreate.mockRejectedValueOnce(apiError(400));
+
+    const result = await chat();
+
+    expect(mockCreate).toHaveBeenCalledTimes(3);
+    // The pre-retry outcome, so llm.call still records every billed token.
+    expect(result.type).toBe('text');
+    if (result.type !== 'text') return;
+    expect(result.content).toBe('');
+    expect(result.provenance.attempts).toBe(3);
+    expect(result.usage).toMatchObject({ inputTokens: 200, outputTokens: 33_768, reasoningTokens: 33_768 });
+  });
+
   it('does not retry a truncated response that still has an answer', async () => {
     mockCreate.mockResolvedValue({
       ...emptyAtCap(1_000),
