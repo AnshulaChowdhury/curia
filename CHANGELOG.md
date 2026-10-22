@@ -60,6 +60,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Voice model** — ADR-038 moves voice to Haiku 5.5 with thinking off, keeping its own prompt. (#2245)
+- **Voice first-token log** — `voice llm first token` now logs at info with the model. (#2245)
 - **`emitOkfDocument`** — writes the body verbatim instead of appending a trailing newline, so parsing inverts it. (#1823)
 - **OpenRouter retries** — logged per attempt and counted on `llm.call`, instead of the SDK retrying silently. (#1915)
 - **Voice toolset** — spoken turns get nine voice tools, not the coordinator's 73; cold first-token 110–170ms faster. (#1968)

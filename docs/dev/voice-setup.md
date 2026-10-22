@@ -190,7 +190,8 @@ Voice emits structured pino fields for latency debugging:
 
 - `voice.ttfa_ms` — end of user turn to first assistant audio frame.
 - `voice.stt_final_ms` — STT final transcript latency.
-- `voice.llm_ttft_ms` — LLM time to first text delta.
+- `llm_ttft_ms` — turn start to first text delta, after any tool rounds before it. Logged
+  at `info` as `voice llm first token`, with `model`. ADR-038 sets its budget.
 - `voice.tts_first_byte_ms` — TTS time to first audio frame.
 - `voice.barge_in_stop_ms` — time to stop assistant audio after barge-in.
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createSilentLogger } from '../../../../src/logger.js';
+import { createSilentLogger, type Logger } from '../../../../src/logger.js';
 import type {
   LLMProvider,
   LLMResponse,
@@ -7,7 +7,6 @@ import type {
   ToolCall,
 } from '../../../../src/agents/llm/provider.js';
 import { VoiceTurnRunner, StreamUnsupportedError, VoiceTurnError } from '../../../../src/channels/voice/turn-runner.js';
-import { NO_REASONING } from '../../../../src/agents/llm/sampling-options.js';
 
 const logger = createSilentLogger();
 
@@ -402,7 +401,9 @@ describe('VoiceTurnRunner', () => {
 });
 
 describe('VoiceTurnRunner reasoning (ADR-048 §3)', () => {
-  it('sends NO_REASONING with the abort signal on every stream request', async () => {
+  // Pinned to the literal value, not the constant: on Haiku 5.5 anything but
+  // `none` lets the model think before speaking (ADR-038 2026-10-22 addendum, #2245).
+  it("sends reasoning effort 'none' with the abort signal on every stream request", async () => {
     const seen: Array<Record<string, unknown> | undefined> = [];
     const provider = new FakeStreamProvider([[{ type: 'message_end', content: 'Hi.', usage, provenance }]]);
     const original = provider.stream.bind(provider);
@@ -413,6 +414,22 @@ describe('VoiceTurnRunner reasoning (ADR-048 §3)', () => {
     const runner = new VoiceTurnRunner({ provider, model: 'fake', logger, onSpeechText: async () => {} });
     const signal = new AbortController().signal;
     await runner.runTurn({ messages: [{ role: 'user', content: 'hi' }], signal });
-    expect(seen).toEqual([{ reasoning: NO_REASONING, signal }]);
+    expect(seen).toEqual([{ reasoning: { effort: 'none' }, signal }]);
+  });
+});
+
+describe('VoiceTurnRunner first-token log', () => {
+  it('logs llm_ttft_ms with the model at info, once per turn', async () => {
+    const info = vi.fn();
+    const spyLogger = { debug: vi.fn(), info, warn: vi.fn(), error: vi.fn(), fatal: vi.fn(), child: () => spyLogger } as unknown as Logger;
+    const provider = new FakeStreamProvider([
+      [textDelta('One. '), textDelta('Two.'), { type: 'message_end', content: 'One. Two.', usage, provenance }],
+    ]);
+    const runner = new VoiceTurnRunner({ provider, model: 'claude-haiku-5-5', logger: spyLogger, onSpeechText: async () => {} });
+    await runner.runTurn({ messages: [{ role: 'user', content: 'hi' }], signal: new AbortController().signal });
+
+    const firstToken = info.mock.calls.filter(([, msg]) => msg === 'voice llm first token');
+    expect(firstToken).toHaveLength(1);
+    expect(firstToken[0]![0]).toMatchObject({ model: 'claude-haiku-5-5', llm_ttft_ms: expect.any(Number) });
   });
 });

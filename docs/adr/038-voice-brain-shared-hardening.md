@@ -406,9 +406,10 @@ noted, one short utterance).
   - First speech goes from ~390 to ~660 ms p50. Per-token price drops about 8×, and the
     `none` spike cost $0.16 against $1.13 for haiku-4-5.
   - `none` is what voice's turn runner already sends. The default effort is ruled out:
-    first speech is 2.4–3.5 s p50. `low` is unmeasured, and #2245 decides whether a rerun
-    at `low` is worth it, for the pronoun case above.
-  - **Prompt shape is for #2245.** At `none`, `slim-core-system` ties the voice prompt and
+    first speech is 2.4–3.5 s p50. `low` is unmeasured; #2245 skipped the rerun (see
+    the next section).
+  - **Prompt shape was left to #2245**, which kept the voice prompt (next section). At
+    `none`, `slim-core-system` ties the voice prompt and
     the shared modules: +0.012 against each (2+/2− and 3+/1−).
     It adds no first-speech time in the spike, ~+100 ms cold in the microbench, and ~1.45×
     the spend per turn. Under #1968's rule ("ties or beats the shared modules, with TTFT
@@ -424,3 +425,45 @@ noted, one short utterance).
 - **#1613.** The routing and pronoun modules stay on hold. Their bundle ties baseline on
   haiku-4-5, and on haiku-5-5 at `none`. The pronoun module solves
   `pronoun-your-calendar` only when Haiku 5.5 thinks.
+
+## Addendum (2026-10-22) — voice on Haiku 5.5 at `none` (#2245)
+
+**Voice runs on claude-haiku-5-5 at `effort: none`, on its own prompt.** The model moves
+through `channels.voice.model` in the deployment config. No code changes: the turn runner
+already sends `reasoning: NO_REASONING`, which becomes `thinking: {type: "disabled"}` on
+Haiku 5.5 (ADR-048 §2), and a unit test pins that value.
+
+### Prompt shape: the voice prompt stays
+
+`slim-core-system` qualifies under #1968's rule but does not earn the switch. On Haiku 5.5
+at `none` (numbers from the addendum above):
+- **Quality is a tie.** +0.012 against baseline (2+/2−) and against shared-hardening
+  (3+/1−). No category improves enough to matter on a call.
+- **It costs more on every turn.** ~1.45× the spend per turn, ~+100 ms cold TTFT in the
+  microbench, and a system string about 4× the size (~6k tokens against ~1.4k).
+- **The core describes tools voice does not carry.** Haiku 5.5 never called one in the
+  spike, but every coordinator SKILL.md change becomes a voice change too, and the voice
+  eval does not run on those.
+- **The benefit is maintenance only.** One prompt instead of two. That is worth revisiting
+  if the voice prompt starts drifting from the coordinator's rules, not before.
+
+### `low` effort: not rerun
+
+The only reason to run `low` was `pronoun-your-calendar`. That case fails on the voice
+prompt at every model and effort measured (0/5); it passes only with the held #1613 module
+*and* thinking on. Any thinking on voice risks the default-effort pattern, where the model
+runs its tool rounds before it speaks. Recovering one fixture would need both a module
+that stays on hold and a latency risk. Rerun `low` if #1613's pronoun module is ever
+reconsidered for voice.
+
+### Latency budget
+
+Production first speech must stay at **p50 under 1 s** (spike: ~660 ms at `none`). Above
+that, put `channels.voice.model` back to `claude-haiku-4-5` while it is still served.
+
+### Production check
+
+Measured after curia-deploy moved `channels.voice.model` (startup log `Voice runtime
+constructed` naming `claude-haiku-5-5`), over at least 5 calls:
+
+_Pending deploy: fill in calls, first-speech p50 / p90, and the date._
