@@ -59,6 +59,9 @@ interface PgEdgeRow {
   source: string;
   created_at: Date;
   last_confirmed_at: Date;
+}
+
+interface PgSideEdgeRow extends PgEdgeRow {
   other_type: string;
   other_archived: boolean;
 }
@@ -118,6 +121,18 @@ const EDGES_SQL = `
   WHERE e.archived_at IS NULL
     AND (e.source_node_id = $1::uuid OR e.target_node_id = $1::uuid)
   ORDER BY e.id`;
+
+// Live edges from the given facts to anything but the two merge nodes (SnapshotFact.outsideEdges).
+// Locked with the facts in the locked pass, so the set cannot change before the executor runs.
+const FACT_OUTSIDE_EDGES_SQL = `
+  SELECT id, source_node_id, target_node_id, type, properties, confidence, decay_class,
+         source, created_at, last_confirmed_at
+  FROM kg_edges
+  WHERE archived_at IS NULL
+    AND (source_node_id = ANY($1::uuid[]) OR target_node_id = ANY($1::uuid[]))
+    AND source_node_id <> ALL($2::uuid[]) AND target_node_id <> ALL($2::uuid[])
+  ORDER BY id`;
+const FACT_OUTSIDE_EDGES_FOR_UPDATE_SQL = `${FACT_OUTSIDE_EDGES_SQL} FOR UPDATE`;
 
 function iso(value: Date): string {
   return value.toISOString();
@@ -238,7 +253,7 @@ async function loadSide(
   node: SnapshotNode,
   contacts: SnapshotContact[],
 ): Promise<{ side: Omit<MergeSide, 'facts'>; factLinks: Map<string, string[]> }> {
-  const { rows } = await q.query<PgEdgeRow>(EDGES_SQL, [node.id]);
+  const { rows } = await q.query<PgSideEdgeRow>(EDGES_SQL, [node.id]);
   const edges: SnapshotEdge[] = [];
   const factLinks = new Map<string, string[]>();
   for (const row of rows) {
@@ -320,10 +335,16 @@ export async function loadMergeSnapshot(
     const factRows = await q.query<PgNodeRow>(options.forUpdate ? NODES_FOR_UPDATE_SQL : NODES_SQL, [factIds]);
     for (const r of factRows.rows) factNodes.set(r.id, rowToSnapshotNode(r));
   }
+  const outsideEdges: SnapshotEdge[] = factIds.length === 0 ? [] : (await q.query<PgEdgeRow>(
+    options.forUpdate ? FACT_OUTSIDE_EDGES_FOR_UPDATE_SQL : FACT_OUTSIDE_EDGES_SQL,
+    [factIds, [survivorId, absorbedId]],
+  )).rows.map(rowToEdge);
+  const outsideOf = (factId: string): SnapshotEdge[] =>
+    outsideEdges.filter(e => e.sourceNodeId === factId || e.targetNodeId === factId);
   const toFacts = (links: Map<string, string[]>): SnapshotFact[] =>
     [...links.entries()]
       .filter(([id]) => factNodes.has(id))
-      .map(([id, linkEdgeIds]) => ({ node: factNodes.get(id)!, linkEdgeIds: [...linkEdgeIds].sort() }))
+      .map(([id, linkEdgeIds]) => ({ node: factNodes.get(id)!, linkEdgeIds: [...linkEdgeIds].sort(), outsideEdges: outsideOf(id) }))
       .sort((x, y) => x.node.id.localeCompare(y.node.id));
 
   // Would the absorbed label collide with a third node if chosen? Only label-tier live

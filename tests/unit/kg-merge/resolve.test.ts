@@ -62,6 +62,25 @@ describe('applyResolutions — defaults', () => {
     const exec = applyResolutions(conflictPlan(), { properties: { role: 'survivor' } }, NOW);
     expect(exec.node.properties.role).toBe('CEO');
   });
+
+  it('defaults a conflict on a key named like an Object.prototype member, never the inherited value', () => {
+    const { survivor, absorbed } = basicPair(
+      { properties: JSON.parse('{"constructor":"old","__proto__":"old"}') as Record<string, unknown>, lastConfirmedAt: '2026-01-01T00:00:00.000Z' },
+      { properties: JSON.parse('{"constructor":"new","__proto__":"new"}') as Record<string, unknown>, lastConfirmedAt: '2026-02-01T00:00:00.000Z' },
+    );
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor), makeSide(absorbed)));
+    expect(plan.node.propertyConflicts.map(c => [c.key, c.default])).toEqual([['__proto__', 'absorbed'], ['constructor', 'absorbed']]);
+
+    const exec = applyResolutions(plan, {}, NOW);
+    expect(exec.resolutions.properties).toEqual(JSON.parse('{"__proto__":"absorbed","constructor":"absorbed"}'));
+    expect(Object.getOwnPropertyDescriptor(exec.node.properties, 'constructor')!.value).toBe('new');
+    expect(Object.getOwnPropertyDescriptor(exec.node.properties, '__proto__')!.value).toBe('new');
+    expect(Object.getPrototypeOf(exec.node.properties)).toBe(Object.prototype);
+
+    const chosen = applyResolutions(plan, parseResolutions(JSON.parse('{"properties":{"__proto__":"survivor"}}')), NOW);
+    expect(Object.getOwnPropertyDescriptor(chosen.node.properties, '__proto__')!.value).toBe('old');
+    expect(Object.getOwnPropertyDescriptor(chosen.node.properties, 'constructor')!.value).toBe('new');
+  });
 });
 
 describe('applyResolutions — fact conflict choices and previous_values', () => {
@@ -305,6 +324,23 @@ describe('applyResolutions — node, edges and contacts', () => {
 });
 
 describe('parseResolutions', () => {
+  it('keeps a `__proto__` key as a key, so an unknown one is reported rather than dropped', () => {
+    const parsed = parseResolutions(JSON.parse('{"properties":{"__proto__":"absorbed"}}'));
+    expect(Object.keys(parsed.properties!)).toEqual(['__proto__']);
+    expect(Object.getOwnPropertyDescriptor(parsed.properties, '__proto__')!.value).toBe('absorbed');
+    const err = (() => {
+      try {
+        applyResolutions(conflictPlan(), parsed, NOW);
+      } catch (e) {
+        return e;
+      }
+      return null;
+    })();
+    expect(err).toBeInstanceOf(InvalidResolutionError);
+    expect((err as InvalidResolutionError).code).toBe('unknown_resolution');
+    expect((err as InvalidResolutionError).message).toContain('properties:__proto__');
+  });
+
   it('accepts a well-formed body and treats null/undefined as empty', () => {
     expect(parseResolutions(undefined)).toEqual({});
     expect(parseResolutions(null)).toEqual({});
@@ -403,6 +439,7 @@ describe('fact operations — chained operations never lose history or sensitivi
       nearDuplicates: [{ id: `near:${uid(100)}:${uid(102)}`, survivorFact: s1, absorbedFact: a2, absorbedLinkEdgeIds: [`link-${uid(102)}`], similarity: 0.95 }],
       sharedFactIds: [],
       sharedLinkEdgeIds: [],
+      factOutsideEdges: [],
     }, { facts: {}, nearDuplicateFacts: {} }, NOW.toISOString());
     expect(built.deleteFactIds).toEqual([uid(100), uid(101)]);
     expect([...built.updates.keys()]).toEqual([uid(102)]);
@@ -428,6 +465,7 @@ describe('fact operations — chained operations never lose history or sensitivi
       nearDuplicates: [{ id: `near:${uid(100)}:${uid(102)}`, survivorFact: s1, absorbedFact: a2, absorbedLinkEdgeIds: [`link-${uid(102)}`], similarity: 0.95 }],
       sharedFactIds: [],
       sharedLinkEdgeIds: [],
+      factOutsideEdges: [],
     }, { facts: {}, nearDuplicateFacts: {} }, NOW.toISOString());
     expect(built.deleteFactIds).toEqual([uid(100), uid(101)]);
     expect([...built.updates.keys()]).toEqual([uid(102)]);
@@ -449,6 +487,7 @@ describe('fact operations — chained operations never lose history or sensitivi
       nearDuplicates: [{ id: `near:${uid(100)}:${uid(102)}`, survivorFact: s1, absorbedFact: a2, absorbedLinkEdgeIds: [`link-${uid(102)}`], similarity: 0.95 }],
       sharedFactIds: [],
       sharedLinkEdgeIds: [],
+      factOutsideEdges: [],
     }, { facts: {}, nearDuplicateFacts: {} }, NOW.toISOString());
     expect(built.deleteFactIds).toEqual([uid(100), uid(102)]);
     expect([...built.updates.keys()]).toEqual([uid(101)]);
@@ -494,5 +533,58 @@ describe('applyResolutions — principal trust audit (QA G)', () => {
     const exec = applyResolutions(plan, {}, NOW);
     expect(exec.contacts.principalIdentitiesTransferred).toEqual([]);
     expect(exec.contacts.principalPrimaryFieldsFilled).toEqual({});
+  });
+});
+
+describe('fact operations — a dropped fact’s edges to other nodes are kept', () => {
+  const X = uid(60);
+  const Y = uid(61);
+  /** A fact with an edge to a third node, as a snapshot would load it. */
+  function withOutside(fact: ReturnType<typeof makeFact>, ...edges: ReturnType<typeof makeEdge>[]) {
+    return { ...fact, outsideEdges: edges };
+  }
+
+  it('moves the edge to the fact it was folded into', () => {
+    const { survivor, absorbed } = basicPair();
+    const s = makeFact(uid(100), 'Enjoys sailing');
+    const a = withOutside(makeFact(uid(101), 'enjoys sailing.'), makeEdge(uid(300), X, uid(101), 'relates_to'));
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor, { facts: [s] }), makeSide(absorbed, { facts: [a] })));
+    const { facts } = applyResolutions(plan, {}, NOW);
+    expect(facts.deleteFactIds).toEqual([uid(101)]);
+    expect(facts.repointOutsideEdges).toEqual([{ edgeId: uid(300), sourceNodeId: X, targetNodeId: uid(100) }]);
+    expect(facts.dropOutsideEdgeIds).toEqual([]);
+  });
+
+  it('drops an edge the kept fact already has (either direction), and one that would join the fact to itself', () => {
+    const { survivor, absorbed } = basicPair();
+    const s = withOutside(makeFact(uid(100), 'Enjoys sailing'), makeEdge(uid(310), uid(100), X, 'relates_to'));
+    const a = withOutside(
+      makeFact(uid(101), 'enjoys sailing'),
+      makeEdge(uid(300), X, uid(101), 'relates_to'), // duplicates uid(310) once re-pointed
+      makeEdge(uid(301), uid(101), Y, 'relates_to'), // new for the kept fact: moves
+      makeEdge(uid(302), uid(100), uid(101), 'relates_to'), // fact-to-fact: a self-loop once folded
+    );
+    const plan = planNodeMerge(makeSnapshot(
+      makeSide(survivor, { facts: [s] }),
+      makeSide(absorbed, { facts: [a] }),
+    ));
+    const { facts } = applyResolutions(plan, {}, NOW);
+    expect(facts.dropOutsideEdgeIds.sort()).toEqual([uid(300), uid(302)]);
+    expect(facts.repointOutsideEdges).toEqual([{ edgeId: uid(301), sourceNodeId: uid(100), targetNodeId: Y }]);
+  });
+
+  it('follows the fold when the survivor’s own fact is the one dropped', () => {
+    const { survivor, absorbed } = basicPair();
+    const s = withOutside(makeFact(uid(100), 'x', { attribute: 'title', value: 'CEO' }), makeEdge(uid(300), uid(100), X, 'cites'));
+    const a = makeFact(uid(101), 'y', { attribute: 'title', value: 'CTO' });
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor, { facts: [s] }), makeSide(absorbed, { facts: [a] })));
+    const id = plan.facts.conflicts[0]!.id;
+    const { facts } = applyResolutions(plan, { facts: { [id]: 'absorbed' } }, NOW);
+    expect(facts.deleteFactIds).toEqual([uid(100)]);
+    expect(facts.repointOutsideEdges).toEqual([{ edgeId: uid(300), sourceNodeId: uid(101), targetNodeId: X }]);
+    // Keeping both deletes nothing, so nothing moves.
+    const both = applyResolutions(plan, { facts: { [id]: 'both' } }, NOW).facts;
+    expect(both.repointOutsideEdges).toEqual([]);
+    expect(both.dropOutsideEdgeIds).toEqual([]);
   });
 });

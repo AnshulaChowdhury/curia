@@ -106,6 +106,34 @@ export async function executeMerge(
     const res = await client.query(`DELETE FROM kg_edges WHERE id = ANY($1::uuid[])`, [plan.facts.deleteLinkEdgeIds]);
     expectRows(res.rowCount, plan.facts.deleteLinkEdgeIds.length, 'delete shared-fact link edges');
   }
+  // A deleted fact's outside edges move to the fact it was folded into (or are dropped as
+  // duplicates) before the delete, which would otherwise cascade them away.
+  if (plan.facts.dropOutsideEdgeIds.length > 0) {
+    const res = await client.query(`DELETE FROM kg_edges WHERE id = ANY($1::uuid[])`, [plan.facts.dropOutsideEdgeIds]);
+    expectRows(res.rowCount, plan.facts.dropOutsideEdgeIds.length, 'drop duplicate outside edges of dropped facts');
+  }
+  for (const repoint of plan.facts.repointOutsideEdges) {
+    const res = await client.query(
+      `UPDATE kg_edges SET source_node_id = $2, target_node_id = $3 WHERE id = $1 AND archived_at IS NULL`,
+      [repoint.edgeId, repoint.sourceNodeId, repoint.targetNodeId],
+    );
+    expectRows(res.rowCount, 1, `re-point outside edge ${repoint.edgeId} of a dropped fact`);
+  }
+  if (plan.facts.deleteFactIds.length > 0) {
+    // Backstop: the only live edges a dropped fact may still have are its relates_to links
+    // to the two merge nodes. Anything else would be lost to the cascade.
+    const stranded = await client.query<{ id: string }>(
+      `SELECT id FROM kg_edges
+       WHERE archived_at IS NULL
+         AND (source_node_id = ANY($1::uuid[]) OR target_node_id = ANY($1::uuid[]))
+         AND NOT (type = 'relates_to' AND (source_node_id = ANY($2::uuid[]) OR target_node_id = ANY($2::uuid[])))`,
+      [plan.facts.deleteFactIds, [survivorId, absorbedId]],
+    );
+    if (stranded.rows.length > 0) {
+      log.error({ edgeIds: stranded.rows.map(r => r.id) }, 'kg-merge: dropped facts still have other edges — rolling back');
+      throw new MergeInvariantError(`${stranded.rows.length} edge(s) would be lost with the dropped facts`);
+    }
+  }
   if (plan.facts.deleteFactIds.length > 0) {
     // type = 'fact' is a guard: this statement must never touch an entity node.
     // Their link edges cascade (kg_edges ON DELETE CASCADE).

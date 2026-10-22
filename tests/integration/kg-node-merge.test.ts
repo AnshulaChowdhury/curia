@@ -375,6 +375,32 @@ describeIf('KG node merge (#2233)', () => {
     expect((await nodeRow(ev))!.archived_at).not.toBeNull();
   });
 
+  it('keeps a dropped fact’s edges to other nodes: moved to the kept fact, or dropped as a duplicate', async () => {
+    const s = await node('person', 'Outside S');
+    const a = await node('person', 'Outside A');
+    const x = await node('project', 'Outside X');
+    const y = await node('project', 'Outside Y');
+    const kept = await fact(s, 'Enjoys sailing');
+    const dropped = await fact(a, 'enjoys sailing.');
+    // Writers today link a fact only to its entity; the schema allows more, and the cascade
+    // on the dropped fact would take these with it.
+    const toX = await edge(x, dropped, 'relates_to');
+    await edge(kept, y, 'relates_to');
+    const toY = await edge(dropped, y, 'relates_to'); // duplicates kept–y once re-pointed
+
+    const preview = await service.preview(s, a);
+    await service.apply({ survivorId: s, absorbedId: a, planToken: preview.planToken, resolutions: {}, actor: null });
+
+    expect(await nodeRow(dropped)).toBeUndefined();
+    const moved = await pool.query<{ source_node_id: string; target_node_id: string }>(
+      `SELECT source_node_id, target_node_id FROM kg_edges WHERE id = $1`, [toX],
+    );
+    expect(moved.rows[0]).toEqual({ source_node_id: x, target_node_id: kept });
+    expect((await pool.query(`SELECT 1 FROM kg_edges WHERE id = $1`, [toY])).rows).toHaveLength(0);
+    expect((await liveEdges(y)).map(e => [e.source_node_id, e.target_node_id])).toEqual([[kept, y]]);
+    expect((await factsOf(s)).map(f => f.id)).toEqual([kept]);
+  });
+
   it('accepts upper-case node ids (Postgres returns uuids in lower case)', async () => {
     const org = await node('organization', 'Globex');
     const dup = await node('organization', 'Globex Corp');

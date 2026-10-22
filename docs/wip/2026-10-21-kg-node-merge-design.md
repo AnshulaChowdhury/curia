@@ -591,3 +591,6 @@ round. No migration is needed.
   - Near-duplicate facts use the profile's `factDedup` threshold and compare only vectors stamped with the live model. The settings are part of the plan token.
   - Embedding candidates use the profile's `fuzzyAmbiguityFloor`, about where entity resolution starts asking, and compare only vectors from the live model. The old fixed 0.80 matched no calibrated value.
   - The merge service gets the embedding service only when the knowledge graph's boot gate passed. Without it, merges still run: a rename keeps the old vector with a warning, and no near-duplicate facts or embedding candidates are offered.
+- **Second CodeRabbit pass (2026-10-22):**
+  - A deleted fact's live edges to nodes other than the two being merged move to the fact it was folded into, before the delete would cascade them. One that would duplicate an edge that fact keeps, or join it to itself, is dropped. The snapshot loads and locks these edges, and the executor refuses to delete a fact that still has any edge but its links to the merge nodes. No writer creates such edges today; the schema allows them.
+  - Property keys, permission names and request keys are read and written as own properties, so `constructor` or `__proto__` behave like any other key.

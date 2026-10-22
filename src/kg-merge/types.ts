@@ -74,6 +74,12 @@ export interface SnapshotEdge {
 export interface SnapshotFact {
   node: SnapshotNode;
   linkEdgeIds: string[];
+  /**
+   * Live edges from the fact to nodes other than the two being merged. Writers today link a
+   * fact only to its entity, but the schema allows more, and deleting the fact would cascade
+   * these away — so a deleted fact's outside edges move to the fact it was folded into.
+   */
+  outsideEdges: SnapshotEdge[];
 }
 
 export interface SnapshotIdentity {
@@ -376,6 +382,8 @@ export interface FactPlan {
   /** Facts linked to both nodes: kept once; these absorbed-side link edges are deleted. */
   sharedFactIds: string[];
   sharedLinkEdgeIds: string[];
+  /** Every fact's outside edges (SnapshotFact.outsideEdges), once each, by id. */
+  factOutsideEdges: SnapshotEdge[];
 }
 
 export interface EdgeCollapsePlan {
@@ -474,6 +482,12 @@ export interface FactUpdateOp {
   properties: Record<string, unknown>;
 }
 
+export interface OutsideEdgeRepointOp {
+  edgeId: string;
+  sourceNodeId: string;
+  targetNodeId: string;
+}
+
 export interface FactOperations {
   /** Fact nodes to delete (their link edges cascade). */
   deleteFactIds: string[];
@@ -481,6 +495,10 @@ export interface FactOperations {
   relinkEdgeIds: string[];
   /** Absorbed-side link edges of facts shared by both nodes. */
   deleteLinkEdgeIds: string[];
+  /** Outside edges of deleted facts, moved to the fact each was folded into (before the delete). */
+  repointOutsideEdges: OutsideEdgeRepointOp[];
+  /** Outside edges of deleted facts that would duplicate an edge the kept fact already has. */
+  dropOutsideEdgeIds: string[];
   updates: FactUpdateOp[];
   movedFactCount: number;
   collapsedFactCount: number;

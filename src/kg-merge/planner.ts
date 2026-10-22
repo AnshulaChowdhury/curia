@@ -42,8 +42,11 @@ import {
   type Side,
   type SnapshotContact,
   type SnapshotFact,
+  type OutsideEdgeRepointOp,
+  type SnapshotEdge,
   type SnapshotNode,
 } from './types.js';
+import { setOwn } from './own.js';
 
 /** Properties never copied from the absorbed node (§4.1). */
 export const RESERVED_PROPERTY_KEYS: ReadonlySet<string> = new Set(['merged_into', 'merged_at', 'is_agent']);
@@ -65,7 +68,8 @@ function sortKeys(value: unknown): unknown {
     const obj = value as Record<string, unknown>;
     const out: Record<string, unknown> = {};
     for (const key of Object.keys(obj).sort()) {
-      if (obj[key] !== undefined) out[key] = sortKeys(obj[key]);
+      // setOwn: a `__proto__` key must reach the hash, not reset out's prototype.
+      if (obj[key] !== undefined) setOwn(out, key, sortKeys(obj[key]));
     }
     return out;
   }
@@ -358,6 +362,9 @@ export function planFacts(survivor: MergeSide, absorbed: MergeSide, similarity?:
     nearDuplicates,
     sharedFactIds: shared.map(f => f.node.id).sort(),
     sharedLinkEdgeIds: shared.flatMap(f => f.linkEdgeIds).sort(),
+    factOutsideEdges: [
+      ...new Map([...survivor.facts, ...absorbed.facts].flatMap(f => f.outsideEdges).map(e => [e.id, e])).values(),
+    ].sort((x, y) => x.id.localeCompare(y.id)),
   };
 }
 
@@ -374,6 +381,8 @@ export interface BuiltFactOperations {
   deleteFactIds: string[];
   relinkEdgeIds: string[];
   deleteLinkEdgeIds: string[];
+  repointOutsideEdges: OutsideEdgeRepointOp[];
+  dropOutsideEdgeIds: string[];
   updates: Map<string, { fact: SnapshotNode; confidence: number; lastConfirmedAt: string; sensitivity: SnapshotNode['sensitivity']; previousValues: Record<string, unknown>[] }>;
   movedFactIds: Set<string>;
   collapsedFactCount: number;
@@ -516,10 +525,41 @@ export function buildFactOperations(plan: FactPlan, choices: FactChoices, replac
     relinks.delete(id);
   }
 
+  // A deleted fact's outside edges would cascade with it. Each moves to the fact its
+  // endpoint was folded into. One that would then join a fact to itself, or duplicate an
+  // edge that stays (idx_kg_edges_unique is direction-agnostic), is dropped instead; the
+  // edge that stays keeps its own values.
+  const liveId = (id: string): string => {
+    let current = id;
+    for (let next = successor.get(current); next; next = successor.get(current)) current = next.id;
+    return current;
+  };
+  const edgeKey = (x: string, y: string, type: string): string => (x < y ? `${x}|${y}|${type}` : `${y}|${x}|${type}`);
+  const touchesDeleted = (e: SnapshotEdge): boolean => deleteFactIds.has(e.sourceNodeId) || deleteFactIds.has(e.targetNodeId);
+  const taken = new Set(
+    plan.factOutsideEdges.filter(e => !touchesDeleted(e)).map(e => edgeKey(e.sourceNodeId, e.targetNodeId, e.type)),
+  );
+  const repointOutsideEdges: OutsideEdgeRepointOp[] = [];
+  const dropOutsideEdgeIds: string[] = [];
+  for (const e of plan.factOutsideEdges) {
+    if (!touchesDeleted(e)) continue;
+    const sourceNodeId = liveId(e.sourceNodeId);
+    const targetNodeId = liveId(e.targetNodeId);
+    const key = edgeKey(sourceNodeId, targetNodeId, e.type);
+    if (sourceNodeId === targetNodeId || taken.has(key)) {
+      dropOutsideEdgeIds.push(e.id);
+      continue;
+    }
+    taken.add(key);
+    repointOutsideEdges.push({ edgeId: e.id, sourceNodeId, targetNodeId });
+  }
+
   return {
     deleteFactIds: [...deleteFactIds].sort(),
     relinkEdgeIds: [...relinks.values()].flat().sort(),
     deleteLinkEdgeIds: [...plan.sharedLinkEdgeIds],
+    repointOutsideEdges,
+    dropOutsideEdgeIds,
     updates,
     movedFactIds,
     collapsedFactCount,
@@ -567,8 +607,9 @@ export function planProperties(survivor: SnapshotNode, absorbed: SnapshotNode): 
   for (const key of Object.keys(absorbed.properties).sort()) {
     if (RESERVED_PROPERTY_KEYS.has(key)) continue;
     const absorbedValue = absorbed.properties[key];
-    if (!(key in survivor.properties)) {
-      merged[key] = absorbedValue;
+    // Own keys only: an absorbed `toString` is not a conflict with an inherited function.
+    if (!Object.hasOwn(survivor.properties, key)) {
+      setOwn(merged, key, absorbedValue);
       continue;
     }
     const survivorValue = survivor.properties[key];

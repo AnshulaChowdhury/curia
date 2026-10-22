@@ -7,6 +7,7 @@
 import type { MergedContactRow } from '../contacts/contact-service.js';
 import { isStructuralContact } from '../contacts/contact-service.js';
 import { InvalidResolutionError, MergeBlockedError } from './errors.js';
+import { ownValue, setOwn } from './own.js';
 import { buildFactOperations, computeAliases, foldTier, mostDurable, summaryCounts } from './planner.js';
 import { PRINCIPAL_PRIMARY_FIELDS } from './types.js';
 import type {
@@ -38,7 +39,8 @@ function parseChoiceMap<T extends string>(
   if (!isPlainObject(raw)) {
     throw new InvalidResolutionError('invalid_request', `resolutions.${name} must be an object.`);
   }
-  const out: Record<string, T> = {};
+  // Null prototype: a `__proto__` key is kept as a key (and reported if unknown), not dropped.
+  const out = Object.create(null) as Record<string, T>;
   for (const [key, value] of Object.entries(raw)) {
     if (typeof value !== 'string' || !allowed.has(value)) {
       throw new InvalidResolutionError(
@@ -46,7 +48,7 @@ function parseChoiceMap<T extends string>(
         `resolutions.${name}["${key}"] must be one of: ${[...allowed].join(', ')}.`,
       );
     }
-    out[key] = value as T;
+    setOwn(out, key, value as T);
   }
   return out;
 }
@@ -143,16 +145,18 @@ export function applyResolutions(
   // -- Filled-in resolutions (the audit payload records every choice, default or not) --
   const filled: Required<NodeMergeResolutions> = {
     label: labelSide,
-    properties: Object.fromEntries(plan.node.propertyConflicts.map(c => [c.key, resolutions.properties?.[c.key] ?? c.default])),
-    facts: Object.fromEntries(plan.facts.conflicts.map(c => [c.id, resolutions.facts?.[c.id] ?? c.default])),
+    // Own-property lookups: a property key or permission named like an Object.prototype
+    // member (`constructor`) must fall back to the default, not read the inherited value.
+    properties: Object.fromEntries(plan.node.propertyConflicts.map(c => [c.key, ownValue(resolutions.properties, c.key) ?? c.default])),
+    facts: Object.fromEntries(plan.facts.conflicts.map(c => [c.id, ownValue(resolutions.facts, c.id) ?? c.default])),
     nearDuplicateFacts: Object.fromEntries(
-      plan.facts.nearDuplicates.map(n => [n.id, resolutions.nearDuplicateFacts?.[n.id] ?? 'merge']),
+      plan.facts.nearDuplicates.map(n => [n.id, ownValue(resolutions.nearDuplicateFacts, n.id) ?? 'merge']),
     ),
     contactFields: Object.fromEntries(
-      plan.contacts.fieldConflicts.map(c => [c.field, resolutions.contactFields?.[c.field] ?? 'survivor']),
+      plan.contacts.fieldConflicts.map(c => [c.field, ownValue(resolutions.contactFields, c.field) ?? 'survivor']),
     ),
     authOverrides: Object.fromEntries(
-      plan.contacts.authOverrideConflicts.map(c => [c.permission, resolutions.authOverrides?.[c.permission] ?? c.default]),
+      plan.contacts.authOverrideConflicts.map(c => [c.permission, ownValue(resolutions.authOverrides, c.permission) ?? c.default]),
     ),
     acknowledgements: [...acknowledged].sort(),
   };
@@ -161,7 +165,7 @@ export function applyResolutions(
   const { label, aliases } = computeAliases(s, a, labelSide);
   const properties: Record<string, unknown> = { ...plan.node.mergedProperties };
   for (const conflict of plan.node.propertyConflicts) {
-    properties[conflict.key] = filled.properties[conflict.key] === 'absorbed' ? conflict.absorbedValue : conflict.survivorValue;
+    setOwn(properties, conflict.key, ownValue(filled.properties, conflict.key) === 'absorbed' ? conflict.absorbedValue : conflict.survivorValue);
   }
 
   // -- Facts --
@@ -170,6 +174,8 @@ export function applyResolutions(
     deleteFactIds: built.deleteFactIds,
     relinkEdgeIds: built.relinkEdgeIds,
     deleteLinkEdgeIds: built.deleteLinkEdgeIds,
+    repointOutsideEdges: built.repointOutsideEdges,
+    dropOutsideEdgeIds: built.dropOutsideEdgeIds,
     updates: [...built.updates.values()]
       .map(u => {
         const existing = Array.isArray(u.fact.properties.previous_values)

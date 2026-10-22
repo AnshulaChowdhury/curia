@@ -93,6 +93,27 @@ describe('planNodeMerge — properties', () => {
     const plan = planNodeMerge(makeSnapshot(makeSide(survivor), makeSide(absorbed)));
     expect(plan.preview.conflicts.properties[0]!.default).toBe('survivor');
   });
+
+  it('treats keys named like Object.prototype members as ordinary own keys', () => {
+    // JSON.parse, as pg uses for jsonb, makes `__proto__` an own key.
+    const absorbedProps = JSON.parse('{"toString":"inherited name","constructor":"x","__proto__":{"polluted":true}}') as Record<string, unknown>;
+    const { survivor, absorbed } = basicPair({ properties: {} }, { properties: absorbedProps });
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor), makeSide(absorbed)));
+    expect(plan.preview.conflicts.properties).toEqual([]);
+    const merged = plan.node.mergedProperties;
+    expect(Object.keys(merged).sort()).toEqual(['__proto__', 'constructor', 'toString']);
+    expect(Object.getPrototypeOf(merged)).toBe(Object.prototype);
+    expect(Object.getOwnPropertyDescriptor(merged, '__proto__')!.value).toEqual({ polluted: true });
+  });
+
+  it('hashes a `__proto__` property into the plan token', () => {
+    const snap = (value: string) => {
+      const { survivor, absorbed } = basicPair({}, { properties: JSON.parse(`{"__proto__":"${value}"}`) as Record<string, unknown> });
+      return makeSnapshot(makeSide(survivor), makeSide(absorbed));
+    };
+    expect(canonicalJson(snap('a'))).toContain('"__proto__":"a"');
+    expect(planToken(snap('a'))).not.toBe(planToken(snap('b')));
+  });
 });
 
 describe('planNodeMerge — scalars', () => {

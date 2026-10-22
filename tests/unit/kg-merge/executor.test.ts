@@ -25,7 +25,10 @@ function basePlan(overrides: Partial<ExecutionPlan> = {}): ExecutionPlan {
       decayClass: 'slow_decay', sensitivity: 'internal', createdAt: NOW, lastConfirmedAt: NOW,
       warnedAt: null, warnReason: null, identitySource: 'label',
     },
-    facts: { deleteFactIds: [], relinkEdgeIds: [], deleteLinkEdgeIds: [], updates: [], movedFactCount: 0, collapsedFactCount: 0 },
+    facts: {
+      deleteFactIds: [], relinkEdgeIds: [], deleteLinkEdgeIds: [], repointOutsideEdges: [], dropOutsideEdgeIds: [],
+      updates: [], movedFactCount: 0, collapsedFactCount: 0,
+    },
     edges: { deleteEdgeIds: [], collapses: [], moveEdgeIds: [] },
     contacts: {
       action: 'none', survivingContactId: null, repoints: [], merges: [], mergedRow: null,
@@ -79,6 +82,10 @@ describe('executeMerge — invariants', () => {
     })],
     ['a fact re-link', /UPDATE kg_edges\s+SET source_node_id/, basePlan({ facts: { ...basePlan().facts, relinkEdgeIds: [uid(300)] } })],
     ['a shared link delete', /DELETE FROM kg_edges/, basePlan({ facts: { ...basePlan().facts, deleteLinkEdgeIds: [uid(301)] } })],
+    ['an outside-edge drop', /DELETE FROM kg_edges/, basePlan({ facts: { ...basePlan().facts, dropOutsideEdgeIds: [uid(302)], deleteFactIds: [uid(101)] } })],
+    ['an outside-edge re-point', /UPDATE kg_edges SET source_node_id = \$2, target_node_id = \$3/, basePlan({
+      facts: { ...basePlan().facts, repointOutsideEdges: [{ edgeId: uid(303), sourceNodeId: uid(60), targetNodeId: uid(100) }], deleteFactIds: [uid(101)] },
+    })],
     ['an edge move', /UPDATE kg_edges\s+SET source_node_id/, basePlan({ edges: { deleteEdgeIds: [], collapses: [], moveEdgeIds: [uid(201), uid(202)] } })],
     ['an edge collapse', /UPDATE kg_edges\s+SET confidence/, basePlan({
       edges: {
@@ -95,6 +102,32 @@ describe('executeMerge — invariants', () => {
     await expect(executeMerge(client, plan, null, deps)).rejects.toBeInstanceOf(MergeInvariantError);
     // Nothing after the failed statement ran — the survivor was never updated.
     expect(query.mock.calls.some(([sql]) => /RETURNING/.test(String(sql)))).toBe(false);
+  });
+
+  it('re-points a dropped fact’s outside edges before deleting the fact', async () => {
+    const { client, query } = fakeClient();
+    const plan = basePlan({
+      facts: {
+        ...basePlan().facts,
+        deleteFactIds: [uid(101)],
+        dropOutsideEdgeIds: [uid(302)],
+        repointOutsideEdges: [{ edgeId: uid(303), sourceNodeId: uid(60), targetNodeId: uid(100) }],
+      },
+    });
+    await executeMerge(client, plan, null, deps);
+    const sqls = query.mock.calls.map(([sql]) => String(sql));
+    const at = (re: RegExp) => sqls.findIndex(s => re.test(s));
+    expect(at(/DELETE FROM kg_edges/)).toBeLessThan(at(/DELETE FROM kg_nodes/));
+    expect(at(/SET source_node_id = \$2, target_node_id = \$3/)).toBeLessThan(at(/DELETE FROM kg_nodes/));
+    expect(query.mock.calls.find(([sql]) => /SET source_node_id = \$2, target_node_id = \$3/.test(String(sql)))![1])
+      .toEqual([uid(303), uid(60), uid(100)]);
+  });
+
+  it('refuses to delete facts that still have edges the cascade would lose', async () => {
+    const { client, query } = fakeClient([{ match: /SELECT id FROM kg_edges/, rows: [{ id: uid(304) }], rowCount: 1 }]);
+    const plan = basePlan({ facts: { ...basePlan().facts, deleteFactIds: [uid(101)] } });
+    await expect(executeMerge(client, plan, null, deps)).rejects.toThrow(/would be lost with the dropped facts/);
+    expect(query.mock.calls.some(([sql]) => /DELETE FROM kg_nodes/.test(String(sql)))).toBe(false);
   });
 
   it('refuses to archive the absorbed node while a contact still points at it', async () => {

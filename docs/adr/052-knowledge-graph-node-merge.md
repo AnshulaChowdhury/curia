@@ -100,9 +100,10 @@ Rejected:
 Contradictions are not resolved silently. Property conflicts, conflicting attribute facts,
 near-duplicate facts (cosine at least the embedding profile's fact-dedup threshold, scored only
 between vectors from the live model, per ADR-051), contact field conflicts
-and auth-override conflicts each come back with a deterministic id and a default (newer
-`last_confirmed_at` wins, survivor on a tie; near-duplicates default to *merge*). The user
-can override any of them. Where a fact value loses, it is appended to the kept fact's
+and auth-override conflicts each come back with a deterministic id and a default. Property
+and fact conflicts take the newer `last_confirmed_at` (survivor on a tie), near-duplicates
+default to *merge*, contact field conflicts default to the survivor, and auth-override
+conflicts default to the side that denies. The user can override any of them. Where a fact value loses, it is appended to the kept fact's
 `properties.previous_values`, matching `storeFact`. Sensitivity only ratchets up and is
 never user-selectable downward.
 
@@ -191,7 +192,9 @@ the resolutions. Some rows are deleted outright:
   takes the higher confidence, the latest confirmation and the higher sensitivity.
 - **Losing facts in a conflict:** when the user keeps one side, the other fact node is
   deleted. Its value goes into the kept fact's `previous_values`.
-- **Edges:** collapsed edges, and edges that would become self-loops.
+- **Edges:** collapsed edges, and edges that would become self-loops. A deleted fact's
+  edges to other nodes move to the fact it was folded into; one that would duplicate an
+  edge that fact already has is deleted.
 
 A deleted fact node's own `previous_values` history moves to the kept fact. What a
 deleted node does not keep is its id, its provenance row, and, for duplicates, its exact

@@ -52,7 +52,7 @@ export function makeFact(
   overrides: Partial<SnapshotNode> = {},
   linkEdgeIds: string[] = [`link-${id}`],
 ): SnapshotFact {
-  return { node: makeNode({ id, type: 'fact', label, properties, ...overrides }), linkEdgeIds };
+  return { node: makeNode({ id, type: 'fact', label, properties, ...overrides }), linkEdgeIds, outsideEdges: [] };
 }
 
 export function makeEdge(
