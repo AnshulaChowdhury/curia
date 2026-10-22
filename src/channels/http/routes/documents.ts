@@ -291,6 +291,13 @@ export async function documentsRoutes(
     try {
       const doc = await resolveDocument(query, reply);
       if (!doc) return;
+      // Semgrep direct-response-write flags user input reaching reply.send as XSS. Not
+      // applicable: this sends an object, which Fastify serializes as application/json
+      // (pinned by a test), never HTML. The only HTML inside it — `htmlChunks` — is produced
+      // by markdownToHtml → sanitize-html before it leaves the server. The route is
+      // session-authed and nosniff is set app-wide. `resp.render()` is for HTML templates and
+      // does not apply. Same pattern as the KG JSON routes (kg.ts).
+      // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write
       return reply.send(await detailJson(doc));
     } catch (err) {
       logger.error({ err, path: query.path, id: query.id }, 'GET /api/documents/doc: read failed');

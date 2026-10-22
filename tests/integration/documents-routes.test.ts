@@ -180,6 +180,18 @@ describeIf('console Documents routes (integration)', () => {
       expect(body.htmlChunks.join('')).toContain('<a href="activity-log.md">');
     });
 
+    it('responds as JSON, never HTML, with sanitized rendered chunks (code-scanning #305)', async () => {
+      await repo.create({ path: '/projects/xss/probe.md', type: 'note', body: '<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n' });
+      const res = await app.inject({ method: 'GET', url: '/api/documents/doc?path=/projects/xss/probe.md', headers: AUTH });
+      expect(res.headers['content-type']).toMatch(/^application\/json/);
+      const { htmlChunks } = JSON.parse(res.payload) as { htmlChunks: string[] };
+      const html = htmlChunks.join('');
+      // No live tags or handler attributes — the probe survives only as escaped text.
+      expect(html).not.toMatch(/<script|<img|<[^>]+\son\w+=/i);
+      expect(html).toContain('&lt;script&gt;');
+      await repo.softDelete('/projects/xss/probe.md');
+    });
+
     it('chunks the 211 kB-class activity log for progressive rendering', async () => {
       const { body } = await get<{ htmlChunks: string[]; document: { byteSize: number } }>(
         '/api/documents/doc?path=/projects/social-media/activity-log.md',
