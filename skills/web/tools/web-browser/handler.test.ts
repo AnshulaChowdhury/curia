@@ -17,6 +17,17 @@ vi.mock('../../../../src/browser/human-behavior.js', () => ({
   humanType: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Settle timings shrunk so a page that never settles (a mock whose reads all fail) hits the
+// cap in milliseconds, not 35s. The settle behaviour itself is covered in settle.test.ts and
+// the "adaptive settle" block below.
+vi.mock('./settle.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./settle.js')>();
+  return {
+    ...actual,
+    DEFAULT_SETTLE_TIMING: { capMs: 40, pollMs: 5, quietMs: 10, handoffStableMs: 20, navGraceMs: 5, actionNetworkMs: 20 },
+  };
+});
+
 import {
   jitteredDelay,
   simulateHumanPresence,

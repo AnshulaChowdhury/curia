@@ -96,8 +96,12 @@ interface AgentBudget {
 // archive-extract pinned, and file-parse's description now covers XML, text, Markdown and the
 // filename argument (#2208): +1,831 bytes, 81,624 over 73 local tools. The budget rises by
 // exactly that delta.
+// web-browser adaptive settle (#2244): the waiting is enforced in code; the manifest gains only
+// the clear_site_data action, its domain input, the settled/redirect_chain/console_errors/cleared
+// outputs, and one line on what settled:false means (the existing challenge sentence was folded
+// into it): +238 bytes, 81,862 over 73 local tools. The budget rises by exactly that delta.
 const AGENT_BUDGETS: AgentBudget[] = [
-  { agent: 'coordinator', alwaysOnPromptTokens: 3_200, localToolDefinitionBytes: 81_624, allowMcpPins: false, rosterTokens: 500 },
+  { agent: 'coordinator', alwaysOnPromptTokens: 3_200, localToolDefinitionBytes: 81_862, allowMcpPins: false, rosterTokens: 500 },
   // Specialists, trimmed per ADR-046 in #2025 (baseline log, final phase).
   // calendar: YAML 28,727 → 23,897 chars (~7,187 → ~5,984 tokens always-on); 24,370 bytes over 19 local tools.
   { agent: 'calendar', alwaysOnPromptTokens: 6_200, localToolDefinitionBytes: 25_000, allowMcpPins: false },

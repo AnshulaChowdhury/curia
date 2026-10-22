@@ -59,6 +59,16 @@ describe('loadYamlConfig: browser block validation', () => {
     expect(() => loadYamlConfig(dir)).toThrow('browser.languages');
   });
 
+  it('accepts a settleCapMs within the skill timeout', () => {
+    const dir = writeTempConfig(`browser:\n  settleCapMs: 20000\n`);
+    expect(loadYamlConfig(dir).browser?.settleCapMs).toBe(20000);
+  });
+
+  it.each([0, -1, 1.5, 90001])('rejects settleCapMs %s', (value) => {
+    const dir = writeTempConfig(`browser:\n  settleCapMs: ${value}\n`);
+    expect(() => loadYamlConfig(dir)).toThrow('browser.settleCapMs');
+  });
+
   it('accepts a valid proxy', () => {
     const dir = writeTempConfig(`browser:\n  proxy: "http://browser-wg:8888"\n`);
     expect(loadYamlConfig(dir).browser?.proxy).toBe('http://browser-wg:8888');

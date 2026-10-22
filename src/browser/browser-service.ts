@@ -76,6 +76,9 @@ interface BrowserServiceOptions {
   locale?: string;
   /** Ordered navigator.languages / Accept-Language list. `locale` is always first. */
   languages?: string[];
+  /** Longest the web-browser skill waits for a page to finish redirecting before reading
+   *  it, in ms (#2244). Default 35_000: Air Canada's sign-in chain takes ~28s. */
+  settleCapMs?: number;
   /** IANA timezone for the context, aligned to the principal. */
   timezone?: string;
   /**
@@ -98,6 +101,8 @@ export class BrowserService {
   private locale: string;
   private languages: string[];
   private timezone: string | undefined;
+  /** See BrowserServiceOptions.settleCapMs. Read by the web-browser skill. */
+  readonly settleCapMs: number;
   private contextFactory: () => Promise<BrowserContext>;
 
   // The persistent context IS the warm browser in this model. Sessions are pages within
@@ -140,6 +145,7 @@ export class BrowserService {
     this.locale = options.locale && options.locale.length > 0 ? options.locale : 'en-US';
     this.languages = [...new Set([this.locale, ...(options.languages ?? [])])];
     this.timezone = options.timezone;
+    this.settleCapMs = options.settleCapMs ?? 35_000;
     this.contextFactory = options.contextFactory ?? (() => this.launchPersistentContext());
   }
 
@@ -360,6 +366,16 @@ export class BrowserService {
       this.logger.error({ sessionId: newSessionId }, 'Page crashed — removing session');
       void session.close().catch(() => {});
       this.sessions.delete(newSessionId);
+    });
+
+    // Page errors, kept on the session so a blank or unsettled page can be diagnosed
+    // (#2244). Under Patchright 'console' carries only browser-reported entries (failed
+    // loads, CSP and security errors); see BrowserSession.consoleErrors.
+    page.on('console', (message) => {
+      if (message.type() === 'error') session.recordConsoleError(message.text());
+    });
+    page.on('pageerror', (error) => {
+      session.recordConsoleError(`Uncaught ${error.name}: ${error.message}`);
     });
 
     this.sessions.set(newSessionId, session);

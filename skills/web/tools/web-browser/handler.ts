@@ -31,6 +31,17 @@ import type { Verification } from '../../../../src/verification/types.js';
 import { detectVerificationScreen } from './verification-detect.js';
 import { isBlockedFrameUrl, isPrivateHost } from './frame-url.js';
 import { focusedFrame } from './focus-frame.js';
+import {
+  DEFAULT_SETTLE_TIMING,
+  PageActivity,
+  actionStartedNavigation,
+  isHandoffUrl,
+  reportableChain,
+  settlePage,
+  type SettleResult,
+  type SettleTiming,
+} from './settle.js';
+import { clearSiteData, siteForDomainInput } from './clear-site-data.js';
 
 // Maximum cleaned DOM content length before truncation.
 // Prevents token blowout on content-heavy pages.
@@ -86,10 +97,24 @@ const INTERACTION_ACTIONS: ReadonlySet<string> = new Set(['click', 'type', 'sele
 // How long `wait_for` waits for an element to become visible before giving up.
 const WAIT_FOR_TIMEOUT_MS = 10_000;
 
+// Time kept back from the skill's deadline when settling a page (#2244), for the final
+// read, the verification check and a screenshot after it.
+const SETTLE_DEADLINE_RESERVE_MS = 15_000;
+
+// Page errors this long before the call started still count as recent (#2244 point 9):
+// the page may have stalled before the agent looked at it again.
+const CONSOLE_ERROR_LOOKBACK_MS = 60_000;
+
+// Longest console error returned, cut after redaction.
+const MAX_CONSOLE_ERROR_CHARS = 300;
+
 // The actions dispatched per page operation (everything except close_session, which is
 // terminal and handled directly in execute()). Hoisted so both the batch/single validation
 // path and performAction's guard reference one list.
-const VALID_ACTIONS: BrowserAction[] = ['navigate', 'click', 'type', 'select', 'scroll', 'hover', 'press_key', 'wait_for', 'get_content', 'screenshot', 'close_session'];
+const VALID_ACTIONS: BrowserAction[] = ['navigate', 'click', 'type', 'select', 'scroll', 'hover', 'press_key', 'wait_for', 'get_content', 'screenshot', 'close_session', 'clear_site_data'];
+
+// Actions that only run on their own, never as a step of a batch.
+const STANDALONE_ACTIONS: ReadonlySet<string> = new Set(['close_session', 'clear_site_data']);
 
 // Cap on the number of actions in one batched call. A real form page is well under this
 // (a 16personalities page is ~12 answers + Next); the cap bounds a single call's wall-clock
@@ -130,6 +155,11 @@ interface ActionDeps {
   session: BrowserSession;
   ctx: ToolContext;
   sessionId: string;
+  /** Watches the page for navigations, so a step knows whether it started one (#2244). */
+  activity: PageActivity;
+  timing: SettleTiming;
+  /** Epoch ms after which no settle wait may run (the skill deadline less a reserve). */
+  settleDeadline: number | undefined;
   /** Called the instant a secret value is registered on the session — BEFORE the risky fill
    *  that follows. Screenshot suppression latches on this, so it holds even if the fill then
    *  throws mid-typing (which skips the step's normal return). This is what keeps the #973
@@ -141,8 +171,9 @@ interface ActionDeps {
  *  it does NOT count toward the circuit breaker and stops a batch cleanly. Execution errors
  *  (stale ref, Playwright failure) THROW instead, so the caller counts them and redacts them.
  *  (Secret injection is signalled out-of-band via ActionDeps.markSecretInjected so it survives
- *  a throw, not returned here.) */
-type PerformResult = { ok: true } | { ok: false; error: string };
+ *  a throw, not returned here.) `navigated` is true when the step started a main-frame
+ *  navigation, so the caller lets the page settle before the next step (#2244). */
+type PerformResult = { ok: true; navigated?: boolean } | { ok: false; error: string };
 
 // Monotonic epoch seed for element refs (g<epoch>f<frame>e<n>). Passed into extractFrameContent
 // on every read; a fresh document adopts the then-current value as its epoch, a re-read document
@@ -159,7 +190,7 @@ export class WebBrowserHandler implements ToolHandler {
       return { success: false, error: 'browserService is not available — BrowserService failed to start or is not wired into ExecutionLayer' };
     }
 
-    const { action, url, selector, text, value, key, secret_ref, session_id, screenshot, block_ads, incognito, keep_warm, actions } = ctx.input as {
+    const { action, url, selector, text, value, key, secret_ref, session_id, screenshot, block_ads, incognito, keep_warm, actions, domain } = ctx.input as {
       action?: string;
       url?: string;
       selector?: string;
@@ -188,6 +219,8 @@ export class WebBrowserHandler implements ToolHandler {
       // call. When present, the top-level action/selector/… fields are ignored and each step
       // supplies its own. Lets a whole form page be filled in a single turn.
       actions?: unknown;
+      // domain: the site clear_site_data forgets (#2244). Only meaningful for that action.
+      domain?: string;
     };
 
     // --- Build the step list: a batch (`actions`) or a single top-level action ---
@@ -213,8 +246,9 @@ export class WebBrowserHandler implements ToolHandler {
     }
 
     // Validate every step's action verb up front, before acquiring a session, so a typo
-    // fails with a clear message rather than mid-flight. close_session is only valid as a
-    // single, standalone action (it tears the session down) — never inside a batch.
+    // fails with a clear message rather than mid-flight. close_session (it tears the session
+    // down) and clear_site_data (it signs a site out) are only valid as single, standalone
+    // actions — never inside a batch.
     for (let i = 0; i < steps.length; i++) {
       const stepAction = steps[i]!.action;
       if (!stepAction || typeof stepAction !== 'string') {
@@ -223,8 +257,8 @@ export class WebBrowserHandler implements ToolHandler {
       if (!VALID_ACTIONS.includes(stepAction as BrowserAction)) {
         return { success: false, error: `Unknown action: "${stepAction}". Valid actions: ${VALID_ACTIONS.join(', ')}` };
       }
-      if (isBatch && stepAction === 'close_session') {
-        return { success: false, error: `actions[${i}]: close_session cannot be used inside a batch — call it as a single action` };
+      if (isBatch && STANDALONE_ACTIONS.has(stepAction)) {
+        return { success: false, error: `actions[${i}]: ${stepAction} cannot be used inside a batch — call it as a single action` };
       }
     }
 
@@ -246,6 +280,18 @@ export class WebBrowserHandler implements ToolHandler {
       }
       ctx.log.info({ session_id }, 'Browser session closed');
       return { success: true, data: { content: '', session_id, url: '' } };
+    }
+
+    // clear_site_data needs a site; check before acquiring a session.
+    let siteToClear: string | null = null;
+    if (!isBatch && steps[0]!.action === 'clear_site_data') {
+      if (!domain || typeof domain !== 'string') {
+        return { success: false, error: 'clear_site_data requires domain (string — e.g. "aircanada.com")' };
+      }
+      siteToClear = siteForDomainInput(domain);
+      if (!siteToClear) {
+        return { success: false, error: `clear_site_data: "${logSafeText(ctx, domain)}" is not a website domain (e.g. "aircanada.com")` };
+      }
     }
 
     // --- All other actions: acquire session once for the whole call ---
@@ -277,6 +323,61 @@ export class WebBrowserHandler implements ToolHandler {
     // (`if (sessionId)`): an empty string is treated as "no session provided".
     const sessionProvided = typeof session_id === 'string' && session_id.length > 0;
     const sessionReused = sessionProvided ? sessionId === session_id : undefined;
+
+    // --- clear_site_data: forget one site in this session's profile (#2244) ---
+    // Recovery for a sign-in that was interrupted and left the profile half-signed-in. It
+    // runs under the same autonomy gate as every other web-browser call.
+    if (siteToClear) {
+      try {
+        const cleared = await clearSiteData(session.context, page, siteToClear, ctx.log);
+        const data: Record<string, unknown> = {
+          content: '',
+          session_id: sessionId,
+          url: session.redactInjectedSecrets(page.url()),
+          cleared: { site: cleared.site, cookies: cleared.cookiesCleared, origins: cleared.originsCleared },
+        };
+        if (sessionReused !== undefined) data.session_reused = sessionReused;
+        return { success: true, data };
+      } catch (err) {
+        const safeMessage = logSafeText(ctx, session.redactInjectedSecrets(err instanceof Error ? err.message : String(err)));
+        ctx.log.error({ sessionId, site: siteToClear, errMessage: safeMessage }, 'clear_site_data failed');
+        return { success: false, error: `Browser action "clear_site_data" failed: ${safeMessage}` };
+      }
+    }
+
+    // Watch the page for the whole call, so each step knows whether it navigated and a
+    // redirect chain can be reported (#2244). Detached however the call ends.
+    const activity = new PageActivity(page);
+    try {
+      return await this.runSteps({ ctx, steps, isBatch, page, session, sessionId, sessionReused, screenshot, activity });
+    } finally {
+      activity.detach();
+    }
+  }
+
+  /** Run the steps of one call against the page, then read back its final state. */
+  private async runSteps(args: {
+    ctx: ToolContext;
+    steps: BrowserActionStep[];
+    isBatch: boolean;
+    page: Page;
+    session: BrowserSession;
+    sessionId: string;
+    sessionReused: boolean | undefined;
+    screenshot: boolean | undefined;
+    activity: PageActivity;
+  }): Promise<ToolResult> {
+    const { ctx, steps, isBatch, page, session, sessionId, sessionReused, screenshot, activity } = args;
+    const callStartedAt = Date.now();
+    // Settle timings (#2244). Only the cap is configurable (browser.settleCapMs).
+    const timing: SettleTiming = {
+      ...DEFAULT_SETTLE_TIMING,
+      capMs: ctx.browserService?.settleCapMs ?? DEFAULT_SETTLE_TIMING.capMs,
+    };
+    const settleDeadline = ctx.deadline !== undefined ? ctx.deadline - SETTLE_DEADLINE_RESERVE_MS : undefined;
+    // Where the reported redirect chain starts: the call's first page, moved to each step
+    // that navigates, so the chain shown is the one that produced the final page.
+    let chainStart = activity.chainStart(true);
 
     // Run each step in order against the same page. A batch stops at the first failure and
     // reports how far it got, with fresh page content so the agent can recover. injected-secret
@@ -325,8 +426,9 @@ export class WebBrowserHandler implements ToolHandler {
       const logUrl = typeof step.url === 'string' ? logSafeText(ctx,step.url) : step.url;
       ctx.log.info({ action: stepAction, sessionId, url: logUrl, selector: step.selector, batchIndex: isBatch ? i : undefined }, 'Executing browser action');
 
+      const stepChainStart = activity.chainStart(stepAction !== 'navigate');
       try {
-        const outcome = await performAction(step, { page, session, ctx, sessionId, markSecretInjected });
+        const outcome = await performAction(step, { page, session, ctx, sessionId, activity, timing, settleDeadline, markSecretInjected });
         if (!outcome.ok) {
           // Validation error (bad/missing params) — does NOT count toward the breaker.
           failure = { index: i, error: outcome.error, kind: 'validation' };
@@ -344,6 +446,15 @@ export class WebBrowserHandler implements ToolHandler {
         // A redirect or a click that reached a Google file (or its sign-in page) stops the
         // batch here: later steps would act on a page this tool refuses.
         if (isGoogleWorkspaceLanding(page.url())) break;
+        // A step that started a navigation: let the page settle before the next step acts
+        // on it (#2244 point 4). The last step's settle is the final one below.
+        if (outcome.navigated) {
+          chainStart = stepChainStart;
+          if (i < steps.length - 1) {
+            await settlePage(page, activity, { timing, chainStart, deadline: settleDeadline, log: ctx.log, sessionId });
+            if (isGoogleWorkspaceLanding(page.url())) break;
+          }
+        }
       } catch (err) {
         // Count this failure toward the circuit-breaker — but ONLY for the interaction actions
         // the breaker actually gates. A failed navigate/get_content, or a secret_ref config
@@ -368,12 +479,16 @@ export class WebBrowserHandler implements ToolHandler {
 
     // A redirect or a click can reach a Google file the navigate guard never saw, or its
     // sign-in page: same refusal, before the page is read. Checked ahead of the failure
-    // returns too, since an action can fail after it navigated there. Batch progress says
+    // returns too, since an action can fail after it navigated there, and again after each
+    // settle below, since the page can redirect there while settling. Batch progress says
     // what already ran.
-    if (isGoogleWorkspaceLanding(page.url())) {
+    const googleLanding = (): ToolResult | null => {
+      if (!isGoogleWorkspaceLanding(page.url())) return null;
       const progress = isBatch ? ` The batch completed ${completed}/${steps.length} action(s) first.` : '';
       return { success: false, error: `${googleWorkspaceUrlError('web-browser')}${progress}` };
-    }
+    };
+    const landedEarly = googleLanding();
+    if (landedEarly) return landedEarly;
 
     // Single-action back-compat: one action, one failure → { success:false, error } exactly as
     // before. A validation error and the breaker message are returned RAW (the original switch
@@ -390,10 +505,29 @@ export class WebBrowserHandler implements ToolHandler {
     // Only skip the DOM read for a standalone screenshot action; a batch always reads back so
     // the agent sees where it landed (and can recover from a mid-batch failure).
     const screenshotOnly = !isBatch && steps[0]!.action === 'screenshot';
+    // Let the page settle before reading it (#2244): an ordinary page returns at once; one
+    // that is blank, still changing URL, or on a sign-in handoff is waited on, up to the cap.
+    let settle: SettleResult = await settlePage(page, activity, { timing, chainStart, deadline: settleDeadline, log: ctx.log, sessionId });
+    const landedWhileSettling = googleLanding();
+    if (landedWhileSettling) return landedWhileSettling;
     let content: string;
     let currentUrl: string;
     try {
-      const rawContent = screenshotOnly ? '' : await getCleanedContent(page, ctx.log);
+      let rawContent: string;
+      try {
+        rawContent = screenshotOnly ? '' : await getCleanedContent(page, ctx.log);
+      } catch (firstErr) {
+        // A read that fails while the page navigates is "not settled yet", not an error
+        // (#2244 point 5): wait for it and read once more. Only a second failure is returned.
+        ctx.log.debug(
+          { sessionId, errMessage: logSafeText(ctx, session.redactInjectedSecrets(firstErr instanceof Error ? firstErr.message : String(firstErr))) },
+          'Page read failed — waiting for the page to settle, then reading again',
+        );
+        settle = await settlePage(page, activity, { timing, chainStart, deadline: settleDeadline, log: ctx.log, sessionId });
+        const landedOnRetry = googleLanding();
+        if (landedOnRetry) return landedOnRetry;
+        rawContent = await getCleanedContent(page, ctx.log);
+      }
       // Value-aware redaction backstop (#973): scrub any secret value injected into this
       // session from BOTH the content and the URL before they reach the LLM. A hostile page
       // could reflect a typed password back through the DOM, or a GET-form submit could echo
@@ -416,7 +550,23 @@ export class WebBrowserHandler implements ToolHandler {
       return { success: false, error: `Failed to read page content${progress}: ${safeMessage}` };
     }
 
-    const result: Record<string, unknown> = { content, session_id: sessionId, url: currentUrl };
+    const note = settleNote(settle);
+    if (note) content = content ? `${content}\n${note}` : note;
+
+    const result: Record<string, unknown> = { content, session_id: sessionId, url: currentUrl, settled: settle.settled };
+    // The main-frame URLs the page passed through, when it moved (#2244). Scrubbed like
+    // the url: injected secrets and tracked codes, plus OAuth grant parameters.
+    if (settle.redirectChain.length > 1) {
+      result.redirect_chain = reportableChain(settle.redirectChain, (u) => logSafeText(ctx, session.redactInjectedSecrets(u)));
+    }
+    // A page that never paints is diagnosed from its errors, not guessed at (#2244 point 9).
+    if (!settle.settled || settle.blank) {
+      // Redacted before truncation, so a cut can't split a secret past the redaction.
+      const errors = session.recentConsoleErrors(callStartedAt - CONSOLE_ERROR_LOOKBACK_MS)
+        .map((e) => logSafeText(ctx, session.redactInjectedSecrets(e)))
+        .map((e) => (e.length > MAX_CONSOLE_ERROR_CHARS ? `${e.slice(0, MAX_CONSOLE_ERROR_CHARS)}…` : e));
+      if (errors.length > 0) result.console_errors = errors;
+    }
     // Only include session_reused when a session_id was passed (see above) — absent = "not
     // applicable, this is a fresh session you didn't ask to reuse".
     if (sessionReused !== undefined) result.session_reused = sessionReused;
@@ -481,7 +631,7 @@ export class WebBrowserHandler implements ToolHandler {
  * get_content/screenshot are no-ops here. close_session is terminal and handled by the caller.
  */
 async function performAction(step: BrowserActionStep, deps: ActionDeps): Promise<PerformResult> {
-  const { page, session, ctx, sessionId } = deps;
+  const { page, session, ctx, sessionId, activity, timing } = deps;
   const { action, url, selector, text, value, key, secret_ref } = step;
 
   // GUIDANCE (#1053): on bot-protected sites, prefer real UI interaction (click/type/
@@ -521,6 +671,13 @@ async function performAction(step: BrowserActionStep, deps: ActionDeps): Promise
         return { ok: false, error: TRACKED_CODE_REFUSAL };
       }
       const response = await page.goto(parsedUrl.toString(), { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      // A page that has moved on from where goto landed, or sits on a sign-in handoff, is
+      // mid-redirect: its blank hop is not a soft block, and reloading it would restart or
+      // break the chain (#2244). Only the challenge-title check applies to it.
+      const landedUrl = page.url();
+      // goto committed a main-frame navigation; record it even when no event reported it.
+      activity.recordUrl(landedUrl, true);
+      const redirecting = (): boolean => page.url() !== landedUrl || isHandoffUrl(page.url());
 
       // Cloudflare / Akamai often serve a short-lived challenge page that clears once
       // behavioral JS runs. Poll until the challenge title/body disappears — otherwise
@@ -549,7 +706,7 @@ async function performAction(step: BrowserActionStep, deps: ActionDeps): Promise
       // report the post-reload HTTP status (the status from the initial `goto` may no
       // longer be representative after the recovery attempt). (#1053)
       let reloadResponse: Awaited<ReturnType<typeof page.reload>> | undefined;
-      if (isHardBlock(pageTitle) || (await isLikelyEmpty(page, ctx.log))) {
+      if (isHardBlock(pageTitle) || (!redirecting() && (await isLikelyEmpty(page, ctx.log)))) {
         ctx.log.info({ sessionId, url: logSafeText(ctx,parsedUrl.toString()), pageTitle }, 'Soft block suspected — dwelling and reloading once');
         await jitteredDelay(1500, 3000);
         reloadResponse = await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch((err) => {
@@ -568,7 +725,7 @@ async function performAction(step: BrowserActionStep, deps: ActionDeps): Promise
       // AND still near-empty after, it's a persistent soft block — not a transient stub.
       // Use the reload response status when available — it reflects the post-recovery state.
       const status = reloadResponse?.status() ?? response?.status();
-      if (isHardBlock(pageTitle) || (await isLikelyEmpty(page, ctx.log))) {
+      if (isHardBlock(pageTitle) || (!redirecting() && (await isLikelyEmpty(page, ctx.log)))) {
         ctx.log.warn({ sessionId, url: logSafeText(ctx,parsedUrl.toString()), status, pageTitle }, 'Navigation hit a hard edge block');
         return {
           ok: false,
@@ -580,7 +737,7 @@ async function performAction(step: BrowserActionStep, deps: ActionDeps): Promise
       // challenge JS can score human-like telemetry before the first interaction. (#1053)
       await jitteredDelay(2000, 4000);
       await simulateHumanPresence(page, { log: ctx.log });
-      return { ok: true };
+      return { ok: true, navigated: true };
     }
 
     case 'click': {
@@ -588,13 +745,14 @@ async function performAction(step: BrowserActionStep, deps: ActionDeps): Promise
         return { ok: false, error: 'click requires selector (string — describe the element in natural language)' };
       }
       const clickTarget = await resolveLocator(page, selector, ctx.log);
+      const clickMark = activity.mark();
       // Use humanClick for realistic mouse-movement telemetry; behavioral challenge JS
       // scores natural pointer paths as more human-like than direct .click(). (#1053)
       await humanClick(page, clickTarget, { log: ctx.log });
       // Adaptive settle: a click may trigger navigation or an in-page update. Wait
       // briefly for the DOM to settle, but don't fail the action if nothing navigates.
       await settleAfterInteraction(page, ctx, sessionId);
-      return { ok: true };
+      return { ok: true, navigated: await actionStartedNavigation(activity, clickMark, timing, deps.settleDeadline) };
     }
 
     case 'scroll': {
@@ -634,10 +792,12 @@ async function performAction(step: BrowserActionStep, deps: ActionDeps): Promise
         return { ok: false, error: TRACKED_CODE_KEY_REFUSAL };
       }
       // Keyboard nav is often the only reliable way through calendar grids and
-      // custom comboboxes. Presses against the currently focused element.
+      // custom comboboxes. Presses against the currently focused element. Enter often
+      // submits a form, so a key press is watched for a navigation like a click (#2244).
+      const keyMark = activity.mark();
       await page.keyboard.press(key);
       await settleAfterInteraction(page, ctx, sessionId);
-      return { ok: true };
+      return { ok: true, navigated: await actionStartedNavigation(activity, keyMark, timing, deps.settleDeadline) };
     }
 
     case 'wait_for': {
@@ -740,8 +900,10 @@ async function performAction(step: BrowserActionStep, deps: ActionDeps): Promise
       if (!trackedCodeAllowedOn(ctx, value, documentSiteUrl(page, selectScope), sessionId)) {
         return { ok: false, error: TRACKED_CODE_REFUSAL };
       }
+      // A select can navigate too (a country or language picker that reloads on change).
+      const selectMark = activity.mark();
       await selectTarget.selectOption(value);
-      return { ok: true };
+      return { ok: true, navigated: await actionStartedNavigation(activity, selectMark, timing, deps.settleDeadline) };
     }
 
     case 'get_content':
@@ -753,7 +915,8 @@ async function performAction(step: BrowserActionStep, deps: ActionDeps): Promise
       return { ok: true };
 
     default:
-      // Unreachable: execute() validated the verb against VALID_ACTIONS before dispatching.
+      // Unreachable: execute() validated the verb against VALID_ACTIONS before dispatching,
+      // and handles close_session and clear_site_data itself.
       return { ok: false, error: `Unknown action: "${String(action)}"` };
   }
 }
@@ -932,6 +1095,23 @@ async function trackTypedCode(
   if (matching.length === 0) return;
   session.registerInjectedSecret(value);
   ctx.log.info({ sessionId, verificationIds: matching.map((v) => v.id) }, 'Typed sign-in code tracked for its verification(s)');
+}
+
+/**
+ * The one-line note added to the content when a page had not settled by the cap (#2244),
+ * or null when it had. On a sign-in handoff the note says what leaving costs: the agent
+ * that navigated away from one left the profile half-signed-in.
+ */
+function settleNote(settle: SettleResult): string | null {
+  if (settle.settled) return null;
+  const waited = `${Math.round(settle.waitedMs / 1000)}s`;
+  if (settle.handoff) {
+    return `[Note: this is a sign-in handoff and it was still loading after ${waited}. Navigating away aborts ` +
+      'the sign-in and can leave the account half-signed-in. Wait (get_content again), or wait_for the element you need.]';
+  }
+  const state = settle.reasons.includes('blank') ? 'blank' : 'still redirecting';
+  return `[Note: the page was ${state} after waiting ${waited}. It may still finish: get_content again, or ` +
+    'wait_for the element you need, before concluding the site is broken.]';
 }
 
 /**

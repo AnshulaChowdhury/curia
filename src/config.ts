@@ -512,6 +512,12 @@ export interface YamlConfig {
      * ["en-CA", "en-US", "en"]. `locale` is always first. Empty/absent → [locale].
      */
     languages?: string[];
+    /**
+     * Longest the web-browser skill waits for a page to finish redirecting (a single-sign-on
+     * chain) before reading it, in ms (#2244). Default 35000. At most 90000, so a call
+     * stays inside the skill's 120s timeout.
+     */
+    settleCapMs?: number;
   };
   agents?: {
     coordinator?: { config_path?: string };
@@ -1137,12 +1143,16 @@ export function loadYamlConfig(configDir: string): YamlConfig {
   // reach BrowserService and schedule near-continuous sweeps. Reject malformed values here.
   const browser = config.browser;
   if (browser !== undefined) {
-    const { sessionTtlMs, sweepIntervalMs, profileDir, channel, proxy, locale, languages } = browser;
+    const { sessionTtlMs, sweepIntervalMs, profileDir, channel, proxy, locale, languages, settleCapMs } = browser;
     if (sessionTtlMs !== undefined && (!Number.isInteger(sessionTtlMs) || sessionTtlMs <= 0)) {
       throw new Error(`browser.sessionTtlMs must be a positive integer, got: ${sessionTtlMs}`);
     }
     if (sweepIntervalMs !== undefined && (!Number.isInteger(sweepIntervalMs) || sweepIntervalMs <= 0)) {
       throw new Error(`browser.sweepIntervalMs must be a positive integer, got: ${sweepIntervalMs}`);
+    }
+    // Bounded above so one settle can't use up the web-browser skill's 120s timeout.
+    if (settleCapMs !== undefined && (!Number.isInteger(settleCapMs) || settleCapMs <= 0 || settleCapMs > 90_000)) {
+      throw new Error(`browser.settleCapMs must be a positive integer of at most 90000, got: ${settleCapMs}`);
     }
     // Reaches BrowserService's sweep timer directly. sessionTtlMs needs no such ceiling:
     // it is only compared against elapsed time, never used as a timer delay.

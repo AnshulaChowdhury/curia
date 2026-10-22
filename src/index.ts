@@ -1149,6 +1149,7 @@ async function main(): Promise<void> {
       proxy: browserConfig?.proxy,
       locale: browserConfig?.locale,
       languages: browserConfig?.languages,
+      settleCapMs: browserConfig?.settleCapMs,
       // Align the browser timezone with the principal's configured timezone.
       timezone: config.timezone,
     });

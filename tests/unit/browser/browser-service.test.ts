@@ -116,6 +116,22 @@ describe('BrowserService (unit — mocked browser)', () => {
     expect(mockContext.newPage).toHaveBeenCalledOnce();
   });
 
+  // #2244: page errors are kept on the session for diagnosing a page that never paints.
+  it('records the page\'s console errors and uncaught errors on the session', async () => {
+    const { session } = await service.getOrCreateSession(undefined);
+    const handlers = new Map<string, (arg: unknown) => void>(
+      mockPage.on.mock.calls.map((call) => [call[0] as string, call[1] as (arg: unknown) => void]),
+    );
+    const before = Date.now();
+    handlers.get('console')!({ type: () => 'error', text: () => 'Failed to load resource: net::ERR_FAILED' });
+    handlers.get('console')!({ type: () => 'warning', text: () => 'not an error' });
+    handlers.get('pageerror')!(new TypeError('x is undefined'));
+    expect(session.recentConsoleErrors(before)).toEqual([
+      'Failed to load resource: net::ERR_FAILED',
+      'Uncaught TypeError: x is undefined',
+    ]);
+  });
+
   it('reuses an existing session when a valid session_id is provided', async () => {
     const first = await service.getOrCreateSession(undefined);
     const second = await service.getOrCreateSession(first.sessionId);

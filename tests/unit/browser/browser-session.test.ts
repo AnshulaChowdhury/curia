@@ -106,3 +106,24 @@ describe('BrowserSession injected-secret redaction', () => {
     expect(b.redactInjectedSecrets('only-in-a appears here')).toBe('only-in-a appears here');
   });
 });
+
+describe('BrowserSession console errors (#2244)', () => {
+  it('keeps the most recent errors, each length-capped', () => {
+    const session = makeSession();
+    for (let i = 0; i < 25; i++) session.recordConsoleError(`error ${i}`);
+    session.recordConsoleError('x'.repeat(5_000));
+    const recent = session.recentConsoleErrors(0, 100);
+    expect(recent).toHaveLength(20);
+    expect(recent[0]).toBe('error 6');
+    expect(recent.at(-1)!.length).toBeLessThanOrEqual(2_001);
+  });
+
+  it('returns at most `limit`, newest last, and only those since the given time', () => {
+    const session = makeSession();
+    session.recordConsoleError('old');
+    const later = Date.now() + 60_000;
+    expect(session.recentConsoleErrors(later)).toEqual([]);
+    session.recordConsoleError('  spaced\n  out  ');
+    expect(session.recentConsoleErrors(0, 1)).toEqual(['spaced out']);
+  });
+});

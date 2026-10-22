@@ -57,6 +57,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **AWS Bedrock provider** — tiers can run Claude on Bedrock; opt-in, off by default. (#1766)
 - **KG node merge** — merge duplicate or mistyped knowledge-graph nodes from the console, with previewed conflicts. (#2233)
 - **`kg.nodes_merged` bus event** — new audit event for each knowledge-graph node merge; public bus surface. (#2233)
+- **`web-browser` `clear_site_data`** — clears one site's cookies and storage, recovering half-finished sign-ins; others stay signed in. (#2244)
+- **`browser.settleCapMs`** — **config:** caps the web-browser redirect wait; default 35s, at most 90s. (#2244)
 
 ### Changed
 
@@ -153,6 +155,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Fork PR CI** — `ci` and Semgrep reach their steps on fork PRs, pulling anonymously without Docker Hub secrets. (#2153)
 - **Approval attribution** — resolve tools record `coordinator`; only reaction decisions count as principal feedback. (#2159)
 - **Contact merge** — keeps calendars, grant recommendations and task or message references instead of dropping them. (#2233)
+- **`web-browser` redirect settle** — waits out JavaScript sign-in redirect chains before reading; reports `settled` and `redirect_chain`. (#2244)
 
 ### Security
 
