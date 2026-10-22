@@ -162,7 +162,8 @@ describeIf('OKF export → import round trip (integration, #1824)', () => {
     const apply = await upload(`mode=apply&format=zip&planToken=${plan.token}`);
     expect(apply.statusCode).toBe(200);
     applied = (JSON.parse(apply.payload) as { result: typeof applied }).result;
-  });
+    // Seeds, exports and imports a 211 kB-class store; generous for a loaded runner.
+  }, 30_000);
 
   afterAll(async () => {
     await sourceApp?.close();
