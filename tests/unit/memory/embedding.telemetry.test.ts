@@ -1,4 +1,4 @@
-// embedding.test.ts — unit tests for OpenAIBackend telemetry.
+// embedding.test.ts — unit tests for HttpEmbeddingBackend telemetry.
 //
 // Mocks globalThis.fetch so tests run without a real API key.
 // Uses vi.stubGlobal / vi.unstubAllGlobals to keep the mock isolated per test.

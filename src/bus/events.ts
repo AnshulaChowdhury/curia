@@ -1394,7 +1394,7 @@ export interface EmbeddingCallEvent extends BaseEvent {
   payload: EmbeddingCallPayload;
 }
 
-// EmbeddingErrorEvent — published by the OpenAI embedding backend on failure.
+// EmbeddingErrorEvent — published by the embedding backend on failure.
 // Used by HealthService to track embedding service health.
 // No parentEventId — embedding calls fire from KG/validator paths that
 // don't always have an agent.task event ID in scope.

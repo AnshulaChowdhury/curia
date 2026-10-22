@@ -114,7 +114,7 @@ export class EmbeddingService {
     bus?: EventBus,
     modelRegistry?: ModelRegistry,
   ): EmbeddingService {
-    return new EmbeddingService(new OpenAIBackend(endpoint, profile.dimensions, logger, bus, modelRegistry), profile);
+    return new EmbeddingService(new HttpEmbeddingBackend(endpoint, profile.dimensions, logger, bus, modelRegistry), profile);
   }
 
   // Test factory — produces deterministic vectors without any network calls.
@@ -157,7 +157,7 @@ export class EmbeddingService {
 
 // -- Production backend: calls an OpenAI-compatible /embeddings endpoint --
 
-class OpenAIBackend implements EmbeddingBackend {
+class HttpEmbeddingBackend implements EmbeddingBackend {
   constructor(
     private endpoint: EmbeddingEndpoint,
     private dimensions: number,
@@ -195,8 +195,8 @@ class OpenAIBackend implements EmbeddingBackend {
           this.logger.warn({ publishErr }, 'Failed to publish embedding.error event');
         });
       }
-      this.logger.error({ err, textLength: text.length }, 'OpenAI embedding fetch failed');
-      throw new Error(`OpenAI embedding fetch error: ${(err as Error).message}`);
+      this.logger.error({ err, textLength: text.length }, 'Embedding endpoint fetch failed');
+      throw new Error(`Embedding endpoint fetch error: ${(err as Error).message}`);
     }
 
     if (!response.ok) {
@@ -210,8 +210,8 @@ class OpenAIBackend implements EmbeddingBackend {
           this.logger.warn({ publishErr }, 'Failed to publish embedding.error event');
         });
       }
-      this.logger.error({ status: response.status, body }, 'OpenAI embedding request failed');
-      throw new Error(`OpenAI embedding API error: ${response.status}`);
+      this.logger.error({ status: response.status, body }, 'Embedding endpoint request failed');
+      throw new Error(`Embedding endpoint API error: ${response.status}`);
     }
 
     // Wrap JSON parse so a malformed response surfaces as a distinct error
@@ -230,8 +230,8 @@ class OpenAIBackend implements EmbeddingBackend {
           this.logger.warn({ publishErr }, 'Failed to publish embedding.error event');
         });
       }
-      this.logger.error({ err }, 'OpenAI embedding response JSON parse failed');
-      throw new Error(`OpenAI embedding response parse error: ${(err as Error).message}`);
+      this.logger.error({ err }, 'Embedding endpoint response JSON parse failed');
+      throw new Error(`Embedding endpoint response parse error: ${(err as Error).message}`);
     }
 
     let embedding = json.data[0]?.embedding;
@@ -244,7 +244,7 @@ class OpenAIBackend implements EmbeddingBackend {
     if (!embedding || embedding.length !== this.dimensions) {
       this.logger.error(
         { expected: this.dimensions, actual: embedding?.length },
-        'OpenAI embedding dimension mismatch',
+        'Embedding endpoint dimension mismatch',
       );
       // Publish embedding.error so HealthService counts malformed responses as failures.
       if (this.bus) {
@@ -294,7 +294,7 @@ class OpenAIBackend implements EmbeddingBackend {
     } catch (err) {
       // Telemetry failures must never propagate — log at warn so they're visible
       // in dashboards without impacting the caller.
-      this.logger.warn({ err }, 'OpenAIBackend: failed to publish embedding.call telemetry event — cost tracking gap');
+      this.logger.warn({ err }, 'HttpEmbeddingBackend: failed to publish embedding.call telemetry event — cost tracking gap');
     }
   }
 }
