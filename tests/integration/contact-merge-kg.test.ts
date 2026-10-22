@@ -222,4 +222,53 @@ describeIf('mergeContacts KG memory (#1711)', () => {
     expect(await contactService.getContact(secondaryId)).toBeUndefined();
     expect(await contactService.getContact(primaryId)).toBeDefined();
   });
+
+  // #2233 §6.4: the FK cascades used to delete the secondary's calendars and grant
+  // recommendations, SET NULL blanked task waits, and the canonical attributes vanished.
+  it('carries the secondary’s calendars, task waits, originator lineage and attributes across', async () => {
+    const runId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const contactService = ContactService.createWithPostgres(pool, entityMemory, createSilentLogger());
+
+    const primaryId = await makeNodelessContact(`Assoc Primary ${runId}`);
+    const secondaryId = await makeNodelessContact(`Assoc Secondary ${runId}`);
+    await pool.query(`UPDATE contacts SET title = 'CEO' WHERE id = $1`, [primaryId]);
+    await pool.query(
+      `UPDATE contacts SET title = 'CTO', timezone = 'Europe/Paris', inbound_message_count = 4 WHERE id = $1`,
+      [secondaryId],
+    );
+    await pool.query(
+      `INSERT INTO contact_calendars (nylas_calendar_id, contact_id, label, is_primary) VALUES ($1, $2, 'Work', true)`,
+      [`cal-${runId}`, secondaryId],
+    );
+    await pool.query(
+      `INSERT INTO grant_recommendations (contact_id, permission, reasoning) VALUES ($1, 'send_email', 'itest')`,
+      [secondaryId],
+    );
+    const { rows: taskRows } = await pool.query<{ id: string }>(
+      `INSERT INTO tasks (agent_id, intent_anchor, error_budget, waiting_on_contact_id, originator)
+       VALUES ('coordinator', 'itest 2233', '{}'::jsonb, $1, $2::jsonb) RETURNING id`,
+      [secondaryId, JSON.stringify({ contactId: secondaryId, systemRole: null, channel: 'email', initiatedAt: new Date().toISOString() })],
+    );
+    const taskId = taskRows[0]!.id;
+
+    try {
+      await contactService.mergeContacts(primaryId, secondaryId, false);
+
+      const cal = await pool.query(`SELECT contact_id FROM contact_calendars WHERE nylas_calendar_id = $1`, [`cal-${runId}`]);
+      expect(cal.rows[0]?.contact_id).toBe(primaryId);
+      const grants = await pool.query(`SELECT 1 FROM grant_recommendations WHERE contact_id = $1`, [primaryId]);
+      expect(grants.rows).toHaveLength(1);
+      const task = await pool.query<{ waiting_on_contact_id: string | null; originator: { contactId: string } }>(
+        `SELECT waiting_on_contact_id, originator FROM tasks WHERE id = $1`,
+        [taskId],
+      );
+      expect(task.rows[0]).toMatchObject({ waiting_on_contact_id: primaryId, originator: { contactId: primaryId } });
+
+      // Attributes the primary lacked are taken; ones it had are kept; counts are summed.
+      const survivor = await contactService.getContact(primaryId);
+      expect(survivor).toMatchObject({ title: 'CEO', timezone: 'Europe/Paris', inboundMessageCount: 4 });
+    } finally {
+      await pool.query(`DELETE FROM tasks WHERE id = $1`, [taskId]);
+    }
+  });
 });

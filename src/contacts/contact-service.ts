@@ -70,9 +70,108 @@ export class ContactValidationError extends Error {
  * non-null system_role. Such rows must never be deleted by a merge and a structural
  * primary's tier must never be downgraded by survivorship. Exported for unit testing.
  */
-export function isStructuralContact(c: Contact): boolean {
+export function isStructuralContact(c: Pick<Contact, 'systemRole' | 'kind' | 'tier'>): boolean {
   return c.systemRole !== null || c.kind === 'principal' || c.kind === 'agent' || c.tier === 'principal';
 }
+
+/**
+ * Tier survivorship of a merge — the one implementation, shared by mergeContacts
+ * (computeGoldenRecord) and the KG node merge's multi-contact fold (src/kg-merge).
+ *
+ * A structural primary (principal/agent/system-role) always keeps its own tier — a merge
+ * must never downgrade it, not even via blocked-wins: merging a 'blocked' duplicate into
+ * the principal must not lock the principal out. For ordinary contacts, a 'blocked' tier
+ * on any side wins (most restrictive, so a merge can never un-block a contact); otherwise
+ * the more-capable (higher TIER_RANK) tier survives, the primary's on a tie, preserving any
+ * explicit principal grant (trusted/principal).
+ */
+export function survivingTier(
+  primary: Pick<Contact, 'systemRole' | 'kind' | 'tier'>,
+  others: ReadonlyArray<Pick<Contact, 'tier'>>,
+): ContactTier {
+  if (isStructuralContact(primary)) return primary.tier;
+  if (primary.tier === 'blocked' || others.some(c => c.tier === 'blocked')) return 'blocked';
+  return others.reduce<ContactTier>((best, c) => (TIER_RANK[c.tier] > TIER_RANK[best] ? c.tier : best), primary.tier);
+}
+
+/**
+ * The surviving contact row a merge writes: every mutable column except system_role,
+ * which a merge never changes (see the structural-contact guard in mergeContacts).
+ * Computed by the caller — mergeContacts from its golden record, the KG node merge
+ * (src/kg-merge) from the user's resolutions — and written by mergeContactRowsInTx.
+ */
+export interface MergedContactRow {
+  kgNodeId: string | null;
+  displayName: string;
+  role: string | null;
+  notes: string | null;
+  tier: ContactTier;
+  kind: ContactKind;
+  preferredName: string | null;
+  title: string | null;
+  organization: string | null;
+  primaryEmail: string | null;
+  primaryPhone: string | null;
+  timezone: string | null;
+  locale: string | null;
+  location: string | null;
+  pronouns: string | null;
+  linkedinUrl: string | null;
+  bio: string | null;
+  birthday: string | null;
+  contactConfidence: number;
+  lastSeenAt: Date | null;
+  inboundMessageCount: number;
+  outboundMessageCount: number;
+}
+
+/**
+ * Rows re-pointed (or dropped) by reattachContactReferences, per table. Before #2233 a
+ * merge lost these: the FK cascades deleted calendars, grant recommendations and
+ * conversation resolutions; SET NULL blanked task/voice/working-memory references; and
+ * originator JSON kept naming the deleted contact.
+ */
+export const CONTACT_REFERENCE_KEYS = [
+  'contact_calendars',
+  'contact_calendars_demoted',
+  'grant_recommendations',
+  'grant_recommendations_dropped',
+  'conversation_resolved_entities',
+  'conversation_resolved_entities_dropped',
+  'tasks_waiting_on',
+  'voice_sessions',
+  'working_memory',
+  'originator_tasks',
+  'originator_scheduled_jobs',
+  'originator_bullpen_threads',
+  'originator_secret_capture_tokens',
+  'originator_pending_delegations',
+] as const;
+export type ContactReferenceKey = (typeof CONTACT_REFERENCE_KEYS)[number];
+export type ContactReferenceCounts = Record<ContactReferenceKey, number>;
+
+export function emptyContactReferenceCounts(): ContactReferenceCounts {
+  return Object.fromEntries(CONTACT_REFERENCE_KEYS.map(k => [k, 0])) as ContactReferenceCounts;
+}
+
+/** Rows that now point at the survivor (excludes the dropped / demoted tallies). */
+export function countRepointedReferences(counts: ContactReferenceCounts): number {
+  return CONTACT_REFERENCE_KEYS
+    .filter(k => !k.endsWith('_dropped') && !k.endsWith('_demoted'))
+    .reduce((sum, k) => sum + counts[k], 0);
+}
+
+/** What one contact fold changed, for logging and the node-merge result. */
+export interface ContactRowMergeOutcome {
+  exclusions: ReattachExclusionsResult;
+  references: ContactReferenceCounts;
+}
+
+/** Canonical attribute keys copied by a contact merge (migration 048). */
+const CANONICAL_ATTRIBUTE_KEYS = [
+  'preferredName', 'title', 'organization', 'primaryEmail', 'primaryPhone', 'timezone',
+  'locale', 'location', 'pronouns', 'linkedinUrl', 'bio', 'birthday',
+] as const;
 
 // ---------------------------------------------------------------------------
 // Email sender classification (issue #946)
@@ -182,7 +281,7 @@ interface ContactServiceBackend {
 
   getAuthOverrides(contactId: string): Promise<Array<{ permission: string; granted: boolean }>>;
   createAuthOverride(override: AuthOverride, client?: DbPoolClient): Promise<void>;
-  revokeAuthOverride(contactId: string, permission: string): Promise<boolean>;
+  revokeAuthOverride(contactId: string, permission: string, client?: DbPoolClient): Promise<boolean>;
 
   // -- Grant recommendations (issue #952) --
   /** Insert a recommendation. Returns true if a row was written, false if the unique pair already existed. */
@@ -245,6 +344,25 @@ interface ContactServiceBackend {
    * explained in a comment.
    */
   reattachDedupExclusions(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<ReattachExclusionsResult>;
+
+  /**
+   * Re-point every other row that references fromContactId onto toContactId (#2233,
+   * spec §6.2): calendars, grant recommendations, conversation resolutions, the SET NULL
+   * reference columns and originator JSON. Rows that would collide with the survivor's
+   * own are dropped (grant recommendations, conversation resolutions) or demoted (a
+   * second primary calendar). Pass `client` to enlist in the merge transaction.
+   */
+  reattachContactReferences(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<ContactReferenceCounts>;
+
+  /** Write a merge's surviving row, including the scoring counters updateContact leaves alone. */
+  writeMergedContact(id: string, row: MergedContactRow, client?: DbPoolClient): Promise<void>;
+
+  /**
+   * Lock the given contact rows for a merge (SELECT … FOR UPDATE, ordered by id so two
+   * merges touching the same rows queue instead of deadlocking) and return them as read
+   * under the lock. Missing ids are simply absent. Pass the merge transaction's `client`.
+   */
+  lockContactsForMerge(ids: string[], client?: DbPoolClient): Promise<Contact[]>;
 
   /**
    * Delete a contact by ID. Call only after FK-referenced rows have been re-pointed.
@@ -1748,6 +1866,10 @@ export class ContactService {
    * - tier: blocked-on-either-side wins (most restrictive); otherwise the higher TIER_RANK
    * - channel identities: union (duplicates discarded)
    * - auth overrides: union (primary wins on same-permission conflict)
+   * - canonical attributes: primary's, else the secondary's (#2233)
+   * - scoring counters: confidence / last-seen max, message counts summed (#2233)
+   * - every other reference (calendars, grant recommendations, task waits, originator
+   *   lineage, …): re-pointed by reattachContactReferences (#2233)
    * - KG nodes: merged via entityMemory.mergeEntities() after the secondary
    *   contact row is deleted, so the node delete is not blocked by the
    *   contacts.kg_node_id foreign key (#1711)
@@ -1826,36 +1948,43 @@ export class ContactService {
     // points at that node (#1711). Waiting until the contact row is gone unblocks
     // the node delete, and a rolled-back contact merge cannot have already
     // collapsed the two KG nodes.
-    let exclusions: ReattachExclusionsResult;
-    try {
-      exclusions = await this.backend.withTransaction(async (client) => {
-        await this.backend.reattachIdentities(secondaryId, primaryId, client);
-        await this.backend.reattachAuthOverrides(secondaryId, primaryId, client);
-        // Exclusions the secondary held move to the survivor, renormalized into stored
-        // pair order. The exclusion between the merging pair itself (if any) is dropped:
-        // merging is the decision that they ARE the same person (#1625, ADR-039).
-        const reattached = await this.backend.reattachDedupExclusions(secondaryId, primaryId, client);
+    // Write the golden record fields onto the primary contact. The surviving tier
+    // is computed by computeGoldenRecord (blocked-on-either-side wins; else higher
+    // TIER_RANK) — the single source of survivorship truth. Rationale: tier
+    // represents a principal grant (e.g. the principal explicitly trusted a secondary contact).
+    // Merging should never silently downgrade that grant — losing a 'trusted' tier
+    // because the primary happened to be 'known' is incorrect, especially since
+    // #944's dedup calls mergeContacts. A 'blocked' tier on either side always wins
+    // so a merge can never un-block a contact.
+    //
+    // Canonical attributes the primary lacks are taken from the secondary (#2233): before,
+    // a secondary's title/organization/timezone/… vanished with its row. A value set on
+    // both sides keeps the primary's — this API has no conflict prompt.
+    //
+    // The row is computed from the rows mergeContactRowsInTx locks inside the transaction,
+    // not from the reads above: a message scored (atomic counter increment) or a tier
+    // changed between those reads and the write would otherwise be overwritten by values
+    // computed from stale data.
+    const mergedRowFrom = (locked: { primary: Contact; secondary: Contact }): MergedContactRow => {
+      const golden = this.computeGoldenRecord(locked.primary, [], [], locked.secondary, [], []);
+      return {
+        ...mergedCounters(locked.primary, locked.secondary),
+        kgNodeId: locked.primary.kgNodeId,
+        displayName: golden.displayName,
+        role: golden.role,
+        notes: golden.notes,
+        tier: golden.tier,
+        kind: locked.primary.kind,
+        ...fillCanonicalAttributes(locked.primary, locked.secondary),
+      };
+    };
 
-        // Write the golden record fields onto the primary contact. The surviving tier
-        // is computed by computeGoldenRecord (blocked-on-either-side wins; else higher
-        // TIER_RANK) — the single source of survivorship truth. Rationale: tier
-        // represents a principal grant (e.g. the principal explicitly trusted a secondary contact).
-        // Merging should never silently downgrade that grant — losing a 'trusted' tier
-        // because the primary happened to be 'known' is incorrect, especially since
-        // #944's dedup calls mergeContacts. A 'blocked' tier on either side always wins
-        // so a merge can never un-block a contact.
-        const updatedPrimary: Contact = {
-          ...primary,
-          displayName: goldenRecord.displayName,
-          role: goldenRecord.role,
-          notes: goldenRecord.notes,
-          tier: goldenRecord.tier,
-          updatedAt: new Date(),
-        };
-        await this.backend.updateContact(updatedPrimary, client);
-        await this.backend.deleteContact(secondaryId, client);
-        return reattached;
-      });
+    let exclusions: ReattachExclusionsResult;
+    let references: ContactReferenceCounts;
+    try {
+      ({ exclusions, references } = await this.backend.withTransaction(
+        (client) => this.mergeContactRowsInTx(client, primaryId, secondaryId, mergedRowFrom),
+      ));
     } catch (err) {
       // One transaction, so the failure rolled the whole sequence back: both contacts,
       // their identities, auth overrides and exclusion rows are exactly as they were and
@@ -1897,33 +2026,14 @@ export class ContactService {
       await this.archiveAnchoredNode(secondaryId, secondary.kgNodeId);
     }
 
-    if (exclusions.dropped > 0) {
-      // A dropped row is a principal ruling leaving the ledger. Both causes are expected and
-      // benign, but an operator asking "why was this pair re-proposed months later"
-      // needs the event in the log, not only in a code comment. Logged after commit so
-      // a rolled-back merge never claims rulings were dropped.
-      this.logger?.info(
-        { primaryId, secondaryId, ...exclusions },
-        'contacts: dedup exclusions dropped during merge (superseded by the merge, or already held by the survivor)',
-      );
-    }
+    this.logMergeOutcome(primaryId, secondaryId, { exclusions, references });
 
     const mergedAt = new Date();
-
-    if (this.onContactMerged) {
-      try {
-        this.onContactMerged(primaryId, secondaryId, mergedAt);
-      } catch (callbackErr) {
-        // The merge is already fully committed at this point — swallow the callback error
-        // so the caller sees a successful merge result rather than a spurious failure.
-        this.logger?.warn({ err: callbackErr }, 'onContactMerged callback threw (non-fatal, merge already committed)');
-      }
-    }
 
     // Primary absorbs the secondary's identities — refresh principal cache if either side
     // was (or is) the principal contact. Secondary is already deleted; notifying primary
     // is enough when the principal was the survivor.
-    this.notifyIdentitiesChanged(primaryId);
+    this.announceContactsMerged(primaryId, [secondaryId], mergedAt);
 
     this.logger?.info({ primaryId, secondaryId }, 'Contacts merged');
 
@@ -1934,6 +2044,123 @@ export class ContactService {
       dryRun: false,
       mergedAt,
     };
+  }
+
+  /**
+   * Fold `secondaryId` into `primaryId` inside the caller's transaction (spec §6.5).
+   *
+   * The one place that knows how to fold a contact: mergeContacts (Contacts page, dedup)
+   * and the KG node merge (src/kg-merge) both call it. Order matters only at the end —
+   * every reference is re-pointed before the secondary row is deleted, so no FK cascade
+   * or SET NULL fires on data the merge meant to keep.
+   *
+   * `overridesPreferSecondary` lists permissions where the secondary's active override
+   * must win: the primary's is revoked first, so reattachAuthOverrides (primary wins on
+   * a same-permission pair) carries the secondary's across.
+   *
+   * Both contact rows are locked first (SELECT … FOR UPDATE, ordered by id) and re-read.
+   * `row` may be a function of those locked rows — mergeContacts computes its counters and
+   * tier that way, so a concurrent atomic increment is never overwritten by a stale read.
+   * The KG node merge passes a precomputed row: its snapshot already locked every contact
+   * and its plan token proves the values unchanged under that lock.
+   *
+   * Refuses a structural secondary (StructuralContactMergeError) regardless of what the
+   * caller checked: the fold deletes the secondary row, and a structural row (principal,
+   * agent, system role) must never be deleted by a merge.
+   *
+   * Writes nothing outside the transaction and fires no callbacks — the caller does that
+   * after COMMIT (announceContactsMerged). For the in-memory backend `client` is
+   * undefined and every write applies directly.
+   */
+  async mergeContactRowsInTx(
+    client: DbPoolClient | undefined,
+    primaryId: string,
+    secondaryId: string,
+    row: MergedContactRow | ((locked: { primary: Contact; secondary: Contact }) => MergedContactRow),
+    options?: { overridesPreferSecondary?: string[] },
+  ): Promise<ContactRowMergeOutcome> {
+    if (primaryId === secondaryId) {
+      throw new Error('mergeContactRowsInTx: primary and secondary must be different contacts');
+    }
+    const locked = await this.backend.lockContactsForMerge([primaryId, secondaryId], client);
+    const primary = locked.find(c => c.id === primaryId);
+    if (!primary) throw new ContactNotFoundError(primaryId);
+    const secondary = locked.find(c => c.id === secondaryId);
+    if (!secondary) throw new ContactNotFoundError(secondaryId);
+    if (isStructuralContact(secondary)) throw new StructuralContactMergeError(secondaryId);
+    const mergedRow = typeof row === 'function' ? row({ primary, secondary }) : row;
+
+    for (const permission of options?.overridesPreferSecondary ?? []) {
+      await this.backend.revokeAuthOverride(primaryId, permission, client);
+    }
+    await this.backend.reattachIdentities(secondaryId, primaryId, client);
+    await this.backend.reattachAuthOverrides(secondaryId, primaryId, client);
+    // Exclusions the secondary held move to the survivor, renormalized into stored
+    // pair order. The exclusion between the merging pair itself (if any) is dropped:
+    // merging is the decision that they ARE the same person (#1625, ADR-039).
+    const exclusions = await this.backend.reattachDedupExclusions(secondaryId, primaryId, client);
+    const references = await this.backend.reattachContactReferences(secondaryId, primaryId, client);
+    await this.backend.writeMergedContact(
+      primaryId,
+      { ...mergedRow, displayName: sanitizeDisplayName(mergedRow.displayName) },
+      client,
+    );
+    await this.backend.deleteContact(secondaryId, client);
+    return { exclusions, references };
+  }
+
+  /**
+   * Post-commit notifications for contacts folded by mergeContactRowsInTx: one
+   * `onContactMerged` per merged-away contact (→ contact.merged on the bus), then an
+   * identity refresh for the survivor. Never throws — the merge is already committed.
+   *
+   * `identitiesChanged: false` skips the refresh (nothing was folded, e.g. a re-point).
+   */
+  announceContactsMerged(
+    survivingContactId: string,
+    mergedContactIds: string[],
+    mergedAt: Date,
+    options?: { identitiesChanged?: boolean },
+  ): void {
+    if (this.onContactMerged) {
+      for (const secondaryId of mergedContactIds) {
+        try {
+          this.onContactMerged(survivingContactId, secondaryId, mergedAt);
+        } catch (callbackErr) {
+          // The merge is already fully committed at this point — swallow the callback error
+          // so the caller sees a successful merge result rather than a spurious failure.
+          this.logger?.warn(
+            { err: callbackErr, survivingContactId, secondaryId },
+            'onContactMerged callback threw (non-fatal, merge already committed)',
+          );
+        }
+      }
+    }
+    if (options?.identitiesChanged !== false) {
+      this.notifyIdentitiesChanged(survivingContactId);
+    }
+  }
+
+  /** Log what a committed fold moved or discarded. Call after COMMIT only. */
+  logMergeOutcome(primaryId: string, secondaryId: string, outcome: ContactRowMergeOutcome): void {
+    const { exclusions, references } = outcome;
+    if (exclusions.dropped > 0) {
+      // A dropped row is a principal ruling leaving the ledger. Both causes are expected and
+      // benign, but an operator asking "why was this pair re-proposed months later"
+      // needs the event in the log, not only in a code comment. Logged after commit so
+      // a rolled-back merge never claims rulings were dropped.
+      this.logger?.info(
+        { primaryId, secondaryId, ...exclusions },
+        'contacts: dedup exclusions dropped during merge (superseded by the merge, or already held by the survivor)',
+      );
+    }
+    const repointed = countRepointedReferences(references);
+    if (repointed > 0 || references.grant_recommendations_dropped > 0 || references.conversation_resolved_entities_dropped > 0) {
+      this.logger?.info(
+        { primaryId, secondaryId, repointed, references },
+        'contacts: merge re-pointed contact references onto the survivor',
+      );
+    }
   }
 
   // -- Dedup exclusions (#1625, ADR-039) --
@@ -2147,19 +2374,9 @@ export class ContactService {
     const noteParts = [primary.notes, secondary.notes].filter(Boolean);
     const notes = noteParts.length > 0 ? noteParts.join('\n---\n') : null;
 
-    // Tier survivorship. A structural primary (principal/agent/system-role) always keeps
-    // its own tier — a merge must never downgrade it, not even via blocked-wins: merging
-    // a 'blocked' duplicate into the principal must not lock the principal out. For
-    // ordinary contacts, a 'blocked' tier on either side wins (most restrictive, so a
-    // merge can never un-block a contact); otherwise the more-capable (higher TIER_RANK)
-    // tier survives, preserving any explicit principal grant (trusted/principal).
-    const tier: ContactTier = isStructuralContact(primary)
-      ? primary.tier
-      : primary.tier === 'blocked' || secondary.tier === 'blocked'
-        ? 'blocked'
-        : TIER_RANK[primary.tier] >= TIER_RANK[secondary.tier]
-          ? primary.tier
-          : secondary.tier;
+    // Tier survivorship: the shared rule (survivingTier) — structural primary keeps its
+    // tier; otherwise blocked-on-either-side wins, else the higher TIER_RANK.
+    const tier: ContactTier = survivingTier(primary, [secondary]);
 
     // Union of identities — deduplicated by channel:channelIdentifier key
     const identityKeys = new Set<string>();
@@ -2183,6 +2400,37 @@ export class ContactService {
 
     return { displayName, role, notes, tier, identities, authOverrides };
   }
+}
+
+/**
+ * Scoring counters of a folded contact: confidence and last-seen take the max, message
+ * counts are summed (spec §5.1). Before #2233 a merge kept only the primary's.
+ */
+export function mergedCounters(
+  primary: Pick<Contact, 'contactConfidence' | 'lastSeenAt' | 'inboundMessageCount' | 'outboundMessageCount'>,
+  secondary: Pick<Contact, 'contactConfidence' | 'lastSeenAt' | 'inboundMessageCount' | 'outboundMessageCount'>,
+): Pick<MergedContactRow, 'contactConfidence' | 'lastSeenAt' | 'inboundMessageCount' | 'outboundMessageCount'> {
+  const lastSeenAt = primary.lastSeenAt && secondary.lastSeenAt
+    ? (primary.lastSeenAt.getTime() >= secondary.lastSeenAt.getTime() ? primary.lastSeenAt : secondary.lastSeenAt)
+    : (primary.lastSeenAt ?? secondary.lastSeenAt);
+  return {
+    contactConfidence: Math.max(primary.contactConfidence, secondary.contactConfidence),
+    lastSeenAt,
+    inboundMessageCount: primary.inboundMessageCount + secondary.inboundMessageCount,
+    outboundMessageCount: primary.outboundMessageCount + secondary.outboundMessageCount,
+  };
+}
+
+/** Canonical attributes: the primary's value, or the secondary's where the primary has none (§6.4). */
+export function fillCanonicalAttributes(
+  primary: Contact,
+  secondary: Contact,
+): Pick<MergedContactRow, (typeof CANONICAL_ATTRIBUTE_KEYS)[number]> {
+  const filled = {} as Pick<MergedContactRow, (typeof CANONICAL_ATTRIBUTE_KEYS)[number]>;
+  for (const key of CANONICAL_ATTRIBUTE_KEYS) {
+    filled[key] = primary[key] ?? secondary[key];
+  }
+  return filled;
 }
 
 // -- Postgres-specific row shape (all 28 columns as of migration 055) --
@@ -2693,9 +2941,9 @@ class PostgresContactBackend implements ContactServiceBackend {
     );
   }
 
-  async revokeAuthOverride(contactId: string, permission: string): Promise<boolean> {
+  async revokeAuthOverride(contactId: string, permission: string, client?: DbPoolClient): Promise<boolean> {
     this.logger.debug({ contactId, permission }, 'Revoking auth override');
-    const result = await this.pool.query(
+    const result = await (client ?? this.pool).query(
       `UPDATE contact_auth_overrides SET revoked_at = now()
        WHERE contact_id = $1 AND permission = $2 AND revoked_at IS NULL`,
       [contactId, permission],
@@ -2902,14 +3150,19 @@ class PostgresContactBackend implements ContactServiceBackend {
 
   async reattachIdentities(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<void> {
     const q = client ?? this.pool;
-    // Delete identities that would conflict with the primary's existing ones
+    // Delete identities that would conflict with the primary's existing ones: an exact
+    // (channel, identifier) match, or — for email — a case-insensitive one, which
+    // idx_cci_email_lower_unique would otherwise reject on the re-point below.
     await q.query(
-      `DELETE FROM contact_channel_identities
-       WHERE contact_id = $1
-         AND (channel, channel_identifier) IN (
-           SELECT channel, channel_identifier
-           FROM contact_channel_identities
-           WHERE contact_id = $2
+      `DELETE FROM contact_channel_identities s
+       WHERE s.contact_id = $1
+         AND EXISTS (
+           SELECT 1
+           FROM contact_channel_identities p
+           WHERE p.contact_id = $2
+             AND p.channel = s.channel
+             AND (p.channel_identifier = s.channel_identifier
+                  OR (s.channel = 'email' AND lower(p.channel_identifier) = lower(s.channel_identifier)))
          )`,
       [fromContactId, toContactId],
     );
@@ -3017,6 +3270,132 @@ class PostgresContactBackend implements ContactServiceBackend {
       moved: moved.rows.length,
       dropped: removed.rows.length - moved.rows.length,
     };
+  }
+
+  async reattachContactReferences(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<ContactReferenceCounts> {
+    const q = client ?? this.pool;
+    const counts = emptyContactReferenceCounts();
+    const params = [fromContactId, toContactId];
+    const run = async (sql: string): Promise<number> => (await q.query(sql, params)).rowCount ?? 0;
+
+    // contact_calendars — idx_contact_calendars_primary allows one primary per contact.
+    // When the survivor already has one, the moved calendars stop being primary first.
+    counts.contact_calendars_demoted = await run(
+      `UPDATE contact_calendars SET is_primary = false, updated_at = now()
+       WHERE contact_id = $1 AND is_primary
+         AND EXISTS (SELECT 1 FROM contact_calendars WHERE contact_id = $2 AND is_primary)`,
+    );
+    counts.contact_calendars = await run(
+      `UPDATE contact_calendars SET contact_id = $2, updated_at = now() WHERE contact_id = $1`,
+    );
+
+    // grant_recommendations — UNIQUE (contact_id, permission). The survivor's row for a
+    // permission wins; the secondary's duplicate is dropped.
+    counts.grant_recommendations_dropped = await run(
+      `DELETE FROM grant_recommendations s
+       WHERE s.contact_id = $1
+         AND EXISTS (SELECT 1 FROM grant_recommendations p WHERE p.contact_id = $2 AND p.permission = s.permission)`,
+    );
+    counts.grant_recommendations = await run(
+      `UPDATE grant_recommendations SET contact_id = $2 WHERE contact_id = $1`,
+    );
+
+    // conversation_resolved_entities — PK (conversation_id, agent_id, contact_id)
+    // (migration 088). On a collision the survivor's row keeps the later resolved_at, so
+    // "recently resolved in this conversation" stays true; the secondary's is dropped.
+    await run(
+      `UPDATE conversation_resolved_entities p
+       SET resolved_at = GREATEST(p.resolved_at, s.resolved_at)
+       FROM conversation_resolved_entities s
+       WHERE p.contact_id = $2 AND s.contact_id = $1
+         AND p.conversation_id = s.conversation_id AND p.agent_id = s.agent_id`,
+    );
+    counts.conversation_resolved_entities_dropped = await run(
+      `DELETE FROM conversation_resolved_entities s
+       WHERE s.contact_id = $1
+         AND EXISTS (
+           SELECT 1 FROM conversation_resolved_entities p
+           WHERE p.contact_id = $2 AND p.conversation_id = s.conversation_id AND p.agent_id = s.agent_id
+         )`,
+    );
+    counts.conversation_resolved_entities = await run(
+      `UPDATE conversation_resolved_entities SET contact_id = $2 WHERE contact_id = $1`,
+    );
+
+    // ON DELETE SET NULL columns (migrations 049, 082/089, 090). held_messages, also named
+    // in the spec, was dropped by migration 059 and has nothing left to re-point.
+    counts.tasks_waiting_on = await run(
+      `UPDATE tasks SET waiting_on_contact_id = $2 WHERE waiting_on_contact_id = $1`,
+    );
+    counts.voice_sessions = await run(
+      `UPDATE voice_sessions SET caller_contact_id = $2 WHERE caller_contact_id = $1`,
+    );
+    counts.working_memory = await run(
+      `UPDATE working_memory SET sender_contact_id = $2 WHERE sender_contact_id = $1`,
+    );
+
+    // originator JSONB lineage (migrations 040, 041, 054, 065, 086). No FK, so a deleted
+    // contact id would linger there forever. One literal statement per table: no SQL is
+    // assembled from strings.
+    counts.originator_tasks = await run(
+      `UPDATE tasks SET originator = jsonb_set(originator, '{contactId}', to_jsonb($2::text))
+       WHERE originator->>'contactId' = $1::text`,
+    );
+    counts.originator_scheduled_jobs = await run(
+      `UPDATE scheduled_jobs SET originator = jsonb_set(originator, '{contactId}', to_jsonb($2::text))
+       WHERE originator->>'contactId' = $1::text`,
+    );
+    counts.originator_bullpen_threads = await run(
+      `UPDATE bullpen_threads SET originator = jsonb_set(originator, '{contactId}', to_jsonb($2::text))
+       WHERE originator->>'contactId' = $1::text`,
+    );
+    counts.originator_secret_capture_tokens = await run(
+      `UPDATE secret_capture_tokens SET originator = jsonb_set(originator, '{contactId}', to_jsonb($2::text))
+       WHERE originator->>'contactId' = $1::text`,
+    );
+    counts.originator_pending_delegations = await run(
+      `UPDATE pending_delegations SET originator = jsonb_set(originator, '{contactId}', to_jsonb($2::text))
+       WHERE originator->>'contactId' = $1::text`,
+    );
+
+    this.logger.debug({ fromContactId, toContactId, counts }, 'contacts: reattached contact references');
+    return counts;
+  }
+
+  async writeMergedContact(id: string, row: MergedContactRow, client?: DbPoolClient): Promise<void> {
+    this.logger.debug({ contactId: id }, 'contacts: writing merged contact row');
+    await (client ?? this.pool).query(
+      `UPDATE contacts SET
+         kg_node_id = $2, display_name = $3, role = $4, notes = $5, tier = $6, kind = $7,
+         preferred_name = $8, title = $9, organization = $10, primary_email = $11,
+         primary_phone = $12, timezone = $13, locale = $14, location = $15,
+         pronouns = $16, linkedin_url = $17, bio = $18, birthday = $19,
+         contact_confidence = $20, last_seen_at = $21,
+         inbound_message_count = $22, outbound_message_count = $23,
+         updated_at = now()
+       WHERE id = $1`,
+      [
+        id, row.kgNodeId, row.displayName, row.role, row.notes, row.tier, row.kind,
+        row.preferredName, row.title, row.organization, row.primaryEmail,
+        row.primaryPhone, row.timezone, row.locale, row.location,
+        row.pronouns, row.linkedinUrl, row.bio, row.birthday,
+        row.contactConfidence, row.lastSeenAt,
+        row.inboundMessageCount, row.outboundMessageCount,
+      ],
+    );
+  }
+
+  async lockContactsForMerge(ids: string[], client?: DbPoolClient): Promise<Contact[]> {
+    if (!client) {
+      // FOR UPDATE outside a transaction releases the lock as soon as the statement ends,
+      // which would silently make the merge's read-modify-write unprotected again.
+      throw new Error('contacts: lockContactsForMerge needs the merge transaction client');
+    }
+    const result = await client.query<ContactRow>(
+      `SELECT ${CONTACT_COLS} FROM contacts WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
+      [ids],
+    );
+    return result.rows.map(row => this.rowToContact(row));
   }
 
   async deleteContact(id: string, client?: DbPoolClient): Promise<void> {
@@ -3433,7 +3812,7 @@ class InMemoryContactBackend implements ContactServiceBackend {
     this.overrides.set(override.id, override);
   }
 
-  async revokeAuthOverride(contactId: string, permission: string): Promise<boolean> {
+  async revokeAuthOverride(contactId: string, permission: string, _client?: DbPoolClient): Promise<boolean> {
     for (const [id, override] of this.overrides) {
       if (override.contactId === contactId &&
           override.permission === permission &&
@@ -3507,17 +3886,20 @@ class InMemoryContactBackend implements ContactServiceBackend {
   }
 
   async reattachIdentities(fromContactId: string, toContactId: string, _client?: DbPoolClient): Promise<void> {
-    // Build set of channel:channelIdentifier keys already owned by the primary
+    // Build set of channel:channelIdentifier keys already owned by the primary. Email is
+    // compared case-insensitively, mirroring idx_cci_email_lower_unique in Postgres.
+    const keyOf = (identity: ChannelIdentity): string =>
+      `${identity.channel}:${identity.channel === 'email' ? identity.channelIdentifier.toLowerCase() : identity.channelIdentifier}`;
     const primaryKeys = new Set<string>();
     for (const identity of this.identities.values()) {
       if (identity.contactId === toContactId) {
-        primaryKeys.add(`${identity.channel}:${identity.channelIdentifier}`);
+        primaryKeys.add(keyOf(identity));
       }
     }
     // Re-point secondary's identities onto primary, discarding any that conflict
     for (const [id, identity] of this.identities) {
       if (identity.contactId !== fromContactId) continue;
-      const key = `${identity.channel}:${identity.channelIdentifier}`;
+      const key = keyOf(identity);
       if (primaryKeys.has(key)) {
         // Duplicate — would violate UNIQUE constraint in Postgres, so discard
         this.identities.delete(id);
@@ -3600,6 +3982,53 @@ class InMemoryContactBackend implements ContactServiceBackend {
 
     // Same accounting as the Postgres backend so both report the same event.
     return { removed, moved, dropped: removed - moved };
+  }
+
+  async reattachContactReferences(fromContactId: string, toContactId: string, _client?: DbPoolClient): Promise<ContactReferenceCounts> {
+    // Only calendars and grant recommendations exist in memory; the other referencing
+    // tables are Postgres-only, so their counts stay 0 here.
+    const counts = emptyContactReferenceCounts();
+
+    const survivorHasPrimary = [...this.calendars.values()].some(c => c.contactId === toContactId && c.isPrimary);
+    for (const [id, cal] of this.calendars) {
+      if (cal.contactId !== fromContactId) continue;
+      let moved: ContactCalendar = { ...cal, contactId: toContactId, updatedAt: new Date() };
+      if (cal.isPrimary && survivorHasPrimary) {
+        moved = { ...moved, isPrimary: false };
+        counts.contact_calendars_demoted++;
+      }
+      this.calendars.set(id, moved);
+      counts.contact_calendars++;
+    }
+
+    const survivorPerms = new Set(
+      [...this.recommendations.values()].filter(r => r.contactId === toContactId).map(r => r.permission),
+    );
+    for (const [key, rec] of this.recommendations) {
+      if (rec.contactId !== fromContactId) continue;
+      this.recommendations.delete(key);
+      if (survivorPerms.has(rec.permission)) {
+        counts.grant_recommendations_dropped++;
+        continue;
+      }
+      this.recommendations.set(`${toContactId}:${rec.permission}`, { ...rec, contactId: toContactId });
+      counts.grant_recommendations++;
+    }
+    return counts;
+  }
+
+  async lockContactsForMerge(ids: string[], _client?: DbPoolClient): Promise<Contact[]> {
+    // Single-threaded: there is nothing to lock, only the current rows to return.
+    return [...new Set(ids)]
+      .sort()
+      .map(id => this.contacts.get(id))
+      .filter((c): c is Contact => c !== undefined);
+  }
+
+  async writeMergedContact(id: string, row: MergedContactRow, _client?: DbPoolClient): Promise<void> {
+    const existing = this.contacts.get(id);
+    if (!existing) return;
+    this.contacts.set(id, { ...existing, ...row, updatedAt: new Date() });
   }
 
   async deleteContact(id: string, _client?: DbPoolClient): Promise<void> {

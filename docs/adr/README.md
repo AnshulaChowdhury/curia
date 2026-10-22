@@ -73,6 +73,7 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 | [049](049-band-driven-autonomy.md) | The autonomy band decides when Curia asks first; contact tier only flags an outsider steering Curia, judged per send with the drafting turn's evidence; integrity rules stay deterministic; `autonomy.gating` rolls back (#2159) | Accepted |
 | [050](050-external-verifications-as-first-class-state.md) | External verifications are first-class state — a `verifications` record per site, per-turn injection over always-on prompt, tracked sign-in codes replaced by `[sign-in code]` in every tool input except `web-browser`, in-memory single-process tracker (#2017) | Accepted |
 | [051](051-knowledge-graph-embeddings-from-a-configurable-endpoint.md) | Knowledge graph embeddings come from any OpenAI-compatible endpoint, with a per-model profile (width, prefixes, thresholds), vectors stamped with their model, a boot gate and `pnpm reembed:kg` (#2023) | Accepted |
+| [052](052-knowledge-graph-node-merge.md) | Knowledge-graph node merge — previewed, plan-token-gated, single-transaction console merge; the survivor's type is the result type; the absorbed node is archived as a tombstone; contacts fold by survivor type; contact merges re-point calendars, grants and task/message references (#2233) | Accepted |
 
 ## Adding new ADRs
 

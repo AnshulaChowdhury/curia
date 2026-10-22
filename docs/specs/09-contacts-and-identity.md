@@ -585,13 +585,36 @@ Contact CRUD operations are exposed as skills, invoked by the Coordinator during
 | `contact.lookup` | Look up a contact by name, role, or channel identifier |
 | `contact.list` | List contacts filtered by role, `tier`, or `kind`, with limit/offset. Default view excludes `automated` and `agent` contacts. Filtering is DB-level for performance. |
 | `contact.set-tier` | Set a contact's `tier` directly ("treat Dana as trusted"); principal-auth guarded, rejects `tier='principal'`. |
-| `contact.merge` | Merge two contacts into one (channel identities and overrides always; KG memory fold is best-effort — on failure the merge stays committed and the secondary node is archived) |
+| `contact.merge` | Merge two contacts into one (channel identities, overrides, dedup exclusions, non-conflicting canonical attributes and all contact references always; KG memory fold is best-effort — on failure the merge stays committed and the secondary node is archived). See *Merging contacts*. |
 
 All contact mutations are audit-logged. The Coordinator confirms changes with the CEO before writing:
 
 > Coordinator: "I'll add Jenna's personal phone (+15550002222) to her contact. Confirmed?"
 > CEO: "Yes"
 > → `contact.link-identity` invoked
+
+### Merging contacts
+
+`ContactService.mergeContacts` folds a secondary contact into a primary in one transaction. Besides the primary's `displayName`, `role`, `notes` and `tier`, it:
+
+- re-attaches the secondary's **channel identities** (exact duplicates, and case-insensitive email duplicates, are dropped), **auth overrides** and **dedup exclusions** (ADR-039);
+- copies **non-conflicting canonical attributes**: any attribute that is null on the primary and set on the secondary (title, organization, timezone, locale, location, pronouns, and so on). A value set on both sides keeps the primary's;
+- re-points every **contact reference** with `reattachContactReferences`, so none is cascade-deleted, nulled or left stale (#2233):
+  - `contact_calendars` (moved rows are demoted from `is_primary` when the primary already has a primary calendar);
+  - `grant_recommendations` (a permission the primary already has is dropped);
+  - `conversation_resolved_entities`;
+  - `tasks.waiting_on_contact_id`, `voice_sessions.caller_contact_id` and `working_memory.sender_contact_id`;
+  - the `originator.contactId` field on `tasks`, `scheduled_jobs`, `bullpen_threads`, `secret_capture_tokens` and `pending_delegations`.
+
+A structural contact (principal, agent) is never deleted or downgraded (see *Tier & Kind*). After the commit, the KG nodes are folded best-effort through `EntityMemory.mergeEntities`, and the `contact.merged` event is published.
+
+**Node merge from the console.** Merging two KG nodes from the knowledge-graph explorer (spec 12, *Merging nodes*; [ADR-052](../adr/052-knowledge-graph-node-merge.md)) folds their contacts in the same transaction, by the survivor node's type:
+
+- `person` survivor: all contacts on both nodes fold into **one** contact (the survivor's contact if it has one, otherwise the earliest absorbed contact, re-pointed to the survivor node). The other contacts are merged into it with the same shared helper and `reattachContactReferences` as above, and the user resolves any field or auth-override conflicts in the preview (title, organization, `primary_email`, `timezone`, `bio`, `birthday`, and so on; an auth-override conflict defaults to the side that denies). When the survivor node has no contact, every folded contact is a peer and nothing is prompted: the earliest-created contact wins each field, a deny beats a grant, and a `contacts_disagree` warning lists each case.
+- `organization` survivor: absorbed contacts are re-pointed to the survivor node and become `kind='organization'`. They are not merged with each other, because several contacts can share one organization node (ADR-040).
+- any other survivor type: refused when the absorbed node has contacts.
+
+When the survivor is the principal's node, the absorbed contact's identities become principal identities and the user must acknowledge the transfer.
 
 ---
 

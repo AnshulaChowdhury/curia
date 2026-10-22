@@ -108,6 +108,8 @@ export interface HttpAdapterConfig {
   identityService?: OfficeIdentityService;
   executiveProfileService?: ExecutiveProfileService;
   contactService: ContactService;
+  /** Backs POST /api/kg/nodes/merge and GET /api/kg/nodes/:id/merge-candidates (#2233). */
+  nodeMergeService?: import('../../kg-merge/service.js').NodeMergeApi;
   autonomyService?: AutonomyService;
   registryService?: import('../../registry/registry-service.js').RegistryService;
   /** Backs the /api/registry/channels/* routes (channel install/enable lifecycle). Mounted
@@ -602,6 +604,7 @@ export class HttpAdapter implements Channel {
         eventRouter: this.eventRouter,
         contactService: this.config.contactService,
         sessions,
+        nodeMergeService: this.config.nodeMergeService,
       });
     }
 

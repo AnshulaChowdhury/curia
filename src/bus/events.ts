@@ -504,6 +504,61 @@ interface ContactMergedPayload {
   mergedAt: Date;
 }
 
+// kg.nodes_merged — published by NodeMergeService after the principal merges two
+// knowledge-graph nodes from the console (#2233). Committed state only: the publish runs
+// after COMMIT. This is an audit record of what the merge decided, not an undo log: the
+// absorbed node survives as an archived tombstone with properties.merged_into, but dropped
+// facts, collapsed edges and merged-away contact rows are deleted and cannot be restored
+// from this payload.
+interface KgNodesMergedPayload {
+  /** Duplicated at the top level for audit field extraction (target_id). */
+  survivorId: string;
+  absorbedId: string;
+  survivor: { id: string; type: string; label: string };
+  absorbed: { id: string; type: string; label: string };
+  resultLabel: string;
+  crossType: boolean;
+  /** Null when no contact changed. survivingContactId is null for an organization re-point. */
+  contactMerge: {
+    survivingContactId: string | null;
+    mergedContactIds: string[];
+    repointedContactIds: string[];
+  } | null;
+  summary: {
+    factsMoved: number;
+    factsCollapsed: number;
+    edgesMoved: number;
+    edgesCollapsed: number;
+    edgesDropped: number;
+    conflictsResolved: number;
+    contactReferencesRepointed: number;
+  };
+  /** Every resolution as applied, defaults filled in. */
+  resolutions: {
+    label: string;
+    properties: Record<string, string>;
+    facts: Record<string, string>;
+    nearDuplicateFacts: Record<string, string>;
+    contactFields: Record<string, string>;
+    authOverrides: Record<string, string>;
+    acknowledgements: string[];
+  };
+  /**
+   * Principal trust audit: when the surviving contact is the principal, every folded
+   * identity that became a principal identity, as "channel: identifier". Empty otherwise.
+   */
+  principalIdentitiesTransferred: string[];
+  /**
+   * Principal trust audit: the principal's primary_email / primary_phone the merge wrote a
+   * new value into (filled, or replaced by a resolved conflict), with that value. Empty
+   * unless the surviving contact is the principal.
+   */
+  principalPrimaryFieldsFilled: { primary_email?: string; primary_phone?: string };
+  /** The console originator (resolveConsoleOriginator); null when no principal resolved. */
+  actor: import('../contacts/types.js').TaskOriginator | null;
+  mergedAt: string;
+}
+
 // contact.elevated — published when a contact is automatically promoted from 'unknown' to 'known'.
 // Fired by ContactService.elevateTierToKnown() on success via the onContactElevated callback.
 interface ContactElevatedPayload {
@@ -1396,6 +1451,12 @@ export interface DocumentConsoleActionEvent extends BaseEvent {
   payload: DocumentConsoleActionPayload;
 }
 
+export interface KgNodesMergedEvent extends BaseEvent {
+  type: 'kg.nodes_merged';
+  sourceLayer: 'system';
+  payload: KgNodesMergedPayload;
+}
+
 /**
  * Full redacted LLM I/O for the `llm_call_archive` table. Carried on
  * `llm.call` as a non-persisted top-level field — AuditLogger omits it from
@@ -1897,6 +1958,7 @@ export type BusEvent =
   | ConfigChangeEvent        // System: config object changed (office identity, etc.)
   | SystemRestartEvent       // System: operator-initiated process restart (#1765)
   | DocumentConsoleActionEvent // System: principal edited the document store from the console (#1822)
+  | KgNodesMergedEvent       // Console: two knowledge-graph nodes merged (#2233)
   | ConversationCheckpointEvent // Checkpoint pipeline: Dispatch fires after inactivity window
   | CheckpointExtractionSkippedEvent // Checkpoint pipeline: KG extraction skipped for trust policy (#1290)
   | LlmCallEvent             // Spec 10: LLM API call provenance (model, tokens, cost, hashes)
@@ -2807,6 +2869,16 @@ export function createDocumentConsoleAction(payload: DocumentConsoleActionPayloa
     id: randomUUID(),
     timestamp: new Date(),
     type: 'document.console_action',
+    sourceLayer: 'system',
+    payload,
+  };
+}
+
+export function createKgNodesMerged(payload: KgNodesMergedPayload): KgNodesMergedEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'kg.nodes_merged',
     sourceLayer: 'system',
     payload,
   };

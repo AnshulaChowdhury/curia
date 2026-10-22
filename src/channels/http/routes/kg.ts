@@ -25,6 +25,15 @@ import { fetchChatHistoryPage } from '../chat-history-page.js';
 import { AGENT_NAME_RULE, isAgentName } from '../../../agents/agent-name.js';
 import { isUuid } from '../../../util/uuid.js';
 import { validateTaskErrorBudget } from '../../../tasks/task-error-budget.js';
+import type { NodeMergeApi } from '../../../kg-merge/service.js';
+import { DEFAULT_CANDIDATES, MAX_CANDIDATES } from '../../../kg-merge/service.js';
+import { parseResolutions } from '../../../kg-merge/resolve.js';
+import {
+  InvalidResolutionError,
+  MergeBlockedError,
+  NodeNotFoundError,
+  StalePreviewError,
+} from '../../../kg-merge/errors.js';
 
 export interface KnowledgeGraphRouteOptions {
   pool: Pool;
@@ -43,6 +52,10 @@ export interface KnowledgeGraphRouteOptions {
   // Shared session store — created in HttpAdapter, passed to both KG and identity routes
   // so both can accept the curia_session cookie for authentication.
   sessions: SessionStore;
+  // Node merge (#2233): POST /api/kg/nodes/merge and GET /api/kg/nodes/:id/merge-candidates.
+  // Optional so callers that never mount the merge (tests) need not build one; when absent
+  // those two routes answer 503.
+  nodeMergeService?: NodeMergeApi;
 }
 
 // Channel identifier used when the KG web app dispatches messages to the agent layer.
@@ -65,6 +78,28 @@ interface KgNodeRow {
   created_at: string;
   last_confirmed_at: string;
   sensitivity: string;
+}
+
+/** GET /api/kg/nodes also returns the alias list, identity tier and archived flag (#2233). */
+interface KgNodeListRow extends KgNodeRow {
+  aliases: string[] | null;
+  identity_source: string;
+  archived_at: string | null;
+}
+
+/** GET /api/kg/graph nodes carry the alias list and whether the node is archived (#2233). */
+interface KgGraphNodeRow extends KgNodeRow {
+  aliases: string[] | null;
+  archived_at: string | null;
+}
+
+/**
+ * SQL predicate: the row aliased `n` is NOT a merge tombstone — an archived node whose
+ * properties name the survivor it was merged into (#2233). Decayed archived nodes (no
+ * merged_into) still pass.
+ */
+function notMergeTombstone(alias: string): string {
+  return `NOT (${alias}.archived_at IS NOT NULL AND ${alias}.properties->>'merged_into' IS NOT NULL)`;
 }
 
 interface KgEdgeRow {
@@ -90,8 +125,7 @@ export async function knowledgeGraphRoutes(
   app: FastifyInstance,
   options: KnowledgeGraphRouteOptions,
 ): Promise<void> {
-  const { pool, logger, webAppBootstrapSecret, secureCookies, bus, eventRouter, contactService, sessions } = options;
-  // sessions is managed by HttpAdapter — no local Map creation needed here.
+  const { pool, logger, webAppBootstrapSecret, secureCookies, bus, eventRouter, contactService, sessions, nodeMergeService } = options;
   // sessions is managed by HttpAdapter — no local Map creation needed here.
 
   // POST /auth — exchanges the bootstrap secret for an HttpOnly session cookie.
@@ -155,24 +189,35 @@ export async function knowledgeGraphRoutes(
       query?: string;
       type?: string;
       limit?: string;
+      exclude_facts?: string;
     };
 
     const limit = normalizeLimit(query.limit, 50, 250);
     const searchQuery = query.query?.trim();
     const typeFilter = query.type?.trim();
+    // exclude_facts=true drops fact nodes — the merge picker searches entities only (#2233).
+    const excludeFacts = query.exclude_facts === 'true' || query.exclude_facts === '1';
 
-    const result = await pool.query<KgNodeRow>(
-      `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity
+    // Merge tombstones are excluded (#2233), the same rule /api/kg/graph applies: a
+    // merged-away node lives on only as a redirect to its survivor. Decayed archived nodes
+    // are still listed, flagged `archived`, so the list and the graph agree. The text
+    // search also matches aliases, so a node is found by a name it was merged from.
+    const result = await pool.query<KgNodeListRow>(
+      `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity,
+              aliases, identity_source, archived_at
        FROM kg_nodes
-       WHERE ($1::text IS NULL OR type = $1)
+       WHERE ${notMergeTombstone('kg_nodes')}
+         AND ($1::text IS NULL OR type = $1)
+         AND (NOT $4::boolean OR type <> 'fact')
          AND (
            $2::text IS NULL
            OR label ILIKE '%' || $2 || '%'
            OR properties::text ILIKE '%' || $2 || '%'
+           OR EXISTS (SELECT 1 FROM unnest(aliases) AS a(alias) WHERE a.alias ILIKE '%' || $2 || '%')
          )
        ORDER BY last_confirmed_at DESC
        LIMIT $3`,
-      [typeFilter || null, searchQuery || null, limit],
+      [typeFilter || null, searchQuery || null, limit, excludeFacts],
     );
 
     return reply.send({
@@ -187,6 +232,9 @@ export async function knowledgeGraphRoutes(
         createdAt: row.created_at,
         lastConfirmedAt: row.last_confirmed_at,
         sensitivity: row.sensitivity,
+        aliases: row.aliases ?? [],
+        identitySource: row.identity_source === 'contact' ? 'contact' : 'label',
+        archived: row.archived_at !== null && row.archived_at !== undefined,
       })),
     });
   });
@@ -210,8 +258,10 @@ export async function knowledgeGraphRoutes(
       return reply.status(400).send({ error: 'Invalid node_id: must be a valid UUID.' });
     }
 
+    // Merge tombstones (#2233) are never drawn or traversed through; only the focal node
+    // itself (the CTE anchor) may be one, so the 404 node_merged below can name the survivor.
     const nodeResult = nodeId
-      ? await pool.query<KgNodeRow>(
+      ? await pool.query<KgGraphNodeRow>(
           // visited tracks the set of node IDs already expanded, preventing the same
           // node from being re-expanded when reached at a different depth (which UNION
           // alone can't prevent because depth is part of each row's identity).
@@ -221,24 +271,29 @@ export async function knowledgeGraphRoutes(
              WHERE id = $1::uuid
              UNION ALL
              SELECT
-               CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END AS id,
+               o.id,
                t.depth + 1,
-               t.visited || CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END
+               t.visited || o.id
              FROM traversal t
              JOIN kg_edges e ON e.source_node_id = t.id OR e.target_node_id = t.id
+             JOIN kg_nodes o ON o.id = CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END
              WHERE t.depth < $2
-               AND NOT (CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END = ANY(t.visited))
+               AND NOT (o.id = ANY(t.visited))
+               AND ${notMergeTombstone('o')}
            )
-           SELECT DISTINCT n.id, n.type, n.label, n.properties, n.confidence, n.decay_class, n.source, n.created_at, n.last_confirmed_at, n.sensitivity
+           SELECT DISTINCT n.id, n.type, n.label, n.properties, n.confidence, n.decay_class, n.source, n.created_at, n.last_confirmed_at, n.sensitivity,
+                  n.aliases, n.archived_at
            FROM traversal t
            JOIN kg_nodes n ON n.id = t.id
            ORDER BY n.last_confirmed_at DESC
            LIMIT $3`,
           [nodeId, depth, limit],
         )
-      : await pool.query<KgNodeRow>(
-          `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity
-           FROM kg_nodes
+      : await pool.query<KgGraphNodeRow>(
+          `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity,
+                  aliases, archived_at
+           FROM kg_nodes n
+           WHERE ${notMergeTombstone('n')}
            ORDER BY last_confirmed_at DESC
            LIMIT $1`,
           [limit],
@@ -246,7 +301,7 @@ export async function knowledgeGraphRoutes(
 
     if (nodeResult.rows.length === 0) {
       // With a focal node_id the CTE anchor is that node itself: zero rows means no
-      // kg_nodes row (including archived — neither query filters archived_at). An
+      // kg_nodes row (including archived — the anchor is never filtered). An
       // isolated node still yields exactly one row (itself) and an empty edge list
       // below — keep that as 200 so callers can tell the two apart (#1881).
       if (nodeId) {
@@ -254,6 +309,23 @@ export async function knowledgeGraphRoutes(
         return reply.status(404).send({ error: `Node not found: ${nodeId}` });
       }
       return reply.send({ nodes: [], edges: [] });
+    }
+
+    // A deep link to a node that was merged away (#2233): send the console to the
+    // survivor instead of drawing the tombstone. An archived node without merged_into
+    // (decayed) keeps the behaviour above — it is still drawn.
+    if (nodeId) {
+      const focal = nodeResult.rows.find((row) => row.id === nodeId);
+      const mergedInto = focal?.properties?.merged_into;
+      if (focal?.archived_at && typeof mergedInto === 'string' && mergedInto.length > 0) {
+        logger.debug({ nodeId, mergedInto }, 'kg: graph node was merged away');
+        return reply.status(404).send({
+          error: `Node ${nodeId} was merged into ${mergedInto}.`,
+          code: 'node_merged',
+          mergedInto,
+          label: focal.label,
+        });
+      }
     }
 
     const nodeIds = nodeResult.rows.map((row) => row.id);
@@ -281,6 +353,8 @@ export async function knowledgeGraphRoutes(
         createdAt: row.created_at,
         lastConfirmedAt: row.last_confirmed_at,
         sensitivity: row.sensitivity,
+        aliases: row.aliases ?? [],
+        archived: row.archived_at !== null && row.archived_at !== undefined,
       })),
       edges: edgeResult.rows.map((row) => ({
         id: row.id,
@@ -294,6 +368,100 @@ export async function knowledgeGraphRoutes(
         lastConfirmedAt: row.last_confirmed_at,
       })),
     });
+  });
+
+  // ── Node merge (#2233, docs/wip/2026-10-21-kg-node-merge-design.md §8) ──────────
+
+  /** Map a merge failure to its HTTP response; null when it is not a merge error. */
+  function mergeErrorResponse(err: unknown): { status: number; body: Record<string, unknown> } | null {
+    if (err instanceof InvalidResolutionError) return { status: 400, body: { error: err.message, code: err.code } };
+    if (err instanceof NodeNotFoundError) return { status: 404, body: { error: err.message, code: err.code } };
+    if (err instanceof StalePreviewError) return { status: 409, body: { error: err.message, code: err.code } };
+    if (err instanceof MergeBlockedError) {
+      return { status: 422, body: { error: err.message, code: err.code, blockers: err.blockers } };
+    }
+    return null;
+  }
+
+  // POST /api/kg/nodes/merge — preview (dryRun, the default) or apply a node merge.
+  app.post('/api/kg/nodes/merge', KG_RATE, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+    if (!nodeMergeService) {
+      return reply.status(503).send({ error: 'Node merge is not available.', code: 'unavailable' });
+    }
+
+    const body = (request.body ?? {}) as {
+      survivorId?: unknown;
+      absorbedId?: unknown;
+      dryRun?: unknown;
+      planToken?: unknown;
+      resolutions?: unknown;
+    };
+    const invalid = (error: string) => reply.status(400).send({ error, code: 'invalid_request' });
+    const survivorId = typeof body.survivorId === 'string' ? body.survivorId.trim() : '';
+    const absorbedId = typeof body.absorbedId === 'string' ? body.absorbedId.trim() : '';
+    if (!isUuid(survivorId) || !isUuid(absorbedId)) {
+      return invalid('survivorId and absorbedId must be valid UUIDs.');
+    }
+    if (survivorId.toLowerCase() === absorbedId.toLowerCase()) {
+      return invalid('survivorId and absorbedId must differ.');
+    }
+    if (body.dryRun !== undefined && typeof body.dryRun !== 'boolean') {
+      return invalid('dryRun must be a boolean.');
+    }
+    const dryRun = body.dryRun !== false;
+
+    try {
+      if (dryRun) {
+        // JSON body (Fastify serializes the object as application/json), not HTML;
+        // resp.render() does not apply. Same send path as the other KG JSON routes.
+        // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write
+        return reply.send(await nodeMergeService.preview(survivorId, absorbedId));
+      }
+      if (typeof body.planToken !== 'string' || body.planToken.trim().length === 0) {
+        return invalid('planToken is required when dryRun is false. Preview the merge first.');
+      }
+      const resolutions = parseResolutions(body.resolutions);
+      const actor = await resolveConsoleOriginator(contactService, logger);
+      const result = await nodeMergeService.apply({
+        survivorId,
+        absorbedId,
+        planToken: body.planToken.trim(),
+        resolutions,
+        actor,
+      });
+      // JSON body (Fastify serializes the object as application/json), not HTML;
+      // resp.render() does not apply. Same send path as the other KG JSON routes.
+      // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write
+      return reply.send(result);
+    } catch (err) {
+      const mapped = mergeErrorResponse(err);
+      if (mapped) return reply.status(mapped.status).send(mapped.body);
+      logger.error({ err, survivorId, absorbedId, dryRun }, 'POST /api/kg/nodes/merge failed');
+      return reply.status(500).send({ error: dryRun ? 'Failed to preview node merge.' : 'Failed to merge nodes.' });
+    }
+  });
+
+  // GET /api/kg/nodes/:id/merge-candidates?limit=8 — likely duplicates of any type.
+  app.get('/api/kg/nodes/:id/merge-candidates', KG_RATE, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+    if (!nodeMergeService) {
+      return reply.status(503).send({ error: 'Node merge is not available.', code: 'unavailable' });
+    }
+    const { id } = request.params as { id: string };
+    if (!isUuid(id)) {
+      return reply.status(400).send({ error: 'Invalid node id: must be a valid UUID.', code: 'invalid_request' });
+    }
+    const limit = normalizeLimit((request.query as { limit?: string }).limit, DEFAULT_CANDIDATES, MAX_CANDIDATES);
+    try {
+      const candidates = await nodeMergeService.candidates(id, limit);
+      return reply.send({ candidates });
+    } catch (err) {
+      const mapped = mergeErrorResponse(err);
+      if (mapped) return reply.status(mapped.status).send(mapped.body);
+      logger.error({ err, nodeId: id }, 'GET /api/kg/nodes/:id/merge-candidates failed');
+      return reply.status(500).send({ error: 'Failed to load merge candidates.' });
+    }
   });
 
   // tier/kind selectable via the API — 'principal' and kind∈{principal,agent} are structural-only.

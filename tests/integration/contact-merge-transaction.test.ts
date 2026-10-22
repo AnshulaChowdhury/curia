@@ -290,4 +290,67 @@ describeIf('mergeContacts transactionality (#1695)', () => {
       b: primary < other ? other : primary,
     }]);
   });
+
+  it('never loses a scoring increment that lands while the merge is in flight (QA D)', async () => {
+    // mergeContacts reads both contacts before its transaction. A message scored between
+    // that read and the write used to be overwritten by the absolute counts the merge
+    // computed from the stale read. The fold now locks both rows and computes the counters
+    // from the locked values, so the increment survives.
+    const primary = await makeContact('Counter Primary QA-D');
+    const secondary = await makeContact('Counter Secondary QA-D');
+    await pool.query(
+      `UPDATE contacts SET inbound_message_count = 5, outbound_message_count = 1 WHERE id = $1`,
+      [primary],
+    );
+    await pool.query(
+      `UPDATE contacts SET inbound_message_count = 3, outbound_message_count = 2 WHERE id = $1`,
+      [secondary],
+    );
+
+    // A second connection increments the primary's counters (as updateScoringFields does)
+    // and holds the row lock, uncommitted, while the merge starts.
+    const scorer = await pool.connect();
+    let merge: Promise<unknown> | undefined;
+    try {
+      await scorer.query('BEGIN');
+      await scorer.query(
+        `UPDATE contacts SET inbound_message_count = inbound_message_count + 10,
+                             outbound_message_count = outbound_message_count + 4,
+                             last_seen_at = now()
+         WHERE id = $1`,
+        [primary],
+      );
+
+      const scorerXid = (await scorer.query<{ xid: string }>('SELECT pg_current_xact_id()::text AS xid')).rows[0]!.xid;
+
+      merge = contactService.mergeContacts(primary, secondary, false);
+      // Wait until the merge is queued on the scorer's row lock (a row-lock wait is a wait
+      // on the holder's transaction id), i.e. its pre-transaction read has already happened.
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const { rows } = await pool.query<{ n: string }>(
+          `SELECT count(*) AS n FROM pg_locks
+           WHERE locktype = 'transactionid' AND NOT granted AND transactionid::text = $1`,
+          [scorerXid],
+        );
+        if (Number(rows[0]!.n) > 0) break;
+        if (Date.now() > deadline) throw new Error('merge never waited on the scorer’s row lock');
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      await scorer.query('COMMIT');
+    } catch (err) {
+      await scorer.query('ROLLBACK');
+      throw err;
+    } finally {
+      scorer.release();
+    }
+    await merge;
+
+    const { rows } = await pool.query<{ inbound_message_count: number; outbound_message_count: number; last_seen_at: Date | null }>(
+      `SELECT inbound_message_count, outbound_message_count, last_seen_at FROM contacts WHERE id = $1`,
+      [primary],
+    );
+    expect(rows[0]).toMatchObject({ inbound_message_count: 5 + 10 + 3, outbound_message_count: 1 + 4 + 2 });
+    expect(rows[0]!.last_seen_at).not.toBeNull();
+  });
 });
