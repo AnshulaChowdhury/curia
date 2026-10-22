@@ -38,6 +38,22 @@ Trust is a security boundary, so this needs a decision before code (see the open
 below). The aim: a sender the principal has corresponded with is not declined as a stranger,
 and a decline actually reaches the principal.
 
+**What shipped in PR 2 beyond the decisions below:**
+- The elevated message is counted toward confidence before the trust score is taken, so a
+  first email scores 0.34 rather than 0.24 (decided with the user).
+- The scenario stack scores and authorizes senders as production does (AuthorizationService
+  in the resolver; channel trust, weights and the confidence pipeline in the harness
+  Dispatcher). Before this, every known contact reached the coordinator in scenarios with no
+  AUTHORIZATION section (decided with the user; release gate re-run).
+- Turn guidance on the elevated turn names the evidence (`principal-colleague` or
+  `principal-correspondent`) and how to weigh a request for the principal's time
+  (`acquaintance-time-request`). Without them the colleague was sometimes treated as
+  unvetted, and the acquaintance was booked into the next two workdays (3/9).
+- 25m/25n `principal_hears` also accepts the principal note (the Dispatcher emails it).
+
+**Result (2026-10-22, 9 runs, autonomy 84 band):** 25m and 25n pass every critical behavior
+9/9 (baseline 0/10 between them). Markers removed.
+
 ## PR 3 — making room by band (gap C)
 
 An injection keyed on "make room" language in a principal turn, carrying the band's rule:
@@ -49,7 +65,9 @@ Consider a calendar-side check that flags an offered slot overlapping a busy eve
 
 Decided (2026-10-22): a code check in dispatch, not a prompt step. For an email sender with
 tier `unknown`, kind person, and `senderVerified` (SPF, DKIM and DMARC pass): if the sender
-shares the principal's (non-freemail) domain, or the principal has sent them mail (an
+is on a configured organization domain (`security.principal_org_domains`, empty by default;
+first drafted as "the principal's own non-freemail domain", replaced after a security review
+because a denylist of mail providers fails open), or the principal has sent them mail (an
 injectable lookup over the principal's mailbox, so scenarios can stub it), elevate the
 contact to `known` and re-resolve before routing. `known` carries `schedule_meetings`.
 Also decided: lower `security.trust_thresholds.scheduling` from 0.5 to 0.3, since a `known`

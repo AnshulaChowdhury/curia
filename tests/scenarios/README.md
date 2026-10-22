@@ -321,6 +321,7 @@ seed:
       kind: person                        # person | organization | automated
       channel: email
       identifier: sam@example.test        # always under example.test
+      # principal_wrote: true             # email only: the principal has mailed Sam (see below)
   outbound_context:                       # → {{entry:<key>}}
     - key: offsite
       channel: signal
@@ -464,6 +465,26 @@ inbound:
   content: "Subject: …"
   email: { nylas_message_id: m-1, to: [dana], cc: [curia] }
 ```
+
+### Senders the principal knows
+
+The Dispatcher elevates a verified `unknown` email sender the principal knows to `known`
+before routing (#2227, `src/contacts/principal-acquaintance.ts`). Two fields drive it:
+
+- `inbound.email.sender_verified: true` is the adapter's `senderVerified` (SPF, DKIM and
+  DMARC pass). The check runs only when it is set. Unset leaves it out of the metadata, so
+  existing cases never meet the rule.
+- `principal_wrote: true` on a seeded email contact means the principal has sent them mail:
+  the run's stand-in for the principal's Sent folder answers yes for that address.
+
+The scenario office's `security.principal_org_domains` is `example.test`, the test
+principal's own domain. So a verified sender at `…@example.test` counts as a colleague, and
+one at `…@lumen.example.test` does not.
+
+The harness Dispatcher scores senders as production does: channel trust from
+`config/channel-trust.yaml`, the `security.trust_score` weights and the confidence pipeline.
+The stack's resolver evaluates production's permission model. So the coordinator sees the
+same trust score and AUTHORIZATION section that production would show it.
 
 After adding a case, run it (`--case`, a few runs) so the CLI records its stub coverage,
 and commit the updated `stub-coverage.json`.

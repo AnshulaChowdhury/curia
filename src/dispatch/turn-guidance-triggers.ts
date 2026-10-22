@@ -9,6 +9,7 @@
 
 import type { TurnGuidanceKey } from '../agents/prompts/turn-guidance.js';
 import { isTaskWakeReplyBinding } from './task-wake-reply.js';
+import type { AcquaintanceEvidence } from '../contacts/principal-acquaintance.js';
 
 export interface InboundGuidanceFacts {
   /** A live principal turn (stampOriginator). */
@@ -43,6 +44,11 @@ export interface InboundGuidanceFacts {
   forward?: boolean;
   /** The inbound text holds a booking-page link (hasBookingPageLink). Absent means no. */
   bookingLink?: boolean;
+  /**
+   * The dispatcher elevated this (non-principal) sender on evidence the principal knows
+   * them (#2227). Absent means it did not.
+   */
+  principalAcquaintance?: AcquaintanceEvidence;
 }
 
 // Booking-page hosts (#2227). A link on the host's root is not a booking page, so each needs
@@ -203,6 +209,10 @@ export function inboundTurnGuidance(facts: InboundGuidanceFacts): TurnGuidanceKe
   const principalForward = facts.liveTurn && facts.forward === true && facts.channelId === 'email' && !facts.curiaCc;
   if (!facts.liveTurn) {
     keys.push('non-principal-reply-shaped');
+    if (facts.principalAcquaintance !== undefined) {
+      keys.push(facts.principalAcquaintance === 'principal-domain' ? 'principal-colleague' : 'principal-correspondent');
+      keys.push('acquaintance-time-request');
+    }
   } else if (entries.length === 0) {
     // A spot-check verdict ("2 bad") is reply-shaped but not ambiguous: the reply-shaped note
     // says to ask what the principal is replying to, spot-check-reply says to act. They give

@@ -81,6 +81,8 @@ import { createContactDuplicateDetected, createContactElevated, createContactMer
 import { NylasClient } from './channels/email/nylas-client.js';
 import { NylasCalendarClient } from './channels/calendar/nylas-calendar-client.js';
 import { resolvePrincipalCalendarGrant } from './channels/calendar/resolve-calendar-grant.js';
+import { PrincipalAcquaintanceCheck } from './contacts/principal-acquaintance.js';
+import { NylasPrincipalMailbox } from './contacts/nylas-principal-mailbox.js';
 import { EmailAdapter } from './channels/email/email-adapter.js';
 import { EmailAccountsRepo } from './channels/email/email-accounts-repo.js';
 import { resolveEmailAccounts } from './channels/email/resolve-email-accounts.js';
@@ -1099,6 +1101,8 @@ async function main(): Promise<void> {
   // Every disabled path logs exactly once — none is silent. Guard on the API key first so
   // we don't read the grant (or log a spurious read error) when Nylas isn't configured at all.
   let nylasCalendarClient: NylasCalendarClient | undefined;
+  // The principal's own grant, kept for the dispatcher's principal-mailbox lookup (#2227).
+  let principalNylasGrantId: string | undefined;
   if (!config.nylasApiKey) {
     // Calendar shares the Nylas API key with email; its absence is already reported as a
     // warning by the email-channel bootstrap above. Logged at debug here to keep this path
@@ -1121,6 +1125,7 @@ async function main(): Promise<void> {
         'Failed to read ceo_nylas_grant_id — calendar disabled this boot. Check the database and SECRET_ENCRYPTION_KEY (a wrong key breaks all secrets, not just calendar).',
       );
     }
+    principalNylasGrantId = principalCalendarGrant;
     if (principalCalendarGrant) {
       nylasCalendarClient = new NylasCalendarClient(config.nylasApiKey, principalCalendarGrant, logger);
       logger.info('Nylas calendar client initialized (bound to the principal\'s Nylas grant)');
@@ -3012,6 +3017,23 @@ async function main(): Promise<void> {
     gating: autonomyGating,
     bullpenService,
     principalIdentities,
+    // Absent without a contact service (nothing to elevate). Without the principal's Nylas
+    // grant only the org-domain rule applies; with no org domains configured, only the
+    // mailbox rule does.
+    principalAcquaintance: contactService
+      ? {
+          check: new PrincipalAcquaintanceCheck({
+            orgDomains: yamlConfig.security?.principal_org_domains ?? [],
+            principalEmails: () =>
+              principalIdentities.filter((id) => id.channel === 'email').map((id) => id.channelIdentifier),
+            mailbox: config.nylasApiKey && principalNylasGrantId
+              ? new NylasPrincipalMailbox(config.nylasApiKey, principalNylasGrantId, logger)
+              : undefined,
+            logger,
+          }),
+          contacts: contactService,
+        }
+      : undefined,
     principalBacklog: createPrincipalBacklogSource(pool),
     verification: verificationRuntime,
   });

@@ -192,6 +192,21 @@ describe('inboundTurnGuidance', () => {
       expect(inboundTurnGuidance(facts({ forward: true }))).toEqual(['principal-reply-shaped']);
     });
   });
+  describe('senders the principal knows (#2227)', () => {
+    it('names the evidence, then the weighing rule, on a non-principal turn', () => {
+      expect(inboundTurnGuidance(facts({ channelId: 'email', liveTurn: false, principalAcquaintance: 'principal-domain' }))).toEqual([
+        'non-principal-reply-shaped', 'principal-colleague', 'acquaintance-time-request', 'email-direct-reply', 'email-etiquette',
+      ]);
+      expect(inboundTurnGuidance(facts({ channelId: 'email', liveTurn: false, principalAcquaintance: 'principal-correspondence' }))).toEqual([
+        'non-principal-reply-shaped', 'principal-correspondent', 'acquaintance-time-request', 'email-direct-reply', 'email-etiquette',
+      ]);
+    });
+
+    it('is never added on a principal turn', () => {
+      expect(inboundTurnGuidance(facts({ principalAcquaintance: 'principal-domain' }))).toEqual(['principal-reply-shaped']);
+    });
+  });
+
   describe('booking-link (#2227)', () => {
     // Keys come back in detection order; renderTurnGuidance puts them in TURN_GUIDANCE_ORDER.
     it('is added on any sender, and beside the forward note', () => {

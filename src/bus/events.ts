@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ErrorType } from '../errors/types.js';
-import type { ContactTier, DedupConfidence, SystemRole, TrustLevel } from '../contacts/types.js';
+import type { ContactTier, DedupConfidence, SystemRole, TierElevationReason, TrustLevel } from '../contacts/types.js';
 import type { Sensitivity, NodeType } from '../memory/types.js';
 import type { ActionRisk } from '../skills/types.js';
 import type { ReasoningEffort } from '../agents/llm/sampling-options.js';
@@ -563,7 +563,7 @@ interface KgNodesMergedPayload {
 // Fired by ContactService.elevateTierToKnown() on success via the onContactElevated callback.
 interface ContactElevatedPayload {
   contactId: string;
-  reason: 'correspondence' | 'domain-validated' | 'judgment';
+  reason: TierElevationReason;
 }
 
 // MessageRejectedPayload — emitted by the dispatch layer when a message is rejected

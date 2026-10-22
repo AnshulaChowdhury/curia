@@ -63,6 +63,8 @@ export class SeedScope {
   readonly verificationIds = new Set<string>();
   /** Browser session ids the run's verification block reads as alive (#2017). */
   readonly aliveSessions = new Set<string>();
+  /** Addresses the principal has sent mail to (seed.contacts principal_wrote, #2227), lowercased. */
+  readonly principalWroteTo = new Set<string>();
   /** What the run says is waiting on the principal (`seed.backlog`); none when unset. */
   backlog: PrincipalBacklogCounts | undefined;
   /**
@@ -78,6 +80,7 @@ export class SeedScope {
     this.specialistConversations.clear();
     this.verificationIds.clear();
     this.aliveSessions.clear();
+    this.principalWroteTo.clear();
     this.backlog = undefined;
     this.errors.length = 0;
   }
@@ -355,6 +358,7 @@ export async function seedRun(scenario: ScenarioCase, deps: SeedDeps): Promise<S
       const created = await seedContact(stack, contact);
       seeded.contacts.push(created);
       seeded.refs.set(`contact:${contact.key}`, created.id);
+      if (contact.principalWrote) scope.principalWroteTo.add(contact.identifier.trim().toLowerCase());
     }
 
     for (const raw of scenario.seed.outboundContext) {

@@ -18,13 +18,12 @@ description: >
 tags: [principal-scheduling, ps-core, calendar, third-party-request]
 delegation: real
 release_gate: false
-known_failure: { issue: "#2227", reason: "Declines a colleague on trust score without checking the principal's mailbox." }
 autonomy: { score: 84, gating: band }
 stub_sets: [human-channels, calendar-office, calendar-specialist]
 seed:
   contacts:
-    # In contacts as Curia's own first contact with them made it: unverified (unknown
-    # tier). The evidence that the principal knows them is in the principal's mailbox.
+    # In contacts as Curia's own first contact with them made it: unknown tier. She is on the
+    # principal's own domain (example.test), which the Dispatcher counts before routing (#2227).
     - key: priya
       display_name: Priya Shah
       tier: unknown
@@ -49,6 +48,9 @@ inbound:
   email:
     nylas_message_id: scenario-msg-25m-priya
     to: [curia]
+    # Passed SPF, DKIM and DMARC, as the adapter reports it: the Dispatcher counts a
+    # sender as known to the principal only then.
+    sender_verified: true
 tool_stubs:
   # Other fair writes a specialist may make on the way.
   contact-set-role:
@@ -113,12 +115,6 @@ expected_behaviors:
       called: [calendar-find-free-time, calendar-list-events]
       agent: any
       success: true
-  - id: checks_history
-    weight: important
-    description: The principal's mailbox is searched for past contact with the sender.
-    check:
-      called: ceo-inbox-search
-      agent: any
   - id: establishes_who
     weight: critical
     description: >
@@ -151,9 +147,11 @@ expected_behaviors:
     description: Lets the principal know the meeting is set or offered, with enough context to prepare.
   - id: principal_hears
     weight: important
-    description: The principal is told about the request (a report, a message or a task for them), not only promised to the sender.
+    description: The principal is told about the request (a report, a message, a task or a note for them), not only promised to the sender.
     check:
       any_of:
+        # The note the coordinator leaves for the principal, which the Dispatcher emails them.
+        - { principal_note: present }
         - { called: report-to-principal }
         - { called: task-create }
         - { called: email-send, contains: { to: principal } }

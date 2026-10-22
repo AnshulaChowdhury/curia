@@ -86,7 +86,10 @@ import { resolvePrincipalCalendarGrant } from '../channels/calendar/resolve-cale
 import { ContactService } from '../contacts/contact-service.js';
 import { ContactResolver } from '../contacts/contact-resolver.js';
 import { ConfidencePipeline } from '../contacts/confidence-pipeline.js';
-import type { ChannelIdentity, PrincipalPrimaryEmailRef } from '../contacts/types.js';
+import { loadAuthConfig } from '../contacts/config-loader.js';
+import { AuthorizationService } from '../contacts/authorization.js';
+import type { TrustScorerWeights } from '../dispatch/trust-scorer.js';
+import type { ChannelIdentity, ChannelPolicyConfig, PrincipalPrimaryEmailRef } from '../contacts/types.js';
 import { OutboundContextService } from '../dispatch/outbound-context.js';
 import { OutboundContentFilter } from '../dispatch/outbound-filter.js';
 import {
@@ -374,6 +377,19 @@ export interface TestModeStack {
   verification: VerificationRuntime;
   agentContactId: string | undefined;
   principalContactId: string | undefined;
+  /** The principal's verified, active identities as read at boot (production's snapshot). */
+  principalIdentities: readonly ChannelIdentity[];
+  /**
+   * What production's Dispatcher scores senders with (#2227): channel trust policies
+   * (config/channel-trust.yaml), `security.trust_score` weights, and the confidence pipeline.
+   * A caller that builds its own Dispatcher passes these so the coordinator sees the same
+   * trust score production would show it.
+   */
+  trustScoring: {
+    channelPolicies: Record<string, ChannelPolicyConfig>;
+    weights: TrustScorerWeights | undefined;
+    confidencePipeline: ConfidencePipeline;
+  };
   /**
    * The LLM providers agents use, keyed by provider id ('anthropic', 'openrouter').
    * For test infrastructure that needs its own model calls — the scenario judge (#1956)
@@ -771,7 +787,11 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     }
     const bullpenService = BullpenService.createWithPostgres(pool, logger);
     const contactService = ContactService.createWithPostgres(pool, entityMemory, logger);
-    const contactResolver = new ContactResolver(contactService, entityMemory, undefined, logger);
+    // Production's permission model (#2227): without it every known contact reached the
+    // coordinator with no AUTHORIZATION section, unlike production. Fatal on a bad file, as
+    // in production.
+    const authConfig = loadAuthConfig(configDir);
+    const contactResolver = new ContactResolver(contactService, entityMemory, new AuthorizationService(authConfig), logger);
     const entityContextAssembler = new EntityContextAssembler(pool, logger);
 
     const agentIdentity = await bootstrapAgentIdentity(officeIdentityService.get().assistant.name, pool, logger);
@@ -1016,6 +1036,19 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       verification,
       agentContactId,
       principalContactId: principalContact?.id,
+      principalIdentities,
+      trustScoring: {
+        channelPolicies: authConfig.channelPolicies,
+        // As src/index.ts reads security.trust_score.
+        weights: yamlConfig.security?.trust_score
+          ? {
+              channelWeight: yamlConfig.security.trust_score.channel_weight ?? 0.4,
+              contactWeight: yamlConfig.security.trust_score.contact_weight ?? 0.4,
+              maxRiskPenalty: yamlConfig.security.trust_score.max_risk_penalty ?? 0.2,
+            }
+          : undefined,
+        confidencePipeline: new ConfidencePipeline(contactService, logger),
+      },
       llmProviders: providerRegistry,
       agents,
       disabledTools,

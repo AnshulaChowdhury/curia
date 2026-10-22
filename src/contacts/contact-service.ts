@@ -39,6 +39,7 @@ import type {
   IdentitySource,
   IdentityStatus,
   SystemRole,
+  TierElevationReason,
 } from './types.js';
 import { jaroWinkler, normalizeDisplayName, type DedupService } from './dedup-service.js';
 import type { ContactCalendar, CreateCalendarLinkOptions, ResolvedCalendar } from './calendar-types.js';
@@ -277,7 +278,7 @@ interface ContactServiceBackend {
    * Guards against automated/agent kinds at DB level.
    * Returns true if the row was updated, false otherwise (already elevated, wrong tier, or excluded kind).
    */
-  elevateTierToKnown(contactId: string, reason: 'correspondence' | 'domain-validated' | 'judgment'): Promise<boolean>;
+  elevateTierToKnown(contactId: string, reason: TierElevationReason): Promise<boolean>;
 
   getAuthOverrides(contactId: string): Promise<Array<{ permission: string; granted: boolean }>>;
   createAuthOverride(override: AuthOverride, client?: DbPoolClient): Promise<void>;
@@ -453,7 +454,7 @@ export class ContactService {
   private onContactMerged?: (primaryId: string, secondaryId: string, mergedAt: Date) => void;
   private onIdentityVerified?: (contactId: string) => void;
   private onIdentitiesChanged?: (contactId: string) => void | Promise<void>;
-  private onContactElevated?: (contactId: string, reason: 'correspondence' | 'domain-validated' | 'judgment') => void;
+  private onContactElevated?: (contactId: string, reason: TierElevationReason) => void;
   private dedupService?: DedupService;
   private onDuplicateDetected?: (
     newContactId: string,
@@ -1578,7 +1579,7 @@ export class ContactService {
    */
   async elevateTierToKnown(
     contactId: string,
-    reason: 'correspondence' | 'domain-validated' | 'judgment',
+    reason: TierElevationReason,
   ): Promise<boolean> {
     try {
       const elevated = await this.backend.elevateTierToKnown(contactId, reason);

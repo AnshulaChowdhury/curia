@@ -25,6 +25,9 @@ export type TurnGuidanceKey =
   | 'principal-forward'
   | 'booking-link'
   | 'non-principal-reply-shaped'
+  | 'principal-colleague'
+  | 'principal-correspondent'
+  | 'acquaintance-time-request'
   | 'spot-check-reply'
   | 'outbound-context'
   | 'outbound-context-task-wake'
@@ -89,6 +92,36 @@ const BOOKING_LINK = [
   'book it with the principal\'s name and email. The page sends the invite, so create no event',
   'or hold of your own. Then confirm the booked time on the thread. Only if the page fails or',
   'has no slot that fits, offer times by email instead.',
+];
+
+/**
+ * The dispatcher raised this sender from `unknown` to `known` on evidence that the principal
+ * knows them (#2227, src/contacts/principal-acquaintance.ts). Says what the evidence was:
+ * without it the coordinator could not tell the sender had been checked, and in scenario
+ * 25m sometimes treated a colleague as unvetted.
+ */
+const PRINCIPAL_COLLEAGUE = [
+  'This sender is a colleague of the principal: their address is on the principal\'s',
+  'organization domain. You had not dealt with them before, so the system made them a known',
+  'contact on that basis.',
+];
+
+const PRINCIPAL_CORRESPONDENT = [
+  'The principal has emailed this sender before (it is in the principal\'s Sent mail). You had',
+  'not dealt with them before, so the system made them a known contact on that basis.',
+];
+
+/**
+ * Follows either acquaintance note. Without it, once the sender was let in, a networking
+ * request was booked into the next two workdays in 3 of 9 runs (scenario 25n).
+ */
+const ACQUAINTANCE_TIME_REQUEST = [
+  'If they ask for the principal\'s time, first read the calendar, even if you will only ask the',
+  'principal: a recommendation names real free times. Then weigh how much it matters. A',
+  'time-bound, internal or sensitive request gets time soon (for a sensitive one, an invite',
+  'title that does not name the matter). A discretionary one (networking, catching up, advice',
+  'for themselves) gets one or two short call or video slots a week or more out, or a private',
+  'ask to the principal with your recommendation. Either way, tell the principal.',
 ];
 
 /** The named verification-code-received lines: one per verification the code was registered for. */
@@ -278,6 +311,9 @@ const TURN_GUIDANCE: Record<TurnGuidanceKey, readonly string[]> = {
   'principal-forward': PRINCIPAL_FORWARD,
   'booking-link': BOOKING_LINK,
   'non-principal-reply-shaped': NON_PRINCIPAL_REPLY_SHAPED,
+  'principal-colleague': PRINCIPAL_COLLEAGUE,
+  'principal-correspondent': PRINCIPAL_CORRESPONDENT,
+  'acquaintance-time-request': ACQUAINTANCE_TIME_REQUEST,
   'spot-check-reply': SPOT_CHECK_REPLY,
   'outbound-context': OUTBOUND_CONTEXT,
   'outbound-context-task-wake': OUTBOUND_CONTEXT_TASK_WAKE,
@@ -302,6 +338,10 @@ export const TURN_GUIDANCE_ORDER: readonly TurnGuidanceKey[] = [
   // After the forward note: a forwarded booking page is booked through, not answered by email.
   'booking-link',
   'non-principal-reply-shaped',
+  // After the reply contract: who this sender is to the principal, then how to weigh a request.
+  'principal-colleague',
+  'principal-correspondent',
+  'acquaintance-time-request',
   'spot-check-reply',
   'outbound-context',
   'outbound-context-task-wake',
