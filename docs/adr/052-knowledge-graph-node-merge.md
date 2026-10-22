@@ -174,7 +174,11 @@ the data loss without waiting for the node merge.
 After a successful apply, `NodeMergeService` publishes `kg.nodes_merged` on the system
 layer (the route only maps errors to statuses). The event carries both nodes' ids, types and labels, the result label, `crossType`, the
 contact merge ids, the summary counts, the chosen resolutions and the console originator as
-`actor`. The audit row targets the survivor (`target_type = 'kg_node'`).
+`actor`. When the surviving contact is the principal, it also records the trust the merge
+handed over: `principalIdentitiesTransferred` lists each folded identity that became a
+principal identity, and `principalPrimaryFieldsFilled` gives the primary email or phone the
+merge filled or replaced. Both are empty otherwise. The audit row targets the survivor
+(`target_type = 'kg_node'`).
 
 ## Consequences
 

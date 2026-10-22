@@ -3,9 +3,11 @@
 // Spec: docs/wip/2026-10-21-kg-node-merge-design.md §7. Called twice per apply: once on
 // the pool without locks (fast stale check), then on the transaction's client with
 // `forUpdate`, which locks both nodes (ordered by id, so two merges touching the same
-// nodes queue instead of deadlocking), every linked contact, then every linked fact node.
-// FOR UPDATE on the node rows also blocks concurrent edge inserts against them — the FK
-// check takes KEY SHARE.
+// nodes queue instead of deadlocking), every linked contact, every live edge on the two
+// nodes, then every linked fact node and the facts' outside edges. FOR UPDATE on the node
+// rows blocks concurrent edge inserts against them (the FK check takes KEY SHARE); the edge
+// locks block a concurrent update, such as a reinforcement, that the executor's collapse
+// values would otherwise overwrite.
 //
 // Every array is sorted deterministically: the plan token hashes this object.
 
@@ -121,6 +123,8 @@ const EDGES_SQL = `
   WHERE e.archived_at IS NULL
     AND (e.source_node_id = $1::uuid OR e.target_node_id = $1::uuid)
   ORDER BY e.id`;
+// OF e: lock the edges only; the joined node rows are read for their type.
+const EDGES_FOR_UPDATE_SQL = `${EDGES_SQL} FOR UPDATE OF e`;
 
 // Live edges from the given facts to anything but the two merge nodes (SnapshotFact.outsideEdges).
 // Locked with the facts in the locked pass, so the set cannot change before the executor runs.
@@ -252,8 +256,9 @@ async function loadSide(
   q: Queryable,
   node: SnapshotNode,
   contacts: SnapshotContact[],
+  forUpdate: boolean,
 ): Promise<{ side: Omit<MergeSide, 'facts'>; factLinks: Map<string, string[]> }> {
-  const { rows } = await q.query<PgSideEdgeRow>(EDGES_SQL, [node.id]);
+  const { rows } = await q.query<PgSideEdgeRow>(forUpdate ? EDGES_FOR_UPDATE_SQL : EDGES_SQL, [node.id]);
   const edges: SnapshotEdge[] = [];
   const factLinks = new Map<string, string[]>();
   for (const row of rows) {
@@ -322,8 +327,8 @@ export async function loadMergeSnapshot(
     rowToContact(r, identitiesByContact.get(r.id) ?? [], overridesByContact.get(r.id) ?? []),
   );
 
-  const survivorSide = await loadSide(q, survivorNode, contacts.filter(c => c.kgNodeId === survivorId));
-  const absorbedSide = await loadSide(q, absorbedNode, contacts.filter(c => c.kgNodeId === absorbedId));
+  const survivorSide = await loadSide(q, survivorNode, contacts.filter(c => c.kgNodeId === survivorId), options.forUpdate);
+  const absorbedSide = await loadSide(q, absorbedNode, contacts.filter(c => c.kgNodeId === absorbedId), options.forUpdate);
 
   // Fact nodes for both sides in one query.
   const factIds = [...new Set([...survivorSide.factLinks.keys(), ...absorbedSide.factLinks.keys()])];

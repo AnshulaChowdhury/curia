@@ -18,6 +18,7 @@ import type { EventBus } from '../../src/bus/bus.js';
 import type { BusEvent } from '../../src/bus/events.js';
 import { NodeMergeService, type Embedder, type NodeMergeServiceDeps } from '../../src/kg-merge/service.js';
 import { InvalidResolutionError, MergeBlockedError, StalePreviewError } from '../../src/kg-merge/errors.js';
+import { loadMergeSnapshot } from '../../src/kg-merge/snapshot.js';
 import { requireCuriaTestDatabase } from './require-test-db.js';
 
 const { Pool } = pg;
@@ -552,6 +553,49 @@ describeIf('KG node merge (#2233)', () => {
     expect((await factsOf(a)).map(f => f.id)).toEqual([injected]);
     expect(await factsOf(s)).toEqual([]);
     expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('locks the edges on both merge nodes in the locked pass, so a concurrent update waits', async () => {
+    const s = await node('person', 'Edge Lock S');
+    const a = await node('person', 'Edge Lock A');
+    const x = await node('project', 'Edge Lock X');
+    const survivorEdge = await edge(s, x, 'works_on');
+    const absorbedEdge = await edge(x, a, 'works_on');
+
+    // What a reinforcement does to an edge the executor may collapse or move.
+    const reinforce = async (edgeId: string): Promise<unknown> => {
+      const other = await pool.connect();
+      try {
+        await other.query('BEGIN');
+        await other.query(`SET LOCAL lock_timeout = '200ms'`);
+        await other.query(`UPDATE kg_edges SET confidence = 0.99 WHERE id = $1`, [edgeId]);
+        await other.query('ROLLBACK');
+        return null;
+      } catch (err) {
+        await other.query('ROLLBACK');
+        return err;
+      } finally {
+        other.release();
+      }
+    };
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await loadMergeSnapshot(client, s, a, { forUpdate: true });
+      for (const edgeId of [survivorEdge, absorbedEdge]) {
+        expect(await reinforce(edgeId)).toMatchObject({ code: '55P03' }); // lock_not_available
+      }
+      await client.query('ROLLBACK');
+
+      // The unlocked pass takes no locks.
+      await client.query('BEGIN');
+      await loadMergeSnapshot(client, s, a, { forUpdate: false });
+      expect(await reinforce(survivorEdge)).toBeNull();
+      await client.query('ROLLBACK');
+    } finally {
+      client.release();
+    }
   });
 
   it('discards the connection when ROLLBACK itself fails, and writes nothing', async () => {

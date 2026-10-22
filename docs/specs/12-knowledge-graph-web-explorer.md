@@ -103,4 +103,4 @@ The whole apply is one Postgres transaction. Known limitation: a concurrent writ
 
 ### Audit
 
-A successful apply publishes `kg.nodes_merged` (survivor and absorbed id, type and label, the result label, `crossType`, contact merge ids, summary counts, chosen resolutions and the console `actor`). The audit row targets the survivor (`target_type='kg_node'`).
+A successful apply publishes `kg.nodes_merged` (survivor and absorbed id, type and label, the result label, `crossType`, contact merge ids, summary counts, chosen resolutions, the console `actor`, and `principalIdentitiesTransferred` and `principalPrimaryFieldsFilled`, which record the identities that became principal identities and the primary email or phone filled on the principal, and are empty unless the survivor's contact is the principal). The audit row targets the survivor (`target_type='kg_node'`).
