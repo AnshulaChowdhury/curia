@@ -407,7 +407,7 @@ embedding:
 
 | Key | Description |
 |---|---|
-| `dimensions` | Width stored in `kg_nodes.embedding`, at most 2,000 (pgvector's HNSW limit). A longer vector from the server is truncated and renormalised. |
+| `dimensions` | Width stored in `kg_nodes.embedding`, at most 2,000 (pgvector's HNSW limit). A longer vector from the server is truncated and renormalised. Truncation is only valid for a Matryoshka-trained model, and Curia logs a warning the first time it truncates. |
 | `prefixes.query` / `.document` / `.similarity` | Text put before a search query, a stored node label, and a label matched against stored labels. Each defaults to empty. |
 | `thresholds.fact_dedup` | Cosine score at or above which a new fact merges into an existing one. |
 | `thresholds.fuzzy_resolve` | Score at or above which a name resolves to an existing entity. |

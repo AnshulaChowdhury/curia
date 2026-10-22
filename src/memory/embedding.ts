@@ -158,6 +158,8 @@ export class EmbeddingService {
 // -- Production backend: calls an OpenAI-compatible /embeddings endpoint --
 
 class HttpEmbeddingBackend implements EmbeddingBackend {
+  private warnedTruncation = false;
+
   constructor(
     private endpoint: EmbeddingEndpoint,
     private dimensions: number,
@@ -237,8 +239,15 @@ class HttpEmbeddingBackend implements EmbeddingBackend {
     let embedding = json.data[0]?.embedding;
     // Servers that ignore `dimensions` (llama.cpp, Ollama) return the model's full width.
     // For a Matryoshka-trained model such as Qwen3-Embedding, the leading dimensions are a
-    // valid smaller embedding once rescaled to unit length.
+    // valid smaller embedding once rescaled to unit length. For any other model they are not.
     if (embedding && embedding.length > this.dimensions) {
+      if (!this.warnedTruncation) {
+        this.warnedTruncation = true;
+        this.logger.warn(
+          { model: this.endpoint.model, returnedDimensions: embedding.length, profileDimensions: this.dimensions },
+          'Embedding endpoint returned more dimensions than the profile, so Curia truncates each vector to the profile width. Truncation is only valid for Matryoshka-trained models.',
+        );
+      }
       embedding = truncateAndNormalize(embedding, this.dimensions);
     }
     if (!embedding || embedding.length !== this.dimensions) {

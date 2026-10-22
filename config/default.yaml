@@ -410,7 +410,9 @@ dreaming:
 #       base: Qwen3-Embedding-4B
 #     # A model with no built-in profile: give dimensions and all three thresholds.
 #     my-embedding-model:
-#       dimensions: 1024              # at most 2000 (pgvector's HNSW limit)
+#       # At most 2000 (pgvector's HNSW limit). Curia truncates a longer vector from the
+#       # server to this width. That is only valid for a Matryoshka-trained model.
+#       dimensions: 1024
 #       prefixes:                     # optional; each defaults to ""
 #         query: ""                   # put before a search query
 #         document: ""                # put before a stored node label

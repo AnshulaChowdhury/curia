@@ -154,6 +154,40 @@ describe('EmbeddingService — custom endpoint', () => {
     expect(Math.sqrt(embedding.reduce((sum, x) => sum + x * x, 0))).toBeCloseTo(1);
   });
 
+  it('warns once per backend the first time it truncates, naming the model and both widths', async () => {
+    stubFetch(Array.from({ length: 2560 }, () => 1));
+    const testLogger = createSilentLogger();
+    const warnSpy = vi.spyOn(testLogger, 'warn');
+    const service = EmbeddingService.createWithEndpoint(
+      { baseUrl: 'http://embed.local/v1', model: 'wide-model', apiKey: undefined },
+      profile,
+      testLogger,
+    );
+
+    await service.embed('first', 'document');
+    await service.embed('second', 'document');
+
+    expect(warnSpy).toHaveBeenCalledOnce();
+    const [fields, message] = warnSpy.mock.calls[0]! as unknown as [Record<string, unknown>, string];
+    expect(fields).toEqual({ model: 'wide-model', returnedDimensions: 2560, profileDimensions: EMBEDDING_DIMENSIONS });
+    expect(message).toContain('only valid for Matryoshka-trained models');
+  });
+
+  it('does not warn when the vector already has the profile width', async () => {
+    stubFetch(Array.from({ length: EMBEDDING_DIMENSIONS }, () => 0.5));
+    const testLogger = createSilentLogger();
+    const warnSpy = vi.spyOn(testLogger, 'warn');
+    const service = EmbeddingService.createWithEndpoint(
+      { baseUrl: 'http://embed.local/v1', model: 'm', apiKey: undefined },
+      profile,
+      testLogger,
+    );
+
+    await service.embed('hello', 'document');
+
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
   it('still rejects a vector narrower than the profile width', async () => {
     stubFetch(Array.from({ length: 1024 }, () => 0.5));
     const service = EmbeddingService.createWithEndpoint(
