@@ -36,6 +36,12 @@ export const OPENAI_TEXT_EMBEDDING_3_SMALL: EmbeddingProfile = {
 };
 
 /**
+ * The thresholds come from `scripts/embedding-eval.ts` on the synthetic fixture in
+ * tests/fixtures/embedding-eval/. They were checked against a private set of 51 real name
+ * pairs. On that set, 0.98 was the lowest auto-resolve threshold with no wrong merge, and a
+ * floor of about 0.70 kept 95% of real matches in the ambiguous band. The scores were
+ * measured with Q8_0 weights on llama.cpp, and another quantization shifts them.
+ *
  * A retrieval instruction on `similarity` was tried and stays out: it helps fact dedup but
  * hurts entity resolution, and one prefix serves both (ADR-051).
  */
@@ -47,7 +53,7 @@ export const QWEN3_EMBEDDING_4B: EmbeddingProfile = {
     document: '',
     similarity: '',
   },
-  thresholds: { factDedup: 0.94, fuzzyResolve: 0.99, fuzzyAmbiguityFloor: 0.80 },
+  thresholds: { factDedup: 0.94, fuzzyResolve: 0.99, fuzzyAmbiguityFloor: 0.70 },
 };
 
 export const BUILTIN_EMBEDDING_PROFILES: Readonly<Record<string, EmbeddingProfile>> = {

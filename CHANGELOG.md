@@ -24,7 +24,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Tier reasoning effort** — **public API (config):** `model_routing.tiers.<tier>.reasoning.effort` for agent turns, validated at boot. (#2044)
 - **`llm.call` reasoning fields** — **public API:** optional `reasoningTokens`, `reasoningEffort`, `upstreamProvider` on the bus event. (#2044)
 - **Suite reasoning metrics** — smoke and scenarios print reasoning tokens and latency p50/p90 per agent. (#2044)
-- **Custom embeddings endpoint** — any OpenAI-compatible server; per-model profiles, calibrated Qwen3-Embedding-4B, model-stamped vectors, `pnpm reembed:kg`. (#2023)
+- **Custom embeddings endpoint** — the knowledge graph can use any OpenAI-compatible embedding server, so OpenAI is optional. (#2023)
 - **`pnpm embedding-eval`** — scores an embedding model against a labelled fixture and suggests its profile thresholds. (#2023)
 - **Style scenarios** — seven cases score reply length, filler and register under a fixed office identity. (#2143)
 - **Principal scheduling scenarios** — fourteen on-demand cases for CC'd, forwarded and booking-link scheduling requests.

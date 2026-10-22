@@ -54,7 +54,7 @@ describe('parseEmbeddingProfiles', () => {
     });
   });
 
-  it('lets a server id such as Ollama\'s reuse the calibrated Qwen3 profile', () => {
+  it('lets a server id such as Ollama\'s reuse the built-in Qwen3 profile', () => {
     const profiles = parseEmbeddingProfiles({ 'qwen3-embedding:4b': { base: 'Qwen3-Embedding-4B' } }, SOURCE);
     expect(profiles['qwen3-embedding:4b']).toEqual({ ...QWEN3_EMBEDDING_4B, model: 'qwen3-embedding:4b' });
   });
@@ -100,7 +100,7 @@ describe('parseEmbeddingProfiles', () => {
 });
 
 // Drift checks: these values are decisions recorded outside the code. OpenAI's are the
-// values every install ran before ADR-051, and Qwen3's are the calibration ADR-051 records.
+// values every install ran before ADR-051, and Qwen3's are the values ADR-051 records.
 describe('built-in profile values', () => {
   it('keeps OpenAI\'s width and thresholds unchanged', () => {
     expect(OPENAI_TEXT_EMBEDDING_3_SMALL).toEqual({
@@ -111,7 +111,7 @@ describe('built-in profile values', () => {
     });
   });
 
-  it('keeps the Qwen3-Embedding-4B calibration from ADR-051', () => {
+  it('keeps the Qwen3-Embedding-4B values from ADR-051', () => {
     expect(QWEN3_EMBEDDING_4B).toEqual({
       model: 'Qwen3-Embedding-4B',
       dimensions: 1536,
@@ -120,7 +120,7 @@ describe('built-in profile values', () => {
         document: '',
         similarity: '',
       },
-      thresholds: { factDedup: 0.94, fuzzyResolve: 0.99, fuzzyAmbiguityFloor: 0.80 },
+      thresholds: { factDedup: 0.94, fuzzyResolve: 0.99, fuzzyAmbiguityFloor: 0.70 },
     });
   });
 });
