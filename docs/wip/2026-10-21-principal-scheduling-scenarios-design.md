@@ -104,7 +104,9 @@ needs reading: offered times in prose, venue, length, tone.
 In the first measurement the autonomy fixture never reached the stack, so every case ran
 at the test database's 75 with tier gating. A spread in the CLI escaped TypeScript's
 excess-property check. The CLI now reads the config back after boot and refuses to run
-if a fixture is not in force (#2228). The cases were re-run and #2227 was corrected.
+if a fixture is not in force (#2228). The cases were re-run at the intended autonomy,
+and #2227's body was rewritten with those numbers. #2227 itself stays open: the behavior
+it describes is unfixed.
 
 Two stub flaws also surfaced on re-runs:
 - 25k/25l's booking page returned "Confirmed" for any browser call after opening it,
