@@ -640,8 +640,9 @@ export async function documentsRoutes(
   app.post('/api/documents/import', {
     bodyLimit: maxImportUpload,
     config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    // Before the (up to 32 MiB) upload is read into memory.
+    onRequest: authBeforeBody,
   }, async (request, reply) => {
-    if (!requireAuth(request, reply)) return;
     const query = request.query as Query;
     const mode = query.mode;
     const format = query.format ?? 'zip';
@@ -721,20 +722,51 @@ export async function documentsRoutes(
         });
       }
       const single = format === 'md';
+      const planned = plan.items.filter(i => i.action === 'create' || i.action === 'update');
+
+      // Write-ahead, like the single-document edits: record the planned import before any
+      // document is written, and refuse to start if that record can't be made.
+      try {
+        await bus.publish('system', createDocumentConsoleAction({
+          stage: 'requested',
+          action: 'import',
+          scope,
+          created: plan.counts.create,
+          updated: plan.counts.update,
+          unchanged: plan.counts.unchanged,
+          conflicts: plan.counts.conflict,
+          failed: 0,
+          skipped: plan.counts.skipped,
+          byteTotal: planned.reduce((sum, i) => sum + i.byteSize, 0),
+          initiatedBy: 'principal',
+          channel: CONSOLE_CHANNEL,
+        }));
+      } catch (err) {
+        logger.error({ err, scope }, 'POST /api/documents/import: audit write failed — import refused');
+        return reply.status(500).send({
+          error: 'Nothing was imported: the import could not be audited, so it was not started. Check the server logs.',
+        });
+      }
+
       const result = await applyImportPlan(plan, documents, workingDocs, single ? stampPrincipalEdit : undefined);
       const written = new Set([...result.created, ...result.updated]);
+      // After the writes: as with edits, misses here are warnings on a successful response —
+      // the documents are in, and the import is already audited as requested.
+      const warnings: string[] = [];
       if (single) {
         for (const path of written) {
-          await appendDirectoryLogEntry(workingDocs, logger, {
+          const logged = await appendDirectoryLogEntry(workingDocs, logger, {
             documentPath: path,
             operation: 'console-import',
             summary: `principal imported an offline edit of ${leafOf(path)} in the console`,
             source: 'console documents',
           });
+          if (!logged) warnings.push(`${path} was imported, but its entry in ${LOG_FILENAME} could not be written.`);
         }
       }
       try {
         await bus.publish('system', createDocumentConsoleAction({
+          stage: 'completed',
           action: 'import',
           scope,
           created: result.created.length,
@@ -748,16 +780,13 @@ export async function documentsRoutes(
           channel: CONSOLE_CHANNEL,
         }));
       } catch (err) {
-        logger.error({ err, scope }, 'POST /api/documents/import: imported but audit event failed');
-        return reply.status(500).send({
-          error: 'The import was applied, but its audit entry could not be written — check the server logs.',
-          result,
-        });
+        logger.error({ err, scope }, 'POST /api/documents/import: completed audit event failed after the import');
+        warnings.push('The import was applied and its request was audited, but the completion audit entry failed — check the server logs.');
       }
       if (result.failed.length > 0) {
         logger.error({ scope, failed: result.failed }, 'POST /api/documents/import: some documents failed to import');
       }
-      return reply.send({ mode, plan, result });
+      return reply.send({ mode, plan, result, warnings });
     } catch (err) {
       logger.error({ err, scope }, 'POST /api/documents/import: import failed');
       return reply.status(500).send({ error: 'Import failed' });

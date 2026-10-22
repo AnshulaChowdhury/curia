@@ -92,10 +92,12 @@ describeIf('console Documents export + import (integration)', () => {
     return { preview: preview.body, applied };
   }
 
+  /** Console audit payloads, minus write-ahead `requested` records — what actually happened. */
   const exportActions = () => publish.mock.calls
     .map(([, e]) => e)
     .filter(e => e.type === 'document.console_action')
-    .map(e => e.payload);
+    .map(e => e.payload)
+    .filter(p => !('stage' in p) || p.stage !== 'requested');
 
   describe('auth', () => {
     it.each([
@@ -367,6 +369,32 @@ describeIf('console Documents export + import (integration)', () => {
         );
         expect(res.body.plan.items[0]).toMatchObject({ action: 'conflict', reason: expect.stringMatching(/no base version/) });
       });
+    });
+
+    it('records the import before writing, and refuses to start if it cannot (#2236 review)', async () => {
+      const zip = buildRawZip([{ name: 'projects/new/idea.md', data: emitOkfDocument({ type: 'note', body: 'x\n' }) }]);
+      const preview = await importUpload(zip, 'mode=preview&format=zip');
+      publish.mockRejectedValueOnce(new Error('audit down'));
+      const refused = await importUpload(zip, `mode=apply&format=zip&planToken=${preview.body.plan.token}`);
+      expect(refused.status).toBe(500);
+      expect(refused.body.error).toMatch(/Nothing was imported/);
+      expect(await repo.read('/projects/new/idea.md')).toBeNull();
+
+      publish.mockClear();
+      const applied = await importUpload(zip, `mode=apply&format=zip&planToken=${preview.body.plan.token}`);
+      expect(applied.status).toBe(200);
+      const stages = publish.mock.calls.map(([, e]) => (e.payload as { stage?: string }).stage);
+      expect(stages).toEqual(['requested', 'completed']);
+    });
+
+    it('rejects an unauthenticated upload before buffering it (#2236 review)', async () => {
+      // Larger than the 32 MiB import limit: a 413 would mean the body was read first.
+      const res = await app.inject({
+        method: 'POST', url: '/api/documents/import?mode=preview&format=zip',
+        headers: { 'content-type': 'application/zip' },
+        payload: Buffer.alloc(33 * 1024 * 1024),
+      });
+      expect(res.statusCode).toBe(401);
     });
 
     it('rejects an upload that is not a zip', async () => {

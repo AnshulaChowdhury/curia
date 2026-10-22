@@ -681,6 +681,8 @@ interface DocumentConsoleExportPayload extends DocumentConsoleActorFields {
 }
 
 interface DocumentConsoleImportPayload extends DocumentConsoleActorFields {
+  /** Two-stage like edits: `requested` carries the plan's counts, `completed` what landed. */
+  stage: 'requested' | 'completed';
   action: 'import';
   /** `bundle` for a zip, or the target path for a single-document upload. */
   scope: string;

@@ -341,6 +341,9 @@ function DocumentView({
 }) {
   const [editing, setEditingState] = useState(false);
   const setEditing = (next: boolean) => { setEditingState(next); onEditingChange(next); };
+  // An unmounted view has no open editor, whatever the last toggle said — e.g. after
+  // "+ New document" replaces the view and is cancelled, Import must not stay disabled.
+  useEffect(() => () => onEditingChange(false), [onEditingChange]);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const doc = data.document;
@@ -673,7 +676,7 @@ function ImportDialog({ targetPath, onClose, onApplied }: { targetPath: string |
         headers: { 'Content-Type': single ? 'text/markdown' : 'application/zip' },
         body: file,
       });
-      const data = await res.json() as { plan?: ImportPlanView; result?: ImportResultView; error?: string };
+      const data = await res.json() as { plan?: ImportPlanView; result?: ImportResultView; warnings?: string[]; error?: string };
       if (data.plan) setPlan(data.plan);
       if (!res.ok) {
         setError(data.error ?? `Import failed (${res.status})`);
@@ -681,6 +684,7 @@ function ImportDialog({ targetPath, onClose, onApplied }: { targetPath: string |
       }
       if (mode === 'apply' && data.result) {
         setResult(data.result);
+        if (data.warnings && data.warnings.length > 0) setError(data.warnings.join(' '));
         onApplied();
       }
     } catch (err) {
