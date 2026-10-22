@@ -28,7 +28,10 @@ export async function invokeVoiceToolAudited(params: {
   call: ToolCall;
   conversationId: string;
   sessionId: string;
-  /** The turn's inbound.message id; absent for a turn with no utterance. */
+  /**
+   * The turn's inbound.message id. Absent for a turn with no utterance, or one whose
+   * inbound.message failed to publish (so it has no audit row).
+   */
   turnEventId?: string;
   /** Runs the tool. Receives the tool.invoke id, for ExecutionLayer's parentEventId. */
   invoke: (invokeEventId: string) => Promise<ToolResult>;

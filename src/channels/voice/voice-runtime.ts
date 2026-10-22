@@ -1364,10 +1364,19 @@ export class VoiceRuntime {
       senderId: session.caller.senderId,
       content: sanitizeOutput(utterance),
     });
+    // publish() rejects only before or in the audit write-ahead, so a failed publish
+    // means no audit row for this id. Tool audit then parents on the session instead
+    // of pointing at a missing row. The tools still run: each call's own tool.invoke is
+    // written ahead, and a call whose invoke cannot be written does not run.
+    let turnEventId: string | undefined = inbound.id;
     try {
       await this.config.bus.publish('channel', inbound);
     } catch (err) {
-      this.log.warn({ sessionId: session.sessionId, err }, 'failed to publish voice inbound.message');
+      turnEventId = undefined;
+      this.log.warn(
+        { sessionId: session.sessionId, err },
+        'failed to publish voice inbound.message — this turn\'s tool audit parents on the session',
+      );
     }
 
     // Single authoritative history (#1551): reload prior turns from working_memory
@@ -1411,7 +1420,7 @@ export class VoiceRuntime {
       priorHistory: turnContext.history,
       contactRecent: turnContext.contactRecent,
       withTools: true,
-      turnEventId: inbound.id,
+      turnEventId,
       persistIncomplete: (spokenText) => this.persistIncompleteAssistantTurn(session, {
         inProcessContent: utterance,
         storedContent: storedUserContent,

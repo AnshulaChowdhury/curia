@@ -837,19 +837,37 @@ function percentile(sorted: number[], p: number): number | null {
 }
 
 /**
- * Per-arm turn latency over every rep, errored turns left out. `ttft` is the pause
+ * Stops where the turn failed rather than finished: the harness catch ('error'), a
+ * provider failure ('stream_error'), the 120 s timeout ('aborted') and an empty stream.
+ * Their timings are of a failure, not of a turn. 'exhausted' (round cap) stays in: the
+ * principal waits through it.
+ */
+const FAILED_STOPS: ReadonlySet<string> = new Set(['error', 'stream_error', 'aborted', 'empty_stream']);
+
+/**
+ * Per-arm turn latency over every rep, failed turns left out (`excluded` counts them,
+ * so `n` alone shows nothing was dropped silently). `ttft` is the pause
  * before the first spoken text, after any tool rounds that came first; that is the
  * silence the principal hears. Unlike the microbench, it covers real utterances.
  */
 function turnLatency(results: CaseResult[]) {
-  const byArm: Record<string, { n: number; ttftP50: number | null; ttftP90: number | null; fullP50: number | null; fullP90: number | null }> = {};
+  const byArm: Record<string, {
+    n: number;
+    excluded: number;
+    ttftP50: number | null;
+    ttftP90: number | null;
+    fullP50: number | null;
+    fullP90: number | null;
+  }> = {};
   for (const arm of ALL_ARMS) {
-    const rows = results.filter(r => r.arm === arm && r.stopReason !== 'error');
+    const armRows = results.filter(r => r.arm === arm);
+    const rows = armRows.filter(r => !FAILED_STOPS.has(r.stopReason));
     if (rows.length === 0) continue;
     const ttfts = rows.map(r => r.ttftMs).filter((n): n is number => n !== null).sort((a, b) => a - b);
     const fulls = rows.map(r => r.fullTurnMs).sort((a, b) => a - b);
     byArm[arm] = {
       n: rows.length,
+      excluded: armRows.length - rows.length,
       ttftP50: percentile(ttfts, 0.5),
       ttftP90: percentile(ttfts, 0.9),
       fullP50: percentile(fulls, 0.5),

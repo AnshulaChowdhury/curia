@@ -1703,6 +1703,7 @@
   "turnLatency": {
     "baseline": {
       "n": 95,
+      "excluded": 0,
       "ttftP50": 660,
       "ttftP90": 1267,
       "fullP50": 2577,
@@ -1710,6 +1711,7 @@
     },
     "shared-hardening": {
       "n": 95,
+      "excluded": 0,
       "ttftP50": 662,
       "ttftP90": 1612,
       "fullP50": 2498,
@@ -1717,6 +1719,7 @@
     },
     "slim-core": {
       "n": 95,
+      "excluded": 0,
       "ttftP50": 646,
       "ttftP90": 1264,
       "fullP50": 2067,
@@ -1724,6 +1727,7 @@
     },
     "slim-core-system": {
       "n": 95,
+      "excluded": 0,
       "ttftP50": 681,
       "ttftP90": 1356,
       "fullP50": 2391,
