@@ -10,7 +10,6 @@ import { EmbeddingService } from '../memory/embedding.js';
 import { MAX_ALIASES_PER_ENTITY } from '../memory/entity-memory.js';
 import { maxSensitivity } from '../memory/sensitivity.js';
 import type { DecayClass } from '../memory/types.js';
-import { DEDUP_SIMILARITY_THRESHOLD } from '../memory/validation.js';
 import { isStructuralContact, survivingTier } from '../contacts/contact-service.js';
 import type { ContactTier } from '../contacts/types.js';
 import {
@@ -73,9 +72,14 @@ function sortKeys(value: unknown): unknown {
   return value;
 }
 
-/** SHA-256 over the canonical snapshot (§3). Changes whenever anything the plan reads changes. */
-export function planToken(snapshot: MergeSnapshot): string {
-  return createHash('sha256').update(canonicalJson(snapshot)).digest('hex');
+/**
+ * SHA-256 over the canonical snapshot (§3) and the fact-similarity settings. Changes whenever
+ * anything the plan reads changes, including an embedding profile swapped between preview
+ * and apply, which would pair facts differently.
+ */
+export function planToken(snapshot: MergeSnapshot, similarity?: FactSimilarity): string {
+  const hashed = similarity ? { snapshot, similarity } : snapshot;
+  return createHash('sha256').update(canonicalJson(hashed)).digest('hex');
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +215,17 @@ function groupByAttribute(facts: SnapshotFact[]): Map<string, SnapshotFact[]> {
   return groups;
 }
 
-export function planFacts(survivor: MergeSide, absorbed: MergeSide): FactPlan {
+/**
+ * How to score two fact embeddings: only vectors stamped with `embeddingModel` are compared,
+ * at that model's fact-dedup threshold (ADR-051). Scores from different models, or a
+ * threshold from another model, mean nothing.
+ */
+export interface FactSimilarity {
+  embeddingModel: string;
+  threshold: number;
+}
+
+export function planFacts(survivor: MergeSide, absorbed: MergeSide, similarity?: FactSimilarity): FactPlan {
   const survivorFactIds = new Set(survivor.facts.map(f => f.node.id));
   const shared = absorbed.facts.filter(f => survivorFactIds.has(f.node.id));
   const absorbedOnly = absorbed.facts.filter(f => !survivorFactIds.has(f.node.id));
@@ -295,16 +309,19 @@ export function planFacts(survivor: MergeSide, absorbed: MergeSide): FactPlan {
 
   // 3. Near-duplicates by embedding. Greedy by similarity so each absorbed fact pairs with
   // its best match and each survivor fact with at most one absorbed fact. Survivor facts
-  // that already absorbed an exact duplicate are left out of pairing.
+  // that already absorbed an exact duplicate are left out of pairing. Without a
+  // FactSimilarity (no embedding profile) nothing is paired.
   const pairs: { s: SnapshotNode; a: SnapshotFact; similarity: number }[] = [];
-  for (const aFact of plainRemaining) {
-    const aEmb = aFact.node.embedding;
+  const comparable = (node: SnapshotNode): number[] | null =>
+    similarity && node.embeddingModel === similarity.embeddingModel ? node.embedding : null;
+  for (const aFact of similarity ? plainRemaining : []) {
+    const aEmb = comparable(aFact.node);
     if (!aEmb) continue;
     for (const s of survivorPlain) {
-      const sEmb = s.node.embedding;
+      const sEmb = comparable(s.node);
       if (!sEmb || sEmb.length !== aEmb.length || collapseTargets.has(s.node.id)) continue;
-      const similarity = EmbeddingService.cosineSimilarity(sEmb, aEmb);
-      if (similarity >= DEDUP_SIMILARITY_THRESHOLD) pairs.push({ s: s.node, a: aFact, similarity });
+      const score = EmbeddingService.cosineSimilarity(sEmb, aEmb);
+      if (score >= similarity!.threshold) pairs.push({ s: s.node, a: aFact, similarity: score });
     }
   }
   pairs.sort((x, y) =>
@@ -885,8 +902,9 @@ export function summaryCounts(edges: EdgePlan, facts: BuiltFactOperations): Merg
 // The plan
 // ---------------------------------------------------------------------------
 
-export function planNodeMerge(snapshot: MergeSnapshot): MergePlan {
-  const token = planToken(snapshot);
+/** `similarity` comes from the live embedding profile; without it no facts pair as near-duplicates. */
+export function planNodeMerge(snapshot: MergeSnapshot, similarity?: FactSimilarity): MergePlan {
+  const token = planToken(snapshot, similarity);
   const { survivor, absorbed } = snapshot;
   const s = survivor.node;
   const a = absorbed.node;
@@ -966,7 +984,7 @@ export function planNodeMerge(snapshot: MergeSnapshot): MergePlan {
   };
 
   // -- Facts and edges (§4.3–4.4) --
-  const facts = planFacts(survivor, absorbed);
+  const facts = planFacts(survivor, absorbed, similarity);
   const edges = planEdges(survivor, absorbed);
   // The preview summary describes the default choices. The timestamp is irrelevant to counts.
   const defaultOps = buildFactOperations(facts, { facts: {}, nearDuplicateFacts: {} }, s.lastConfirmedAt);

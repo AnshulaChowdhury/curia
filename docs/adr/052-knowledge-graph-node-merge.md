@@ -1,4 +1,4 @@
-# ADR-051: Knowledge-graph node merge — a previewed, single-transaction merge where the survivor's type is the result type
+# ADR-052: Knowledge-graph node merge — a previewed, single-transaction merge where the survivor's type is the result type
 
 Date: 2026-10-21
 Status: Accepted
@@ -62,7 +62,8 @@ The merge writes through new SQL that takes a `PoolClient` (`src/kg-merge/`), in
 transaction that also covers the contact merge. Facts and edges are *moved*: a fact's
 `relates_to` edge is re-pointed at the survivor, and the fact node keeps its id, embedding,
 timestamps and provenance. Duplicates are collapsed in place. The only embedding call is for
-the survivor's label if the label changes, and it happens before the transaction.
+the survivor's label if the label changes, and it happens before the transaction. The new
+vector is a `document` embedding stored with its model stamp (ADR-051).
 
 Rejected:
 
@@ -97,7 +98,8 @@ Rejected:
 ### Conflicts are surfaced, with server-computed defaults
 
 Contradictions are not resolved silently. Property conflicts, conflicting attribute facts,
-near-duplicate facts (cosine at least `DEDUP_SIMILARITY_THRESHOLD`), contact field conflicts
+near-duplicate facts (cosine at least the embedding profile's fact-dedup threshold, scored only
+between vectors from the live model, per ADR-051), contact field conflicts
 and auth-override conflicts each come back with a deterministic id and a default (newer
 `last_confirmed_at` wins, survivor on a tie; near-duplicates default to *merge*). The user
 can override any of them. Where a fact value loses, it is appended to the kept fact's

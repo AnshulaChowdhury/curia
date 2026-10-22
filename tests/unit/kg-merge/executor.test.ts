@@ -7,7 +7,6 @@ import type { ContactService } from '../../../src/contacts/contact-service.js';
 import type { Logger } from '../../../src/logger.js';
 import { executeMerge, MergeInvariantError } from '../../../src/kg-merge/executor.js';
 import { isUsableEmbedding } from '../../../src/kg-merge/service.js';
-import { EMBEDDING_DIMENSIONS } from '../../../src/memory/types.js';
 import type { ExecutionPlan } from '../../../src/kg-merge/types.js';
 import { A_ID, S_ID, uid } from './fixtures.js';
 
@@ -114,13 +113,15 @@ describe('executeMerge — invariants', () => {
 });
 
 describe('isUsableEmbedding', () => {
-  it('accepts only a finite vector of the column’s dimension', () => {
-    expect(isUsableEmbedding(new Array(EMBEDDING_DIMENSIONS).fill(0.1))).toBe(true);
-    expect(isUsableEmbedding(new Array(EMBEDDING_DIMENSIONS - 1).fill(0.1))).toBe(false);
-    expect(isUsableEmbedding([...new Array(EMBEDDING_DIMENSIONS - 1).fill(0.1), Number.NaN])).toBe(false);
-    expect(isUsableEmbedding([...new Array(EMBEDDING_DIMENSIONS - 1).fill(0.1), Infinity])).toBe(false);
-    expect(isUsableEmbedding([...new Array(EMBEDDING_DIMENSIONS - 1).fill(0.1), '0.1'])).toBe(false);
-    expect(isUsableEmbedding(null)).toBe(false);
-    expect(isUsableEmbedding('[0.1]')).toBe(false);
+  it('accepts only a finite vector of the profile’s dimension', () => {
+    const dims = 1536;
+    expect(isUsableEmbedding(new Array(dims).fill(0.1), dims)).toBe(true);
+    expect(isUsableEmbedding(new Array(dims - 1).fill(0.1), dims)).toBe(false);
+    expect(isUsableEmbedding(new Array(dims).fill(0.1), 1024)).toBe(false);
+    expect(isUsableEmbedding([...new Array(dims - 1).fill(0.1), Number.NaN], dims)).toBe(false);
+    expect(isUsableEmbedding([...new Array(dims - 1).fill(0.1), Infinity], dims)).toBe(false);
+    expect(isUsableEmbedding([...new Array(dims - 1).fill(0.1), '0.1'], dims)).toBe(false);
+    expect(isUsableEmbedding(null, dims)).toBe(false);
+    expect(isUsableEmbedding('[0.1]', dims)).toBe(false);
   });
 });

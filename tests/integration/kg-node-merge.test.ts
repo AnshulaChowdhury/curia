@@ -12,6 +12,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } 
 import pg from 'pg';
 import { ContactService } from '../../src/contacts/contact-service.js';
 import { EmbeddingService } from '../../src/memory/embedding.js';
+import { embeddingStamp } from '../../src/memory/embedding-profiles.js';
 import { createSilentLogger } from '../../src/logger.js';
 import type { EventBus } from '../../src/bus/bus.js';
 import type { BusEvent } from '../../src/bus/events.js';
@@ -150,8 +151,9 @@ describeIf('KG node merge (#2233)', () => {
   async function nodeRow(id: string) {
     const { rows } = await pool.query<{
       id: string; type: string; label: string; aliases: string[]; properties: Record<string, unknown>;
-      archived_at: Date | null; identity_source: string; embedding: string | null;
-    }>(`SELECT id, type, label, aliases, properties, archived_at, identity_source, embedding::text AS embedding FROM kg_nodes WHERE id = $1`, [id]);
+      archived_at: Date | null; identity_source: string; embedding: string | null; embedding_model: string | null;
+    }>(`SELECT id, type, label, aliases, properties, archived_at, identity_source, embedding::text AS embedding, embedding_model
+        FROM kg_nodes WHERE id = $1`, [id]);
     return rows[0];
   }
 
@@ -506,9 +508,10 @@ describeIf('KG node merge (#2233)', () => {
     const real = EmbeddingService.createForTesting();
     let injected: string | null = null;
     const racingEmbedder: Embedder = {
-      embed: async (text: string) => {
+      profile: real.profile,
+      embed: async (text, purpose) => {
         injected = await fact(a, 'Learned while the merge was embedding');
-        return real.embed(text);
+        return real.embed(text, purpose);
       },
     };
     const racing = serviceWith({ embedder: racingEmbedder });
@@ -550,7 +553,10 @@ describeIf('KG node merge (#2233)', () => {
     const real = EmbeddingService.createForTesting();
     const broken = serviceWith({
       pool: brokenPool,
-      embedder: { embed: async (text: string) => { await fact(a, 'Races the rollback test'); return real.embed(text); } },
+      embedder: {
+        profile: real.profile,
+        embed: async (text, purpose) => { await fact(a, 'Races the rollback test'); return real.embed(text, purpose); },
+      },
     });
 
     await expect(broken.apply({
@@ -579,12 +585,47 @@ describeIf('KG node merge (#2233)', () => {
     const s = await node('person', 'Embedding S');
     const a = await node('person', 'Embedding A');
     const preview = await service.preview(s, a);
-    const result = await serviceWith({ embedder: { embed: async () => [0.1, Number.NaN, 0.3] } })
+    const { profile } = EmbeddingService.createForTesting();
+    const result = await serviceWith({ embedder: { profile, embed: async () => [0.1, Number.NaN, 0.3] } })
       .apply({ survivorId: s, absorbedId: a, planToken: preview.planToken, resolutions: { label: 'absorbed' }, actor: null });
     expect(result.warnings).toEqual(['embedding_not_refreshed']);
     const survivor = await nodeRow(s);
     expect(survivor!.label).toBe(`Embedding A ${runId}`);
     expect(survivor!.embedding).toBeNull();
+    expect(survivor!.embedding_model).toBeNull();
+  });
+
+  it('re-embeds a renamed survivor as a document and stamps the vector with its model (ADR-051)', async () => {
+    const s = await node('person', 'Stamp S');
+    const a = await node('person', 'Stamp A');
+    const embedder = EmbeddingService.createForTesting();
+    const purposes: string[] = [];
+    const recording: Embedder = {
+      profile: embedder.profile,
+      embed: async (text, purpose) => { purposes.push(purpose); return embedder.embed(text, purpose); },
+    };
+    const merging = serviceWith({ embedder: recording });
+    const preview = await merging.preview(s, a);
+    const result = await merging.apply({
+      survivorId: s, absorbedId: a, planToken: preview.planToken, resolutions: { label: 'absorbed' }, actor: null,
+    });
+    expect(result.warnings).toEqual([]);
+    expect(purposes).toEqual(['document']);
+    const survivor = await nodeRow(s);
+    const expected = `[${(await embedder.embed(`Stamp A ${runId}`, 'document')).join(',')}]`;
+    const { rows } = await pool.query<{ v: string }>(`SELECT $1::vector::text AS v`, [expected]);
+    expect(survivor!.embedding).toBe(rows[0]!.v);
+    expect(survivor!.embedding_model).toBe(embeddingStamp(embedder.profile));
+  });
+
+  it('keeps the old vector and its stamp when the label does not change', async () => {
+    const s = await node('person', 'Unrenamed S');
+    const a = await node('person', 'Unrenamed A');
+    const { rows } = await pool.query<{ v: string }>(`SELECT array_fill(0.5, ARRAY[1536])::vector::text AS v`);
+    await pool.query(`UPDATE kg_nodes SET embedding = $1::vector, embedding_model = 'an-older-model' WHERE id = $2`, [rows[0]!.v, s]);
+    const preview = await service.preview(s, a);
+    await service.apply({ survivorId: s, absorbedId: a, planToken: preview.planToken, resolutions: {}, actor: null });
+    expect(await nodeRow(s)).toMatchObject({ embedding: rows[0]!.v, embedding_model: 'an-older-model' });
   });
 
   it('folded contacts that disagree where the survivor holds nothing: earliest field wins, deny wins', async () => {
@@ -696,27 +737,37 @@ describeIf('KG node merge (#2233)', () => {
 
   it('suggests live non-fact nodes of any type by label, alias and embedding', async () => {
     const embedder = EmbeddingService.createForTesting();
-    const vector = `[${(await embedder.embed(`acme-${runId}`)).join(',')}]`;
+    const vector = `[${(await embedder.embed(`acme-${runId}`, 'document')).join(',')}]`;
+    const stamp = embeddingStamp(embedder.profile);
 
     const base = await node('organization', 'Acme Corp');
     const sameLabel = await node('event', 'ACME CORP');
     const aliasHolder = await node('person', 'Acme Contact', { aliases: [`acme corp ${runId}`] });
     const similar = await node('project', 'Unrelated name');
+    // The same vector from another model is not comparable, however close it scores.
+    const otherModel = await node('project', 'Another model entirely');
     const archived = await node('concept', 'acme corp');
     await pool.query(`UPDATE kg_nodes SET archived_at = now() WHERE id = $1`, [archived]);
     await fact(base, `Acme Corp ${runId}`); // a fact with the same text is never a candidate
-    await pool.query(`UPDATE kg_nodes SET embedding = $1::vector WHERE id = ANY($2::uuid[])`, [vector, [base, similar]]);
+    await pool.query(`UPDATE kg_nodes SET embedding = $1::vector, embedding_model = $2 WHERE id = ANY($3::uuid[])`, [vector, stamp, [base, similar]]);
+    await pool.query(`UPDATE kg_nodes SET embedding = $1::vector, embedding_model = 'another-model' WHERE id = $2`, [vector, otherModel]);
 
     const candidates = await service.candidates(base, 8);
     const byId = new Map(candidates.map(c => [c.node.id, c]));
     expect(byId.get(sameLabel)).toMatchObject({ score: 1, reasons: ['same_label'] });
     expect(byId.get(aliasHolder)).toMatchObject({ score: 1, reasons: ['alias_match'] });
     expect(byId.get(similar)).toMatchObject({ reasons: ['similar_embedding'] });
-    expect(byId.get(similar)!.score).toBeGreaterThanOrEqual(0.8);
+    expect(byId.get(similar)!.score).toBeGreaterThanOrEqual(embedder.profile.thresholds.fuzzyAmbiguityFloor);
+    expect(byId.has(otherModel)).toBe(false);
     expect(byId.has(archived)).toBe(false);
     expect(byId.has(base)).toBe(false);
     expect(candidates.every(c => c.node.type !== 'fact')).toBe(true);
     expect(byId.get(sameLabel)!.node).toMatchObject({ type: 'event', identitySource: 'label', aliases: [] });
+
+    // Without an embedder (the knowledge graph's embedding gate is closed) no score is trusted.
+    const unscored = await serviceWith({ embedder: undefined }).candidates(base, 8);
+    expect(unscored.some(c => c.reasons.includes('similar_embedding'))).toBe(false);
+    expect(unscored.map(c => c.node.id)).toContain(sameLabel);
   });
 
   // -- 8. principal survivor ------------------------------------------------
@@ -765,5 +816,6 @@ describeIf('KG node merge (#2233)', () => {
     const survivor = await nodeRow(p);
     expect(survivor!.label).toBe(`Principal Duplicate ${runId}`);
     expect(survivor!.embedding).not.toBeNull();
+    expect(survivor!.embedding_model).toBe(embeddingStamp(EmbeddingService.createForTesting().profile));
   });
 });

@@ -10,6 +10,8 @@ import {
 } from '../../../src/kg-merge/planner.js';
 import {
   A_ID,
+  FACT_SIMILARITY,
+  TEST_EMBEDDING_MODEL,
   S_ID,
   basicPair,
   makeContact,
@@ -224,7 +226,7 @@ describe('planNodeMerge — facts', () => {
     const plan = planNodeMerge(makeSnapshot(
       makeSide(survivor, { facts: [s1, s2] }),
       makeSide(absorbed, { facts: [a1, aNull, aFar] }),
-    ));
+    ), FACT_SIMILARITY);
     expect(plan.preview.conflicts.nearDuplicateFacts).toHaveLength(1);
     const n = plan.preview.conflicts.nearDuplicateFacts[0]!;
     expect(n.id).toBe(nearDuplicateId(uid(100), uid(102)));
@@ -232,6 +234,39 @@ describe('planNodeMerge — facts', () => {
     expect(n.default).toBe('merge');
     expect(n.similarity).toBeGreaterThanOrEqual(0.92);
     expect(plan.facts.moves.map(m => m.fact.id).sort()).toEqual([uid(103), uid(104)]);
+  });
+
+  describe('scores only vectors from the live embedding model (ADR-051)', () => {
+    function sailingSnapshot(absorbedModel: string) {
+      const { survivor, absorbed } = basicPair();
+      const s = makeFact(uid(100), 'Enjoys sailing on weekends', {}, { embedding: [1, 0, 0] });
+      const a = makeFact(uid(102), 'Goes sailing at weekends', {}, { embedding: [0.999, 0.04, 0], embeddingModel: absorbedModel });
+      return makeSnapshot(makeSide(survivor, { facts: [s] }), makeSide(absorbed, { facts: [a] }));
+    }
+
+    it('does not pair a vector stamped with another model, however close', () => {
+      const plan = planNodeMerge(sailingSnapshot('another-model'), FACT_SIMILARITY);
+      expect(plan.preview.conflicts.nearDuplicateFacts).toEqual([]);
+      expect(plan.facts.moves.map(m => m.fact.id)).toEqual([uid(102)]);
+    });
+
+    it('uses the model’s own threshold', () => {
+      const snap = sailingSnapshot(TEST_EMBEDDING_MODEL);
+      expect(planNodeMerge(snap, FACT_SIMILARITY).preview.conflicts.nearDuplicateFacts).toHaveLength(1);
+      expect(planNodeMerge(snap, { ...FACT_SIMILARITY, threshold: 0.9999 }).preview.conflicts.nearDuplicateFacts).toEqual([]);
+    });
+
+    it('pairs nothing without an embedding profile', () => {
+      expect(planNodeMerge(sailingSnapshot(TEST_EMBEDDING_MODEL)).preview.conflicts.nearDuplicateFacts).toEqual([]);
+    });
+
+    it('changes the plan token when the profile changes between preview and apply', () => {
+      const snap = sailingSnapshot(TEST_EMBEDDING_MODEL);
+      const token = planNodeMerge(snap, FACT_SIMILARITY).planToken;
+      expect(planToken(snap, FACT_SIMILARITY)).toBe(token);
+      expect(planToken(snap, { ...FACT_SIMILARITY, threshold: 0.95 })).not.toBe(token);
+      expect(planToken(snap)).not.toBe(token);
+    });
   });
 });
 

@@ -14,11 +14,11 @@ import { createKgNodesMerged } from '../bus/events.js';
 import type { ContactService } from '../contacts/contact-service.js';
 import type { TaskOriginator } from '../contacts/types.js';
 import type { Logger } from '../logger.js';
-import { EMBEDDING_DIMENSIONS } from '../memory/types.js';
+import { embeddingStamp, type EmbeddingProfile, type EmbeddingPurpose } from '../memory/embedding-profiles.js';
 import { isUuid } from '../util/uuid.js';
 import { InvalidResolutionError, NodeNotFoundError, StalePreviewError } from './errors.js';
-import { executeMerge, type ExecutionOutcome } from './executor.js';
-import { planNodeMerge, planToken } from './planner.js';
+import { executeMerge, type ExecutionOutcome, type SurvivorEmbedding } from './executor.js';
+import { planNodeMerge, planToken, type FactSimilarity } from './planner.js';
 import { applyResolutions } from './resolve.js';
 import { loadMergeSnapshot, NODE_COLUMNS, toApiKgNode, type PgNodeRow } from './snapshot.js';
 import type {
@@ -29,13 +29,13 @@ import type {
   NodeMergeResult,
 } from './types.js';
 
-/** Embedding cosine at or above which a node is suggested as a likely duplicate (§8). */
-export const CANDIDATE_SIMILARITY_THRESHOLD = 0.8;
 export const MAX_CANDIDATES = 20;
 export const DEFAULT_CANDIDATES = 8;
 
+/** The slice of EmbeddingService the merge uses: the live profile and a document embed. */
 export interface Embedder {
-  embed(text: string): Promise<number[]>;
+  readonly profile: EmbeddingProfile;
+  embed(text: string, purpose: EmbeddingPurpose): Promise<number[]>;
 }
 
 export interface NodeMergeServiceDeps {
@@ -43,7 +43,11 @@ export interface NodeMergeServiceDeps {
   contactService: ContactService;
   bus: EventBus;
   logger: Logger;
-  /** Re-embeds a changed label. Optional: without it a label change keeps the old embedding. */
+  /**
+   * The knowledge graph's embedding service, present when its boot gate passed (ADR-051).
+   * Without it a label change keeps the old embedding, and neither near-duplicate facts nor
+   * embedding candidates are offered: a score means nothing without its model's threshold.
+   */
   embedder?: Embedder;
 }
 
@@ -65,12 +69,12 @@ export interface NodeMergeApi {
 
 /**
  * An embedder's output is only written when it is a vector the kg_nodes.embedding column
- * accepts: an array of EMBEDDING_DIMENSIONS finite numbers. Anything else is treated like
- * a failed embed call (the survivor keeps its old embedding) rather than failing the merge.
+ * accepts: an array of the profile's `dimensions` finite numbers. Anything else is treated
+ * like a failed embed call (the survivor keeps its old embedding) rather than failing the merge.
  */
-export function isUsableEmbedding(value: unknown): value is number[] {
+export function isUsableEmbedding(value: unknown, dimensions: number): value is number[] {
   return Array.isArray(value)
-    && value.length === EMBEDDING_DIMENSIONS
+    && value.length === dimensions
     && value.every(v => typeof v === 'number' && Number.isFinite(v));
 }
 
@@ -91,12 +95,20 @@ function validateIds(survivorId: string, absorbedId: string): { survivorId: stri
 }
 
 export class NodeMergeService implements NodeMergeApi {
-  constructor(private readonly deps: NodeMergeServiceDeps) {}
+  /** Fact near-duplicate scoring from the live profile, or undefined without an embedder. */
+  private readonly factSimilarity: FactSimilarity | undefined;
+
+  constructor(private readonly deps: NodeMergeServiceDeps) {
+    const profile = deps.embedder?.profile;
+    this.factSimilarity = profile
+      ? { embeddingModel: embeddingStamp(profile), threshold: profile.thresholds.factDedup }
+      : undefined;
+  }
 
   async preview(rawSurvivorId: string, rawAbsorbedId: string): Promise<NodeMergePreview> {
     const { survivorId, absorbedId } = validateIds(rawSurvivorId, rawAbsorbedId);
     const snapshot = await loadMergeSnapshot(this.deps.pool, survivorId, absorbedId, { forUpdate: false });
-    return planNodeMerge(snapshot).preview;
+    return planNodeMerge(snapshot, this.factSimilarity).preview;
   }
 
   async apply(input: ApplyNodeMergeInput): Promise<NodeMergeResult> {
@@ -105,25 +117,28 @@ export class NodeMergeService implements NodeMergeApi {
 
     // 1–2. Plan from unlocked data; a changed graph fails fast, before any lock is taken.
     const snapshot = await loadMergeSnapshot(this.deps.pool, survivorId, absorbedId, { forUpdate: false });
-    const plan = planNodeMerge(snapshot);
+    const plan = planNodeMerge(snapshot, this.factSimilarity);
     if (plan.planToken !== input.planToken) throw new StalePreviewError();
     const exec = applyResolutions(plan, input.resolutions);
 
     // 3. Embedding for a changed label, outside the transaction.
     const warnings: string[] = [];
-    let embedding: number[] | null = null;
+    let embedding: SurvivorEmbedding | null = null;
     if (exec.node.labelChanged) {
-      if (!this.deps.embedder) {
+      const embedder = this.deps.embedder;
+      if (!embedder) {
         log.warn('kg-merge: no embedder configured — survivor keeps its old embedding after the rename');
         warnings.push('embedding_not_refreshed');
       } else {
+        const { dimensions } = embedder.profile;
         try {
-          const candidate: unknown = await this.deps.embedder.embed(exec.node.label);
-          if (isUsableEmbedding(candidate)) {
-            embedding = candidate;
+          // 'document': the purpose every stored label is embedded with (ADR-051).
+          const candidate: unknown = await embedder.embed(exec.node.label, 'document');
+          if (isUsableEmbedding(candidate, dimensions)) {
+            embedding = { vector: candidate, model: embeddingStamp(embedder.profile) };
           } else {
             log.warn(
-              { length: Array.isArray(candidate) ? candidate.length : null, expected: EMBEDDING_DIMENSIONS },
+              { length: Array.isArray(candidate) ? candidate.length : null, expected: dimensions },
               'kg-merge: embedder returned an invalid vector — survivor keeps its old embedding',
             );
             warnings.push('embedding_not_refreshed');
@@ -144,7 +159,7 @@ export class NodeMergeService implements NodeMergeApi {
     try {
       await client.query('BEGIN');
       const locked = await loadMergeSnapshot(client, survivorId, absorbedId, { forUpdate: true });
-      if (planToken(locked) !== plan.planToken) throw new StalePreviewError();
+      if (planToken(locked, this.factSimilarity) !== plan.planToken) throw new StalePreviewError();
       outcome = await executeMerge(client, exec, embedding, { contactService: this.deps.contactService, logger: log });
       await client.query('COMMIT');
     } catch (err) {
@@ -224,7 +239,9 @@ export class NodeMergeService implements NodeMergeApi {
 
   /**
    * Likely duplicates of a node, of any type (§8): label/alias equality in either direction
-   * (score 1.0), then embedding neighbours at cosine ≥ 0.80 via the HNSW index.
+   * (score 1.0), then embedding neighbours via the HNSW index at or above the profile's
+   * fuzzy ambiguity floor, the score where entity resolution starts asking (ADR-051). Only
+   * vectors from the live model are compared; without an embedder, none are.
    */
   async candidates(nodeId: string, limit: number = DEFAULT_CANDIDATES): Promise<MergeCandidate[]> {
     if (!isUuid(nodeId)) {
@@ -259,17 +276,20 @@ export class NodeMergeService implements NodeMergeApi {
       found.set(row.id, { node: toApiKgNode(row), score: 1, reasons });
     }
 
-    if (node.embedding) {
+    const profile = this.deps.embedder?.profile;
+    const model = profile ? embeddingStamp(profile) : null;
+    if (profile && node.embedding && node.embedding_model === model) {
       const similar = await pool.query<PgNodeRow & { similarity: number }>(
         `SELECT ${NODE_COLUMNS}, 1 - (embedding <=> $1::vector) AS similarity
          FROM kg_nodes
-         WHERE embedding IS NOT NULL AND archived_at IS NULL AND type <> 'fact' AND id <> $2
+         WHERE embedding IS NOT NULL AND embedding_model = $4
+           AND archived_at IS NULL AND type <> 'fact' AND id <> $2
          ORDER BY embedding <=> $1::vector
          LIMIT $3`,
-        [node.embedding, nodeId, cap * 3],
+        [node.embedding, nodeId, cap * 3, model],
       );
       for (const row of similar.rows) {
-        if (row.similarity < CANDIDATE_SIMILARITY_THRESHOLD) continue;
+        if (row.similarity < profile.thresholds.fuzzyAmbiguityFloor) continue;
         const existing = found.get(row.id);
         if (existing) {
           existing.reasons.push('similar_embedding');

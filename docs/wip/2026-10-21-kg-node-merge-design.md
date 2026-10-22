@@ -116,8 +116,8 @@ A fact linked to both sides is kept once, and the absorbed side's link is droppe
    - **Exact duplicate** labels are collapsed automatically, as above.
      Normalization: lower-case, collapse whitespace, strip trailing `.`/`!`.
    - **Near-duplicates**: cosine similarity of the two fact embeddings is at
-     least `DEDUP_SIMILARITY_THRESHOLD` (0.92, `src/memory/validation.ts`;
-     export it). The options are `merge | keep_both`, and the default is
+     least the embedding profile's `factDedup` threshold (ADR-051). Only
+     vectors stamped with the live model are compared. The options are `merge | keep_both`, and the default is
      `merge`, which keeps the higher-confidence fact and treats the pair as an
      exact duplicate. Pairs with a null embedding are skipped. Each absorbed fact
      pairs with at most one survivor fact (its best match).
@@ -302,7 +302,8 @@ Returns `{ candidates: { node: ApiKgNode, score: number, reasons: ('same_label'|
   type (cross-type duplicates are the point).
 - A case-insensitive label or alias equality match in either direction scores
   1.0.
-- Embedding cosine of at least 0.80 scores the similarity. This uses the HNSW
+- Embedding cosine at or above the profile's `fuzzyAmbiguityFloor` scores the
+  similarity, between vectors stamped with the live model. This uses the HNSW
   index, ordered and limited.
 - The two sets are unioned and sorted by score.
 
@@ -555,7 +556,7 @@ round. No migration is needed.
 - **`apps/console/src/pages/kg-merge-utils.test.ts`**.
 
 ## 13. Docs
-- ADR-051 "Knowledge-graph node merge", with a row in the ADR README.
+- ADR-052 "Knowledge-graph node merge", with a row in the ADR README.
 - Spec 12: a "Merging nodes" section.
 - Spec 09: the merge now carries all contact references.
 - CHANGELOG `[Unreleased]`:
@@ -584,3 +585,9 @@ round. No migration is needed.
   - **Principal audit:** `kg.nodes_merged` records `principalIdentitiesTransferred` and `principalPrimaryFieldsFilled`. The acknowledgement details list any primary email or phone that will be filled.
   - **Archived nodes:** `GET /api/kg/nodes` hides only merge tombstones, as `/graph` does, and carries `archived`.
   - **Schema guard:** `tests/integration/kg-merge-schema-guard.test.ts` fails when a new foreign key to `contacts` or `kg_nodes` is not handled by the merge.
+- **Rebased onto per-model embeddings (#2225, ADR-051):**
+  - The ADR is now ADR-052; #2225 took 051.
+  - A renamed survivor is embedded with the `document` purpose. Its vector is written together with `embedding_model`, as migration 103's CHECK requires, and is checked against the profile's width.
+  - Near-duplicate facts use the profile's `factDedup` threshold and compare only vectors stamped with the live model. The settings are part of the plan token.
+  - Embedding candidates use the profile's `fuzzyAmbiguityFloor`, about where entity resolution starts asking, and compare only vectors from the live model. The old fixed 0.80 matched no calibrated value.
+  - The merge service gets the embedding service only when the knowledge graph's boot gate passed. Without it, merges still run: a rename keeps the old vector with a warning, and no near-duplicate facts or embedding candidates are offered.

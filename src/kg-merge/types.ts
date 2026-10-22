@@ -42,6 +42,8 @@ export interface SnapshotNode {
   label: string;
   properties: Record<string, unknown>;
   embedding: number[] | null;
+  /** embeddingStamp() of the model that made `embedding`; null exactly when it is (migration 103). */
+  embeddingModel: string | null;
   confidence: number;
   decayClass: DecayClass;
   source: string;

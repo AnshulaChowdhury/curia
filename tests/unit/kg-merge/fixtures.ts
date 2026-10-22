@@ -9,6 +9,7 @@ import type {
   SnapshotNode,
 } from '../../../src/kg-merge/types.js';
 import { CONTACT_MERGE_FIELDS } from '../../../src/kg-merge/types.js';
+import type { FactSimilarity } from '../../../src/kg-merge/planner.js';
 
 /** Deterministic UUID-shaped id from a number. */
 export function uid(n: number): string {
@@ -18,12 +19,17 @@ export function uid(n: number): string {
 export const S_ID = uid(1);
 export const A_ID = uid(2);
 
+/** The stamp makeNode gives a node that has an embedding, and the model FACT_SIMILARITY scores. */
+export const TEST_EMBEDDING_MODEL = 'test-embedding-model';
+export const FACT_SIMILARITY: FactSimilarity = { embeddingModel: TEST_EMBEDDING_MODEL, threshold: 0.92 };
+
 export function makeNode(overrides: Partial<SnapshotNode> & { id: string }): SnapshotNode {
   return {
     type: 'person',
     label: 'Node',
     properties: {},
     embedding: null,
+    embeddingModel: overrides.embedding ? TEST_EMBEDDING_MODEL : null,
     confidence: 0.7,
     decayClass: 'slow_decay',
     source: 'test',

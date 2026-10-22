@@ -57,10 +57,16 @@ function expectRows(actual: number | null, expected: number, what: string): void
   }
 }
 
+/** A renamed survivor's new vector and the stamp it is stored with (migration 103). */
+export interface SurvivorEmbedding {
+  vector: number[];
+  model: string;
+}
+
 export async function executeMerge(
   client: DbPoolClient,
   plan: ExecutionPlan,
-  embedding: number[] | null,
+  embedding: SurvivorEmbedding | null,
   deps: ExecutorDeps,
 ): Promise<ExecutionOutcome> {
   const { survivorId, absorbedId } = plan;
@@ -171,14 +177,16 @@ export async function executeMerge(
   );
   expectRows(archived.rowCount, 1, `archive absorbed node ${absorbedId}`);
 
-  // 5. Survivor node (§4.1). The embedding is replaced only when a new one was computed.
+  // 5. Survivor node (§4.1). The embedding and its model stamp are replaced together, and
+  // only when a new vector was computed: migration 103's CHECK rejects one without the other.
   const node = plan.node;
   const updated = await client.query<PgNodeRow>(
     `UPDATE kg_nodes
      SET label = $2, aliases = $3, properties = $4::jsonb, confidence = $5, decay_class = $6,
          sensitivity = $7, created_at = $8, last_confirmed_at = $9, warned_at = $10,
          warn_reason = $11, identity_source = $12,
-         embedding = COALESCE($13::vector, embedding)
+         embedding = COALESCE($13::vector, embedding),
+         embedding_model = CASE WHEN $13::vector IS NULL THEN embedding_model ELSE $14 END
      WHERE id = $1
      RETURNING ${NODE_COLUMNS}`,
     [
@@ -194,7 +202,8 @@ export async function executeMerge(
       node.warnedAt,
       node.warnReason,
       node.identitySource,
-      embedding ? `[${embedding.join(',')}]` : null,
+      embedding ? `[${embedding.vector.join(',')}]` : null,
+      embedding?.model ?? null,
     ],
   );
   const row = updated.rows[0];

@@ -34,6 +34,7 @@ export interface PgNodeRow {
   label: string;
   properties: Record<string, unknown>;
   embedding: string | null;
+  embedding_model: string | null;
   confidence: number;
   decay_class: string;
   source: string;
@@ -92,8 +93,8 @@ interface PgContactRow {
 }
 
 /** Node columns, with the vector as text so it parses without a pgvector type parser. */
-export const NODE_COLUMNS = `id, type, label, properties, embedding::text AS embedding, confidence, decay_class,
-  source, sensitivity, created_at, last_confirmed_at, archived_at, warned_at, warn_reason, aliases, identity_source`;
+export const NODE_COLUMNS = `id, type, label, properties, embedding::text AS embedding, embedding_model, confidence,
+  decay_class, source, sensitivity, created_at, last_confirmed_at, archived_at, warned_at, warn_reason, aliases, identity_source`;
 
 const NODES_SQL = `SELECT ${NODE_COLUMNS} FROM kg_nodes WHERE id = ANY($1::uuid[]) ORDER BY id`;
 const NODES_FOR_UPDATE_SQL = `${NODES_SQL} FOR UPDATE`;
@@ -142,6 +143,7 @@ export function rowToSnapshotNode(row: PgNodeRow): SnapshotNode {
     label: row.label,
     properties: row.properties ?? {},
     embedding: row.embedding ? parseVector(row.embedding) : null,
+    embeddingModel: row.embedding_model,
     confidence: row.confidence,
     decayClass: row.decay_class as DecayClass,
     source: row.source,

@@ -6,6 +6,7 @@ import { InvalidResolutionError, MergeBlockedError } from '../../../src/kg-merge
 import type { MergePlan } from '../../../src/kg-merge/types.js';
 import {
   A_ID,
+  FACT_SIMILARITY,
   S_ID,
   basicPair,
   makeContact,
@@ -144,7 +145,7 @@ describe('applyResolutions — near-duplicates', () => {
     const { survivor, absorbed } = basicPair();
     const s = makeFact(uid(100), 'Enjoys sailing', {}, { embedding: [1, 0], confidence: sConf });
     const a = makeFact(uid(101), 'Goes sailing', {}, { embedding: [0.999, 0.03], confidence: aConf });
-    return planNodeMerge(makeSnapshot(makeSide(survivor, { facts: [s] }), makeSide(absorbed, { facts: [a] })));
+    return planNodeMerge(makeSnapshot(makeSide(survivor, { facts: [s] }), makeSide(absorbed, { facts: [a] })), FACT_SIMILARITY);
   }
 
   it('merge (default) keeps the higher-confidence fact', () => {

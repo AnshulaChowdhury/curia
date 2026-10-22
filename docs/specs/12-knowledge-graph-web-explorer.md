@@ -62,7 +62,7 @@ On default mount, the explorer loads the **principal's 2-hop neighborhood** so t
 
 ## Merging nodes
 
-The graph accumulates duplicates: two `person` nodes for one human, or an `event` called "Acme" that is really the organization. The node detail drawer has a **Merge…** button (hidden for `fact` nodes, disabled for the agent node) that merges the open node with a second one. The decision record is [ADR-051](../adr/051-knowledge-graph-node-merge.md); the design is `docs/wip/2026-10-21-kg-node-merge-design.md`.
+The graph accumulates duplicates: two `person` nodes for one human, or an `event` called "Acme" that is really the organization. The node detail drawer has a **Merge…** button (hidden for `fact` nodes, disabled for the agent node) that merges the open node with a second one. The decision record is [ADR-052](../adr/052-knowledge-graph-node-merge.md); the design is `docs/wip/2026-10-21-kg-node-merge-design.md`.
 
 ### User flow
 
@@ -88,18 +88,18 @@ A deep link to the absorbed node's id receives `404 node_merged`; the console fo
 | 422 | `blocked` | One or more blockers (`blockers` lists them) |
 | 503 | `unavailable` | The merge service is not wired on this server |
 
-`GET /api/kg/nodes/:id/merge-candidates` returns `{ candidates: [{ node, score, reasons }] }` for live non-fact nodes of any type: a case-insensitive label or alias match scores 1.0, and an embedding cosine of at least 0.80 scores the similarity.
+`GET /api/kg/nodes/:id/merge-candidates` returns `{ candidates: [{ node, score, reasons }] }` for live non-fact nodes of any type: a case-insensitive label or alias match scores 1.0, and an embedding cosine at or above the embedding profile's fuzzy ambiguity floor scores the similarity. Only vectors from the live model are compared, and with entity memory off no embedding candidates are offered.
 
 ### Survivorship (summary)
 
 - **Node.** The survivor keeps its id and type. The label is the user's choice (the other becomes an alias); aliases are unioned and capped at `MAX_ALIASES_PER_ENTITY`; properties are unioned, and a key with different values is a conflict (default: newer `last_confirmed_at`, survivor on a tie). Confidence, `last_confirmed_at` and `sensitivity` take the max (sensitivity never goes down), `decay_class` the most durable, `created_at` the min.
-- **Facts.** Attribute facts with the same value collapse; different values are a conflict (survivor, absorbed or both; a dropped value is appended to `previous_values`, and the kept fact takes the higher sensitivity of the two). A deleted fact node's own `previous_values` history moves to the kept fact. Exact and near-duplicate (cosine at least `DEDUP_SIMILARITY_THRESHOLD`) non-attribute facts collapse. Every other absorbed fact moves to the survivor unchanged, with no re-embedding.
+- **Facts.** Attribute facts with the same value collapse; different values are a conflict (survivor, absorbed or both; a dropped value is appended to `previous_values`, and the kept fact takes the higher sensitivity of the two). A deleted fact node's own `previous_values` history moves to the kept fact. Exact and near-duplicate (cosine at least the embedding profile's fact-dedup threshold, between vectors from the live model) non-attribute facts collapse. Every other absorbed fact moves to the survivor unchanged, with no re-embedding.
 - **Edges.** An edge between the two nodes is dropped, an edge that collides with a survivor edge is collapsed, and the rest are re-pointed.
 - **Contacts.** By survivor type: a `person` survivor folds all contacts into one (see spec 09, *Merging contacts*); an `organization` survivor re-points the absorbed contacts without merging them; any other type refuses an absorbed node that has contacts. When several folded contacts disagree and the survivor has no value, a denied override beats a grant and the earliest contact wins a field; a `contacts_disagree` warning lists each case.
 - **Guards.** The agent node blocks a merge on either side; the principal's node cannot be the absorbed side; as survivor it needs the identity-transfer acknowledgement.
 - **Absorbed node.** Archived as a tombstone with `properties.merged_into` and `merged_at`, not deleted.
 
-The whole apply is one Postgres transaction. Known limitation: a concurrent writer that resolved the absorbed node before the lock can attach an edge to the tombstone after the commit; the tombstone's `merged_into` makes it visible (ADR-051).
+The whole apply is one Postgres transaction. Known limitation: a concurrent writer that resolved the absorbed node before the lock can attach an edge to the tombstone after the commit; the tombstone's `merged_into` makes it visible (ADR-052).
 
 ### Audit
 
