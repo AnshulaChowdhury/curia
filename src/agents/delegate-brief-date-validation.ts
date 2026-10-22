@@ -199,12 +199,16 @@ export function validateDelegateBriefDates(
   const needsResolved = calendarBriefNeedsResolvedDate(task);
   const hasDateLike = briefHasDateLikeContent(task);
 
-  // Relative/day-of-week asks must call date-resolve this turn.
+  // Relative/day-of-week asks must call date-resolve this turn. The error names the next step
+  // (#2227): with the bare refusal, a coordinator sometimes gave up on the calendar and went
+  // on without reading it (scenario 25k: a booking-page slot picked blind, 2 of 9 runs).
   if (needsResolved && priorDateResolves.length === 0) {
     return {
       ok: false,
       error:
-        'Calendar specialist requires date-resolve first — no resolved date was produced this turn',
+        'Calendar specialist requires date-resolve first — no resolved date was produced this turn. ' +
+        'Call date-resolve for the days the brief names ("next week", "Monday"), then delegate again ' +
+        'with the resolved dates in the brief.',
     };
   }
 
