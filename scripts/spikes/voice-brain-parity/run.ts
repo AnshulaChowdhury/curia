@@ -9,6 +9,8 @@
 //   slim-core          — the coordinator's production system string
 //                        (assembleAgent + buildBaseSystemPrompt) with a voice
 //                        module heading the caller's message as turn guidance
+//   slim-core-system   — the same core with the voice module and outbound
+//                        context appended to the system string instead
 //   full-consolidation — coordinator.yaml system_prompt + spoken addendum
 //                        (ADR-038's arm; off by default since #1968, ARMS= to run)
 //
@@ -23,11 +25,22 @@
 //   ANTHROPIC_API_KEY=... pnpm exec tsx scripts/spikes/voice-brain-parity/run.ts
 //   ARM=slim-core CASE=date-next-tuesday pnpm exec tsx ...
 //   ARMS=baseline,full-consolidation REPS=5 pnpm exec tsx ...
+//   VOICE_SPIKE_MODEL=claude-haiku-5-5 REPS=5 pnpm exec tsx ...   (writes variance.<model>.json)
+//
+// Every LLM call's usage is metered per arm and priced from the model registry;
+// the totals land in the variance file under `spend`.
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import * as yaml from 'js-yaml';
-import { loadProductionVoiceContext, renderVoiceTurnGuidance, type ProductionVoiceContext } from './production-context.js';
+import {
+  loadProductionVoiceContext,
+  meterProvider,
+  modelArtifactPath,
+  renderVoiceSystemModule,
+  renderVoiceTurnGuidance,
+  type ProductionVoiceContext,
+} from './production-context.js';
 import { AnthropicProvider } from '../../../src/agents/llm/anthropic.js';
 import { ModelRegistry } from '../../../src/agents/llm/model-registry.js';
 import { estimateTokens } from '../../../src/agents/llm/token-estimator.js';
@@ -35,7 +48,7 @@ import {
   DEFAULT_STREAMING_MAX_ROUNDS,
   runStreamingToolLoop,
 } from '../../../src/agents/llm/streaming-turn.js';
-import type { Message, ToolCall } from '../../../src/agents/llm/provider.js';
+import type { LLMProvider, Message, ToolCall } from '../../../src/agents/llm/provider.js';
 import {
   DATE_RESOLVE_GUARDRAIL,
   PRONOUN_RESOLUTION_GUARDRAIL,
@@ -61,16 +74,17 @@ import pino from 'pino';
 
 const REPO_ROOT = resolve(import.meta.dirname, '../../..');
 const FIXTURES_PATH = resolve(import.meta.dirname, 'fixtures.json');
-const RESULTS_PATH = resolve(import.meta.dirname, 'results.json');
+
 const COORDINATOR_YAML = resolve(REPO_ROOT, 'agents/coordinator.yaml');
 const VOICE_MODEL = process.env.VOICE_SPIKE_MODEL ?? 'claude-haiku-4-5';
 const ARM_FILTER = process.env.ARM?.trim() || null;
-const ALL_ARMS = ['baseline', 'shared-hardening', 'slim-core', 'full-consolidation'] as const;
-const DEFAULT_ARMS: ArmId[] = ['baseline', 'shared-hardening', 'slim-core'];
+const ALL_ARMS = ['baseline', 'shared-hardening', 'slim-core', 'slim-core-system', 'full-consolidation'] as const;
+const DEFAULT_ARMS: ArmId[] = ['baseline', 'shared-hardening', 'slim-core', 'slim-core-system'];
 const ARMS_ENV = process.env.ARMS?.split(',').map(a => a.trim()).filter(Boolean) ?? null;
 const CASE_FILTER = process.env.CASE?.trim() || null;
 const REPS = Math.max(1, Number(process.env.REPS ?? 1) || 1);
-const VARIANCE_PATH = resolve(import.meta.dirname, 'variance.json');
+const VARIANCE_PATH = modelArtifactPath(import.meta.dirname, 'variance', VOICE_MODEL);
+const RESULTS_PATH = modelArtifactPath(import.meta.dirname, 'results', VOICE_MODEL);
 
 interface HistoryTurn {
   role: 'user' | 'assistant';
@@ -215,10 +229,19 @@ async function buildPrompts(
   // guardrail, time, turn budget — unchanged, so one cached prefix serves every
   // channel. The voice module rides the user turn as turn guidance (#1959), and
   // outbound context heads the user turn as the dispatcher puts it on text turns.
+  const coreSystem = await ctx.coordinatorSystemPrompt(now);
   const slimCore: ArmPrompt = {
-    system: await ctx.coordinatorSystemPrompt(now),
+    system: coreSystem,
     turnGuidance: renderVoiceTurnGuidance(),
     outboundInUserTurn: outbound,
+  };
+  // Slim core, voice-owned system string: what a voice migration would most likely
+  // ship. The voice module and outbound context sit where the voice prompt keeps
+  // them — in the system string — and the caller's message is just the utterance.
+  const slimCoreSystem: ArmPrompt = {
+    system: [coreSystem, renderVoiceSystemModule(), ...(outbound ? [outbound] : [])].join('\n\n'),
+    turnGuidance: null,
+    outboundInUserTurn: null,
   };
 
   const voicePrompt = (system: string): ArmPrompt => ({ system, turnGuidance: null, outboundInUserTurn: null });
@@ -226,6 +249,7 @@ async function buildPrompts(
     baseline: voicePrompt(baseline),
     'shared-hardening': voicePrompt(sharedHardening),
     'slim-core': slimCore,
+    'slim-core-system': slimCoreSystem,
     'full-consolidation': voicePrompt(fullConsolidation),
   };
 }
@@ -707,7 +731,7 @@ async function runCase(
   prompt: ArmPrompt,
   fixture: FixtureCase,
   fixtures: Fixtures,
-  provider: AnthropicProvider,
+  provider: LLMProvider,
   ctx: ProductionVoiceContext,
 ): Promise<CaseResult> {
   // Fresh dedup map per case so real async-offramp enqueues don't collide across fixtures.
@@ -930,6 +954,10 @@ function aggregateVariance(reps: RepSummary[], arms: ArmId[]) {
     { key: 'slim-core−shared-hardening', a: 'slim-core', b: 'shared-hardening' },
     { key: 'slim-core−baseline', a: 'slim-core', b: 'baseline' },
     { key: 'slim-core−full-consolidation', a: 'slim-core', b: 'full-consolidation' },
+    // Placement: does moving the voice module into the system string rescue slim-core?
+    { key: 'slim-core-system−baseline', a: 'slim-core-system', b: 'baseline' },
+    { key: 'slim-core-system−shared-hardening', a: 'slim-core-system', b: 'shared-hardening' },
+    { key: 'slim-core-system−slim-core', a: 'slim-core-system', b: 'slim-core' },
   ];
   const pairs = allPairs.filter(p => arms.includes(p.a) && arms.includes(p.b));
 
@@ -1020,7 +1048,7 @@ async function main(): Promise<void> {
   const fixtures = JSON.parse(readFileSync(FIXTURES_PATH, 'utf8')) as Fixtures;
   const cases = fixtures.cases.filter(c => !CASE_FILTER || c.id === CASE_FILTER);
   const logger = createSilentLogger();
-  const provider = new AnthropicProvider(apiKey, logger, new ModelRegistry(logger));
+  const { provider, meter } = meterProvider(new AnthropicProvider(apiKey, logger, new ModelRegistry(logger)), VOICE_MODEL);
 
   const ctx = loadProductionVoiceContext({
     identityBlock: fixtures.identityBlock,
@@ -1049,6 +1077,7 @@ async function main(): Promise<void> {
       const prompts = await buildPrompts(fixtures, outbound, ctx);
       for (const arm of arms) {
         process.stderr.write(`  [r${rep}:${arm}] ${fixture.id} ... `);
+        meter.bucket = arm;
         try {
           const row = await runCase(arm, prompts[arm], fixture, fixtures, provider, ctx);
           results.push(row);
@@ -1123,7 +1152,14 @@ async function main(): Promise<void> {
   };
   writeFileSync(RESULTS_PATH, JSON.stringify(out, null, 2));
   if (variance) {
-    writeFileSync(VARIANCE_PATH, JSON.stringify({ generatedAt: out.generatedAt, model: VOICE_MODEL, ...variance }, null, 2));
+    writeFileSync(
+      VARIANCE_PATH,
+      JSON.stringify(
+        { generatedAt: out.generatedAt, model: VOICE_MODEL, ...variance, spend: { totalUsd: meter.totalUsd(), byArm: meter.totals } },
+        null,
+        2,
+      ),
+    );
     process.stderr.write(`\nWrote ${VARIANCE_PATH}\n`);
     process.stderr.write(JSON.stringify(variance.overall, null, 2) + '\n');
     process.stderr.write('paired check-rate deltas (a−b):\n');
@@ -1144,7 +1180,7 @@ async function main(): Promise<void> {
           `  ${cat}/${arm}: mean=${stats.checkPassRateMean} [${stats.checkPassRateMin},${stats.checkPassRateMax}]${sep}\n`,
         );
       }
-      for (const key of ['shared-hardening−baseline', 'slim-core−shared-hardening', 'slim-core−baseline']) {
+      for (const key of ['shared-hardening−baseline', 'slim-core−shared-hardening', 'slim-core−baseline', 'slim-core-system−baseline', 'slim-core-system−slim-core']) {
         const paired = variance.paired.byCategory[cat]?.[key];
         if (paired) {
           process.stderr.write(`  ${cat} paired ${key}: mean=${paired.mean} win=${paired.pairedWin}\n`);
@@ -1152,6 +1188,7 @@ async function main(): Promise<void> {
       }
     }
   }
+  process.stderr.write(`\nSpend (estimated from registry pricing): $${meter.totalUsd()} ${JSON.stringify(meter.totals)}\n`);
   process.stderr.write(`\nWrote ${RESULTS_PATH}\n`);
   process.stderr.write(JSON.stringify(summary, null, 2) + '\n');
 }

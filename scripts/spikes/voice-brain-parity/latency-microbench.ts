@@ -37,14 +37,20 @@ import {
 } from '../../../src/channels/voice/voice-runtime.js';
 import { createSilentLogger } from '../../../src/logger.js';
 import { formatTimeContextBlock } from '../../../src/time/time-context.js';
-import { loadProductionVoiceContext, renderVoiceTurnGuidance } from './production-context.js';
+import { createEstimateCostUsd } from '../../../src/agents/llm/pricing.js';
+import {
+  loadProductionVoiceContext,
+  modelArtifactPath,
+  renderVoiceSystemModule,
+  renderVoiceTurnGuidance,
+} from './production-context.js';
 
 const REPS = Number(process.env.REPS ?? 10);
 const MODEL = process.env.VOICE_SPIKE_MODEL ?? 'claude-haiku-4-5';
-const OUT = resolve(import.meta.dirname, 'latency-microbench.json');
+const OUT = modelArtifactPath(import.meta.dirname, 'latency-microbench', MODEL);
 const UTTERANCE = 'Thanks, that is all for now.';
 
-type ArmId = 'baseline' | 'shared-hardening' | 'slim-core';
+type ArmId = 'baseline' | 'shared-hardening' | 'slim-core' | 'slim-core-system';
 type ToolSetId = 'none' | 'voice' | 'coordinator';
 
 /** The cells worth paying for: #1968's before/after on the production prompt, and every arm on voice's tools. */
@@ -56,6 +62,7 @@ const CELLS: Array<{ arm: ArmId; tools: ToolSetId }> = [
   { arm: 'shared-hardening', tools: 'voice' },
   { arm: 'slim-core', tools: 'none' },
   { arm: 'slim-core', tools: 'voice' },
+  { arm: 'slim-core-system', tools: 'voice' },
 ];
 
 interface ArmPrompt {
@@ -74,8 +81,10 @@ interface Row {
   /** True when the model answered with a tool call — its "TTFT" is the full call. */
   calledTool: boolean;
   inputTokens: number;
+  outputTokens: number;
   cacheReadInputTokens: number;
   cacheCreationInputTokens: number;
+  usd: number;
 }
 
 async function buildArms(): Promise<{ arms: Record<ArmId, ArmPrompt>; toolSets: Record<ToolSetId, ToolDefinition[]> }> {
@@ -108,6 +117,10 @@ async function buildArms(): Promise<{ arms: Record<ArmId, ArmPrompt>; toolSets: 
       baseline: { system: baseline, turnGuidance: null },
       'shared-hardening': { system: shared, turnGuidance: null },
       'slim-core': { system: await ctx.coordinatorSystemPrompt(now), turnGuidance: renderVoiceTurnGuidance() },
+      'slim-core-system': {
+        system: `${await ctx.coordinatorSystemPrompt(now)}\n\n${renderVoiceSystemModule()}`,
+        turnGuidance: null,
+      },
     },
     toolSets: { none: [], voice: ctx.voiceToolDefs, coordinator: ctx.coordinatorToolDefs },
   };
@@ -127,6 +140,7 @@ async function oneCall(
   system: string,
   tools: ToolDefinition[],
   turnGuidance: string | null,
+  estimate: (model: string, usage: LLMUsage) => number,
 ): Promise<Omit<Row, 'arm' | 'tools' | 'cache' | 'rep'>> {
   const messages: Message[] = [
     { role: 'system', content: system },
@@ -156,8 +170,10 @@ async function oneCall(
     fullMs,
     calledTool,
     inputTokens: usage?.inputTokens ?? 0,
+    outputTokens: usage?.outputTokens ?? 0,
     cacheReadInputTokens: usage?.cacheReadInputTokens ?? 0,
     cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? 0,
+    usd: usage ? estimate(MODEL, usage) : 0,
   };
 }
 
@@ -171,6 +187,7 @@ async function main() {
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY required');
   const logger = createSilentLogger();
   const provider = new AnthropicProvider(apiKey, logger, new ModelRegistry(logger));
+  const estimate = createEstimateCostUsd(new ModelRegistry(logger), MODEL);
   const { arms, toolSets } = await buildArms();
   const rows: Row[] = [];
 
@@ -180,7 +197,7 @@ async function main() {
       const prompt = arms[cell.arm];
       const { system, tools } = withNonce(prompt, toolSets[cell.tools], randomUUID());
       for (const cache of ['cold', 'warm'] as const) {
-        const r = await oneCall(provider, system, tools, prompt.turnGuidance);
+        const r = await oneCall(provider, system, tools, prompt.turnGuidance, estimate);
         rows.push({ arm: cell.arm, tools: cell.tools, cache, rep, ...r });
         process.stderr.write(
           `${cell.arm}/${cell.tools}/${cache} rep${rep}: ttft=${r.ttftMs} full=${r.fullMs} ` +
@@ -211,13 +228,26 @@ async function main() {
         avgCacheRead: avg(subset.map(r => r.cacheReadInputTokens)),
         avgCacheWrite: avg(subset.map(r => r.cacheCreationInputTokens)),
         avgUncachedInput: avg(subset.map(r => r.inputTokens)),
+        avgOutput: avg(subset.map(r => r.outputTokens)),
         toolCallReps: subset.filter(r => r.calledTool).length,
       };
     }
   }
   writeFileSync(
     OUT,
-    JSON.stringify({ generatedAt: new Date().toISOString(), model: MODEL, reps: REPS, utterance: UTTERANCE, summary, rows }, null, 2),
+    JSON.stringify(
+      {
+        generatedAt: new Date().toISOString(),
+        model: MODEL,
+        reps: REPS,
+        utterance: UTTERANCE,
+        spendUsd: Math.round(rows.reduce((sum, r) => sum + r.usd, 0) * 1000) / 1000,
+        summary,
+        rows,
+      },
+      null,
+      2,
+    ),
   );
   process.stderr.write(JSON.stringify(summary, null, 2) + '\n');
 }

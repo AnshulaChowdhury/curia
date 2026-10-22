@@ -247,93 +247,128 @@ The coordinator's sole `### Date & time` instruction is the composed
 
 ## Addendum (2026-10-22) — slim-core rerun (#1968)
 
-**Full consolidation stays rejected.** The question was reopened once the
-coordinator context diet (#1954) had thinned the coordinator prompt: could voice
-run on the coordinator's core plus a voice module, instead of a separately
-maintained voice prompt? On the production voice model it scores below both
-voice prompts, and its failure mode is the one that matters most on a call.
+**Full consolidation stays rejected for the production voice model.** The question was
+reopened once the coordinator context diet (#1954) had thinned the coordinator prompt:
+could voice run on the coordinator's core plus a voice module, instead of a separately
+maintained voice prompt? The rerun covered two placements of the voice module and three
+models.
+- On claude-haiku-4-5, prod's voice model, both placements score below the voice
+  prompts.
+- On claude-haiku-5-5 and claude-sonnet-5-5, the better placement ties them.
+- No model shows a quality gain that would justify consolidation's cost.
 
 ### What was measured
 
 - **Harness** (`scripts/spikes/voice-brain-parity/`, `production-context.ts`).
-  Every arm now gets the production specialist roster and voice's real tool
-  definitions, and `delegate` is scored on its real `agent`/`task`/
-  `outbound_entry_id` arguments. So absolute rates are not comparable with the
-  July run above; the paired deltas within this run are.
-- **Arms.** `baseline` is the production voice prompt. `shared-hardening` is
-  baseline plus the held routing and pronoun modules. `slim-core` is new: the
-  coordinator's production system string (`assembleAgent` +
-  `buildBaseSystemPrompt`, #1966), with a voice module heading the caller's
-  message as turn guidance (#1959). The voice module is the spoken-style
-  addendum, the tool-result policy, the off-ramp, and the voice length reminder.
-  Full consolidation was not rerun.
-- **Run.** claude-haiku-4-5 (prod's voice model), 19 utterances × 3 arms × 5
-  interleaved reps. Artifact: `variance.json`.
-- **Size.** The slim core renders at ~5.5k tokens of system string plus ~0.5k of
-  guidance, against ~1.4k for the voice prompt. The core's always-on budget
-  (YAML + SKILL.md, ~3.1k) leaves out its runtime blocks: security, contact
-  details, roster, date guardrail, time and turn budget.
+  - Every arm gets the production specialist roster and voice's real tool definitions.
+  - `delegate` is scored on its real `agent`/`task`/`outbound_entry_id` arguments.
+  - So absolute rates are not comparable with the July run above; the paired deltas
+    within each run are.
+  - Every call's usage is metered and priced from the model registry.
+- **Arms.**
+  - `baseline` is the production voice prompt.
+  - `shared-hardening` is baseline plus the held routing and pronoun modules.
+  - `slim-core` is the coordinator's production system string (`assembleAgent` +
+    `buildBaseSystemPrompt`, #1966), with the voice module heading the caller's message
+    as turn guidance (#1959). The voice module is the spoken-style addendum, the
+    tool-result policy, the off-ramp, and the voice length reminder.
+  - `slim-core-system` is the same core with the voice module and outbound context
+    appended to the system string, where the voice prompt keeps them. That is the shape
+    a voice migration would most likely ship.
+  - Full consolidation was not rerun.
+- **Run.** 19 utterances × 4 arms × 5 interleaved reps per model. Artifacts:
+  `variance.json` (haiku-4-5), `variance.claude-haiku-5-5.json`,
+  `variance.claude-sonnet-5-5.json`.
+  - A first haiku-4-5 run without `slim-core-system` agreed in direction: slim-core −0.068
+    against baseline, 0 reps positive.
+- **Size.** The slim core renders at ~5.5k tokens of system string plus ~0.5k of voice
+  module, against ~1.4k for the voice prompt. The core's always-on budget (YAML +
+  SKILL.md, ~3.1k) leaves out its runtime blocks: security, contact details, roster,
+  date guardrail, time and turn budget.
+- **Spend.** $5.09 for the three spikes (haiku-4-5 $1.13, haiku-5-5 $0.21,
+  sonnet-5-5 $3.75) and $3.08 for the three microbenches.
 
-### Quality (paired, check-rate unless noted)
+### Quality (paired check-rate Δ, mean and reps positive/negative of 5)
 
-| Comparison | mean Δ | per-rep Δ | paired win? |
+| Comparison | haiku-4-5 (prod) | haiku-5-5 | sonnet-5-5 |
 |---|---|---|---|
-| slim-core − shared-hardening | −0.032 | −0.10, +0.08, −0.02, −0.04, −0.08 | no (1 +, 4 −) |
-| slim-core − baseline | −0.068 | −0.12, 0, −0.06, −0.06, −0.10 | no (0 +, 4 −) |
-| shared-hardening − baseline | −0.036 | −0.02, −0.08, −0.04, −0.02, −0.02 | no (0 +, 5 −) |
+| slim-core − baseline | −0.028 (1+/4−) | −0.024 (0+/4−) | +0.032 (3+/1−) |
+| slim-core-system − baseline | −0.052 (1+/4−) | 0.000 (1+/1−) | +0.028 (3+/2−) |
+| slim-core − shared-hardening | −0.036 (0+/3−) | −0.028 (1+/4−) | 0.000 (2+/3−) |
+| slim-core-system − shared-hardening | −0.060 (0+/5−) | −0.004 (2+/2−) | −0.004 (2+/3−) |
+| slim-core-system − slim-core | −0.024 (2+/3−) | +0.024 (4+/1−) | −0.004 (0+/1−) |
+| shared-hardening − baseline | +0.008 (2+/3−) | +0.004 (2+/2−) | +0.032 (3+/2−) |
 
-Utterance-rate: slim-core − shared +0.011 (1 +, 2 −), slim-core − baseline −0.032
-(1 +, 4 −). Marginal check rates: baseline 0.956, shared 0.920, slim-core 0.888.
+None of these is a paired win. On utterance rate the only paired win is
+shared-hardening over baseline on sonnet-5-5 (+0.084, 4+/0−). Marginal check rates:
 
-| Category (check rate) | baseline | shared | slim-core |
+| Arm | haiku-4-5 | haiku-5-5 | sonnet-5-5 |
 |---|---|---|---|
-| routing-transfer-ownership | 0.925 | 0.900 | **0.550** |
-| outbound-context-ack | 1.000 | 1.000 | 0.700 |
-| pronoun-resolution | 0.840 | 0.800 | **0.920** |
-| async-offramp | 0.867 | 0.933 | 0.967 |
-| routing-borrow-then-answer | 1.000 | 0.733 | 1.000 |
-| day-of-week-arithmetic | 1.000 | 0.950 | 0.933 |
+| baseline | 0.944 | 0.968 | 0.912 |
+| shared-hardening | 0.952 | 0.972 | 0.944 |
+| slim-core | 0.916 | 0.944 | 0.944 |
+| slim-core-system | 0.892 | 0.968 | 0.940 |
 
-- **Transfer-ownership regresses.** "Yes, Thursday works — go ahead and send
-  it" with an active outbound entry: slim-core repeatedly answered "I'll let the
-  inbox team know to send that right away" and called no tool. Once it said
-  "Done — your reply to Sam is on its way" after calling only `task-complete`.
-  A claimed handoff that never happened is the failure the off-ramp design
-  exists to prevent.
-- **Outbound ack.** Slim-core replied "I just sent that over" without naming the
-  channel, so part of that drop is the scorer's keyword list. It gets the block
-  in the user turn, as text channels do, rather than in the system string.
-- **Pronoun.** `pronoun-your-calendar`: slim-core 3/5, baseline 1/5, shared 0/5.
-  It is still the only case the coordinator core solves and the voice prompts
-  do not, as in July. The pronoun module still earns nothing here.
+| Category (check rate, haiku-4-5) | baseline | shared | slim-core | slim-core-system |
+|---|---|---|---|---|
+| routing-transfer-ownership | 0.900 | 0.950 | **0.525** | 0.700 |
+| outbound-context-ack | 1.000 | 1.000 | 1.000 | 0.800 |
+| day-of-week-arithmetic | 1.000 | 0.983 | 1.000 | 0.900 |
+| pronoun-resolution | 0.800 | 0.800 | 0.920 | 0.920 |
 
-### Latency (`latency-microbench.json`, 10 reps per cell, TTFT p50 / p95 ms)
+- **Transfer-ownership is a Haiku 4.5 failure.** With an active outbound entry and "Yes,
+  Thursday works — go ahead and send it", slim-core on haiku-4-5 answered "I'll let the
+  inbox team know to send that right away" and called no tool. Once it said "All set —
+  I've sent it to Sam". Moving the module into the system string helps (0.525 → 0.700)
+  but stays well below the voice prompts. On haiku-5-5 and sonnet-5-5 every arm scores
+  0.925–1.0 here.
+- **The core names tools voice does not carry.** On haiku-4-5, slim-core called
+  `email-send` 3 times and `email-reply` once. They are described in the pinned
+  SKILL.md bodies but are not in voice's tool list. In production that is a wasted
+  round and a "not found" error. The voice prompts on haiku-4-5 called the `contacts`
+  specialist as if it were a tool (5 times). The 5.5 models never called a tool they
+  were not given.
+- **Pronoun is model-bound, not consolidation-bound.** On `pronoun-your-calendar`, baseline
+  passes 0/5 on every model. The held pronoun module (shared-hardening) passes 0/5 on
+  haiku-4-5 but 5/5 on both 5.5 models. Slim-core passes 2–5/5 depending on model and
+  placement. The #1613 hold on that module is a Haiku 4.5 result.
+- **Sonnet 5.5 struggles with dates in every arm.** `date-next-friday-meeting` passes
+  1–2/5, so its higher scores elsewhere are not a uniform lift.
 
-| Prompt + tools | cold | warm |
-|---|---|---|
-| baseline + coordinator tools (voice before #1968) | 565 / 854 | 408 / 714 |
-| baseline + voice tools (voice after #1968) | 396 / 740 | 395 / 617 |
-| shared-hardening + voice tools | 375 / 833 | 371 / 475 |
-| slim-core + voice tools | 416 / 532 | 370 / 545 |
-| baseline, no tools (July's bare turn) | 363 / 490 | 350 / 502 |
+### Latency (TTFT p50 / p95 ms, 10 reps per cell, voice's tools unless noted)
 
-Cold means a fresh nonce in the first tool and the system string, so the whole
-prefix is a cache write. Warm is the same request again, read from cache. The
-voice-only prompts without tools sit under the cache minimum and never cache.
-p95 is the slowest of 10. **Latency does not decide this.** With voice's own
-tools, the slim core is within noise of the voice prompt, and well under what
-voice paid before #1968.
+| Prompt | haiku-4-5 cold | haiku-4-5 warm | haiku-5-5 cold | haiku-5-5 warm | sonnet-5-5 cold | sonnet-5-5 warm |
+|---|---|---|---|---|---|---|
+| baseline + coordinator tools (voice before #1968) | 489 / 695 | 430 / 716 | 1274 / 2338 | 781 / 1519 | 1823 / 6331 | 1016 / 1446 |
+| baseline (voice after #1968) | 379 / 525 | 393 / 405 | 630 / 1213 | 633 / 1718 | 751 / 7582 | 666 / 5800 |
+| shared-hardening | 374 / 669 | 389 / 486 | 714 / 1124 | 675 / 1742 | 1087 / 1500 | 827 / 1414 |
+| slim-core | 416 / 500 | 368 / 925 | 956 / 1858 | 725 / 1271 | 1091 / 2267 | 870 / 1310 |
+| slim-core-system | 402 / 589 | 359 / 492 | 865 / 2092 | 697 / 1262 | 1426 / 8040 | 933 / 7617 |
+
+- **Cold vs warm.** Cold means a fresh nonce in the first tool and the system string, so
+  the whole prefix is a cache write. Warm is the same request again, read from cache. p95
+  is the slowest of 10.
+- **The toolset change pays most on the newer models.** It cuts cold p50 by ~110 ms on
+  haiku-4-5 and ~640 ms on haiku-5-5. An earlier haiku-4-5 bench measured 565 → 396 ms.
+- **The slim core costs time on the 5.5 models:** about +235 ms cold p50 on haiku-5-5.
+  Both 5.5 models think by default and were measured that way. Voice sends no
+  reasoning-effort setting.
+- **Sonnet 5.5's cold first token is too slow for a live call** in any arm, with p95
+  outliers of 6–8 s.
 
 ### Decision
 
-- Slim-core neither ties nor beats the shared modules on quality, so voice stays
-  on its own prompt (ADR-037, this ADR). No migration issue is filed.
-- The voice toolset ships (#1968): `VOICE_TOOL_NAMES` in
-  `src/channels/voice/voice-tools.ts`, derived from production voice sessions,
-  with no discovery tools. It is 9 tools (~3.6k tokens) instead of 74 (~23.5k).
-- Routing and pronoun modules stay on hold (#1613). Their bundle again trails
-  baseline (−0.036, 0/5 reps positive).
-- Not tested: the voice module in the system string instead of the user turn,
-  and other voice models. A future rerun should try the system-string placement
-  first, since transfer-ownership is where slim-core broke.
-
+- **Production (haiku-4-5).** Both slim-core placements trail the voice prompts. Voice
+  stays on its own prompt (ADR-037, this ADR), and no migration issue is filed.
+- **If voice moves to haiku-5-5.** `slim-core-system` ties the voice prompt and the shared
+  modules on quality, and adds ~235 ms cold first-token p50 and ~1.6× the tokens per turn.
+  Under #1968's rule ("ties or beats the shared modules, with TTFT within an agreed
+  budget"), that is a judgment on whether one prompt instead of two is worth the latency.
+  No budget is agreed yet. Decide it with the move, not before.
+- **Sonnet 5.5** is not a voice candidate on latency, whatever the prompt.
+- **The voice toolset ships** (#1968): `VOICE_TOOL_NAMES` in
+  `src/channels/voice/voice-tools.ts`, derived from production voice sessions, with no
+  discovery tools. It is 9 tools (~3.6k tokens) instead of 74 (~23.5k).
+- **#1613.** The routing and pronoun modules stay on hold for haiku-4-5, where their
+  bundle ties baseline. Revisit the pronoun module with any move to a 5.5 model: it
+  solves `pronoun-your-calendar` there.

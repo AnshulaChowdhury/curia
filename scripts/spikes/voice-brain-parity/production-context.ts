@@ -9,7 +9,8 @@
 import { resolve } from 'node:path';
 import { EventBus } from '../../../src/bus/bus.js';
 import { AgentRegistry } from '../../../src/agents/agent-registry.js';
-import type { LLMProvider, ToolDefinition } from '../../../src/agents/llm/provider.js';
+import type { LLMProvider, LLMUsage, ToolDefinition } from '../../../src/agents/llm/provider.js';
+import { createEstimateCostUsd } from '../../../src/agents/llm/pricing.js';
 import { ModelRegistry } from '../../../src/agents/llm/model-registry.js';
 import { ModelRouter } from '../../../src/agents/llm/model-router.js';
 import { discoverAgentManifests, loadAgentConfig, type AgentYamlConfig } from '../../../src/agents/loader.js';
@@ -154,4 +155,74 @@ export const VOICE_CHANNEL_MODULE = [
 export function renderVoiceTurnGuidance(): string {
   const lengthReminder = turnLengthReminder('voice', DEFAULT_OFFICE_IDENTITY.tone.verbosity);
   return [TURN_GUIDANCE_HEADER, VOICE_CHANNEL_MODULE, ...(lengthReminder ? [lengthReminder] : [])].join('\n\n');
+}
+
+/**
+ * The same voice module as a system-string suffix, for the slim-core-system arm:
+ * the shape a voice migration would most likely take (voice owns its system string,
+ * as today), where turn guidance is the text path's shape.
+ */
+export function renderVoiceSystemModule(): string {
+  const lengthReminder = turnLengthReminder('voice', DEFAULT_OFFICE_IDENTITY.tone.verbosity);
+  return [VOICE_CHANNEL_MODULE, ...(lengthReminder ? [lengthReminder] : [])].join('\n\n');
+}
+
+/** Token and dollar totals for one bucket (an arm, or a microbench cell). */
+export interface SpendTotals {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  reasoningTokens: number;
+  usd: number;
+}
+
+/**
+ * Wrap a provider so every streamed call's usage is added to the bucket named by
+ * `meter.bucket` at the time of the call. Runs are sequential, so setting the bucket
+ * before each case attributes spend to the right arm.
+ */
+export function meterProvider(inner: LLMProvider, model: string): {
+  provider: LLMProvider;
+  meter: { bucket: string; totals: Record<string, SpendTotals>; totalUsd(): number };
+} {
+  const estimate = createEstimateCostUsd(new ModelRegistry(createSilentLogger()), model);
+  const meter = {
+    bucket: 'unassigned',
+    totals: {} as Record<string, SpendTotals>,
+    totalUsd(): number {
+      return Math.round(Object.values(meter.totals).reduce((sum, t) => sum + t.usd, 0) * 1000) / 1000;
+    },
+  };
+  const record = (usage: LLMUsage | undefined): void => {
+    if (!usage) return;
+    const t = (meter.totals[meter.bucket] ??= {
+      calls: 0, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, reasoningTokens: 0, usd: 0,
+    });
+    t.calls += 1;
+    t.inputTokens += usage.inputTokens;
+    t.outputTokens += usage.outputTokens;
+    t.cacheReadInputTokens += usage.cacheReadInputTokens;
+    t.cacheCreationInputTokens += usage.cacheCreationInputTokens;
+    t.reasoningTokens += usage.reasoningTokens ?? 0;
+    t.usd += estimate(model, usage);
+  };
+  const provider: LLMProvider = {
+    id: inner.id,
+    chat: params => inner.chat(params),
+    async *stream(params) {
+      if (!inner.stream) throw new Error(`provider '${inner.id}' cannot stream`);
+      for await (const event of inner.stream(params)) {
+        if (event.type === 'message_end' || event.type === 'tool_use' || event.type === 'error') record(event.usage);
+        yield event;
+      }
+    },
+  };
+  return { provider, meter };
+}
+
+/** Artifact path for a model: the bare name for prod's voice model, a model-suffixed one otherwise. */
+export function modelArtifactPath(dir: string, base: string, model: string): string {
+  return model === 'claude-haiku-4-5' ? resolve(dir, `${base}.json`) : resolve(dir, `${base}.${model}.json`);
 }
