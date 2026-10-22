@@ -121,6 +121,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Empty answers at the output cap** — OpenRouter responses that reasoned to `max_tokens` with no answer are retried. (#1915)
 - **Test-mode autonomy gating** — suites now describe autonomy bands per `autonomy.gating`, as production does.
 - **Health canaries** — run daily again; boot cancelled the job, so no canary ran or pinged heartbeats. (#2229)
 - **`google_workspace` / `tavily` canaries** — make a live call each instead of always skipping, so heartbeats fire. (#2242)

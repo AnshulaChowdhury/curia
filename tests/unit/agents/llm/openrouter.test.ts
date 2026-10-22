@@ -1571,6 +1571,67 @@ describe('OpenRouterProvider chat() retries', () => {
     expect(result.type === 'error' && result.error.context.attempts).toBe(1);
   });
 
+  // The coordinator on 2026-10-22 reasoned through all 32,768 output tokens and
+  // returned nothing; the principal got "I wasn't able to formulate a response".
+  const emptyAtCap = (outputTokens: number) => ({
+    ...makeTextResponse(),
+    choices: [{
+      index: 0,
+      finish_reason: 'length' as const,
+      message: { role: 'assistant' as const, content: '', tool_calls: undefined, refusal: null },
+      logprobs: null,
+    }],
+    usage: {
+      prompt_tokens: 100,
+      completion_tokens: outputTokens,
+      total_tokens: 100 + outputTokens,
+      completion_tokens_details: { reasoning_tokens: outputTokens },
+    },
+  });
+
+  it('retries a response that hit max_tokens with no answer, counting its tokens', async () => {
+    mockCreate.mockResolvedValueOnce(emptyAtCap(32_768));
+    mockCreate.mockResolvedValueOnce(makeTextResponse());
+
+    const result = await chat();
+
+    expect(mockCreate).toHaveBeenCalledTimes(2);
+    expect(result.type).toBe('text');
+    if (result.type !== 'text') return;
+    expect(result.content).toBe('hello from openrouter');
+    expect(result.provenance.attempts).toBe(2);
+    // The empty attempt was billed, so llm.call's tokens and cost include it.
+    expect(result.usage).toMatchObject({ inputTokens: 110, outputTokens: 32_773, reasoningTokens: 32_768 });
+  });
+
+  it('returns the last empty response when every attempt hits the cap', async () => {
+    mockCreate.mockResolvedValue(emptyAtCap(1_000));
+
+    const result = await chat();
+
+    expect(mockCreate).toHaveBeenCalledTimes(OPENROUTER_MAX_ATTEMPTS);
+    expect(result.type === 'text' && result.content).toBe('');
+    expect(result.type === 'text' && result.provenance.attempts).toBe(OPENROUTER_MAX_ATTEMPTS);
+    expect(result.type === 'text' && result.usage.outputTokens).toBe(3_000);
+  });
+
+  it('does not retry a truncated response that still has an answer', async () => {
+    mockCreate.mockResolvedValue({
+      ...emptyAtCap(1_000),
+      choices: [{
+        index: 0,
+        finish_reason: 'length' as const,
+        message: { role: 'assistant' as const, content: 'partial but usable', tool_calls: undefined, refusal: null },
+        logprobs: null,
+      }],
+    });
+
+    const result = await chat();
+
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    expect(result.type === 'text' && result.content).toBe('partial but usable');
+  });
+
   it('stops retrying once the caller aborts', async () => {
     const controller = new AbortController();
     mockCreate.mockImplementation(async () => {

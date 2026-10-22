@@ -173,8 +173,41 @@ function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
   });
 }
 
+/**
+ * A completion that ran into max_tokens before producing anything usable: no
+ * text and no tool call. Typically the whole budget went on reasoning. A
+ * truncated response that still carries an answer does not count (#1915).
+ */
+export function isEmptyAtOutputCap(response: ChatCompletion): boolean {
+  const choice = response.choices[0];
+  if (!choice || choice.finish_reason !== 'length') return false;
+  const hasText = typeof choice.message.content === 'string' && choice.message.content.trim() !== '';
+  const hasToolCalls = (choice.message.tool_calls?.length ?? 0) > 0;
+  return !hasText && !hasToolCalls;
+}
+
+/** Token counts of two requests added together, for a call that took more than one. */
+function addUsage(a: LLMUsage, b: LLMUsage | undefined): LLMUsage {
+  if (!b) return a;
+  const reasoningReported = a.reasoningTokens !== undefined || b.reasoningTokens !== undefined;
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheCreationInputTokens: a.cacheCreationInputTokens + b.cacheCreationInputTokens,
+    cacheReadInputTokens: a.cacheReadInputTokens + b.cacheReadInputTokens,
+    ...(reasoningReported ? { reasoningTokens: (a.reasoningTokens ?? 0) + (b.reasoningTokens ?? 0) } : {}),
+  };
+}
+
 type CreateOutcome =
-  | { ok: true; response: ChatCompletion; attempts: number; failedAttemptsMs: number }
+  | {
+      ok: true;
+      response: ChatCompletion;
+      attempts: number;
+      failedAttemptsMs: number;
+      /** Tokens billed for attempts that came back empty at the output cap. */
+      discardedUsage: LLMUsage | undefined;
+    }
   | { ok: false; err: unknown; attempts: number };
 
 /** Non-negative integer count, or 0 for anything else (absent, null, malformed). */
@@ -699,6 +732,10 @@ export class OpenRouterProvider implements LLMProvider {
    * (`maxRetries: 0`) so every failed attempt is logged and the count reaches
    * llm.call (#1915). stream() keeps the SDK's retries: they happen before any
    * token arrives.
+   *
+   * A response that hit max_tokens with no answer is retried too, at once: it is
+   * not an overload signal. The last attempt's response is returned whatever it
+   * holds, so the caller's own empty-response handling still applies.
    */
   private async createWithRetries(
     createParams: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
@@ -706,14 +743,15 @@ export class OpenRouterProvider implements LLMProvider {
     model: string,
   ): Promise<CreateOutcome> {
     const startedMs = Date.now();
+    let discardedUsage: LLMUsage | undefined;
     for (let attempt = 1; ; attempt++) {
       const attemptStartMs = Date.now();
+      let response: ChatCompletion;
       try {
-        const response: ChatCompletion = await this.client.chat.completions.create(createParams, {
+        response = await this.client.chat.completions.create(createParams, {
           maxRetries: 0,
           ...(signal ? { signal } : {}),
         });
-        return { ok: true, response, attempts: attempt, failedAttemptsMs: attemptStartMs - startedMs };
       } catch (err) {
         if (attempt >= OPENROUTER_MAX_ATTEMPTS || signal?.aborted || !isRetryableOpenRouterError(err)) {
           return { ok: false, err, attempts: attempt };
@@ -725,7 +763,35 @@ export class OpenRouterProvider implements LLMProvider {
         );
         await sleep(delayMs, signal);
         if (signal?.aborted) return { ok: false, err, attempts: attempt };
+        continue;
       }
+
+      if (isEmptyAtOutputCap(response) && attempt < OPENROUTER_MAX_ATTEMPTS && !signal?.aborted) {
+        // Billed even though unusable, so llm.call's tokens and cost include it.
+        const usage = usageFromOpenRouter(response.usage);
+        discardedUsage = addUsage(usage, discardedUsage);
+        this.logger.warn(
+          {
+            model,
+            attempt,
+            maxAttempts: OPENROUTER_MAX_ATTEMPTS,
+            attemptMs: Date.now() - attemptStartMs,
+            outputTokens: usage.outputTokens,
+            reasoningTokens: usage.reasoningTokens,
+            upstreamProvider: upstreamProviderFrom(response),
+          },
+          'OpenRouter response hit max_tokens with no answer — retrying',
+        );
+        continue;
+      }
+
+      return {
+        ok: true,
+        response,
+        attempts: attempt,
+        failedAttemptsMs: attemptStartMs - startedMs,
+        discardedUsage,
+      };
     }
   }
 
@@ -749,7 +815,7 @@ export class OpenRouterProvider implements LLMProvider {
         error.context.attempts = outcome.attempts;
         return { type: 'error', error };
       }
-      const { response, attempts, failedAttemptsMs } = outcome;
+      const { response, attempts, failedAttemptsMs, discardedUsage } = outcome;
 
       // Extract the first choice — OpenRouter always returns at least one.
       const choice = response.choices[0];
@@ -781,7 +847,7 @@ export class OpenRouterProvider implements LLMProvider {
         );
       }
 
-      const usage = this.usageFromCompletion(response);
+      const usage = addUsage(this.usageFromCompletion(response), discardedUsage);
       const provenance = {
         ...this.provenanceFromCompletion(response, model, reasoningEffort),
         attempts,
