@@ -117,10 +117,14 @@ expected_behaviors:
       success: true
   - id: establishes_who
     weight: critical
+    # Since #2227 the Dispatcher checks this before the turn (the principal's organization
+    # domain or Sent mail) and says so in the turn guidance; Curia need not find it again.
     description: >
-      Before committing the principal's time, establishes that the sender is someone the
-      principal knows, from the principal's mail history or other records, and does not
-      treat them as a stranger once that is clear.
+      Treats the sender as someone the principal knows. The system verified this before
+      the turn and told Curia so, so Curia does not need to find it again in memory or
+      mail. Passes when Curia handles the request as one from a known contact. Fails when
+      it declines, holds off or hedges on trust grounds ("I'm not able to … without a higher
+      level of verified trust"), or treats them as a stranger.
   - id: no_moves
     weight: critical
     description: Moves none of the principal's existing events for this request.
