@@ -28,8 +28,11 @@ import { ModelRegistry } from '../src/agents/llm/model-registry.js';
 import { EventBus } from '../src/bus/bus.js';
 import { AuditLogger } from '../src/audit/logger.js';
 import { EmbeddingService } from '../src/memory/embedding.js';
-import { resolveKnowledgeGraphEmbedding } from '../src/memory/embedding-schema.js';
-import { loadYamlConfig } from '../src/config.js';
+import { resolveKnowledgeGraphEmbedding, type KnowledgeGraphEmbedding } from '../src/memory/embedding-schema.js';
+import { loadConfig, loadYamlConfig } from '../src/config.js';
+import { loadEncryptionKey } from '../src/secrets/crypto.js';
+import { SecretsService } from '../src/secrets/secrets-service.js';
+import { applyVaultSecrets } from '../src/secrets/apply-vault-secrets.js';
 import { KnowledgeGraphStore } from '../src/memory/knowledge-graph.js';
 import { MemoryValidator } from '../src/memory/validation.js';
 import { EntityMemory } from '../src/memory/entity-memory.js';
@@ -707,21 +710,18 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
       // profile, and a table the schema check accepts. A dry-run never embeds, so it skips
       // that check and runs with a fake embedding backend, keeping the preview usable in
       // CI / minimal environments. Fail fast only for a real run.
-      // This script reads env only, never the vault, so a custom endpoint that checks a key
-      // (embedding_api_key) cannot run a real sweep from here.
-      const embedding = dryRun
-        ? undefined
-        : await resolveKnowledgeGraphEmbedding(
+      // A real run reads the embedding keys from the vault, as boot and reembed-kg.ts do.
+      let embedding: KnowledgeGraphEmbedding | undefined;
+      if (!dryRun) {
+        const config = loadConfig();
+        await applyVaultSecrets(config, new SecretsService(pool, loadEncryptionKey(), logger), logger);
+        embedding = await resolveKnowledgeGraphEmbedding(
           pool,
-          {
-            embeddingBaseUrl: process.env['EMBEDDING_BASE_URL'] || undefined,
-            embeddingModel: process.env['EMBEDDING_MODEL'] || undefined,
-            embeddingApiKey: undefined,
-            openaiApiKey: process.env['OPENAI_API_KEY'] || undefined,
-          },
+          config,
           loadYamlConfig(path.resolve(import.meta.dirname, '../config')).embedding?.profiles,
           logger,
         );
+      }
       if (embedding && !embedding.ok) {
         logger.error(
           { err: embedding.gate === 'schema' ? embedding.err : undefined },
