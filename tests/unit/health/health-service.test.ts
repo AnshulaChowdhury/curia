@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { HealthService } from '../../../src/health/health-service.js';
 import { DEFAULT_HEALTH_CONFIG } from '../../../src/config.js';
 
@@ -238,6 +238,145 @@ describe('HealthService.getStatus()', () => {
     expect(result.status).toBe('degraded');
     expect(result.checks.signal).toBe('fail');
     expect(result.checks.db).toBe('ok');
+  });
+});
+
+// #2242: both canaries were hard-wired to `skipped` at bootstrap, so their heartbeats
+// never fired. They now make one cheap live call each and only report ok on success.
+describe('HealthService google_workspace canary (#2242)', () => {
+  const FIXED = { user_google_email: 'curia@example.com' };
+
+  function gwsDeps(callTool: ReturnType<typeof vi.fn>, overrides: Record<string, unknown> = {}) {
+    return makeDeps({
+      mcpServerStatuses: new Map([['google-workspace', { status: 'ok', toolCount: 30 }]]),
+      mcpSessions: [{ serverId: 'google-workspace', client: { callTool } }],
+      mcpFixedInputs: new Map([['google-workspace', FIXED]]),
+      ...overrides,
+    });
+  }
+
+  async function gwsResult(deps: ReturnType<typeof makeDeps>) {
+    const results = await new HealthService(deps as never).runCanaries();
+    return results.find((r) => r.name === 'google_workspace');
+  }
+
+  it('is ok when a one-item Drive listing succeeds, sending the resolved fixed inputs', async () => {
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'Found 1 item' }] });
+    const result = await gwsResult(gwsDeps(callTool));
+    expect(result?.status).toBe('ok');
+    expect(callTool).toHaveBeenCalledWith(
+      { name: 'list_drive_items', arguments: { ...FIXED, page_size: 1 } },
+      undefined,
+      expect.objectContaining({ timeout: expect.any(Number) }),
+    );
+  });
+
+  it('keeps page_size at 1 even when a fixed input sets it', async () => {
+    const callTool = vi.fn().mockResolvedValue({ content: [] });
+    await gwsResult(gwsDeps(callTool, {
+      mcpFixedInputs: new Map([['google-workspace', { ...FIXED, page_size: '100' }]]),
+    }));
+    expect(callTool.mock.calls[0]![0].arguments).toEqual({ ...FIXED, page_size: 1 });
+  });
+
+  it('pings the google_workspace heartbeat when the probe succeeds', async () => {
+    const heartbeat = 'https://uptime.example.com/api/v1/heartbeat/gws';
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const callTool = vi.fn().mockResolvedValue({ content: [] });
+      await new HealthService(gwsDeps(callTool, {
+        config: {
+          ...DEFAULT_HEALTH_CONFIG,
+          heartbeats: { ...DEFAULT_HEALTH_CONFIG.heartbeats, google_workspace: heartbeat },
+        },
+      }) as never).runCanaries();
+      expect(fetchMock).toHaveBeenCalledWith(heartbeat);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('fails with a fixed detail, not the server text, when the tool returns isError', async () => {
+    // The server's error text can echo fixed_inputs back, and canary detail is logged.
+    const callTool = vi.fn().mockResolvedValue({
+      isError: true,
+      content: [{ type: 'text', text: 'invalid_grant for curia@example.com' }],
+    });
+    const result = await gwsResult(gwsDeps(callTool));
+    expect(result?.status).toBe('fail');
+    expect(result?.detail).toMatch(/list_drive_items/);
+    expect(result?.detail).not.toMatch(/curia@example\.com|invalid_grant/);
+  });
+
+  it('fails with the error class only when the call throws or times out', async () => {
+    const err = Object.assign(new Error('Request timed out for curia@example.com'), { name: 'McpError' });
+    const callTool = vi.fn().mockRejectedValue(err);
+    const result = await gwsResult(gwsDeps(callTool));
+    expect(result?.status).toBe('fail');
+    expect(result?.detail).toMatch(/McpError/);
+    expect(result?.detail).not.toMatch(/curia@example\.com/);
+  });
+
+  it('still fails on a zero_tools or unavailable boot without calling the server', async () => {
+    const callTool = vi.fn();
+    for (const boot of [{ status: 'zero_tools' }, { status: 'unavailable', reason: 'connect failed' }]) {
+      const result = await gwsResult(gwsDeps(callTool, {
+        mcpServerStatuses: new Map([['google-workspace', boot]]),
+      }));
+      expect(result?.status).toBe('fail');
+    }
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it('is skipped when the server is not enabled', async () => {
+    const result = await gwsResult(makeDeps());
+    expect(result?.status).toBe('skipped');
+  });
+});
+
+describe('HealthService tavily canary (#2242)', () => {
+  const USAGE_URL = 'https://api.tavily.com/usage';
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  async function tavilyResult(deps: ReturnType<typeof makeDeps>) {
+    const results = await new HealthService(deps as never).runCanaries();
+    return results.find((r) => r.name === 'tavily');
+  }
+
+  it('is skipped when no key resolves', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await tavilyResult(makeDeps({ resolveTavilyApiKey: vi.fn().mockResolvedValue(null) }));
+    expect(result?.status).toBe('skipped');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('is ok when the usage endpoint accepts the key', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await tavilyResult(makeDeps({ resolveTavilyApiKey: vi.fn().mockResolvedValue('tvly-good') }));
+    expect(result?.status).toBe('ok');
+    expect(fetchMock).toHaveBeenCalledWith(USAGE_URL, expect.objectContaining({
+      headers: { Authorization: 'Bearer tvly-good' },
+    }));
+  });
+
+  it('fails when the usage endpoint rejects the key', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status: 401 })));
+    const result = await tavilyResult(makeDeps({ resolveTavilyApiKey: vi.fn().mockResolvedValue('tvly-revoked') }));
+    expect(result?.status).toBe('fail');
+    expect(result?.detail).toMatch(/401/);
+    expect(result?.detail).not.toMatch(/tvly-revoked/);
+  });
+
+  it('fails when the usage request errors', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(Object.assign(new Error('getaddrinfo ENOTFOUND'), { name: 'TypeError' })));
+    const result = await tavilyResult(makeDeps({ resolveTavilyApiKey: vi.fn().mockResolvedValue('tvly-good') }));
+    expect(result?.status).toBe('fail');
   });
 });
 

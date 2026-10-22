@@ -246,6 +246,24 @@ servers:
     expect(writeFile!.manifest.action_risk).toBe('low');
   });
 
+  it('returns each registered server’s resolved fixed_inputs, for the health canary (#2242)', async () => {
+    const session = makeMockSession([
+      { name: 'list_drive_items', inputSchema: { type: 'object', properties: {}, required: [] } },
+    ]);
+    mockConnectStdio.mockResolvedValueOnce(session);
+    const dir = writeSkillsYaml(`
+servers:
+  - name: google-workspace
+    transport: stdio
+    command: npx
+    action_risk: low
+    fixed_inputs:
+      user_google_email: curia@example.com
+`);
+    const { fixedInputs } = await loadMcpServers(dir, new ToolRegistry(), logger, secrets);
+    expect(fixedInputs.get('google-workspace')).toEqual({ user_google_email: 'curia@example.com' });
+  });
+
   it('applies server-level action_risk and sensitivity to all tools', async () => {
     const session = makeMockSession([
       { name: 'tool-x', inputSchema: { type: 'object', properties: {}, required: [] } },
