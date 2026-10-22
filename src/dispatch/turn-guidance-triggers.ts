@@ -35,6 +35,32 @@ export interface InboundGuidanceFacts {
    * may score anything is decided here, not by the text.
    */
   spotCheckReply: boolean;
+  /**
+   * Email only: the inbound is a forward (looksLikeForward). Only honoured on a live
+   * principal turn addressed to Curia; a forward Curia is CC'd on is to someone else.
+   * Absent means no.
+   */
+  forward?: boolean;
+  /** The inbound text holds a booking-page link (hasBookingPageLink). Absent means no. */
+  bookingLink?: boolean;
+}
+
+// Booking-page hosts (#2227). A link on the host's root is not a booking page, so each needs
+// a path. Google's two forms: the calendar.app.google short link and the long
+// calendar.google.com/calendar/appointments URL. Microsoft Bookings and Bookings with me
+// live under outlook.office(365).com/book and /bookwithme.
+const BOOKING_PAGE_URL = new RegExp(
+  [
+    String.raw`https?://(?:[\w-]+\.)*(?:calendly\.com|cal\.com|savvycal\.com|zcal\.co|tidycal\.com|youcanbook\.me|acuityscheduling\.com|calendar\.app\.google|meetings(?:-[a-z0-9]+)?\.hubspot\.com)/[^\s/]`,
+    String.raw`https?://calendar\.google\.com/calendar/(?:u/\d+/)?appointments/`,
+    String.raw`https?://outlook\.office(?:365)?\.com/(?:book|bookwithme)/`,
+  ].join('|'),
+  'i',
+);
+
+/** Whether the text holds a link to a scheduling page (Calendly, Google booking pages and similar). */
+export function hasBookingPageLink(content: string): boolean {
+  return BOOKING_PAGE_URL.test(content);
 }
 
 /** Verdicts are short ("2 bad, that was a renewal notice"); a long message is something else. */
@@ -144,6 +170,25 @@ export function spotCheckCandidateText(channelId: string, content: string): stri
   return (quoteAt === -1 ? lines : lines.slice(0, quoteAt)).join('\n').trim();
 }
 
+// A forward's subject prefix: "Fwd:" (Gmail, Apple Mail), "FW:" (Outlook), "Fw:".
+const FORWARD_SUBJECT = /^Subject:\s*(fwd?|fw)\s*:/i;
+
+/**
+ * Whether an inbound email is a forward (#2227): a forward subject prefix, or a Gmail or
+ * Apple Mail forward marker as the first quote marker. Only the first: a reply whose quoted
+ * history holds an older forward is a reply. Not the Outlook underscore separator alone,
+ * which replies carry too; an Outlook forward is caught by its "FW:" subject.
+ */
+export function looksLikeForward(channelId: string, content: string): boolean {
+  if (channelId !== 'email') return false;
+  if (FORWARD_SUBJECT.test(content)) return true;
+  const lines = content.replace(EMAIL_SUBJECT_PREFIX, '').split('\n');
+  const quoteAt = firstQuoteLine(lines);
+  if (quoteAt === -1) return false;
+  const marker = lines[quoteAt]!.trim();
+  return FORWARD_GMAIL.test(marker) || FORWARD_APPLE.test(marker);
+}
+
 export function inboundTurnGuidance(facts: InboundGuidanceFacts): TurnGuidanceKey[] {
   // Machine mail gets nothing more: reply-shaping and reply mechanics do not apply to a
   // message the coordinator must not answer.
@@ -155,16 +200,20 @@ export function inboundTurnGuidance(facts: InboundGuidanceFacts): TurnGuidanceKe
   // A message where Curia is only CC'd is written to someone else ("2 good candidates came
   // through"), so it is never a verdict on Curia's digest either (F1).
   const spotCheckVerdict = facts.liveTurn && facts.spotCheckReply && !facts.curiaCc;
+  const principalForward = facts.liveTurn && facts.forward === true && facts.channelId === 'email' && !facts.curiaCc;
   if (!facts.liveTurn) {
     keys.push('non-principal-reply-shaped');
   } else if (entries.length === 0) {
     // A spot-check verdict ("2 bad") is reply-shaped but not ambiguous: the reply-shaped note
     // says to ask what the principal is replying to, spot-check-reply says to act. They give
     // conflicting advice, so the verdict key replaces the note. With an outbound block the
-    // block's keys stay and spot-check-reply is added alongside them (below).
-    if (!spotCheckVerdict) keys.push('principal-reply-shaped');
+    // block's keys stay and spot-check-reply is added alongside them (below). A forward is
+    // self-contained and principal-forward says to act, so it replaces the note too.
+    if (!spotCheckVerdict && !principalForward) keys.push('principal-reply-shaped');
   }
   if (facts.liveTurn && facts.verificationCodeReceived === true) keys.push('verification-code-received');
+  if (principalForward) keys.push('principal-forward');
+  if (facts.bookingLink === true) keys.push('booking-link');
   if (facts.liveTurn && entries.length > 0) {
     keys.push('outbound-context');
     if (entries.some((m) => isTaskWakeReplyBinding(m))) keys.push('outbound-context-task-wake');

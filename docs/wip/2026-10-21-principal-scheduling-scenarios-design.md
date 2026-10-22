@@ -200,8 +200,9 @@ It is drafted from the results:
   don't regress.
 
 Filed as #2227 after the first measurement (2026-10-21). The pronoun guessing the runs
-surfaced is #2226. Cases 25b, 25c, 25j, 25k, 25l, 25m and 25n carry `known_failure` markers
-for #2227. Remove them in the PR that fixes it.
+surfaced is #2226. Cases 25b, 25c, 25j, 25k, 25l, 25m and 25n carried `known_failure` markers
+for #2227, each removed by the PR that fixes it. PR 1 (forwards and booking links) removed
+25j, 25k and 25l at 9/9 (2026-10-22); see `2026-10-22-principal-scheduling-fixes.md`.
 
 ## Calls made here (not discussed)
 

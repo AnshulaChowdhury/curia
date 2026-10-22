@@ -11,7 +11,6 @@ description: >
 tags: [principal-scheduling, ps-core, calendar, booking-link]
 delegation: real
 release_gate: false
-known_failure: { issue: "#2227", reason: "A forwarded booking page is rarely used; Curia asks the principal or sends its own invite." }
 autonomy: { score: 84, gating: band }
 stub_sets: [human-channels, calendar-office, calendar-specialist]
 seed:

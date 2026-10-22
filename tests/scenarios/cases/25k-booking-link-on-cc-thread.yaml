@@ -12,7 +12,6 @@ description: >
 tags: [principal-scheduling, ps-core, calendar, booking-link]
 delegation: real
 release_gate: false
-known_failure: { issue: "#2227", reason: "At autonomy 84 it ignores the link and emails times in 2 of 5 runs; when it books, it also sends its own invite." }
 autonomy: { score: 84, gating: band }
 stub_sets: [human-channels, calendar-office, calendar-specialist]
 seed:

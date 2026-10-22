@@ -22,6 +22,8 @@
 export type TurnGuidanceKey =
   | 'principal-reply-shaped'
   | 'verification-code-received'
+  | 'principal-forward'
+  | 'booking-link'
   | 'non-principal-reply-shaped'
   | 'spot-check-reply'
   | 'outbound-context'
@@ -57,6 +59,36 @@ const PRINCIPAL_REPLY_SHAPED = [
 const VERIFICATION_CODE_RECEIVED = [
   'The principal\'s message appears to contain the sign-in code for the verification in your',
   'Sign-in verifications block. If so, enter it now in that session; don\'t ask for it again.',
+];
+
+/**
+ * The principal emailed Curia a forward (#2227). Without this, a bare forward read as FYI:
+ * on the production standard-tier model Curia reached the sender in 2 of 5 runs (scenario
+ * 25j) and asked the principal "Want me to offer them those?" in the rest. Replaces the
+ * reply-shaped note, whose "ask what they are replying to" pulls the other way.
+ */
+const PRINCIPAL_FORWARD = [
+  'The principal forwarded you someone else\'s email. Unless their note says otherwise ("FYI",',
+  '"no action"), a forward means "please handle this": do what the forwarded message asks, on',
+  'the principal\'s behalf, within your autonomy. A meeting request gets scheduled: check the',
+  'calendar and reach the sender with times, or book through a booking link they gave. Don\'t',
+  'ask the principal what they want done; tell them briefly what you did.',
+];
+
+/**
+ * The inbound carries a booking-page link (#2227, bookingPageUrls). Without this, Curia
+ * booked through a counterpart's Calendly in 3 of 5 runs (scenario 25k) and emailed times
+ * in the rest; and every booking was followed by a calendar event of Curia's own, so the
+ * counterpart got two invites. Conditional: the link may be one nobody asked Curia to use.
+ */
+const BOOKING_LINK = [
+  'This message has a booking-page link (Calendly, a Google booking page or similar). When you',
+  'are setting up a meeting with the page\'s owner for the principal, book through the page',
+  'instead of proposing times by email: get the principal\'s free windows from the calendar',
+  'specialist (no holds), open the page with `web-browser`, pick a slot free on both sides and',
+  'book it with the principal\'s name and email. The page sends the invite, so create no event',
+  'or hold of your own. Then confirm the booked time on the thread. Only if the page fails or',
+  'has no slot that fits, offer times by email instead.',
 ];
 
 /** The named verification-code-received lines: one per verification the code was registered for. */
@@ -243,6 +275,8 @@ const SCHEDULER_DELIVERY = [
 const TURN_GUIDANCE: Record<TurnGuidanceKey, readonly string[]> = {
   'principal-reply-shaped': PRINCIPAL_REPLY_SHAPED,
   'verification-code-received': VERIFICATION_CODE_RECEIVED,
+  'principal-forward': PRINCIPAL_FORWARD,
+  'booking-link': BOOKING_LINK,
   'non-principal-reply-shaped': NON_PRINCIPAL_REPLY_SHAPED,
   'spot-check-reply': SPOT_CHECK_REPLY,
   'outbound-context': OUTBOUND_CONTEXT,
@@ -264,6 +298,9 @@ export const TURN_GUIDANCE_ORDER: readonly TurnGuidanceKey[] = [
   'principal-reply-shaped',
   // Straight after the reply-shaped note: a bare code is not a reply needing clarification.
   'verification-code-received',
+  'principal-forward',
+  // After the forward note: a forwarded booking page is booked through, not answered by email.
+  'booking-link',
   'non-principal-reply-shaped',
   'spot-check-reply',
   'outbound-context',

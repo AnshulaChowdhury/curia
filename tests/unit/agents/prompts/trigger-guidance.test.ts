@@ -171,6 +171,8 @@ describe('parseTurnGuidanceKeys', () => {
     const keys: TurnGuidanceKey[] = [
       'principal-reply-shaped',
       'verification-code-received',
+      'principal-forward',
+      'booking-link',
       'non-principal-reply-shaped',
       'spot-check-reply',
       'outbound-context',
