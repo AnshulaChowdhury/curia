@@ -88,7 +88,7 @@ A deep link to the absorbed node's id receives `404 node_merged`; the console fo
 | 422 | `blocked` | One or more blockers (`blockers` lists them) |
 | 503 | `unavailable` | The merge service is not wired on this server |
 
-`GET /api/kg/nodes/:id/merge-candidates` returns `{ candidates: [{ node, score, reasons }] }` for live non-fact nodes of any type: a case-insensitive label or alias match scores 1.0, and an embedding cosine at or above the embedding profile's fuzzy ambiguity floor scores the similarity. Only vectors from the live model are compared, and with entity memory off no embedding candidates are offered.
+`GET /api/kg/nodes/:id/merge-candidates` returns `{ candidates: [{ node, score, reasons }] }` for live non-fact nodes of any type: a case-insensitive label or alias match scores 1.0, and an embedding cosine at or above the embedding profile's fuzzy ambiguity floor scores the similarity. Only vectors from the live model are compared, and with entity memory off no embedding candidates are offered. The comparison is an exact scan rather than the HNSW index, which returns its 40 nearest nodes before facts are filtered out, so facts close to the node could hide a duplicate.
 
 ### Survivorship (summary)
 

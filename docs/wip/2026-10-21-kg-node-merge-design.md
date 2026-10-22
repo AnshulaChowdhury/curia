@@ -303,8 +303,8 @@ Returns `{ candidates: { node: ApiKgNode, score: number, reasons: ('same_label'|
 - A case-insensitive label or alias equality match in either direction scores
   1.0.
 - Embedding cosine at or above the profile's `fuzzyAmbiguityFloor` scores the
-  similarity, between vectors stamped with the live model. This uses the HNSW
-  index, ordered and limited.
+  similarity, between vectors stamped with the live model. This is an exact scan
+  over live non-fact nodes, not the HNSW index (see §14).
 - The two sets are unioned and sorted by score.
 
 ### Changes to existing routes
@@ -594,3 +594,4 @@ round. No migration is needed.
 - **Second CodeRabbit pass (2026-10-22):**
   - A deleted fact's live edges to nodes other than the two being merged move to the fact it was folded into, before the delete would cascade them. One that would duplicate an edge that fact keeps, or join it to itself, is dropped. The snapshot loads and locks these edges, and the executor refuses to delete a fact that still has any edge but its links to the merge nodes. No writer creates such edges today; the schema allows them.
   - Property keys, permission names and request keys are read and written as own properties, so `constructor` or `__proto__` behave like any other key.
+- **Merge candidates use an exact scan (JustWork #13, 2026-10-22):** `idx_kg_nodes_embedding` covers every node, and an HNSW scan returns its `hnsw.ef_search` (40) nearest before `type <> 'fact'` is applied. Facts often name their entity, and when 40 of them sit closer than a duplicate, they fill all 40. With synthetic vectors on the test database, 60 facts at cosine 0.95 hid a duplicate at 0.85 in 6 of 6 runs; how often real facts outrank a duplicate depends on the model and has not been measured. Iterative index scans and a larger `ef_search` only lowered the miss rate. The query now orders by the computed similarity, which keeps the index out. It runs once per merge dialog, over live non-fact nodes only. `KnowledgeGraphStore.semanticSearch` has the same pattern with a type filter; that is tracked separately.

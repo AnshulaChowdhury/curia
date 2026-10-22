@@ -239,9 +239,9 @@ export class NodeMergeService implements NodeMergeApi {
 
   /**
    * Likely duplicates of a node, of any type (§8): label/alias equality in either direction
-   * (score 1.0), then embedding neighbours via the HNSW index at or above the profile's
-   * fuzzy ambiguity floor, the score where entity resolution starts asking (ADR-051). Only
-   * vectors from the live model are compared; without an embedder, none are.
+   * (score 1.0), then embedding neighbours at or above the profile's fuzzy ambiguity floor,
+   * the score where entity resolution starts asking (ADR-051). Only vectors from the live
+   * model are compared; without an embedder, none are.
    */
   async candidates(nodeId: string, limit: number = DEFAULT_CANDIDATES): Promise<MergeCandidate[]> {
     if (!isUuid(nodeId)) {
@@ -279,17 +279,25 @@ export class NodeMergeService implements NodeMergeApi {
     const profile = this.deps.embedder?.profile;
     const model = profile ? embeddingStamp(profile) : null;
     if (profile && node.embedding && node.embedding_model === model) {
+      // An exact scan, not the HNSW index. idx_kg_nodes_embedding covers every node, and the
+      // index returns only its hnsw.ef_search (40) nearest before the WHERE clause runs. Facts
+      // often name their entity; when 40 of them sit closer than a duplicate, the duplicate
+      // is never suggested. Ordering by the computed similarity, rather
+      // than by `embedding <=> $1`, keeps the index out; the scan is one console request and
+      // computes distances for live non-fact nodes only.
       const similar = await pool.query<PgNodeRow & { similarity: number }>(
-        `SELECT ${NODE_COLUMNS}, 1 - (embedding <=> $1::vector) AS similarity
-         FROM kg_nodes
-         WHERE embedding IS NOT NULL AND embedding_model = $4
-           AND archived_at IS NULL AND type <> 'fact' AND id <> $2
-         ORDER BY embedding <=> $1::vector
+        `SELECT * FROM (
+           SELECT ${NODE_COLUMNS}, 1 - (embedding <=> $1::vector) AS similarity
+           FROM kg_nodes
+           WHERE embedding IS NOT NULL AND embedding_model = $4
+             AND archived_at IS NULL AND type <> 'fact' AND id <> $2
+         ) scored
+         WHERE similarity >= $5
+         ORDER BY similarity DESC, id
          LIMIT $3`,
-        [node.embedding, nodeId, cap * 3, model],
+        [node.embedding, nodeId, cap * 3, model, profile.thresholds.fuzzyAmbiguityFloor],
       );
       for (const row of similar.rows) {
-        if (row.similarity < profile.thresholds.fuzzyAmbiguityFloor) continue;
         const existing = found.get(row.id);
         if (existing) {
           existing.reasons.push('similar_embedding');

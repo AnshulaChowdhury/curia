@@ -796,6 +796,45 @@ describeIf('KG node merge (#2233)', () => {
     expect(unscored.map(c => c.node.id)).toContain(sameLabel);
   });
 
+  it('suggests a duplicate that many facts about the node sit closer to than it does', async () => {
+    // Facts often name their entity and can embed nearer the node than its duplicate does.
+    // An HNSW scan returns only its ef_search (40) nearest before filtering out facts, so 60
+    // closer facts hid the duplicate. The vectors are synthetic and seeded: how often real
+    // facts outrank a duplicate depends on the model, and is not what this test measures.
+    let seed = 2233;
+    const rand = (): number => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return seed / 2_147_483_648 - 0.5;
+    };
+    const dims = EmbeddingService.createForTesting().profile.dimensions;
+    const base = Array.from({ length: dims }, rand);
+    const near = (scale: number): string => `[${base.map(b => b + scale * rand()).join(',')}]`;
+    const stamp = embeddingStamp(EmbeddingService.createForTesting().profile);
+
+    const org = await node('organization', 'Recall Acme');
+    const duplicate = await node('organization', 'Recall ACME Corporation');
+    const setVector = (id: string, vector: string) =>
+      pool.query(`UPDATE kg_nodes SET embedding = $1::vector, embedding_model = $2 WHERE id = $3`, [vector, stamp, id]);
+    await setVector(org, near(0));
+    await setVector(duplicate, near(0.62)); // cosine about 0.85, above the 0.75 floor
+    for (let i = 0; i < 60; i++) {
+      await setVector(await fact(org, `Recall Acme fact ${i} ${runId}`), near(0.33)); // about 0.95
+    }
+
+    // A pool whose planner reaches for the HNSW index whenever a query allows it, as it does
+    // on a production-sized table. On a test-sized table it would scan and sort instead.
+    const indexPool = new Pool({ connectionString: DATABASE_URL, options: '-c enable_seqscan=off -c enable_sort=off' });
+    try {
+      const candidates = await serviceWith({ pool: indexPool }).candidates(org, 8);
+      const found = candidates.find(c => c.node.id === duplicate);
+      expect(found).toMatchObject({ reasons: ['similar_embedding'] });
+      expect(found!.score).toBeGreaterThan(0.8);
+      expect(found!.score).toBeLessThan(0.9);
+    } finally {
+      await indexPool.end();
+    }
+  });
+
   // -- 8. principal survivor ------------------------------------------------
 
   it('requires an acknowledgement before identities become principal identities', async (ctx) => {
