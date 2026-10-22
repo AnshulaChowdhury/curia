@@ -2523,3 +2523,14 @@ table.records-table tbody tr.active td { background: transparent; }
   font-family: 'JetBrains Mono', monospace;
   font-size: 12.5px;
 }
+.docs-notices {
+  margin: 10px 20px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--app-amber);
+  border-radius: 6px;
+  font-size: 12.5px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+}

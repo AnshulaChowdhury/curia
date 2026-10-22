@@ -172,6 +172,7 @@ describe('Event Types', () => {
 
   it('creates a document.console_action event (#1822)', () => {
     const event = createDocumentConsoleAction({
+      stage: 'completed',
       action: 'update',
       path: '/projects/x/brief.md',
       documentId: '00000000-0000-4000-8000-000000000001',

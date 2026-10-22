@@ -6,9 +6,10 @@
 // read and write goes through WorkingDocsRepo — no SQL against working_documents lives
 // here.
 //
-// Every mutation appends to the directory's log.md the way doc-write does, stamps the
-// principal's edit into the frontmatter, and publishes a document.console_action audit
-// event.
+// Every mutation is audited write-ahead (a `requested` document.console_action event
+// before the store is touched; refused if it can't be recorded), then appends to the
+// directory's log.md the way doc-write does, stamps the principal's edit into the
+// frontmatter, and publishes a `completed` event.
 //
 // The store holds sensitive personal content (medical prep, travel and family logistics),
 // so these routes are only mounted when the bootstrap secret is configured.
@@ -172,42 +173,75 @@ export async function documentsRoutes(
   }
 
   /**
-   * Record a console mutation: a log.md line in the document's directory (except for
-   * log.md itself, which would log into the file being changed — or recreate an archived
-   * one) and the audit event.
+   * Write-ahead audit: durably record that the principal asked for a change BEFORE the
+   * store is touched. If the record can't be written the change is refused — a mutation
+   * must never exist without an audit row. Sends the 500 itself and returns false.
    */
-  async function recordMutation(action: ConsoleAction, doc: WorkingDocRow): Promise<void> {
+  async function auditRequested(
+    action: ConsoleAction,
+    target: { path: string; documentId: string | null; baseVersion: number | null; byteSize: number | null },
+    reply: FastifyReply,
+  ): Promise<boolean> {
+    try {
+      await bus.publish('system', createDocumentConsoleAction({
+        stage: 'requested',
+        action,
+        ...target,
+        initiatedBy: 'principal',
+        channel: CONSOLE_CHANNEL,
+      }));
+      return true;
+    } catch (err) {
+      logger.error({ err, action, path: target.path }, 'console documents: audit write failed — change refused');
+      void reply.status(500).send({
+        error: 'Nothing was changed: the change could not be audited, so it was not made. Check the server logs.',
+      });
+      return false;
+    }
+  }
+
+  /**
+   * After a successful write: the log.md line in the document's directory (except for
+   * log.md itself, which would log into the file being changed — or recreate an archived
+   * one) and the `completed` audit event. The change is already made and already audited
+   * as requested, so a miss here comes back as a warning on a successful response rather
+   * than an error that would invite retrying a change that happened.
+   */
+  async function recordCompleted(action: ConsoleAction, doc: WorkingDocRow): Promise<string[]> {
+    const warnings: string[] = [];
     if (leafOf(doc.path) !== LOG_FILENAME) {
-      await appendDirectoryLogEntry(workingDocs, logger, {
+      const logged = await appendDirectoryLogEntry(workingDocs, logger, {
         documentPath: doc.path,
         operation: `console-${action}`,
         summary: `principal ${action === 'update' ? 'edited' : `${action}d`} ${leafOf(doc.path)} in the console`,
         source: 'console documents',
       });
+      if (!logged) warnings.push(`The change was made, but its entry in ${LOG_FILENAME} could not be written.`);
     }
-    await bus.publish('system', createDocumentConsoleAction({
-      action,
-      path: doc.path,
-      documentId: doc.id,
-      version: doc.version,
-      byteSize: doc.byteSize,
-      initiatedBy: 'principal',
-      channel: CONSOLE_CHANNEL,
-    }));
+    try {
+      await bus.publish('system', createDocumentConsoleAction({
+        stage: 'completed',
+        action,
+        path: doc.path,
+        documentId: doc.id,
+        version: doc.version,
+        byteSize: doc.byteSize,
+        initiatedBy: 'principal',
+        channel: CONSOLE_CHANNEL,
+      }));
+    } catch (err) {
+      logger.error({ err, action, path: doc.path }, 'console documents: completed audit event failed after the change was made');
+      warnings.push('The change was made and its request was audited, but the completion audit entry failed — check the server logs.');
+    }
+    return warnings;
   }
 
-  /** Mutations respond after recording; a failed audit is reported, not hidden. */
-  async function recordOrFail(action: ConsoleAction, doc: WorkingDocRow, reply: FastifyReply): Promise<boolean> {
-    try {
-      await recordMutation(action, doc);
-      return true;
-    } catch (err) {
-      logger.error({ err, action, path: doc.path }, 'console documents: change saved but audit event failed');
-      void reply.status(500).send({
-        error: 'The change was saved, but its audit entry could not be written — check the server logs.',
-      });
-      return false;
-    }
+  /**
+   * Authenticate in onRequest, before Fastify reads and parses the body — an
+   * unauthenticated client must not get a large body buffered before its 401.
+   */
+  async function authBeforeBody(request: FastifyRequest, reply: FastifyReply) {
+    if (!requireAuth(request, reply)) return reply;
   }
 
   // Writes are rarer than reads. JSON escaping can grow a body up to 6× (\uXXXX), so the
@@ -215,6 +249,7 @@ export async function documentsRoutes(
   const WRITE_ROUTE = {
     bodyLimit: editMaxBytes * 6 + 16 * 1024,
     config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    onRequest: authBeforeBody,
   };
 
   // -- GET /api/documents — the store as a flat list (no bodies); the console builds the tree --
@@ -321,7 +356,6 @@ export async function documentsRoutes(
   // -- POST /api/documents/doc — create a document from OKF text at a new path --
 
   app.post('/api/documents/doc', WRITE_ROUTE, async (request, reply) => {
-    if (!requireAuth(request, reply)) return;
     const body = request.body as { path?: unknown; content?: unknown } | undefined;
     const path = parseDocPath(body?.path);
     if (!path) return reply.status(400).send({ error: 'path must be an absolute .md document path' });
@@ -344,6 +378,7 @@ export async function documentsRoutes(
       if (await workingDocs.livePathExists(path)) {
         return reply.status(409).send({ error: `A live document already exists at ${path}`, reason: 'exists' });
       }
+      if (!(await auditRequested('create', { path, documentId: null, baseVersion: null, byteSize: size }, reply))) return;
       let created: WorkingDocRow;
       try {
         created = await workingDocs.create({ path, type: parsed.type, frontmatter, body: parsed.body });
@@ -354,8 +389,8 @@ export async function documentsRoutes(
         }
         throw err;
       }
-      if (!(await recordOrFail('create', created, reply))) return;
-      return reply.status(201).send(await detailJson(created));
+      const warnings = await recordCompleted('create', created);
+      return reply.status(201).send({ ...(await detailJson(created)), warnings });
     } catch (err) {
       logger.error({ err, path }, 'POST /api/documents/doc: create failed');
       return reply.status(500).send({ error: 'Failed to create document' });
@@ -365,7 +400,6 @@ export async function documentsRoutes(
   // -- PUT /api/documents/doc — whole-document save with optimistic concurrency --
 
   app.put('/api/documents/doc', WRITE_ROUTE, async (request, reply) => {
-    if (!requireAuth(request, reply)) return;
     const body = request.body as { path?: unknown; content?: unknown; expectedVersion?: unknown } | undefined;
     const path = parseDocPath(body?.path);
     if (!path) return reply.status(400).send({ error: 'path must be an absolute .md document path' });
@@ -392,6 +426,7 @@ export async function documentsRoutes(
         return reply.status(413).send({ error: `Document would be ${size} bytes — over the ${editMaxBytes}-byte console limit`, reason: 'over_cap' });
       }
 
+      if (!(await auditRequested('update', { path, documentId: current.id, baseVersion: expectedVersion, byteSize: size }, reply))) return;
       const result = await workingDocs.update(path, {
         type: parsed.type,
         frontmatter,
@@ -402,8 +437,8 @@ export async function documentsRoutes(
         // Never overwrite: hand back what is there now and let the principal decide.
         return reply.status(409).send({ conflict: true, ...(await detailJson(result.document)) });
       }
-      if (!(await recordOrFail('update', result.document, reply))) return;
-      return reply.send(await detailJson(result.document));
+      const warnings = await recordCompleted('update', result.document);
+      return reply.send({ ...(await detailJson(result.document)), warnings });
     } catch (err) {
       logger.error({ err, path }, 'PUT /api/documents/doc: save failed');
       return reply.status(500).send({ error: 'Failed to save document' });
@@ -413,7 +448,6 @@ export async function documentsRoutes(
   // -- POST /api/documents/archive — soft-delete (never a hard DELETE) --
 
   app.post('/api/documents/archive', WRITE_ROUTE, async (request, reply) => {
-    if (!requireAuth(request, reply)) return;
     const body = request.body as { path?: unknown; expectedVersion?: unknown } | undefined;
     const path = parseDocPath(body?.path);
     if (!path) return reply.status(400).send({ error: 'path must be an absolute .md document path' });
@@ -423,14 +457,15 @@ export async function documentsRoutes(
     }
 
     try {
+      if (!(await auditRequested('archive', { path, documentId: null, baseVersion: expectedVersion, byteSize: null }, reply))) return;
       const result = await workingDocs.softDeleteAtVersion(path, expectedVersion);
       if (!result) return reply.status(404).send({ error: 'No live document at that path' });
       if (!result.ok) {
         // Never archive a version the principal hasn't seen — show them what is there now.
         return reply.status(409).send({ conflict: true, ...(await detailJson(result.document)) });
       }
-      if (!(await recordOrFail('archive', result.document, reply))) return;
-      return reply.send(await detailJson(result.document));
+      const warnings = await recordCompleted('archive', result.document);
+      return reply.send({ ...(await detailJson(result.document)), warnings });
     } catch (err) {
       logger.error({ err, path }, 'POST /api/documents/archive: archive failed');
       return reply.status(500).send({ error: 'Failed to archive document' });
@@ -440,12 +475,17 @@ export async function documentsRoutes(
   // -- POST /api/documents/restore — return an archived row to live --
 
   app.post('/api/documents/restore', WRITE_ROUTE, async (request, reply) => {
-    if (!requireAuth(request, reply)) return;
     const body = request.body as { id?: unknown } | undefined;
     if (!isUuid(body?.id)) return reply.status(400).send({ error: 'id must be a UUID' });
     const id = body.id;
 
     try {
+      const target = await workingDocs.readById(id);
+      if (!target) return reply.status(404).send({ error: 'Document not found' });
+      if (target.archivedAt === null) {
+        return reply.status(400).send({ error: 'That document is not archived', reason: 'not_archived' });
+      }
+      if (!(await auditRequested('restore', { path: target.path, documentId: id, baseVersion: target.version, byteSize: null }, reply))) return;
       const result = await workingDocs.restore(id);
       if (!result.ok) {
         if (result.reason === 'not_found') return reply.status(404).send({ error: 'Document not found' });
@@ -458,8 +498,8 @@ export async function documentsRoutes(
           livePath: result.document?.path ?? null,
         });
       }
-      if (!(await recordOrFail('restore', result.document, reply))) return;
-      return reply.send(await detailJson(result.document));
+      const warnings = await recordCompleted('restore', result.document);
+      return reply.send({ ...(await detailJson(result.document)), warnings });
     } catch (err) {
       logger.error({ err, id }, 'POST /api/documents/restore: restore failed');
       return reply.status(500).send({ error: 'Failed to restore document' });

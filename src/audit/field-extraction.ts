@@ -101,7 +101,8 @@ const EXTRACTORS: Readonly<Record<string, Extractor>> = {
   // Console Documents page (#1822): the principal acting on one working document.
   'document.console_action': (p, fail) => ({
     action: str(p, 'action', fail),
-    outcome: 'success',
+    // Two-stage, like agent.task: `requested` is written ahead of the change.
+    outcome: p.stage === 'requested' ? 'pending' : 'success',
     target_type: 'working_document',
     target_id: str(p, 'path', fail),
     initiator_type: 'human',

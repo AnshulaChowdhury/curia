@@ -24,10 +24,19 @@ describe('extractStructuredFields', () => {
     });
   });
 
+  it('maps a requested document.console_action as pending (write-ahead)', () => {
+    expect(extractStructuredFields(
+      'document.console_action',
+      { stage: 'requested', action: 'update', path: '/projects/x/brief.md', initiatedBy: 'principal', channel: 'console' },
+      'evt-doc-req',
+      logger,
+    )).toMatchObject({ action: 'update', outcome: 'pending', target_id: '/projects/x/brief.md' });
+  });
+
   it('maps document.console_action onto the working document (#1822)', () => {
     expect(extractStructuredFields(
       'document.console_action',
-      { action: 'archive', path: '/projects/x/brief.md', initiatedBy: 'principal', channel: 'console' },
+      { stage: 'completed', action: 'archive', path: '/projects/x/brief.md', initiatedBy: 'principal', channel: 'console' },
       'evt-doc',
       logger,
     )).toEqual({

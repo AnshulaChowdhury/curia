@@ -100,7 +100,8 @@ export interface DirectoryLogEntryParams {
 /**
  * Append a change record to `log.md` in the document's directory, creating it on first
  * use. Shared by `doc-write` and the console Documents routes (#1822). Best-effort: the
- * document write already succeeded, so failures warn rather than throw.
+ * document write already succeeded, so failures warn rather than throw. Returns whether
+ * the entry was written, so a caller can surface a miss (the console does).
  *
  * The log stays unowned (no `task_id`): it is shared across tasks in the folder, and one
  * project's archival must not remove the audit trail (#1819 CodeRabbit).
@@ -109,7 +110,7 @@ export async function appendDirectoryLogEntry(
   repo: Pick<WorkingDocsRepo, 'read' | 'create' | 'append'>,
   log: Logger,
   params: DirectoryLogEntryParams,
-): Promise<void> {
+): Promise<boolean> {
   const logPath = logPathForDocument(params.documentPath);
   const entry = formatLogEntry(new Date().toISOString(), params.operation, params.summary);
 
@@ -126,7 +127,7 @@ export async function appendDirectoryLogEntry(
             conversationId: params.conversationId,
             agentId: params.agentId,
           });
-          return;
+          return true;
         } catch (err) {
           // Another writer may have created log.md between read and create — retry.
           if (attempt === maxAttempts - 1) throw err;
@@ -137,7 +138,7 @@ export async function appendDirectoryLogEntry(
         content: entry.trimEnd(),
         expectedVersion: existing.version,
       });
-      if (result.ok) return;
+      if (result.ok) return true;
       if (attempt === maxAttempts - 1) {
         log.warn(
           { path: logPath, version: existing.version },
@@ -145,11 +146,13 @@ export async function appendDirectoryLogEntry(
         );
       }
     }
+    return false;
   } catch (err) {
     log.warn(
       { err, path: logPath },
       `${params.source}: log.md append failed — document write succeeded; audit entry may be missing`,
     );
+    return false;
   }
 }
 

@@ -65,7 +65,11 @@ describeIf('console Documents editing (integration)', () => {
     return { status: res.statusCode, body: JSON.parse(res.payload) as DetailResponse };
   }
 
-  const auditActions = () => publish.mock.calls.map(([, event]) => (event.type === 'document.console_action' ? event.payload.action : event.type));
+  /** Audit trail as `stage:action`, in publish order. */
+  const auditTrail = () => publish.mock.calls.map(([, event]) =>
+    (event.type === 'document.console_action' && 'stage' in event.payload ? `${event.payload.stage}:${event.payload.action}` : event.type));
+  /** Completed actions only — what actually changed. */
+  const auditActions = () => auditTrail().filter(a => a.startsWith('completed:')).map(a => a.slice('completed:'.length));
 
   async function logBody(dir: string): Promise<string> {
     return (await repo.read(`${dir}log.md`))?.body ?? '';
@@ -79,6 +83,16 @@ describeIf('console Documents editing (integration)', () => {
       ['POST', '/api/documents/restore'],
     ] as const)('rejects an unauthenticated %s %s', async (method, url) => {
       const res = await app.inject({ method, url, payload: {} });
+      expect(res.statusCode).toBe(401);
+    });
+
+    it('rejects an unauthenticated write before reading its body (#2236 review)', async () => {
+      // Over the body limit: a 413 would mean the body was read before auth ran.
+      const res = await app.inject({
+        method: 'PUT', url: '/api/documents/doc',
+        headers: { 'content-type': 'application/json' },
+        payload: JSON.stringify({ content: 'x'.repeat(CAP * 8) }),
+      });
       expect(res.statusCode).toBe(401);
     });
   });
@@ -105,7 +119,8 @@ describeIf('console Documents editing (integration)', () => {
       ]);
       expect(await logBody('/projects/p/')).toMatch(/console-update \| principal edited brief\.md in the console/);
       expect(auditActions()).toEqual(['update']);
-      expect(publish.mock.calls[0]![0]).toBe('system');
+      expect(publish.mock.calls.every(([layer]) => layer === 'system')).toBe(true);
+      expect(auditTrail()).toEqual(['requested:update', 'completed:update']);
     });
 
     it('persists a frontmatter-only edit and re-runs link extraction', async () => {
@@ -141,7 +156,7 @@ describeIf('console Documents editing (integration)', () => {
       expect(saved.body.document.body).toBe('agent wrote this\n');
       expect(saved.body.document.version).toBe(2);
       expect((await repo.read('/projects/p/brief.md'))!.body).toBe('agent wrote this\n');
-      expect(publish).not.toHaveBeenCalled();
+      expect(auditActions()).toEqual([]);
     });
 
     it('makes over-cap documents read-only and refuses saves that would cross the cap', async () => {
@@ -267,7 +282,7 @@ describeIf('console Documents editing (integration)', () => {
       expect(res.status).toBe(409);
       expect(res.body.reason).toBe('path_in_use');
       expect((await repo.read('/projects/a/doc.md'))!.body).toBe('new\n');
-      expect(publish).not.toHaveBeenCalled();
+      expect(auditActions()).toEqual([]);
     });
 
     it('rejects restoring a live row', async () => {
@@ -276,15 +291,80 @@ describeIf('console Documents editing (integration)', () => {
     });
   });
 
-  it('reports a failed audit write instead of hiding it — the change itself stands', async () => {
-    await repo.create({ path: '/projects/a/doc.md', type: 'brief', body: 'x\n' });
-    publish.mockRejectedValueOnce(new Error('audit_log unavailable'));
-    const res = await call('PUT', '/api/documents/doc', {
-      path: '/projects/a/doc.md', content: emitOkfDocument({ type: 'brief', body: 'y\n' }), expectedVersion: 1,
+  describe('write-ahead audit (#2235 review)', () => {
+    it('records the request before writing, then the completion', async () => {
+      await repo.create({ path: '/projects/a/doc.md', type: 'brief', body: 'x\n' });
+      let bodyAtRequest: string | undefined;
+      publish.mockImplementation(async (_layer, event) => {
+        if (event.type === 'document.console_action' && 'stage' in event.payload && event.payload.stage === 'requested') {
+          bodyAtRequest = (await repo.read('/projects/a/doc.md'))!.body;
+        }
+      });
+      const res = await call('PUT', '/api/documents/doc', {
+        path: '/projects/a/doc.md', content: emitOkfDocument({ type: 'brief', body: 'y\n' }), expectedVersion: 1,
+      });
+      expect(res.status).toBe(200);
+      expect(bodyAtRequest).toBe('x\n');
+      expect(auditTrail()).toEqual(['requested:update', 'completed:update']);
     });
-    expect(res.status).toBe(500);
-    expect(res.body.error).toMatch(/saved, but its audit entry could not be written/);
+
+    it('refuses the change when the request cannot be audited — nothing is written', async () => {
+      await repo.create({ path: '/projects/a/doc.md', type: 'brief', body: 'x\n' });
+      publish.mockRejectedValueOnce(new Error('audit_log unavailable'));
+      const res = await call('PUT', '/api/documents/doc', {
+        path: '/projects/a/doc.md', content: emitOkfDocument({ type: 'brief', body: 'y\n' }), expectedVersion: 1,
+      });
+      expect(res.status).toBe(500);
+      expect(res.body.error).toMatch(/Nothing was changed/);
+      const row = (await repo.read('/projects/a/doc.md'))!;
+      expect([row.body, row.version]).toEqual(['x\n', 1]);
+      expect(await repo.read('/projects/a/log.md')).toBeNull();
+    });
+
+    it('leaves only a request on the trail when the write loses a conflict', async () => {
+      await repo.create({ path: '/projects/a/doc.md', type: 'brief', body: 'x\n' });
+      await repo.update('/projects/a/doc.md', { body: 'agent\n', expectedVersion: 1 });
+      const res = await call('PUT', '/api/documents/doc', {
+        path: '/projects/a/doc.md', content: emitOkfDocument({ type: 'brief', body: 'y\n' }), expectedVersion: 1,
+      });
+      expect(res.status).toBe(409);
+      expect(auditTrail()).toEqual(['requested:update']);
+    });
+
+    it('returns success with a warning when the completion event fails after the change', async () => {
+      await repo.create({ path: '/projects/a/doc.md', type: 'brief', body: 'x\n' });
+      publish.mockImplementationOnce(async () => {}).mockRejectedValueOnce(new Error('audit_log unavailable'));
+      const res = await call('PUT', '/api/documents/doc', {
+        path: '/projects/a/doc.md', content: emitOkfDocument({ type: 'brief', body: 'y\n' }), expectedVersion: 1,
+      });
+      expect(res.status).toBe(200);
+      expect((res.body as unknown as { warnings: string[] }).warnings).toEqual([expect.stringMatching(/completion audit entry failed/)]);
+      expect((await repo.read('/projects/a/doc.md'))!.body).toBe('y\n');
+    });
+  });
+
+  it('warns, rather than failing, when the log.md entry cannot be written (#2235 review)', async () => {
+    await repo.create({ path: '/projects/a/doc.md', type: 'brief', body: 'x\n' });
+    const failingLogRepo = Object.create(repo) as WorkingDocsRepo;
+    failingLogRepo.create = async (params) => {
+      if (params.path.endsWith('/log.md')) throw new Error('log write failed');
+      return repo.create(params);
+    };
+    const logApp = Fastify();
+    await logApp.register(cookie);
+    await logApp.register(documentsRoutes, {
+      workingDocs: failingLogRepo, logger: createSilentLogger(), webAppBootstrapSecret: SECRET,
+      sessions: new Map(), scratchTtlDays: 7, editMaxBytes: CAP, bus: { publish },
+    });
+    const res = await logApp.inject({
+      method: 'PUT', url: '/api/documents/doc', headers: AUTH,
+      payload: { path: '/projects/a/doc.md', content: emitOkfDocument({ type: 'brief', body: 'y\n' }), expectedVersion: 1 },
+    });
+    await logApp.close();
+    expect(res.statusCode).toBe(200);
+    expect((JSON.parse(res.payload) as { warnings: string[] }).warnings).toEqual([expect.stringMatching(/entry in log\.md could not be written/)]);
     expect((await repo.read('/projects/a/doc.md'))!.body).toBe('y\n');
+    expect(auditActions()).toEqual(['update']);
   });
 
   it('does not log a log.md edit into itself', async () => {

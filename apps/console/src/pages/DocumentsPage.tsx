@@ -44,6 +44,8 @@ interface DocResponse {
   editMaxBytes: number;
   /** The whole document as OKF text — present only when editable. */
   okf: string | null;
+  /** On a successful mutation: things that went wrong after the change was made. */
+  warnings?: string[];
 }
 
 /** Template for a new document: OKF requires frontmatter with a non-empty type. */
@@ -268,6 +270,9 @@ function DocumentEditor({
             <button
               type="button"
               className="btn btn-secondary btn-sm"
+              // Over the cap now, so there is no editable text to load — Cancel shows it read-only.
+              disabled={conflict.okf === null}
+              title={conflict.okf === null ? 'It is now over the console size limit — cancel to view it read-only' : undefined}
               onClick={() => {
                 setText(conflict.okf ?? '');
                 setBaseVersion(conflict.document.version);
@@ -320,8 +325,11 @@ function DocumentView({
 }: {
   data: DocResponse;
   onOpenPath: (path: string) => void;
-  /** A save replaced this document's content. */
-  onChanged: (next: DocResponse) => void;
+  /**
+   * This document's content changed (a save, or a refresh after a conflict). `notices`
+   * are shown by the page, which outlives this view — the view remounts per version.
+   */
+  onChanged: (next: DocResponse, notices?: string[]) => void;
   onArchived: (archived: DocResponse) => void;
   onRestored: (restored: DocResponse) => void;
 }) {
@@ -339,8 +347,7 @@ function DocumentView({
       const { status, data: res } = await sendJson('POST', '/api/documents/archive', { path: doc.path, expectedVersion: doc.version });
       if (status === 200) onArchived(res);
       else if (status === 409 && res.conflict) {
-        setActionError(`Not archived: it changed since you opened it (now version ${res.document.version}). Showing the current version.`);
-        onChanged(res);
+        onChanged(res, [`Not archived: it changed since you opened it (now version ${res.document.version}). Showing the current version.`]);
       } else setActionError(res.error ?? `Archive failed (${status})`);
     } catch (err) {
       console.error('[DocumentsPage] archive failed:', err);
@@ -419,7 +426,7 @@ function DocumentView({
         {editing ? (
           <DocumentEditor
             data={data}
-            onSaved={next => { setEditing(false); onChanged(next); }}
+            onSaved={next => { setEditing(false); onChanged(next, next.warnings); }}
             onCancel={() => setEditing(false)}
           />
         ) : (
@@ -562,6 +569,8 @@ export default function DocumentsPage() {
   const [detail, setDetail] = useState<DocResponse | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  /** Messages about the last action on the open document; cleared when you navigate. */
+  const [notices, setNotices] = useState<string[]>([]);
 
   useEffect(() => {
     document.documentElement.dataset['mobileSidebar'] = mobileOpen ? 'open' : '';
@@ -679,8 +688,10 @@ export default function DocumentsPage() {
     });
   }, [openPath]);
 
-  function open(target: Selection) {
+  /** Navigate to a document. `withNotices` carries messages about the action that led here. */
+  function open(target: Selection, withNotices: string[] = []) {
     setCreating(false);
+    setNotices(withNotices);
     void navigate({
       to: '/documents',
       search: {
@@ -844,28 +855,36 @@ export default function DocumentsPage() {
                     setCreating(false);
                     setDetail(created);
                     void loadList();
-                    open({ path: created.document.path });
+                    open({ path: created.document.path }, created.warnings);
                   }}
                 />
               ) : detailError ? (
                 <div className="docs-error">{detailError}</div>
               ) : detail ? (
+                <>
+                {notices.length > 0 && (
+                  <div className="docs-notices" role="status">
+                    {notices.map(n => <div key={n}>{n}</div>)}
+                    <button type="button" className="docs-link-btn" onClick={() => setNotices([])}>Dismiss</button>
+                  </div>
+                )}
                 <DocumentView
                   key={`${detail.document.id}:${detail.document.version}`}
                   data={detail}
                   onOpenPath={path => open({ path })}
-                  onChanged={next => { setDetail(next); void loadList(); }}
+                  onChanged={(next, changeNotices = []) => { setDetail(next); setNotices(changeNotices); void loadList(); }}
                   onArchived={archived => {
                     setDetail(archived);
                     void loadList();
-                    open({ id: archived.document.id });
+                    open({ id: archived.document.id }, archived.warnings);
                   }}
                   onRestored={restored => {
                     setDetail(restored);
                     void loadList();
-                    open({ path: restored.document.path });
+                    open({ path: restored.document.path }, restored.warnings);
                   }}
                 />
+                </>
               ) : (
                 <div className="docs-empty-note docs-empty-center">
                   Pick a document to read it. Directories are path prefixes — the same

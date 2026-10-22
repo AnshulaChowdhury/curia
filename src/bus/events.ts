@@ -629,9 +629,34 @@ interface SystemRestartPayload {
 }
 
 // DocumentConsoleActionPayload — the principal changed the OKF working-document store
-// from the console Documents page (#1822). Audit-only: nothing subscribes to act on it;
-// it exists so every console mutation lands in audit_log via the write-ahead hook.
-interface DocumentConsoleActionPayload {
+// from the console Documents page (#1822). Audit-only: nothing subscribes to act on it.
+//
+// Each mutation is recorded in two stages, like tool.invoke / tool.result. `requested` is
+// published BEFORE the store is touched, and the console refuses the change if it cannot
+// be recorded — so no mutation exists without a durable audit row. `completed` follows a
+// successful write. A `requested` with no matching `completed` is a change that was not
+// made (a version conflict, a reused path, or a failure).
+interface DocumentConsoleActorFields {
+  /** The console session is principal-only (see console-originator.ts). */
+  initiatedBy: 'principal';
+  channel: 'console';
+}
+
+interface DocumentConsoleRequestedPayload extends DocumentConsoleActorFields {
+  stage: 'requested';
+  action: 'create' | 'update' | 'archive' | 'restore';
+  /** Store path of the document to act on. */
+  path: string;
+  /** Row id, when the target row is known up front (not for create). */
+  documentId: string | null;
+  /** Version the change is conditioned on, when it has one. */
+  baseVersion: number | null;
+  /** Serialized OKF size of the new content, for create/update. */
+  byteSize: number | null;
+}
+
+interface DocumentConsoleCompletedPayload extends DocumentConsoleActorFields {
+  stage: 'completed';
   action: 'create' | 'update' | 'archive' | 'restore';
   /** Store path of the document acted on. */
   path: string;
@@ -641,10 +666,9 @@ interface DocumentConsoleActionPayload {
   version: number;
   /** Serialized OKF size after the action. */
   byteSize: number;
-  /** The console session is principal-only (see console-originator.ts). */
-  initiatedBy: 'principal';
-  channel: 'console';
 }
+
+type DocumentConsoleActionPayload = DocumentConsoleRequestedPayload | DocumentConsoleCompletedPayload;
 
 // LlmCallPayload — emitted by the agent runtime after every LLM API call completes.
 // Provides model provenance, token accounting, timing, and content fingerprints for audit.
