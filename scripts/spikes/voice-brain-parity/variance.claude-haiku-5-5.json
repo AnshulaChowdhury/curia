@@ -1704,5 +1704,35 @@
         "usd": 0.06403798499999998
       }
     }
+  },
+  "turnLatency": {
+    "baseline": {
+      "n": 95,
+      "ttftP50": 2383,
+      "ttftP90": 4768,
+      "fullP50": 2743,
+      "fullP90": 4958
+    },
+    "shared-hardening": {
+      "n": 95,
+      "ttftP50": 2690,
+      "ttftP90": 4900,
+      "fullP50": 2854,
+      "fullP90": 5067
+    },
+    "slim-core": {
+      "n": 95,
+      "ttftP50": 3086,
+      "ttftP90": 5237,
+      "fullP50": 3310,
+      "fullP90": 5419
+    },
+    "slim-core-system": {
+      "n": 95,
+      "ttftP50": 3459,
+      "ttftP90": 6307,
+      "fullP50": 3766,
+      "fullP90": 6843
+    }
   }
 }

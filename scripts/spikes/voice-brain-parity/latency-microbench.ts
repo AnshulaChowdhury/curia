@@ -16,6 +16,7 @@
 //
 //   ANTHROPIC_API_KEY=… pnpm exec tsx scripts/spikes/voice-brain-parity/latency-microbench.ts
 //   VOICE_SPIKE_MODEL=claude-haiku-5-5 REPS=8 pnpm exec tsx …
+//   VOICE_SPIKE_EFFORT=none …   (voice's reasoning setting; see production-context.ts)
 import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -43,11 +44,13 @@ import {
   modelArtifactPath,
   renderVoiceSystemModule,
   renderVoiceTurnGuidance,
+  spikeReasoningEffort,
 } from './production-context.js';
 
 const REPS = Number(process.env.REPS ?? 10);
 const MODEL = process.env.VOICE_SPIKE_MODEL ?? 'claude-haiku-4-5';
-const OUT = modelArtifactPath(import.meta.dirname, 'latency-microbench', MODEL);
+const EFFORT = spikeReasoningEffort();
+const OUT = modelArtifactPath(import.meta.dirname, 'latency-microbench', MODEL, EFFORT);
 const UTTERANCE = 'Thanks, that is all for now.';
 
 type ArmId = 'baseline' | 'shared-hardening' | 'slim-core' | 'slim-core-system';
@@ -154,7 +157,7 @@ async function oneCall(
     messages,
     tools,
     model: MODEL,
-    options: { signal: AbortSignal.timeout(60_000) },
+    options: { signal: AbortSignal.timeout(60_000), ...(EFFORT ? { reasoning: { effort: EFFORT } } : {}) },
   })) {
     if (event.type === 'text_delta' && ttft === null) ttft = Date.now() - t0;
     if (event.type === 'message_end') usage = event.usage;
@@ -239,6 +242,7 @@ async function main() {
       {
         generatedAt: new Date().toISOString(),
         model: MODEL,
+        reasoningEffort: EFFORT ?? 'model-default',
         reps: REPS,
         utterance: UTTERANCE,
         spendUsd: Math.round(rows.reduce((sum, r) => sum + r.usd, 0) * 1000) / 1000,

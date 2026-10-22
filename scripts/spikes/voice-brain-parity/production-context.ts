@@ -13,6 +13,7 @@ import type { LLMProvider, LLMUsage, ToolDefinition } from '../../../src/agents/
 import { createEstimateCostUsd } from '../../../src/agents/llm/pricing.js';
 import { ModelRegistry } from '../../../src/agents/llm/model-registry.js';
 import { ModelRouter } from '../../../src/agents/llm/model-router.js';
+import { REASONING_EFFORTS, type ReasoningEffort } from '../../../src/agents/llm/sampling-options.js';
 import { discoverAgentManifests, loadAgentConfig, type AgentYamlConfig } from '../../../src/agents/loader.js';
 import { buildBaseSystemPrompt } from '../../../src/agents/system-prompt.js';
 import { TURN_GUIDANCE_HEADER } from '../../../src/agents/prompts/turn-guidance.js';
@@ -222,7 +223,27 @@ export function meterProvider(inner: LLMProvider, model: string): {
   return { provider, meter };
 }
 
-/** Artifact path for a model: the bare name for prod's voice model, a model-suffixed one otherwise. */
-export function modelArtifactPath(dir: string, base: string, model: string): string {
-  return model === 'claude-haiku-4-5' ? resolve(dir, `${base}.json`) : resolve(dir, `${base}.${model}.json`);
+/**
+ * VOICE_SPIKE_EFFORT: the reasoning effort every spike request sends (#2245).
+ * Unset sends nothing, so the model's default applies. That is how the first 5.5 runs
+ * went, and on a model that thinks by default it is not what voice sends:
+ * `turn-runner.ts` sends NO_REASONING. Set `none` to match production.
+ */
+export function spikeReasoningEffort(): ReasoningEffort | undefined {
+  const raw = process.env.VOICE_SPIKE_EFFORT?.trim();
+  if (!raw) return undefined;
+  if (!(REASONING_EFFORTS as readonly string[]).includes(raw)) {
+    throw new Error(`VOICE_SPIKE_EFFORT must be one of ${REASONING_EFFORTS.join(', ')}; got '${raw}'`);
+  }
+  return raw as ReasoningEffort;
+}
+
+/**
+ * Artifact path for a model: the bare name for prod's voice model, a model-suffixed one
+ * otherwise, and an effort suffix when the run set one.
+ */
+export function modelArtifactPath(dir: string, base: string, model: string, effort?: ReasoningEffort): string {
+  const modelPart = model === 'claude-haiku-4-5' ? '' : `.${model}`;
+  const effortPart = effort ? `.effort-${effort}` : '';
+  return resolve(dir, `${base}${modelPart}${effortPart}.json`);
 }

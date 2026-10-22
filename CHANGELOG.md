@@ -63,7 +63,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`emitOkfDocument`** — writes the body verbatim instead of appending a trailing newline, so parsing inverts it. (#1823)
 - **OpenRouter retries** — logged per attempt and counted on `llm.call`, instead of the SDK retrying silently. (#1915)
 - **Voice toolset** — spoken turns get nine voice tools, not the coordinator's 73; cold first-token 110–170ms faster. (#1968)
-- **Voice brain parity spike** — adds slim-core arms, three models, real tool definitions, metered spend, and cold/warm latency. (#1968)
+- **Voice brain parity spike** — adds slim-core arms, three models, reasoning effort, real tools, metered spend, cold/warm latency. (#1968)
 - **KG explorer layout** — nodes spread further apart and labels no longer overlap. (#351)
 - **Console registry** — shows optional capabilities beside a tool's required ones. (#2028)
 - **ADR-048 outcomes** — effort A/B found no winner; the standard tier stays at the model default. (#2044)

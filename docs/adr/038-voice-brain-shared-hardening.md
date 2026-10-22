@@ -254,8 +254,11 @@ maintained voice prompt? The rerun covered two placements of the voice module an
 models.
 - On claude-haiku-4-5, prod's voice model, both placements score below the voice
   prompts.
-- On claude-haiku-5-5 and claude-sonnet-5-5, the better placement ties them.
+- On claude-haiku-5-5 and claude-sonnet-5-5, the better placement ties them. Haiku 5.5
+  was run twice: at its default thinking, and at `effort: none`, which is what voice sends.
 - No model shows a quality gain that would justify consolidation's cost.
+- Haiku 5.5 is only viable for voice at `none`. At its default effort, the first spoken
+  word comes 2.4–3.5 s into the turn (p50).
 
 ### What was measured
 
@@ -278,36 +281,44 @@ models.
   - Full consolidation was not rerun.
 - **Run.** 19 utterances × 4 arms × 5 interleaved reps per model. Artifacts:
   `variance.json` (haiku-4-5), `variance.claude-haiku-5-5.json`,
-  `variance.claude-sonnet-5-5.json`.
+  `variance.claude-haiku-5-5.effort-none.json`, `variance.claude-sonnet-5-5.json`.
+  - **Effort.** The first runs sent no reasoning option (`VOICE_SPIKE_EFFORT` unset), so
+    both 5.5 models ran at their default adaptive effort. Voice's turn runner sends
+    `reasoning: NO_REASONING`, which on haiku-5-5 is `thinking: disabled` (ADR-048 §3).
+    The `effort-none` run matches production: 0 reasoning tokens against ~14–19k per arm
+    at the default. Haiku 4.5 is unaffected, since Curia sends it no thinking parameter.
+    Sonnet 5.5 was run only at its default.
   - A first haiku-4-5 run without `slim-core-system` agreed in direction: slim-core −0.068
     against baseline, 0 reps positive.
 - **Size.** The slim core renders at ~5.5k tokens of system string plus ~0.5k of voice
   module, against ~1.4k for the voice prompt. The core's always-on budget (YAML +
   SKILL.md, ~3.1k) leaves out its runtime blocks: security, contact details, roster,
   date guardrail, time and turn budget.
-- **Spend.** $5.09 for the three spikes (haiku-4-5 $1.13, haiku-5-5 $0.21,
-  sonnet-5-5 $3.75) and $3.08 for the three microbenches.
+- **Spend.** $5.25 for the four spikes (haiku-4-5 $1.13, haiku-5-5 $0.21 at the default
+  and $0.16 at `none`, sonnet-5-5 $3.75) and $3.19 for the four microbenches.
 
 ### Quality (paired check-rate Δ, mean and reps positive/negative of 5)
 
-| Comparison | haiku-4-5 (prod) | haiku-5-5 | sonnet-5-5 |
-|---|---|---|---|
-| slim-core − baseline | −0.028 (1+/4−) | −0.024 (0+/4−) | +0.032 (3+/1−) |
-| slim-core-system − baseline | −0.052 (1+/4−) | 0.000 (1+/1−) | +0.028 (3+/2−) |
-| slim-core − shared-hardening | −0.036 (0+/3−) | −0.028 (1+/4−) | 0.000 (2+/3−) |
-| slim-core-system − shared-hardening | −0.060 (0+/5−) | −0.004 (2+/2−) | −0.004 (2+/3−) |
-| slim-core-system − slim-core | −0.024 (2+/3−) | +0.024 (4+/1−) | −0.004 (0+/1−) |
-| shared-hardening − baseline | +0.008 (2+/3−) | +0.004 (2+/2−) | +0.032 (3+/2−) |
+| Comparison | haiku-4-5 (prod) | haiku-5-5 default | haiku-5-5 `none` | sonnet-5-5 |
+|---|---|---|---|---|
+| slim-core − baseline | −0.028 (1+/4−) | −0.024 (0+/4−) | −0.032 (1+/3−) | +0.032 (3+/1−) |
+| slim-core-system − baseline | −0.052 (1+/4−) | 0.000 (1+/1−) | +0.012 (2+/2−) | +0.028 (3+/2−) |
+| slim-core − shared-hardening | −0.036 (0+/3−) | −0.028 (1+/4−) | −0.032 (2+/3−) | 0.000 (2+/3−) |
+| slim-core-system − shared-hardening | −0.060 (0+/5−) | −0.004 (2+/2−) | +0.012 (3+/1−) | −0.004 (2+/3−) |
+| slim-core-system − slim-core | −0.024 (2+/3−) | +0.024 (4+/1−) | **+0.044 (4+/0−)** | −0.004 (0+/1−) |
+| shared-hardening − baseline | +0.008 (2+/3−) | +0.004 (2+/2−) | 0.000 (2+/2−) | +0.032 (3+/2−) |
 
-None of these is a paired win. On utterance rate the only paired win is
-shared-hardening over baseline on sonnet-5-5 (+0.084, 4+/0−). Marginal check rates:
+The only paired win on check rate is `slim-core-system` over `slim-core` on haiku-5-5 at
+`none`: on the coordinator core, the voice module belongs in the system string. Nothing
+beats the voice prompts. On utterance rate the only paired win is shared-hardening over
+baseline on sonnet-5-5 (+0.084, 4+/0−). Marginal check rates:
 
-| Arm | haiku-4-5 | haiku-5-5 | sonnet-5-5 |
-|---|---|---|---|
-| baseline | 0.944 | 0.968 | 0.912 |
-| shared-hardening | 0.952 | 0.972 | 0.944 |
-| slim-core | 0.916 | 0.944 | 0.944 |
-| slim-core-system | 0.892 | 0.968 | 0.940 |
+| Arm | haiku-4-5 | haiku-5-5 default | haiku-5-5 `none` | sonnet-5-5 |
+|---|---|---|---|---|
+| baseline | 0.944 | 0.968 | 0.960 | 0.912 |
+| shared-hardening | 0.952 | 0.972 | 0.960 | 0.944 |
+| slim-core | 0.916 | 0.944 | 0.928 | 0.944 |
+| slim-core-system | 0.892 | 0.968 | 0.972 | 0.940 |
 
 | Category (check rate, haiku-4-5) | baseline | shared | slim-core | slim-core-system |
 |---|---|---|---|---|
@@ -321,42 +332,68 @@ shared-hardening over baseline on sonnet-5-5 (+0.084, 4+/0−). Marginal check r
   inbox team know to send that right away" and called no tool. Once it said "All set —
   I've sent it to Sam". Moving the module into the system string helps (0.525 → 0.700)
   but stays well below the voice prompts. On haiku-5-5 and sonnet-5-5 every arm scores
-  0.925–1.0 here.
+  0.925–1.0 here, with one exception. Slim-core on haiku-5-5 at `none` scores 0.850,
+  with the same failure in 2 of 5 reps ("I'll pass your yes on Thursday to the inbox
+  team", no tool). `slim-core-system` scores 1.0 there.
 - **The core names tools voice does not carry.** On haiku-4-5, slim-core called
   `email-send` 3 times and `email-reply` once. They are described in the pinned
   SKILL.md bodies but are not in voice's tool list. In production that is a wasted
   round and a "not found" error. The voice prompts on haiku-4-5 called the `contacts`
   specialist as if it were a tool (5 times). The 5.5 models never called a tool they
   were not given.
-- **Pronoun is model-bound, not consolidation-bound.** On `pronoun-your-calendar`, baseline
-  passes 0/5 on every model. The held pronoun module (shared-hardening) passes 0/5 on
-  haiku-4-5 but 5/5 on both 5.5 models. Slim-core passes 2–5/5 depending on model and
-  placement. The #1613 hold on that module is a Haiku 4.5 result.
+- **The pronoun module needs thinking.** On `pronoun-your-calendar`, baseline passes 0/5
+  on every model and effort. The held pronoun module (shared-hardening) passes 5/5 on both
+  5.5 models at their default effort. It passes 0/5 on haiku-4-5, and 0/5 on haiku-5-5
+  at `none`. Slim-core passes 2–5/5 at the default and 1/5 at `none`. So with thinking
+  off, the module doesn't fix this case. The #1613 hold stands for voice at `none`.
 - **Sonnet 5.5 struggles with dates in every arm.** `date-next-friday-meeting` passes
   1–2/5, so its higher scores elsewhere are not a uniform lift.
 
-### Latency (TTFT p50 / p95 ms, 10 reps per cell, voice's tools unless noted)
+### Latency
 
-| Prompt | haiku-4-5 cold | haiku-4-5 warm | haiku-5-5 cold | haiku-5-5 warm | sonnet-5-5 cold | sonnet-5-5 warm |
+**Spoken turns** (from the spikes: 95 turns per arm, real utterances, voice's tools).
+"First speech" is the time from the start of the turn to the first spoken text, after any
+tool rounds that came first. That is the silence the principal hears. These are p50 / p90
+in ms, from `turnLatency` in each variance file.
+
+| Arm | haiku-4-5 first speech | haiku-4-5 full turn | haiku-5-5 default first speech | haiku-5-5 `none` first speech | haiku-5-5 `none` full turn | sonnet-5-5 first speech |
 |---|---|---|---|---|---|---|
-| baseline + coordinator tools (voice before #1968) | 489 / 695 | 430 / 716 | 1274 / 2338 | 781 / 1519 | 1823 / 6331 | 1016 / 1446 |
-| baseline (voice after #1968) | 379 / 525 | 393 / 405 | 630 / 1213 | 633 / 1718 | 751 / 7582 | 666 / 5800 |
-| shared-hardening | 374 / 669 | 389 / 486 | 714 / 1124 | 675 / 1742 | 1087 / 1500 | 827 / 1414 |
-| slim-core | 416 / 500 | 368 / 925 | 956 / 1858 | 725 / 1271 | 1091 / 2267 | 870 / 1310 |
-| slim-core-system | 402 / 589 | 359 / 492 | 865 / 2092 | 697 / 1262 | 1426 / 8040 | 933 / 7617 |
+| baseline | 393 / 1677 | 2195 / 4102 | 2383 / 4768 | 660 / 1267 | 2577 / 3793 | 3621 / 6356 |
+| shared-hardening | 392 / 1603 | 2145 / 3921 | 2690 / 4900 | 662 / 1612 | 2498 / 4208 | 3574 / 6421 |
+| slim-core | 377 / 487 | 2277 / 3979 | 3086 / 5237 | 646 / 1264 | 2067 / 3692 | 3783 / 6027 |
+| slim-core-system | 388 / 1599 | 2236 / 3472 | 3459 / 6307 | 681 / 1356 | 2391 / 3920 | 3209 / 5871 |
+
+- **Thinking decides whether Haiku 5.5 can take a call.** At its default effort, Haiku
+  5.5 thinks, calls its tools, and only then speaks, so first speech is close to the full
+  turn. At `none` it speaks within ~0.66 s and runs the tools after. That is about
+  +270 ms over haiku-4-5 at p50. Full turns are within ±0.4 s of haiku-4-5's.
+- **At `none` the prompt shape costs no first-speech time.** The four arms are within
+  35 ms of each other at p50.
+- The spikes ran one model after another, not interleaved, so read cross-model gaps as
+  approximate.
+
+**Single request** (microbench: TTFT p50 / p95 ms, 10 reps per cell, voice's tools unless
+noted, one short utterance).
+
+| Prompt | haiku-4-5 cold | haiku-4-5 warm | haiku-5-5 cold | haiku-5-5 warm | haiku-5-5 `none` cold | haiku-5-5 `none` warm | sonnet-5-5 cold | sonnet-5-5 warm |
+|---|---|---|---|---|---|---|---|---|
+| baseline + coordinator tools (voice before #1968) | 489 / 695 | 430 / 716 | 1274 / 2338 | 781 / 1519 | 1244 / 1815 | 811 / 3526 | 1823 / 6331 | 1016 / 1446 |
+| baseline (voice after #1968) | 379 / 525 | 393 / 405 | 630 / 1213 | 633 / 1718 | 737 / 1080 | 651 / 1129 | 751 / 7582 | 666 / 5800 |
+| shared-hardening | 374 / 669 | 389 / 486 | 714 / 1124 | 675 / 1742 | 652 / 1242 | 616 / 1600 | 1087 / 1500 | 827 / 1414 |
+| slim-core | 416 / 500 | 368 / 925 | 956 / 1858 | 725 / 1271 | 895 / 1538 | 661 / 1200 | 1091 / 2267 | 870 / 1310 |
+| slim-core-system | 402 / 589 | 359 / 492 | 865 / 2092 | 697 / 1262 | 837 / 1571 | 591 / 799 | 1426 / 8040 | 933 / 7617 |
 
 - **Cold vs warm.** Cold means a fresh nonce in the first tool and the system string, so
   the whole prefix is a cache write. Warm is the same request again, read from cache. p95
   is the slowest of 10.
 - **The toolset change pays most on the newer models.** It cuts cold p50 by ~110 ms on
   haiku-4-5 and ~640 ms on haiku-5-5. An earlier haiku-4-5 bench measured 565 → 396 ms.
-- **The slim core costs time on the 5.5 models:** about +235 ms cold p50 on haiku-5-5.
-- **The 5.5 runs had thinking on, which voice would not ship.** The spike and the
-  microbench sent no reasoning option, so both 5.5 models ran at their default adaptive
-  effort. Voice's turn runner sends `reasoning: NO_REASONING`, which on haiku-5-5 is
-  `thinking: disabled` (ADR-048 §3). So haiku-5-5 has not been measured with thinking off,
-  either for quality or for latency. The haiku-4-5 figures are unaffected, since Curia
-  sends Haiku 4.5 no thinking parameter.
+- **The slim core costs time cold on haiku-5-5:** about +100–235 ms p50 (+100 at
+  `none`). Warm, the gap is under 100 ms.
+- **The microbench does not exercise thinking.** Its one utterance ("Thanks, that is all
+  for now.") gets a 16–19 token reply even at the default effort, so Haiku 5.5's adaptive
+  thinking stays off and the default and `none` columns differ only by noise. The spike
+  table is the one that shows thinking's cost.
 - **Sonnet 5.5's cold first token is too slow for a live call** in any arm, with p95
   outliers of 6–8 s.
 
@@ -364,19 +401,26 @@ shared-hardening over baseline on sonnet-5-5 (+0.084, 4+/0−). Marginal check r
 
 - **Production (haiku-4-5).** Both slim-core placements trail the voice prompts. On this
   model voice stays on its own prompt (ADR-037, this ADR).
-- **Voice moves to haiku-5-5** (#2245). The principal accepts the move's latency and cost
-  trade-off: on the voice prompt, cold p50 goes from ~380 to ~630 ms, and per-token price
-  drops about 8×.
-  - #2245 sets voice's reasoning effort from a rerun at `none`, `low` and the default,
-    since these runs measured only the default.
-  - #2245 also chooses the prompt shape. `slim-core-system` ties the voice prompt and the
-    shared modules on quality. It adds ~235 ms cold p50 and ~1.6× the tokens per turn.
-    Under #1968's rule ("ties or beats the shared modules, with TTFT within an agreed
-    budget"), the choice is whether one prompt instead of two is worth that latency.
-- **Sonnet 5.5** is not a voice candidate on latency, whatever the prompt.
+- **Voice moves to haiku-5-5 at `effort: none`** (#2245). The principal accepts the
+  move's latency and cost trade-off.
+  - First speech goes from ~390 to ~660 ms p50. Per-token price drops about 8×, and the
+    `none` spike cost $0.16 against $1.13 for haiku-4-5.
+  - `none` is what voice's turn runner already sends. The default effort is ruled out:
+    first speech is 2.4–3.5 s p50. `low` is unmeasured, and #2245 decides whether a rerun
+    at `low` is worth it, for the pronoun case above.
+  - **Prompt shape is for #2245.** At `none`, `slim-core-system` ties the voice prompt and
+    the shared modules: +0.012 against each (2+/2− and 3+/1−).
+    It adds no first-speech time in the spike, ~+100 ms cold in the microbench, and ~1.45×
+    the spend per turn. Under #1968's rule ("ties or beats the shared modules, with TTFT
+    within an agreed budget"), it qualifies. The choice is whether one prompt instead of
+    two is worth that cost. If the core is used, the voice module goes in the system
+    string, not the turn guidance.
+- **Sonnet 5.5** is not a voice candidate at its default effort: first speech is 3.2–3.8 s
+  p50. It was not run at `none`. Its single-request TTFT is still the slowest of the
+  three, so it is not pursued.
 - **The voice toolset ships** (#1968): `VOICE_TOOL_NAMES` in
   `src/channels/voice/voice-tools.ts`, derived from production voice sessions, with no
   discovery tools. It is 9 tools (~3.6k tokens) instead of 74 (~23.5k).
-- **#1613.** The routing and pronoun modules stay on hold for haiku-4-5, where their
-  bundle ties baseline. #2245 revisits the pronoun module: it solves
-  `pronoun-your-calendar` on the 5.5 models.
+- **#1613.** The routing and pronoun modules stay on hold. Their bundle ties baseline on
+  haiku-4-5, and on haiku-5-5 at `none`. The pronoun module solves
+  `pronoun-your-calendar` only when Haiku 5.5 thinks.

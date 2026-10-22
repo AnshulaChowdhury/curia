@@ -26,6 +26,7 @@
 //   ARM=slim-core CASE=date-next-tuesday pnpm exec tsx ...
 //   ARMS=baseline,full-consolidation REPS=5 pnpm exec tsx ...
 //   VOICE_SPIKE_MODEL=claude-haiku-5-5 REPS=5 pnpm exec tsx ...   (writes variance.<model>.json)
+//   VOICE_SPIKE_EFFORT=none ...   (sends voice's reasoning setting; writes variance.<model>.effort-none.json)
 //
 // Every LLM call's usage is metered per arm and priced from the model registry;
 // the totals land in the variance file under `spend`.
@@ -38,6 +39,7 @@ import {
   meterProvider,
   modelArtifactPath,
   renderVoiceSystemModule,
+  spikeReasoningEffort,
   renderVoiceTurnGuidance,
   type ProductionVoiceContext,
 } from './production-context.js';
@@ -83,8 +85,9 @@ const DEFAULT_ARMS: ArmId[] = ['baseline', 'shared-hardening', 'slim-core', 'sli
 const ARMS_ENV = process.env.ARMS?.split(',').map(a => a.trim()).filter(Boolean) ?? null;
 const CASE_FILTER = process.env.CASE?.trim() || null;
 const REPS = Math.max(1, Number(process.env.REPS ?? 1) || 1);
-const VARIANCE_PATH = modelArtifactPath(import.meta.dirname, 'variance', VOICE_MODEL);
-const RESULTS_PATH = modelArtifactPath(import.meta.dirname, 'results', VOICE_MODEL);
+const EFFORT = spikeReasoningEffort();
+const VARIANCE_PATH = modelArtifactPath(import.meta.dirname, 'variance', VOICE_MODEL, EFFORT);
+const RESULTS_PATH = modelArtifactPath(import.meta.dirname, 'results', VOICE_MODEL, EFFORT);
 
 interface HistoryTurn {
   role: 'user' | 'assistant';
@@ -756,6 +759,7 @@ async function runCase(
     tools: ctx.voiceToolDefs,
     maxRounds: DEFAULT_STREAMING_MAX_ROUNDS,
     signal: AbortSignal.timeout(120_000),
+    ...(EFFORT ? { requestOptions: { reasoning: { effort: EFFORT } } } : {}),
     hooks: {
       onTextDelta: () => {
         if (ttftMs === null) ttftMs = Date.now() - started;
@@ -821,6 +825,35 @@ function summarize(results: CaseResult[]) {
       p50FullTurnMs: fulls[Math.floor(fulls.length / 2)]!,
       promptTokensEst: rows[0]!.promptTokensEst,
       failsByCategory,
+    };
+  }
+  return byArm;
+}
+
+/** Nearest-rank percentile of an ascending list. */
+function percentile(sorted: number[], p: number): number | null {
+  if (sorted.length === 0) return null;
+  return sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1)]!;
+}
+
+/**
+ * Per-arm turn latency over every rep, errored turns left out. `ttft` is the pause
+ * before the first spoken text, after any tool rounds that came first; that is the
+ * silence the principal hears. Unlike the microbench, it covers real utterances.
+ */
+function turnLatency(results: CaseResult[]) {
+  const byArm: Record<string, { n: number; ttftP50: number | null; ttftP90: number | null; fullP50: number | null; fullP90: number | null }> = {};
+  for (const arm of ALL_ARMS) {
+    const rows = results.filter(r => r.arm === arm && r.stopReason !== 'error');
+    if (rows.length === 0) continue;
+    const ttfts = rows.map(r => r.ttftMs).filter((n): n is number => n !== null).sort((a, b) => a - b);
+    const fulls = rows.map(r => r.fullTurnMs).sort((a, b) => a - b);
+    byArm[arm] = {
+      n: rows.length,
+      ttftP50: percentile(ttfts, 0.5),
+      ttftP90: percentile(ttfts, 0.9),
+      fullP50: percentile(fulls, 0.5),
+      fullP90: percentile(fulls, 0.9),
     };
   }
   return byArm;
@@ -1141,6 +1174,7 @@ async function main(): Promise<void> {
   const out = {
     generatedAt: new Date().toISOString(),
     model: VOICE_MODEL,
+    reasoningEffort: EFFORT ?? 'model-default',
     reps: REPS,
     fixturesPath: 'scripts/spikes/voice-brain-parity/fixtures.json',
     countingNote:
@@ -1155,7 +1189,7 @@ async function main(): Promise<void> {
     writeFileSync(
       VARIANCE_PATH,
       JSON.stringify(
-        { generatedAt: out.generatedAt, model: VOICE_MODEL, ...variance, spend: { totalUsd: meter.totalUsd(), byArm: meter.totals } },
+        { generatedAt: out.generatedAt, model: VOICE_MODEL, reasoningEffort: out.reasoningEffort, ...variance, turnLatency: turnLatency(allResults), spend: { totalUsd: meter.totalUsd(), byArm: meter.totals } },
         null,
         2,
       ),
