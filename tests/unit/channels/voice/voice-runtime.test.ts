@@ -575,6 +575,35 @@ describe('VoiceRuntime', () => {
 
     expect(invokeTool).toHaveBeenCalledOnce();
   });
+
+  it("hands the tool bridge the turn's inbound.message id, the parent of its tool audit (#1968)", async () => {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'lookup', input: {} }], usage, provenance }],
+      [{ type: 'text_delta', text: 'Found it. ' }, { type: 'message_end', content: 'Found it.', usage, provenance }],
+    ]);
+    const invokeTool = vi.fn<VoiceToolBridge['invokeTool']>(async () => ({ content: 'result' }));
+    const { runtime, stt, events } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      bridge: { resolveVoiceTools: () => [], invokeTool },
+    });
+
+    await runtime.startSession({
+      sessionId: 's-audit',
+      conversationId: 'voice:s-audit',
+      roomName: 'voice-s-audit',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'look something up', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-audit');
+
+    const inbound = events.find(e => e.type === 'inbound.message');
+    expect(inbound).toBeDefined();
+    expect(invokeTool).toHaveBeenCalledOnce();
+    expect(invokeTool.mock.calls[0]![1].turnEventId).toBe(inbound!.id);
+  });
 });
 
 describe('VoiceRuntime brain/context parity (#1551)', () => {

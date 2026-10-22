@@ -96,6 +96,7 @@ import { VoiceSessionBridge } from './channels/voice/session-bridge.js';
 import { VoiceSessionStore } from './channels/voice/session-store.js';
 import { VoiceRuntime } from './channels/voice/voice-runtime.js';
 import { VOICE_TOOL_NAMES } from './channels/voice/voice-tools.js';
+import { invokeVoiceToolAudited } from './channels/voice/voice-tool-audit.js';
 import { evaluateVoiceModelCapabilities } from './channels/voice/voice-model-capabilities.js';
 import { DeepgramSttProvider, CartesiaTtsProvider, SpeechMediaService } from './speech/index.js';
 import { LiveKitRoomSession } from './channels/voice/livekit/room-session.js';
@@ -2804,18 +2805,27 @@ async function main(): Promise<void> {
             memory,
             logger,
           });
-          const result = await executionLayer.invoke(call.name, call.input, executionCaller, {
-            agentId: 'coordinator',
-            channelId: 'voice',
+          // tool.invoke / tool.result around the call, as a text turn records them (#1968).
+          const result = await invokeVoiceToolAudited({
+            bus,
+            call,
             conversationId: ctx.conversationId,
-            taskEventId: ctx.sessionId,
-            liveTurn: sessionCaller.liveTurn,
-            turnDateResolveResults: ctx.turnDateResolveResults,
-            taskMetadata: {
-              originator: sessionCaller.originator,
-              voiceSessionId: ctx.sessionId,
-            },
-            identifierSources,
+            sessionId: ctx.sessionId,
+            turnEventId: ctx.turnEventId,
+            invoke: (invokeEventId) => executionLayer.invoke(call.name, call.input, executionCaller, {
+              agentId: 'coordinator',
+              channelId: 'voice',
+              conversationId: ctx.conversationId,
+              taskEventId: ctx.sessionId,
+              parentEventId: invokeEventId,
+              liveTurn: sessionCaller.liveTurn,
+              turnDateResolveResults: ctx.turnDateResolveResults,
+              taskMetadata: {
+                originator: sessionCaller.originator,
+                voiceSessionId: ctx.sessionId,
+              },
+              identifierSources,
+            }),
           });
           if (result.success) {
             const data = result.data;
