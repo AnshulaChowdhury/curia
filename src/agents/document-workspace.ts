@@ -1,4 +1,5 @@
-import type { WorkingDocRow } from '../db/working-docs-repo.js';
+import type { WorkingDocRow, WorkingDocsRepo } from '../db/working-docs-repo.js';
+import type { Logger } from '../logger.js';
 import {
   docDirectory,
   markdownFenceFor,
@@ -78,6 +79,81 @@ export function formatLogEntry(isoTimestamp: string, operation: string, summary:
 
 export function logPathForDocument(documentPath: string): string {
   return `${docDirectory(documentPath)}${LOG_FILENAME}`;
+}
+
+/**
+ * Frontmatter key the console stamps on a document the principal edits (#1822): an ISO
+ * timestamp, so an agent that reads the document can tell the principal changed it.
+ */
+export const PRINCIPAL_EDIT_STAMP_KEY = 'principal_edited_at';
+
+export interface DirectoryLogEntryParams {
+  documentPath: string;
+  operation: string;
+  summary: string;
+  conversationId?: string;
+  agentId?: string;
+  /** Prefix for warnings — the writer whose change this records (e.g. `doc-write`). */
+  source: string;
+}
+
+/**
+ * Append a change record to `log.md` in the document's directory, creating it on first
+ * use. Shared by `doc-write` and the console Documents routes (#1822). Best-effort: the
+ * document write already succeeded, so failures warn rather than throw. Returns whether
+ * the entry was written, so a caller can surface a miss (the console does).
+ *
+ * The log stays unowned (no `task_id`): it is shared across tasks in the folder, and one
+ * project's archival must not remove the audit trail (#1819 CodeRabbit).
+ */
+export async function appendDirectoryLogEntry(
+  repo: Pick<WorkingDocsRepo, 'read' | 'create' | 'append'>,
+  log: Logger,
+  params: DirectoryLogEntryParams,
+): Promise<boolean> {
+  const logPath = logPathForDocument(params.documentPath);
+  const entry = formatLogEntry(new Date().toISOString(), params.operation, params.summary);
+
+  try {
+    const maxAttempts = 3;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const existing = await repo.read(logPath);
+      if (!existing) {
+        try {
+          await repo.create({
+            path: logPath,
+            type: 'log',
+            body: entry,
+            conversationId: params.conversationId,
+            agentId: params.agentId,
+          });
+          return true;
+        } catch (err) {
+          // Another writer may have created log.md between read and create — retry.
+          if (attempt === maxAttempts - 1) throw err;
+          continue;
+        }
+      }
+      const result = await repo.append(logPath, {
+        content: entry.trimEnd(),
+        expectedVersion: existing.version,
+      });
+      if (result.ok) return true;
+      if (attempt === maxAttempts - 1) {
+        log.warn(
+          { path: logPath, version: existing.version },
+          `${params.source}: log.md append conflict after retries — change record may be missing for this write`,
+        );
+      }
+    }
+    return false;
+  } catch (err) {
+    log.warn(
+      { err, path: logPath },
+      `${params.source}: log.md append failed — document write succeeded; audit entry may be missing`,
+    );
+    return false;
+  }
 }
 
 export function indexPathForDirectory(directoryPrefix: string): string {

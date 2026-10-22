@@ -36,6 +36,18 @@ export interface WorkingDocRow {
   archivedAt: string | null;
 }
 
+/** Live/archived selector for console reads (#1821). */
+export type WorkingDocStatusFilter = 'live' | 'archived' | 'all';
+
+/** A document row without its body — for listing the store cheaply (#1821). */
+export type WorkingDocSummary = Omit<WorkingDocRow, 'body' | 'sectionVersions'>;
+
+export interface ListWorkingDocSummariesOptions {
+  /** Path prefix (`ls`-on-a-prefix, as `listByPrefix`). Defaults to the whole store. */
+  prefix?: string;
+  status?: WorkingDocStatusFilter;
+}
+
 export interface WorkingDocLinkRow {
   sourcePath: string;
   targetPath: string;
@@ -45,6 +57,11 @@ export interface WorkingDocLinkRow {
 export type WorkingDocWriteResult =
   | { ok: true; document: WorkingDocRow }
   | { ok: false; conflict: true; document: WorkingDocRow };
+
+export type WorkingDocRestoreResult =
+  | { ok: true; document: WorkingDocRow }
+  | { ok: false; reason: 'not_found' }
+  | { ok: false; reason: 'not_archived' | 'path_in_use'; document?: WorkingDocRow };
 
 export interface CreateWorkingDocParams {
   path: string;
@@ -136,6 +153,35 @@ function stripTypeFromFrontmatter(frontmatter?: Record<string, unknown>): Record
 /** Escape SQL LIKE wildcards so prefix matching is literal. */
 function escapeLikePattern(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
+/**
+ * Normalize a prefix for LIKE matching, keeping a trailing slash: `/projects/x/` must
+ * not match `/projects/xy/…`, but `normalizeDocPath` alone drops the slash.
+ */
+function normalizeLikePrefix(prefix: string | undefined): string {
+  const raw = prefix ?? '/';
+  const normalized = normalizeDocPath(raw);
+  return raw.trim().endsWith('/') && normalized !== '/' ? `${normalized}/` : normalized;
+}
+
+const SUMMARY_COLUMNS = `
+  id, path, type, frontmatter, version, byte_size,
+  task_id, conversation_id, agent_id, created_at, updated_at, archived_at
+`;
+
+/** SQL predicate for a status filter — a fixed string per value, never user input. */
+function statusPredicate(status: WorkingDocStatusFilter): string {
+  if (status === 'live') return 'archived_at IS NULL';
+  if (status === 'archived') return 'archived_at IS NOT NULL';
+  return 'TRUE';
+}
+
+function mapSummaryRow(row: Omit<DbWorkingDocRow, 'body' | 'section_versions'>): WorkingDocSummary {
+  const { body: _body, sectionVersions: _sv, ...summary } = mapRow({ ...row, body: '', section_versions: null });
+  void _body;
+  void _sv;
+  return summary;
 }
 
 export class WorkingDocsRepo {
@@ -613,6 +659,43 @@ export class WorkingDocsRepo {
     }
   }
 
+  /**
+   * Soft-delete only if the live document is still at `expectedVersion` (#1822 console
+   * archive). The version predicate is in the UPDATE itself, so an agent write that lands
+   * between the caller's read and this call yields a conflict instead of archiving a
+   * version nobody looked at. Returns null when no live document exists at the path.
+   */
+  async softDeleteAtVersion(path: string, expectedVersion: number): Promise<WorkingDocWriteResult | null> {
+    const normalized = normalizeDocPath(path);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query<DbWorkingDocRow>(
+        `UPDATE working_documents
+         SET archived_at = now(), updated_at = now()
+         WHERE path = $1 AND archived_at IS NULL AND version = $2
+         RETURNING ${DOC_COLUMNS}`,
+        [normalized, expectedVersion],
+      );
+      if (!rows[0]) {
+        await client.query('ROLLBACK');
+        const current = await this.read(normalized);
+        return current ? { ok: false, conflict: true, document: current } : null;
+      }
+      await client.query(`DELETE FROM working_document_links WHERE source_path = $1`, [normalized]);
+      await client.query('COMMIT');
+      const document = mapRow(rows[0]);
+      this.logger.info({ path: normalized, version: expectedVersion }, 'working-docs-repo: soft-deleted document at version');
+      return { ok: true, document };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      this.logger.error({ err, path: normalized }, 'working-docs-repo: softDeleteAtVersion transaction failed');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async softDelete(path: string): Promise<WorkingDocRow | null> {
     const normalized = normalizeDocPath(path);
     const client = await this.pool.connect();
@@ -646,6 +729,63 @@ export class WorkingDocsRepo {
     }
   }
 
+  /**
+   * Return an archived row to live (#1822). Refused when another live document now holds
+   * the path — the live-path unique index would reject it anyway; checking first gives the
+   * caller a reason instead of a constraint error. Bumps `version` (a stale editor must not
+   * save over a restore) and rebuilds the outbound links `softDelete` removed.
+   */
+  async restore(id: string): Promise<WorkingDocRestoreResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows: lockedRows } = await client.query<DbWorkingDocRow>(
+        `SELECT ${DOC_COLUMNS} FROM working_documents WHERE id = $1::uuid FOR UPDATE`,
+        [id],
+      );
+      const locked = lockedRows[0];
+      if (!locked) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      if (locked.archived_at === null) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'not_archived', document: mapRow(locked) };
+      }
+      const { rows: liveRows } = await client.query<DbWorkingDocRow>(
+        `SELECT ${DOC_COLUMNS} FROM working_documents WHERE path = $1 AND archived_at IS NULL`,
+        [locked.path],
+      );
+      if (liveRows[0]) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'path_in_use', document: mapRow(liveRows[0]) };
+      }
+      const { rows } = await client.query<DbWorkingDocRow>(
+        `UPDATE working_documents
+            SET archived_at = NULL, version = version + 1, updated_at = now()
+          WHERE id = $1::uuid
+          RETURNING ${DOC_COLUMNS}`,
+        [id],
+      );
+      const restored = mapRow(rows[0]!);
+      await this.replaceLinks(client, restored.path, extractLinks(restored.path, restored.body));
+      await client.query('COMMIT');
+      this.logger.info({ path: restored.path, id }, 'working-docs-repo: restored document');
+      return { ok: true, document: restored };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      // 23505: a concurrent create took the path between the check and the update.
+      if ((err as { code?: string }).code === '23505') {
+        this.logger.warn({ id }, 'working-docs-repo: restore lost a race for its path');
+        return { ok: false, reason: 'path_in_use' };
+      }
+      this.logger.error({ err, id }, 'working-docs-repo: restore transaction failed');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   /** Backlinks — live documents that link to `targetPath` ("what links here"). */
   async getBacklinks(targetPath: string): Promise<WorkingDocLinkRow[]> {
     const normalized = normalizeDocPath(targetPath);
@@ -663,6 +803,60 @@ export class WorkingDocsRepo {
       targetPath: r.target_path,
       linkKind: r.link_kind as 'markdown' | 'wikilink',
     }));
+  }
+
+  /**
+   * List documents without their bodies (#1821 console tree). Unlike `listByPrefix`,
+   * this can include archived rows — several archived rows may share one path, so
+   * callers identify archived documents by `id`, not path.
+   */
+  async listSummaries(options: ListWorkingDocSummariesOptions = {}): Promise<WorkingDocSummary[]> {
+    const status = options.status ?? 'live';
+    const prefix = normalizeLikePrefix(options.prefix);
+    const { rows } = await this.pool.query<Omit<DbWorkingDocRow, 'body' | 'section_versions'>>(
+      `SELECT ${SUMMARY_COLUMNS}
+       FROM working_documents
+       WHERE path LIKE $1 ESCAPE '\\'
+         AND ${statusPredicate(status)}
+       ORDER BY path ASC, updated_at DESC`,
+      [`${escapeLikePattern(prefix)}%`],
+    );
+    return rows.map(mapSummaryRow);
+  }
+
+  /** Read one document by row id, live or archived (#1821). */
+  async readById(id: string): Promise<WorkingDocRow | null> {
+    const { rows } = await this.pool.query<DbWorkingDocRow>(
+      `SELECT ${DOC_COLUMNS}
+       FROM working_documents
+       WHERE id = $1::uuid`,
+      [id],
+    );
+    const row = rows[0];
+    return row ? mapRow(row) : null;
+  }
+
+  /**
+   * Documents whose path or body contains `query`, case-insensitively (#1821 console
+   * search). Returns whole rows; the caller extracts match context. `strpos` rather
+   * than ILIKE so the query needs no wildcard escaping.
+   */
+  async searchText(
+    query: string,
+    options: { prefix?: string; status?: WorkingDocStatusFilter } = {},
+  ): Promise<WorkingDocRow[]> {
+    const status = options.status ?? 'live';
+    const prefix = normalizeLikePrefix(options.prefix);
+    const { rows } = await this.pool.query<DbWorkingDocRow>(
+      `SELECT ${DOC_COLUMNS}
+       FROM working_documents
+       WHERE path LIKE $1 ESCAPE '\\'
+         AND ${statusPredicate(status)}
+         AND (strpos(lower(path), lower($2)) > 0 OR strpos(lower(body), lower($2)) > 0)
+       ORDER BY updated_at DESC, path ASC`,
+      [`${escapeLikePattern(prefix)}%`, query],
+    );
+    return rows.map(mapRow);
   }
 
   private async replaceLinks(client: PoolClient, sourcePath: string, links: ExtractedLink[]): Promise<void> {

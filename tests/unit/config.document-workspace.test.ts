@@ -38,3 +38,20 @@ describe('loadYamlConfig: documentWorkspace.scratchTtlDays', () => {
     expect(config.documentWorkspace?.scratchTtlDays).toBeUndefined();
   });
 });
+
+describe('loadYamlConfig: documentWorkspace.consoleEditMaxBytes (#1822)', () => {
+  it('accepts an integer within range', () => {
+    const dir = writeTempConfig(`documentWorkspace:\n  consoleEditMaxBytes: 131072\n`);
+    expect(loadYamlConfig(dir).documentWorkspace?.consoleEditMaxBytes).toBe(131072);
+  });
+
+  it.each(['0', '1023', '4194305', '65536.5', '"64k"'])('rejects %s', (value) => {
+    const dir = writeTempConfig(`documentWorkspace:\n  consoleEditMaxBytes: ${value}\n`);
+    expect(() => loadYamlConfig(dir)).toThrow('documentWorkspace.consoleEditMaxBytes');
+  });
+
+  it('ships the 64 KiB default in config/default.yaml', () => {
+    const config = loadYamlConfig(path.join(import.meta.dirname, '../../config'));
+    expect(config.documentWorkspace?.consoleEditMaxBytes).toBe(65536);
+  });
+});

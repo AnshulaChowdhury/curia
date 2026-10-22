@@ -98,6 +98,18 @@ const extractToolResult: Extractor = (p, fail) => ({
  * residual dual-vocabulary emitters still get structured columns.
  */
 const EXTRACTORS: Readonly<Record<string, Extractor>> = {
+  // Console Documents page (#1822, #1823): the principal acting on one working document
+  // (target = its path) or on the store in bulk — export/import (target = the scope).
+  'document.console_action': (p, fail) => ({
+    action: str(p, 'action', fail),
+    // Two-stage, like agent.task: `requested` is written ahead of the change.
+    outcome: p.stage === 'requested' ? 'pending' : 'success',
+    target_type: typeof p.path === 'string' ? 'working_document' : 'working_document_store',
+    target_id: typeof p.path === 'string' ? p.path : str(p, 'scope', fail),
+    initiator_type: 'human',
+    initiator_id: str(p, 'initiatedBy', fail),
+  }),
+
   'inbound.message': (p, fail) => ({
     action: 'receive',
     outcome: 'success',

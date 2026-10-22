@@ -122,6 +122,7 @@
       "additionalProperties": false,
       "properties": {
         "scratchTtlDays": { "type": "integer", "minimum": 1, "maximum": 36500 },
+        "consoleEditMaxBytes": { "type": "integer", "minimum": 1024, "maximum": 4194304 },
         "kgPromotion": {
           "type": "object",
           "additionalProperties": false,

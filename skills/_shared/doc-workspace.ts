@@ -4,12 +4,11 @@ import type { ToolContext, ToolResult } from '../../src/skills/types.js';
 import type { WorkingDocRow, WorkingDocWriteResult } from '../../src/db/working-docs-repo.js';
 import { toLocalIso, formatDisplayTimezone } from '../../src/time/timestamp.js';
 import {
+  appendDirectoryLogEntry,
   buildIndexProjection,
   extractSectionContent,
-  formatLogEntry,
   grepDocuments,
   indexPathForDirectory,
-  logPathForDocument,
   normalizeDirectoryPrefix,
   RESERVED_LEAF_NAMES,
   LOG_FILENAME,
@@ -65,53 +64,18 @@ export async function appendDirectoryLog(
   summary: string,
   _taskId?: string,
 ): Promise<void> {
-  const repo = ctx.workingDocs!;
-  const logPath = logPathForDocument(documentPath);
-  const iso = new Date().toISOString();
-  const entry = formatLogEntry(iso, operation, summary);
   // Intentionally ignore `_taskId`: directory log.md is shared across tasks in the
   // folder and must stay unowned so one project's archival cannot remove the audit trail
   // (#1819 CodeRabbit).
   void _taskId;
-
-  try {
-    const maxAttempts = 3;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const existing = await repo.read(logPath);
-      if (!existing) {
-        try {
-          await repo.create({
-            path: logPath,
-            type: 'log',
-            body: entry,
-            conversationId: ctx.conversationId ?? undefined,
-            agentId: ctx.agentId ?? undefined,
-          });
-          return;
-        } catch (err) {
-          // Another writer may have created log.md between read and create — retry.
-          if (attempt === maxAttempts - 1) throw err;
-          continue;
-        }
-      }
-      const result = await repo.append(logPath, {
-        content: entry.trimEnd(),
-        expectedVersion: existing.version,
-      });
-      if (result.ok) return;
-      if (attempt === maxAttempts - 1) {
-        ctx.log.warn(
-          { path: logPath, version: existing.version },
-          'doc-write: log.md append conflict after retries — change record may be missing for this write',
-        );
-      }
-    }
-  } catch (err) {
-    ctx.log.warn(
-      { err, path: logPath },
-      'doc-write: log.md append failed — document write succeeded; audit entry may be missing',
-    );
-  }
+  await appendDirectoryLogEntry(ctx.workingDocs!, ctx.log, {
+    documentPath,
+    operation,
+    summary,
+    conversationId: ctx.conversationId ?? undefined,
+    agentId: ctx.agentId ?? undefined,
+    source: 'doc-write',
+  });
 }
 
 export async function listDirectoryProjection(
