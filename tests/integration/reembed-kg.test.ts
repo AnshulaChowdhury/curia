@@ -173,7 +173,9 @@ describeIf('embedding schema gate, re-embed command and instance lock', () => {
         pool, endpointConfig(SAME_WIDTH_OTHER_MODEL.model), { [SAME_WIDTH_OTHER_MODEL.model]: SAME_WIDTH_OTHER_MODEL }, logger,
       );
       expect(result).toMatchObject({ ok: false, gate: 'schema', state: { reason: 'model_mismatch' } });
-      expect(result.ok === false && result.message).toContain('pnpm reembed:kg');
+      expect(result.ok === false && result.message).toContain('Stop Curia, run pnpm reembed:kg, then start Curia');
+      expect(result.ok === false && result.message).toContain('https://docs.meetcuria.com/integrations/embeddings-endpoint');
+      expect(result.ok === false && result.message).not.toMatch(/docker (compose|stop)/);
     });
 
     describe('at boot, while another session holds the instance lock', () => {

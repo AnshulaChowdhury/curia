@@ -13,6 +13,7 @@ import { SecretsService } from '../src/secrets/secrets-service.js';
 import { applyVaultSecrets } from '../src/secrets/apply-vault-secrets.js';
 import { EmbeddingService, describeEmbeddingUnavailable, resolveEmbedding } from '../src/memory/embedding.js';
 import { reembedKnowledgeGraph } from '../src/memory/reembed.js';
+import { REEMBED_COMMAND, REEMBED_DOCKER_NOTE } from '../src/memory/embedding-schema.js';
 
 const logger = pino({ name: 'reembed-kg', level: process.env.LOG_LEVEL ?? 'info' });
 
@@ -40,7 +41,7 @@ async function main(): Promise<number> {
         logger.error(
           { holder: result.holder },
           `reembed-kg: Curia appears to be running: the instance lock is held by ${describeInstanceLockHolder(result.holder)}. ` +
-          'Stop it first (docker stop curia-curia-1 on a Docker Compose install), then run this command again. Nothing was changed.',
+          `Stop Curia, run ${REEMBED_COMMAND} again, then start Curia. ${REEMBED_DOCKER_NOTE} Nothing was changed.`,
         );
         return 1;
       case 'dry_run':

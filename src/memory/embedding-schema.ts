@@ -11,10 +11,14 @@ import { describeEmbeddingUnavailable, resolveEmbedding, type EmbeddingEndpoint 
 import { REEMBED_APPLICATION_NAME, describeInstanceLockHolder, findInstanceLockHolder } from '../db/instance-lock.js';
 
 export const REEMBED_COMMAND = 'pnpm reembed:kg';
+const REEMBED_DOCS_URL = 'https://docs.meetcuria.com/integrations/embeddings-endpoint';
 
 /** How to run the re-embed command, for a log line an operator acts on. */
 export const REEMBED_INSTRUCTIONS =
-  `Stop Curia, then run ${REEMBED_COMMAND} (in a Docker Compose install: docker compose run --rm curia ./node_modules/.bin/tsx scripts/reembed-kg.ts), then start Curia`;
+  `Stop Curia, run ${REEMBED_COMMAND}, then start Curia`;
+
+/** Where a Docker install finds how to run the command, which depends on its compose file. */
+export const REEMBED_DOCKER_NOTE = `For a Docker install, see ${REEMBED_DOCS_URL}.`;
 
 export interface ReembedRun {
   id: number;
@@ -182,13 +186,13 @@ export function describeEmbeddingSchemaOff(state: Extract<EmbeddingSchemaState, 
     case 'open_run':
       return `A knowledge-graph re-embed started ${state.run.startedAt.toISOString()} did not finish ` +
         `(${state.run.rowsDone} of ${state.run.rowsTotal} rows embedded with ${state.run.targetModel}). ` +
-        `${REEMBED_INSTRUCTIONS} to finish it.`;
+        `${REEMBED_INSTRUCTIONS} to finish it. ${REEMBED_DOCKER_NOTE}`;
     case 'width_mismatch':
       return `kg_nodes.embedding holds ${state.vectorCount} vectors of width ${state.columnDimensions ?? 'unset'}, ` +
-        `but the embedding profile needs ${state.profileDimensions}. ${REEMBED_INSTRUCTIONS}.`;
+        `but the embedding profile needs ${state.profileDimensions}. ${REEMBED_INSTRUCTIONS}. ${REEMBED_DOCKER_NOTE}`;
     case 'model_mismatch':
       return `${state.otherModelVectors} knowledge-graph vectors were made by another model or document prefix than ${state.stamp} ` +
-        `(${JSON.stringify(state.vectorsByModel)}). ${REEMBED_INSTRUCTIONS}.`;
+        `(${JSON.stringify(state.vectorsByModel)}). ${REEMBED_INSTRUCTIONS}. ${REEMBED_DOCKER_NOTE}`;
   }
 }
 

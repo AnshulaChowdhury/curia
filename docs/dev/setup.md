@@ -279,6 +279,8 @@ In a Docker Compose install, stop Curia and run the command in a one-off contain
 docker compose run --rm curia ./node_modules/.bin/tsx scripts/reembed-kg.ts
 ```
 
+An install with its own compose file or service name runs the command through that file and service.
+
 The command refuses to run beside a live Curia, and names the process that holds the lock. An interrupted run stays recorded as open, and the knowledge graph stays off until you run the command again to finish it.
 
 > **Checkpoint:** Email channel active, knowledge graph fully functional with semantic search. This is the recommended baseline for most development work.
