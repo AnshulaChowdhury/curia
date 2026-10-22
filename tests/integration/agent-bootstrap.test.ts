@@ -22,6 +22,7 @@ import { createLogger } from '../../src/logger.js';
 const { Pool } = pg;
 
 const DATABASE_URL = process.env.DATABASE_URL;
+const VECTOR = `[${Array.from({ length: 1536 }, () => 0.1).join(',')}]`;
 const describeIf = DATABASE_URL ? describe : describe.skip;
 
 describeIf('bootstrapAgentIdentity', () => {
@@ -117,5 +118,38 @@ describeIf('bootstrapAgentIdentity', () => {
       [first.kgNodeId],
     );
     expect(afterNode.rows[0]?.label).toBe('Agent Test New Name');
+  });
+
+  async function stampVector(kgNodeId: string): Promise<void> {
+    await pool.query(
+      `UPDATE kg_nodes SET embedding = $1::vector, embedding_model = 'test-model' WHERE id = $2`,
+      [VECTOR, kgNodeId],
+    );
+  }
+
+  async function readVector(kgNodeId: string): Promise<{ hasEmbedding: boolean; model: string | null }> {
+    const { rows } = await pool.query<{ has_embedding: boolean; embedding_model: string | null }>(
+      `SELECT embedding IS NOT NULL AS has_embedding, embedding_model FROM kg_nodes WHERE id = $1`,
+      [kgNodeId],
+    );
+    return { hasEmbedding: rows[0]!.has_embedding, model: rows[0]!.embedding_model };
+  }
+
+  it('clears the vector and its model when a restart renames the agent', async () => {
+    const first = await bootstrapAgentIdentity('Agent Test Before Rename', pool, logger);
+    await stampVector(first.kgNodeId);
+
+    await bootstrapAgentIdentity('Agent Test After Rename', pool, logger);
+
+    expect(await readVector(first.kgNodeId)).toEqual({ hasEmbedding: false, model: null });
+  });
+
+  it('keeps the vector and its model when a restart keeps the name', async () => {
+    const first = await bootstrapAgentIdentity('Agent Test Same Name', pool, logger);
+    await stampVector(first.kgNodeId);
+
+    await bootstrapAgentIdentity('Agent Test Same Name', pool, logger);
+
+    expect(await readVector(first.kgNodeId)).toEqual({ hasEmbedding: true, model: 'test-model' });
   });
 });

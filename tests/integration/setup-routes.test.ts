@@ -285,6 +285,21 @@ describeIf('/api/setup/* routes', () => {
       await pool.query(`DELETE FROM contacts WHERE system_role = 'principal'`);
     });
 
+    async function stampVector(kgNodeId: string): Promise<void> {
+      await pool.query(
+        `UPDATE kg_nodes SET embedding = $1::vector, embedding_model = 'test-model' WHERE id = $2`,
+        [`[${Array.from({ length: 1536 }, () => 0.1).join(',')}]`, kgNodeId],
+      );
+    }
+
+    async function readVector(kgNodeId: string): Promise<{ label: string; hasEmbedding: boolean; model: string | null }> {
+      const { rows } = await pool.query<{ label: string; has_embedding: boolean; embedding_model: string | null }>(
+        `SELECT label, embedding IS NOT NULL AS has_embedding, embedding_model FROM kg_nodes WHERE id = $1`,
+        [kgNodeId],
+      );
+      return { label: rows[0]!.label, hasEmbedding: rows[0]!.has_embedding, model: rows[0]!.embedding_model };
+    }
+
     it('creates a principal contact and returns its IDs', async () => {
       const res = await appSetupMode.inject({
         method: 'POST',
@@ -355,6 +370,42 @@ describeIf('/api/setup/* routes', () => {
       );
       expect(row.rows).toHaveLength(1);
       expect(row.rows[0]!.display_name).toBe('Corrected Name');
+    });
+
+    it('clears the KG vector and its model when the rename changes the label', async () => {
+      const first = await appSetupMode.inject({
+        method: 'POST', url: '/api/setup/principal', headers: AUTH_HEADER,
+        payload: { name: 'Original Name' },
+      });
+      const { kgNodeId } = first.json() as { kgNodeId: string };
+      await stampVector(kgNodeId);
+
+      const second = await appSetupMode.inject({
+        method: 'POST', url: '/api/setup/principal', headers: AUTH_HEADER,
+        payload: { name: 'Corrected Name' },
+      });
+      expect((second.json() as { renamed: boolean }).renamed).toBe(true);
+
+      expect(await readVector(kgNodeId)).toEqual({ label: 'Corrected Name', hasEmbedding: false, model: null });
+    });
+
+    it('keeps the KG vector and its model when the rename leaves the label unchanged', async () => {
+      const first = await appSetupMode.inject({
+        method: 'POST', url: '/api/setup/principal', headers: AUTH_HEADER,
+        payload: { name: 'Same Name' },
+      });
+      const { contactId, kgNodeId } = first.json() as { contactId: string; kgNodeId: string };
+      await stampVector(kgNodeId);
+      // Only the contact differs, so the route renames while the node label stays the same.
+      await pool.query(`UPDATE contacts SET display_name = 'Partial' WHERE id = $1`, [contactId]);
+
+      const second = await appSetupMode.inject({
+        method: 'POST', url: '/api/setup/principal', headers: AUTH_HEADER,
+        payload: { name: 'Same Name' },
+      });
+      expect((second.json() as { renamed: boolean }).renamed).toBe(true);
+
+      expect(await readVector(kgNodeId)).toEqual({ label: 'Same Name', hasEmbedding: true, model: 'test-model' });
     });
 
     it('does not rename when the same name is submitted', async () => {
