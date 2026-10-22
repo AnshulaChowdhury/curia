@@ -26,7 +26,7 @@ import { acceptsCodes, registerCodes } from '../verification/track-codes.js';
 import { personTurnSourceText } from '../agents/identifier-sources.js';
 import type { OutboundContextRow } from './outbound-context.js';
 import type { AcquaintanceEvidence } from '../contacts/principal-acquaintance.js';
-import { hasBookingPageLink, inboundTurnGuidance, looksLikeForward, looksLikeSpotCheckReply, parseSpotCheckVerdicts, spotCheckCandidateText } from './turn-guidance-triggers.js';
+import { hasBookingPageLink, inboundTurnGuidance, looksLikeForward, looksLikeMakeRoom, looksLikeSpotCheckReply, parseSpotCheckVerdicts, spotCheckCandidateText } from './turn-guidance-triggers.js';
 import { hasBacklog, type PrincipalBacklogCounts } from '../agents/prompts/backlog-line.js';
 import type { PrincipalBacklogSource } from './principal-backlog.js';
 import { rewriteLlmFailureTurns } from '../memory/llm-failure-turn.js';
@@ -1115,6 +1115,8 @@ export class Dispatcher {
       forward: looksLikeForward(payload.channelId, payload.content),
       bookingLink: hasBookingPageLink(payload.content),
       principalAcquaintance: acquaintanceEvidence,
+      // The principal's own words only: text above any quote or forward marker.
+      makeRoom: looksLikeMakeRoom(spotCheckText),
     });
 
     // The backlog line (prompt trim PR 7): on a principal turn with anything waiting on

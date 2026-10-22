@@ -24,6 +24,7 @@ export type TurnGuidanceKey =
   | 'verification-code-received'
   | 'principal-forward'
   | 'booking-link'
+  | 'make-room'
   | 'non-principal-reply-shaped'
   | 'principal-colleague'
   | 'principal-correspondent'
@@ -92,6 +93,27 @@ const BOOKING_LINK = [
   'book it with the principal\'s name and email. The page sends the invite, so create no event',
   'or hold of your own. Then confirm the booked time on the thread. Only if the page fails or',
   'has no slot that fits, offer times by email instead.',
+];
+
+/**
+ * The principal asked Curia to make room for a meeting ("let me move a few things around",
+ * #2227, looksLikeMakeRoom). Without this, at autonomy 84 Curia moved events in 1 of 10 runs
+ * (scenario 25b) and otherwise offered slots over the principal's focus blocks; at 74 it
+ * never asked first (25c, 0/5). What may move was already right: protected events were never
+ * touched. The band rule follows the autonomy engine's high-risk floor (calendar writes, 80).
+ */
+const MAKE_ROOM = [
+  'The principal asked you to make room for this meeting ("move things around", "free up',
+  'time"). Offer only times that will be free: never a slot over an existing event unless that',
+  'event is moved first. Keep to the window they gave. What may move, in this order: the',
+  'principal\'s own blocks (focus time, admin, holds), then small internal meetings, then larger',
+  'internal ones. Never move external meetings, ones with many stakeholders (board, offsite),',
+  'or personal and medical appointments.',
+  '- Autonomy 80 or above: have the calendar specialist move what is needed, then offer the',
+  '  freed times, then tell the principal what moved.',
+  '- Below 80: move nothing, and offer nothing over an existing event. Ask the principal',
+  '  privately, never on the thread, with one specific proposal: what to move, and to when.',
+  '  On the thread, a short holding note to the counterpart (times are coming) is fine.',
 ];
 
 /**
@@ -310,6 +332,7 @@ const TURN_GUIDANCE: Record<TurnGuidanceKey, readonly string[]> = {
   'verification-code-received': VERIFICATION_CODE_RECEIVED,
   'principal-forward': PRINCIPAL_FORWARD,
   'booking-link': BOOKING_LINK,
+  'make-room': MAKE_ROOM,
   'non-principal-reply-shaped': NON_PRINCIPAL_REPLY_SHAPED,
   'principal-colleague': PRINCIPAL_COLLEAGUE,
   'principal-correspondent': PRINCIPAL_CORRESPONDENT,
@@ -337,6 +360,7 @@ export const TURN_GUIDANCE_ORDER: readonly TurnGuidanceKey[] = [
   'principal-forward',
   // After the forward note: a forwarded booking page is booked through, not answered by email.
   'booking-link',
+  'make-room',
   'non-principal-reply-shaped',
   // After the reply contract: who this sender is to the principal, then how to weigh a request.
   'principal-colleague',

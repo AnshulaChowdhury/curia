@@ -61,6 +61,21 @@ at ≥80 move the principal's own blocks (then small internal meetings) and say 
 below 80 one private, specific ask. Never external, multi-stakeholder or medical events.
 Consider a calendar-side check that flags an offered slot overlapping a busy event.
 
+**What shipped:** the `make-room` injection (`looksLikeMakeRoom` on the principal's own text,
+above any quote; plain "find some time" does not fire). Below 80 a short holding note to the
+counterpart is allowed. The calendar-side overlap check was not needed.
+
+Case fixes found on the way:
+- 25b's `calendar-check-conflicts` stub reported a conflict for every slot, so a slot freed by
+  a move still read as busy and the calendar specialist looped until the run timed out
+  (2 of 5 runs). It now answers clear; `makes_room` now fails an offer over an event left in
+  place.
+- 25c's `specific_ask` asked for "focus blocks, the 1:1", so the judge docked a proposal that
+  moved only the principal's own blocks, which is the order the principal asked for.
+
+**Result (2026-10-22, 9 runs):** 25b at 84 (band) and 25c at 74 (band) pass every behavior
+9/9 (baseline: 25b moved events in 1/10, 25c asked first in 0/5). Markers removed.
+
 ## PR 2 decisions
 
 Decided (2026-10-22): a code check in dispatch, not a prompt step. For an email sender with

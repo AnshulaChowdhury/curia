@@ -49,6 +49,27 @@ export interface InboundGuidanceFacts {
    * them (#2227). Absent means it did not.
    */
   principalAcquaintance?: AcquaintanceEvidence;
+  /**
+   * The message's own text (above any quote) asks to make room in the calendar
+   * (looksLikeMakeRoom). Only honoured on a live principal turn. Absent means no.
+   */
+  makeRoom?: boolean;
+}
+
+// "Make room" language (#2227): the principal offering to move their own commitments. Plain
+// "find some time" is left out: it is how most scheduling requests are phrased, and asks
+// for nothing to move.
+const MAKE_ROOM_PATTERNS: readonly RegExp[] = [
+  /\b(?:move|shift|shuffle|rearrange|juggle)\s+(?:a\s+few\s+|some\s+|a\s+couple\s+(?:of\s+)?)?(?:things|stuff|meetings|commitments)\b/i,
+  /\b(?:move|shift|shuffle|rearrange|juggle|clear)\s+(?:my|the)\s+(?:calendar|schedule|diary)\b/i,
+  /\bmake\s+(?:some\s+)?(?:room|space)\b/i,
+  /\b(?:find|free\s+up|clear|carve\s+out|open\s+up)\s+(?:some\s+)?(?:room|space)\b/i,
+  /\b(?:free\s+up|clear|carve\s+out|open\s+up)\s+(?:some\s+)?time\b/i,
+];
+
+/** Whether the text asks to make room in the calendar ("let me move a few things around"). */
+export function looksLikeMakeRoom(text: string): boolean {
+  return MAKE_ROOM_PATTERNS.some((p) => p.test(text));
 }
 
 // Booking-page hosts (#2227). A link on the host's root is not a booking page, so each needs
@@ -224,6 +245,7 @@ export function inboundTurnGuidance(facts: InboundGuidanceFacts): TurnGuidanceKe
   if (facts.liveTurn && facts.verificationCodeReceived === true) keys.push('verification-code-received');
   if (principalForward) keys.push('principal-forward');
   if (facts.bookingLink === true) keys.push('booking-link');
+  if (facts.liveTurn && facts.makeRoom === true) keys.push('make-room');
   if (facts.liveTurn && entries.length > 0) {
     keys.push('outbound-context');
     if (entries.some((m) => isTaskWakeReplyBinding(m))) keys.push('outbound-context-task-wake');

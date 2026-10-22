@@ -183,6 +183,7 @@ describe('parseTurnGuidanceKeys', () => {
       'verification-code-received',
       'principal-forward',
       'booking-link',
+      'make-room',
       'non-principal-reply-shaped',
       'principal-colleague',
       'principal-correspondent',
