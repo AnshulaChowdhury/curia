@@ -265,10 +265,18 @@ describe('HealthService google_workspace canary (#2242)', () => {
     const result = await gwsResult(gwsDeps(callTool));
     expect(result?.status).toBe('ok');
     expect(callTool).toHaveBeenCalledWith(
-      { name: 'list_drive_items', arguments: { page_size: 1, ...FIXED } },
+      { name: 'list_drive_items', arguments: { ...FIXED, page_size: 1 } },
       undefined,
       expect.objectContaining({ timeout: expect.any(Number) }),
     );
+  });
+
+  it('keeps page_size at 1 even when a fixed input sets it', async () => {
+    const callTool = vi.fn().mockResolvedValue({ content: [] });
+    await gwsResult(gwsDeps(callTool, {
+      mcpFixedInputs: new Map([['google-workspace', { ...FIXED, page_size: '100' }]]),
+    }));
+    expect(callTool.mock.calls[0]![0].arguments).toEqual({ ...FIXED, page_size: 1 });
   });
 
   it('pings the google_workspace heartbeat when the probe succeeds', async () => {

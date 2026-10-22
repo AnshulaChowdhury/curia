@@ -438,7 +438,8 @@ export class HealthService {
   ): Promise<CanaryResult> {
     try {
       const result = await session.client.callTool(
-        { name: GOOGLE_WORKSPACE_PROBE_TOOL, arguments: { page_size: 1, ...fixedInputs } },
+        // page_size last: a fixed input must not widen the one-item probe.
+        { name: GOOGLE_WORKSPACE_PROBE_TOOL, arguments: { ...fixedInputs, page_size: 1 } },
         undefined,
         { timeout: GOOGLE_WORKSPACE_PROBE_TIMEOUT_MS },
       );
