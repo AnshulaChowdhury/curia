@@ -239,20 +239,29 @@ through `WorkingDocsRepo` only.
   version as `expectedVersion`; a stale save returns the current text and the principal
   decides — never a silent overwrite. Documents over `consoleEditMaxBytes` are read-only in
   the console and edited offline (download, then import). Create (not `index.md`/`log.md`),
-  archive (`softDelete`) and restore (`restore`, refused when the path is taken). Every
-  console write appends to the directory's `log.md`, stamps `principal_edited_at` into the
-  frontmatter, and publishes a `document.console_action` audit event.
+  archive (`softDeleteAtVersion`, refused if the document changed since you looked) and
+  restore (`restore`, refused when the path is taken).
+- **Bookkeeping.** Every console write is audited write-ahead: a `requested`
+  `document.console_action` event is recorded before the store is touched, and the change
+  is refused if it can't be; a `completed` event follows the write. Interactive writes —
+  save, create, archive, restore, and re-uploading one document edited offline — also
+  append to the directory's `log.md` and (save, create, re-upload) stamp
+  `principal_edited_at` into the frontmatter. **A bundle import is the one exception:** it
+  is a faithful restore, so it is audited but adds no `log.md` lines and no stamp, which
+  keeps an export → import round trip exact. A missed `log.md` line or completion event
+  after a successful write is reported as a warning, not an error, since the change was
+  made.
 - **Export / import (#1823).** A zip bundle: one OKF file per document at its store path,
   archived rows under `.archived/<id>/`, and `manifest.json` with each document's version.
   Export streams (documents are read as the writer reaches them) and is audited before it
   starts. Import always previews; apply must present the preview's token and does exactly
-  what it showed. It only creates and updates — an update needs the live version to equal
-  the bundle's — and never archives anything absent from the bundle. Entry names are
+  what it showed. It only creates and updates — an update needs the live document to be
+  the same row (manifest id, or the id fragment in a download's name) at the bundle's
+  version — and never archives anything absent from the bundle. Entry names are
   checked before inflation (no absolute, `..`, backslash or control-character paths), only
   `.md` files with valid OKF frontmatter are taken, and entry count and inflated size are
-  capped during extraction. A bundle import is a faithful restore (no stamp, no `log.md`
-  lines); a single re-uploaded document is an offline console edit and is stamped and
-  logged like one.
+  capped during extraction. Upload routes authenticate before reading the body. See
+  **Bookkeeping** above for how bundle and single-document imports differ.
 
 There is no link-graph view: the backlink index is empty in production, and the static
 visualizer was dropped. The orphan/stale/contradiction lint sketched in the original design
