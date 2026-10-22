@@ -184,7 +184,8 @@ describeIf('console Documents export + import (integration)', () => {
       expect(bundle.documents).toHaveLength(105);
       const log = bundle.documents.find(d => d.path === '/projects/social-media/activity-log.md')!;
       expect(Buffer.byteLength(log.body)).toBeGreaterThan(200_000);
-    });
+      // ~0.5 s alone, but 105 inserts can pass the 5 s default under a full parallel run on one Postgres.
+    }, 30_000);
   });
 
   describe('import', () => {
