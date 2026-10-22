@@ -1,4 +1,4 @@
--- 102_add_kg_embedding_model.sql
+-- 103_add_kg_embedding_model.sql
 --
 -- Stamps each knowledge-graph vector with the model that made it (ADR-051).
 -- Existing vectors get text-embedding-3-small: upstream Curia only ever used that model, so an upgraded install keeps its graph on.

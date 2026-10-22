@@ -72,7 +72,7 @@ export function lookupEmbeddingProfile(
  * that stored stamps are compared with. Stored vectors keep the `document` prefix they
  * were made with, so a non-empty one is part of the stamp. A changed prefix under the
  * same model name then reads as a model mismatch to the boot gate and `pnpm reembed:kg`.
- * An empty prefix leaves the stamp as the model name, which migration 102's backfill wrote.
+ * An empty prefix leaves the stamp as the model name, which migration 103's backfill wrote.
  */
 export function embeddingStamp(profile: Pick<EmbeddingProfile, 'model' | 'prefixes'>): string {
   const prefix = profile.prefixes.document;

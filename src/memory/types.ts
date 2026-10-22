@@ -83,7 +83,7 @@ export interface KgNode {
   properties: Record<string, unknown>;
   embedding?: number[]; // width from the embedding profile — undefined until embedded
   // embeddingStamp() of the profile that produced `embedding`; set exactly when `embedding`
-  // is (migration 102). Vectors with different stamps are never compared.
+  // is (migration 103). Vectors with different stamps are never compared.
   embeddingModel?: string;
   temporal: TemporalMetadata;
   // Sensitivity classification assigned at creation time (#200).

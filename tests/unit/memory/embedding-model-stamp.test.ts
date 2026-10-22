@@ -20,7 +20,7 @@ function makeStore(profile: EmbeddingProfile = OPENAI_TEXT_EMBEDDING_3_SMALL) {
 }
 
 describe('embeddingStamp', () => {
-  // Migration 102 backfills existing vectors with this literal.
+  // Migration 103 backfills existing vectors with this literal.
   it('is the bare model name for OpenAI\'s profile', () => {
     expect(embeddingStamp(OPENAI_TEXT_EMBEDDING_3_SMALL)).toBe('text-embedding-3-small');
   });

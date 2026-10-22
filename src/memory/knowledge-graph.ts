@@ -980,7 +980,7 @@ function pgRowToEdge(row: PgEdgeRow): KgEdge {
   };
 }
 
-/** The stamp to store beside a node's vector: none without a vector (migration 102's CHECK). */
+/** The stamp to store beside a node's vector: none without a vector (migration 103's CHECK). */
 function embeddingModelFor(node: KgNode): string | null {
   return node.embedding ? (node.embeddingModel ?? null) : null;
 }
