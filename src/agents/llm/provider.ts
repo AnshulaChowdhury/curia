@@ -146,6 +146,16 @@ export interface LLMCallProvenance {
    * guard). Absent when it dropped none.
    */
   reasoningBlocksDropped?: number;
+  /**
+   * OpenRouter chat() only: requests sent for this call, counting retries.
+   * Absent where the provider does not count them (#1915).
+   */
+  attempts?: number;
+  /**
+   * OpenRouter chat() only: time spent on failed attempts and the backoff after
+   * each, so `latencyMs - failedAttemptsMs` is the attempt that succeeded (#1915).
+   */
+  failedAttemptsMs?: number;
 }
 
 // Import and re-export ToolDefinition from the canonical location in skills/types.ts

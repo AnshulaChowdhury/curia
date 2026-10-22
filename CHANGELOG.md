@@ -59,7 +59,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Changed
 
 - **`emitOkfDocument`** — writes the body verbatim instead of appending a trailing newline, so parsing inverts it. (#1823)
-
+- **OpenRouter retries** — logged per attempt and counted on `llm.call`, instead of the SDK retrying silently. (#1915)
 - **KG explorer layout** — nodes spread further apart and labels no longer overlap. (#351)
 - **Console registry** — shows optional capabilities beside a tool's required ones. (#2028)
 - **ADR-048 outcomes** — effort A/B found no winner; the standard tier stays at the model default. (#2044)

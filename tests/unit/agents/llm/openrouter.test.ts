@@ -4,8 +4,17 @@
 // Follows the same pattern as anthropic.test.ts: vi.hoisted mockCreate,
 // vi.mock to stub the SDK, and createSilentLogger for silent logging.
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mergeReasoningDetailDeltas, OpenRouterProvider, upstreamProviderFrom, usageFromOpenRouter } from '../../../../src/agents/llm/openrouter.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { APIConnectionError, APIConnectionTimeoutError, APIError, APIUserAbortError } from 'openai';
+import {
+  isRetryableOpenRouterError,
+  mergeReasoningDetailDeltas,
+  OPENROUTER_MAX_ATTEMPTS,
+  OpenRouterProvider,
+  openRouterRetryDelayMs,
+  upstreamProviderFrom,
+  usageFromOpenRouter,
+} from '../../../../src/agents/llm/openrouter.js';
 import { buildAssistantToolUseMessage, buildUserToolResultMessage } from '../../../../src/agents/llm/tool-loop-messages.js';
 import { buildLlmArchiveResponse } from '../../../../src/audit/llm-archive-response.js';
 import { ModelRegistry } from '../../../../src/agents/llm/model-registry.js';
@@ -16,13 +25,20 @@ import type { LLMResponse, LLMStreamEvent, Message } from '../../../../src/agent
 // declared with vi.hoisted() to be available inside the mock factory.
 const mockCreate = vi.hoisted(() => vi.fn());
 
-vi.mock('openai', () => ({
+vi.mock('openai', async (importOriginal) => ({
+  // Keep the real error classes: chat() decides what to retry with instanceof.
+  ...(await importOriginal<typeof import('openai')>()),
   // The OpenRouterProvider calls `new OpenAI({ apiKey, baseURL })` in its
   // constructor. Arrow functions are not constructable, so we use a class.
   default: class {
     chat = { completions: { create: mockCreate } };
   },
 }));
+
+/** An SDK APIError for an HTTP status, with optional response headers. */
+function apiError(status: number, headers: Record<string, string> = {}): APIError {
+  return APIError.generate(status, { error: { message: `status ${status}` } }, undefined, new Headers(headers));
+}
 
 // A valid text-only OpenAI chat completion response shape.
 // id and model match OpenRouter's response format.
@@ -1448,5 +1464,129 @@ describe('OpenRouterProvider — reasoning effort (ADR-048 §2)', () => {
     expect(sent().reasoning).toEqual({ effort: 'max' });
     const end = events.at(-1);
     expect(end?.type === 'message_end' && end.provenance.reasoningEffort).toBe('max');
+  });
+});
+
+// chat() owns retries instead of the openai SDK, so each one is logged and
+// counted on llm.call rather than hidden inside one call's latency (#1915).
+describe('OpenRouter retry rule', () => {
+  it('retries connection errors, timeouts, 408, 409, 429 and 5xx', () => {
+    expect(isRetryableOpenRouterError(new APIConnectionError({ message: 'socket hang up' }))).toBe(true);
+    expect(isRetryableOpenRouterError(new APIConnectionTimeoutError())).toBe(true);
+    for (const status of [408, 409, 429, 500, 502, 503, 504]) {
+      expect(isRetryableOpenRouterError(apiError(status)), String(status)).toBe(true);
+    }
+  });
+
+  it('does not retry client errors, caller aborts or non-SDK errors', () => {
+    for (const status of [400, 401, 403, 404, 422]) {
+      expect(isRetryableOpenRouterError(apiError(status)), String(status)).toBe(false);
+    }
+    expect(isRetryableOpenRouterError(new APIUserAbortError())).toBe(false);
+    expect(isRetryableOpenRouterError(Object.assign(new Error('boom'), { status: 500 }))).toBe(false);
+  });
+
+  it('obeys an explicit x-should-retry header either way', () => {
+    expect(isRetryableOpenRouterError(apiError(400, { 'x-should-retry': 'true' }))).toBe(true);
+    expect(isRetryableOpenRouterError(apiError(503, { 'x-should-retry': 'false' }))).toBe(false);
+  });
+
+  it('backs off from 0.5s, doubling to an 8s cap, with up to 25% jitter off', () => {
+    const noJitter = () => 0;
+    expect(openRouterRetryDelayMs(apiError(503), 1, noJitter)).toBe(500);
+    expect(openRouterRetryDelayMs(apiError(503), 2, noJitter)).toBe(1000);
+    expect(openRouterRetryDelayMs(apiError(503), 6, noJitter)).toBe(8000);
+    expect(openRouterRetryDelayMs(apiError(503), 1, () => 1)).toBe(375);
+  });
+
+  it('waits what retry-after-ms or retry-after asks for, up to 60s', () => {
+    expect(openRouterRetryDelayMs(apiError(429, { 'retry-after-ms': '1200' }), 1)).toBe(1200);
+    expect(openRouterRetryDelayMs(apiError(429, { 'retry-after': '3' }), 1)).toBe(3000);
+    expect(openRouterRetryDelayMs(apiError(429, { 'retry-after': '120' }), 1, () => 0)).toBe(500);
+  });
+});
+
+describe('OpenRouterProvider chat() retries', () => {
+  const provider = () => new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+  const chat = (p = provider()) => p.chat({ messages: [{ role: 'user', content: 'Hello' }], model: 'google/gemini-2.0-flash-001' });
+
+  beforeEach(() => {
+    mockCreate.mockReset();
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('turns off the SDK retries on its own requests', async () => {
+    mockCreate.mockResolvedValue(makeTextResponse());
+    await chat();
+    expect(mockCreate.mock.calls[0]![1]).toMatchObject({ maxRetries: 0 });
+  });
+
+  it('records one attempt and no failed time on a first-try success', async () => {
+    mockCreate.mockResolvedValue(makeTextResponse());
+    const result = await chat();
+    expect(result.type === 'text' && result.provenance).toMatchObject({ attempts: 1, failedAttemptsMs: 0 });
+  });
+
+  it('retries a timeout, then records both attempts and the time the first one cost', async () => {
+    mockCreate.mockImplementationOnce(async () => {
+      vi.advanceTimersByTime(600_000);
+      throw new APIConnectionTimeoutError();
+    });
+    mockCreate.mockResolvedValueOnce(makeTextResponse());
+
+    const pending = chat();
+    await vi.runAllTimersAsync();
+    const result = await pending;
+
+    expect(mockCreate).toHaveBeenCalledTimes(2);
+    expect(result.type).toBe('text');
+    if (result.type !== 'text') return;
+    expect(result.provenance.attempts).toBe(2);
+    // The 600s attempt plus a backoff of 375–500ms.
+    expect(result.provenance.failedAttemptsMs).toBeGreaterThanOrEqual(600_375);
+    expect(result.provenance.failedAttemptsMs).toBeLessThanOrEqual(600_500);
+  });
+
+  it(`gives up after ${OPENROUTER_MAX_ATTEMPTS} attempts and reports how many it made`, async () => {
+    mockCreate.mockRejectedValue(apiError(503));
+
+    const pending = chat();
+    await vi.runAllTimersAsync();
+    const result = await pending;
+
+    expect(mockCreate).toHaveBeenCalledTimes(OPENROUTER_MAX_ATTEMPTS);
+    expect(result.type).toBe('error');
+    if (result.type !== 'error') return;
+    expect(result.error.type).toBe('PROVIDER_ERROR');
+    expect(result.error.context.attempts).toBe(OPENROUTER_MAX_ATTEMPTS);
+  });
+
+  it('does not retry a client error', async () => {
+    mockCreate.mockRejectedValue(apiError(400));
+    const result = await chat();
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    expect(result.type === 'error' && result.error.context.attempts).toBe(1);
+  });
+
+  it('stops retrying once the caller aborts', async () => {
+    const controller = new AbortController();
+    mockCreate.mockImplementation(async () => {
+      controller.abort();
+      throw apiError(503);
+    });
+
+    const pending = provider().chat({
+      messages: [{ role: 'user', content: 'Hello' }],
+      model: 'google/gemini-2.0-flash-001',
+      options: { signal: controller.signal },
+    });
+    await vi.runAllTimersAsync();
+    const result = await pending;
+
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    expect(result.type).toBe('error');
   });
 });

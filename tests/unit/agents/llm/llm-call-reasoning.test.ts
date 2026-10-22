@@ -31,12 +31,13 @@ function usage(reasoningTokens?: number): LLMUsage {
   };
 }
 
+/** With an upstream provider, also a call that needed one retry (#1915). */
 function provenance(upstreamProvider?: string): LLMCallProvenance {
   return {
     requestedModel: MODEL,
     actualModel: MODEL,
     providerRequestId: 'gen-1',
-    ...(upstreamProvider !== undefined ? { upstreamProvider } : {}),
+    ...(upstreamProvider !== undefined ? { upstreamProvider, attempts: 2, failedAttemptsMs: 600_400 } : {}),
   };
 }
 
@@ -58,11 +59,25 @@ function recordingBus(): { bus: EventBus; llmCallPayloads: () => Array<Record<st
   };
 }
 
-const reported = { reasoningTokens: 42, reasoningEffort: null, upstreamProvider: 'CoreWeave', reasoningBlocksDropped: 0 };
-const unreported = { reasoningTokens: null, reasoningEffort: null, upstreamProvider: null, reasoningBlocksDropped: 0 };
+const reported = {
+  reasoningTokens: 42,
+  reasoningEffort: null,
+  upstreamProvider: 'CoreWeave',
+  reasoningBlocksDropped: 0,
+  attempts: 2,
+  failedAttemptsMs: 600_400,
+};
+const unreported = {
+  reasoningTokens: null,
+  reasoningEffort: null,
+  upstreamProvider: null,
+  reasoningBlocksDropped: 0,
+  attempts: null,
+  failedAttemptsMs: null,
+};
 
 describe('llmCallReasoningFields', () => {
-  it('carries the reported reasoning tokens and upstream endpoint', () => {
+  it('carries the reported reasoning tokens, upstream endpoint and attempts', () => {
     expect(llmCallReasoningFields(usage(42), provenance('CoreWeave'))).toEqual(reported);
   });
 
