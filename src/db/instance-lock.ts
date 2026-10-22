@@ -7,8 +7,9 @@ import type { DbPool, DbPoolClient } from './connection.js';
 import type { Logger } from '../logger.js';
 
 // The two-key form of pg_try_advisory_lock, so pg_locks shows the pair as classid/objid
-// and the holder can be named. The pair spells "CURI" and 1; nothing else in Curia takes
-// a session-level advisory lock.
+// and the holder can be named. The pair spells "CURI" and 1. The scenario and smoke
+// harnesses take one-key session locks. Postgres keeps one-key and two-key locks apart,
+// so those locks never collide with this one.
 export const INSTANCE_LOCK_KEYS = [0x43555249, 1] as const;
 
 /** application_name a running Curia sets on its connections, so the lock holder is nameable. */
