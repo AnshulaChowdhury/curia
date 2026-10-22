@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import {
   APPLY_OUTCOME_UNKNOWN_MESSAGE,
   LABEL_COLLISION_MESSAGE,
-  MAX_ALIASES,
   MERGE_UNAVAILABLE_MESSAGE,
   STALE_PREVIEW_NOTICE,
   applyButtonLabel,
@@ -108,6 +107,10 @@ function preview(over: Partial<NodeMergePreview> = {}): NodeMergePreview {
       defaultLabel: 'survivor',
       aliases: ['acme summit', 'acme summit 2026'],
       droppedAliases: [],
+      aliasOptions: {
+        survivor: { aliases: ['acme summit', 'acme summit 2026'], droppedAliases: [] },
+        absorbed: { aliases: ['acme', 'acme summit 2026'], droppedAliases: [] },
+      },
       sensitivity: 'internal', confidence: 0.8, decayClass: 'permanent', identitySource: 'label',
     },
     blockers: [],
@@ -420,7 +423,7 @@ describe('label collision', () => {
     expect(buildApplyRequest(p, { label: 'absorbed' }, []).resolutions?.label).toBe('survivor');
   });
 
-  it('recomputes aliases when the server default is overridden', () => {
+  it('looks up the aliases for the overridden label from the server options', () => {
     const p = collided({ defaultLabel: 'absorbed', aliases: ['server'], droppedAliases: [] });
     const label = mergeResolutions({}, p).label!;
     expect(resultAliases(p, label).aliases).toEqual(['acme summit', 'acme summit 2026']);
@@ -561,27 +564,25 @@ describe('requests', () => {
 // ── Aliases ─────────────────────────────────────────────────────────────────
 
 describe('resultAliases', () => {
-  it('returns the server computation for the default label', () => {
-    const p = preview({ result: { ...preview().result, aliases: ['server'], droppedAliases: ['x'] } });
-    expect(resultAliases(p, 'survivor')).toEqual({ aliases: ['server'], dropped: ['x'] });
+  const withOptions = () => preview({
+    result: {
+      ...preview().result,
+      aliases: ['default'],
+      droppedAliases: ['default-dropped'],
+      aliasOptions: {
+        survivor: { aliases: ['s1', 's2'], droppedAliases: ['s-dropped'] },
+        absorbed: { aliases: ['a1'], droppedAliases: [] },
+      },
+    },
   });
 
-  it('recomputes for the other label: unchosen label joins, final label leaves', () => {
-    const p = preview({
-      survivor: summary({ aliases: ['acme inc', 'ACME SUMMIT'] }),
-      absorbed: summary({ id: A, label: 'Acme Summit', type: 'event', aliases: ['acme inc', 'summit'] }),
-    });
-    expect(resultAliases(p, 'absorbed')).toEqual({ aliases: ['acme inc', 'acme', 'summit'], dropped: [] });
+  it('looks up the server-computed aliases for each label choice', () => {
+    expect(resultAliases(withOptions(), 'survivor')).toEqual({ aliases: ['s1', 's2'], dropped: ['s-dropped'] });
+    expect(resultAliases(withOptions(), 'absorbed')).toEqual({ aliases: ['a1'], dropped: [] });
   });
 
-  it('caps at MAX_ALIASES and reports the overflow', () => {
-    const many = Array.from({ length: 12 }, (_, i) => `alias ${i}`);
-    const p = preview({ survivor: summary({ aliases: many }) });
-    const { aliases, dropped } = resultAliases(p, 'absorbed');
-    expect(aliases).toHaveLength(MAX_ALIASES);
-    expect(aliases[0]).toBe('alias 0');
-    // Order is survivor aliases, then the unchosen label, then absorbed aliases.
-    expect(dropped).toEqual(['alias 10', 'alias 11', 'acme', 'acme summit 2026']);
+  it('does not fall back to result.aliases for the default label', () => {
+    expect(resultAliases(withOptions(), 'survivor').aliases).not.toEqual(['default']);
   });
 });
 
@@ -731,6 +732,14 @@ describe('response guards', () => {
     expect(isNodeMergePreview({ ...preview(), dryRun: false })).toBe(false);
     expect(isNodeMergePreview({ ...preview(), conflicts: { properties: [] } })).toBe(false);
     expect(isNodeMergePreview(null)).toBe(false);
+  });
+
+  it('rejects a preview without the per-label alias options', () => {
+    const rest: Record<string, unknown> = { ...preview().result };
+    delete rest['aliasOptions'];
+    expect(isNodeMergePreview({ ...preview(), result: rest })).toBe(false);
+    const half = { ...preview().result, aliasOptions: { survivor: { aliases: [], droppedAliases: [] } } };
+    expect(isNodeMergePreview({ ...preview(), result: half })).toBe(false);
   });
 
   it('recognises a result', () => {

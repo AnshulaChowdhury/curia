@@ -798,18 +798,25 @@ describe('GET /api/kg/nodes and /api/kg/graph — merge-aware (#2233)', () => {
     sensitivity: 'internal',
   };
 
-  it('excludes archived nodes and returns aliases and identitySource', async () => {
+  it('excludes merge tombstones only — like /graph — and returns aliases, identitySource and archived', async () => {
     const pool = makeFakePool();
     vi.mocked(pool.query).mockResolvedValueOnce({
-      rows: [{ ...nodeRow, aliases: ['jd'], identity_source: 'contact' }],
-      rowCount: 1,
+      rows: [
+        { ...nodeRow, aliases: ['jd'], identity_source: 'contact', archived_at: null },
+        // A decayed archived node (no merged_into) is still listed, flagged archived.
+        { ...nodeRow, id: ABSORBED, aliases: null, identity_source: 'label', archived_at: '2026-10-21T00:00:00.000Z' },
+      ],
+      rowCount: 2,
     } as never);
     app = await buildWithMerge(fakeMergeService(), pool);
     const res = await app.inject({ method: 'GET', url: '/api/kg/nodes?query=jane', headers: auth });
     expect(res.statusCode).toBe(200);
-    expect(res.json().nodes[0]).toMatchObject({ aliases: ['jd'], identitySource: 'contact' });
+    expect(res.json().nodes[0]).toMatchObject({ aliases: ['jd'], identitySource: 'contact', archived: false });
+    expect(res.json().nodes[1]).toMatchObject({ id: ABSORBED, aliases: [], archived: true });
+    expect(res.json().nodes[1].archived_at).toBeUndefined();
     const sql = String(vi.mocked(pool.query).mock.calls[0]![0]);
-    expect(sql).toMatch(/archived_at IS NULL/);
+    expect(sql).toContain("NOT (kg_nodes.archived_at IS NOT NULL AND kg_nodes.properties->>'merged_into' IS NOT NULL)");
+    expect(sql).not.toMatch(/WHERE\s+archived_at IS NULL/);
   });
 
   it('searches aliases case-insensitively and excludes facts on request, all parameterized', async () => {

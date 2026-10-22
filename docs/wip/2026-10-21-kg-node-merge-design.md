@@ -180,8 +180,8 @@ A contact in `Ca` that would be deleted (contact-merged away) and is structural
   and marks the duplicates.
 - **Auth overrides**: for active overrides with the same `permission` but a
   different `granted` value on each side, it is an **auth override conflict**
-  (`survivor | absorbed`, default survivor). If the user picks `absorbed`, the
-  survivor's row is revoked or removed before reattach. An equal pair is a
+  (`survivor | absorbed`; the default is whichever side denies, the security-safe
+  reading). If the user picks `absorbed`, the survivor's row is revoked or removed before reattach. An equal pair is a
   duplicate and the survivor's row is kept.
 
 ### 5.2 The principal and the agent
@@ -575,3 +575,12 @@ round. No migration is needed.
 - Post-commit failures appear in `result.warnings`: `embedding_not_refreshed` and `audit_event_not_recorded`. The console shows them in the success banner. The contact-merged callbacks and the principal identity refresh log and swallow their own errors, so they cannot be reported.
 - When the merge service is not wired, the routes return 503 `unavailable`.
 - `GET /api/kg/nodes` gained `exclude_facts=true` and alias matching. Graph nodes carry `aliases` and `archived`. Merge tombstones are excluded from graph results, and the `node_merged` 404 carries the absorbed `label`.
+- **QA follow-up (2026-10-22, PR #2238):**
+  - **Contacts as peers:** only a contact already on the survivor node anchors the "survivor" side. When the survivor node has no contact, every folded contact is a peer: the earliest-created contact wins each field, a deny beats a grant, and a `contacts_disagree` line records each case. A real survivor-vs-absorbed auth-override conflict defaults to the side that denies.
+  - **Dropped third values:** a value from a third contact that a two-way field conflict cannot offer gets a `contacts_disagree` line saying it will be dropped.
+  - **Chained fact operations:** fact operations forward through chains. A deleted fact passes the history, sensitivity and (for duplicates) confidence and confirmation time it had gathered to the fact it was folded into.
+  - **Contact merge locking:** the shared contact fold locks both contact rows `FOR UPDATE` and computes counters from the locked rows. It also refuses a structural secondary itself. One `survivingTier` rule now serves both merge paths.
+  - **Alias options:** `result.aliasOptions` gives the server-computed aliases for each label choice, so the console no longer re-implements the alias rule.
+  - **Principal audit:** `kg.nodes_merged` records `principalIdentitiesTransferred` and `principalPrimaryFieldsFilled`. The acknowledgement details list any primary email or phone that will be filled.
+  - **Archived nodes:** `GET /api/kg/nodes` hides only merge tombstones, as `/graph` does, and carries `archived`.
+  - **Schema guard:** `tests/integration/kg-merge-schema-guard.test.ts` fails when a new foreign key to `contacts` or `kg_nodes` is not handled by the merge.

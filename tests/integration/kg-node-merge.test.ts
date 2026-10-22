@@ -617,6 +617,39 @@ describeIf('KG node merge (#2233)', () => {
     expect(active.rows).toEqual([{ permission: 'calendar.write', granted: false }]);
   });
 
+  it('contactless person survivor: a peer’s deny beats the promoted contact’s own grant (QA A)', async () => {
+    // The survivor node has no contact, so the earliest absorbed contact is promoted onto
+    // it. Its grant is a peer's value, not the survivor's: the later contact's deny wins.
+    const s = await node('person', 'Peer S');
+    const a = await node('organization', 'Peer A');
+    const granting = await contact({ displayName: 'Peer Granting', kgNodeId: a, kind: 'organization', title: 'CTO' });
+    const denying = await contact({ displayName: 'Peer Denying', kgNodeId: a, kind: 'organization', title: 'VP Eng' });
+    await pool.query(`UPDATE contacts SET created_at = $2 WHERE id = $1`, [granting, T1]);
+    await pool.query(`UPDATE contacts SET created_at = $2 WHERE id = $1`, [denying, T2]);
+    await pool.query(
+      `INSERT INTO contact_auth_overrides (contact_id, permission, granted) VALUES ($1, 'calendar.write', true), ($2, 'calendar.write', false)`,
+      [granting, denying],
+    );
+
+    const preview = await service.preview(s, a);
+    expect(preview.contactPlan).toMatchObject({ survivingContactId: granting, mergedContactIds: [denying] });
+    expect(preview.conflicts.authOverrides).toEqual([]);
+    expect(preview.conflicts.contactFields).toEqual([]);
+    expect(preview.warnings.find(w => w.code === 'contacts_disagree')!.details).toEqual([
+      "Title: 'CTO' (Peer Granting) kept over 'VP Eng' (Peer Denying)",
+      'calendar.write: denied kept over granted',
+    ]);
+    await service.apply({ survivorId: s, absorbedId: a, planToken: preview.planToken, resolutions: {}, actor: null });
+
+    expect(await contactRow(granting)).toMatchObject({ kg_node_id: s, kind: 'person', title: 'CTO' });
+    expect(await contactRow(denying)).toBeUndefined();
+    const active = await pool.query<{ permission: string; granted: boolean }>(
+      `SELECT permission, granted FROM contact_auth_overrides WHERE contact_id = $1 AND revoked_at IS NULL`,
+      [granting],
+    );
+    expect(active.rows).toEqual([{ permission: 'calendar.write', granted: false }]);
+  });
+
   // -- 7. failure mid-transaction -------------------------------------------
 
   it('rolls back everything when a statement fails mid-transaction', async () => {
@@ -694,12 +727,18 @@ describeIf('KG node merge (#2233)', () => {
     const dup = await node('person', 'Principal Duplicate', { identitySource: 'contact' });
     const cp = await contact({ displayName: 'Principal Self', kgNodeId: p, kind: 'principal', systemRole: 'principal', tier: 'principal' });
     const cd = await contact({ displayName: 'Principal Duplicate', kgNodeId: dup, tier: 'blocked' });
-    await identity(cd, 'sms', `+1666${Date.now() % 10_000_000}`, false);
+    const sms = `+1666${Date.now() % 10_000_000}`;
+    await identity(cd, 'sms', sms, false);
+    // The principal has no primary email, so the fold fills it — a trust-relevant change (QA G).
+    const dupEmail = `principal-dup-${runId}@example.com`;
+    await pool.query(`UPDATE contacts SET primary_email = $2 WHERE id = $1`, [cd, dupEmail]);
+    const principalEmail = await pool.query<{ primary_email: string | null }>(`SELECT primary_email FROM contacts WHERE id = $1`, [cp]);
+    expect(principalEmail.rows[0]!.primary_email).toBeNull();
 
     const preview = await service.preview(p, dup);
     const warning = preview.warnings.find(w => w.code === 'principal_identity_transfer');
     expect(warning).toMatchObject({ requiresAck: true });
-    expect(warning!.details).toHaveLength(1);
+    expect(warning!.details).toEqual([`sms: ${sms}`, `Primary email will become ${dupEmail}`]);
 
     const err = await service.apply({ survivorId: p, absorbedId: dup, planToken: preview.planToken, resolutions: {}, actor: null })
       .catch((e: unknown) => e);
@@ -718,6 +757,10 @@ describeIf('KG node merge (#2233)', () => {
     // Structural survivor: keeps its name, kind and tier (a blocked duplicate cannot lock it out).
     expect(await contactRow(cp)).toMatchObject({ display_name: 'Principal Self', kind: 'principal', tier: 'principal' });
     expect(await identitiesOf(cp)).toHaveLength(1);
+    // The audit event records what principal-level trust the merge handed over (QA G).
+    const event = publish.mock.calls.at(-1)![1] as Extract<BusEvent, { type: 'kg.nodes_merged' }>;
+    expect(event.payload.principalIdentitiesTransferred).toEqual([`sms: ${sms}`]);
+    expect(event.payload.principalPrimaryFieldsFilled).toEqual({ primary_email: dupEmail });
     // The label changed, so the survivor was re-embedded before the transaction.
     const survivor = await nodeRow(p);
     expect(survivor!.label).toBe(`Principal Duplicate ${runId}`);

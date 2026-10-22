@@ -56,6 +56,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **ADR-050** — external verifications are first-class state; spec 03, 15 and 19 updated. (#2017)
 - **AWS Bedrock provider** — tiers can run Claude on Bedrock; opt-in, off by default. (#1766)
 - **KG node merge** — merge duplicate or mistyped knowledge-graph nodes from the console, with previewed conflicts. (#2233)
+- **`kg.nodes_merged` bus event** — new audit event for each knowledge-graph node merge; public bus surface. (#2233)
 
 ### Changed
 

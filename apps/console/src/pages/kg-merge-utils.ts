@@ -22,8 +22,6 @@ import type {
   Side,
 } from './kg-merge-types.js';
 
-/** Mirrors MAX_ALIASES_PER_ENTITY in src/memory/entity-memory.ts. */
-export const MAX_ALIASES = 10;
 /** Debounce for the pick-step search box (design §10.2). */
 export const SEARCH_DEBOUNCE_MS = 250;
 export const CANDIDATE_LIMIT = 8;
@@ -485,33 +483,14 @@ export function labelCollisionReason(preview: NodeMergePreview): string | null {
   return `Another ${type} is already called ${quoted(preview.result.labels.absorbed)}.`;
 }
 
-function normAlias(a: string): string {
-  return a.trim().toLowerCase();
-}
-
 /**
- * The aliases the result will carry for a given label choice (§4.1): survivor
- * aliases, the unchosen label, absorbed aliases — lower-cased, de-duplicated,
- * minus the final label, capped at MAX_ALIASES. For the default label the
- * server's own computation is returned verbatim.
+ * The aliases the result will carry for a given label choice (§4.1), as the
+ * server computed them (lower-cased, de-duplicated, capped) — looked up, never
+ * recomputed here. `dropped` are the ones the cap left out.
  */
 export function resultAliases(preview: NodeMergePreview, label: Side): { aliases: string[]; dropped: string[] } {
-  if (label === preview.result.defaultLabel) {
-    return { aliases: preview.result.aliases, dropped: preview.result.droppedAliases };
-  }
-  const { labels } = preview.result;
-  const finalLabel = normAlias(label === 'survivor' ? labels.survivor : labels.absorbed);
-  const unchosen = label === 'survivor' ? labels.absorbed : labels.survivor;
-  const pool = [...preview.survivor.aliases, unchosen, ...preview.absorbed.aliases];
-  const seen = new Set<string>();
-  const all: string[] = [];
-  for (const raw of pool) {
-    const a = normAlias(raw);
-    if (!a || a === finalLabel || seen.has(a)) continue;
-    seen.add(a);
-    all.push(a);
-  }
-  return { aliases: all.slice(0, MAX_ALIASES), dropped: all.slice(MAX_ALIASES) };
+  const option = preview.result.aliasOptions[label];
+  return { aliases: option.aliases, dropped: option.droppedAliases };
 }
 
 // ── Contacts ─────────────────────────────────────────────────────────────────
@@ -628,11 +607,22 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+function isAliasOption(v: unknown): boolean {
+  return isRecord(v) && Array.isArray(v['aliases']) && Array.isArray(v['droppedAliases']);
+}
+
+/** result.aliasOptions must carry both label choices, or the Name section has nothing to look up. */
+function hasAliasOptions(result: unknown): boolean {
+  if (!isRecord(result)) return false;
+  const options = result['aliasOptions'];
+  return isRecord(options) && isAliasOption(options['survivor']) && isAliasOption(options['absorbed']);
+}
+
 /** Minimal structural check of a dry-run response before the dialog renders it. */
 export function isNodeMergePreview(body: unknown): body is NodeMergePreview {
   if (!isRecord(body) || body['dryRun'] !== true || typeof body['planToken'] !== 'string') return false;
   const conflicts = body['conflicts'];
-  return isRecord(body['survivor']) && isRecord(body['absorbed']) && isRecord(body['result'])
+  return isRecord(body['survivor']) && isRecord(body['absorbed']) && hasAliasOptions(body['result'])
     && isRecord(body['contactPlan']) && isRecord(body['summary'])
     && Array.isArray(body['blockers']) && Array.isArray(body['warnings'])
     && isRecord(conflicts)

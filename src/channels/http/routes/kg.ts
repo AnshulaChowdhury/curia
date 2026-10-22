@@ -80,10 +80,11 @@ interface KgNodeRow {
   sensitivity: string;
 }
 
-/** GET /api/kg/nodes also returns the alias list and identity tier (#2233). */
+/** GET /api/kg/nodes also returns the alias list, identity tier and archived flag (#2233). */
 interface KgNodeListRow extends KgNodeRow {
   aliases: string[] | null;
   identity_source: string;
+  archived_at: string | null;
 }
 
 /** GET /api/kg/graph nodes carry the alias list and whether the node is archived (#2233). */
@@ -197,14 +198,15 @@ export async function knowledgeGraphRoutes(
     // exclude_facts=true drops fact nodes — the merge picker searches entities only (#2233).
     const excludeFacts = query.exclude_facts === 'true' || query.exclude_facts === '1';
 
-    // Archived nodes (decayed, or tombstones of a merge) are excluded (#2233): the list
-    // is what the console offers to browse and to merge with. The text search also
-    // matches aliases, so a node is found by a name it was merged from.
+    // Merge tombstones are excluded (#2233), the same rule /api/kg/graph applies: a
+    // merged-away node lives on only as a redirect to its survivor. Decayed archived nodes
+    // are still listed, flagged `archived`, so the list and the graph agree. The text
+    // search also matches aliases, so a node is found by a name it was merged from.
     const result = await pool.query<KgNodeListRow>(
       `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity,
-              aliases, identity_source
+              aliases, identity_source, archived_at
        FROM kg_nodes
-       WHERE archived_at IS NULL
+       WHERE ${notMergeTombstone('kg_nodes')}
          AND ($1::text IS NULL OR type = $1)
          AND (NOT $4::boolean OR type <> 'fact')
          AND (
@@ -232,6 +234,7 @@ export async function knowledgeGraphRoutes(
         sensitivity: row.sensitivity,
         aliases: row.aliases ?? [],
         identitySource: row.identity_source === 'contact' ? 'contact' : 'label',
+        archived: row.archived_at !== null && row.archived_at !== undefined,
       })),
     });
   });

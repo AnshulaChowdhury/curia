@@ -22,7 +22,7 @@ If `WEB_APP_BOOTSTRAP_SECRET` is missing, the KG API routes are not registered a
 
 - `GET /api/kg/nodes`
   - Query params: `query`, `type`, `limit`, `exclude_facts`
-  - Purpose: label, alias and property text search and browsing. Archived nodes (including merge tombstones) are excluded; `exclude_facts=true` also drops `fact` nodes. Each node carries `aliases` and `identitySource`.
+  - Purpose: label, alias and property text search and browsing. Merge tombstones are excluded; decayed archived nodes still appear, as they do in `/graph`; `exclude_facts=true` also drops `fact` nodes. Each node carries `aliases` and `identitySource`.
 
 - `GET /api/kg/graph`
   - Query params: `node_id`, `depth`, `limit`
@@ -36,7 +36,7 @@ If `WEB_APP_BOOTSTRAP_SECRET` is missing, the KG API routes are not registered a
 
 - `POST /api/kg/nodes/merge`
   - Body: `survivorId`, `absorbedId`, `dryRun` (default `true`), `planToken`, `resolutions`
-  - Purpose: preview or apply a node merge. The only mutating route in this API. See *Merging nodes*.
+  - Purpose: preview or apply a node merge. See *Merging nodes*.
 
 ## Graph layout
 

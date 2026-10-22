@@ -31,6 +31,7 @@ function basePlan(overrides: Partial<ExecutionPlan> = {}): ExecutionPlan {
     contacts: {
       action: 'none', survivingContactId: null, repoints: [], merges: [], mergedRow: null,
       mergedContactIds: [], repointedContactIds: [], survivingIsPrincipal: false,
+      principalIdentitiesTransferred: [], principalPrimaryFieldsFilled: {},
     },
     summary: { factsMoved: 0, factsCollapsed: 0, edgesMoved: 0, edgesCollapsed: 0, edgesDropped: 0, conflictsResolved: 0 },
     resolutions: { label: 'survivor', properties: {}, facts: {}, nearDuplicateFacts: {}, contactFields: {}, authOverrides: {}, acknowledgements: [] },

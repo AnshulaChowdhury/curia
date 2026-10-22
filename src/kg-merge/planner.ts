@@ -11,11 +11,12 @@ import { MAX_ALIASES_PER_ENTITY } from '../memory/entity-memory.js';
 import { maxSensitivity } from '../memory/sensitivity.js';
 import type { DecayClass } from '../memory/types.js';
 import { DEDUP_SIMILARITY_THRESHOLD } from '../memory/validation.js';
-import { isStructuralContact } from '../contacts/contact-service.js';
-import { TIER_RANK, type ContactTier } from '../contacts/types.js';
+import { isStructuralContact, survivingTier } from '../contacts/contact-service.js';
+import type { ContactTier } from '../contacts/types.js';
 import {
   CONTACT_MERGE_FIELD_LABELS,
   CONTACT_MERGE_FIELDS,
+  PRINCIPAL_PRIMARY_FIELDS,
   type AuthOverrideConflictPlan,
   type ContactFieldConflictPlan,
   type ContactMergeField,
@@ -381,39 +382,75 @@ function existingHistory(fact: SnapshotNode): Record<string, unknown>[] {
     : [];
 }
 
+/**
+ * The fact operations for a set of choices. Operations chain: a survivor fact can absorb a
+ * duplicate (gaining its history and sensitivity) and then lose a conflict or a
+ * near-duplicate pairing itself. So a deleted fact forwards everything it had accumulated —
+ * history, sensitivity, and for a duplicate its confidence and confirmation — to the fact it
+ * was folded into, and any later operation naming a deleted fact acts on its successor
+ * (union-find style forwarding). No history entry and no sensitivity level is ever lost.
+ */
 export function buildFactOperations(plan: FactPlan, choices: FactChoices, replacedAt: string): BuiltFactOperations {
   const deleteFactIds = new Set<string>();
   /** fact id → its absorbed-side link edges to re-point */
   const relinks = new Map<string, string[]>();
   const movedFactIds = new Set<string>();
   const updates: BuiltFactOperations['updates'] = new Map();
+  /** deleted fact id → the fact it was folded into */
+  const successor = new Map<string, SnapshotNode>();
   let collapsedFactCount = plan.sharedFactIds.length;
 
+  /** The live fact standing for `fact`: itself, or the fact its deletion forwarded to. */
+  const live = (fact: SnapshotNode): SnapshotNode => {
+    let current = fact;
+    for (let next = successor.get(current.id); next; next = successor.get(current.id)) current = next;
+    return current;
+  };
+  /** A fact's accumulated state: its pending update, or its stored values. Not recorded. */
+  const stateOf = (fact: SnapshotNode) => updates.get(fact.id) ?? {
+    fact,
+    confidence: fact.confidence,
+    lastConfirmedAt: fact.lastConfirmedAt,
+    sensitivity: fact.sensitivity,
+    previousValues: [] as Record<string, unknown>[],
+  };
   const update = (fact: SnapshotNode) => {
-    let u = updates.get(fact.id);
-    if (!u) {
-      u = {
-        fact,
-        confidence: fact.confidence,
-        lastConfirmedAt: fact.lastConfirmedAt,
-        sensitivity: fact.sensitivity,
-        previousValues: [],
-      };
-      updates.set(fact.id, u);
-    }
+    const u = stateOf(fact);
+    updates.set(fact.id, u);
     return u;
   };
-  // keep absorbs drop: max confidence, newest confirmation, highest sensitivity.
-  const absorbInto = (keep: SnapshotNode, drop: SnapshotNode) => {
-    const u = update(keep);
-    u.confidence = Math.max(u.confidence, drop.confidence);
-    u.lastConfirmedAt = maxIso(u.lastConfirmedAt, drop.lastConfirmedAt);
-    u.sensitivity = maxSensitivity(u.sensitivity, drop.sensitivity);
-    // The dropped node is deleted; its own value history moves to the kept fact.
-    u.previousValues.push(...existingHistory(drop));
+
+  /**
+   * Fold `drop` into `keep` (each resolved to its live fact) and delete `drop`.
+   * - 'duplicate': the same assertion — confidence and confirmation take the max.
+   * - 'replaced': a different value — it is appended to the kept fact's previous_values.
+   * Either way the kept fact takes the max sensitivity (it now holds the dropped history or
+   * value) and inherits the dropped fact's stored and pending history. Returns false when
+   * both already resolve to the same fact.
+   */
+  const fold = (keepFact: SnapshotNode, dropFact: SnapshotNode, mode: 'duplicate' | 'replaced'): boolean => {
+    const keep = live(keepFact);
+    const drop = live(dropFact);
+    if (keep.id === drop.id) return false;
+    const from = stateOf(drop);
+    const into = update(keep);
+    into.sensitivity = maxSensitivity(into.sensitivity, from.sensitivity);
+    if (mode === 'duplicate') {
+      into.confidence = Math.max(into.confidence, from.confidence);
+      into.lastConfirmedAt = maxIso(into.lastConfirmedAt, from.lastConfirmedAt);
+    }
+    // The dropped node's own history first, then what it gathered in this merge, then (for
+    // a replaced value) the value it held.
+    into.previousValues.push(...existingHistory(drop), ...from.previousValues);
+    if (mode === 'replaced') into.previousValues.push(previousValueEntry(drop, replacedAt));
+    updates.delete(drop.id);
     deleteFactIds.add(drop.id);
+    successor.set(drop.id, keep);
+    return true;
   };
   const relink = (fact: SnapshotNode, linkEdgeIds: string[]) => {
+    // A fact already folded away has no links left to move (they cascade with the node).
+    if (deleteFactIds.has(fact.id)) return;
     relinks.set(fact.id, linkEdgeIds);
     movedFactIds.add(fact.id);
   };
@@ -421,30 +458,18 @@ export function buildFactOperations(plan: FactPlan, choices: FactChoices, replac
   for (const move of plan.moves) relink(move.fact, move.linkEdgeIds);
 
   for (const c of plan.collapses) {
-    absorbInto(c.survivorFact, c.absorbedFact);
-    collapsedFactCount++;
+    if (fold(c.survivorFact, c.absorbedFact, 'duplicate')) collapsedFactCount++;
   }
-
-  // The dropped value lives on in the kept fact's previous_values, so the kept fact must be
-  // at least as sensitive as the dropped one — otherwise the merge would downgrade it.
-  const keepWithPreviousValue = (keep: SnapshotNode, drop: SnapshotNode) => {
-    const u = update(keep);
-    u.sensitivity = maxSensitivity(u.sensitivity, drop.sensitivity);
-    // The dropped node's own history first, then the value it held — so a winning absorbed
-    // fact does not discard the survivor fact's earlier values with the node.
-    u.previousValues.push(...existingHistory(drop), previousValueEntry(drop, replacedAt));
-    deleteFactIds.add(drop.id);
-  };
 
   for (const conflict of plan.conflicts) {
     const choice = choices.facts[conflict.id] ?? conflict.default;
     if (choice === 'both') {
       relink(conflict.absorbedFact, conflict.absorbedLinkEdgeIds);
     } else if (choice === 'survivor') {
-      keepWithPreviousValue(conflict.survivorFact, conflict.absorbedFact);
+      fold(conflict.survivorFact, conflict.absorbedFact, 'replaced');
     } else {
       relink(conflict.absorbedFact, conflict.absorbedLinkEdgeIds);
-      keepWithPreviousValue(conflict.absorbedFact, conflict.survivorFact);
+      fold(conflict.absorbedFact, conflict.survivorFact, 'replaced');
     }
   }
 
@@ -454,20 +479,22 @@ export function buildFactOperations(plan: FactPlan, choices: FactChoices, replac
       relink(pair.absorbedFact, pair.absorbedLinkEdgeIds);
       continue;
     }
-    // merge keeps the higher-confidence fact (the survivor's on a tie).
-    if (pair.absorbedFact.confidence > pair.survivorFact.confidence) {
-      absorbInto(pair.absorbedFact, pair.survivorFact);
+    // merge keeps the higher-confidence fact (the survivor's on a tie), comparing what each
+    // side has accumulated so far.
+    const s = live(pair.survivorFact);
+    const a = live(pair.absorbedFact);
+    if (s.id === a.id) continue;
+    if (stateOf(a).confidence > stateOf(s).confidence) {
       relink(pair.absorbedFact, pair.absorbedLinkEdgeIds);
-    } else {
-      absorbInto(pair.survivorFact, pair.absorbedFact);
+      if (fold(a, s, 'duplicate')) collapsedFactCount++;
+    } else if (fold(s, a, 'duplicate')) {
+      collapsedFactCount++;
     }
-    collapsedFactCount++;
   }
 
-  // A fact deleted later (e.g. a conflict lost to the absorbed side) needs no update, and
-  // its link edges go with it.
+  // A fact deleted after it was moved (e.g. an absorbed fact that later lost a pairing)
+  // is not moved after all: its link edges go with it.
   for (const id of deleteFactIds) {
-    updates.delete(id);
     movedFactIds.delete(id);
     relinks.delete(id);
   }
@@ -571,6 +598,7 @@ export function planContacts(
     fieldConflicts: [],
     authOverrideConflicts: [],
     foldOverridePreferences: [],
+    principalIdentitiesTransferred: [],
   };
 
   if (type === 'person') {
@@ -634,26 +662,51 @@ function quoteValue(value: string): string {
   return `'${flat.length > 60 ? `${flat.slice(0, 57)}...` : flat}'`;
 }
 
+/**
+ * Field and auth-override survivorship of a contact fold (§5.1).
+ *
+ * Only a contact that was already linked to the survivor node is *anchored*: its values are
+ * the "survivor" side of a choosable conflict. When the survivor node had no contact, the
+ * surviving contact was promoted from the absorbed side (plan.survivingFrom === 'absorbed')
+ * — it is just the row the fold lands on, so it and every other folded contact are peers.
+ * Peers never raise a conflict: a field keeps the earliest-created holder's value and a
+ * permission keeps the deny, and each such disagreement is listed in contacts_disagree.
+ */
 function planContactFields(plan: ContactPlan, surviving: SnapshotContact, warnings: MergeWarning[]): void {
-  // Lines for the contacts_disagree warning: values the surviving contact does not hold,
-  // on which two or more folded contacts disagree, so one is kept by rule and not by choice.
+  // Lines for the contacts_disagree warning: values decided by rule rather than by choice,
+  // and values no choice can keep.
   const disagreements: string[] = [];
-  const mergedByCreation = [...plan.merged].sort(byCreation);
+  const anchored = plan.survivingFrom === 'survivor';
+  const peers = (anchored ? [...plan.merged] : [surviving, ...plan.merged]).sort(byCreation);
 
   for (const field of CONTACT_MERGE_FIELDS) {
-    const survivorValue = surviving.fields[field];
+    const survivorValue = anchored ? surviving.fields[field] : null;
     if (survivorValue !== null) {
       plan.fieldBase[field] = survivorValue;
-      const differing = plan.merged
-        .map(m => m.fields[field])
-        .find((v): v is string => v !== null && !sameFieldValue(field, v, survivorValue));
-      if (differing !== undefined) {
-        plan.fieldConflicts.push({ field, survivorValue, absorbedValue: differing });
+      // Every distinct value the folded contacts hold that differs from the survivor's, in
+      // fold order. The conflict is binary (survivor vs the first); the rest would vanish
+      // without a trace, so each is named in the warning.
+      const differing: { value: string; contact: SnapshotContact }[] = [];
+      for (const m of plan.merged) {
+        const value = m.fields[field];
+        if (value === null || sameFieldValue(field, value, survivorValue)) continue;
+        if (differing.some(d => sameFieldValue(field, d.value, value))) continue;
+        differing.push({ value, contact: m });
+      }
+      const [offered, ...dropped] = differing;
+      if (offered) {
+        plan.fieldConflicts.push({ field, survivorValue, absorbedValue: offered.value });
+        for (const d of dropped) {
+          disagreements.push(
+            `${CONTACT_MERGE_FIELD_LABELS[field]}: ${quoteValue(d.value)} (${d.contact.displayName}) will be dropped; `
+            + `the choice is between ${quoteValue(survivorValue)} and ${quoteValue(offered.value)}`,
+          );
+        }
       }
       continue;
     }
-    // No survivor value: the earliest-created folded contact holding one wins.
-    const holders = mergedByCreation.filter(m => m.fields[field] !== null);
+    // No anchored value: the earliest-created peer holding one wins.
+    const holders = peers.filter(m => m.fields[field] !== null);
     const kept = holders[0];
     plan.fieldBase[field] = kept ? kept.fields[field] : null;
     if (!kept) continue;
@@ -667,15 +720,21 @@ function planContactFields(plan: ContactPlan, surviving: SnapshotContact, warnin
     }
   }
 
-  const survivorOverrides = new Map(surviving.authOverrides.map(o => [o.permission, o.granted]));
+  const survivorOverrides = new Map(anchored ? surviving.authOverrides.map(o => [o.permission, o.granted]) : []);
   const seen = new Set<string>();
-  // permission → folded contacts holding an active override for it, in fold order.
+  // permission → peers holding an active override for it, in fold order: the surviving
+  // contact first (its row is in place before any fold), then each folded contact.
   const unanchored = new Map<string, { contact: SnapshotContact; granted: boolean }[]>();
+  const addUnanchored = (contact: SnapshotContact, granted: boolean, permission: string) =>
+    unanchored.set(permission, [...(unanchored.get(permission) ?? []), { contact, granted }]);
+  if (!anchored) {
+    for (const o of surviving.authOverrides) addUnanchored(surviving, o.granted, o.permission);
+  }
   for (const m of plan.merged) {
     for (const o of m.authOverrides) {
       const survivorGranted = survivorOverrides.get(o.permission);
       if (survivorGranted === undefined) {
-        unanchored.set(o.permission, [...(unanchored.get(o.permission) ?? []), { contact: m, granted: o.granted }]);
+        addUnanchored(m, o.granted, o.permission);
         continue;
       }
       if (survivorGranted === o.granted || seen.has(o.permission)) continue;
@@ -685,15 +744,18 @@ function planContactFields(plan: ContactPlan, surviving: SnapshotContact, warnin
         survivorGranted,
         absorbedGranted: o.granted,
         absorbedContactId: m.id,
+        // The side that denies is the default (security-safe); the user can still pick the grant.
+        default: survivorGranted ? 'absorbed' : 'survivor',
       });
     }
   }
   plan.authOverrideConflicts.sort((a, b) => a.permission.localeCompare(b.permission));
 
-  // Folded contacts that disagree on a permission the survivor holds no override for: the
-  // deny wins (the security-safe reading). A fold carries the first holder's override and
-  // drops later same-permission rows, so when the first holder grants, the first denying
-  // contact must be preferred at its fold.
+  // Peers that disagree on a permission: the deny wins (the security-safe reading). A fold
+  // keeps the surviving row's override and drops a later same-permission row, so when the
+  // first holder grants — the surviving contact's own grant, or the grant the first fold
+  // carried in — the first denying contact must be preferred at its fold, which revokes
+  // that grant before the deny is reattached.
   for (const permission of [...unanchored.keys()].sort()) {
     const holders = unanchored.get(permission)!;
     const firstDeny = holders.find(h => !h.granted);
@@ -707,20 +769,40 @@ function planContactFields(plan: ContactPlan, surviving: SnapshotContact, warnin
   if (disagreements.length > 0) {
     warnings.push({
       code: 'contacts_disagree',
-      message: 'The contacts being merged disagree on values the surviving contact does not hold. '
-        + 'For each field the earliest contact’s value is kept; for each permission, denied wins over granted.',
+      message: 'The contacts being merged disagree on values that are not offered as a choice. '
+        + 'Where no contact already on the kept node holds a value, the earliest contact’s field value is kept '
+        + 'and, for each permission, denied wins over granted. Values listed as dropped are lost.',
       requiresAck: false,
       details: disagreements,
     });
   }
 }
 
-/** Tier survivorship of a fold — computeGoldenRecord's rule applied across every contact. */
+/** Tier survivorship of a fold: the contacts module's one rule (survivingTier), across every contact. */
 export function foldTier(surviving: SnapshotContact, merged: SnapshotContact[]): ContactTier {
-  if (isStructuralContact(surviving)) return surviving.tier;
-  const all = [surviving, ...merged];
-  if (all.some(c => c.tier === 'blocked')) return 'blocked';
-  return all.reduce<ContactTier>((best, c) => (TIER_RANK[c.tier] > TIER_RANK[best] ? c.tier : best), surviving.tier);
+  return survivingTier(surviving, merged);
+}
+
+/**
+ * Warning lines for the principal's primary email / phone a fold would fill, or would
+ * replace if the user picks the absorbed side of a field conflict. These fields identify
+ * the principal too, so they belong next to the identities in the trust warning.
+ */
+function principalPrimaryFieldLines(plan: ContactPlan): string[] {
+  const surviving = plan.surviving;
+  if (!surviving) return [];
+  const lines: string[] = [];
+  for (const field of PRINCIPAL_PRIMARY_FIELDS) {
+    const label = CONTACT_MERGE_FIELD_LABELS[field];
+    const conflict = plan.fieldConflicts.find(c => c.field === field);
+    if (conflict) {
+      lines.push(`${label} will become ${conflict.absorbedValue} if the absorbed value is chosen`);
+      continue;
+    }
+    const value = plan.fieldBase[field];
+    if (surviving.fields[field] === null && value !== null) lines.push(`${label} will become ${value}`);
+  }
+  return lines;
 }
 
 function contactPlanView(plan: ContactPlan, survivor: MergeSide): ContactPlanView {
@@ -842,13 +924,14 @@ export function planNodeMerge(snapshot: MergeSnapshot): MergePlan {
         transferred.push(`${i.channel}: ${i.identifier}`);
       }
     }
+    contacts.principalIdentitiesTransferred = transferred;
     warnings.push({
       code: 'principal_identity_transfer',
       message: transferred.length > 0
         ? `These identities will become principal identities, which carry principal-level trust.`
         : `The contact of ‘${a.label}’ will be folded into the principal’s contact.`,
       requiresAck: true,
-      details: transferred,
+      details: [...transferred, ...principalPrimaryFieldLines(contacts)],
     });
   }
 
@@ -902,6 +985,7 @@ export function planNodeMerge(snapshot: MergeSnapshot): MergePlan {
   }
 
   const aliases = computeAliases(s, a, 'survivor');
+  const absorbedLabelAliases = computeAliases(s, a, 'absorbed');
 
   const preview: MergePlan['preview'] = {
     dryRun: true,
@@ -916,6 +1000,10 @@ export function planNodeMerge(snapshot: MergeSnapshot): MergePlan {
       defaultLabel: 'survivor',
       aliases: aliases.aliases,
       droppedAliases: aliases.droppedAliases,
+      aliasOptions: {
+        survivor: { aliases: aliases.aliases, droppedAliases: aliases.droppedAliases },
+        absorbed: { aliases: absorbedLabelAliases.aliases, droppedAliases: absorbedLabelAliases.droppedAliases },
+      },
       sensitivity: node.sensitivity,
       confidence: node.confidence,
       decayClass: node.decayClass,
@@ -950,7 +1038,7 @@ export function planNodeMerge(snapshot: MergeSnapshot): MergePlan {
         permission: c.permission,
         survivorGranted: c.survivorGranted,
         absorbedGranted: c.absorbedGranted,
-        default: 'survivor' as const,
+        default: c.default,
       })),
     },
     contactPlan: contactPlanView(contacts, survivor),

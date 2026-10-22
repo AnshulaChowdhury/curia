@@ -168,8 +168,8 @@ the data loss without waiting for the node merge.
 
 ### Audit
 
-A successful apply publishes `kg.nodes_merged` from the HTTP route (the `system.restart`
-pattern), carrying both nodes' ids, types and labels, the result label, `crossType`, the
+After a successful apply, `NodeMergeService` publishes `kg.nodes_merged` on the system
+layer (the route only maps errors to statuses). The event carries both nodes' ids, types and labels, the result label, `crossType`, the
 contact merge ids, the summary counts, the chosen resolutions and the console originator as
 `actor`. The audit row targets the survivor (`target_type = 'kg_node'`).
 

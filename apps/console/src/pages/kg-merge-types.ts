@@ -150,6 +150,8 @@ export interface NodeMergePreview {
     /** Aliases for the default label. */
     aliases: string[];
     droppedAliases: string[];
+    /** Server-computed aliases (and those dropped by the cap) for each label choice. */
+    aliasOptions: Record<Side, { aliases: string[]; droppedAliases: string[] }>;
     sensitivity: string;
     confidence: number;
     decayClass: string;

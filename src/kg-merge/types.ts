@@ -289,8 +289,14 @@ export interface NodeMergePreview {
     type: string;
     labels: { survivor: string; absorbed: string };
     defaultLabel: Side;
+    /** The alias list for the default label (`defaultLabel`). */
     aliases: string[];
     droppedAliases: string[];
+    /** The server-computed alias list for each label choice, so the console never recomputes it. */
+    aliasOptions: {
+      survivor: { aliases: string[]; droppedAliases: string[] };
+      absorbed: { aliases: string[]; droppedAliases: string[] };
+    };
     sensitivity: string;
     confidence: number;
     decayClass: string;
@@ -394,6 +400,8 @@ export interface AuthOverrideConflictPlan {
   absorbedGranted: boolean;
   /** The merged-away contact holding the conflicting override. */
   absorbedContactId: string;
+  /** The side that denies — the security-safe default. */
+  default: Side;
 }
 
 export interface ContactPlan {
@@ -417,7 +425,16 @@ export interface ContactPlan {
    * fold, over the grant an earlier fold carried in.
    */
   foldOverridePreferences: { permission: string; contactId: string }[];
+  /**
+   * When the surviving contact is the principal: every folded identity that becomes a
+   * principal identity, as "channel: identifier". Empty otherwise.
+   */
+  principalIdentitiesTransferred: string[];
 }
+
+/** The principal's primary contact fields a fold can fill or replace (trust-relevant). */
+export const PRINCIPAL_PRIMARY_FIELDS = ['primary_email', 'primary_phone'] as const;
+export type PrincipalPrimaryField = (typeof PRINCIPAL_PRIMARY_FIELDS)[number];
 
 export interface NodePlan {
   /** Survivor properties ∪ non-reserved absorbed properties; conflicting keys hold the survivor value. */
@@ -496,6 +513,10 @@ export interface ContactOperations {
   repointedContactIds: string[];
   /** True when the surviving contact is the principal (identities refresh after commit). */
   survivingIsPrincipal: boolean;
+  /** Identities that become principal identities ("channel: identifier"); empty unless survivingIsPrincipal. */
+  principalIdentitiesTransferred: string[];
+  /** Principal primary fields the fold writes a new value into, with that value; empty unless survivingIsPrincipal. */
+  principalPrimaryFieldsFilled: Partial<Record<PrincipalPrimaryField, string>>;
 }
 
 export interface NodeUpdateOp {

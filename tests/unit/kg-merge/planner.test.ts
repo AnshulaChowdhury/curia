@@ -287,7 +287,8 @@ describe('planNodeMerge — contact plan matrix', () => {
     ]);
     expect(plan.contacts.fieldBase).toMatchObject({ title: 'CEO', location: 'Paris', timezone: 'America/Toronto', primary_email: 'jane@x.com' });
     expect(plan.preview.conflicts.authOverrides).toEqual([
-      { permission: 'send_email', survivorGranted: true, absorbedGranted: false, default: 'survivor' },
+      // The deny is the security-safe default (QA A).
+      { permission: 'send_email', survivorGranted: true, absorbedGranted: false, default: 'absorbed' },
     ]);
     expect(plan.preview.contactPlan.identities).toEqual([
       { channel: 'email', identifier: 'jane@x.com', from: 'survivor', duplicate: false, verified: true },
@@ -521,5 +522,150 @@ describe('planToken and determinism', () => {
       { id: uid(11), displayName: 'J', kind: 'person', systemRole: null, tier: 'known', identityCount: 1 },
     ]);
     expect(makeNode({ id: uid(1) }).type).toBe('person');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA fixes on PR #2238 (A, C, F, G)
+// ---------------------------------------------------------------------------
+
+describe('planNodeMerge — contactless person survivor: folded contacts are peers (QA A)', () => {
+  // The survivor node has no contact, so the earliest absorbed contact is promoted. It is
+  // not "the survivor's" contact — every folded contact is a peer.
+  function peerPlan(
+    promoted: { title: string | null; granted?: boolean },
+    other: { title: string | null; granted?: boolean },
+  ) {
+    const { survivor, absorbed } = basicPair();
+    const first = makeContact({
+      id: uid(11), kgNodeId: A_ID, displayName: 'Jane D.', createdAt: T1,
+      fields: { title: promoted.title },
+      authOverrides: promoted.granted === undefined ? [] : [{ permission: 'calendar.write', granted: promoted.granted }],
+    });
+    const second = makeContact({
+      id: uid(12), kgNodeId: A_ID, displayName: 'J. Doe', createdAt: T2,
+      fields: { title: other.title },
+      authOverrides: other.granted === undefined ? [] : [{ permission: 'calendar.write', granted: other.granted }],
+    });
+    return planNodeMerge(makeSnapshot(makeSide(survivor), makeSide(absorbed, { contacts: [second, first] })));
+  }
+
+  it('lets a deny beat the promoted contact’s own grant, with no conflict and a contacts_disagree line', () => {
+    const plan = peerPlan({ title: 'CEO', granted: true }, { title: 'CTO', granted: false });
+    expect(plan.contacts.survivingFrom).toBe('absorbed');
+    expect(plan.contacts.surviving!.id).toBe(uid(11));
+    expect(plan.preview.conflicts.authOverrides).toEqual([]);
+    expect(plan.preview.conflicts.contactFields).toEqual([]);
+    // The promoted contact's grant must be revoked when the denying contact folds in.
+    expect(plan.contacts.foldOverridePreferences).toEqual([{ permission: 'calendar.write', contactId: uid(12) }]);
+    // Fields: the earliest-created holder wins, by rule.
+    expect(plan.contacts.fieldBase.title).toBe('CEO');
+    const warning = plan.preview.warnings.find(w => w.code === 'contacts_disagree');
+    expect(warning).toMatchObject({ requiresAck: false });
+    expect(warning!.details).toEqual([
+      "Title: 'CEO' (Jane D.) kept over 'CTO' (J. Doe)",
+      'calendar.write: denied kept over granted',
+    ]);
+  });
+
+  it('keeps the promoted contact’s deny over a later grant without a fold preference', () => {
+    const plan = peerPlan({ title: null, granted: false }, { title: 'CTO', granted: true });
+    expect(plan.preview.conflicts.authOverrides).toEqual([]);
+    expect(plan.contacts.foldOverridePreferences).toEqual([]);
+    expect(plan.contacts.fieldBase.title).toBe('CTO');
+    expect(plan.preview.warnings.find(w => w.code === 'contacts_disagree')!.details).toEqual([
+      'calendar.write: denied kept over granted',
+    ]);
+  });
+});
+
+describe('planNodeMerge — survivor-vs-absorbed auth override default (QA A)', () => {
+  function overridePlan(survivorGranted: boolean, absorbedGranted: boolean) {
+    const { survivor, absorbed } = basicPair();
+    const cs = makeContact({ id: uid(10), kgNodeId: S_ID, authOverrides: [{ permission: 'send_email', granted: survivorGranted }] });
+    const ca = makeContact({ id: uid(11), kgNodeId: A_ID, authOverrides: [{ permission: 'send_email', granted: absorbedGranted }] });
+    return planNodeMerge(makeSnapshot(makeSide(survivor, { contacts: [cs] }), makeSide(absorbed, { contacts: [ca] })));
+  }
+
+  it('defaults to the side that denies', () => {
+    expect(overridePlan(true, false).preview.conflicts.authOverrides).toEqual([
+      { permission: 'send_email', survivorGranted: true, absorbedGranted: false, default: 'absorbed' },
+    ]);
+    expect(overridePlan(false, true).preview.conflicts.authOverrides).toEqual([
+      { permission: 'send_email', survivorGranted: false, absorbedGranted: true, default: 'survivor' },
+    ]);
+  });
+});
+
+describe('planNodeMerge — a third distinct field value is never dropped silently (QA C)', () => {
+  it('keeps the binary conflict and lists every other dropped value in contacts_disagree', () => {
+    const { survivor, absorbed } = basicPair();
+    const cs = makeContact({ id: uid(10), kgNodeId: S_ID, displayName: 'Jane Doe', fields: { title: 'CEO' } });
+    const ca1 = makeContact({ id: uid(11), kgNodeId: A_ID, displayName: 'J. Doe', createdAt: T1, fields: { title: 'CTO' } });
+    const ca2 = makeContact({ id: uid(12), kgNodeId: A_ID, displayName: 'Pat', createdAt: T2, fields: { title: 'VP' } });
+    const ca3 = makeContact({ id: uid(13), kgNodeId: A_ID, displayName: 'Jay', createdAt: T3, fields: { title: 'cto' } });
+    const plan = planNodeMerge(makeSnapshot(
+      makeSide(survivor, { contacts: [cs] }),
+      makeSide(absorbed, { contacts: [ca3, ca2, ca1] }),
+    ));
+    expect(plan.preview.conflicts.contactFields).toEqual([
+      { field: 'title', label: 'Title', survivorValue: 'CEO', absorbedValue: 'CTO', default: 'survivor' },
+    ]);
+    expect(plan.preview.warnings.find(w => w.code === 'contacts_disagree')!.details).toEqual([
+      "Title: 'VP' (Pat) will be dropped; the choice is between 'CEO' and 'CTO'",
+      "Title: 'cto' (Jay) will be dropped; the choice is between 'CEO' and 'CTO'",
+    ]);
+  });
+});
+
+describe('planNodeMerge — alias options per label choice (QA F)', () => {
+  it('returns the server-computed alias list for each label choice', () => {
+    const { survivor, absorbed } = basicPair({ aliases: ['jane'] }, { aliases: ['Janie'] });
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor), makeSide(absorbed)));
+    expect(plan.preview.result.aliasOptions).toEqual({
+      survivor: { aliases: ['jane', 'j. doe', 'janie'], droppedAliases: [] },
+      absorbed: { aliases: ['jane', 'jane doe', 'janie'], droppedAliases: [] },
+    });
+    // The default label's list stays at the top level.
+    expect(plan.preview.result.aliases).toEqual(plan.preview.result.aliasOptions.survivor.aliases);
+    expect(plan.preview.result.droppedAliases).toEqual(plan.preview.result.aliasOptions.survivor.droppedAliases);
+  });
+});
+
+describe('planNodeMerge — principal trust audit (QA G)', () => {
+  function principalPlan(principalFields: Record<string, string | null>, dupFields: Record<string, string | null>) {
+    const { survivor, absorbed } = basicPair();
+    const principal = makeContact({
+      id: uid(10), kgNodeId: S_ID, systemRole: 'principal', kind: 'principal', tier: 'principal',
+      fields: principalFields,
+      identities: [{ id: uid(30), channel: 'email', identifier: 'me@x.com', verified: true }],
+    });
+    const dup = makeContact({
+      id: uid(11), kgNodeId: A_ID, fields: dupFields,
+      identities: [{ id: uid(32), channel: 'sms', identifier: '+15550002', verified: false }],
+    });
+    return planNodeMerge(makeSnapshot(makeSide(survivor, { contacts: [principal] }), makeSide(absorbed, { contacts: [dup] })));
+  }
+
+  it('lists primary email / phone the merge would fill on the principal in the warning details', () => {
+    const plan = principalPlan({ primary_email: null, primary_phone: null }, { primary_email: 'x@y.com', primary_phone: '+15550009' });
+    const w = plan.preview.warnings.find(x => x.code === 'principal_identity_transfer')!;
+    expect(w.details).toEqual(['sms: +15550002', 'Primary email will become x@y.com', 'Primary phone will become +15550009']);
+    expect(plan.contacts.principalIdentitiesTransferred).toEqual(['sms: +15550002']);
+  });
+
+  it('names a primary field that changes only if the absorbed value is chosen', () => {
+    const plan = principalPlan({ primary_email: 'me@x.com' }, { primary_email: 'other@y.com' });
+    const w = plan.preview.warnings.find(x => x.code === 'principal_identity_transfer')!;
+    expect(w.details).toContain('Primary email will become other@y.com if the absorbed value is chosen');
+  });
+
+  it('records nothing for a non-principal surviving contact', () => {
+    const { survivor, absorbed } = basicPair();
+    const plan = planNodeMerge(makeSnapshot(
+      makeSide(survivor, { contacts: [makeContact({ id: uid(10), kgNodeId: S_ID })] }),
+      makeSide(absorbed, { contacts: [makeContact({ id: uid(11), kgNodeId: A_ID, fields: { primary_email: 'x@y.com' } })] }),
+    ));
+    expect(plan.contacts.principalIdentitiesTransferred).toEqual([]);
   });
 });

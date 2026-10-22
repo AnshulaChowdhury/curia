@@ -8,6 +8,7 @@ import type { MergedContactRow } from '../contacts/contact-service.js';
 import { isStructuralContact } from '../contacts/contact-service.js';
 import { InvalidResolutionError, MergeBlockedError } from './errors.js';
 import { buildFactOperations, computeAliases, foldTier, mostDurable, summaryCounts } from './planner.js';
+import { PRINCIPAL_PRIMARY_FIELDS } from './types.js';
 import type {
   ContactOperations,
   EdgeOperations,
@@ -151,7 +152,7 @@ export function applyResolutions(
       plan.contacts.fieldConflicts.map(c => [c.field, resolutions.contactFields?.[c.field] ?? 'survivor']),
     ),
     authOverrides: Object.fromEntries(
-      plan.contacts.authOverrideConflicts.map(c => [c.permission, resolutions.authOverrides?.[c.permission] ?? 'survivor']),
+      plan.contacts.authOverrideConflicts.map(c => [c.permission, resolutions.authOverrides?.[c.permission] ?? c.default]),
     ),
     acknowledgements: [...acknowledged].sort(),
   };
@@ -263,6 +264,8 @@ function buildContactOperations(
     mergedContactIds: cp.merged.map(c => c.id),
     repointedContactIds: cp.repointed.map(r => r.contact.id),
     survivingIsPrincipal: surviving?.systemRole === 'principal',
+    principalIdentitiesTransferred: surviving?.systemRole === 'principal' ? [...cp.principalIdentitiesTransferred] : [],
+    principalPrimaryFieldsFilled: {},
   };
   if (cp.action !== 'merge' || !surviving) return ops;
 
@@ -270,6 +273,15 @@ function buildContactOperations(
   const fields = { ...cp.fieldBase };
   for (const conflict of cp.fieldConflicts) {
     fields[conflict.field] = filled.contactFields[conflict.field] === 'absorbed' ? conflict.absorbedValue : conflict.survivorValue;
+  }
+
+  // Trust audit: primary email / phone the fold writes onto the principal (filled where it
+  // had none, or replaced by a conflict resolved to the absorbed side).
+  if (ops.survivingIsPrincipal) {
+    for (const field of PRINCIPAL_PRIMARY_FIELDS) {
+      const value = fields[field];
+      if (value !== null && value !== surviving.fields[field]) ops.principalPrimaryFieldsFilled[field] = value;
+    }
   }
 
   const all = [surviving, ...cp.merged];

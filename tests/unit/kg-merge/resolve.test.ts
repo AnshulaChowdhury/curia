@@ -1,6 +1,6 @@
 // Pure tests for applyResolutions / parseResolutions (spec §7 step 2, §12).
 import { describe, it, expect } from 'vitest';
-import { planNodeMerge } from '../../../src/kg-merge/planner.js';
+import { buildFactOperations, planNodeMerge } from '../../../src/kg-merge/planner.js';
 import { applyResolutions, parseResolutions } from '../../../src/kg-merge/resolve.js';
 import { InvalidResolutionError, MergeBlockedError } from '../../../src/kg-merge/errors.js';
 import type { MergePlan } from '../../../src/kg-merge/types.js';
@@ -333,5 +333,165 @@ describe('parseResolutions', () => {
     expectInvalid(() => parseResolutions({ facts: { f: 'merge' } }), 'invalid_request');
     expectInvalid(() => parseResolutions({ nearDuplicateFacts: { n: 'both' } }), 'invalid_request');
     expectInvalid(() => parseResolutions({ acknowledgements: [1] }), 'invalid_request');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA fixes on PR #2238 (A, B, G)
+// ---------------------------------------------------------------------------
+
+describe('applyResolutions — contactless person survivor: deny beats the promoted contact’s grant (QA A)', () => {
+  it('revokes the promoted contact’s grant when the denying peer folds in', () => {
+    const { survivor, absorbed } = basicPair();
+    const promoted = makeContact({ id: uid(11), kgNodeId: A_ID, createdAt: T1, authOverrides: [{ permission: 'calendar.write', granted: true }] });
+    const denying = makeContact({ id: uid(12), kgNodeId: A_ID, createdAt: T2, authOverrides: [{ permission: 'calendar.write', granted: false }] });
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor), makeSide(absorbed, { contacts: [promoted, denying] })));
+    const exec = applyResolutions(plan, {}, NOW);
+    expect(exec.resolutions.authOverrides).toEqual({});
+    expect(exec.contacts).toMatchObject({
+      survivingContactId: uid(11),
+      repoints: [{ contactId: uid(11), kind: 'person' }],
+      merges: [{ secondaryId: uid(12), overridesPreferSecondary: ['calendar.write'] }],
+    });
+  });
+
+  it('fills a survivor-vs-absorbed override conflict with the denying side by default', () => {
+    const { survivor, absorbed } = basicPair();
+    const cs = makeContact({ id: uid(10), kgNodeId: S_ID, authOverrides: [{ permission: 'send_email', granted: true }] });
+    const ca = makeContact({ id: uid(11), kgNodeId: A_ID, authOverrides: [{ permission: 'send_email', granted: false }] });
+    const exec = applyResolutions(planNodeMerge(makeSnapshot(makeSide(survivor, { contacts: [cs] }), makeSide(absorbed, { contacts: [ca] }))), {}, NOW);
+    expect(exec.resolutions.authOverrides).toEqual({ send_email: 'absorbed' });
+    expect(exec.contacts.merges).toEqual([{ secondaryId: uid(11), overridesPreferSecondary: ['send_email'] }]);
+  });
+});
+
+describe('fact operations — chained operations never lose history or sensitivity (QA B)', () => {
+  const T3 = '2026-03-01T00:00:00.000Z';
+
+  it('collapse → conflict lost: the survivor fact’s absorbed duplicate’s history and sensitivity reach the winner', () => {
+    const { survivor, absorbed } = basicPair();
+    const s1 = makeFact(uid(100), 'Title: CEO', { attribute: 'title', value: 'CEO', previous_values: [{ value: 'VP' }] }, { lastConfirmedAt: T1, sensitivity: 'internal', confidence: 0.5 });
+    const a1 = makeFact(uid(101), 'Title: ceo', { attribute: 'title', value: 'ceo', previous_values: [{ value: 'Director' }] }, { lastConfirmedAt: T1, sensitivity: 'restricted', confidence: 0.9 });
+    const a2 = makeFact(uid(102), 'Title: CTO', { attribute: 'title', value: 'CTO' }, { lastConfirmedAt: T2, sensitivity: 'internal', confidence: 0.6 });
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor, { facts: [s1] }), makeSide(absorbed, { facts: [a1, a2] })));
+    expect(plan.facts.collapses).toHaveLength(1);
+    expect(plan.facts.conflicts[0]!.default).toBe('absorbed');
+
+    const exec = applyResolutions(plan, {}, NOW);
+    expect(exec.facts.deleteFactIds).toEqual([uid(100), uid(101)]);
+    expect(exec.facts.relinkEdgeIds).toEqual([`link-${uid(102)}`]);
+    expect(exec.facts.updates).toHaveLength(1);
+    const kept = exec.facts.updates[0]!;
+    expect(kept.id).toBe(uid(102));
+    expect(kept.sensitivity).toBe('restricted');
+    expect(kept.properties.previous_values).toEqual([
+      { value: 'VP' },
+      { value: 'Director' },
+      expect.objectContaining({ value: 'CEO', reason: 'node_merge', replaced_at: NOW.toISOString() }),
+    ]);
+  });
+
+  it('collapse → near-duplicate lost: the accumulated state moves to the higher-confidence fact', () => {
+    const s1 = makeFact(uid(100), 'Enjoys sailing', {}, { sensitivity: 'internal', confidence: 0.5, lastConfirmedAt: T1 }).node;
+    const a1 = makeFact(uid(101), 'enjoys sailing', { previous_values: [{ value: 'Enjoys rowing' }] }, { sensitivity: 'restricted', confidence: 0.6, lastConfirmedAt: T3 }).node;
+    const a2 = makeFact(uid(102), 'Goes sailing', {}, { sensitivity: 'internal', confidence: 0.95, lastConfirmedAt: T1 }).node;
+    const built = buildFactOperations({
+      moves: [],
+      collapses: [{ survivorFact: s1, absorbedFact: a1 }],
+      conflicts: [],
+      nearDuplicates: [{ id: `near:${uid(100)}:${uid(102)}`, survivorFact: s1, absorbedFact: a2, absorbedLinkEdgeIds: [`link-${uid(102)}`], similarity: 0.95 }],
+      sharedFactIds: [],
+      sharedLinkEdgeIds: [],
+    }, { facts: {}, nearDuplicateFacts: {} }, NOW.toISOString());
+    expect(built.deleteFactIds).toEqual([uid(100), uid(101)]);
+    expect([...built.updates.keys()]).toEqual([uid(102)]);
+    expect(built.updates.get(uid(102))).toMatchObject({
+      sensitivity: 'restricted',
+      confidence: 0.95,
+      lastConfirmedAt: T3,
+      previousValues: [{ value: 'Enjoys rowing' }],
+    });
+    expect(built.relinkEdgeIds).toEqual([`link-${uid(102)}`]);
+  });
+
+  it('conflict → near-duplicate: the dropped value recorded on the conflict winner survives the winner’s own loss', () => {
+    // Not reachable from planFacts today (attribute and plain facts never mix), but the
+    // operation builder must stay lossless for any plan it is given.
+    const s1 = makeFact(uid(100), 'Title: CEO', { attribute: 'title', value: 'CEO' }, { sensitivity: 'internal', confidence: 0.5 }).node;
+    const a1 = makeFact(uid(101), 'Title: CTO', { attribute: 'title', value: 'CTO' }, { sensitivity: 'restricted', confidence: 0.4, source: 'agent:x' }).node;
+    const a2 = makeFact(uid(102), 'Title is CEO', {}, { sensitivity: 'internal', confidence: 0.9 }).node;
+    const built = buildFactOperations({
+      moves: [],
+      collapses: [],
+      conflicts: [{ id: `fact:${uid(100)}:${uid(101)}`, attribute: 'title', survivorFact: s1, absorbedFact: a1, absorbedLinkEdgeIds: [`link-${uid(101)}`], default: 'survivor' }],
+      nearDuplicates: [{ id: `near:${uid(100)}:${uid(102)}`, survivorFact: s1, absorbedFact: a2, absorbedLinkEdgeIds: [`link-${uid(102)}`], similarity: 0.95 }],
+      sharedFactIds: [],
+      sharedLinkEdgeIds: [],
+    }, { facts: {}, nearDuplicateFacts: {} }, NOW.toISOString());
+    expect(built.deleteFactIds).toEqual([uid(100), uid(101)]);
+    expect([...built.updates.keys()]).toEqual([uid(102)]);
+    const kept = built.updates.get(uid(102))!;
+    expect(kept.sensitivity).toBe('restricted');
+    expect(kept.previousValues).toEqual([expect.objectContaining({ value: 'CTO', source: 'agent:x', reason: 'node_merge' })]);
+  });
+
+  it('an operation on an already-deleted fact resolves to its successor', () => {
+    // The conflict is lost by the survivor fact (absorbed wins); the near-duplicate pair
+    // still names the deleted survivor fact and must act on the conflict winner instead.
+    const s1 = makeFact(uid(100), 'Title: CEO', { attribute: 'title', value: 'CEO' }, { confidence: 0.5 }).node;
+    const a1 = makeFact(uid(101), 'Title: CTO', { attribute: 'title', value: 'CTO' }, { confidence: 0.8 }).node;
+    const a2 = makeFact(uid(102), 'Is the CTO', { previous_values: [{ value: 'Was an engineer' }] }, { sensitivity: 'confidential', confidence: 0.3 }).node;
+    const built = buildFactOperations({
+      moves: [],
+      collapses: [],
+      conflicts: [{ id: `fact:${uid(100)}:${uid(101)}`, attribute: 'title', survivorFact: s1, absorbedFact: a1, absorbedLinkEdgeIds: [`link-${uid(101)}`], default: 'absorbed' }],
+      nearDuplicates: [{ id: `near:${uid(100)}:${uid(102)}`, survivorFact: s1, absorbedFact: a2, absorbedLinkEdgeIds: [`link-${uid(102)}`], similarity: 0.95 }],
+      sharedFactIds: [],
+      sharedLinkEdgeIds: [],
+    }, { facts: {}, nearDuplicateFacts: {} }, NOW.toISOString());
+    expect(built.deleteFactIds).toEqual([uid(100), uid(102)]);
+    expect([...built.updates.keys()]).toEqual([uid(101)]);
+    const kept = built.updates.get(uid(101))!;
+    expect(kept.sensitivity).toBe('confidential');
+    expect(kept.previousValues).toEqual([
+      expect.objectContaining({ value: 'CEO', reason: 'node_merge' }),
+      { value: 'Was an engineer' },
+    ]);
+    expect(built.relinkEdgeIds).toEqual([`link-${uid(101)}`]);
+  });
+});
+
+describe('applyResolutions — principal trust audit (QA G)', () => {
+  it('records the identities and primary fields a fold into the principal hands over', () => {
+    const { survivor, absorbed } = basicPair();
+    const principal = makeContact({
+      id: uid(10), kgNodeId: S_ID, systemRole: 'principal', kind: 'principal', tier: 'principal',
+      fields: { primary_email: 'me@x.com' },
+      identities: [{ id: uid(30), channel: 'email', identifier: 'me@x.com', verified: true }],
+    });
+    const dup = makeContact({
+      id: uid(11), kgNodeId: A_ID, fields: { primary_email: 'other@y.com', primary_phone: '+15550009' },
+      identities: [{ id: uid(31), channel: 'sms', identifier: '+15550002', verified: false }],
+    });
+    const plan = planNodeMerge(makeSnapshot(makeSide(survivor, { contacts: [principal] }), makeSide(absorbed, { contacts: [dup] })));
+    const acks = { acknowledgements: ['principal_identity_transfer'] };
+
+    const kept = applyResolutions(plan, acks, NOW);
+    expect(kept.contacts.principalIdentitiesTransferred).toEqual(['sms: +15550002']);
+    expect(kept.contacts.principalPrimaryFieldsFilled).toEqual({ primary_phone: '+15550009' });
+
+    const replaced = applyResolutions(plan, { ...acks, contactFields: { primary_email: 'absorbed' } }, NOW);
+    expect(replaced.contacts.principalPrimaryFieldsFilled).toEqual({ primary_email: 'other@y.com', primary_phone: '+15550009' });
+  });
+
+  it('records nothing when the surviving contact is not the principal', () => {
+    const { survivor, absorbed } = basicPair();
+    const plan = planNodeMerge(makeSnapshot(
+      makeSide(survivor, { contacts: [makeContact({ id: uid(10), kgNodeId: S_ID })] }),
+      makeSide(absorbed, { contacts: [makeContact({ id: uid(11), kgNodeId: A_ID, fields: { primary_email: 'x@y.com' } })] }),
+    ));
+    const exec = applyResolutions(plan, {}, NOW);
+    expect(exec.contacts.principalIdentitiesTransferred).toEqual([]);
+    expect(exec.contacts.principalPrimaryFieldsFilled).toEqual({});
   });
 });

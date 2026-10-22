@@ -2,8 +2,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ContactService } from '../../../src/contacts/contact-service.js';
 import type { Contact } from '../../../src/contacts/types.js';
-import { ContactNotFoundError } from '../../../src/contacts/types.js';
-import { ContactValidationError } from '../../../src/contacts/contact-service.js';
+import { ContactNotFoundError, StructuralContactMergeError } from '../../../src/contacts/types.js';
+import { ContactValidationError, survivingTier, type MergedContactRow } from '../../../src/contacts/contact-service.js';
 import { InvalidExclusionPairError } from '../../../src/contacts/dedup-exclusions.js';
 import { canonicalPairKey } from '../../../src/contacts/dedup-pair-key.js';
 import { DedupService } from '../../../src/contacts/dedup-service.js';
@@ -1773,5 +1773,54 @@ describe('EntityMemory.mergeEntities', () => {
     await entityMemory.mergeEntities(primary.id, secondary.id);
     const merged = await entityMemory.getEntity(primary.id);
     expect(merged!.properties['city']).toBe('Vancouver');
+  });
+});
+
+// QA fixes on PR #2238 (E): the fold refuses a structural secondary itself, and the tier
+// survivorship rule has one implementation shared with the KG node merge.
+describe('mergeContactRowsInTx — defense in depth (QA E)', () => {
+  let service: ContactService;
+
+  beforeEach(() => {
+    const embeddingService = EmbeddingService.createForTesting();
+    const store = KnowledgeGraphStore.createInMemory(embeddingService);
+    const validator = new MemoryValidator(store, embeddingService);
+    service = ContactService.createInMemory(new EntityMemory(store, validator, embeddingService, createSilentLogger()));
+  });
+
+  function rowFor(c: Contact): MergedContactRow {
+    return {
+      kgNodeId: c.kgNodeId, displayName: c.displayName, role: c.role, notes: c.notes, tier: c.tier, kind: c.kind,
+      preferredName: null, title: null, organization: null, primaryEmail: null, primaryPhone: null, timezone: null,
+      locale: null, location: null, pronouns: null, linkedinUrl: null, bio: null, birthday: null,
+      contactConfidence: 0, lastSeenAt: null, inboundMessageCount: 0, outboundMessageCount: 0,
+    };
+  }
+
+  it('refuses to fold away a structural secondary even when the caller skipped the check', async () => {
+    const primary = await service.createContact({ displayName: 'Ordinary', source: 'test' });
+    const principal = await service.createContact({ displayName: 'The Principal', source: 'ceo_stated' });
+    await service.setTier(principal.id, 'principal');
+
+    await expect(service.mergeContactRowsInTx(undefined, primary.id, principal.id, rowFor(primary)))
+      .rejects.toBeInstanceOf(StructuralContactMergeError);
+    // Nothing was written: the structural row and the primary are untouched.
+    expect(await service.getContact(principal.id)).toMatchObject({ tier: 'principal' });
+    expect(await service.getContact(primary.id)).toMatchObject({ displayName: 'Ordinary' });
+  });
+
+  it('refuses a secondary that does not exist', async () => {
+    const primary = await service.createContact({ displayName: 'Ordinary', source: 'test' });
+    await expect(service.mergeContactRowsInTx(undefined, primary.id, '00000000-0000-4000-8000-000000000999', rowFor(primary)))
+      .rejects.toBeInstanceOf(ContactNotFoundError);
+  });
+
+  it('shares one tier rule between computeGoldenRecord and the KG fold', () => {
+    const c = (tier: Contact['tier'], systemRole: Contact['systemRole'] = null) =>
+      ({ tier, systemRole, kind: systemRole === 'principal' ? 'principal' : 'person' }) as Pick<Contact, 'tier' | 'systemRole' | 'kind'>;
+    expect(survivingTier(c('known'), [c('trusted')])).toBe('trusted');
+    expect(survivingTier(c('trusted'), [c('known'), c('blocked')])).toBe('blocked');
+    expect(survivingTier(c('principal', 'principal'), [c('blocked')])).toBe('principal');
+    expect(survivingTier(c('unknown'), [])).toBe('unknown');
   });
 });

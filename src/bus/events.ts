@@ -504,10 +504,12 @@ interface ContactMergedPayload {
   mergedAt: Date;
 }
 
-// kg.nodes_merged — published after the principal merges two knowledge-graph nodes from
-// the console (#2233). Committed state only: the publish runs after COMMIT. The absorbed
-// node survives as an archived tombstone with properties.merged_into, so this payload plus
-// that row is enough to reconstruct (and, later, undo) the merge.
+// kg.nodes_merged — published by NodeMergeService after the principal merges two
+// knowledge-graph nodes from the console (#2233). Committed state only: the publish runs
+// after COMMIT. This is an audit record of what the merge decided, not an undo log: the
+// absorbed node survives as an archived tombstone with properties.merged_into, but dropped
+// facts, collapsed edges and merged-away contact rows are deleted and cannot be restored
+// from this payload.
 interface KgNodesMergedPayload {
   /** Duplicated at the top level for audit field extraction (target_id). */
   survivorId: string;
@@ -541,6 +543,17 @@ interface KgNodesMergedPayload {
     authOverrides: Record<string, string>;
     acknowledgements: string[];
   };
+  /**
+   * Principal trust audit: when the surviving contact is the principal, every folded
+   * identity that became a principal identity, as "channel: identifier". Empty otherwise.
+   */
+  principalIdentitiesTransferred: string[];
+  /**
+   * Principal trust audit: the principal's primary_email / primary_phone the merge wrote a
+   * new value into (filled, or replaced by a resolved conflict), with that value. Empty
+   * unless the surviving contact is the principal.
+   */
+  principalPrimaryFieldsFilled: { primary_email?: string; primary_phone?: string };
   /** The console originator (resolveConsoleOriginator); null when no principal resolved. */
   actor: import('../contacts/types.js').TaskOriginator | null;
   mergedAt: string;

@@ -198,12 +198,16 @@ describe('Event Types', () => {
       contactMerge: null,
       summary: { factsMoved: 1, factsCollapsed: 0, edgesMoved: 2, edgesCollapsed: 0, edgesDropped: 0, conflictsResolved: 0, contactReferencesRepointed: 0 },
       resolutions: { label: 'survivor', properties: {}, facts: {}, nearDuplicateFacts: {}, contactFields: {}, authOverrides: {}, acknowledgements: [] },
+      principalIdentitiesTransferred: ['sms: +15550002'],
+      principalPrimaryFieldsFilled: { primary_email: 'me@x.com' },
       actor: null,
       mergedAt: '2026-10-21T00:00:00.000Z',
     });
     expect(event.type).toBe('kg.nodes_merged');
     expect(event.sourceLayer).toBe('system');
     expect(event.payload.crossType).toBe(true);
+    expect(event.payload.principalIdentitiesTransferred).toEqual(['sms: +15550002']);
+    expect(event.payload.principalPrimaryFieldsFilled).toEqual({ primary_email: 'me@x.com' });
     expect(event.id).toBeTruthy();
   });
 

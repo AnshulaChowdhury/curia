@@ -72,8 +72,9 @@ import type { Layer, EventType } from './events.js';
 //          a relay to the principal goes to the digest. Only system subscribes (the audit logger).
 // #1911 (outbound judge audit): dispatch layer publishes outbound.judge for every Stage-2
 //          decision (pass/block/skip/failed_open) so fail-open delivery is visible in audit_log.
-// #2233 (KG node merge): the console merge route publishes kg.nodes_merged through the system
-//          layer, as system.ts does for system.restart; only system subscribes (audit logger).
+// #2233 (KG node merge): NodeMergeService (src/kg-merge/service.ts) publishes kg.nodes_merged
+//          through the system layer after COMMIT, as system.ts does for system.restart; only
+//          system subscribes (audit logger).
 const publishAllowlist: Record<Layer, Set<EventType>> = {
   channel: new Set(['inbound.message', 'inbound.reaction', 'channel.poll', 'channel.stalled', 'channel.disconnected', 'channel.reconnect', 'voice.session.started', 'voice.session.ended']),
   dispatch: new Set(['agent.task', 'outbound.message', 'outbound.blocked', 'outbound.judge', 'outbound.delivered', 'outbound.pii_redacted', 'outbound.suppressed_duplicate', 'outbound.no_reply', 'outbound.notification', 'contact.resolved', 'contact.unknown', 'message.rejected', 'contact.duplicate_detected', 'contact.merged', 'contact.elevated', 'conversation.checkpoint', 'human.decision', 'authorization.decision', 'autonomy.send_blocked', 'autonomy.relay_deferred', 'principal.report']),

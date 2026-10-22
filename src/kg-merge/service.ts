@@ -198,6 +198,8 @@ export class NodeMergeService implements NodeMergeApi {
             },
         summary,
         resolutions: exec.resolutions,
+        principalIdentitiesTransferred: contacts.principalIdentitiesTransferred,
+        principalPrimaryFieldsFilled: contacts.principalPrimaryFieldsFilled,
         actor: input.actor,
         mergedAt: exec.mergedAt,
       }));
