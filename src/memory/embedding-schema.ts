@@ -186,7 +186,7 @@ export function describeEmbeddingSchemaOff(state: Extract<EmbeddingSchemaState, 
     case 'open_run':
       return `A knowledge-graph re-embed started ${state.run.startedAt.toISOString()} did not finish ` +
         `(${state.run.rowsDone} of ${state.run.rowsTotal} rows embedded with ${state.run.targetModel}). ` +
-        `${REEMBED_INSTRUCTIONS} to finish it. ${REEMBED_DOCKER_NOTE}`;
+        `To finish it: ${REEMBED_INSTRUCTIONS}. ${REEMBED_DOCKER_NOTE}`;
     case 'width_mismatch':
       return `kg_nodes.embedding holds ${state.vectorCount} vectors of width ${state.columnDimensions ?? 'unset'}, ` +
         `but the embedding profile needs ${state.profileDimensions}. ${REEMBED_INSTRUCTIONS}. ${REEMBED_DOCKER_NOTE}`;
