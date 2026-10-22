@@ -351,24 +351,32 @@ shared-hardening over baseline on sonnet-5-5 (+0.084, 4+/0−). Marginal check r
 - **The toolset change pays most on the newer models.** It cuts cold p50 by ~110 ms on
   haiku-4-5 and ~640 ms on haiku-5-5. An earlier haiku-4-5 bench measured 565 → 396 ms.
 - **The slim core costs time on the 5.5 models:** about +235 ms cold p50 on haiku-5-5.
-  Both 5.5 models think by default and were measured that way. Voice sends no
-  reasoning-effort setting.
+- **The 5.5 runs had thinking on, which voice would not ship.** The spike and the
+  microbench sent no reasoning option, so both 5.5 models ran at their default adaptive
+  effort. Voice's turn runner sends `reasoning: NO_REASONING`, which on haiku-5-5 is
+  `thinking: disabled` (ADR-048 §3). So haiku-5-5 has not been measured with thinking off,
+  either for quality or for latency. The haiku-4-5 figures are unaffected, since Curia
+  sends Haiku 4.5 no thinking parameter.
 - **Sonnet 5.5's cold first token is too slow for a live call** in any arm, with p95
   outliers of 6–8 s.
 
 ### Decision
 
-- **Production (haiku-4-5).** Both slim-core placements trail the voice prompts. Voice
-  stays on its own prompt (ADR-037, this ADR), and no migration issue is filed.
-- **If voice moves to haiku-5-5.** `slim-core-system` ties the voice prompt and the shared
-  modules on quality, and adds ~235 ms cold first-token p50 and ~1.6× the tokens per turn.
-  Under #1968's rule ("ties or beats the shared modules, with TTFT within an agreed
-  budget"), that is a judgment on whether one prompt instead of two is worth the latency.
-  No budget is agreed yet. Decide it with the move, not before.
+- **Production (haiku-4-5).** Both slim-core placements trail the voice prompts. On this
+  model voice stays on its own prompt (ADR-037, this ADR).
+- **Voice moves to haiku-5-5** (#2245). The principal accepts the move's latency and cost
+  trade-off: on the voice prompt, cold p50 goes from ~380 to ~630 ms, and per-token price
+  drops about 8×.
+  - #2245 sets voice's reasoning effort from a rerun at `none`, `low` and the default,
+    since these runs measured only the default.
+  - #2245 also chooses the prompt shape. `slim-core-system` ties the voice prompt and the
+    shared modules on quality. It adds ~235 ms cold p50 and ~1.6× the tokens per turn.
+    Under #1968's rule ("ties or beats the shared modules, with TTFT within an agreed
+    budget"), the choice is whether one prompt instead of two is worth that latency.
 - **Sonnet 5.5** is not a voice candidate on latency, whatever the prompt.
 - **The voice toolset ships** (#1968): `VOICE_TOOL_NAMES` in
   `src/channels/voice/voice-tools.ts`, derived from production voice sessions, with no
   discovery tools. It is 9 tools (~3.6k tokens) instead of 74 (~23.5k).
 - **#1613.** The routing and pronoun modules stay on hold for haiku-4-5, where their
-  bundle ties baseline. Revisit the pronoun module with any move to a 5.5 model: it
-  solves `pronoun-your-calendar` there.
+  bundle ties baseline. #2245 revisits the pronoun module: it solves
+  `pronoun-your-calendar` on the 5.5 models.
