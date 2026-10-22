@@ -115,7 +115,8 @@ on its own measured benefit — do **not** ship the bundle:
 
 Harness: `scripts/spikes/voice-brain-parity/` — Haiku 4.5, `stream()` + tools.
 **19 utterances / ~50 assertion-checks × 5 reps.** Arms interleaved within
-each rep. Calendar mock is load-bearing. Canonical artifact: `variance.json`
+each rep. Calendar mock is load-bearing. Canonical artifact: `variance-adr038.json`
+(`variance.json` now holds the #1968 rerun)
 (incl. `paired`).
 
 **Paired check-rate deltas** (preferred statistic):
@@ -167,6 +168,14 @@ Bare-turn latency (prior interleaved microbench, not re-run — prompt sizes
 barely changed): baseline p50 TTFT ~526 ms; shared-hardening ~657 ms;
 full-consolidation ~782 ms. Full consolidation remains ~19× the instruction
 tokens every spoken turn.
+
+> **Annotation (2026-10-22, #1968): these latency figures exclude tool
+> definitions.** The microbench sent `tools: []`, while every production spoken
+> turn carried the coordinator's 73 pinned tools plus `async-offramp` (~23.5k
+> tokens). Tools were most of the request, so the "~19×" ratio overstated
+> consolidation's cost: with tools counted, full consolidation added roughly
+> 50% per turn, not 19×. Measured with tools, cold and warm, in the
+> [2026-10-22 addendum](#addendum-2026-10-22--slim-core-rerun-1968).
 
 Outbound-context: both prototype arms inject `formatInjectionBlock` **once**
 on the voice system-prompt path. Preserve that invariant.
@@ -235,3 +244,96 @@ The coordinator's sole `### Date & time` instruction is the composed
   shared modules + off-ramp + #1612.
 - Spike harness retained under `scripts/spikes/voice-brain-parity/` (`REPS=N`
   for variance).
+
+## Addendum (2026-10-22) — slim-core rerun (#1968)
+
+**Full consolidation stays rejected.** The question was reopened once the
+coordinator context diet (#1954) had thinned the coordinator prompt: could voice
+run on the coordinator's core plus a voice module, instead of a separately
+maintained voice prompt? On the production voice model it scores below both
+voice prompts, and its failure mode is the one that matters most on a call.
+
+### What was measured
+
+- **Harness** (`scripts/spikes/voice-brain-parity/`, `production-context.ts`).
+  Every arm now gets the production specialist roster and voice's real tool
+  definitions, and `delegate` is scored on its real `agent`/`task`/
+  `outbound_entry_id` arguments. So absolute rates are not comparable with the
+  July run above; the paired deltas within this run are.
+- **Arms.** `baseline` is the production voice prompt. `shared-hardening` is
+  baseline plus the held routing and pronoun modules. `slim-core` is new: the
+  coordinator's production system string (`assembleAgent` +
+  `buildBaseSystemPrompt`, #1966), with a voice module heading the caller's
+  message as turn guidance (#1959). The voice module is the spoken-style
+  addendum, the tool-result policy, the off-ramp, and the voice length reminder.
+  Full consolidation was not rerun.
+- **Run.** claude-haiku-4-5 (prod's voice model), 19 utterances × 3 arms × 5
+  interleaved reps. Artifact: `variance.json`.
+- **Size.** The slim core renders at ~5.5k tokens of system string plus ~0.5k of
+  guidance, against ~1.4k for the voice prompt. The core's always-on budget
+  (YAML + SKILL.md, ~3.1k) leaves out its runtime blocks: security, contact
+  details, roster, date guardrail, time and turn budget.
+
+### Quality (paired, check-rate unless noted)
+
+| Comparison | mean Δ | per-rep Δ | paired win? |
+|---|---|---|---|
+| slim-core − shared-hardening | −0.032 | −0.10, +0.08, −0.02, −0.04, −0.08 | no (1 +, 4 −) |
+| slim-core − baseline | −0.068 | −0.12, 0, −0.06, −0.06, −0.10 | no (0 +, 4 −) |
+| shared-hardening − baseline | −0.036 | −0.02, −0.08, −0.04, −0.02, −0.02 | no (0 +, 5 −) |
+
+Utterance-rate: slim-core − shared +0.011 (1 +, 2 −), slim-core − baseline −0.032
+(1 +, 4 −). Marginal check rates: baseline 0.956, shared 0.920, slim-core 0.888.
+
+| Category (check rate) | baseline | shared | slim-core |
+|---|---|---|---|
+| routing-transfer-ownership | 0.925 | 0.900 | **0.550** |
+| outbound-context-ack | 1.000 | 1.000 | 0.700 |
+| pronoun-resolution | 0.840 | 0.800 | **0.920** |
+| async-offramp | 0.867 | 0.933 | 0.967 |
+| routing-borrow-then-answer | 1.000 | 0.733 | 1.000 |
+| day-of-week-arithmetic | 1.000 | 0.950 | 0.933 |
+
+- **Transfer-ownership regresses.** "Yes, Thursday works — go ahead and send
+  it" with an active outbound entry: slim-core repeatedly answered "I'll let the
+  inbox team know to send that right away" and called no tool. Once it said
+  "Done — your reply to Sam is on its way" after calling only `task-complete`.
+  A claimed handoff that never happened is the failure the off-ramp design
+  exists to prevent.
+- **Outbound ack.** Slim-core replied "I just sent that over" without naming the
+  channel, so part of that drop is the scorer's keyword list. It gets the block
+  in the user turn, as text channels do, rather than in the system string.
+- **Pronoun.** `pronoun-your-calendar`: slim-core 3/5, baseline 1/5, shared 0/5.
+  It is still the only case the coordinator core solves and the voice prompts
+  do not, as in July. The pronoun module still earns nothing here.
+
+### Latency (`latency-microbench.json`, 10 reps per cell, TTFT p50 / p95 ms)
+
+| Prompt + tools | cold | warm |
+|---|---|---|
+| baseline + coordinator tools (voice before #1968) | 565 / 854 | 408 / 714 |
+| baseline + voice tools (voice after #1968) | 396 / 740 | 395 / 617 |
+| shared-hardening + voice tools | 375 / 833 | 371 / 475 |
+| slim-core + voice tools | 416 / 532 | 370 / 545 |
+| baseline, no tools (July's bare turn) | 363 / 490 | 350 / 502 |
+
+Cold means a fresh nonce in the first tool and the system string, so the whole
+prefix is a cache write. Warm is the same request again, read from cache. The
+voice-only prompts without tools sit under the cache minimum and never cache.
+p95 is the slowest of 10. **Latency does not decide this.** With voice's own
+tools, the slim core is within noise of the voice prompt, and well under what
+voice paid before #1968.
+
+### Decision
+
+- Slim-core neither ties nor beats the shared modules on quality, so voice stays
+  on its own prompt (ADR-037, this ADR). No migration issue is filed.
+- The voice toolset ships (#1968): `VOICE_TOOL_NAMES` in
+  `src/channels/voice/voice-tools.ts`, derived from production voice sessions,
+  with no discovery tools. It is 9 tools (~3.6k tokens) instead of 74 (~23.5k).
+- Routing and pronoun modules stay on hold (#1613). Their bundle again trails
+  baseline (−0.036, 0/5 reps positive).
+- Not tested: the voice module in the system string instead of the user turn,
+  and other voice models. A future rerun should try the system-string placement
+  first, since transfer-ownership is where slim-core broke.
+
