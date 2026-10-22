@@ -2,7 +2,7 @@
 // store (#1821). Navigation is path-based: directories are path prefixes and the
 // frontmatter title is only a hint beside the path.
 
-import { useCallback, useEffect, useMemo, useState, type MouseEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { MobileMenuContext } from '../context/MobileMenu.js';
 import { Sidebar } from '../components/Sidebar.js';
@@ -316,18 +316,28 @@ export default function DocumentsPage() {
     document.documentElement.dataset['mobileSidebar'] = mobileOpen ? 'open' : '';
   }, [mobileOpen]);
 
+  // Generation counters: only the newest list load, and only searches for the current
+  // query, may write state — a slow stale response is dropped rather than overwriting.
+  const listGen = useRef(0);
+  const searchGen = useRef(0);
+  /** Serializes "Load more", so two clicks can't fetch the same offset and append it twice. */
+  const pageInFlight = useRef(false);
+
   // ── List ──
   const loadList = useCallback(async () => {
+    const gen = ++listGen.current;
     const params = new URLSearchParams({ status, prefix });
     if (typeFilter) params.set('type', typeFilter);
     try {
       const res = await apiFetch(`/api/documents?${params}`);
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as { documents: DocSummary[]; types: Array<{ name: string; count: number }> };
+      if (gen !== listGen.current) return;
       setDocs(data.documents);
       setTypes(data.types);
       setListError(null);
     } catch (err) {
+      if (gen !== listGen.current) return;
       console.error('[DocumentsPage] failed to load documents:', err);
       setListError(err instanceof Error ? err.message : 'Failed to load documents');
     }
@@ -343,6 +353,12 @@ export default function DocumentsPage() {
 
   const runSearch = useCallback(async (offset: number) => {
     if (debouncedQuery === '') return;
+    if (offset > 0) {
+      if (pageInFlight.current) return;
+      pageInFlight.current = true;
+    }
+    // A fresh search starts a new generation; a page continues the current one.
+    const gen = offset === 0 ? ++searchGen.current : searchGen.current;
     const params = new URLSearchParams({
       q: debouncedQuery, status, prefix, offset: String(offset), limit: String(SEARCH_PAGE_SIZE),
     });
@@ -350,16 +366,21 @@ export default function DocumentsPage() {
       const res = await apiFetch(`/api/documents/search?${params}`);
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as SearchResponse;
+      if (gen !== searchGen.current) return;
       setSearch(prev => (offset > 0 && prev ? { ...data, matches: [...prev.matches, ...data.matches] } : data));
       setSearchError(null);
     } catch (err) {
+      if (gen !== searchGen.current) return;
       console.error('[DocumentsPage] search failed:', err);
       setSearchError(err instanceof Error ? err.message : 'Search failed');
+    } finally {
+      if (offset > 0) pageInFlight.current = false;
     }
   }, [debouncedQuery, status, prefix]);
 
   useEffect(() => {
     if (debouncedQuery === '') {
+      searchGen.current++; // drop any search still in flight for the old query
       setSearch(null);
       return;
     }

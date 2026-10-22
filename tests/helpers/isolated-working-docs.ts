@@ -8,11 +8,15 @@
 // it. WorkingDocsRepo's unqualified table names then resolve there, untouched by
 // anything else.
 //
+// It creates and drops a schema, so it refuses any database but `curia_test` — in both
+// directions, for every caller (require-test-db.ts).
+//
 // The `task_id → tasks` foreign key is not copied (LIKE never copies foreign keys);
 // these stores hold no task-linked rows.
 
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
+import { requireCuriaTestDatabase } from '../integration/require-test-db.js';
 
 export interface IsolatedWorkingDocsStore {
   pool: pg.Pool;
@@ -26,6 +30,7 @@ export async function createIsolatedWorkingDocsStore(databaseUrl: string): Promi
   const schema = `wd_test_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
   const admin = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
+    await requireCuriaTestDatabase(admin);
     await admin.query(`CREATE SCHEMA ${schema}`);
     await admin.query(`CREATE TABLE ${schema}.working_documents (LIKE public.working_documents INCLUDING ALL)`);
     await admin.query(`CREATE TABLE ${schema}.working_document_links (LIKE public.working_document_links INCLUDING ALL)`);
@@ -41,6 +46,7 @@ export async function createIsolatedWorkingDocsStore(databaseUrl: string): Promi
       await pool.end();
       const cleanup = new pg.Pool({ connectionString: databaseUrl, max: 1 });
       try {
+        await requireCuriaTestDatabase(cleanup);
         await cleanup.query(`DROP SCHEMA ${schema} CASCADE`);
       } finally {
         await cleanup.end();
