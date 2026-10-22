@@ -36,10 +36,11 @@ export const OPENAI_TEXT_EMBEDDING_3_SMALL: EmbeddingProfile = {
 };
 
 /**
- * The thresholds come from `scripts/embedding-eval.ts` on the synthetic fixture in
- * tests/fixtures/embedding-eval/. They were checked against a private set of 51 real name
- * pairs. On that set, 0.98 was the lowest auto-resolve threshold with no wrong merge, and a
- * floor of about 0.70 kept 95% of real matches in the ambiguous band. The scores were
+ * The two merge thresholds come from `scripts/embedding-eval.ts` on the synthetic fixture
+ * in tests/fixtures/embedding-eval/. Each is the lowest at which no distinct pair in the
+ * fixture merged. They were checked against a private set of 51 real name pairs, where 0.98
+ * was the lowest auto-resolve threshold with no wrong merge. The ambiguity floor comes from
+ * that set: about 0.70 kept 95% of real matches in the ambiguous band. The scores were
  * measured with Q8_0 weights on llama.cpp, and another quantization shifts them.
  *
  * A retrieval instruction on `similarity` was tried and stays out: it helps fact dedup but
