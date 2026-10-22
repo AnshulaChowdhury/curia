@@ -9,7 +9,9 @@ import {
   resolveEmbedding,
   describeEmbeddingUnavailable,
   redactUrlUserinfo,
+  EMBEDDING_FETCH_TIMEOUT_MS,
 } from '../../../src/memory/embedding.js';
+import type { EventBus } from '../../../src/bus/bus.js';
 import { createSilentLogger } from '../../../src/logger.js';
 import { OPENAI_TEXT_EMBEDDING_3_SMALL, type EmbeddingProfile } from '../../../src/memory/embedding-profiles.js';
 
@@ -211,6 +213,36 @@ describe('EmbeddingService — custom endpoint', () => {
 
     expect(JSON.parse(fetchMock.mock.calls[0]![1].body).dimensions).toBe(2000);
     expect(embedding).toHaveLength(2000);
+  });
+
+  it('gives up on a server that does not answer, through the fetch-failure path', async () => {
+    // The real timer would make this test wait 30 seconds, so the test aborts the signal itself.
+    const controller = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(controller.signal);
+    vi.stubGlobal('fetch', vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+      init.signal!.addEventListener('abort', () => reject(init.signal!.reason));
+    })));
+    const bus = { publish: vi.fn().mockResolvedValue(undefined) } as unknown as EventBus;
+    const testLogger = createSilentLogger();
+    const errorSpy = vi.spyOn(testLogger, 'error');
+    const service = EmbeddingService.createWithEndpoint(
+      { baseUrl: 'http://embed.local/v1', model: 'm', apiKey: undefined },
+      profile,
+      testLogger,
+      bus,
+    );
+
+    const pending = service.embed('hello', 'document');
+    controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+
+    await expect(pending).rejects.toThrow('Embedding endpoint fetch error: The operation was aborted due to timeout');
+    expect(timeoutSpy).toHaveBeenCalledWith(EMBEDDING_FETCH_TIMEOUT_MS);
+    expect(EMBEDDING_FETCH_TIMEOUT_MS).toBe(30_000);
+    const [, event] = (bus.publish as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(event.type).toBe('embedding.error');
+    expect(event.payload.errorType).toBe('FETCH_FAILED');
+    expect(errorSpy).toHaveBeenCalledWith(expect.anything(), 'Embedding endpoint fetch failed');
+    timeoutSpy.mockRestore();
   });
 
   it('sends the purpose prefix as part of the input', async () => {

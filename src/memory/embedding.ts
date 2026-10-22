@@ -11,6 +11,9 @@ import {
 
 export const DEFAULT_EMBEDDING_BASE_URL = 'https://api.openai.com/v1';
 export const DEFAULT_EMBEDDING_MODEL = OPENAI_TEXT_EMBEDDING_3_SMALL.model;
+// A local server that is busy or still loading its model can hold a request open, and a
+// knowledge-graph write waits on this call.
+export const EMBEDDING_FETCH_TIMEOUT_MS = 30_000;
 
 /**
  * Where embeddings come from. OpenAI by default; any server that speaks OpenAI's
@@ -185,6 +188,7 @@ class HttpEmbeddingBackend implements EmbeddingBackend {
           // Honoured by OpenAI; servers that ignore it return the full width, cut below.
           dimensions: this.dimensions,
         }),
+        signal: AbortSignal.timeout(EMBEDDING_FETCH_TIMEOUT_MS),
       });
     } catch (err) {
       // Publish embedding.error so HealthService can track embedding health.
