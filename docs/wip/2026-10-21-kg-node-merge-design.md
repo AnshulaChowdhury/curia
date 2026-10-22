@@ -566,7 +566,7 @@ round. No migration is needed.
 
 - `held_messages` was dropped in migration 059, so §6.2 has nothing to re-point there.
 - The executor archives the absorbed node **before** updating the survivor. Otherwise a same-type merge that takes the absorbed label would break `idx_kg_nodes_unique`, which cannot be deferred.
-- `previous_values` entries are `{ value, label, confidence, source, replaced_at, reason: 'node_merge' }`. When a fact conflict is resolved to one side, the kept fact takes the max sensitivity of the pair, so a dropped value is never stored below its original level.
+- `previous_values` entries are `{ value, label, confidence, source, replaced_at, reason: 'node_merge' }`. When a fact conflict is resolved to one side, the kept fact takes the max sensitivity of the pair, so a dropped value is never stored below its original level. A deleted fact node's own `previous_values` history is carried onto the kept fact, ahead of the new entry.
 - `label_collision` appears in the preview as an info warning; choosing the absorbed label then fails on apply with 422 blocker `label_collision`. The console disables that option.
 - A preview of a `fact` node returns 200 with blocker `fact_node`. Merge candidates for a fact node are `[]`.
 - `result.contactMerge` is `null` when contacts are only re-pointed (organization survivor). The ids appear in the preview's `contactPlan` and in the audit event.

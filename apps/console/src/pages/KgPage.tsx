@@ -714,6 +714,9 @@ export default function KgPage() {
     cyRef.current = cy;
 
     cy.on('onetap', 'node', evt => {
+      // A merge/redirect notice describes the node it was shown for — drop it when the
+      // user opens another one. A redirect from this tap sets its own notice afterwards.
+      setBanner(null);
       const nodeData = evt.target.data() as ApiKgNode;
       void expandNeighborhood(evt.target.id());
       setSelectedNode(nodeData);
@@ -976,7 +979,7 @@ export default function KgPage() {
                       <button
                         key={node.id}
                         className="kg-node-card"
-                        onClick={() => void loadNeighborhood(node.id)}
+                        onClick={() => { setBanner(null); void loadNeighborhood(node.id); }}
                         title={`Load ${node.label}'s neighborhood`}
                       >
                         <div className="kg-node-card-label">{node.label}</div>

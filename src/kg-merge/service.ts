@@ -74,27 +74,33 @@ export function isUsableEmbedding(value: unknown): value is number[] {
     && value.every(v => typeof v === 'number' && Number.isFinite(v));
 }
 
-function validateIds(survivorId: string, absorbedId: string): void {
+/**
+ * Validates and lower-cases the two ids. isUuid accepts upper case, but Postgres returns
+ * uuid columns in canonical lower case and the snapshot looks rows up by id string — an
+ * upper-case id would miss its own row and read as node_not_found.
+ */
+function validateIds(survivorId: string, absorbedId: string): { survivorId: string; absorbedId: string } {
   if (!isUuid(survivorId) || !isUuid(absorbedId)) {
     throw new InvalidResolutionError('invalid_request', 'survivorId and absorbedId must be valid UUIDs.');
   }
-  if (survivorId.toLowerCase() === absorbedId.toLowerCase()) {
+  const ids = { survivorId: survivorId.toLowerCase(), absorbedId: absorbedId.toLowerCase() };
+  if (ids.survivorId === ids.absorbedId) {
     throw new InvalidResolutionError('invalid_request', 'survivorId and absorbedId must differ.');
   }
+  return ids;
 }
 
 export class NodeMergeService implements NodeMergeApi {
   constructor(private readonly deps: NodeMergeServiceDeps) {}
 
-  async preview(survivorId: string, absorbedId: string): Promise<NodeMergePreview> {
-    validateIds(survivorId, absorbedId);
+  async preview(rawSurvivorId: string, rawAbsorbedId: string): Promise<NodeMergePreview> {
+    const { survivorId, absorbedId } = validateIds(rawSurvivorId, rawAbsorbedId);
     const snapshot = await loadMergeSnapshot(this.deps.pool, survivorId, absorbedId, { forUpdate: false });
     return planNodeMerge(snapshot).preview;
   }
 
   async apply(input: ApplyNodeMergeInput): Promise<NodeMergeResult> {
-    const { survivorId, absorbedId } = input;
-    validateIds(survivorId, absorbedId);
+    const { survivorId, absorbedId } = validateIds(input.survivorId, input.absorbedId);
     const log = this.deps.logger.child({ survivorId, absorbedId, component: 'kg-merge' });
 
     // 1–2. Plan from unlocked data; a changed graph fails fast, before any lock is taken.

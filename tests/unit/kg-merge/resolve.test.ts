@@ -77,14 +77,17 @@ describe('applyResolutions — fact conflict choices and previous_values', () =>
     ]);
   });
 
-  it('absorbed: drops the survivor fact, moves the absorbed one and records the survivor value', () => {
+  it('absorbed: drops the survivor fact, moves the absorbed one and records the survivor value and history', () => {
     const plan = conflictPlan();
     const id = plan.facts.conflicts[0]!.id;
     const exec = applyResolutions(plan, { facts: { [id]: 'absorbed' } }, NOW);
     expect(exec.facts.deleteFactIds).toEqual([uid(100)]);
     expect(exec.facts.relinkEdgeIds).toEqual([`link-${uid(101)}`]);
     const update = exec.facts.updates.find(u => u.id === uid(101))!;
+    // The deleted survivor fact's own history ('VP') survives on the kept fact, ahead of
+    // the value it held.
     expect(update.properties.previous_values).toEqual([
+      { value: 'VP' },
       expect.objectContaining({ value: 'CEO', reason: 'node_merge', replaced_at: NOW.toISOString() }),
     ]);
     expect(exec.summary.factsMoved).toBe(1);
@@ -124,6 +127,15 @@ describe('applyResolutions — fact conflict choices and previous_values', () =>
       { id: uid(100), confidence: 0.9, lastConfirmedAt: T2, sensitivity: 'confidential', properties: {} },
     ]);
     expect(exec.summary.factsCollapsed).toBe(1);
+  });
+
+  it('a collapsed duplicate hands its previous_values history to the kept fact', () => {
+    const { survivor, absorbed } = basicPair();
+    const s = makeFact(uid(100), 'Loves sailing', {});
+    const a = makeFact(uid(101), 'loves sailing.', { previous_values: [{ value: 'Loves rowing' }] });
+    const exec = applyResolutions(planNodeMerge(makeSnapshot(makeSide(survivor, { facts: [s] }), makeSide(absorbed, { facts: [a] }))), {}, NOW);
+    expect(exec.facts.deleteFactIds).toEqual([uid(101)]);
+    expect(exec.facts.updates[0]!.properties.previous_values).toEqual([{ value: 'Loves rowing' }]);
   });
 });
 

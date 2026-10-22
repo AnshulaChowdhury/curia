@@ -373,6 +373,14 @@ export function previousValueEntry(dropped: SnapshotNode, replacedAt: string): R
   };
 }
 
+/** The previous_values history a fact node already carries; it must outlive the node. */
+function existingHistory(fact: SnapshotNode): Record<string, unknown>[] {
+  const history = fact.properties.previous_values;
+  return Array.isArray(history)
+    ? history.filter((h): h is Record<string, unknown> => typeof h === 'object' && h !== null)
+    : [];
+}
+
 export function buildFactOperations(plan: FactPlan, choices: FactChoices, replacedAt: string): BuiltFactOperations {
   const deleteFactIds = new Set<string>();
   /** fact id → its absorbed-side link edges to re-point */
@@ -401,6 +409,8 @@ export function buildFactOperations(plan: FactPlan, choices: FactChoices, replac
     u.confidence = Math.max(u.confidence, drop.confidence);
     u.lastConfirmedAt = maxIso(u.lastConfirmedAt, drop.lastConfirmedAt);
     u.sensitivity = maxSensitivity(u.sensitivity, drop.sensitivity);
+    // The dropped node is deleted; its own value history moves to the kept fact.
+    u.previousValues.push(...existingHistory(drop));
     deleteFactIds.add(drop.id);
   };
   const relink = (fact: SnapshotNode, linkEdgeIds: string[]) => {
@@ -420,7 +430,9 @@ export function buildFactOperations(plan: FactPlan, choices: FactChoices, replac
   const keepWithPreviousValue = (keep: SnapshotNode, drop: SnapshotNode) => {
     const u = update(keep);
     u.sensitivity = maxSensitivity(u.sensitivity, drop.sensitivity);
-    u.previousValues.push(previousValueEntry(drop, replacedAt));
+    // The dropped node's own history first, then the value it held — so a winning absorbed
+    // fact does not discard the survivor fact's earlier values with the node.
+    u.previousValues.push(...existingHistory(drop), previousValueEntry(drop, replacedAt));
     deleteFactIds.add(drop.id);
   };
 

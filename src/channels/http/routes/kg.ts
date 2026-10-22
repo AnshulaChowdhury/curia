@@ -410,6 +410,9 @@ export async function knowledgeGraphRoutes(
 
     try {
       if (dryRun) {
+        // JSON body (Fastify serializes the object as application/json), not HTML;
+        // resp.render() does not apply. Same send path as the other KG JSON routes.
+        // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write
         return reply.send(await nodeMergeService.preview(survivorId, absorbedId));
       }
       if (typeof body.planToken !== 'string' || body.planToken.trim().length === 0) {
@@ -424,6 +427,9 @@ export async function knowledgeGraphRoutes(
         resolutions,
         actor,
       });
+      // JSON body (Fastify serializes the object as application/json), not HTML;
+      // resp.render() does not apply. Same send path as the other KG JSON routes.
+      // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write
       return reply.send(result);
     } catch (err) {
       const mapped = mergeErrorResponse(err);

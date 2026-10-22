@@ -373,6 +373,22 @@ describeIf('KG node merge (#2233)', () => {
     expect((await nodeRow(ev))!.archived_at).not.toBeNull();
   });
 
+  it('accepts upper-case node ids (Postgres returns uuids in lower case)', async () => {
+    const org = await node('organization', 'Globex');
+    const dup = await node('organization', 'Globex Corp');
+    const dupFact = await fact(dup, 'Based in Springfield');
+
+    const preview = await service.preview(org.toUpperCase(), dup.toUpperCase());
+    expect(preview.survivor.id).toBe(org);
+    expect(preview.absorbed.id).toBe(dup);
+    const result = await service.apply({
+      survivorId: org.toUpperCase(), absorbedId: dup.toUpperCase(), planToken: preview.planToken, resolutions: {}, actor: null,
+    });
+    expect(result.survivorId).toBe(org);
+    expect((await factsOf(org)).map(f => f.id)).toEqual([dupFact]);
+    expect((await nodeRow(dup))!.archived_at).not.toBeNull();
+  });
+
   // -- 3. organization (org contact) → person (contact) ---------------------
 
   it('organization with an org contact → person with a contact: one person contact with both identities', async () => {

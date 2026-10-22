@@ -182,9 +182,19 @@ silently, and is all-or-nothing. Contact merges stop losing calendars, grant
 recommendations, and task, message, voice and working-memory references, whichever page
 starts them.
 
-**Recoverable.** The tombstone carries `merged_into`, the audit payload carries the
-resolutions, and no fact or edge is deleted except exact duplicates and edges that would
-become self-loops. An undo is possible later; it is not built.
+**Partly recoverable.** The tombstone carries `merged_into`, and the audit payload carries
+the resolutions. Some rows are deleted outright:
+
+- **Duplicate facts:** collapsed duplicate and near-duplicate fact nodes. The kept fact
+  takes the higher confidence, the latest confirmation and the higher sensitivity.
+- **Losing facts in a conflict:** when the user keeps one side, the other fact node is
+  deleted. Its value goes into the kept fact's `previous_values`.
+- **Edges:** collapsed edges, and edges that would become self-loops.
+
+A deleted fact node's own `previous_values` history moves to the kept fact. What a
+deleted node does not keep is its id, its provenance row, and, for duplicates, its exact
+wording. An undo is possible for the node and its moved data. It cannot bring back
+deleted rows, and it is not built.
 
 **Known limitation.** A concurrent writer that resolved the absorbed node before the lock
 was taken, and inserts an edge or fact after the commit, attaches it to the tombstone. The
