@@ -48,6 +48,15 @@ inbound:
     nylas_message_id: scenario-msg-25n-morgan
     to: [curia]
 tool_stubs:
+  # Other fair writes a specialist may make on the way.
+  contact-set-role:
+    - agent: contacts
+      match: {}
+      return: { contact_id: "{{contact:morgan}}", display_name: Morgan Lee, role: contact }
+  calendar-holds-sweep:
+    - agent: calendar
+      match: {}
+      return: { scanned: 0, expired: 0, failed: 0, calendarErrors: 0 }
   # The contacts specialist filling in a contact's organization: a fair write.
   contact-update:
     - agent: contacts

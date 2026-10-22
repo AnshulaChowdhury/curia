@@ -5,13 +5,13 @@
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:14:48.419Z"
+      "recordedAt": "2026-10-21T21:22:49.103Z"
     },
     "booking link on a cc thread books through it": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:14:48.419Z"
+      "recordedAt": "2026-10-21T21:35:04.828Z"
     },
     "bullpen mention stays on thread": {
       "unstubbed": 0,
@@ -107,49 +107,49 @@
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:18:11.249Z"
+      "recordedAt": "2026-10-21T21:24:55.420Z"
     },
     "cc coffee follows standing rule (rules)": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:14:48.419Z"
+      "recordedAt": "2026-10-21T21:22:49.103Z"
     },
     "cc coffee in a week or two": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:14:48.419Z"
+      "recordedAt": "2026-10-21T21:22:49.103Z"
     },
     "cc drinks follows standing rule (both)": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:18:11.249Z"
+      "recordedAt": "2026-10-21T21:24:55.420Z"
     },
     "cc drinks follows standing rule (prefs)": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:18:11.249Z"
+      "recordedAt": "2026-10-21T21:24:55.420Z"
     },
     "cc drinks follows standing rule (rules)": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:14:48.419Z"
+      "recordedAt": "2026-10-21T21:22:49.103Z"
     },
     "cc move things around asks first at approval band": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:09:02.030Z"
+      "recordedAt": "2026-10-21T21:15:23.461Z"
     },
     "cc move things around to make room": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:32:52.736Z"
+      "recordedAt": "2026-10-21T22:04:59.476Z"
     },
     "cold outreach creates a contact": {
       "unstubbed": 0,
@@ -161,7 +161,7 @@
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:14:48.419Z"
+      "recordedAt": "2026-10-21T21:22:49.103Z"
     },
     "contacts ambiguous name with a wrong role": {
       "unstubbed": 0,
@@ -299,13 +299,13 @@
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:14:48.419Z"
+      "recordedAt": "2026-10-21T21:22:49.103Z"
     },
     "forwarded google booking page books through it": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:14:48.419Z"
+      "recordedAt": "2026-10-21T21:45:02.966Z"
     },
     "google doc bare id read": {
       "unstubbed": 0,
@@ -737,7 +737,7 @@
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T20:24:03.051Z"
+      "recordedAt": "2026-10-21T21:24:55.420Z"
     }
   }
 }

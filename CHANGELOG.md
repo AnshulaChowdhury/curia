@@ -115,6 +115,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 - **Test-mode autonomy gating** — suites now describe autonomy bands per `autonomy.gating`, as production does.
 - **Health canaries** — run daily again; boot cancelled the job, so no canary ran or pinged heartbeats. (#2229)
+- **Principal scheduling scenarios** — booking-page and delete checks no longer pass or fail on stub artifacts. (#2227)
 - **Browser fingerprint** — window fits a 1920×1080 screen with a desktop panel. (#2221)
 - **`browser.languages`** — ordered `navigator.languages` and `Accept-Language` list; `locale` goes first. (#2221)
 
