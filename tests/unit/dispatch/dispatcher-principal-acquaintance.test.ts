@@ -102,6 +102,15 @@ describe('Dispatcher — senders the principal knows (#2227)', () => {
     expect(h.incrementalUpdate).toHaveBeenCalledTimes(1);
   });
 
+  it('scores any known sender after counting this message, so a new introduction can book', async () => {
+    // Stored confidence 0 (a recently introduced contact): 0.24 before counting, under 0.3.
+    const h = harness({ scoring: true, tier: 'known' });
+    await send(h.bus);
+    expect(h.evidenceFor).not.toHaveBeenCalled();
+    expect(h.incrementalUpdate).toHaveBeenCalledTimes(1);
+    expect(h.tasks[0]!.payload.messageTrustScore).toBeCloseTo(0.34, 5);
+  });
+
   it('passes the evidence through as the elevation reason', async () => {
     const h = harness({ evidence: 'principal-domain' });
     await send(h.bus);

@@ -310,8 +310,10 @@ trust_policy:
 
 Scheduling was 0.5 until #2227. A `known` email contact scores 0.24 plus 0.4 × its contact
 confidence, so at 0.5 nearly every known email correspondent was declined a meeting even
-though the `known` tier allows `schedule_meetings`. A new `unknown` email sender (about 0.12)
-is still below 0.3.
+though the `known` tier allows `schedule_meetings`. Since #2227 the dispatcher also counts
+each inbound message toward its sender's confidence *before* taking the score; it used to count
+it afterwards, for the next message. So a known contact on their first message scores about
+0.24 + 0.4 × 0.25 = 0.34, over 0.3, and a new `unknown` email sender about 0.22, still under.
 
 **Senders the principal knows (#2227).** A new email sender starts at tier `unknown`, which
 runs read-only. Before routing, the dispatcher elevates such a sender to `known` when the
@@ -327,10 +329,9 @@ principal knows them (`src/contacts/principal-acquaintance.ts`):
   of the principal's Sent mail over their Nylas grant, with a 5-second limit. Mail the sender
   sent the principal does not count.
 
-The message is then counted toward the contact's confidence, and the contact resolved
-again. So this first message is authorized and scored as a known contact's: about 0.24 +
-0.4 × 0.25 = 0.34, over the scheduling threshold. Without that count it would be scored on
-a stored confidence of 0, which gives 0.24. Lookup failures and timeouts leave the sender `unknown`. The elevation is
+The message is then counted toward the contact's confidence (as for every sender, above), and
+the contact resolved again. So this first message is authorized and scored as a known
+contact's: about 0.34, over the scheduling threshold. Lookup failures and timeouts leave the sender `unknown`. The elevation is
 published as `contact.elevated` with the evidence as its `reason`.
 
 When a request's `messageTrustScore` falls below the required threshold, the Coordinator declines the action: "I'm not able to do that without a higher level of verified trust with you. If you'd like, I can let [CEO name] know you reached out." The Coordinator may still respond in a general, non-action way (introductions, pleasantries, clarifying questions). It never explains the trust system or mentions scores to external senders. Trust thresholds do not apply to the CEO (role: `ceo` or channel: `cli`).

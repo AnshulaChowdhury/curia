@@ -607,29 +607,41 @@ export class Dispatcher {
                 }
               }
 
-              // Path 3: judgment elevation — fire-and-forget; updates confidence history for the NEXT
-              // inbound. The trust score for THIS message already used the stored contactConfidence.
-              // Capture tier/kind snapshots before the IIFE so it sees pre-message values even if
-              // senderContext is mutated (e.g. by Path 2 above).
+              // Path 3: count this message toward the sender's confidence, awaited so the trust
+              // score below is taken after it (#2227). Until then the score read the stored
+              // confidence from before this message, so a recently introduced known contact
+              // (confidence 0) scored 0.24 on email and was declined a meeting at the 0.3
+              // scheduling threshold. A count can only raise confidence (the pipeline returns 0
+              // when it skips), so the larger value is kept. Judgment elevation stays
+              // fire-and-forget: it changes the tier for the NEXT message. Tier/kind snapshots are
+              // taken before it so it sees pre-message values even if Path 2 mutated them.
               if (this.confidencePipeline && !messageCounted) {
                 const contactService = this.contactService;
                 const snapshotTier = senderContext.tier;
                 const snapshotKind = senderContext.kind;
-                void (async () => {
-                  try {
-                    const newConfidence = await this.confidencePipeline!.incrementalUpdate(resolvedContactId, { type: 'message_seen' });
-                    if (
-                      contactService &&
-                      snapshotTier === 'unknown' &&
-                      !isAutomatedKind(snapshotKind) &&
-                      newConfidence >= JUDGMENT_ELEVATION_THRESHOLD
-                    ) {
+                let newConfidence: number | undefined;
+                try {
+                  newConfidence = await this.confidencePipeline.incrementalUpdate(resolvedContactId, { type: 'message_seen' });
+                  senderContext.contactConfidence = Math.max(senderContext.contactConfidence, newConfidence);
+                } catch (err) {
+                  this.logger.warn({ err, contactId: resolvedContactId }, 'Confidence pipeline update failed (non-fatal)');
+                }
+                if (
+                  newConfidence !== undefined &&
+                  contactService &&
+                  snapshotTier === 'unknown' &&
+                  !isAutomatedKind(snapshotKind) &&
+                  newConfidence >= JUDGMENT_ELEVATION_THRESHOLD
+                ) {
+                  const confidence = newConfidence;
+                  void (async () => {
+                    try {
                       await contactService.elevateTierToKnown(resolvedContactId, 'judgment');
+                    } catch (err) {
+                      this.logger.warn({ err, contactId: resolvedContactId, confidence }, 'Judgment elevation failed (non-fatal)');
                     }
-                  } catch (err) {
-                    this.logger.warn({ err, contactId: resolvedContactId }, 'Confidence pipeline or judgment elevation failed (non-fatal)');
-                  }
-                })();
+                  })();
+                }
               }
             }
 
