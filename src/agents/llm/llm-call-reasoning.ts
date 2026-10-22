@@ -1,7 +1,7 @@
-// llm-call-reasoning.ts — the reasoning fields every llm.call publisher sets.
+// llm-call-reasoning.ts — the reasoning and attempt fields every llm.call publisher sets.
 //
 // One helper so the five publishers (runtime, TelemetryLlmProvider, both
-// judges, infra-llm) cannot drift apart (ADR-048 §5).
+// judges, infra-llm) cannot drift apart (ADR-048 §5, #1915).
 
 import type { LLMCallProvenance, LLMUsage } from './provider.js';
 import type { ReasoningEffort } from './sampling-options.js';
@@ -11,6 +11,8 @@ export interface LlmCallReasoningFields {
   reasoningEffort: ReasoningEffort | null;
   upstreamProvider: string | null;
   reasoningBlocksDropped: number;
+  attempts: number | null;
+  failedAttemptsMs: number | null;
 }
 
 /**
@@ -28,5 +30,8 @@ export function llmCallReasoningFields(
     reasoningEffort: provenance.reasoningEffort ?? null,
     upstreamProvider: provenance.upstreamProvider ?? null,
     reasoningBlocksDropped: provenance.reasoningBlocksDropped ?? 0,
+    // null, not 1, where the provider does not count: its SDK may retry unseen.
+    attempts: provenance.attempts ?? null,
+    failedAttemptsMs: provenance.failedAttemptsMs ?? null,
   };
 }

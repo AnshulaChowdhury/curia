@@ -15,7 +15,7 @@
 //      callers never need try/catch around chat().
 //   5. Streaming uses OpenRouter's OpenAI-compatible chunk protocol.
 
-import OpenAI from 'openai';
+import OpenAI, { APIConnectionError, APIError, APIUserAbortError } from 'openai';
 import type { ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, ChatCompletionTool, ChatCompletion } from 'openai/resources/chat/completions/completions.js';
 import type { CompletionUsage } from 'openai/resources/completions.js';
 import type { LLMProvider, LLMResponse, LLMStreamEvent, LLMUsage, LLMCallProvenance, LLMReasoning, Message, ContentBlock, ReasoningContent, ToolCall, ToolDefinition, ToolResult, ReasoningOmission } from './provider.js';
@@ -106,6 +106,109 @@ export function upstreamProviderFrom(carrier: object): string | undefined {
   const value = (carrier as { provider?: unknown }).provider;
   return typeof value === 'string' && value ? value : undefined;
 }
+
+/**
+ * Per-attempt request timeout. This is the openai SDK's own default, made explicit:
+ * a non-streamed call still running at this point is aborted as a timeout (#1915).
+ */
+export const OPENROUTER_REQUEST_TIMEOUT_MS = 600_000;
+
+/** Attempts per chat() call: the first plus the SDK's default of two retries. */
+export const OPENROUTER_MAX_ATTEMPTS = 3;
+
+/**
+ * Whether chat() retries a failed request. The openai SDK's own rule: connection
+ * errors and timeouts, 408, 409, 429 and 5xx, unless an `x-should-retry` header
+ * says otherwise. chat() applies it itself so each retry is logged and counted
+ * on llm.call, instead of the SDK folding it silently into one call (#1915).
+ */
+export function isRetryableOpenRouterError(err: unknown): boolean {
+  if (err instanceof APIUserAbortError) return false;
+  if (err instanceof APIConnectionError) return true;
+  if (!(err instanceof APIError)) return false;
+  const shouldRetry = err.headers?.get('x-should-retry');
+  if (shouldRetry === 'true') return true;
+  if (shouldRetry === 'false') return false;
+  const status = err.status;
+  return status === 408 || status === 409 || status === 429 || (status !== undefined && status >= 500);
+}
+
+/** Wait the server asked for in `retry-after-ms` or `retry-after`, if it gave one. */
+function retryAfterMs(headers: Headers | undefined): number | undefined {
+  const millis = headers?.get('retry-after-ms');
+  if (millis) {
+    const value = parseFloat(millis);
+    if (!Number.isNaN(value)) return value;
+  }
+  const after = headers?.get('retry-after');
+  if (!after) return undefined;
+  const seconds = parseFloat(after);
+  return Number.isNaN(seconds) ? Date.parse(after) - Date.now() : seconds * 1000;
+}
+
+/**
+ * Backoff before retry number `retry` (1-based), matching the openai SDK: the
+ * server's retry-after when it is 0–60s, otherwise 0.5s doubling per retry,
+ * capped at 8s, less up to 25% jitter.
+ */
+export function openRouterRetryDelayMs(err: unknown, retry: number, random: () => number = Math.random): number {
+  const requested = retryAfterMs(err instanceof APIError ? err.headers : undefined);
+  if (requested !== undefined && Number.isFinite(requested) && requested >= 0 && requested <= 60_000) {
+    return requested;
+  }
+  const baseMs = Math.min(500 * 2 ** (retry - 1), 8_000);
+  return Math.round(baseMs * (1 - random() * 0.25));
+}
+
+/** Resolve after `ms`, or as soon as `signal` aborts. */
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    signal?.addEventListener('abort', done, { once: true });
+  });
+}
+
+/**
+ * A completion that ran into max_tokens before producing anything usable: no
+ * text and no tool call. Typically the whole budget went on reasoning. A
+ * truncated response that still carries an answer does not count (#1915).
+ */
+export function isEmptyAtOutputCap(response: ChatCompletion): boolean {
+  const choice = response.choices[0];
+  if (!choice || choice.finish_reason !== 'length') return false;
+  const hasText = typeof choice.message.content === 'string' && choice.message.content.trim() !== '';
+  const hasToolCalls = (choice.message.tool_calls?.length ?? 0) > 0;
+  return !hasText && !hasToolCalls;
+}
+
+/** Token counts of two requests added together, for a call that took more than one. */
+function addUsage(a: LLMUsage, b: LLMUsage | undefined): LLMUsage {
+  if (!b) return a;
+  const reasoningReported = a.reasoningTokens !== undefined || b.reasoningTokens !== undefined;
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheCreationInputTokens: a.cacheCreationInputTokens + b.cacheCreationInputTokens,
+    cacheReadInputTokens: a.cacheReadInputTokens + b.cacheReadInputTokens,
+    ...(reasoningReported ? { reasoningTokens: (a.reasoningTokens ?? 0) + (b.reasoningTokens ?? 0) } : {}),
+  };
+}
+
+type CreateOutcome =
+  | {
+      ok: true;
+      response: ChatCompletion;
+      attempts: number;
+      failedAttemptsMs: number;
+      /** Tokens billed for attempts that came back empty at the output cap. */
+      discardedUsage: LLMUsage | undefined;
+    }
+  | { ok: false; err: unknown; attempts: number };
 
 /** Non-negative integer count, or 0 for anything else (absent, null, malformed). */
 function tokenCount(value: unknown): number {
@@ -328,6 +431,7 @@ export class OpenRouterProvider implements LLMProvider {
     this.client = new OpenAI({
       apiKey,
       baseURL: 'https://openrouter.ai/api/v1',
+      timeout: OPENROUTER_REQUEST_TIMEOUT_MS,
     });
     this.logger = logger;
     this.modelRegistry = modelRegistry;
@@ -623,6 +727,98 @@ export class OpenRouterProvider implements LLMProvider {
     return classified;
   }
 
+  /**
+   * Send a non-streamed request, retrying it here rather than in the SDK
+   * (`maxRetries: 0`) so every failed attempt is logged and the count reaches
+   * llm.call (#1915). stream() keeps the SDK's retries: they happen before any
+   * token arrives.
+   *
+   * A response that hit max_tokens with no answer is retried too, at once: it is
+   * not an overload signal. The last attempt's response is returned whatever it
+   * holds, so the caller's own empty-response handling still applies.
+   */
+  private async createWithRetries(
+    createParams: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+    signal: AbortSignal | undefined,
+    model: string,
+  ): Promise<CreateOutcome> {
+    const startedMs = Date.now();
+    // Billed tokens of empty-at-cap attempts before `lastEmpty`.
+    let discardedUsage: LLMUsage | undefined;
+    // The latest empty-at-cap response, held so a retry that then errors does
+    // not lose it: its tokens were billed and only a returned response reaches
+    // llm.call.
+    let lastEmpty: { response: ChatCompletion; usage: LLMUsage; attemptMs: number } | undefined;
+
+    const giveUp = (err: unknown, attempts: number): CreateOutcome => {
+      if (!lastEmpty) return { ok: false, err, attempts };
+      // Return what chat() returned before it retried empty responses, so the
+      // caller's empty-response handling runs and every billed token is recorded.
+      this.logger.warn(
+        { err, model, attempts },
+        'OpenRouter retry after an empty max_tokens response failed — returning the empty response',
+      );
+      return {
+        ok: true,
+        response: lastEmpty.response,
+        attempts,
+        failedAttemptsMs: Date.now() - startedMs - lastEmpty.attemptMs,
+        discardedUsage,
+      };
+    };
+
+    for (let attempt = 1; ; attempt++) {
+      const attemptStartMs = Date.now();
+      let response: ChatCompletion;
+      try {
+        response = await this.client.chat.completions.create(createParams, {
+          maxRetries: 0,
+          ...(signal ? { signal } : {}),
+        });
+      } catch (err) {
+        if (attempt >= OPENROUTER_MAX_ATTEMPTS || signal?.aborted || !isRetryableOpenRouterError(err)) {
+          return giveUp(err, attempt);
+        }
+        const delayMs = openRouterRetryDelayMs(err, attempt);
+        this.logger.warn(
+          { err, model, attempt, maxAttempts: OPENROUTER_MAX_ATTEMPTS, attemptMs: Date.now() - attemptStartMs, delayMs },
+          'OpenRouter API call failed — retrying',
+        );
+        await sleep(delayMs, signal);
+        if (signal?.aborted) return giveUp(err, attempt);
+        continue;
+      }
+
+      if (isEmptyAtOutputCap(response) && attempt < OPENROUTER_MAX_ATTEMPTS && !signal?.aborted) {
+        const usage = usageFromOpenRouter(response.usage);
+        if (lastEmpty) discardedUsage = addUsage(lastEmpty.usage, discardedUsage);
+        lastEmpty = { response, usage, attemptMs: Date.now() - attemptStartMs };
+        this.logger.warn(
+          {
+            model,
+            attempt,
+            maxAttempts: OPENROUTER_MAX_ATTEMPTS,
+            attemptMs: Date.now() - attemptStartMs,
+            outputTokens: usage.outputTokens,
+            reasoningTokens: usage.reasoningTokens,
+            upstreamProvider: upstreamProviderFrom(response),
+          },
+          'OpenRouter response hit max_tokens with no answer — retrying',
+        );
+        continue;
+      }
+
+      return {
+        ok: true,
+        response,
+        attempts: attempt,
+        failedAttemptsMs: attemptStartMs - startedMs,
+        // Billed even though unusable, so llm.call's tokens and cost include them.
+        discardedUsage: lastEmpty ? addUsage(lastEmpty.usage, discardedUsage) : discardedUsage,
+      };
+    }
+  }
+
   async chat(params: {
     messages: Message[];
     tools?: ToolDefinition[];
@@ -636,7 +832,14 @@ export class OpenRouterProvider implements LLMProvider {
       const built = this.buildCreateParams(params, 'chat');
       model = built.model;
       const { createParams, signal, reasoningEffort } = built;
-      const response: ChatCompletion = await this.client.chat.completions.create(createParams, signal ? { signal } : undefined);
+      const outcome = await this.createWithRetries(createParams, signal, model);
+      if (!outcome.ok) {
+        this.logger.error({ err: outcome.err, model, attempts: outcome.attempts }, 'OpenRouter API call failed');
+        const error = this.classifyProviderError(outcome.err);
+        error.context.attempts = outcome.attempts;
+        return { type: 'error', error };
+      }
+      const { response, attempts, failedAttemptsMs, discardedUsage } = outcome;
 
       // Extract the first choice — OpenRouter always returns at least one.
       const choice = response.choices[0];
@@ -668,8 +871,12 @@ export class OpenRouterProvider implements LLMProvider {
         );
       }
 
-      const usage = this.usageFromCompletion(response);
-      const provenance = this.provenanceFromCompletion(response, model, reasoningEffort);
+      const usage = addUsage(this.usageFromCompletion(response), discardedUsage);
+      const provenance = {
+        ...this.provenanceFromCompletion(response, model, reasoningEffort),
+        attempts,
+        failedAttemptsMs,
+      };
       const reasoning = reasoningFromCarrier(
         choice.message,
         usage,

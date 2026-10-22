@@ -760,6 +760,16 @@ interface LlmCallPayload {
    * the request prefix changed (ADR-048 §1, prefix guard). 0 when none.
    */
   reasoningBlocksDropped?: number;
+  /**
+   * Requests sent for this call, counting retries. `null` where the provider
+   * does not count them (only OpenRouter chat() does today, #1915).
+   */
+  attempts?: number | null;
+  /**
+   * Time spent on failed attempts and the backoff after each; `latencyMs` minus
+   * this is the attempt that succeeded. `null` where `attempts` is.
+   */
+  failedAttemptsMs?: number | null;
 }
 
 // ModelFallbackEngagedPayload — emitted by the agent runtime when the primary
