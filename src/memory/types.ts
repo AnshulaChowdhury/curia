@@ -81,7 +81,10 @@ export interface KgNode {
   type: NodeType;
   label: string;
   properties: Record<string, unknown>;
-  embedding?: number[]; // VECTOR(1536) — undefined until embedded
+  embedding?: number[]; // width from the embedding profile — undefined until embedded
+  // embeddingStamp() of the profile that produced `embedding`; set exactly when `embedding`
+  // is (migration 103). Vectors with different stamps are never compared.
+  embeddingModel?: string;
   temporal: TemporalMetadata;
   // Sensitivity classification assigned at creation time (#200).
   // Immutable after creation — changing sensitivity requires a manual data migration.
@@ -145,9 +148,10 @@ export interface ValidatedFactData {
     decayClass: DecayClass;
     source: string;
   };
-  // Pre-computed embedding from the dedup scan — passed through so the store
-  // can skip a redundant embed() call when persisting the new node.
-  embedding: number[];
+  // The dedup scan's vector, passed through so the store can skip a second embed()
+  // call. Absent when the profile's `similarity` and `document` prefixes differ: the
+  // stored vector must be the `document` one that search and pnpm reembed:kg expect.
+  embedding?: number[];
 }
 
 // -- Validation result --
@@ -188,6 +192,3 @@ export function createNodeId(): string {
 export function createEdgeId(): string {
   return randomUUID();
 }
-
-// -- Embedding dimensions constant (hardcoded for text-embedding-3-small) --
-export const EMBEDDING_DIMENSIONS = 1536;

@@ -27,6 +27,7 @@ export const SEED_SECRET_NAMES = [
   'openrouter_api_key',
   'aws_access_key_id',
   'aws_secret_access_key',
+  'embedding_api_key',
   'api_token',
   'web_app_bootstrap_secret',
   'nylas_api_key',

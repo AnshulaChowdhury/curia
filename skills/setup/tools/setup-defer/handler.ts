@@ -21,7 +21,6 @@ const VALID_TASK_IDS = new Set([
   'email',
   'signal',
   'web_research',
-  'kg_memory',
 ]);
 
 export class SetupDeferHandler implements ToolHandler {

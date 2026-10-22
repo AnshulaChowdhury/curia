@@ -42,6 +42,8 @@
     "rederive:contact-tiers": "tsx --env-file=.env scripts/rederive-contact-tiers.ts",
     "report:kg-linkage": "tsx --env-file=.env scripts/kg-node-linkage-report.ts",
     "dedup:contacts": "tsx --env-file=.env scripts/dedup-contacts.ts",
+    "embedding-eval": "tsx scripts/embedding-eval.ts",
+    "reembed:kg": "tsx --env-file=.env scripts/reembed-kg.ts",
     "seed-vault": "tsx --env-file=.env scripts/seed-vault.ts",
     "audit:verify": "tsx --env-file=.env scripts/audit-verify.ts",
     "audit:override-floors": "tsx scripts/audit-override-floors.ts"

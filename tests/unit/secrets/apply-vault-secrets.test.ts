@@ -18,6 +18,9 @@ function baseConfig(): Config {
     awsSecretAccessKey: undefined,
     awsRegion: undefined,
     awsBedrockTimeoutMs: 120000,
+    embeddingBaseUrl: undefined,
+    embeddingModel: undefined,
+    embeddingApiKey: undefined,
     logLevel: 'info',
     httpPort: 3000,
     apiToken: undefined,
@@ -62,11 +65,13 @@ describe('applyVaultSecrets', () => {
       api_token: 'tok-vault',
       nylas_grant_id: 'grant-vault',
       nylas_self_email: 'curia@vault.test',
+      embedding_api_key: 'embed-vault',
     });
 
     await applyVaultSecrets(config, secrets, logger);
 
     expect(config.anthropicApiKey).toBe('sk-ant-vault');
+    expect(config.embeddingApiKey).toBe('embed-vault');
     expect(config.apiToken).toBe('tok-vault');
     expect(config.nylasGrantId).toBe('grant-vault');
     expect(config.nylasSelfEmail).toBe('curia@vault.test');

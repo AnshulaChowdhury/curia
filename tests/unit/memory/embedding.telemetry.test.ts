@@ -1,20 +1,26 @@
-// embedding.test.ts — unit tests for OpenAIBackend telemetry.
+// embedding.test.ts — unit tests for HttpEmbeddingBackend telemetry.
 //
 // Mocks globalThis.fetch so tests run without a real API key.
 // Uses vi.stubGlobal / vi.unstubAllGlobals to keep the mock isolated per test.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { EmbeddingService } from '../../../src/memory/embedding.js';
+import {
+  EmbeddingService,
+  DEFAULT_EMBEDDING_BASE_URL,
+  DEFAULT_EMBEDDING_MODEL,
+} from '../../../src/memory/embedding.js';
 import type { EventBus } from '../../../src/bus/bus.js';
 import { ModelRegistry } from '../../../src/agents/llm/model-registry.js';
 import { createSilentLogger } from '../../../src/logger.js';
-import { EMBEDDING_DIMENSIONS } from '../../../src/memory/types.js';
+import { OPENAI_TEXT_EMBEDDING_3_SMALL } from '../../../src/memory/embedding-profiles.js';
 
 const logger = createSilentLogger();
 const modelRegistry = new ModelRegistry(logger);
 
 // A valid embedding of the correct dimension — used as the mock API response payload.
-const FAKE_EMBEDDING = Array.from({ length: EMBEDDING_DIMENSIONS }, (_, i) => i / EMBEDDING_DIMENSIONS);
+const DIMENSIONS = OPENAI_TEXT_EMBEDDING_3_SMALL.dimensions;
+const FAKE_EMBEDDING = Array.from({ length: DIMENSIONS }, (_, i) => i / DIMENSIONS);
+const OPENAI_ENDPOINT = { baseUrl: DEFAULT_EMBEDDING_BASE_URL, model: DEFAULT_EMBEDDING_MODEL, apiKey: 'test-key' };
 
 // Builds a minimal OpenAI embeddings API response.
 const makeEmbeddingResponse = (promptTokens = 8) => ({
@@ -39,8 +45,8 @@ describe('EmbeddingService — OpenAI backend telemetry', () => {
       json: () => Promise.resolve(makeEmbeddingResponse(8)),
     }));
 
-    const service = EmbeddingService.createWithOpenAI('test-key', logger, mockBus, modelRegistry);
-    const result = await service.embed('hello world');
+    const service = EmbeddingService.createWithEndpoint(OPENAI_ENDPOINT, OPENAI_TEXT_EMBEDDING_3_SMALL, logger, mockBus, modelRegistry);
+    const result = await service.embed('hello world', 'document');
 
     expect(result).toEqual(FAKE_EMBEDDING);
     expect(mockBus.publish).toHaveBeenCalledOnce();
@@ -66,9 +72,9 @@ describe('EmbeddingService — OpenAI backend telemetry', () => {
     // Fresh logger with a warn spy — verifies the failure is logged, not silently swallowed.
     const testLogger = createSilentLogger();
     const warnSpy = vi.spyOn(testLogger, 'warn');
-    const service = EmbeddingService.createWithOpenAI('test-key', testLogger, mockBus, modelRegistry);
+    const service = EmbeddingService.createWithEndpoint(OPENAI_ENDPOINT, OPENAI_TEXT_EMBEDDING_3_SMALL, testLogger, mockBus, modelRegistry);
     // Must not throw — telemetry failure is non-fatal
-    const result = await service.embed('hello world');
+    const result = await service.embed('hello world', 'document');
     expect(result).toEqual(FAKE_EMBEDDING);
     // publishTelemetry is fire-and-forget; drain pending microtasks so the
     // catch block (which calls logger.warn) completes before we assert it.
@@ -83,8 +89,8 @@ describe('EmbeddingService — OpenAI backend telemetry', () => {
     }));
 
     // No bus/modelRegistry — simulates test or misconfigured production paths
-    const service = EmbeddingService.createWithOpenAI('test-key', logger);
-    const result = await service.embed('hello world');
+    const service = EmbeddingService.createWithEndpoint(OPENAI_ENDPOINT, OPENAI_TEXT_EMBEDDING_3_SMALL, logger);
+    const result = await service.embed('hello world', 'document');
 
     // The service was created without a bus, so embed() should resolve normally.
     expect(result).toEqual(FAKE_EMBEDDING);

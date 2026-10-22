@@ -2,10 +2,8 @@ import type { KnowledgeGraphStore } from './knowledge-graph.js';
 // Value import (not `import type`) because we call the static method
 // EmbeddingService.cosineSimilarity() at runtime.
 import { EmbeddingService } from './embedding.js';
+import { embeddingStamp } from './embedding-profiles.js';
 import type { StoreFactOptions, ValidationResult } from './types.js';
-
-// Spec line 116: cosine similarity threshold for deduplication
-const DEDUP_SIMILARITY_THRESHOLD = 0.92;
 
 // Spec line 126: max writes per agent per task
 // Exported so tests can exhaust the limit without hard-coding the magic number.
@@ -38,7 +36,8 @@ function isDistinctMultiValuedFact(
  *
  * All writes to entity memory pass through these checks:
  * 1. Rate limiting — max 50 writes per agent per task execution
- * 2. Deduplication — same entity + similar label (cosine > 0.92) → merge
+ * 2. Deduplication — same entity + similar label (cosine at or above the profile's
+ *    factDedup threshold) → merge
  * 3. Contradiction detection — conflicting facts → escalate to user
  * 4. Source attribution — every write records full provenance chain
  *
@@ -113,7 +112,9 @@ export class MemoryValidator {
     //    Spec line 115: "same entity + similar label" prevents cross-entity false matches
     //    and avoids a full table scan as the fact count grows.
     const entityEdges = await this.store.getEdgesForNode(options.entityNodeId);
-    const newEmbedding = await this.embeddingService.embed(options.label);
+    const newEmbedding = await this.embeddingService.embed(options.label, 'similarity');
+    // The threshold belongs to the model that produced the scores (ADR-051).
+    const dedupThreshold = this.embeddingService.profile.thresholds.factDedup;
 
     for (const edge of entityEdges) {
       // Walk either direction of the edge to find the connected node
@@ -125,9 +126,11 @@ export class MemoryValidator {
       // Only compare against existing fact nodes that have been embedded
       if (!targetNode || targetNode.type !== 'fact') continue;
       if (!targetNode.embedding) continue;
+      // A vector from another model or document prefix is not comparable (ADR-051).
+      if (targetNode.embeddingModel !== embeddingStamp(this.embeddingService.profile)) continue;
 
       const similarity = EmbeddingService.cosineSimilarity(newEmbedding, targetNode.embedding);
-      if (similarity >= DEDUP_SIMILARITY_THRESHOLD) {
+      if (similarity >= dedupThreshold) {
         // Multi-valued facts must not be merged when their `value` differs —
         // near-identical labels would otherwise overwrite `value` and destroy
         // the first fact. Check either side so an unrelated incoming write
@@ -156,12 +159,13 @@ export class MemoryValidator {
     //    the validated inputs plus the embedding from the dedup scan above.
     //    Timestamps are intentionally omitted — the store always stamps its own
     //    createdAt/lastConfirmedAt on INSERT; any value we set here would be ignored.
+    const { prefixes } = this.embeddingService.profile;
     return {
       action: 'create',
       validated: {
         label: options.label,
         properties: options.properties ?? {},
-        embedding: newEmbedding,
+        ...(prefixes.similarity === prefixes.document ? { embedding: newEmbedding } : {}),
         provenance: {
           confidence: options.confidence ?? 0.7,
           decayClass: options.decayClass ?? 'slow_decay',

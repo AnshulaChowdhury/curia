@@ -115,7 +115,7 @@ The heartbeat key identifies the capability tier, not the vendor. If you remap `
 | Key | Probe | Skipped when |
 |---|---|---|
 | `llm_fast/standard/powerful` | Last recorded call outcome for that tier (no billed probe call) | No model configured for that tier in `modelRoutingConfig.tiers` |
-| `embeddings` | Last recorded embedding call outcome | No `OPENAI_API_KEY` |
+| `embeddings` | Last recorded embedding call outcome, from OpenAI or the server at `EMBEDDING_BASE_URL` | Entity memory is off (no embedding endpoint, no profile for the model, or the boot schema check turned it off) |
 | `image_gen` | Last `image-generate` skill outcome | No `OPENAI_API_KEY` |
 | `nylas` | `listMessages(limit=1)` via the injected Nylas client | Email not configured (no `NylasClient` provided) |
 | `nylas_calendar` | `listCalendars()` via the principal calendar client (`ceo_nylas_grant_id`) | Calendar not configured (no `NylasCalendarClient`) |

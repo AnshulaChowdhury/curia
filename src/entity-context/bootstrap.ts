@@ -58,6 +58,12 @@ export async function bootstrapAgentIdentity(
        VALUES ('person', $1, $2, 1.0, 'permanent', 'bootstrap', now(), now(), 'contact')
        ON CONFLICT ((properties->>'is_agent')) WHERE (properties->>'is_agent') = 'true'
        DO UPDATE SET label = EXCLUDED.label,
+                     -- A vector made from the old name no longer matches the node.
+                     -- Both columns clear together for migration 103's CHECK.
+                     embedding = CASE WHEN kg_nodes.label IS DISTINCT FROM EXCLUDED.label
+                                      THEN NULL ELSE kg_nodes.embedding END,
+                     embedding_model = CASE WHEN kg_nodes.label IS DISTINCT FROM EXCLUDED.label
+                                            THEN NULL ELSE kg_nodes.embedding_model END,
                      last_confirmed_at = now(),
                      -- The conflict path must anchor too, not just the insert. An agent
                      -- node that exists while no contact points at it (a previous boot

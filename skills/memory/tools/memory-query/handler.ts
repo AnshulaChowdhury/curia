@@ -1,8 +1,8 @@
 // handler.ts — memory-query skill.
 //
 // Performs freeform semantic search over the knowledge graph. Embeds the
-// query string via text-embedding-3-small and returns the most similar nodes
-// by cosine similarity (highest score first).
+// query string with the configured embedding model (ADR-051) and returns the
+// most similar nodes by cosine similarity (highest score first).
 //
 // Supports three optional filters applied before the results are returned:
 //   - type          — restrict to a specific node type (person, fact, etc.)

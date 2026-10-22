@@ -119,16 +119,3 @@ tasks:
         - user.tavily_api_key
     credential_how_to: "Get a free API key at tavily.com. I'll send you a secure link to enter it."
     docs_url: /integrations/tavily
-
-  - id: kg_memory
-    label: "KG entity memory (OpenAI embeddings)"
-    value_prop: "Semantic relationship memory across people, projects, and context."
-    tier: one-key
-    handoff: in-chat
-    optional: true
-    completion_check:
-      type: vault_secrets_all
-      keys:
-        - user.openai_api_key
-    credential_how_to: "Get an OpenAI API key at platform.openai.com. I'll send you a secure link to enter it. This is optional — Curia works without it."
-    docs_url: /integrations/openai-embeddings

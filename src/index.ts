@@ -27,6 +27,7 @@ import { HttpAdapter } from './channels/http/http-adapter.js';
 import { resolveMemoryRetentionSnapshot } from './channels/http/routes/memory-retention.js';
 import { resolveSystemSnapshot } from './channels/http/routes/system.js';
 import { createPool } from './db/connection.js';
+import { CURIA_APPLICATION_NAME, holdInstanceLock } from './db/instance-lock.js';
 import { DbAvailabilityMonitor } from './db/availability-monitor.js';
 import { MemorySampler } from './monitoring/memory-sampler.js';
 import { EventBus } from './bus/bus.js';
@@ -57,7 +58,8 @@ import {
 import { WorkingMemory } from './memory/working-memory.js';
 import { sharedIdentifierSourceIndex } from './agents/identifier-source-index.js';
 import { createIdentifierSources } from './agents/identifier-sources.js';
-import { EmbeddingService } from './memory/embedding.js';
+import { EmbeddingService, redactUrlUserinfo } from './memory/embedding.js';
+import { resolveKnowledgeGraphEmbedding } from './memory/embedding-schema.js';
 import { KnowledgeGraphStore } from './memory/knowledge-graph.js';
 import { MemoryValidator } from './memory/validation.js';
 import { EntityMemory } from './memory/entity-memory.js';
@@ -327,7 +329,7 @@ async function main(): Promise<void> {
   // 2. Database — needed by audit logger before the bus can accept events.
   // We probe with SELECT 1 to distinguish a misconfigured URL (fast fail)
   // from a legitimate connection that might be retried later.
-  const pool = createPool(config.databaseUrl, logger);
+  const pool = createPool(config.databaseUrl, logger, { applicationName: CURIA_APPLICATION_NAME });
   try {
     await pool.query('SELECT 1');
     logger.info('Database connected');
@@ -384,6 +386,11 @@ async function main(): Promise<void> {
     logger.fatal({ err }, 'Database migration failed');
     process.exit(1);
   }
+
+  // Instance lock (ADR-051): held for the process's life so maintenance commands such as
+  // pnpm reembed:kg refuse to run beside a live Curia. Advisory only — a failure to take
+  // it, or its loss later, is logged and Curia keeps running.
+  const releaseInstanceLock = await holdInstanceLock(pool, logger);
 
   // Resolve bootstrap/config secrets from the vault now that migrations have run
   // (the `secrets` table exists) and before any consumer reads config (#911).
@@ -625,16 +632,20 @@ async function main(): Promise<void> {
     workingMemoryTtlDays,
   );
 
-  // Entity memory — optional, requires OPENAI_API_KEY for embeddings.
+  // Entity memory — optional, requires an embedding endpoint and a profile for its model.
   // If not configured, agents still work — they just don't have KG access.
   let entityMemory: EntityMemory | undefined;
   // Sensitivity classifier — declared outside the if-block (like entityMemory above) so it
   // stays in scope for the ExecutionLayer construction further down (#1419), which exposes
   // it to skills as the 'sensitivityClassifier' capability. Same availability as entityMemory:
-  // both require OPENAI_API_KEY today because the classifier is currently only built inside
-  // this branch — see the sensitivity_rules guard below for why it can't be built earlier.
+  // both require an embedding endpoint (the vault's openai_api_key or EMBEDDING_BASE_URL)
+  // and a profile for its model, because the classifier is currently only built inside this
+  // branch — see the sensitivity_rules guard below for why it can't be built earlier.
   let sensitivityClassifier: SensitivityClassifier | undefined;
-  if (config.openaiApiKey) {
+  // The schema gate (ADR-051): a width or model the stored vectors do not match, or an
+  // unfinished re-embed, keeps the knowledge graph off until a person runs the command.
+  const embedding = await resolveKnowledgeGraphEmbedding(pool, config, yamlConfig.embedding?.profiles, logger);
+  if (embedding.ok) {
     // Sensitivity classifier — built from the already-merged config (default.yaml +
     // local.yaml, see loadYamlConfig()) so operator overrides in local.yaml actually
     // take effect rather than being silently ignored (#1369). Malformed rules already
@@ -651,8 +662,9 @@ async function main(): Promise<void> {
     sensitivityClassifier = SensitivityClassifier.fromRules(yamlConfig.sensitivity_rules);
     logger.info({ ruleCount: yamlConfig.sensitivity_rules.length }, 'Sensitivity classifier loaded');
 
-    const embeddingService = EmbeddingService.createWithOpenAI(
-      config.openaiApiKey,
+    const embeddingService = EmbeddingService.createWithEndpoint(
+      embedding.endpoint,
+      embedding.profile,
       logger,
       bus,           // EventBus — wired at line 234
       modelRegistry, // ModelRegistry — wired at line 281
@@ -660,9 +672,23 @@ async function main(): Promise<void> {
     const kgStore = KnowledgeGraphStore.createWithPostgres(pool, embeddingService, logger);
     const validator = new MemoryValidator(kgStore, embeddingService);
     entityMemory = new EntityMemory(kgStore, validator, embeddingService, logger, sensitivityClassifier);
-    logger.info('Entity memory initialized with knowledge graph');
+    logger.info(
+      {
+        embeddingBaseUrl: redactUrlUserinfo(embedding.endpoint.baseUrl),
+        embeddingModel: embedding.endpoint.model,
+        embeddingDimensions: embedding.profile.dimensions,
+      },
+      'Entity memory initialized with knowledge graph',
+    );
+  } else if (embedding.gate === 'config') {
+    logger.warn(`${embedding.message} Entity memory is disabled (knowledge graph unavailable).`);
+  } else if (embedding.err) {
+    logger.error({ err: embedding.err }, `${embedding.message} Entity memory is disabled (knowledge graph unavailable).`);
   } else {
-    logger.warn('OPENAI_API_KEY not set — entity memory disabled (knowledge graph unavailable)');
+    logger.warn(
+      { embeddingSchema: embedding.state },
+      `${embedding.message} Until then entity memory is disabled (knowledge graph unavailable), and the sensitivity classifier and the setup wizard are off with it.`,
+    );
   }
 
   // Bullpen service — Tier 2 inter-agent discussion. Always initialized (no
@@ -1177,8 +1203,8 @@ async function main(): Promise<void> {
       // principal grant, resolved above), so they don't sit in contacts/meeting-debrief
       // tool lists failing closed. Gated on the BUILT client rather than vault key names
       // because the key resolves from three sources (channel key, env, legacy key).
-      // entityMemory is deliberately not listed: memory-*/setup-* have always been enabled
-      // without OpenAI and fail closed; the KG relationship tools gate on openai_api_key.
+      // entityMemory is deliberately not listed: the memory-* and setup-* tools are enabled
+      // without an embedding source and fail closed when entity memory is off.
       unavailableCapabilities: new Set(nylasCalendarClient ? [] : ['nylasCalendarClient']),
       defaults: registryDefaults,
       logger,
@@ -2396,6 +2422,7 @@ async function main(): Promise<void> {
     modelRoutingConfig,
     config: healthConfig,
     openaiApiKey: config.openaiApiKey,
+    embeddingsEnabled: entityMemory !== undefined,
     // Same order as the execution layer resolves web-search's secret: vault, then env.
     resolveTavilyApiKey: async () =>
       (await secretsService.get('tavily_api_key')) || process.env.TAVILY_API_KEY || null,
@@ -3196,7 +3223,7 @@ async function main(): Promise<void> {
     // Powers POST /api/setup/suggest-name (wizard starter-name suggestion, #799).
     infraLlmService,
     // Powers principal profile endpoints in setup routes (#392). Undefined when
-    // OPENAI_API_KEY is not set (entity memory requires embeddings); individual
+    // entity memory is off (no usable embedding source, ADR-051); individual
     // endpoints handle the absent case in Tasks 3–5.
     entityMemory,
     // Powers GET /api/health with real probes and canary state (#434).
@@ -3360,6 +3387,12 @@ async function main(): Promise<void> {
       } catch (err) {
         logger.error({ err }, 'Error shutting down temp file store during shutdown');
       }
+    }
+    // The lock's client is checked out, and pool.end() waits for every checked-out client.
+    try {
+      await releaseInstanceLock();
+    } catch (err) {
+      logger.error({ err }, 'Error releasing the instance lock during shutdown');
     }
     try {
       await pool.end();

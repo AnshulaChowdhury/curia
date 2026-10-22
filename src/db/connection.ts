@@ -15,6 +15,8 @@ export interface CreatePoolOptions {
    * Without this, a dead Postgres can hang callers indefinitely (#1381).
    */
   connectionTimeoutMillis?: number;
+  /** Shown in pg_stat_activity, so a session (such as the instance-lock holder) can be named. */
+  applicationName?: string;
 }
 
 /**
@@ -43,6 +45,8 @@ export function createPool(
     connectionString: databaseUrl,
     connectionTimeoutMillis:
       options.connectionTimeoutMillis ?? DEFAULT_CONNECTION_TIMEOUT_MS,
+    // Only when given: an application_name already in the connection string must survive.
+    ...(options.applicationName ? { application_name: options.applicationName } : {}),
   });
 
   pool.on('error', (err) => {

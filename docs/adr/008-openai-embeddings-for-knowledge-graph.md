@@ -1,7 +1,7 @@
 # ADR-008: OpenAI text-embedding-3-small for knowledge graph embeddings
 
 Date: 2026-02-20
-Status: Accepted
+Status: Superseded by [ADR-051](051-knowledge-graph-embeddings-from-a-configurable-endpoint.md)
 
 ## Context
 

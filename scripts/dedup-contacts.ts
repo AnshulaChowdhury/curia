@@ -14,6 +14,7 @@
 //
 // Run: pnpm run dedup:contacts [--dry-run]
 
+import path from 'node:path';
 import pg from 'pg';
 import { createLogger } from '../src/logger.js';
 import { classifyPair, type PairClassification } from '../src/contacts/dedup-classifier.js';
@@ -27,6 +28,11 @@ import { ModelRegistry } from '../src/agents/llm/model-registry.js';
 import { EventBus } from '../src/bus/bus.js';
 import { AuditLogger } from '../src/audit/logger.js';
 import { EmbeddingService } from '../src/memory/embedding.js';
+import { resolveKnowledgeGraphEmbedding, type KnowledgeGraphEmbedding } from '../src/memory/embedding-schema.js';
+import { loadConfig, loadYamlConfig } from '../src/config.js';
+import { loadEncryptionKey } from '../src/secrets/crypto.js';
+import { SecretsService } from '../src/secrets/secrets-service.js';
+import { applyVaultSecrets } from '../src/secrets/apply-vault-secrets.js';
 import { KnowledgeGraphStore } from '../src/memory/knowledge-graph.js';
 import { MemoryValidator } from '../src/memory/validation.js';
 import { EntityMemory } from '../src/memory/entity-memory.js';
@@ -700,12 +706,27 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
       //   - createTask: uses TaskRepo.createTask(), which publishes task.created events.
       //   - listExclusionPairKeys: reads contact_dedup_exclusions via ContactService.
       // A real sweep merges KG entity nodes (entityMemory.mergeEntities), which embeds fact
-      // labels and therefore needs OpenAI credentials. A dry-run never embeds, so it can run
-      // with a fake embedding backend and no API key — keeping the preview usable in CI /
-      // minimal environments. Fail fast only for a real run.
-      const openaiApiKey = process.env['OPENAI_API_KEY'];
-      if (!dryRun && !openaiApiKey) {
-        logger.error('dedup-contacts: OPENAI_API_KEY is required for a real sweep (KG entity merge embeds fact labels). Re-run with --dry-run to preview without it.');
+      // labels and therefore needs entity memory as boot would build it: an endpoint, a
+      // profile, and a table the schema check accepts. A dry-run never embeds, so it skips
+      // that check and runs with a fake embedding backend, keeping the preview usable in
+      // CI / minimal environments. Fail fast only for a real run.
+      // A real run reads the embedding keys from the vault, as boot and reembed-kg.ts do.
+      let embedding: KnowledgeGraphEmbedding | undefined;
+      if (!dryRun) {
+        const config = loadConfig();
+        await applyVaultSecrets(config, new SecretsService(pool, loadEncryptionKey(), logger), logger);
+        embedding = await resolveKnowledgeGraphEmbedding(
+          pool,
+          config,
+          loadYamlConfig(path.resolve(import.meta.dirname, '../config')).embedding?.profiles,
+          logger,
+        );
+      }
+      if (embedding && !embedding.ok) {
+        logger.error(
+          { err: embedding.gate === 'schema' ? embedding.err : undefined },
+          `dedup-contacts: ${embedding.message} A real sweep needs entity memory (KG entity merge embeds fact labels). Re-run with --dry-run to preview without it.`,
+        );
         process.exit(1);
       }
 
@@ -719,11 +740,10 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
       );
 
       const modelRegistry = new ModelRegistry(logger);
-      // With a key, use the real OpenAI-backed embeddings. Without one (dry-run only — the
-      // check above exits a real run that lacks a key), fall back to the fake backend; the
-      // dry-run path never embeds, so its results are unaffected.
-      const embeddingService = openaiApiKey
-        ? EmbeddingService.createWithOpenAI(openaiApiKey, logger, bus, modelRegistry)
+      // A real run uses real embeddings (the check above exits one that lacks them). A
+      // dry-run uses the fake backend; it never embeds, so its results are unaffected.
+      const embeddingService = embedding?.ok
+        ? EmbeddingService.createWithEndpoint(embedding.endpoint, embedding.profile, logger, bus, modelRegistry)
         : EmbeddingService.createForTesting();
       const kgStore = KnowledgeGraphStore.createWithPostgres(pool, embeddingService, logger);
       const validator = new MemoryValidator(kgStore, embeddingService);

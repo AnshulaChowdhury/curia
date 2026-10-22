@@ -149,7 +149,12 @@ export async function setupRoutes(
           // is the authoritative display name.
           try {
             await pool.query(
-              `UPDATE kg_nodes SET label = $1, last_confirmed_at = now()
+              // A vector made from the old label no longer matches the node. Clearing
+              // both columns lets the next re-embed fill it, and keeps the CHECK from
+              // migration 103 satisfied.
+              `UPDATE kg_nodes SET label = $1, last_confirmed_at = now(),
+                   embedding = CASE WHEN label IS DISTINCT FROM $1 THEN NULL ELSE embedding END,
+                   embedding_model = CASE WHEN label IS DISTINCT FROM $1 THEN NULL ELSE embedding_model END
                  WHERE id = $2 AND type = 'person'`,
               [trimmed, result.kgNodeId],
             );

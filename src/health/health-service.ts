@@ -76,7 +76,10 @@ export interface HealthServiceDeps {
   mcpServerStatuses?: ReadonlyMap<string, McpServerLoadStatus>;
   modelRoutingConfig: ModelRoutingConfig;
   config: HealthConfig;
+  /** Gates the image_gen canary. */
   openaiApiKey?: string;
+  /** Whether entity memory runs with an embedding service; the embeddings canary is skipped without one. */
+  embeddingsEnabled?: boolean;
   /**
    * Resolves the Tavily key at canary time, vault first then `TAVILY_API_KEY`, as the
    * execution layer does for web-search (#2242). null → the tavily canary is skipped.
@@ -242,7 +245,7 @@ export class HealthService {
    */
   async runCanaries(): Promise<CanaryResult[]> {
     const {
-      logger, config, openaiApiKey, resolveTavilyApiKey,
+      logger, config, openaiApiKey, embeddingsEnabled, resolveTavilyApiKey,
       nylasClient, nylasCalendarClient, signalRpcClient,
       mcpSessions, mcpFixedInputs, modelRoutingConfig,
     } = this.deps;
@@ -274,9 +277,10 @@ export class HealthService {
       await run(`llm_${tier}`, async () => this.canaryLlmTier(tier, modelRoutingConfig));
     }
 
-    // Embeddings canary — skipped when OpenAI is not configured.
+    // Embeddings canary — skipped when entity memory has no embedding service, whichever
+    // endpoint (OpenAI or the operator's own) would serve it.
     await run('embeddings', async () => {
-      if (!openaiApiKey) return { name: 'embeddings', status: 'skipped' };
+      if (!embeddingsEnabled) return { name: 'embeddings', status: 'skipped' };
       return this.canaryOutcome('embeddings', 'embeddings');
     });
 

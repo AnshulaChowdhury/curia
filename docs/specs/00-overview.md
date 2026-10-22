@@ -100,7 +100,7 @@ All event types are defined as a TypeScript discriminated union — no `any` pay
 - **Config:** YAML (js-yaml) with env var interpolation
 - **Logging:** pino (structured JSON)
 - **Migrations:** node-pg-migrate (plain SQL migrations, no ORM coupling)
-- **Embeddings:** OpenAI `text-embedding-3-small` (1536 dimensions), pgvector HNSW index
+- **Embeddings:** any OpenAI-compatible `/embeddings` endpoint, OpenAI `text-embedding-3-small` by default; width and thresholds from a per-model profile (ADR-051); pgvector HNSW index
 
 ---
 
