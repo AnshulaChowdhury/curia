@@ -62,6 +62,11 @@ export interface McpLoadResult {
    * connect failure surfaces on `/api/health` (#1500).
    */
   serverStatuses: Map<string, McpServerLoadStatus>;
+  /**
+   * Server name → fixed_inputs resolved this boot, for every server that registered
+   * tools. HealthService's google_workspace canary sends them with its live call (#2242).
+   */
+  fixedInputs: Map<string, Record<string, string>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -448,12 +453,13 @@ export async function loadMcpServers(
 
   if (servers.length === 0) {
     logger.debug('No MCP servers configured in config/skills.yaml');
-    return { sessions: [], projectedTools: new Map(), serverStatuses: new Map() };
+    return { sessions: [], projectedTools: new Map(), serverStatuses: new Map(), fixedInputs: new Map() };
   }
 
   const sessions: McpSession[] = [];
   const projectedTools = new Map<string, string[]>();
   const serverStatuses = new Map<string, McpServerLoadStatus>();
+  const fixedInputs = new Map<string, Record<string, string>>();
 
   for (const serverEntry of servers) {
     // Registry filter first: disabled servers must not affect health (#1500).
@@ -676,9 +682,10 @@ export async function loadMcpServers(
     );
     sessions.push(session);
     serverStatuses.set(serverEntry.name, { status: 'ok', toolCount: registeredNames.length });
+    fixedInputs.set(serverEntry.name, resolvedFixedInputs);
   }
 
-  return { sessions, projectedTools, serverStatuses };
+  return { sessions, projectedTools, serverStatuses, fixedInputs };
 }
 
 /** One entry of an MCP server's tools/list result: what registration reads from it. */

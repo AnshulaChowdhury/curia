@@ -120,8 +120,8 @@ The heartbeat key identifies the capability tier, not the vendor. If you remap `
 | `nylas` | `listMessages(limit=1)` via the injected Nylas client | Email not configured (no `NylasClient` provided) |
 | `nylas_calendar` | `listCalendars()` via the principal calendar client (`ceo_nylas_grant_id`) | Calendar not configured (no `NylasCalendarClient`) |
 | `signal` | Signal-cli socket ping | Signal not configured |
-| `google_workspace` | Credential file readable + refresh token not expired | MCP server not registered |
-| `tavily` | `TAVILY_API_KEY` present in environment | Key not injected into `HealthService` (not yet wired from vault; always skipped in current build) |
+| `google_workspace` | `list_drive_items` (one item) through the MCP session, which exercises the OAuth grant. Also fails on a `zero_tools` or `unavailable` boot | `google-workspace` MCP server not enabled |
+| `tavily` | `GET https://api.tavily.com/usage` with the key (no search credits spent) | No `tavily_api_key` in the vault and no `TAVILY_API_KEY` env var |
 
 ### LLM canaries make no billed calls
 

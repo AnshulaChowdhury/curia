@@ -80,11 +80,25 @@ export interface HealthServiceDeps {
   openaiApiKey?: string;
   /** Whether entity memory runs with an embedding service; the embeddings canary is skipped without one. */
   embeddingsEnabled?: boolean;
-  tavilyApiKey?: string;
-  /** Absolute path to the Google Workspace credential JSON file.
-   *  Required for the google_workspace canary; absent means it is skipped. */
-  googleWorkspaceConfigPath?: string;
+  /**
+   * Resolves the Tavily key at canary time, vault first then `TAVILY_API_KEY`, as the
+   * execution layer does for web-search (#2242). null → the tavily canary is skipped.
+   */
+  resolveTavilyApiKey?: () => Promise<string | null>;
+  /**
+   * Resolved fixed_inputs per MCP server, from loadMcpServers (#2242). The
+   * google_workspace canary sends these with its live Drive call, the same way a
+   * tool handler does (workspace-mcp requires `user_google_email`).
+   */
+  mcpFixedInputs?: ReadonlyMap<string, Readonly<Record<string, string>>>;
 }
+
+/** Tavily usage endpoint: validates the key without spending search credits. */
+const TAVILY_USAGE_URL = 'https://api.tavily.com/usage';
+/** Cheapest read-only workspace-mcp call that goes through Google OAuth. */
+const GOOGLE_WORKSPACE_PROBE_TOOL = 'list_drive_items';
+/** A stdio MCP round trip plus a Drive API call; once a day, so generous. */
+const GOOGLE_WORKSPACE_PROBE_TIMEOUT_MS = 15_000;
 
 export class HealthService {
   // Exposed as a private field so integration tests can reach it via
@@ -231,9 +245,9 @@ export class HealthService {
    */
   async runCanaries(): Promise<CanaryResult[]> {
     const {
-      logger, config, openaiApiKey, embeddingsEnabled, tavilyApiKey,
-      nylasClient, nylasCalendarClient, signalRpcClient, googleWorkspaceConfigPath,
-      mcpSessions, modelRoutingConfig,
+      logger, config, openaiApiKey, embeddingsEnabled, resolveTavilyApiKey,
+      nylasClient, nylasCalendarClient, signalRpcClient,
+      mcpSessions, mcpFixedInputs, modelRoutingConfig,
     } = this.deps;
     const results: CanaryResult[] = [];
 
@@ -317,9 +331,10 @@ export class HealthService {
       return { name: 'signal', status: result === 'ok' ? 'ok' : 'fail' };
     });
 
-    // Google Workspace canary — credential file readable and refresh token not expired.
-    // Also fail when the enabled MCP session is missing or advertises 0 tools (#1500),
-    // so Better Stack heartbeats stop pinging instead of staying green.
+    // Google Workspace canary — one live Drive call through the MCP session, so an
+    // expired or revoked OAuth grant fails it (#2242). Also fail when the enabled
+    // server is unavailable or advertises 0 tools (#1500), so Better Stack heartbeats
+    // stop pinging instead of staying green.
     await run('google_workspace', async () => {
       const boot = this.deps.mcpServerStatuses?.get('google-workspace');
       if (boot?.status === 'zero_tools') {
@@ -329,14 +344,15 @@ export class HealthService {
         return { name: 'google_workspace', status: 'fail', detail: boot.reason };
       }
       const session = mcpSessions.find(s => s.serverId === 'google-workspace');
-      if (!session || !googleWorkspaceConfigPath) return { name: 'google_workspace', status: 'skipped' };
-      return this.canaryGoogleWorkspace(googleWorkspaceConfigPath);
+      if (!session) return { name: 'google_workspace', status: 'skipped' };
+      return this.canaryGoogleWorkspace(session, mcpFixedInputs?.get('google-workspace') ?? {});
     });
 
-    // Tavily canary — key presence is sufficient; no live API call.
+    // Tavily canary — the usage endpoint authenticates the key without spending credits.
     await run('tavily', async () => {
-      if (!tavilyApiKey) return { name: 'tavily', status: 'skipped' };
-      return { name: 'tavily', status: 'ok' };
+      const apiKey = resolveTavilyApiKey ? await resolveTavilyApiKey() : null;
+      if (!apiKey) return { name: 'tavily', status: 'skipped' };
+      return this.canaryTavily(apiKey);
     });
 
     return results;
@@ -413,23 +429,51 @@ export class HealthService {
   }
 
   /**
-   * Read the Google Workspace credential file and check whether the refresh token
-   * has expired. The file is a standard OAuth2 credentials JSON with an expiry_date
-   * field (epoch milliseconds).
+   * List one Drive item through the google-workspace MCP session (#2242). This goes
+   * through workspace-mcp's OAuth refresh, so a revoked or expired grant fails here.
+   *
+   * The detail never carries the server's error text or a thrown message: either can
+   * echo the fixed_inputs back, and canary detail is logged (same rule as
+   * buildMcpToolHandler in mcp-loader).
    */
-  private async canaryGoogleWorkspace(credentialPath: string): Promise<CanaryResult> {
-    const { readFile } = await import('node:fs/promises');
+  private async canaryGoogleWorkspace(
+    session: McpSession,
+    fixedInputs: Readonly<Record<string, string>>,
+  ): Promise<CanaryResult> {
     try {
-      const raw = await readFile(credentialPath, 'utf-8');
-      // Cast through unknown — runtime JSON.parse() guarantees the value is an object,
-      // but we cannot know its shape statically without a full schema validator.
-      const creds = JSON.parse(raw) as unknown as { expiry_date?: number };
-      if (creds.expiry_date && creds.expiry_date < Date.now()) {
-        return { name: 'google_workspace', status: 'fail', detail: 'refresh token expired' };
+      const result = await session.client.callTool(
+        // page_size last: a fixed input must not widen the one-item probe.
+        { name: GOOGLE_WORKSPACE_PROBE_TOOL, arguments: { ...fixedInputs, page_size: 1 } },
+        undefined,
+        { timeout: GOOGLE_WORKSPACE_PROBE_TIMEOUT_MS },
+      );
+      if (result.isError === true) {
+        return { name: 'google_workspace', status: 'fail', detail: `${GOOGLE_WORKSPACE_PROBE_TOOL} returned an error result` };
       }
       return { name: 'google_workspace', status: 'ok' };
     } catch (err) {
-      return { name: 'google_workspace', status: 'fail', detail: String(err) };
+      const errorName = err instanceof Error ? err.name : typeof err;
+      return { name: 'google_workspace', status: 'fail', detail: `${GOOGLE_WORKSPACE_PROBE_TOOL} call threw ${errorName}` };
+    }
+  }
+
+  /**
+   * Authenticate the Tavily key against the usage endpoint (#2242). Reports the HTTP
+   * status only, never the key.
+   */
+  private async canaryTavily(apiKey: string): Promise<CanaryResult> {
+    try {
+      const response = await fetch(TAVILY_USAGE_URL, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!response.ok) {
+        return { name: 'tavily', status: 'fail', detail: `usage endpoint returned HTTP ${response.status}` };
+      }
+      return { name: 'tavily', status: 'ok' };
+    } catch (err) {
+      const errorName = err instanceof Error ? err.name : typeof err;
+      return { name: 'tavily', status: 'fail', detail: `usage request failed (${errorName})` };
     }
   }
 

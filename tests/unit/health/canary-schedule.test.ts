@@ -201,7 +201,7 @@ describe('CanarySchedule driving HealthService.runCanaries', () => {
         ...DEFAULT_HEALTH_CONFIG,
         heartbeats: { ...DEFAULT_HEALTH_CONFIG.heartbeats, tavily: HEARTBEAT },
       },
-      tavilyApiKey: 'tvly-test',
+      resolveTavilyApiKey: async () => 'tvly-test',
     });
     await healthService.start();
 

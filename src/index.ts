@@ -1308,6 +1308,7 @@ async function main(): Promise<void> {
   let mcpSessions: McpSession[] = [];
   let mcpProjectedTools = new Map<string, string[]>();
   let mcpServerStatuses = new Map<string, McpServerLoadStatus>();
+  let mcpFixedInputs = new Map<string, Record<string, string>>();
   try {
     const mcpLoad = await loadMcpServers(
       configDir, toolRegistry, logger, secretsService, enabledMcpServers, principalIdentities,
@@ -1315,6 +1316,7 @@ async function main(): Promise<void> {
     mcpSessions = mcpLoad.sessions;
     mcpProjectedTools = mcpLoad.projectedTools;
     mcpServerStatuses = mcpLoad.serverStatuses;
+    mcpFixedInputs = mcpLoad.fixedInputs;
   } catch (err) {
     // Malformed skills.yaml or unexpected loader error — degrade gracefully rather
     // than crashing. The startup validator catches schema violations, but a YAML
@@ -2416,12 +2418,14 @@ async function main(): Promise<void> {
     signalPulseSocketPath: signalCallBridge ? config.signalPulseSocketPath : undefined,
     mcpSessions,
     mcpServerStatuses,
+    mcpFixedInputs,
     modelRoutingConfig,
     config: healthConfig,
     openaiApiKey: config.openaiApiKey,
     embeddingsEnabled: entityMemory !== undefined,
-    tavilyApiKey: undefined,             // vault secret, not in config — canary skipped
-    googleWorkspaceConfigPath: undefined, // OAuth env vars, no credential file — canary skipped
+    // Same order as the execution layer resolves web-search's secret: vault, then env.
+    resolveTavilyApiKey: async () =>
+      (await secretsService.get('tavily_api_key')) || process.env.TAVILY_API_KEY || null,
   });
   await healthService.start();
 
