@@ -45,13 +45,15 @@
 // the values it returns stay inside createTestModeStack: the ExecutionLayer never sees
 // the vault, and the returned `config` carries no vault value.
 //
-// Known differences from production (none of them change the system prompt):
+// Known differences from production (only the last two change the system prompt):
 //   - The tools above fail closed instead of running.
 //   - MCP tools come from a snapshot and return canned results; a configured server
 //     without a snapshot is absent (listed in `warnings`).
 //   - No Dispatcher: the caller wires its own (the smoke harness does).
-//   - Offline mode without SECRET_ENCRYPTION_KEY: no Signal number, and email
+//   - Offline mode without SECRET_ENCRYPTION_KEY: no Signal or SMS number, and email
 //     self-addresses come from email_accounts without the vault grant check.
+//   - Your Contact Details shows the Signal and SMS numbers whenever they resolve;
+//     production also drops a number whose channel is disabled in the registry.
 
 import * as path from 'node:path';
 import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveLateDeliveryConfig, resolveTasksConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
@@ -655,6 +657,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
   let openaiApiKey = config.openaiApiKey;
   let embeddingApiKey = config.embeddingApiKey;
   let signalPhoneNumber = config.signalPhoneNumber;
+  let smsFromNumber = config.smsFromNumber;
   const llmMode = options.llm ?? 'live';
   const warnings: string[] = [];
   const configDir = options.configDir ?? path.join(REPO_ROOT, 'config');
@@ -702,7 +705,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       throw new Error('SECRET_ENCRYPTION_KEY is required: LLM API keys are read from the vault (#911)');
     } else {
       warnings.push(
-        'SECRET_ENCRYPTION_KEY is not set — no vault: the Signal number is missing from Your Contact ' +
+        'SECRET_ENCRYPTION_KEY is not set — no vault: the Signal and SMS numbers are missing from Your Contact ' +
         'Details, email addresses skip the grant check, and tools not yet enrolled that need a vault ' +
         'secret or the calendar stay off, so the prompt may differ from production.',
       );
@@ -710,8 +713,9 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     if (encryptionKey) {
       vault = new SecretsService(pool, encryptionKey, logger);
       // Resolve onto a throwaway copy and keep only what the stack uses: the LLM keys
-      // and the Signal number for the prompt. Nylas, Slack, SMS and API tokens are
-      // dropped here, so nothing downstream can build a transport client from them.
+      // and the Signal and SMS numbers for the prompt. Nylas, Slack, SMS credentials and
+      // API tokens are dropped here, so nothing downstream can build a transport client
+      // from them.
       const resolved: Config = { ...config };
       await applyVaultSecrets(resolved, vault, logger);
       await applyChannelVaultSecrets(resolved, vault, process.env, logger);
@@ -722,6 +726,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       openaiApiKey = resolved.openaiApiKey;
       embeddingApiKey = resolved.embeddingApiKey;
       signalPhoneNumber = resolved.signalPhoneNumber;
+      smsFromNumber = resolved.smsFromNumber;
       if (resolved.nylasApiKey) {
         try {
           calendarConfigured = (await resolvePrincipalCalendarGrant(vault)) !== undefined;
@@ -969,7 +974,8 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       officeIdentityService: agentOfficeIdentity,
       securityContextBlock,
       timezone: config.timezone,
-      channelAccounts: { email: selfEmails[0], phone: signalPhoneNumber },
+      // Not gated on the channel registry as production is (see the header).
+      channelAccounts: { email: selfEmails[0], signal: signalPhoneNumber, sms: smsFromNumber },
       selfEmails,
       principalIdentities,
       principalPrimaryEmail,

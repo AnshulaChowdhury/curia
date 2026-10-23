@@ -139,6 +139,23 @@ export function formatWhoYouServeBlock(
   ].join('\n');
 }
 
+/**
+ * The phone lines of `## Your Contact Details`, labelled by channel. Signal and
+ * SMS/voice are separate accounts that may use different numbers, so a single
+ * "Phone" line would claim the Signal number takes texts it never receives. One
+ * combined line when both are set to the same number (compared by digits only).
+ */
+export function formatOwnPhoneLines(signal: string | undefined, sms: string | undefined): string[] {
+  const digits = (value: string): string => value.replace(/\D/g, '');
+  if (signal && sms && digits(signal) === digits(sms)) {
+    return [`- Phone (Signal, SMS and voice): ${sms}`];
+  }
+  const lines: string[] = [];
+  if (signal) lines.push(`- Signal: ${signal}`);
+  if (sms) lines.push(`- Phone (SMS and voice): ${sms}`);
+  return lines;
+}
+
 /** Intro lines for `## Your Contact Details`. Shared so the debug renderer cannot drift. */
 export const OWN_CONTACT_DETAILS_INTRO: readonly string[] = [
   'These are your own accounts. Use them when tools require an email address, phone number,',

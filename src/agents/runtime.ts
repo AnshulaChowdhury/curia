@@ -232,13 +232,17 @@ export interface AgentConfig {
    *  block is appended to the system prompt on every task so the date is always fresh.
    *  If omitted, no time block is injected. */
   timezone?: string;
-  /** Curia's own channel contact details, sourced from deployment env vars (NYLAS_SELF_EMAIL,
-   *  SIGNAL_PHONE_NUMBER). When provided, a "Your Contact Details" block is added to the
-   *  system prompt preamble so the LLM knows which accounts to use when tools ask for an email address
-   *  or phone number. Injected into all agents — specialists need this too (#387). */
+  /** Curia's own channel contact details: the first mailbox's address, the Signal account
+   *  number (channel.signal.phone_number) and the SMS/voice DID (channel.sms.from_number).
+   *  The two numbers are separate fields because they are separate accounts: a deployment
+   *  may run SMS on a different number from Signal. When provided, a "Your Contact Details"
+   *  block is added to the system prompt preamble so the LLM knows which accounts to use
+   *  when tools ask for an email address or phone number. Injected into all agents —
+   *  specialists need this too (#387). */
   channelAccounts?: {
     email?: string;
-    phone?: string;
+    signal?: string;
+    sms?: string;
   };
   /**
    * Every owned mailbox. Email contact-recent recall requires one of these

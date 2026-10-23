@@ -145,6 +145,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Fixed
 
 - **Email reply-all** — keeps every original To recipient on To; replies to Curia's own messages reach their recipients. (#2273)
+- **Your Contact Details** — lists Signal and SMS numbers separately, so Curia stops giving Signal as its texting number.
 - **`curia-postgres` shutdown** — `docker stop` now lets Postgres finish shutting down instead of killing it midway.
 - **`send-draft`** — finds drafts by ID, fixing Gmail 400s; missing drafts no longer read as transient. (#2262)
 - **`email-list` drafts** — `folder: DRAFTS` lists drafts instead of failing on Gmail. (#2262)

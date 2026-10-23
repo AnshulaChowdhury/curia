@@ -25,7 +25,7 @@ function coordinatorConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
       getConfig: async () => ({ score: 82, band: 'spot-check', updatedAt: new Date(0), updatedBy: 'principal' }),
     },
     timezone: 'America/Toronto ',
-    channelAccounts: { email: 'curia@example.com', phone: undefined },
+    channelAccounts: { email: 'curia@example.com', signal: '+15550003333', sms: undefined },
     agentContactId: AGENT_CONTACT_ID,
     principalIdentities: [
       { channel: 'email', channelIdentifier: 'p@example.com', label: 'work', verified: true, status: 'active' },
@@ -70,7 +70,8 @@ describe('buildPromptInputsSnapshot', () => {
         { channel: 'signal', channel_identifier: '+15550001111', label: null },
       ],
       principal_primary_email: 'p@example.com',
-      channel_accounts: { email: 'curia@example.com', phone: null },
+      // phone mirrors signal for curia-deploy's loader until it reads signal/sms.
+      channel_accounts: { email: 'curia@example.com', signal: '+15550003333', sms: null, phone: '+15550003333' },
       disabled_skills: ['calendar', 'ceo-inbox'],
     });
   });

@@ -70,7 +70,8 @@ export interface PromptInputsSnapshot {
   /** Verified + active only (readPrincipalIdentitySnapshot) — the fields the block renders. */
   principal_identities: Array<{ channel: string; channel_identifier: string; label: string | null }>;
   principal_primary_email: string | null;
-  channel_accounts: { email: string | null; phone: string | null };
+  /** `phone` is a legacy alias of `signal` for curia-deploy's loader. */
+  channel_accounts: { email: string | null; signal: string | null; sms: string | null; phone: string | null };
   /**
    * SKILL.md bundles on disk that this deployment does not enable. Production never
    * registers them, so a pin on one contributes no instructions; the harness omits them
@@ -132,7 +133,11 @@ export async function buildPromptInputsSnapshot(
     principal_primary_email: rc.principalPrimaryEmail.current ?? null,
     channel_accounts: {
       email: rc.channelAccounts.email ?? null,
-      phone: rc.channelAccounts.phone ?? null,
+      signal: rc.channelAccounts.signal ?? null,
+      sms: rc.channelAccounts.sms ?? null,
+      // Legacy key: curia-deploy's loader and fetch-prompt-blocks.sh still require
+      // `phone`, which was always the Signal number. Drop once they read signal/sms.
+      phone: rc.channelAccounts.signal ?? null,
     },
     // The stack's SkillRegistry holds exactly what production's reconcile enables.
     disabled_skills: discoveredSkillNames.filter((name) => !stack.skillRegistry.get(name)).sort(),

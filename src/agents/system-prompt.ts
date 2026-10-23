@@ -29,6 +29,7 @@ import { DEFAULT_ERROR_BUDGET } from '../errors/types.js';
 import { parseSchedulerRunJobId } from '../scheduler/conversation-id.js';
 import { formatTimeContextBlock } from '../time/time-context.js';
 import {
+  formatOwnPhoneLines,
   formatWhoYouServeBlock,
   OWN_CONTACT_DETAILS_INTRO,
 } from './principal-contact-block.js';
@@ -141,10 +142,11 @@ export async function buildBaseSystemPrompt(
   // gating on channel accounts alone would drop the contact ID for a deployment with
   // no email/phone (codeant review on #974).
   const { channelAccounts } = sources;
-  if ((channelAccounts && (channelAccounts.email || channelAccounts.phone)) || sources.agentContactId) {
+  const ownPhoneLines = formatOwnPhoneLines(channelAccounts?.signal, channelAccounts?.sms);
+  if (channelAccounts?.email || ownPhoneLines.length > 0 || sources.agentContactId) {
     const lines: string[] = ['## Your Contact Details', ...OWN_CONTACT_DETAILS_INTRO, ''];
     if (channelAccounts?.email) lines.push(`- Email: ${channelAccounts.email}`);
-    if (channelAccounts?.phone) lines.push(`- Phone: ${channelAccounts.phone}`);
+    lines.push(...ownPhoneLines);
     // The agent's own contact ID — coordinator-only in practice.
     if (sources.agentContactId) lines.push(`- Contact ID: ${sources.agentContactId}`);
     preambleParts.push(lines.join('\n'));

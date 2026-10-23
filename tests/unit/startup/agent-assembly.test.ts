@@ -173,7 +173,7 @@ function buildContext(provider: LLMProvider, configs: AgentYamlConfig[]): AgentA
     } as unknown as OfficeIdentityService,
     securityContextBlock: '## Security\nPolicy here.',
     timezone: 'America/Toronto',
-    channelAccounts: { email: 'curia@example.com', phone: '+15550001111' },
+    channelAccounts: { email: 'curia@example.com', signal: '+15550001111', sms: '+15550002222' },
     selfEmails: ['curia@example.com'],
     principalIdentities: [principalIdentity()],
     principalPrimaryEmail: { current: 'principal@example.com' },
@@ -245,7 +245,7 @@ describe('assembleAgent', () => {
     expect(rc.resolvedModel).toBe('claude-haiku-4-5');
     // Every agent still gets time, own and principal contact details.
     expect(rc.timezone).toBe('America/Toronto');
-    expect(rc.channelAccounts).toEqual({ email: 'curia@example.com', phone: '+15550001111' });
+    expect(rc.channelAccounts).toEqual({ email: 'curia@example.com', signal: '+15550001111', sms: '+15550002222' });
     expect(rc.principalIdentities).toHaveLength(1);
   });
 

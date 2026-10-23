@@ -2700,10 +2700,14 @@ async function main(): Promise<void> {
     officeIdentityService,
     securityContextBlock,
     timezone: config.timezone,
-    // Email: the first account's address for agent context injection.
+    // Email: the first account's address for agent context injection. The numbers are
+    // gated on channelShouldStart like the outbound clients, so a disabled channel's
+    // number is never advertised. Signal and SMS are separate fields: SMS can run on
+    // a different number (Telnyx DID) from the Signal account.
     channelAccounts: {
       email: resolvedEmailAccounts[0]?.selfEmail,
-      phone: config.signalPhoneNumber,
+      signal: registryGatedOutbound.signalPhoneNumber,
+      sms: channelShouldStart.has('sms') ? config.smsFromNumber : undefined,
     },
     selfEmails: resolvedEmailAccounts.map(a => a.selfEmail),
     // Shared hot-reload array/holder (#1514) — passed by reference.
