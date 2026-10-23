@@ -478,6 +478,15 @@ interface StartVoiceSessionParams {
   transport?: AudioTransport;
 }
 
+interface CarriedUtterance {
+  utterance: string;
+  /** The user row as stored (sanitized), for the pairing check. */
+  storedContent: string;
+  /** False when that turn's user-row write failed — never pair an older row. */
+  persisted: boolean;
+  fragments: number;
+}
+
 interface ActiveSession {
   sessionId: string;
   conversationId: string;
@@ -511,10 +520,11 @@ interface ActiveSession {
   drainScheduled: boolean;
   /**
    * Utterance whose turn barge-in cancelled before any audio played. The next
-   * turn runs on it joined with what the caller said next (#2240).
+   * turn runs on it joined with what the caller said next (#2240). Its stored
+   * user row is unpaired until then; if it never joins (hang-up, oversize join)
+   * it is paired with the failure marker instead.
    */
-  carryOverUtterance: string;
-  carryOverFragments: number;
+  carryOver: CarriedUtterance | null;
   turnStats: VoiceSessionTurnStats;
   ttsSeq: number;
   ending: boolean;
@@ -631,8 +641,7 @@ export class VoiceRuntime {
         queuedUtterance: '',
         queuedFragments: 0,
         drainScheduled: false,
-        carryOverUtterance: '',
-        carryOverFragments: 0,
+        carryOver: null,
         turnStats: { utterances: 0, turns: 0, bargeInCancels: 0, joinedUtterances: 0 },
         ttsSeq: 0,
         ending: false,
@@ -704,11 +713,11 @@ export class VoiceRuntime {
       this.bargeIn(session);
     }
 
-    // Speech inside the hold window: the caller resumed, so the utterance stays
-    // open and the next end-of-speech re-arms the hold (#2240).
+    // Speech inside the hold window: the caller resumed. Restart the hold rather
+    // than clearing it — an interim Deepgram later revises away never brings a
+    // final or an end-of-speech, and the held utterance must still run (#2240).
     if (isSpeech && session.holdTimer) {
-      clearTimeout(session.holdTimer);
-      session.holdTimer = null;
+      this.armHold(session);
     }
 
     if (!event.isFinal) return;
@@ -738,26 +747,34 @@ export class VoiceRuntime {
     // End-of-speech. Deepgram can send it twice per utterance (speech_final,
     // then UtteranceEnd with no words); only one that closes new words counts.
     if (event.speechFinal) {
-      if (session.wordsSinceEndOfSpeech) {
+      const closedWords = session.wordsSinceEndOfSpeech;
+      if (closedWords) {
         session.wordsSinceEndOfSpeech = false;
         session.pendingFragments += 1;
         session.turnStats.utterances += 1;
       }
       if (session.pendingFinalText.trim().length === 0) return;
 
-      const holdMs = this.config.turnHoldMs ?? DEFAULT_TURN_HOLD_MS;
-      if (holdMs <= 0) {
+      if ((this.config.turnHoldMs ?? DEFAULT_TURN_HOLD_MS) <= 0) {
         this.flushPendingUtterance(session);
         return;
       }
-      // Already holding (e.g. UtteranceEnd right after speech_final): keep the
-      // original deadline rather than pushing the turn back.
-      if (session.holdTimer) return;
-      session.holdTimer = setTimeout(() => {
-        session.holdTimer = null;
-        this.flushPendingUtterance(session);
-      }, holdMs);
+      // Re-arm whenever this end-of-speech closed new words, including a short or
+      // low-confidence "ok" that did not pass the speech gate above. One with no
+      // new words (UtteranceEnd right after speech_final) keeps the deadline.
+      if (closedWords || !session.holdTimer) {
+        this.armHold(session);
+      }
     }
+  }
+
+  /** (Re)start the hold; when it fires, the pending utterance becomes a turn. */
+  private armHold(session: ActiveSession): void {
+    if (session.holdTimer) clearTimeout(session.holdTimer);
+    session.holdTimer = setTimeout(() => {
+      session.holdTimer = null;
+      this.flushPendingUtterance(session);
+    }, this.config.turnHoldMs ?? DEFAULT_TURN_HOLD_MS);
   }
 
   /** Hand the finished utterance to the turn queue. */
@@ -810,28 +827,56 @@ export class VoiceRuntime {
       .catch(err => {
         this.log.warn({ sessionId: session.sessionId, err }, 'previous voice turn rejected; continuing chain');
       })
-      .then(() => {
+      .then(async () => {
         session.drainScheduled = false;
-        let next = joinUtterances(session.carryOverUtterance, session.queuedUtterance);
-        let nextFragments = session.carryOverFragments + session.queuedFragments;
+        // endSession takes any carry-over itself, synchronously with setting ending.
+        if (session.ending) return;
+        const carry = session.carryOver;
+        const queued = session.queuedUtterance;
+        const queuedFragments = session.queuedFragments;
+        session.carryOver = null;
+        session.queuedUtterance = '';
+        session.queuedFragments = 0;
+
+        let next = joinUtterances(carry?.utterance ?? '', queued);
+        let nextFragments = (carry?.fragments ?? 0) + queuedFragments;
         const maxBytes = this.config.maxUtteranceBytes ?? DEFAULT_MAX_UTTERANCE_BYTES;
-        if (session.carryOverUtterance && Buffer.byteLength(next, 'utf8') > maxBytes) {
+        if (carry && Buffer.byteLength(next, 'utf8') > maxBytes) {
           this.log.warn(
             { sessionId: session.sessionId, maxBytes },
             'joined voice utterance exceeded maxUtteranceBytes; dropping the carried-over part',
           );
-          next = session.queuedUtterance;
-          nextFragments = session.queuedFragments;
+          await this.pairCarriedUtterance(session, carry);
+          next = queued;
+          nextFragments = queuedFragments;
         }
-        session.carryOverUtterance = '';
-        session.carryOverFragments = 0;
-        session.queuedUtterance = '';
-        session.queuedFragments = 0;
-        if (next.length === 0 || session.ending) return;
-        session.turnStats.turns += 1;
-        if (nextFragments > 1) session.turnStats.joinedUtterances += nextFragments - 1;
-        return this.runUserTurn(session, next, nextFragments);
+        if (next.length === 0) return;
+        await this.runUserTurn(session, next, nextFragments);
       });
+  }
+
+  /**
+   * A user turn reached an outcome — a reply, an error, or a hang-up — instead
+   * of being carried into a later turn. Every fragment but one in it was joined,
+   * so utterances = turns + joinedUtterances across a session.
+   */
+  private recordTurnOutcome(session: ActiveSession, fragments: number): void {
+    session.turnStats.turns += 1;
+    session.turnStats.joinedUtterances += Math.max(fragments - 1, 0);
+  }
+
+  /**
+   * Pair a carried-over utterance that will not join a later turn with the
+   * failure marker, so its stored user row is not left unpaired (dropped from
+   * later LLM context, shown without a reply in console history).
+   */
+  private async pairCarriedUtterance(session: ActiveSession, carry: CarriedUtterance): Promise<void> {
+    await this.persistIncompleteAssistantTurn(session, {
+      inProcessContent: carry.utterance,
+      storedContent: carry.storedContent,
+      persistToStore: carry.persisted,
+    });
+    this.recordTurnOutcome(session, carry.fragments);
   }
 
   private enqueueGreetingTurn(session: ActiveSession): void {
@@ -896,6 +941,11 @@ export class VoiceRuntime {
        * written only on success.
        */
       persistIncomplete?: (spokenText: string | undefined, outcome: { cancelledSilently: boolean }) => Promise<void>;
+      /**
+       * Controller the caller already registered (user turns register it before
+       * their preamble so barge-in reaches it there too). Created here otherwise.
+       */
+      controller?: AbortController;
     },
   ): Promise<void> {
     if (session.ending) {
@@ -906,7 +956,7 @@ export class VoiceRuntime {
     // Register the controller BEFORE any await so a concurrent endSession can
     // abort this turn (otherwise updateStatus yields with currentController
     // still null and a phantom reply can persist after hangup).
-    const controller = new AbortController();
+    const controller = opts.controller ?? new AbortController();
     session.currentController = controller;
     session.llmActive = true;
 
@@ -1488,6 +1538,30 @@ export class VoiceRuntime {
 
   /** `fragments` counts the end-of-speech pieces in `utterance`, for turn stats. */
   private async runUserTurn(session: ActiveSession, utterance: string, fragments: number): Promise<void> {
+    // Register the turn before the preamble's awaits (bus publish, history read,
+    // user-row write). Speech during them then barges in and joins this
+    // utterance, instead of queuing as a second turn that answers it (#2240).
+    const controller = new AbortController();
+    session.currentController = controller;
+    session.llmActive = true;
+    let carried = false;
+    try {
+      await this.runUserTurnBody(session, utterance, fragments, controller, () => {
+        carried = true;
+      });
+    } finally {
+      this.clearTurnState(session, controller);
+      if (!carried) this.recordTurnOutcome(session, fragments);
+    }
+  }
+
+  private async runUserTurnBody(
+    session: ActiveSession,
+    utterance: string,
+    fragments: number,
+    controller: AbortController,
+    onCarried: () => void,
+  ): Promise<void> {
     if (session.ending) return;
 
     // Publish the final user transcript for bus audit. The dispatcher skips
@@ -1556,14 +1630,22 @@ export class VoiceRuntime {
       contactRecent: turnContext.contactRecent,
       withTools: true,
       turnEventId,
+      controller,
       persistIncomplete: async (spokenText, { cancelledSilently }) => {
         if (cancelledSilently) {
           // The caller spoke over a turn that had not said anything yet: they
           // had not finished. Carry the utterance into the next turn instead of
           // pairing it with a failure marker (#2240). The stored user row stays
-          // unpaired; historyForLlm collapses it under the joined row.
-          session.carryOverUtterance = joinUtterances(session.carryOverUtterance, utterance);
-          session.carryOverFragments += fragments;
+          // unpaired; historyForLlm collapses it under the joined row. Turns are
+          // serialized and the drain took any earlier carry, so this one is
+          // the whole utterance.
+          session.carryOver = {
+            utterance,
+            storedContent: storedUserContent,
+            persisted: userTurnPersisted,
+            fragments,
+          };
+          onCarried();
           this.log.debug(
             { sessionId: session.sessionId, fragments },
             'voice turn cancelled before any audio; joining it to the next utterance',
@@ -1617,6 +1699,10 @@ export class VoiceRuntime {
         clearTimeout(session.holdTimer);
         session.holdTimer = null;
       }
+      // Taken in the same tick as `ending` is set, so a drain that runs later
+      // finds nothing to join; paired below rather than left unpaired.
+      const carry = session.carryOver;
+      session.carryOver = null;
 
       if (session.currentController && !session.currentController.signal.aborted) {
         session.currentController.abort();
@@ -1645,6 +1731,12 @@ export class VoiceRuntime {
         } catch (err) {
           this.log.warn({ sessionId, roomName: session.roomName, err }, 'failed to delete LiveKit room after session end');
         }
+      }
+
+      // A silently cancelled utterance the caller never continued: pair its
+      // stored row so the next call's history keeps the request (#2240).
+      if (carry) {
+        await this.pairCarriedUtterance(session, carry);
       }
     }
 

@@ -201,6 +201,7 @@ function makeRuntime(overrides: {
   createTransport?: (opts: { roomName: string; token: string; livekitUrl: string; callerIdentity: string }) => FakeAudioTransport;
   /** End-of-speech hold (#2240). Defaults to 0 here so a final starts its turn at once. */
   turnHoldMs?: number;
+  maxUtteranceBytes?: number;
 }) {
   const bus = new EventBus(logger);
   const events: BusEvent[] = [];
@@ -231,6 +232,7 @@ function makeRuntime(overrides: {
     historyReadTimeoutMs: overrides.historyReadTimeoutMs,
     outboundContextService: overrides.outboundContextService,
     turnHoldMs: overrides.turnHoldMs ?? 0,
+    maxUtteranceBytes: overrides.maxUtteranceBytes,
   });
   if (overrides.bridge) runtime.configureTools(overrides.bridge);
   return { runtime, bus, events, stt, transport, tts, store };
@@ -1474,7 +1476,8 @@ describe('VoiceRuntime orphaned-user history sanitization (#1776)', () => {
     expect(later.map(t => t.content)).toEqual(["what's on my calendar? just the afternoon", 'Afternoon only.']);
 
     await runtime.endSession('prelude-abort', 'test');
-    expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 2, bargeInCancels: 1, joinedUtterances: 1 });
+    // The cancelled half is counted once, as joined; only the joined turn is a turn.
+    expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 1, bargeInCancels: 1, joinedUtterances: 1 });
   });
 
   it('pairs a mid-reply stream error with the heard fragment, not the failure marker', async () => {
@@ -2410,6 +2413,145 @@ describe('VoiceRuntime turn-taking: hold, join, coalesce (#2240)', () => {
     await runtime.endSession('coalesce', 'test');
     // The stalled turn had played its filler, so it is a real barge-in, not joined.
     expect(endedTurnStats(events)).toEqual({ utterances: 4, turns: 2, bargeInCancels: 1, joinedUtterances: 2 });
+  });
+
+  it('still runs the held utterance when an interim restarts the hold and no final follows', async () => {
+    const llm = new FakeStreamProvider([replyScript('Okay.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 60 });
+    await start(runtime, 'hold-revised');
+
+    stt.emit({ text: 'send it to Dana', isFinal: true, speechFinal: true });
+    await delay(30);
+    // An interim Deepgram later revises away: no final, no end-of-speech.
+    stt.emit({ text: 'hmm well', isFinal: false, confidence: 0.9 });
+    await delay(150);
+    await runtime.awaitIdle('hold-revised');
+
+    expect(inboundContents(events)).toEqual(['send it to Dana']);
+  });
+
+  it('re-arms the hold on an end-of-speech that adds a short or low-confidence word', async () => {
+    const llm = new FakeStreamProvider([replyScript('Will do.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 100 });
+    await start(runtime, 'hold-short');
+
+    stt.emit({ text: 'call Dana', isFinal: true, speechFinal: true });
+    await delay(70);
+    // "ok" fails the speech gate (too short) but is part of the utterance.
+    stt.emit({ text: 'ok', isFinal: true, speechFinal: true });
+    await delay(60);
+    // Past the first deadline (100 ms), inside the re-armed one (~170 ms).
+    expect(llm.seenMessages).toHaveLength(0);
+
+    await delay(120);
+    await runtime.awaitIdle('hold-short');
+    expect(inboundContents(events)).toEqual(['call Dana ok']);
+  });
+
+  /** Working memory whose history reads take `ms`, so a user turn sits in its preamble. */
+  function slowHistoryMemory(ms: number): WorkingMemory {
+    const wm = WorkingMemory.createInMemory();
+    const read = wm.getHistory.bind(wm);
+    vi.spyOn(wm, 'getHistory').mockImplementation(async (...args: Parameters<typeof read>) => {
+      await delay(ms);
+      return read(...args);
+    });
+    return wm;
+  }
+
+  it('joins speech that arrives during a user turn\'s preamble instead of queuing a second turn', async () => {
+    const wm = slowHistoryMemory(80);
+    const llm = new FakeStreamProvider([replyScript('Booked.'), replyScript('Booked.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await start(runtime, 'preamble');
+
+    stt.emit({ text: 'book the boardroom', isFinal: true, speechFinal: true });
+    await delay(20);
+    // The first turn is still reading history; nothing has been sent to the model.
+    expect(llm.seenMessages).toHaveLength(0);
+    stt.emit({ text: 'for Thursday at ten', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('preamble');
+
+    expect(llm.seenMessages).toHaveLength(1);
+    const messages = llm.seenMessages[0]!;
+    expect(messages[messages.length - 1]).toEqual({ role: 'user', content: 'book the boardroom for Thursday at ten' });
+    const stored = await wm.getHistory('voice:preamble', 'coordinator', { raw: true });
+    expect(stored.some(t => t.content === LLM_FAILURE_TURN_CONTENT)).toBe(false);
+  });
+
+  it('counts a chain of silent cancels once: utterances = turns + joined', async () => {
+    const wm = slowHistoryMemory(80);
+    const llm = new FakeStreamProvider([replyScript('Got it.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await start(runtime, 'chain');
+
+    stt.emit({ text: 'find tutoring', isFinal: true, speechFinal: true });
+    await delay(20);
+    stt.emit({ text: 'near his school', isFinal: true, speechFinal: true, confidence: 0.9 });
+    // The joined turn starts once the first unwinds (~80 ms); cancel it in its preamble too.
+    await delay(90);
+    stt.emit({ text: 'after three pm', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('chain');
+
+    expect(llm.seenMessages).toHaveLength(1);
+    const messages = llm.seenMessages[0]!;
+    expect(messages[messages.length - 1]).toEqual({
+      role: 'user',
+      content: 'find tutoring near his school after three pm',
+    });
+    await runtime.endSession('chain', 'test');
+    expect(endedTurnStats(events)).toEqual({ utterances: 3, turns: 1, bargeInCancels: 2, joinedUtterances: 2 });
+  });
+
+  it('pairs a carried-over utterance with the failure marker when the caller hangs up', async () => {
+    const wm = slowHistoryMemory(60);
+    const llm = new FakeStreamProvider([replyScript('Never spoken.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await start(runtime, 'carry-hangup');
+
+    stt.emit({ text: 'move my three o clock', isFinal: true, speechFinal: true });
+    await delay(20);
+    // Speech cancels the turn before any audio, but never finalizes.
+    stt.emit({ text: 'hold on a sec', isFinal: false, confidence: 0.9 });
+    await runtime.awaitIdle('carry-hangup');
+    await runtime.endSession('carry-hangup', 'test');
+
+    expect(llm.seenMessages).toHaveLength(0);
+    const stored = await wm.getHistory('voice:carry-hangup', 'coordinator', { raw: true });
+    expect(stored).toEqual([
+      { role: 'user', content: 'move my three o clock' },
+      { role: 'assistant', content: LLM_FAILURE_TURN_CONTENT },
+    ]);
+    expect(endedTurnStats(events)).toEqual({ utterances: 1, turns: 1, bargeInCancels: 1, joinedUtterances: 0 });
+  });
+
+  it('pairs the carried-over part when the join would exceed maxUtteranceBytes', async () => {
+    const wm = slowHistoryMemory(60);
+    const llm = new FakeStreamProvider([replyScript('Planning review noted.')]);
+    const { runtime, stt, events } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: wm,
+      maxUtteranceBytes: 40,
+    });
+    await start(runtime, 'carry-oversize');
+
+    stt.emit({ text: 'please book the conference room', isFinal: true, speechFinal: true });
+    await delay(20);
+    stt.emit({ text: 'for the quarterly planning review', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('carry-oversize');
+
+    expect(inboundContents(events)).toEqual([
+      'please book the conference room',
+      'for the quarterly planning review',
+    ]);
+    const stored = await wm.getHistory('voice:carry-oversize', 'coordinator', { raw: true });
+    expect(stored.slice(0, 2)).toEqual([
+      { role: 'user', content: 'please book the conference room' },
+      { role: 'assistant', content: LLM_FAILURE_TURN_CONTENT },
+    ]);
+    await runtime.endSession('carry-oversize', 'test');
+    expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 2, bargeInCancels: 1, joinedUtterances: 0 });
   });
 
   it('drops a pending hold when the session ends', async () => {
