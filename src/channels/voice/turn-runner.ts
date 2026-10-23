@@ -129,7 +129,11 @@ export class VoiceTurnRunner {
         onTextDelta: async (text) => {
           if (!ttftLogged) {
             ttftLogged = true;
-            this.log.debug({ streamId, llm_ttft_ms: Date.now() - turnStartedAt }, 'voice llm first token');
+            // info, not debug: this is how prod checks ADR-038's first-speech budget (#2245).
+            this.log.info(
+              { streamId, model: this.config.model, llm_ttft_ms: Date.now() - turnStartedAt },
+              'voice llm first token',
+            );
           }
           for (const sentence of chunker.push(text)) {
             if (signal.aborted) break;

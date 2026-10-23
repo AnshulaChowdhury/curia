@@ -188,9 +188,13 @@ skip as principal web chat).
 
 Voice emits structured pino fields for latency debugging:
 
-- `voice.ttfa_ms` — end of user turn to first assistant audio frame.
+- `voice.ttfa_ms` — end of user turn to first assistant audio frame: what the caller
+  hears. Logged at `info` as `voice time-to-first-audio`.
 - `voice.stt_final_ms` — STT final transcript latency.
-- `voice.llm_ttft_ms` — LLM time to first text delta.
+- `llm_ttft_ms` — turn start to first text delta, after any tool rounds before it. Logged
+  at `info` as `voice llm first token`, with `model`. ADR-038's first-speech budget is
+  on this field, because its spike measured the same span; `voice.ttfa_ms` adds TTS
+  and prompt assembly, which a model change does not move.
 - `voice.tts_first_byte_ms` — TTS time to first audio frame.
 - `voice.barge_in_stop_ms` — time to stop assistant audio after barge-in.
 
