@@ -283,7 +283,11 @@ const EMAIL_CC_REPLY = [
   '`email:<thread id>`), and `account` is the `Account` line.',
 ];
 
-/** The principal CC'd Curia on an email to someone else. */
+/**
+ * The principal CC'd Curia on an email to someone else. The last two lines (#2227): handed a
+ * meeting, Curia asked the counterpart for windows instead of offering times in about a
+ * quarter of runs (scenario 25a, 5 of 18 on main).
+ */
 const EMAIL_CC_PRINCIPAL = [
   'The principal copied you on an email to someone else; you are not the primary recipient.',
   'Read it as a whole and infer what they expect: they may be looping you in, making an',
@@ -292,6 +296,8 @@ const EMAIL_CC_PRINCIPAL = [
   'Only if the intent is genuinely ambiguous (two clearly contradictory readings) ask the',
   'principal, and then on a separate channel (e.g. Signal) or a new email thread, never on',
   'this thread, where third parties would see the question.',
+  'When they hand you a meeting to set up, offer the other person specific times from the',
+  'principal\'s calendar, in the window and format they gave; don\'t ask for their availability.',
 ];
 
 /** Any inbound email turn. */

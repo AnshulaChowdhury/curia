@@ -88,3 +88,20 @@ contact to `known` and re-resolve before routing. `known` carries `schedule_meet
 Also decided: lower `security.trust_thresholds.scheduling` from 0.5 to 0.3, since a `known`
 email contact scores about 0.24 + 0.4 × confidence and would otherwise still be declined in
 production.
+
+## PR 4 — CC'd scheduling, hold hygiene and the release gate
+
+- **CC'd scheduling.** On main, handed a meeting on a CC, Curia asked the counterpart for
+  their windows instead of offering times in about a quarter of runs (25a: `slots_in_window`
+  14/18, `coffee_shaped` 13/18 on `d82dbd8d`). Two lines in `email-cc-principal`; 25a then
+  9/9 on `slots_in_window`.
+- **Hold hygiene, measured and left to the sweep.** Read run by run, holds match the offered
+  times: 25j holds exactly the three it offers. A real orphan (a hold for a time not offered,
+  or holds left when no offer went out) was about one 25b run in nine. A first heuristic
+  counted far more by misreading time ranges. A `calendar-release-hold` tool, with the rule
+  in `calendar-create-hold`'s description, was tried and never called (0 of 9 runs), so it
+  was dropped rather than shipped unused. Orphans still expire through the 7-day holds sweep.
+  A code-level fix is the next step if this matters.
+- **Release gate.** The 25-series stays on demand; the README says why and when to run it.
+- `trigger-guidance.test.ts`'s worst-turn bound now covers the #2227 triggers (6,678 chars
+  worst; bound 5,000 → 7,000).

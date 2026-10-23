@@ -72,6 +72,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Senders the principal knows** — verified email senders in `security.principal_org_domains` or the principal's Sent mail start as known. (#2227)
 - **Scheduling trust threshold** — lowered from 0.5 to 0.3 so known email contacts can book meetings (spec 06). (#2227)
 - **`contact.elevated`** — **public API:** new `principal-domain` and `principal-correspondence` reasons. (#2227)
+- **CC'd scheduling** — handed a meeting on a CC, Curia offers specific times instead of asking for availability. (#2227)
 - **Making room** — "move things around" moves the principal's own blocks at autonomy ≥80; below, asks first. (#2227)
 - **Booking links** — Curia books through a counterpart's booking page instead of emailing times, without duplicate invites. (#2227)
 - **KG explorer layout** — nodes spread further apart and labels no longer overlap. (#351)

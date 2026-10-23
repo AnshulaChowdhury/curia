@@ -605,6 +605,24 @@ pnpm scenarios --tags ps-ask   --model …   # autonomy 74 (band): 25c
 pnpm scenarios --tags ps-prefs --model …   # autonomy 84 + identity scheduling-prefs: 25f–25i
 ```
 
+**Why they stay out of the release gate (#2227).** Each batch needs a run-level fixture:
+autonomy for all three, plus the office identity for ps-prefs. A fixture applies to a whole
+run, so the loader requires `release_gate: false` on any case that sets one. The gate runs
+every case in one stack, at the database's own autonomy. They are also the suite's most
+expensive cases: real delegation, and about $0.05–0.10 a run. All 14 at five runs adds
+roughly $4 and 45 minutes to a gate.
+
+**When to run them instead.** Run all three batches, 9 runs each, before merging a change to:
+- the coordinator's or the calendar specialist's prompts;
+- the turn guidance (`src/agents/prompts/turn-guidance.ts`, `src/dispatch/turn-guidance-triggers.ts`);
+- sender trust or authorization (`src/contacts/principal-acquaintance.ts`, the trust
+  thresholds, `config/role-defaults.yaml`);
+- the calendar tools.
+
+Every critical behavior should hold at 8/9 or better. 25a sits near that line on `main`
+as well: `coffee_shaped` was 7/9 in one 9-run measurement. A miss there is worth reading
+before calling it a regression.
+
 ## A deployment's own agents
 
 A deployment repo (curia-deploy) keeps its agents' cases next to their prompts and runs
