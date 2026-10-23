@@ -44,6 +44,14 @@ const DEEPGRAM_PRERECORDED_URL = 'https://api.deepgram.com/v1/listen';
 const CONNECT_TIMEOUT_MS = 10_000;
 const CLOSE_TIMEOUT_MS = 5_000;
 const DEFAULT_PRERECORDED_CONTENT_TYPE = 'application/octet-stream';
+/**
+ * Silence (ms) before Deepgram flags `speech_final` (#2240). `endpointing=true`
+ * sent no threshold, so Deepgram used its 10 ms default: every breath between
+ * words ended the utterance and started a turn on a sentence fragment. 400 ms
+ * rides over ordinary pauses between words; VoiceRuntime's turn hold
+ * (DEFAULT_TURN_HOLD_MS) then catches a principal who resumes after a longer one.
+ */
+const ENDPOINTING_MS = 400;
 
 function getWebSocketConstructor(): ProviderWebSocketConstructor {
   const ctor = (globalThis as { WebSocket?: ProviderWebSocketConstructor }).WebSocket;
@@ -62,7 +70,7 @@ function buildDeepgramUrl(opts: SttSessionOptions): string {
   url.searchParams.set('interim_results', 'true');
   url.searchParams.set('punctuate', 'true');
   url.searchParams.set('smart_format', 'true');
-  url.searchParams.set('endpointing', 'true');
+  url.searchParams.set('endpointing', String(ENDPOINTING_MS));
   url.searchParams.set('utterance_end_ms', '1000');
   url.searchParams.set('vad_events', 'true');
   if (opts.language) {

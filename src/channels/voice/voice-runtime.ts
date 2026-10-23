@@ -28,6 +28,7 @@
 // messages — and must not be copied onto text channels.
 import type { EventBus } from '../../bus/bus.js';
 import { createInboundMessage, createVoiceSessionEnded } from '../../bus/events.js';
+import type { VoiceSessionTurnStats } from '../../bus/events.js';
 import type { OutboundContextService } from '../../dispatch/outbound-context.js';
 import type { Logger } from '../../logger.js';
 import type { LLMProvider, Message, ToolCall, ToolDefinition } from '../../agents/llm/provider.js';
@@ -92,6 +93,15 @@ const DEFAULT_HISTORY_READ_TIMEOUT_MS = 1_000;
 const BARGE_IN_MIN_CHARS = 3;
 /** Ignore low-confidence interims when the provider reports confidence. */
 const BARGE_IN_MIN_CONFIDENCE = 0.4;
+/**
+ * Wait after the STT end-of-speech signal before starting a turn (#2240). Speech
+ * inside the window keeps the utterance open, so a principal who pauses
+ * mid-thought ("His school is… Oakbridge") is answered once, not per fragment.
+ * Added to Deepgram's 400 ms endpointing, a turn starts about a second after the
+ * last word — the same point Deepgram's own UtteranceEnd (utterance_end_ms=1000)
+ * would fire.
+ */
+const DEFAULT_TURN_HOLD_MS = 600;
 /** Agent id used when writing voice turns into working_memory (chat history). */
 const VOICE_HISTORY_AGENT_ID = 'coordinator';
 /** Default max utterance size — matches Dispatcher maxMessageBytes. */
@@ -117,6 +127,13 @@ function isHardTtsFailure(err: unknown): boolean {
  */
 function spokenHistoryForLlm(turns: Array<{ role: Message['role']; content: string }>): Message[] {
   return historyForLlm(turns);
+}
+
+/** Join two pieces of one spoken utterance; either may be empty. */
+function joinUtterances(first: string, second: string): string {
+  if (!first) return second;
+  if (!second) return first;
+  return `${first} ${second}`;
 }
 
 function stringTurns(messages: Message[]): Array<{ role: Message['role']; content: string }> {
@@ -370,6 +387,12 @@ export interface VoiceRuntimeConfig {
    */
   maxUtteranceBytes?: number;
   /**
+   * Hold (ms) between the STT end-of-speech signal and starting the turn; speech
+   * inside it extends the utterance (#2240). Default DEFAULT_TURN_HOLD_MS. 0
+   * starts the turn on the signal itself.
+   */
+  turnHoldMs?: number;
+  /**
    * IANA timezone for the per-turn date/time block (same block the coordinator
    * gets — formatTimeContextBlock). Without it, "tomorrow / next week" is
    * un-anchored for every voice tool call (#1551). Omitted → no time block.
@@ -473,7 +496,26 @@ interface ActiveSession {
   ttsActive: boolean;
   /** Set once a first transcript is seen so we flip DB status starting→active once. */
   markedActive: boolean;
+  /** Final transcript text of the utterance still being spoken (or held). */
   pendingFinalText: string;
+  /** End-of-speech signals with words that `pendingFinalText` spans. */
+  pendingFragments: number;
+  /** Final words arrived since the last end-of-speech signal. */
+  wordsSinceEndOfSpeech: boolean;
+  /** Armed on end-of-speech; the utterance becomes a turn when it fires (#2240). */
+  holdTimer: NodeJS.Timeout | null;
+  /** Finished utterances waiting for the running turn; they run as one turn. */
+  queuedUtterance: string;
+  queuedFragments: number;
+  /** True while a drain of `queuedUtterance` is chained on `turnTail`. */
+  drainScheduled: boolean;
+  /**
+   * Utterance whose turn barge-in cancelled before any audio played. The next
+   * turn runs on it joined with what the caller said next (#2240).
+   */
+  carryOverUtterance: string;
+  carryOverFragments: number;
+  turnStats: VoiceSessionTurnStats;
   ttsSeq: number;
   ending: boolean;
   /** Consecutive synthesize() failures; reset on a successful synthesis (#1556). */
@@ -583,6 +625,15 @@ export class VoiceRuntime {
         ttsActive: false,
         markedActive: false,
         pendingFinalText: '',
+        pendingFragments: 0,
+        wordsSinceEndOfSpeech: false,
+        holdTimer: null,
+        queuedUtterance: '',
+        queuedFragments: 0,
+        drainScheduled: false,
+        carryOverUtterance: '',
+        carryOverFragments: 0,
+        turnStats: { utterances: 0, turns: 0, bargeInCancels: 0, joinedUtterances: 0 },
         ttsSeq: 0,
         ending: false,
         consecutiveTtsFailures: 0,
@@ -643,14 +694,21 @@ export class VoiceRuntime {
     if (session.ending) return;
     const text = event.text.trim();
 
-    // Barge-in: speech while the assistant talks cancels it. Gate on length +
-    // confidence so speaker echo / noise doesn't interrupt Curia mid-sentence.
-    if (
-      text.length >= BARGE_IN_MIN_CHARS
-      && (session.llmActive || session.ttsActive)
-      && (event.confidence === undefined || event.confidence >= BARGE_IN_MIN_CONFIDENCE)
-    ) {
+    // Gate on length + confidence so speaker echo / noise neither interrupts
+    // Curia mid-sentence nor holds a finished utterance open.
+    const isSpeech = text.length >= BARGE_IN_MIN_CHARS
+      && (event.confidence === undefined || event.confidence >= BARGE_IN_MIN_CONFIDENCE);
+
+    // Barge-in: speech while the assistant talks cancels it.
+    if (isSpeech && (session.llmActive || session.ttsActive)) {
       this.bargeIn(session);
+    }
+
+    // Speech inside the hold window: the caller resumed, so the utterance stays
+    // open and the next end-of-speech re-arms the hold (#2240).
+    if (isSpeech && session.holdTimer) {
+      clearTimeout(session.holdTimer);
+      session.holdTimer = null;
     }
 
     if (!event.isFinal) return;
@@ -669,18 +727,51 @@ export class VoiceRuntime {
           'voice utterance exceeded maxUtteranceBytes; dropping pending transcript',
         );
         session.pendingFinalText = '';
+        session.pendingFragments = 0;
+        session.wordsSinceEndOfSpeech = false;
         return;
       }
       session.pendingFinalText = next;
+      session.wordsSinceEndOfSpeech = true;
     }
 
-    // Endpoint (end-of-turn) — run the accumulated utterance as one user turn.
+    // End-of-speech. Deepgram can send it twice per utterance (speech_final,
+    // then UtteranceEnd with no words); only one that closes new words counts.
     if (event.speechFinal) {
-      const utterance = session.pendingFinalText.trim();
-      session.pendingFinalText = '';
-      if (utterance.length > 0) {
-        this.enqueueTurn(session, utterance);
+      if (session.wordsSinceEndOfSpeech) {
+        session.wordsSinceEndOfSpeech = false;
+        session.pendingFragments += 1;
+        session.turnStats.utterances += 1;
       }
+      if (session.pendingFinalText.trim().length === 0) return;
+
+      const holdMs = this.config.turnHoldMs ?? DEFAULT_TURN_HOLD_MS;
+      if (holdMs <= 0) {
+        this.flushPendingUtterance(session);
+        return;
+      }
+      // Already holding (e.g. UtteranceEnd right after speech_final): keep the
+      // original deadline rather than pushing the turn back.
+      if (session.holdTimer) return;
+      session.holdTimer = setTimeout(() => {
+        session.holdTimer = null;
+        this.flushPendingUtterance(session);
+      }, holdMs);
+    }
+  }
+
+  /** Hand the finished utterance to the turn queue. */
+  private flushPendingUtterance(session: ActiveSession): void {
+    if (session.holdTimer) {
+      clearTimeout(session.holdTimer);
+      session.holdTimer = null;
+    }
+    const utterance = session.pendingFinalText.trim();
+    const fragments = Math.max(session.pendingFragments, 1);
+    session.pendingFinalText = '';
+    session.pendingFragments = 0;
+    if (utterance.length > 0) {
+      this.enqueueUtterance(session, utterance, fragments);
     }
   }
 
@@ -694,20 +785,53 @@ export class VoiceRuntime {
     }
     controller.abort();
     session.ttsActive = false;
+    session.turnStats.bargeInCancels += 1;
     this.log.debug(
       { sessionId: session.sessionId, 'voice.barge_in_stop_ms': Date.now() - startedAt },
       'voice barge-in: cancelled assistant turn',
     );
   }
 
-  private enqueueTurn(session: ActiveSession, utterance: string): void {
+  /**
+   * Queue a finished utterance. Utterances that finish while a turn is still
+   * running join into one, so they run as a single turn when it ends instead of
+   * replaying one turn per fragment (#2240). A carried-over utterance from a
+   * silently cancelled turn is joined in front at drain time.
+   */
+  private enqueueUtterance(session: ActiveSession, utterance: string, fragments: number): void {
+    session.queuedUtterance = joinUtterances(session.queuedUtterance, utterance);
+    session.queuedFragments += fragments;
+    if (session.drainScheduled) return;
+    session.drainScheduled = true;
+
     // Serialize turns onto the tail so a barged-in turn fully unwinds before the
     // next starts. Log rejections — never silently erase them or break the chain.
     session.turnTail = session.turnTail
       .catch(err => {
         this.log.warn({ sessionId: session.sessionId, err }, 'previous voice turn rejected; continuing chain');
       })
-      .then(() => this.runUserTurn(session, utterance));
+      .then(() => {
+        session.drainScheduled = false;
+        let next = joinUtterances(session.carryOverUtterance, session.queuedUtterance);
+        let nextFragments = session.carryOverFragments + session.queuedFragments;
+        const maxBytes = this.config.maxUtteranceBytes ?? DEFAULT_MAX_UTTERANCE_BYTES;
+        if (session.carryOverUtterance && Buffer.byteLength(next, 'utf8') > maxBytes) {
+          this.log.warn(
+            { sessionId: session.sessionId, maxBytes },
+            'joined voice utterance exceeded maxUtteranceBytes; dropping the carried-over part',
+          );
+          next = session.queuedUtterance;
+          nextFragments = session.queuedFragments;
+        }
+        session.carryOverUtterance = '';
+        session.carryOverFragments = 0;
+        session.queuedUtterance = '';
+        session.queuedFragments = 0;
+        if (next.length === 0 || session.ending) return;
+        session.turnStats.turns += 1;
+        if (nextFragments > 1) session.turnStats.joinedUtterances += nextFragments - 1;
+        return this.runUserTurn(session, next, nextFragments);
+      });
   }
 
   private enqueueGreetingTurn(session: ActiveSession): void {
@@ -767,13 +891,15 @@ export class VoiceRuntime {
        * Pair a user turn that was already persisted when this assistant turn
        * does not `persistSuccess` — every exit, including abort during the
        * prelude. `spokenText` is what was handed to TTS (empty when nothing
-       * was heard). Greeting omits this; its cue is written only on success.
+       * was heard). `cancelledSilently` is true when barge-in cancelled the
+       * turn before any audio played (#2240). Greeting omits this; its cue is
+       * written only on success.
        */
-      persistIncomplete?: (spokenText?: string) => Promise<void>;
+      persistIncomplete?: (spokenText: string | undefined, outcome: { cancelledSilently: boolean }) => Promise<void>;
     },
   ): Promise<void> {
     if (session.ending) {
-      await this.safePersistIncomplete(opts.persistIncomplete, session);
+      await this.safePersistIncomplete(opts.persistIncomplete, session, undefined, false);
       return;
     }
 
@@ -786,6 +912,7 @@ export class VoiceRuntime {
 
     let completed = false;
     let spokenForPairing: string | undefined;
+    let audioPlayed = false;
     try {
       if (!session.markedActive) {
         session.markedActive = true;
@@ -811,6 +938,7 @@ export class VoiceRuntime {
       let ttfaRecorded = false;
       const onSpeechText = this.createSpeechHandler(session, controller, {
         onFirstAudio: () => {
+          audioPlayed = true;
           if (ttfaRecorded) return;
           ttfaRecorded = true;
           // info: what the caller hears, logged beside llm_ttft_ms for ADR-038's check (#2245).
@@ -897,19 +1025,24 @@ export class VoiceRuntime {
     } finally {
       this.clearTurnState(session, controller);
       if (!completed) {
-        await this.safePersistIncomplete(opts.persistIncomplete, session, spokenForPairing);
+        // Only barge-in and endSession abort the controller; endSession sets ending.
+        const cancelledSilently = controller.signal.aborted && !session.ending && !audioPlayed;
+        await this.safePersistIncomplete(opts.persistIncomplete, session, spokenForPairing, cancelledSilently);
       }
     }
   }
 
   private async safePersistIncomplete(
-    persistIncomplete: ((spokenText?: string) => Promise<void>) | undefined,
+    persistIncomplete:
+      | ((spokenText: string | undefined, outcome: { cancelledSilently: boolean }) => Promise<void>)
+      | undefined,
     session: ActiveSession,
-    spokenText?: string,
+    spokenText: string | undefined,
+    cancelledSilently: boolean,
   ): Promise<void> {
     if (!persistIncomplete) return;
     try {
-      await persistIncomplete(spokenText);
+      await persistIncomplete(spokenText, { cancelledSilently });
     } catch (persistErr) {
       this.log.warn(
         { sessionId: session.sessionId, err: persistErr },
@@ -1353,7 +1486,8 @@ export class VoiceRuntime {
     }
   }
 
-  private async runUserTurn(session: ActiveSession, utterance: string): Promise<void> {
+  /** `fragments` counts the end-of-speech pieces in `utterance`, for turn stats. */
+  private async runUserTurn(session: ActiveSession, utterance: string, fragments: number): Promise<void> {
     if (session.ending) return;
 
     // Publish the final user transcript for bus audit. The dispatcher skips
@@ -1422,12 +1556,27 @@ export class VoiceRuntime {
       contactRecent: turnContext.contactRecent,
       withTools: true,
       turnEventId,
-      persistIncomplete: (spokenText) => this.persistIncompleteAssistantTurn(session, {
-        inProcessContent: utterance,
-        storedContent: storedUserContent,
-        spokenText,
-        persistToStore: userTurnPersisted,
-      }),
+      persistIncomplete: async (spokenText, { cancelledSilently }) => {
+        if (cancelledSilently) {
+          // The caller spoke over a turn that had not said anything yet: they
+          // had not finished. Carry the utterance into the next turn instead of
+          // pairing it with a failure marker (#2240). The stored user row stays
+          // unpaired; historyForLlm collapses it under the joined row.
+          session.carryOverUtterance = joinUtterances(session.carryOverUtterance, utterance);
+          session.carryOverFragments += fragments;
+          this.log.debug(
+            { sessionId: session.sessionId, fragments },
+            'voice turn cancelled before any audio; joining it to the next utterance',
+          );
+          return;
+        }
+        await this.persistIncompleteAssistantTurn(session, {
+          inProcessContent: utterance,
+          storedContent: storedUserContent,
+          spokenText,
+          persistToStore: userTurnPersisted,
+        });
+      },
       assembleMessages: ({ systemPrompt, priorHistory: prior, contactRecent }) => [
         { role: 'system', content: systemPrompt },
         ...(contactRecent ? [{ role: 'system' as const, content: contactRecent }] : []),
@@ -1464,6 +1613,10 @@ export class VoiceRuntime {
     if (session) {
       session.ending = true;
       this.sessions.delete(sessionId);
+      if (session.holdTimer) {
+        clearTimeout(session.holdTimer);
+        session.holdTimer = null;
+      }
 
       if (session.currentController && !session.currentController.signal.aborted) {
         session.currentController.abort();
@@ -1515,6 +1668,7 @@ export class VoiceRuntime {
             conversationId: ended.conversationId,
             reason: ended.endReason ?? reason,
             durationMs: ended.endedAt ? ended.endedAt.getTime() - ended.startedAt.getTime() : undefined,
+            ...(session ? { turnStats: { ...session.turnStats } } : {}),
           }),
         );
       } catch (err) {

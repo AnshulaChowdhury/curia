@@ -1833,11 +1833,27 @@ export interface VoiceSessionStartedEvent extends BaseEvent {
   payload: VoiceSessionStartedPayload;
 }
 
+/**
+ * Turn-taking counts for one voice session (#2240), so the fragment rate can be
+ * compared across deploys from audit_log. Absent when no runtime owned the session.
+ */
+export interface VoiceSessionTurnStats {
+  /** Speech-to-text end-of-speech signals that carried words. */
+  utterances: number;
+  /** User turns run (each one LLM reply). */
+  turns: number;
+  /** Assistant turns cancelled because the caller spoke over them. */
+  bargeInCancels: number;
+  /** Utterances folded into another utterance's turn instead of running their own. */
+  joinedUtterances: number;
+}
+
 interface VoiceSessionEndedPayload {
   sessionId: string;
   conversationId: string;
   reason: string;
   durationMs?: number;
+  turnStats?: VoiceSessionTurnStats;
 }
 
 export interface VoiceSessionEndedEvent extends BaseEvent {
