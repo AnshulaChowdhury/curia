@@ -263,8 +263,21 @@ describe('looksLikeMakeRoom', () => {
     'Can you move my flight to Friday?',
     'I blocked my calendar for the offsite',
     'Push my luck and ask for a holdback',
+    "Don't make room by moving my meetings; offer another day.",
+    'I can’t move my focus block this week',
+    'No need to clear my calendar for this',
+    'Please do not shuffle any meetings, just send times',
+    '> I can move my focus block\nNo, leave it.',
   ])('is false for %s', (text) => {
     expect(looksLikeMakeRoom(text)).toBe(false);
+  });
+
+  it.each([
+    "Don't worry, I'll make some room",
+    "I can't do Monday. Let me move a few things around on Tuesday",
+    '> Can we meet this week?\nYes, I can move my focus block',
+  ])('still matches a request outside a refusal or quote: %s', (text) => {
+    expect(looksLikeMakeRoom(text)).toBe(true);
   });
 });
 

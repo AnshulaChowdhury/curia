@@ -70,9 +70,33 @@ const MAKE_ROOM_PATTERNS: readonly RegExp[] = [
   /\b(?:move|shift|push|bump|slide)\s+(?:my|our)\s+(?:[\w'-]+\s+){0,2}(?:block|focus\s+time|hold|1:1|one-on-one|1-on-1)(?=\W|$)/i,
 ];
 
-/** Whether the text asks to make room in the calendar ("let me move a few things around"). */
+// A refusal ahead of the match in the same clause: "Don't make room by moving my meetings",
+// "I can't move my focus block", "no need to clear my calendar". A clause ends at . ; ! ? , or
+// a line break, so "Don't worry, I'll make some room" is still a request.
+const MAKE_ROOM_NEGATION = /\b(?:don['’]?t|do\s+not|doesn['’]?t|not|never|no\s+need\s+to|can['’]?t|cannot|won['’]?t|shouldn['’]?t|rather\s+not|without)\b/i;
+const CLAUSE_END = /[.;!?,\n]/;
+
+/** Whether the match at `index` has a negation earlier in its clause. */
+function negatedInClause(text: string, index: number): boolean {
+  let start = index;
+  while (start > 0 && !CLAUSE_END.test(text[start - 1]!)) start--;
+  return MAKE_ROOM_NEGATION.test(text.slice(start, index));
+}
+
+/**
+ * Whether the text asks to make room in the calendar ("let me move a few things around").
+ * Lines quoted with `>` are someone else's words and are skipped. The email caller has
+ * already cut quoted mail; this covers a quote typed or pasted into Signal, Slack or SMS.
+ * A refused move ("don't move my meetings, offer another day") is not a request.
+ */
 export function looksLikeMakeRoom(text: string): boolean {
-  return MAKE_ROOM_PATTERNS.some((p) => p.test(text));
+  const own = text.split('\n').filter((line) => !line.trimStart().startsWith('>')).join('\n');
+  return MAKE_ROOM_PATTERNS.some((p) => {
+    for (const match of own.matchAll(new RegExp(p.source, `${p.flags}g`))) {
+      if (!negatedInClause(own, match.index)) return true;
+    }
+    return false;
+  });
 }
 
 // Booking-page hosts (#2227). A link on the host's root is not a booking page, so each needs
