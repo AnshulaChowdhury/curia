@@ -121,6 +121,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Security
 
+- **fastify** — bumped to 5.12.6, clearing a LOW advisory (CVE-2026-107832).
 - **sanitize-html** — bumped to 2.18.1, clearing a MEDIUM advisory (CVE-2026-113650).
 - **markdown-it** — bumped to 15.0.3, clearing a HIGH and a LOW advisory (CVE-2026-111758, CVE-2026-111766).
 - **`fast-uri` floor** — raised to `>=4.2.3`, clearing four upstream-only advisories on the resolved 4.2.1. (#2216)
