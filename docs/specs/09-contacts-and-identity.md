@@ -493,7 +493,7 @@ Role, overrides, and channel trust gate *what a contact may ask for*. **Gate C**
 Contacts created at `tier='unknown'` are promoted to `tier='known'` automatically, without a CEO confirmation step, via three signals (#951):
 
 1. **Correspondence** — when Curia (or the CEO) sends an outbound message to an unknown contact, the outbound gateway elevates the contact to at least `'known'` before send. Mutual communication is sufficient grounds.
-2. **Domain / judgment** — a weekly LLM-judge scan and the dispatcher's scoring pipeline evaluate domain, relationship, and communication signals, elevating contacts that cross the confidence threshold.
+2. **Domain / judgment** — a weekly LLM-judge scan and the dispatcher's scoring pipeline evaluate domain, relationship, and communication signals, elevating contacts that cross the confidence threshold. The dispatcher elevates an email sender this way only on `senderVerified` mail (SPF, DKIM and DMARC pass), since a forged From address would otherwise earn `known` (#2227).
 3. **One-shot backfill** — `scripts/rederive-contact-tiers.ts` (`rederive:contact-tiers`) recomputes confidence and elevates eligible `unknown` contacts historically.
 
 This replaced the old daily provisional→confirmed promotion sweep (retired in #955). Elevation never raises a contact to `trusted`/`principal` automatically — those require an explicit CEO grant. The CEO can also set a tier directly with `contact-set-tier`, and a weekly `scan-grant-recommendations` job surfaces scheduling-access recommendations for CEO approve/decline (#952).

@@ -615,6 +615,9 @@ export class Dispatcher {
               // when it skips), so the larger value is kept. Judgment elevation stays
               // fire-and-forget: it changes the tier for the NEXT message. Tier/kind snapshots are
               // taken before it so it sees pre-message values even if Path 2 mutated them.
+              // SECURITY: email elevates only on `senderVerified` mail (SPF, DKIM and DMARC pass),
+              // as the principal-acquaintance path does. A From address is forgeable, and at the
+              // 0.3 scheduling threshold a judgment-elevated `known` email sender can book meetings.
               if (this.confidencePipeline && !messageCounted) {
                 const contactService = this.contactService;
                 const snapshotTier = senderContext.tier;
@@ -631,6 +634,7 @@ export class Dispatcher {
                   contactService &&
                   snapshotTier === 'unknown' &&
                   !isAutomatedKind(snapshotKind) &&
+                  (payload.channelId !== 'email' || payload.metadata?.['senderVerified'] === true) &&
                   newConfidence >= JUDGMENT_ELEVATION_THRESHOLD
                 ) {
                   const confidence = newConfidence;
