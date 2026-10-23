@@ -74,7 +74,10 @@ browser:
   channel: ""             # "chrome" for real Chrome (must be installed in the image), empty for the bundled Playwright Chromium.
   locale: "en-US"         # Browser locale (BCP 47), part of fingerprint hardening.
   languages: []           # Ordered navigator.languages / Accept-Language, e.g. [en-CA, en-US, en]. Empty → [locale].
+  settleCapMs: 35000      # Longest web-browser waits for a page to finish redirecting before reading it (ms). Max 90000.
 ```
+
+`settleCapMs` bounds the adaptive settle (#2244): an ordinary page is read at once, and the wait runs only while a page is blank, still changing URL, or on a sign-in handoff. Air Canada's sign-in chain takes up to ~28s. It must be a positive integer of at most 90000, so one wait stays inside the skill's 120s timeout.
 
 Raise `sessionTtlMs` if skills that open browser sessions are timing out mid-task. Lower it to free resources faster on memory-constrained deployments. `sessionTtlMs` and `sweepIntervalMs` are validated at startup (a non-positive value is a hard failure); `profileDir`, `channel`, and `locale` must be strings, and `languages` a list of language tags.
 

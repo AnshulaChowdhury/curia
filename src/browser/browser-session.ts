@@ -7,6 +7,11 @@
 import type { BrowserContext, Page } from 'playwright';
 import { redactValues } from '../skills/sanitize.js';
 
+/** How many page error messages a session keeps, and the longest each may be. */
+const MAX_CONSOLE_ERRORS = 20;
+// Long enough that the handler redacts before it cuts to its own, shorter, return length.
+const MAX_CONSOLE_ERROR_LENGTH = 2_000;
+
 /** HTML-entity-escape the characters a browser escapes when reflecting input into DOM text.
  *  `&` must be replaced first so the entity ampersands it introduces aren't re-escaped. */
 function htmlEscape(value: string): string {
@@ -67,6 +72,32 @@ export class BrowserSession {
    * oscillates trip→re-read→trip; fail-fast on stale refs does most of the budget savings.
    */
   consecutiveFailures = 0;
+
+  /**
+   * The page's most recent error messages (#2244): browser-reported console errors (a
+   * failed resource load, a blocked script, a CSP violation) and uncaught page errors where
+   * the browser reports them. Patchright disables the Console API to close a detection
+   * leak, so a page script's own console.error() calls never arrive here. Returned with a
+   * blank or unsettled page so one that never paints can be diagnosed. Untrusted page
+   * text, capped in count and length.
+   */
+  private readonly consoleErrors: Array<{ at: number; text: string }> = [];
+
+  /** Record one page error message (see consoleErrors). */
+  recordConsoleError(text: string): void {
+    const trimmed = text.replace(/\s+/g, ' ').trim();
+    if (!trimmed) return;
+    this.consoleErrors.push({
+      at: Date.now(),
+      text: trimmed.length > MAX_CONSOLE_ERROR_LENGTH ? `${trimmed.slice(0, MAX_CONSOLE_ERROR_LENGTH)}…` : trimmed,
+    });
+    if (this.consoleErrors.length > MAX_CONSOLE_ERRORS) this.consoleErrors.shift();
+  }
+
+  /** Error messages recorded at or after `sinceMs`, oldest first, at most `limit`. */
+  recentConsoleErrors(sinceMs: number, limit = 10): string[] {
+    return this.consoleErrors.filter((e) => e.at >= sinceMs).slice(-limit).map((e) => e.text);
+  }
 
   /** Record a failed action (circuit-breaker input). */
   recordFailure(): void {
