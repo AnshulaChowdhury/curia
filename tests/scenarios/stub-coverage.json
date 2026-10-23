@@ -103,6 +103,12 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-14T16:53:34.402Z"
     },
+    "cc coffee follows standing rule (both)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T21:24:55.420Z"
+    },
     "cc coffee follows standing rule (prefs)": {
       "unstubbed": 0,
       "runs": 5,
@@ -288,6 +294,12 @@
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "email me after specialist relay": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-23T15:23:00.937Z"
     },
     "external reply first person": {
       "unstubbed": 0,
@@ -732,12 +744,6 @@
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
-    },
-    "cc coffee follows standing rule (both)": {
-      "unstubbed": 0,
-      "runs": 5,
-      "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T21:24:55.420Z"
     }
   }
 }

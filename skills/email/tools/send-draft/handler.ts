@@ -16,12 +16,37 @@ import type { NylasMessage } from '../../../../src/channels/email/nylas-client.j
 import { createHumanDecision } from '../../../../src/bus/events.js';
 import { isPrincipalOriginated } from '../../../../src/contacts/principal.js';
 import { isPrincipalDirectedSend } from '../../../../src/skills/_shared/principal-directed.js';
+import { nylasStatus } from '../../../../src/channels/email/nylas-message-id.js';
 import type { TaskOriginator } from '../../../../src/contacts/types.js';
 
-/** Result of findDraftById — either the draft + owning account, or a structured error. */
+/**
+ * Result of findDraftById — either the draft + owning account, or a structured error.
+ * `transient` marks a fetch error worth retrying (network, 429, 5xx). A 4xx is not:
+ * every call fails the same way, and calling it transient started days of retry
+ * tasks (#2262).
+ */
 type DraftDiscoveryResult =
   | { success: true; draft: NylasMessage; resolvedAccount: string }
-  | { success: false; error: string; reason: 'not_found' | 'fetch_error' };
+  | { success: false; error: string; reason: 'not_found' }
+  | { success: false; error: string; reason: 'fetch_error'; transient: boolean };
+
+function isTransientFetchError(err: unknown): boolean {
+  const status = nylasStatus(err);
+  return status === undefined || status === 429 || status >= 500;
+}
+
+// Drafts ceo-inbox composes live in the principal's personal mailbox, which Curia
+// cannot send from. That is the usual reason a draft ID is in none of Curia's
+// accounts, so the error names it and the two things to do instead (#2262).
+function draftNotFoundError(draftId: string, searched: string, failNote = ''): string {
+  return (
+    `Draft not found: ${draftId}. Searched Curia's email accounts: ${searched}.${failNote} ` +
+    'send-draft only sends drafts saved in Curia\'s own accounts. A draft the ceo-inbox specialist ' +
+    'made is in the principal\'s personal Gmail, and Curia cannot send it: tell the principal it is ' +
+    'in their Gmail Drafts, or, if they asked you to email them, send it yourself with email-send. ' +
+    'Do not retry this draft ID.'
+  );
+}
 
 export class SendDraftHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -76,18 +101,18 @@ export class SendDraftHandler implements ToolHandler {
     ctx.log.info({ draftId, account: account ?? '(auto-discover)' }, 'send-draft: fetching draft');
 
     // ------------------------------------------------------------------
-    // Step 3: Fetch draft from Nylas DRAFTS folder
+    // Step 3: Fetch the draft from Nylas by ID
     // ------------------------------------------------------------------
-    // The Nylas DRAFTS folder is the source of truth — no shadow PG registry needed.
-    // We list all drafts and filter client-side by ID; Nylas doesn't support
-    // a direct draft-by-ID lookup via the messages API.
+    // Nylas's drafts resource is the source of truth — no shadow PG registry needed.
+    // It is read by ID: the old list of `/messages?in=DRAFTS` was a 400 on Gmail,
+    // whose label is DRAFT, and `/messages` holds no drafts anyway (#2262).
     //
     // The draft content is fetched here for two purposes:
     //   1. Verify the draft exists before attempting to send.
     //   2. Extract the primary recipient and body for the safety pipeline in
     //      gateway.sendEmailDraft() — blocked-contact check and content filter.
     //
-    // When account is provided, search only that account's DRAFTS folder.
+    // When account is provided, look only in that account.
     // When omitted, iterate all configured accounts (via gateway.listAccountIds())
     // and stop at the first match. This avoids requiring the LLM to know which
     // account owns the draft — the skill derives it from the draft's location.
@@ -261,7 +286,7 @@ export class SendDraftHandler implements ToolHandler {
   /**
    * Find a draft by ID, either in a specific account or across all accounts.
    *
-   * When `account` is provided, searches only that account's DRAFTS folder.
+   * When `account` is provided, looks only in that account.
    * When omitted, iterates all configured accounts (via gateway.listAccountIds())
    * and returns the first match along with the account that owns it.
    *
@@ -283,31 +308,37 @@ export class SendDraftHandler implements ToolHandler {
     // Slow path: search all accounts. Stop at the first match.
     const accountIds = gateway.listAccountIds();
     if (accountIds.length === 0) {
-      return { success: false, error: 'No email accounts configured', reason: 'fetch_error' };
+      return { success: false, error: 'No email accounts configured', reason: 'fetch_error', transient: false };
     }
 
     // Track which accounts failed so the error message is informative.
-    const failedAccounts: string[] = [];
+    const failures: Array<{ account: string; transient: boolean; error: string }> = [];
     for (const acctId of accountIds) {
       const result = await this.searchAccountForDraft(ctx, gateway, draftId, acctId);
       if (result.success) return result;
       if (result.reason === 'fetch_error') {
-        failedAccounts.push(acctId);
+        failures.push({ account: acctId, transient: result.transient, error: result.error });
       }
     }
+    const failedAccounts = failures.map((f) => f.account);
 
     // When every account had a fetch error, the draft was never actually searched —
-    // return a distinct message so the principal knows it's a transient API issue, not a
-    // missing draft. Without this, a complete Nylas outage reads as "Draft not found."
-    if (failedAccounts.length === accountIds.length) {
+    // return a distinct message so a Nylas outage does not read as "Draft not found."
+    // Only an outage is worth retrying; a rejected request fails the same way every time.
+    if (failures.length === accountIds.length) {
       ctx.log.error(
         { draftId, failedAccounts },
         'send-draft: all accounts failed during draft search — cannot confirm draft existence',
       );
+      const transient = failures.every((f) => f.transient);
       return {
         success: false,
         reason: 'fetch_error',
-        error: `Could not search for draft ${draftId}: all email accounts had fetch errors (${failedAccounts.join(', ')}). This is likely a transient API issue — try again shortly.`,
+        transient,
+        error: transient
+          ? `Could not search for draft ${draftId}: all email accounts had fetch errors (${failedAccounts.join(', ')}). This is likely a transient API issue — try again shortly.`
+          : `Could not search for draft ${draftId}: ${failures.map((f) => f.error).join('; ')}. ` +
+            'This is not a temporary outage, so retrying will fail the same way. Tell the principal the draft could not be sent.',
       };
     }
 
@@ -319,32 +350,34 @@ export class SendDraftHandler implements ToolHandler {
       { draftId, searchedAccounts: accountIds, failedAccounts },
       'send-draft: draft not found in any account',
     );
-    return {
-      success: false,
-      reason: 'not_found',
-      error: `Draft not found: ${draftId}. Searched accounts: ${searched}.${failNote}`,
-    };
+    return { success: false, reason: 'not_found', error: draftNotFoundError(draftId, searched, failNote) };
   }
 
-  /** Search a single account's DRAFTS folder for a draft by ID. */
+  /** Look up a draft by ID in a single account. */
   private async searchAccountForDraft(
     ctx: ToolContext,
     gateway: NonNullable<ToolContext['outboundGateway']>,
     draftId: string,
     account: string,
   ): Promise<DraftDiscoveryResult> {
-    let drafts: Awaited<ReturnType<typeof gateway.listEmailMessages>>;
+    let draft: NylasMessage | null;
     try {
-      drafts = await gateway.listEmailMessages({ folders: ['DRAFTS'] }, account);
+      draft = await gateway.getEmailDraft(draftId, account);
     } catch (err) {
-      ctx.log.error({ err, account }, 'send-draft: failed to fetch DRAFTS folder');
-      return { success: false, reason: 'fetch_error', error: `Failed to fetch drafts folder for account '${account}'` };
+      const transient = isTransientFetchError(err);
+      ctx.log.error({ err, account, transient }, 'send-draft: draft lookup failed');
+      const detail = err instanceof Error ? err.message : String(err);
+      return {
+        success: false,
+        reason: 'fetch_error',
+        transient,
+        error: `Failed to look up the draft in account '${account}': ${detail}`,
+      };
     }
 
-    const draft = drafts.find((m) => m.id === draftId);
     if (!draft) {
       ctx.log.debug({ draftId, account }, 'send-draft: draft not in this account');
-      return { success: false, reason: 'not_found', error: `Draft not found: ${draftId}` };
+      return { success: false, reason: 'not_found', error: draftNotFoundError(draftId, account) };
     }
 
     ctx.log.info(

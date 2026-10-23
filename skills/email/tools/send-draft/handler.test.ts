@@ -23,7 +23,7 @@ const DRAFT_STUB = {
   snippet: 'Hello Kevin',
   date: 1746000000, // epoch seconds
   unread: false,
-  folders: ['DRAFTS'],
+  folders: ['DRAFT'],
 };
 
 function makeCtx(overrides: {
@@ -35,7 +35,7 @@ function makeCtx(overrides: {
   actionLogRepo?: Partial<ActionLogRepo> | null;
 }): ToolContext {
   const gateway = {
-    listEmailMessages: vi.fn().mockResolvedValue([DRAFT_STUB]),
+    getEmailDraft: vi.fn().mockResolvedValue(DRAFT_STUB),
     sendEmailDraft: vi.fn().mockResolvedValue({ success: true, messageId: 'msg-sent-1' }),
     listAccountIds: vi.fn().mockReturnValue(['curia', 'personal']),
     ...overrides.gateway,
@@ -148,20 +148,20 @@ describe('SendDraftHandler', () => {
   it('returns error when DRAFTS folder fetch throws (explicit account)', async () => {
     const ctx = makeCtx({
       gateway: {
-        listEmailMessages: vi.fn().mockRejectedValue(new Error('Nylas error')),
+        getEmailDraft: vi.fn().mockRejectedValue(new Error('Nylas error')),
         sendEmailDraft: vi.fn(),
         listAccountIds: vi.fn().mockReturnValue(['personal']),
       },
     });
     const result = await handler.execute(ctx);
     expect(result.success).toBe(false);
-    if (!result.success) expect(result.error).toMatch(/fetch drafts folder/i);
+    if (!result.success) expect(result.error).toMatch(/look up the draft/i);
   });
 
   it('returns error when draft is not found in DRAFTS folder (explicit account)', async () => {
     const ctx = makeCtx({
       gateway: {
-        listEmailMessages: vi.fn().mockResolvedValue([]),
+        getEmailDraft: vi.fn().mockResolvedValue(null),
         sendEmailDraft: vi.fn(),
         listAccountIds: vi.fn().mockReturnValue(['personal']),
       },
@@ -175,7 +175,7 @@ describe('SendDraftHandler', () => {
     const draftNoRecipient = { ...DRAFT_STUB, to: [] };
     const ctx = makeCtx({
       gateway: {
-        listEmailMessages: vi.fn().mockResolvedValue([draftNoRecipient]),
+        getEmailDraft: vi.fn().mockResolvedValue(draftNoRecipient),
         sendEmailDraft: vi.fn(),
         listAccountIds: vi.fn().mockReturnValue(['personal']),
       },
@@ -236,7 +236,7 @@ describe('SendDraftHandler', () => {
     const draftWithCc = { ...DRAFT_STUB, cc: [{ email: 'third@external.com' }] };
     const ctx = makeCtx({
       gateway: {
-        listEmailMessages: vi.fn().mockResolvedValue([draftWithCc]),
+        getEmailDraft: vi.fn().mockResolvedValue(draftWithCc),
         sendEmailDraft: sendEmailDraftMock,
       },
     });
@@ -330,20 +330,20 @@ describe('SendDraftHandler', () => {
 
   describe('cross-account draft discovery', () => {
     it('finds draft in secondary account when account is omitted', async () => {
-      // Draft lives in 'personal' (second account). listEmailMessages returns empty
+      // Draft lives in 'personal' (second account). getEmailDraft returns empty
       // for 'curia' but finds the draft in 'personal'.
-      const listEmailMessages = vi.fn()
-        .mockImplementation((_opts: unknown, accountId: string) =>
+      const getEmailDraft = vi.fn()
+        .mockImplementation((_draftId: string, accountId: string) =>
           accountId === 'personal'
-            ? Promise.resolve([DRAFT_STUB])
-            : Promise.resolve([]),
+            ? Promise.resolve(DRAFT_STUB)
+            : Promise.resolve(null),
         );
       const sendEmailDraft = vi.fn().mockResolvedValue({ success: true, messageId: 'msg-sent-1' });
 
       const ctx = makeCtx({
         input: { draft_id: 'draft-abc123' }, // no account
         gateway: {
-          listEmailMessages,
+          getEmailDraft,
           sendEmailDraft,
           listAccountIds: vi.fn().mockReturnValue(['curia', 'personal']),
         },
@@ -363,18 +363,18 @@ describe('SendDraftHandler', () => {
     it('sends from discovered account, not primary', async () => {
       // The primary account is 'curia', but the draft is in 'personal'.
       // The send must use 'personal' credentials.
-      const listEmailMessages = vi.fn()
-        .mockImplementation((_opts: unknown, accountId: string) =>
+      const getEmailDraft = vi.fn()
+        .mockImplementation((_draftId: string, accountId: string) =>
           accountId === 'personal'
-            ? Promise.resolve([DRAFT_STUB])
-            : Promise.resolve([]),
+            ? Promise.resolve(DRAFT_STUB)
+            : Promise.resolve(null),
         );
       const sendEmailDraft = vi.fn().mockResolvedValue({ success: true, messageId: 'msg-sent-1' });
 
       const ctx = makeCtx({
         input: { draft_id: 'draft-abc123' }, // no account specified
         gateway: {
-          listEmailMessages,
+          getEmailDraft,
           sendEmailDraft,
           listAccountIds: vi.fn().mockReturnValue(['curia', 'personal']),
         },
@@ -387,12 +387,12 @@ describe('SendDraftHandler', () => {
     });
 
     it('returns clear error when draft not found in any account (no fallback to creating new draft)', async () => {
-      const listEmailMessages = vi.fn().mockResolvedValue([]);
+      const getEmailDraft = vi.fn().mockResolvedValue(null);
 
       const ctx = makeCtx({
         input: { draft_id: 'draft-nonexistent' }, // no account
         gateway: {
-          listEmailMessages,
+          getEmailDraft,
           sendEmailDraft: vi.fn(),
           listAccountIds: vi.fn().mockReturnValue(['curia', 'personal']),
         },
@@ -411,17 +411,17 @@ describe('SendDraftHandler', () => {
 
     it('stops searching after first account match (short-circuits)', async () => {
       // Draft found in the first account ('curia') — should not query 'personal'.
-      const listEmailMessages = vi.fn()
-        .mockImplementation((_opts: unknown, accountId: string) =>
+      const getEmailDraft = vi.fn()
+        .mockImplementation((_draftId: string, accountId: string) =>
           accountId === 'curia'
-            ? Promise.resolve([DRAFT_STUB])
+            ? Promise.resolve(DRAFT_STUB)
             : Promise.reject(new Error('should not be called')),
         );
 
       const ctx = makeCtx({
         input: { draft_id: 'draft-abc123' }, // no account
         gateway: {
-          listEmailMessages,
+          getEmailDraft,
           sendEmailDraft: vi.fn().mockResolvedValue({ success: true, messageId: 'msg-sent-1' }),
           listAccountIds: vi.fn().mockReturnValue(['curia', 'personal']),
         },
@@ -429,23 +429,23 @@ describe('SendDraftHandler', () => {
 
       const result = await handler.execute(ctx);
       expect(result.success).toBe(true);
-      // listEmailMessages should have been called exactly once (for 'curia')
-      expect(listEmailMessages).toHaveBeenCalledTimes(1);
+      // getEmailDraft should have been called exactly once (for 'curia')
+      expect(getEmailDraft).toHaveBeenCalledTimes(1);
     });
 
     it('continues searching when one account fetch fails', async () => {
       // 'curia' throws an error, but 'personal' has the draft — should still succeed.
-      const listEmailMessages = vi.fn()
-        .mockImplementation((_opts: unknown, accountId: string) => {
+      const getEmailDraft = vi.fn()
+        .mockImplementation((_draftId: string, accountId: string) => {
           if (accountId === 'curia') return Promise.reject(new Error('Nylas timeout'));
-          return Promise.resolve([DRAFT_STUB]);
+          return Promise.resolve(DRAFT_STUB);
         });
       const sendEmailDraft = vi.fn().mockResolvedValue({ success: true, messageId: 'msg-sent-1' });
 
       const ctx = makeCtx({
         input: { draft_id: 'draft-abc123' }, // no account
         gateway: {
-          listEmailMessages,
+          getEmailDraft,
           sendEmailDraft,
           listAccountIds: vi.fn().mockReturnValue(['curia', 'personal']),
         },
@@ -463,16 +463,16 @@ describe('SendDraftHandler', () => {
 
     it('reports fetch errors in the error message when draft not found', async () => {
       // Both accounts fail — error message should mention which had fetch errors.
-      const listEmailMessages = vi.fn()
-        .mockImplementation((_opts: unknown, accountId: string) => {
+      const getEmailDraft = vi.fn()
+        .mockImplementation((_draftId: string, accountId: string) => {
           if (accountId === 'curia') return Promise.reject(new Error('Nylas timeout'));
-          return Promise.resolve([]); // personal: no match
+          return Promise.resolve(null); // personal: no match
         });
 
       const ctx = makeCtx({
         input: { draft_id: 'draft-nonexistent' },
         gateway: {
-          listEmailMessages,
+          getEmailDraft,
           sendEmailDraft: vi.fn(),
           listAccountIds: vi.fn().mockReturnValue(['curia', 'personal']),
         },
@@ -489,12 +489,12 @@ describe('SendDraftHandler', () => {
     it('returns transient-error message when ALL accounts have fetch errors', async () => {
       // Every account throws — the draft was never searched, so the error should
       // say "could not search" not "not found".
-      const listEmailMessages = vi.fn().mockRejectedValue(new Error('Nylas down'));
+      const getEmailDraft = vi.fn().mockRejectedValue(new Error('Nylas down'));
 
       const ctx = makeCtx({
         input: { draft_id: 'draft-abc123' },
         gateway: {
-          listEmailMessages,
+          getEmailDraft,
           sendEmailDraft: vi.fn(),
           listAccountIds: vi.fn().mockReturnValue(['curia', 'personal']),
         },
@@ -511,11 +511,71 @@ describe('SendDraftHandler', () => {
       }
     });
 
+    // #2262: Gmail rejected the old DRAFTS lookup with a 400 on every call, and the
+    // "transient" wording sent the coordinator into days of retry tasks.
+    it('does not call a rejected request transient', async () => {
+      const badRequest = Object.assign(new Error('Bad Request'), { statusCode: 400 });
+      const ctx = makeCtx({
+        input: { draft_id: 'draft-abc123' },
+        gateway: {
+          getEmailDraft: vi.fn().mockRejectedValue(badRequest),
+          sendEmailDraft: vi.fn(),
+          listAccountIds: vi.fn().mockReturnValue(['curia']),
+        },
+      });
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).not.toMatch(/transient|try again/i);
+        expect(result.error).toMatch(/not a temporary outage/i);
+        expect(result.error).toContain('Bad Request');
+      }
+    });
+
+    it.each([429, 503])('still calls a %i transient', async (statusCode) => {
+      const err = Object.assign(new Error('Service Unavailable'), { statusCode });
+      const ctx = makeCtx({
+        input: { draft_id: 'draft-abc123' },
+        gateway: {
+          getEmailDraft: vi.fn().mockRejectedValue(err),
+          sendEmailDraft: vi.fn(),
+          listAccountIds: vi.fn().mockReturnValue(['curia']),
+        },
+      });
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/transient/i);
+    });
+
+    it('explains a draft in none of Curia\'s accounts and points at email-send', async () => {
+      // A ceo-inbox draft lives in the principal's Gmail, outside every Curia account.
+      const ctx = makeCtx({
+        input: { draft_id: 'r956985379676630908' },
+        gateway: {
+          getEmailDraft: vi.fn().mockResolvedValue(null),
+          sendEmailDraft: vi.fn(),
+          listAccountIds: vi.fn().mockReturnValue(['curia']),
+        },
+      });
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toMatch(/not found/i);
+        expect(result.error).toContain('email-send');
+        expect(result.error).toMatch(/Gmail Drafts/);
+        expect(result.error).toMatch(/do not retry/i);
+        expect(result.error).not.toMatch(/transient/i);
+      }
+    });
+
     it('returns error when no email accounts are configured', async () => {
       const ctx = makeCtx({
         input: { draft_id: 'draft-abc123' }, // no account
         gateway: {
-          listEmailMessages: vi.fn(),
+          getEmailDraft: vi.fn(),
           sendEmailDraft: vi.fn(),
           listAccountIds: vi.fn().mockReturnValue([]),
         },
@@ -528,21 +588,21 @@ describe('SendDraftHandler', () => {
 
     it('uses explicit account when provided (fast path)', async () => {
       // When account is provided, only that account is searched — not all accounts.
-      const listEmailMessages = vi.fn().mockResolvedValue([DRAFT_STUB]);
+      const getEmailDraft = vi.fn().mockResolvedValue(DRAFT_STUB);
       const sendEmailDraft = vi.fn().mockResolvedValue({ success: true, messageId: 'msg-sent-1' });
       const listAccountIds = vi.fn().mockReturnValue(['curia', 'personal']);
 
       const ctx = makeCtx({
         input: { draft_id: 'draft-abc123', account: 'personal' },
-        gateway: { listEmailMessages, sendEmailDraft, listAccountIds },
+        gateway: { getEmailDraft, sendEmailDraft, listAccountIds },
       });
 
       await handler.execute(ctx);
 
       // listAccountIds should NOT be called — fast path skips the iteration
       expect(listAccountIds).not.toHaveBeenCalled();
-      // listEmailMessages called once with 'personal' specifically
-      expect(listEmailMessages).toHaveBeenCalledWith({ folders: ['DRAFTS'] }, 'personal');
+      // getEmailDraft called once with 'personal' specifically
+      expect(getEmailDraft).toHaveBeenCalledWith('draft-abc123', 'personal');
     });
   });
 

@@ -24,11 +24,12 @@ import type {
   CreateDraftRequest,
   CreateAttachmentRequest,
   ListFolderQueryParams,
+  ListDraftsQueryParams,
 } from 'nylas';
 import type { Logger } from '../../logger.js';
 import { budgetExpired, remainingMs } from '../../util/call-budget.js';
 import type { CallBudget } from '../../util/call-budget.js';
-import { markMessageRequestError } from './nylas-message-id.js';
+import { markMessageRequestError, nylasStatus } from './nylas-message-id.js';
 
 /** Per-request SDK options. `timeout` caps one request (see budgetOverrides). */
 interface RequestOverrides {
@@ -76,6 +77,17 @@ interface NylasLike {
     create(params: {
       identifier: string;
       requestBody: CreateDraftRequest;
+    }): Promise<NylasResponse<NylasDraft>>;
+
+    /** Drafts live in their own collection: `/messages` never returns them (#2262). */
+    list(params: {
+      identifier: string;
+      queryParams?: ListDraftsQueryParams;
+    }): Promise<NylasListResponse<NylasDraft>>;
+
+    find(params: {
+      identifier: string;
+      draftId: string;
     }): Promise<NylasResponse<NylasDraft>>;
 
     /**
@@ -208,7 +220,7 @@ export interface ListMessagesOptions {
   fields?: 'include_headers';
   /** Filter to messages in these folder IDs (maps to Nylas `in` param).
    *  Standard Gmail values: INBOX, DRAFT, SENT, TRASH, SPAM, STARRED, IMPORTANT.
-   *  Note: Gmail uses DRAFT (singular), not DRAFTS. Providers may have custom labels. */
+   *  DRAFT or DRAFTS alone lists drafts instead (see listMessages). */
   folders?: string[];
   /** Filter to messages from this sender email address */
   from?: string;
@@ -218,6 +230,12 @@ export interface ListMessagesOptions {
   subject?: string;
   /** Provider-native search query (Gmail search syntax, Outlook KQL, etc.) */
   searchQueryNative?: string;
+}
+
+/** True for the folder names callers use for drafts: Gmail's DRAFT, or DRAFTS. */
+export function isDraftsFolder(folder: string): boolean {
+  const name = folder.trim().toUpperCase();
+  return name === 'DRAFT' || name === 'DRAFTS';
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +271,13 @@ export class NylasClient {
    * thread (e.g. email-adapter's sendOutboundReply) depend on this guarantee.
    */
   async listMessages(options?: ListMessagesOptions): Promise<NylasMessage[]> {
+    // Gmail rejects `in=DRAFTS` (its label is DRAFT), and `/messages` has no drafts
+    // under either name, so a drafts-only folder filter reads `/drafts` (#2262).
+    const folders = options?.folders;
+    if (folders && folders.length > 0 && folders.every(isDraftsFolder) && options?.searchQueryNative === undefined) {
+      return this.listDrafts({ limit: options?.limit, threadId: options?.threadId, subject: options?.subject });
+    }
+
     const queryParams: ListMessagesQueryParams = {};
 
     if (options?.limit !== undefined) {
@@ -321,6 +346,38 @@ export class NylasClient {
       return response.data.map((msg) => this.normalizeMessage(msg));
     } catch (err) {
       this.log.error({ err, grantId: this.grantId, queryParams }, 'Nylas listMessages failed');
+      throw err;
+    }
+  }
+
+  /** List unsent drafts, newest first (first page only, like listMessages). */
+  async listDrafts(options?: { limit?: number; threadId?: string; subject?: string }): Promise<NylasMessage[]> {
+    const queryParams: ListDraftsQueryParams = {};
+    if (options?.limit !== undefined) queryParams.limit = options.limit;
+    if (options?.threadId !== undefined) queryParams.threadId = options.threadId;
+    if (options?.subject !== undefined) queryParams.subject = options.subject;
+
+    try {
+      const response = await this.nylas.drafts.list({ identifier: this.grantId, queryParams });
+      // Draft and Message share BaseMessage, as in createDraft.
+      return response.data.map((draft) => this.normalizeMessage(draft as unknown as NylasSdkMessage));
+    } catch (err) {
+      this.log.error({ err, grantId: this.grantId, queryParams }, 'Nylas listDrafts failed');
+      throw err;
+    }
+  }
+
+  /** Fetch one draft by ID, or null when this mailbox has no such draft. */
+  async getDraft(draftId: string): Promise<NylasMessage | null> {
+    try {
+      const response = await this.nylas.drafts.find({ identifier: this.grantId, draftId });
+      return this.normalizeMessage(response.data as unknown as NylasSdkMessage);
+    } catch (err) {
+      if (nylasStatus(err) === 404) {
+        this.log.debug({ grantId: this.grantId, draftId }, 'Nylas getDraft: no such draft');
+        return null;
+      }
+      this.log.error({ err, grantId: this.grantId, draftId }, 'Nylas getDraft failed');
       throw err;
     }
   }

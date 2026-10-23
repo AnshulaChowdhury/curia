@@ -253,6 +253,23 @@ describe('CeoInboxDraftComposeHandler', () => {
       ]);
     });
 
+    // #2262: "email me that" was delegated here and became a draft from the principal to themselves.
+    it.each([
+      { to: ['principal'] },
+      { to: ['principal#personal'], cc: ['principal'] },
+    ])('refuses a draft addressed only to the principal, and points at email-send (%j)', async (recipients) => {
+      const error = refused(await handler.execute(buildCtx({ ...recipients, subject: 'Refresh done', body: 'Link.' })));
+      expect(error).toMatch(/only to the principal/);
+      expect(error).toContain('email-send');
+      expect(error).toContain('No draft was saved.');
+    });
+
+    it('still saves a draft to the principal when someone else is on it', async () => {
+      ok();
+      const result = await handler.execute(buildCtx({ to: ['principal', fixture.aliceId], subject: 'Hello', body: 'Hi.' }));
+      expect(result.success).toBe(true);
+    });
+
     it('refuses a reference that matches no contact, and saves nothing', async () => {
       const error = refused(await handler.execute(buildCtx({
         to: ['4fdfd02a-1466-46ca-b37b-13bb564fe3f0'], subject: 'Hello', body: 'Hi.',

@@ -2963,6 +2963,21 @@ export class OutboundGateway {
   }
 
   /**
+   * Fetch one draft by ID from a configured account, or null when that account has
+   * no such draft. Read-only — no security filtering applied.
+   */
+  async getEmailDraft(draftId: string, accountId?: string): Promise<NylasMessage | null> {
+    const client = this.getNylasClient(accountId);
+    if (!client) {
+      if (accountId && this.nylasClients.size > 0) {
+        throw new UnknownEmailAccountError(accountId, this.listAccountIds());
+      }
+      throw new Error('outbound-gateway: getEmailDraft called but no nylasClient is configured');
+    }
+    return client.getDraft(draftId);
+  }
+
+  /**
    * Create a Nylas draft without sending it — used as a fallback when the autonomy
    * gate blocks a direct send (score too low).
    *
