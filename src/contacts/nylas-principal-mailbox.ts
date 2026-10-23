@@ -2,8 +2,9 @@
 //
 // The same grant ceo-inbox reads (ceo_nylas_grant_id). It runs inside dispatch, ahead of
 // the coordinator, so every lookup has a short deadline: a slow mailbox delays the turn by
-// at most that, and a timeout reads as "no evidence" (PrincipalAcquaintanceCheck). The
-// request itself is read-only, so one left running past the deadline does no harm.
+// at most that, and a timeout reads as "no evidence" (PrincipalAcquaintanceCheck). The race
+// returns at the deadline; the client is built with the same SDK timeout, so the request
+// itself is aborted then too rather than left running (SDK 8.4 takes no AbortSignal).
 
 import { NylasClient } from '../channels/email/nylas-client.js';
 import type { Logger } from '../logger.js';
@@ -23,7 +24,7 @@ export class NylasPrincipalMailbox implements PrincipalMailbox {
     logger: Logger,
     private readonly timeoutMs = LOOKUP_TIMEOUT_MS,
   ) {
-    this.client = new NylasClient(apiKey, grantId, logger);
+    this.client = new NylasClient(apiKey, grantId, logger, timeoutMs);
   }
 
   async hasSentTo(address: string): Promise<boolean> {

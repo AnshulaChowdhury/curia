@@ -112,7 +112,7 @@ interface NylasLike {
  * The Nylas default export is a class constructor at runtime.
  * Cast it through unknown so TypeScript treats it as constructable.
  */
-const NylasSDK = NylasDefault as unknown as new (config: { apiKey: string }) => NylasLike;
+const NylasSDK = NylasDefault as unknown as new (config: { apiKey: string; timeout?: number }) => NylasLike;
 
 // ---------------------------------------------------------------------------
 // Our own simplified message shape — normalized from the Nylas SDK's Message
@@ -225,8 +225,15 @@ export class NylasClient {
   // This client is long-lived and bound to one grant, so the cache is per grant.
   private folderCache: { folders: NylasFolder[]; expiresAt: number } | undefined;
 
-  constructor(apiKey: string, grantId: string, logger: Logger) {
-    this.nylas = new NylasSDK({ apiKey });
+  /**
+   * `timeoutMs` caps every request this client makes (the SDK default is 90s). The SDK
+   * config takes seconds. Leave it unset for the long-lived channel clients.
+   */
+  constructor(apiKey: string, grantId: string, logger: Logger, timeoutMs?: number) {
+    this.nylas = new NylasSDK({
+      apiKey,
+      ...(timeoutMs === undefined ? {} : { timeout: timeoutMs / 1000 }),
+    });
     this.grantId = grantId;
     this.log = logger.child({ component: 'nylas-client' });
   }
