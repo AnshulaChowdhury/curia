@@ -41,7 +41,7 @@ import {
   type SettleResult,
   type SettleTiming,
 } from './settle.js';
-import { clearSiteData, siteForDomainInput } from './clear-site-data.js';
+import { clearSiteData, hostForDomainInput } from './clear-site-data.js';
 
 // Maximum cleaned DOM content length before truncation.
 // Prevents token blowout on content-heavy pages.
@@ -219,7 +219,7 @@ export class WebBrowserHandler implements ToolHandler {
       // call. When present, the top-level action/selector/… fields are ignored and each step
       // supplies its own. Lets a whole form page be filled in a single turn.
       actions?: unknown;
-      // domain: the site clear_site_data forgets (#2244). Only meaningful for that action.
+      // domain: the host clear_site_data forgets (#2244). Only meaningful for that action.
       domain?: string;
     };
 
@@ -247,7 +247,7 @@ export class WebBrowserHandler implements ToolHandler {
 
     // Validate every step's action verb up front, before acquiring a session, so a typo
     // fails with a clear message rather than mid-flight. close_session (it tears the session
-    // down) and clear_site_data (it signs a site out) are only valid as single, standalone
+    // down) and clear_site_data (it signs a host out) are only valid as single, standalone
     // actions — never inside a batch.
     for (let i = 0; i < steps.length; i++) {
       const stepAction = steps[i]!.action;
@@ -282,14 +282,14 @@ export class WebBrowserHandler implements ToolHandler {
       return { success: true, data: { content: '', session_id, url: '' } };
     }
 
-    // clear_site_data needs a site; check before acquiring a session.
-    let siteToClear: string | null = null;
+    // clear_site_data needs a host; check before acquiring a session.
+    let hostToClear: string | null = null;
     if (!isBatch && steps[0]!.action === 'clear_site_data') {
       if (!domain || typeof domain !== 'string') {
         return { success: false, error: 'clear_site_data requires domain (string — e.g. "aircanada.com")' };
       }
-      siteToClear = siteForDomainInput(domain);
-      if (!siteToClear) {
+      hostToClear = hostForDomainInput(domain);
+      if (!hostToClear) {
         return { success: false, error: `clear_site_data: "${logSafeText(ctx, domain)}" is not a website domain (e.g. "aircanada.com")` };
       }
     }
@@ -324,23 +324,23 @@ export class WebBrowserHandler implements ToolHandler {
     const sessionProvided = typeof session_id === 'string' && session_id.length > 0;
     const sessionReused = sessionProvided ? sessionId === session_id : undefined;
 
-    // --- clear_site_data: forget one site in this session's profile (#2244) ---
+    // --- clear_site_data: forget one host in this session's profile (#2244) ---
     // Recovery for a sign-in that was interrupted and left the profile half-signed-in. It
     // runs under the same autonomy gate as every other web-browser call.
-    if (siteToClear) {
+    if (hostToClear) {
       try {
-        const cleared = await clearSiteData(session.context, page, siteToClear, ctx.log);
+        const cleared = await clearSiteData(session.context, page, hostToClear, ctx.log);
         const data: Record<string, unknown> = {
           content: '',
           session_id: sessionId,
           url: session.redactInjectedSecrets(page.url()),
-          cleared: { site: cleared.site, cookies: cleared.cookiesCleared, origins: cleared.originsCleared },
+          cleared: { host: cleared.host, cookies: cleared.cookiesCleared, origins: cleared.originsCleared },
         };
         if (sessionReused !== undefined) data.session_reused = sessionReused;
         return { success: true, data };
       } catch (err) {
         const safeMessage = logSafeText(ctx, session.redactInjectedSecrets(err instanceof Error ? err.message : String(err)));
-        ctx.log.error({ sessionId, site: siteToClear, errMessage: safeMessage }, 'clear_site_data failed');
+        ctx.log.error({ sessionId, host: hostToClear, errMessage: safeMessage }, 'clear_site_data failed');
         return { success: false, error: `Browser action "clear_site_data" failed: ${safeMessage}` };
       }
     }

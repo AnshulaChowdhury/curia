@@ -342,24 +342,25 @@ describe('web-browser adaptive settle (#2244)', () => {
 });
 
 describe('web-browser clear_site_data (#2244)', () => {
-  /** A context with a real-enough cookie jar: clearCookies applies its domain filter. */
-  function fakeContext(cookieDomains: string[]) {
+  /** A context with a real-enough cookie jar: clearCookies removes the exact cookie named. */
+  function fakeContext(cookieDomains: string[], frameUrl = 'https://www.aircanada.com/clogin/pages/consent') {
     let cookies = cookieDomains.map((domain, i) => ({ name: `c${i}`, value: 'v', domain, path: '/' }));
     const sent: Array<{ method: string; params: unknown }> = [];
     const cdp = {
       send: vi.fn(async (method: string, params: unknown) => { sent.push({ method, params }); return {}; }),
       detach: vi.fn().mockResolvedValue(undefined),
     };
-    const framesOnSite = { url: () => 'https://accounts.aircanada.com/clogin/pages/consent', evaluate: vi.fn().mockResolvedValue(undefined) };
+    const frameOnHost = { url: () => frameUrl, evaluate: vi.fn().mockResolvedValue(undefined) };
     const context = {
       cookies: vi.fn(async () => cookies),
-      clearCookies: vi.fn(async (filter: { domain: RegExp }) => {
-        cookies = cookies.filter((c) => !filter.domain.test(c.domain.replace(/^\./, '')));
+      clearCookies: vi.fn(async (filter: { name: string; domain: string; path: string }) => {
+        cookies = cookies.filter((c) => !(c.name === filter.name && c.domain === filter.domain && c.path === filter.path));
       }),
-      pages: () => [{ frames: () => [framesOnSite, { url: () => 'https://www.linkedin.com/feed' }] }],
+      pages: () => [{ frames: () => [frameOnHost, { url: () => 'https://www.linkedin.com/feed' }] }],
       newCDPSession: vi.fn().mockResolvedValue(cdp),
     };
-    return { context, sent, remaining: () => cookies.map((c) => c.domain), framesOnSite };
+    const origins = (): string[] => sent.map((s) => (s.params as { origin: string }).origin);
+    return { context, sent, origins, remaining: () => cookies.map((c) => c.domain), frameOnHost };
   }
 
   function clearCtx(input: Record<string, unknown>, context: unknown) {
@@ -371,51 +372,47 @@ describe('web-browser clear_site_data (#2244)', () => {
     return { input, log: logger, browserService } as unknown as ToolContext;
   }
 
-  it('clears one site and leaves other sites signed in', async () => {
-    const jar = fakeContext(['.aircanada.com', 'www.aircanada.com', 'accounts.aircanada.com', '.linkedin.com', 'www.manulife.ca', '.notaircanada.com']);
+  const AIR_CANADA_JAR = ['.aircanada.com', 'www.aircanada.com', 'accounts.aircanada.com', 'aircanada.com', '.linkedin.com', 'www.manulife.ca', '.notaircanada.com'];
+
+  // The recovery case: the stuck page is on www.aircanada.com; the half-signed-in state sits
+  // on the parent .aircanada.com domain cookie the browser sends there.
+  it('clears what the host can see and leaves other sites signed in', async () => {
+    const jar = fakeContext(AIR_CANADA_JAR);
 
     const result = await new WebBrowserHandler().execute(clearCtx({ action: 'clear_site_data', domain: 'www.aircanada.com' }, jar.context));
 
     expect(result.success).toBe(true);
     if (!result.success) return;
-    const data = result.data as Record<string, unknown>;
-    expect(data.cleared).toMatchObject({ site: 'aircanada.com', cookies: 3 });
-    expect(jar.remaining()).toEqual(['.linkedin.com', 'www.manulife.ca', '.notaircanada.com']);
-    const origins = jar.sent.map((s) => (s.params as { origin: string }).origin);
-    expect(origins).toContain('https://www.aircanada.com');
-    expect(origins).toContain('https://accounts.aircanada.com');
-    expect(origins.some((o) => o.includes('linkedin') || o.includes('manulife'))).toBe(false);
+    expect((result.data as Record<string, unknown>).cleared).toMatchObject({ host: 'www.aircanada.com', cookies: 2 });
+    // A sibling host's cookie and the parent's host-only cookie are not sent to www, so they stay.
+    expect(jar.remaining()).toEqual(['accounts.aircanada.com', 'aircanada.com', '.linkedin.com', 'www.manulife.ca', '.notaircanada.com']);
+    expect(jar.origins()).toEqual(['https://www.aircanada.com', 'http://www.aircanada.com']);
     expect(jar.sent.every((s) => s.method === 'Storage.clearDataForOrigin')).toBe(true);
-    // Session storage cleared in the frame open on the site.
-    expect(jar.framesOnSite.evaluate).toHaveBeenCalledWith('sessionStorage.clear()');
+    expect(jar.frameOnHost.evaluate).toHaveBeenCalledWith('sessionStorage.clear()');
   });
 
-  // A tenant on a shared host not on the Public Suffix List is its own site too (PR #2259 review).
+  it('clears the whole site when given the bare domain', async () => {
+    const jar = fakeContext(AIR_CANADA_JAR);
+
+    await new WebBrowserHandler().execute(clearCtx({ action: 'clear_site_data', domain: 'aircanada.com' }, jar.context));
+
+    expect(jar.remaining()).toEqual(['.linkedin.com', 'www.manulife.ca', '.notaircanada.com']);
+    expect(jar.origins()).toEqual(expect.arrayContaining(['https://aircanada.com', 'https://www.aircanada.com', 'https://accounts.aircanada.com']));
+    expect(jar.origins().some((o) => /linkedin|manulife|notaircanada/.test(o))).toBe(false);
+  });
+
+  // No list of shared hosts: a tenant host only sees its own cookies and the shared
+  // parent-domain ones, so other tenants stay signed in (PR #2259 review).
   it.each([
-    ['acme.okta.com', 'acme.okta.com'],
-    ['https://acme.us.auth0.com/u/login', 'acme.us.auth0.com'],
-    ['login.manulife.b2clogin.com', 'manulife.b2clogin.com'],
-    ['www.aircanada.com', 'aircanada.com'],
-  ])('scopes %s to the site %s', async (domain, site) => {
-    const jar = fakeContext(['.okta.com', 'other.okta.com', 'acme.okta.com']);
+    ['acme.okta.com', ['acme.okta.com', 'other.okta.com', '.okta.com'], ['other.okta.com']],
+    ['https://acme.us.auth0.com/u/login', ['acme.us.auth0.com', 'other.us.auth0.com'], ['other.us.auth0.com']],
+    ['manulife.b2clogin.com', ['manulife.b2clogin.com', 'contoso.b2clogin.com'], ['contoso.b2clogin.com']],
+    ['acme.github.io', ['acme.github.io', 'other.github.io'], ['other.github.io']],
+  ])('clearing tenant %s leaves the other tenants signed in', async (domain, jarDomains, left) => {
+    const jar = fakeContext(jarDomains, 'https://www.linkedin.com/');
     const result = await new WebBrowserHandler().execute(clearCtx({ action: 'clear_site_data', domain }, jar.context));
     expect(result.success).toBe(true);
-    if (result.success) expect((result.data as { cleared: { site: string } }).cleared.site).toBe(site);
-  });
-
-  it('clearing one Okta tenant leaves the others signed in', async () => {
-    const jar = fakeContext(['acme.okta.com', 'other.okta.com']);
-    await new WebBrowserHandler().execute(clearCtx({ action: 'clear_site_data', domain: 'acme.okta.com' }, jar.context));
-    expect(jar.remaining()).toEqual(['other.okta.com']);
-  });
-
-  // Review fix: a tenant on a shared host (private suffix) is its own site.
-  it('clears only the tenant on a shared host', async () => {
-    const jar = fakeContext(['acme.github.io', 'other.github.io']);
-    const result = await new WebBrowserHandler().execute(clearCtx({ action: 'clear_site_data', domain: 'acme.github.io' }, jar.context));
-    expect(result.success).toBe(true);
-    if (result.success) expect((result.data as { cleared: { site: string } }).cleared.site).toBe('acme.github.io');
-    expect(jar.remaining()).toEqual(['other.github.io']);
+    expect(jar.remaining()).toEqual(left);
   });
 
   it('requires a domain', async () => {

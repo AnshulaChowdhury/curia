@@ -57,7 +57,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **AWS Bedrock provider** — tiers can run Claude on Bedrock; opt-in, off by default. (#1766)
 - **KG node merge** — merge duplicate or mistyped knowledge-graph nodes from the console, with previewed conflicts. (#2233)
 - **`kg.nodes_merged` bus event** — new audit event for each knowledge-graph node merge; public bus surface. (#2233)
-- **`web-browser` `clear_site_data`** — clears one site's cookies and storage, recovering half-finished sign-ins; others stay signed in. (#2244)
+- **`web-browser` `clear_site_data`** — clears one host's cookies and storage, recovering half-finished sign-ins; others stay signed in. (#2244)
 - **`browser.settleCapMs`** — **config:** caps the web-browser redirect wait; default 35s, at most 90s. (#2244)
 
 ### Changed
