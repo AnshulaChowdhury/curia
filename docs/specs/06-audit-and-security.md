@@ -326,8 +326,9 @@ principal knows them (`src/contacts/principal-acquaintance.ts`):
   domain could be a shared mail provider, and then anyone with an address there would
   count.
 - `principal-correspondence`: the principal has sent mail to this address. This is a search
-  of the principal's Sent mail over their Nylas grant, with a 5-second limit. Mail the sender
-  sent the principal does not count.
+  of the principal's Sent mail over their Nylas grant, with a 5-second limit. It finds the
+  Sent folder by its `\Sent` attribute and filters by address, so it works on Gmail,
+  Microsoft and IMAP grants alike. Mail the sender sent the principal does not count.
 
 The message is then counted toward the contact's confidence (as for every sender, above), and
 the contact resolved again. So this first message is authorized and scored as a known

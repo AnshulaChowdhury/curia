@@ -164,6 +164,11 @@ export interface EmailAttachment {
 export interface NylasFolder {
   id: string;
   name: string;
+  /**
+   * Provider-neutral system-folder markers from Nylas, e.g. `\Sent` on the Sent folder
+   * whatever its id or name (Gmail `SENT`, Outlook "Sent Items"). Absent on user folders.
+   */
+  attributes?: string[];
 }
 
 /**
@@ -207,6 +212,8 @@ export interface ListMessagesOptions {
   folders?: string[];
   /** Filter to messages from this sender email address */
   from?: string;
+  /** Filter to messages with this address in from, to, cc or bcc (Nylas `any_email`) */
+  anyEmail?: string;
   /** Filter to messages with this exact subject line */
   subject?: string;
   /** Provider-native search query (Gmail search syntax, Outlook KQL, etc.) */
@@ -270,11 +277,12 @@ export class NylasClient {
       if (options.unread !== undefined) suppressed.unread = options.unread;
       if (options.receivedAfter !== undefined) suppressed.receivedAfter = options.receivedAfter;
       if (options.from !== undefined) suppressed.from = options.from;
+      if (options.anyEmail !== undefined) suppressed.anyEmail = options.anyEmail;
       if (options.subject !== undefined) suppressed.subject = options.subject;
       if (Object.keys(suppressed).length > 0) {
         this.log.warn(
           { suppressed },
-          'nylas: listMessages — folders/unread/receivedAfter/from/subject ignored because searchQueryNative is set (Nylas v3 limitation)',
+          'nylas: listMessages — folders/unread/receivedAfter/from/anyEmail/subject ignored because searchQueryNative is set (Nylas v3 limitation)',
         );
       }
       queryParams.searchQueryNative = options.searchQueryNative;
@@ -292,6 +300,9 @@ export class NylasClient {
       if (options?.from !== undefined) {
         // Nylas expects `from` as an array of email strings.
         queryParams.from = [options.from];
+      }
+      if (options?.anyEmail !== undefined) {
+        queryParams.anyEmail = [options.anyEmail];
       }
       if (options?.subject !== undefined) {
         queryParams.subject = options.subject;
@@ -538,7 +549,11 @@ export class NylasClient {
           ...(pageToken ? { queryParams: { pageToken } } : {}),
           ...this.budgetOverrides(budget, 'listFolders'),
         });
-        folders.push(...response.data.map((f) => ({ id: f.id, name: f.name })));
+        folders.push(...response.data.map((f) => ({
+          id: f.id,
+          name: f.name,
+          ...(f.attributes?.length ? { attributes: f.attributes } : {}),
+        })));
 
         // An empty page with a cursor would otherwise spin forever.
         if (response.data.length === 0 || !response.nextCursor) break;
