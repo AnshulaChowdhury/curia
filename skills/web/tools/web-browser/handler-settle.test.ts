@@ -390,6 +390,25 @@ describe('web-browser clear_site_data (#2244)', () => {
     expect(jar.framesOnSite.evaluate).toHaveBeenCalledWith('sessionStorage.clear()');
   });
 
+  // A tenant on a shared host not on the Public Suffix List is its own site too (PR #2259 review).
+  it.each([
+    ['acme.okta.com', 'acme.okta.com'],
+    ['https://acme.us.auth0.com/u/login', 'acme.us.auth0.com'],
+    ['login.manulife.b2clogin.com', 'manulife.b2clogin.com'],
+    ['www.aircanada.com', 'aircanada.com'],
+  ])('scopes %s to the site %s', async (domain, site) => {
+    const jar = fakeContext(['.okta.com', 'other.okta.com', 'acme.okta.com']);
+    const result = await new WebBrowserHandler().execute(clearCtx({ action: 'clear_site_data', domain }, jar.context));
+    expect(result.success).toBe(true);
+    if (result.success) expect((result.data as { cleared: { site: string } }).cleared.site).toBe(site);
+  });
+
+  it('clearing one Okta tenant leaves the others signed in', async () => {
+    const jar = fakeContext(['acme.okta.com', 'other.okta.com']);
+    await new WebBrowserHandler().execute(clearCtx({ action: 'clear_site_data', domain: 'acme.okta.com' }, jar.context));
+    expect(jar.remaining()).toEqual(['other.okta.com']);
+  });
+
   // Review fix: a tenant on a shared host (private suffix) is its own site.
   it('clears only the tenant on a shared host', async () => {
     const jar = fakeContext(['acme.github.io', 'other.github.io']);
