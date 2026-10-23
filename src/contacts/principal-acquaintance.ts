@@ -41,7 +41,10 @@ function domainOf(address: string): string | null {
 }
 
 // Results are cached per address: a positive one does not change, and a negative one is
-// re-checked after an hour so a reply the principal sends later still counts.
+// re-checked after an hour so a reply the principal sends later still counts. A failed
+// lookup is not cached (a mailbox outage is not evidence of no correspondence), so the next
+// message asks again. Lookups already running are shared, so a burst of messages from one
+// sender makes one mailbox request.
 const NEGATIVE_TTL_MS = 60 * 60_000;
 const CACHE_MAX = 2_000;
 
@@ -58,6 +61,7 @@ export interface PrincipalAcquaintanceCheckOptions {
 
 export class PrincipalAcquaintanceCheck {
   private readonly cache = new Map<string, { evidence: AcquaintanceEvidence | null; at: number }>();
+  private readonly inFlight = new Map<string, Promise<AcquaintanceEvidence | null>>();
   private readonly orgDomains: ReadonlySet<string>;
 
   constructor(private readonly options: PrincipalAcquaintanceCheckOptions) {
@@ -82,6 +86,14 @@ export class PrincipalAcquaintanceCheck {
     const cached = this.cache.get(address);
     if (cached && (cached.evidence !== null || now - cached.at < NEGATIVE_TTL_MS)) return cached.evidence;
 
+    const running = this.inFlight.get(address);
+    if (running) return running;
+    const lookup = this.lookUp(mailbox, address, now).finally(() => this.inFlight.delete(address));
+    this.inFlight.set(address, lookup);
+    return lookup;
+  }
+
+  private async lookUp(mailbox: PrincipalMailbox, address: string, now: number): Promise<AcquaintanceEvidence | null> {
     let evidence: AcquaintanceEvidence | null;
     try {
       evidence = (await mailbox.hasSentTo(address)) ? 'principal-correspondence' : null;

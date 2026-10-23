@@ -61,6 +61,26 @@ describe('PrincipalAcquaintanceCheck', () => {
     expect(await check({ mailbox: mailbox(new Error('nylas down')) }).evidenceFor('morgan.lee@lumen.example')).toBeNull();
   });
 
+  it('does not cache a failure: the next message asks the mailbox again', async () => {
+    const mb = mailbox(new Error('nylas down'));
+    const c = check({ mailbox: mb, now: () => 0 });
+    expect(await c.evidenceFor('morgan.lee@lumen.example')).toBeNull();
+    mb.hasSentTo.mockResolvedValue(true);
+    expect(await c.evidenceFor('morgan.lee@lumen.example')).toBe('principal-correspondence');
+    expect(mb.hasSentTo).toHaveBeenCalledTimes(2);
+  });
+
+  it('shares one lookup between concurrent checks of the same address', async () => {
+    let answer!: (sent: boolean) => void;
+    const mb = { hasSentTo: vi.fn(() => new Promise<boolean>((resolve) => { answer = resolve; })) };
+    const c = check({ mailbox: mb });
+    const first = c.evidenceFor('morgan.lee@lumen.example');
+    const second = c.evidenceFor('Morgan.Lee@lumen.example');
+    answer(true);
+    expect(await Promise.all([first, second])).toEqual(['principal-correspondence', 'principal-correspondence']);
+    expect(mb.hasSentTo).toHaveBeenCalledTimes(1);
+  });
+
   it('never matches the principal\'s own address', async () => {
     expect(await check({ mailbox: mailbox(true) }).evidenceFor('avery@acme.example')).toBeNull();
   });
