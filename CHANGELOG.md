@@ -62,6 +62,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Behavior suite usage** — docs make smoke and scenarios a release gate; development runs only targeted cases.
 - **Voice model** — ADR-038 moves voice to Haiku 5.5 with thinking off, keeping its own prompt. (#2245)
 - **Voice latency logs** — first-token (with model) and time-to-first-audio now log at info. (#2245)
 - **`emitOkfDocument`** — writes the body verbatim instead of appending a trailing newline, so parsing inverts it. (#1823)

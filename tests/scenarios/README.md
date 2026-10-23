@@ -32,6 +32,8 @@ pnpm scenarios --model deepseek/deepseek-v4.1-flash
 pnpm scenarios --case "sweep-on-close" --runs 2 --model deepseek/deepseek-v4.1-flash
 ```
 
+**Every run costs money:** each case runs 5 times by default, and the judge is billed too. The unfiltered suite is the release gate. While developing, run only the cases your change touches, with few runs, and compare against saved transcripts rather than re-running `main`.
+
 | Flag | Meaning |
 |---|---|
 | `--model <id>` | Route every agent to this model (registry id). Default: the configured `model_routing`. |
