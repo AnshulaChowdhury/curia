@@ -109,7 +109,7 @@ export function markMessageRequestError(err: unknown): unknown {
 
 // The HTTP status of a Nylas failure: `status` on CeoNylasClient's NylasApiError,
 // `statusCode` on the SDK's.
-function nylasStatus(err: unknown): number | undefined {
+export function nylasStatus(err: unknown): number | undefined {
   if (typeof err !== 'object' || err === null) return undefined;
   const { status, statusCode } = err as { status?: unknown; statusCode?: unknown };
   if (typeof statusCode === 'number') return statusCode;
