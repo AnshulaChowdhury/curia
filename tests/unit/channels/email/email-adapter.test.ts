@@ -1317,7 +1317,7 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
 
     await triggerOutbound(makeOutboundEvent('email:thread-abc'));
 
-    const sendArg = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const sendArg = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0]![0];
     expect(sendArg).toMatchObject({ to: CEO_EMAIL, additionalTo: ['extra@example.com'] });
     expect(sendArg.cc).toBeUndefined();
   });
@@ -1332,7 +1332,7 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
 
     await triggerOutbound(makeOutboundEvent('email:thread-abc'));
 
-    const [sendArg, options] = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [sendArg, options] = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0]!;
     expect(sendArg).toMatchObject({
       to: CEO_EMAIL,
       additionalTo: ['second@example.com'],
@@ -1350,7 +1350,7 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
 
     await triggerOutbound(makeOutboundEvent('email:thread-abc'));
 
-    const sendArg = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const sendArg = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0]![0];
     expect(sendArg).not.toHaveProperty('toFromOwnMessage');
   });
 
@@ -1367,7 +1367,7 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
 
     await triggerOutbound(makeOutboundEvent('email:thread-abc'));
 
-    const [sendArg, options] = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [sendArg, options] = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0]!;
     expect(sendArg).toMatchObject({ to: CEO_EMAIL, toFromOwnMessage: true });
     expect(sendArg.cc).toBeUndefined();
     expect(options).not.toHaveProperty('recipientSource');
