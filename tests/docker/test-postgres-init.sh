@@ -123,4 +123,44 @@ wait_for_verified "$container" 2 45               # verification must run again 
 assert_pgaudit "$container"
 pass "existing volume: healthy after restart, pgAudit re-verified"
 
+# A client stays connected through the stop, as Curia does. Postgres's "smart"
+# shutdown waits for that client to leave, so only a "fast" shutdown finishes
+# before Docker's stop timeout.
+echo "==> [stop] docker stop must let Postgres finish a clean shutdown..."
+container="curia-pg-stop-$$"
+volume="curia-pg-stop-vol-$$"
+CONTAINERS+=("$container"); VOLUMES+=("$volume")
+docker run -d --name "$container" -v "$volume:/var/lib/postgresql/data" \
+  -e POSTGRES_DB=curia -e POSTGRES_USER=curia -e POSTGRES_PASSWORD=inittest \
+  "$IMAGE" "${PGAUDIT_CMD[@]}" >/dev/null
+wait_for_verified "$container" 1 60
+docker exec -d "$container" psql -U curia -d curia -c 'select pg_sleep(300)'
+# Without a connected client, a smart shutdown would also pass this case.
+for ((i = 1; i <= 30; i++)); do
+  if docker exec "$container" psql -U curia -d curia -tAc \
+    "select 1 from pg_stat_activity where query like 'select pg_sleep%'" | grep -q 1; then
+    break
+  fi
+  sleep 1
+done
+if ((i > 30)); then
+  fail "$container" "test client did not connect within 30s"
+fi
+docker stop "$container" >/dev/null
+exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$container")"
+if [ "$exit_code" != 0 ]; then
+  fail "$container" "container exited with code $exit_code after docker stop"
+fi
+# The last line, because a fresh volume's init also logs a shutdown of its temp server.
+last_line="$(docker logs "$container" 2>&1 | tail -1)"
+if [[ "$last_line" != *"database system is shut down"* ]]; then
+  fail "$container" "Postgres did not log a completed shutdown after docker stop"
+fi
+cluster_state="$(docker run --rm --entrypoint gosu -v "$volume:/var/lib/postgresql/data" \
+  "$IMAGE" postgres pg_controldata /var/lib/postgresql/data | grep 'Database cluster state' || true)"
+if [[ "$cluster_state" != *"shut down" ]]; then
+  fail "$container" "data directory not cleanly shut down: $cluster_state"
+fi
+pass "stop: Postgres shut down cleanly with a client connected"
+
 echo "ALL POSTGRES IMAGE TESTS PASSED"
