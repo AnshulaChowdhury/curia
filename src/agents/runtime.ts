@@ -233,7 +233,7 @@ export interface AgentConfig {
    *  If omitted, no time block is injected. */
   timezone?: string;
   /** Curia's own channel contact details: the first mailbox's address, the Signal account
-   *  number (channel.signal.phone_number) and the SMS/voice DID (channel.sms.from_number).
+   *  number (channel.signal.phone_number) and the SMS DID (channel.sms.from_number).
    *  The two numbers are separate fields because they are separate accounts: a deployment
    *  may run SMS on a different number from Signal. When provided, a "Your Contact Details"
    *  block is added to the system prompt preamble so the LLM knows which accounts to use

@@ -155,15 +155,15 @@ describe('buildBaseSystemPrompt own contact numbers', () => {
 
   it('renders one combined line when Signal and SMS share a number, compared by digits', async () => {
     const block = await contactBlock({ signal: '+1 (555) 000-1111', sms: '+15550001111' });
-    expect(block).toContain('- Phone (Signal, SMS and voice): +15550001111');
+    expect(block).toContain('- Phone (Signal and SMS): +15550001111');
     expect(block).not.toContain('- Signal:');
-    expect(block).not.toContain('- Phone (SMS and voice):');
+    expect(block).not.toContain('- SMS:');
   });
 
   it('renders separate Signal and SMS lines when the numbers differ', async () => {
     const block = await contactBlock({ email: 'curia@example.com', signal: '+15550001111', sms: '+15550002222' });
-    expect(block).toContain('- Email: curia@example.com\n- Signal: +15550001111\n- Phone (SMS and voice): +15550002222');
-    expect(block).not.toContain('Signal, SMS and voice');
+    expect(block).toContain('- Email: curia@example.com\n- Signal: +15550001111\n- SMS: +15550002222');
+    expect(block).not.toContain('Signal and SMS');
   });
 
   it('renders only the Signal line when there is no SMS number', async () => {
@@ -174,7 +174,7 @@ describe('buildBaseSystemPrompt own contact numbers', () => {
 
   it('renders only the SMS line when there is no Signal number', async () => {
     const block = await contactBlock({ sms: '+15550002222' });
-    expect(block).toContain('- Phone (SMS and voice): +15550002222');
+    expect(block).toContain('- SMS: +15550002222');
     expect(block).not.toContain('- Signal:');
   });
 
