@@ -4,7 +4,7 @@ import { markdownToHtml } from '../../../../src/format/markdown-to-html.js';
 import { parseAttachmentInputs } from '../../../_shared/parse-attachments.js';
 import { readAttachmentFiles, MAX_ATTACHMENT_BYTES } from '../../../../src/skills/_shared/read-attachments.js';
 import { captureDraftSnapshot } from '../../../_shared/voice-learning-capture.js';
-import { parseRecipientReference } from '../../../../src/skills/_shared/recipient-reference.js';
+import { PRINCIPAL_RECIPIENT_ALIAS, parseRecipientReference } from '../../../../src/skills/_shared/recipient-reference.js';
 import {
   MAX_DRAFT_RECIPIENTS,
   checkRawRecipients,
@@ -25,11 +25,38 @@ const NOT_SAVED = 'No draft was saved.';
 // none, so it fails closed. Curia cannot send these drafts: the principal sends them
 // from Gmail.
 
-/** True when every recipient is the `principal` alias and no raw address is given. */
-function isPrincipalOnly(lists: Record<'to' | 'cc' | 'to_addresses' | 'cc_addresses', string[]>): boolean {
+// A draft to the principal alone would sit in their own Drafts, from them to them.
+// "Email me that" means mail from Curia's account; on 2026-10-23 it landed here and
+// the principal had to send it to themselves (#2262).
+const PRINCIPAL_ONLY_ERROR =
+  'A draft addressed only to the principal is not saved: it would sit in their own Drafts, from them ' +
+  'to them. When the principal asks to be emailed something, that email comes from Curia\'s own ' +
+  'account. Reply that nothing was drafted, so the coordinator sends it to the principal with ' +
+  `email-send. ${NOT_SAVED}`;
+
+type RecipientLists = Record<'to' | 'cc' | 'to_addresses' | 'cc_addresses', string[]>;
+
+/** True when every recipient is the `principal` alias and no raw address is given. Shape only. */
+function isPrincipalAliasOnly(lists: RecipientLists): boolean {
   if (lists.to_addresses.length > 0 || lists.cc_addresses.length > 0) return false;
   const refs = [...lists.to, ...lists.cc];
   return refs.length > 0 && refs.every((entry) => parseRecipientReference(entry)?.kind === 'principal');
+}
+
+/**
+ * True when the resolved references are all the principal's own contact, as when the
+ * principal's contact ID is passed instead of the alias. The principal's ID comes from
+ * the same resolver the alias goes through. When it cannot be resolved the draft is not
+ * refused: this check redirects a misroute, it is not a security boundary.
+ */
+async function isPrincipalContactOnly(ctx: ToolContext, contactIds: readonly string[]): Promise<boolean> {
+  if (contactIds.length === 0 || !ctx.resolveRecipientReference) return false;
+  const principal = await ctx.resolveRecipientReference('email', PRINCIPAL_RECIPIENT_ALIAS, { field: 'to' });
+  if (!principal.ok) {
+    ctx.log.warn({ err: principal.cause }, 'ceo-inbox-draft-compose: principal not resolvable — self-addressed check skipped');
+    return false;
+  }
+  return contactIds.every((id) => id === principal.contactId);
 }
 
 export class CeoInboxDraftComposeHandler implements ToolHandler {
@@ -69,18 +96,9 @@ export class CeoInboxDraftComposeHandler implements ToolHandler {
         error: "A draft needs a To recipient: a contact ID (or \"principal\") in to, or an address copied from the principal's mail in to_addresses.",
       };
     }
-    // A draft to the principal alone would sit in their own Drafts, from them to them.
-    // "Email me that" means mail from Curia's account; on 2026-10-23 it landed here and
-    // the principal had to send it to themselves (#2262).
-    if (isPrincipalOnly(lists)) {
-      return {
-        success: false,
-        error:
-          'A draft addressed only to the principal is not saved: it would sit in their own Drafts, from them ' +
-          'to them. When the principal asks to be emailed something, that email comes from Curia\'s own ' +
-          'account. Reply that nothing was drafted, so the coordinator sends it to the principal with ' +
-          `email-send. ${NOT_SAVED}`,
-      };
+    // The alias form is refused before any lookup; the contact-ID form after resolution below.
+    if (isPrincipalAliasOnly(lists)) {
+      return { success: false, error: PRINCIPAL_ONLY_ERROR };
     }
     const recipientCount = Object.values(lists).reduce((sum, entries) => sum + entries.length, 0);
     if (recipientCount > MAX_DRAFT_RECIPIENTS) {
@@ -104,6 +122,12 @@ export class CeoInboxDraftComposeHandler implements ToolHandler {
     if (!toRefs.ok) return { success: false, error: toRefs.error };
     const ccRefs = await resolveReferenceRecipients(ctx, lists.cc, CC, NOT_SAVED);
     if (!ccRefs.ok) return { success: false, error: ccRefs.error };
+    if (
+      lists.to_addresses.length === 0 && lists.cc_addresses.length === 0
+      && await isPrincipalContactOnly(ctx, [...toRefs.contactIds, ...ccRefs.contactIds])
+    ) {
+      return { success: false, error: PRINCIPAL_ONLY_ERROR };
+    }
     const toRaw = await checkRawRecipients(ctx, lists.to_addresses, TO, NOT_SAVED);
     if (!toRaw.ok) return { success: false, error: toRaw.error };
     const ccRaw = await checkRawRecipients(ctx, lists.cc_addresses, CC, NOT_SAVED);

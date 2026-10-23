@@ -264,6 +264,11 @@ describe('CeoInboxDraftComposeHandler', () => {
       expect(error).toContain('No draft was saved.');
     });
 
+    it('refuses a draft to the principal\'s contact ID, not just the alias', async () => {
+      const error = refused(await handler.execute(buildCtx({ to: [fixture.principalId], subject: 'Refresh done', body: 'Link.' })));
+      expect(error).toMatch(/only to the principal/);
+    });
+
     it('still saves a draft to the principal when someone else is on it', async () => {
       ok();
       const result = await handler.execute(buildCtx({ to: ['principal', fixture.aliceId], subject: 'Hello', body: 'Hi.' }));

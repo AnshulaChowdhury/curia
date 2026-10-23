@@ -145,7 +145,7 @@ describe('SendDraftHandler', () => {
 
   // ─── Draft lookup ─────────────────────────────────────────────────────────
 
-  it('returns error when DRAFTS folder fetch throws (explicit account)', async () => {
+  it('returns error when the draft lookup throws (explicit account)', async () => {
     const ctx = makeCtx({
       gateway: {
         getEmailDraft: vi.fn().mockRejectedValue(new Error('Nylas error')),
@@ -155,7 +155,25 @@ describe('SendDraftHandler', () => {
     });
     const result = await handler.execute(ctx);
     expect(result.success).toBe(false);
-    if (!result.success) expect(result.error).toMatch(/look up the draft/i);
+    if (!result.success) {
+      expect(result.error).toMatch(/could not search/i);
+      expect(result.error).toContain('personal: Nylas error');
+    }
+  });
+
+  // The named-account path builds its sentence from the same flag as the all-accounts one.
+  it.each([
+    { statusCode: 503, wording: /transient.*try again/i },
+    { statusCode: 400, wording: /not a temporary outage/i },
+  ])('words a $statusCode on a named account the same as across accounts', async ({ statusCode, wording }) => {
+    const err = Object.assign(new Error('Nylas said no'), { statusCode });
+    const ctx = makeCtx({
+      input: { draft_id: 'draft-abc123', account: 'personal' },
+      gateway: { getEmailDraft: vi.fn().mockRejectedValue(err), sendEmailDraft: vi.fn() },
+    });
+    const result = await handler.execute(ctx);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(wording);
   });
 
   it('returns error when draft is not found in DRAFTS folder (explicit account)', async () => {
@@ -461,11 +479,12 @@ describe('SendDraftHandler', () => {
       );
     });
 
-    it('reports fetch errors in the error message when draft not found', async () => {
-      // Both accounts fail — error message should mention which had fetch errors.
+    it('keeps a partial outage retryable, without the not-found guidance', async () => {
+      // curia timed out and personal had no match. The draft may be in curia, so the
+      // error must not say "do not retry" or send the model to the principal's Gmail.
       const getEmailDraft = vi.fn()
         .mockImplementation((_draftId: string, accountId: string) => {
-          if (accountId === 'curia') return Promise.reject(new Error('Nylas timeout'));
+          if (accountId === 'curia') return Promise.reject(Object.assign(new Error('Gateway Timeout'), { statusCode: 504 }));
           return Promise.resolve(null); // personal: no match
         });
 
@@ -481,15 +500,54 @@ describe('SendDraftHandler', () => {
       const result = await handler.execute(ctx);
       expect(result.success).toBe(false);
       if (!result.success) {
-        expect(result.error).toContain('fetch errors');
-        expect(result.error).toContain('curia');
+        expect(result.error).toContain('curia: Gateway Timeout');
+        expect(result.error).toContain('It is not in personal.');
+        expect(result.error).toMatch(/try again shortly/i);
+        expect(result.error).not.toMatch(/do not retry|Gmail Drafts|email-send|not found/i);
       }
+    });
+
+    it('calls a partial permanent failure permanent, without the not-found guidance', async () => {
+      const getEmailDraft = vi.fn()
+        .mockImplementation((_draftId: string, accountId: string) => {
+          if (accountId === 'curia') return Promise.reject(Object.assign(new Error('Bad Request'), { statusCode: 400 }));
+          return Promise.resolve(null);
+        });
+      const ctx = makeCtx({
+        input: { draft_id: 'draft-nonexistent' },
+        gateway: { getEmailDraft, sendEmailDraft: vi.fn(), listAccountIds: vi.fn().mockReturnValue(['curia', 'personal']) },
+      });
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toMatch(/not a temporary outage/i);
+        expect(result.error).not.toMatch(/Gmail Drafts|email-send/);
+      }
+    });
+
+    it('retries when one account is down even though another rejected the request', async () => {
+      // A 400 beside a 503: the retry reaches the account that was down.
+      const getEmailDraft = vi.fn()
+        .mockImplementation((_draftId: string, accountId: string) => Promise.reject(
+          Object.assign(new Error(accountId === 'curia' ? 'Bad Request' : 'Service Unavailable'), {
+            statusCode: accountId === 'curia' ? 400 : 503,
+          }),
+        ));
+      const ctx = makeCtx({
+        input: { draft_id: 'draft-abc123' },
+        gateway: { getEmailDraft, sendEmailDraft: vi.fn(), listAccountIds: vi.fn().mockReturnValue(['curia', 'personal']) },
+      });
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/transient.*try again/i);
     });
 
     it('returns transient-error message when ALL accounts have fetch errors', async () => {
       // Every account throws — the draft was never searched, so the error should
       // say "could not search" not "not found".
-      const getEmailDraft = vi.fn().mockRejectedValue(new Error('Nylas down'));
+      const getEmailDraft = vi.fn().mockRejectedValue(Object.assign(new Error('Nylas down'), { statusCode: 503 }));
 
       const ctx = makeCtx({
         input: { draft_id: 'draft-abc123' },
@@ -531,6 +589,27 @@ describe('SendDraftHandler', () => {
         expect(result.error).toMatch(/not a temporary outage/i);
         expect(result.error).toContain('Bad Request');
       }
+    });
+
+    // A Nylas SDK timeout and Node fetch's socket failure carry no status of their own.
+    class NylasSdkTimeoutError extends Error {}
+    it.each([
+      { label: '408', err: Object.assign(new Error('Request Timeout'), { statusCode: 408 }), transient: true },
+      { label: 'the SDK timeout', err: new NylasSdkTimeoutError('Nylas SDK timed out'), transient: true },
+      {
+        label: 'a fetch socket error',
+        err: new TypeError('fetch failed', { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) }),
+        transient: true,
+      },
+      { label: 'an unknown account', err: new Error("unknown account 'work'; available: [curia]"), transient: false },
+    ])('classifies $label as transient: $transient', async ({ err, transient }) => {
+      const ctx = makeCtx({
+        input: { draft_id: 'draft-abc123' },
+        gateway: { getEmailDraft: vi.fn().mockRejectedValue(err), sendEmailDraft: vi.fn(), listAccountIds: vi.fn().mockReturnValue(['curia']) },
+      });
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(/transient/i.test(result.error)).toBe(transient);
     });
 
     it.each([429, 503])('still calls a %i transient', async (statusCode) => {

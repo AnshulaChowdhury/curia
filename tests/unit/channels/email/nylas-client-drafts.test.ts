@@ -14,7 +14,7 @@ vi.mock('nylas', () => {
   return { default: MockNylas };
 });
 
-import { NylasClient } from '../../../../src/channels/email/nylas-client.js';
+import { NylasClient, UnsupportedDraftsFilterError } from '../../../../src/channels/email/nylas-client.js';
 import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
@@ -53,6 +53,26 @@ describe('NylasClient drafts (#2262)', () => {
       expect(result).toHaveLength(1);
       expect(result[0]!.id).toBe('r956985379676630908');
       expect(result[0]!.to).toEqual([{ email: 'joseph@example.com' }]);
+    });
+
+    it('passes unread to the drafts query', async () => {
+      await client.listMessages({ folders: ['DRAFTS'], unread: true, subject: 'Refresh' });
+      expect(mockDrafts.list).toHaveBeenCalledWith({
+        identifier: 'grant-id',
+        queryParams: { unread: true, subject: 'Refresh' },
+      });
+    });
+
+    it.each([
+      { filter: 'from', options: { from: 'alice@example.com' } },
+      { filter: 'receivedAfter', options: { receivedAfter: 1792761567 } },
+      { filter: 'fields', options: { fields: 'include_headers' as const } },
+    ])('refuses $filter rather than returning an unfiltered page', async ({ filter, options }) => {
+      const call = client.listMessages({ folders: ['DRAFTS'], ...options });
+      await expect(call).rejects.toBeInstanceOf(UnsupportedDraftsFilterError);
+      await expect(call).rejects.toThrow(filter);
+      expect(mockDrafts.list).not.toHaveBeenCalled();
+      expect(mockMessages.list).not.toHaveBeenCalled();
     });
 
     it('keeps other folders on /messages', async () => {

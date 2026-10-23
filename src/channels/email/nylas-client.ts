@@ -232,6 +232,21 @@ export interface ListMessagesOptions {
   searchQueryNative?: string;
 }
 
+/**
+ * A drafts listing asked for a filter the drafts query has no equivalent for. Drafts
+ * are all from the mailbox owner and have no received date, so `from` and
+ * `receivedAfter` cannot be applied; `fields` (headers) is a messages-only option.
+ */
+export class UnsupportedDraftsFilterError extends Error {
+  constructor(readonly filters: readonly string[]) {
+    super(
+      `Listing drafts cannot filter by ${filters.join(', ')}: drafts are all from this mailbox and have no ` +
+      'received date. Drop that filter, or filter by subject.',
+    );
+    this.name = 'UnsupportedDraftsFilterError';
+  }
+}
+
 /** True for the folder names callers use for drafts: Gmail's DRAFT, or DRAFTS. */
 export function isDraftsFolder(folder: string): boolean {
   const name = folder.trim().toUpperCase();
@@ -274,8 +289,21 @@ export class NylasClient {
     // Gmail rejects `in=DRAFTS` (its label is DRAFT), and `/messages` has no drafts
     // under either name, so a drafts-only folder filter reads `/drafts` (#2262).
     const folders = options?.folders;
-    if (folders && folders.length > 0 && folders.every(isDraftsFolder) && options?.searchQueryNative === undefined) {
-      return this.listDrafts({ limit: options?.limit, threadId: options?.threadId, subject: options?.subject });
+    if (folders && folders.length > 0 && folders.every(isDraftsFolder)) {
+      if (options?.searchQueryNative === undefined) {
+        // A filter the drafts query cannot apply is refused: an unfiltered page
+        // returned as the filtered set is worse than an error.
+        const unsupported = (['from', 'receivedAfter', 'fields'] as const).filter((key) => options?.[key] !== undefined);
+        if (unsupported.length > 0) throw new UnsupportedDraftsFilterError(unsupported);
+        return this.listDrafts({
+          limit: options?.limit,
+          threadId: options?.threadId,
+          subject: options?.subject,
+          unread: options?.unread,
+        });
+      }
+      // A native search runs on /messages and drops folders (below), so it never lists drafts.
+      this.log.warn('nylas: listMessages — drafts folder ignored because searchQueryNative is set; this searches messages, not drafts');
     }
 
     const queryParams: ListMessagesQueryParams = {};
@@ -351,11 +379,12 @@ export class NylasClient {
   }
 
   /** List unsent drafts, newest first (first page only, like listMessages). */
-  async listDrafts(options?: { limit?: number; threadId?: string; subject?: string }): Promise<NylasMessage[]> {
+  async listDrafts(options?: { limit?: number; threadId?: string; subject?: string; unread?: boolean }): Promise<NylasMessage[]> {
     const queryParams: ListDraftsQueryParams = {};
     if (options?.limit !== undefined) queryParams.limit = options.limit;
     if (options?.threadId !== undefined) queryParams.threadId = options.threadId;
     if (options?.subject !== undefined) queryParams.subject = options.subject;
+    if (options?.unread !== undefined) queryParams.unread = options.unread;
 
     try {
       const response = await this.nylas.drafts.list({ identifier: this.grantId, queryParams });

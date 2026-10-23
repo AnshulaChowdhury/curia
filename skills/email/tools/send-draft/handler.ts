@@ -16,31 +16,43 @@ import type { NylasMessage } from '../../../../src/channels/email/nylas-client.j
 import { createHumanDecision } from '../../../../src/bus/events.js';
 import { isPrincipalOriginated } from '../../../../src/contacts/principal.js';
 import { isPrincipalDirectedSend } from '../../../../src/skills/_shared/principal-directed.js';
-import { nylasStatus } from '../../../../src/channels/email/nylas-message-id.js';
+import { hasTransientErrorSignal } from '../../../../src/skills/outbound-gateway.js';
 import type { TaskOriginator } from '../../../../src/contacts/types.js';
 
-/**
- * Result of findDraftById — either the draft + owning account, or a structured error.
- * `transient` marks a fetch error worth retrying (network, 429, 5xx). A 4xx is not:
- * every call fails the same way, and calling it transient started days of retry
- * tasks (#2262).
- */
+/** Result of findDraftById — either the draft + owning account, or an agent-facing error. */
 type DraftDiscoveryResult =
   | { success: true; draft: NylasMessage; resolvedAccount: string }
-  | { success: false; error: string; reason: 'not_found' }
-  | { success: false; error: string; reason: 'fetch_error'; transient: boolean };
+  | { success: false; error: string };
 
+/** One account's lookup: the draft, a definitive miss, or a failed request. */
+type AccountLookup =
+  | { kind: 'found'; draft: NylasMessage }
+  | { kind: 'missing' }
+  | { kind: 'failed'; transient: boolean; detail: string };
+
+/**
+ * Whether a failed lookup is worth retrying: 408, 429, 5xx or a network code (the
+ * gateway's rule), plus the two shapes that carry neither — the SDK's own timeout and
+ * Node fetch's `fetch failed`, whose socket code sits on `cause`. Anything else (a 4xx,
+ * an unknown account, a programming error) fails the same way every time; calling a
+ * Gmail 400 transient started days of retry tasks (#2262).
+ */
 function isTransientFetchError(err: unknown): boolean {
-  const status = nylasStatus(err);
-  return status === undefined || status === 429 || status >= 500;
+  if (hasTransientErrorSignal(err)) return true;
+  if (!(err instanceof Error)) return false;
+  // NylasSdkTimeoutError does not set `name`, and the SDK's ESM types do not export the class.
+  if (err.constructor.name === 'NylasSdkTimeoutError') return true;
+  return hasTransientErrorSignal(err.cause);
 }
 
 // Drafts ceo-inbox composes live in the principal's personal mailbox, which Curia
 // cannot send from. That is the usual reason a draft ID is in none of Curia's
-// accounts, so the error names it and the two things to do instead (#2262).
-function draftNotFoundError(draftId: string, searched: string, failNote = ''): string {
+// accounts, so the error names it and the two things to do instead (#2262). Only
+// for a definitive miss in every account searched: a draft in an account that
+// could not be read was never ruled out.
+function draftNotFoundError(draftId: string, searched: string): string {
   return (
-    `Draft not found: ${draftId}. Searched Curia's email accounts: ${searched}.${failNote} ` +
+    `Draft not found: ${draftId}. Searched Curia's email accounts: ${searched}. ` +
     'send-draft only sends drafts saved in Curia\'s own accounts. A draft the ceo-inbox specialist ' +
     'made is in the principal\'s personal Gmail, and Curia cannot send it: tell the principal it is ' +
     'in their Gmail Drafts, or, if they asked you to email them, send it yourself with email-send. ' +
@@ -300,90 +312,68 @@ export class SendDraftHandler implements ToolHandler {
   ): Promise<DraftDiscoveryResult> {
     const gateway = ctx.outboundGateway!;
 
-    // Fast path: caller specified the account — search only that one.
-    if (account) {
-      return this.searchAccountForDraft(ctx, gateway, draftId, account);
-    }
-
-    // Slow path: search all accounts. Stop at the first match.
-    const accountIds = gateway.listAccountIds();
+    // A named account is the only one searched; otherwise every configured account is.
+    const accountIds = account ? [account] : gateway.listAccountIds();
     if (accountIds.length === 0) {
-      return { success: false, error: 'No email accounts configured', reason: 'fetch_error', transient: false };
+      return { success: false, error: 'No email accounts configured' };
     }
 
-    // Track which accounts failed so the error message is informative.
-    const failures: Array<{ account: string; transient: boolean; error: string }> = [];
+    // Stop at the first match. Misses and failures are kept for the error message.
+    const missed: string[] = [];
+    const failures: Array<{ account: string; transient: boolean; detail: string }> = [];
     for (const acctId of accountIds) {
-      const result = await this.searchAccountForDraft(ctx, gateway, draftId, acctId);
-      if (result.success) return result;
-      if (result.reason === 'fetch_error') {
-        failures.push({ account: acctId, transient: result.transient, error: result.error });
-      }
-    }
-    const failedAccounts = failures.map((f) => f.account);
-
-    // When every account had a fetch error, the draft was never actually searched —
-    // return a distinct message so a Nylas outage does not read as "Draft not found."
-    // Only an outage is worth retrying; a rejected request fails the same way every time.
-    if (failures.length === accountIds.length) {
-      ctx.log.error(
-        { draftId, failedAccounts },
-        'send-draft: all accounts failed during draft search — cannot confirm draft existence',
-      );
-      const transient = failures.every((f) => f.transient);
-      return {
-        success: false,
-        reason: 'fetch_error',
-        transient,
-        error: transient
-          ? `Could not search for draft ${draftId}: all email accounts had fetch errors (${failedAccounts.join(', ')}). This is likely a transient API issue — try again shortly.`
-          : `Could not search for draft ${draftId}: ${failures.map((f) => f.error).join('; ')}. ` +
-            'This is not a temporary outage, so retrying will fail the same way. Tell the principal the draft could not be sent.',
-      };
+      const lookup = await this.lookUpDraft(ctx, gateway, draftId, acctId);
+      if (lookup.kind === 'found') return { success: true, draft: lookup.draft, resolvedAccount: acctId };
+      if (lookup.kind === 'missing') missed.push(acctId);
+      else failures.push({ account: acctId, transient: lookup.transient, detail: lookup.detail });
     }
 
-    const searched = accountIds.join(', ');
-    const failNote = failedAccounts.length > 0
-      ? ` (accounts with fetch errors: ${failedAccounts.join(', ')})`
-      : '';
-    ctx.log.warn(
-      { draftId, searchedAccounts: accountIds, failedAccounts },
-      'send-draft: draft not found in any account',
+    if (failures.length === 0) {
+      ctx.log.warn({ draftId, searchedAccounts: accountIds }, 'send-draft: draft not found in any account');
+      return { success: false, error: draftNotFoundError(draftId, accountIds.join(', ')) };
+    }
+
+    // An account that could not be read may hold the draft, so this is not "not found".
+    // One transient failure makes the whole lookup worth retrying, even beside a 400:
+    // the retry reaches the account that timed out.
+    const transient = failures.some((f) => f.transient);
+    ctx.log.error(
+      { draftId, missedAccounts: missed, failures, transient },
+      'send-draft: draft lookup failed in at least one account — cannot confirm draft existence',
     );
-    return { success: false, reason: 'not_found', error: draftNotFoundError(draftId, searched, failNote) };
+    const details = failures.map((f) => `${f.account}: ${f.detail}`).join('; ');
+    const missNote = missed.length > 0 ? ` It is not in ${missed.join(', ')}.` : '';
+    return {
+      success: false,
+      error: transient
+        ? `Could not search for draft ${draftId} (${details}).${missNote} This is likely a transient API issue — try again shortly.`
+        : `Could not search for draft ${draftId} (${details}).${missNote} This is not a temporary outage, so retrying ` +
+          'will fail the same way. Tell the principal the draft could not be sent.',
+    };
   }
 
   /** Look up a draft by ID in a single account. */
-  private async searchAccountForDraft(
+  private async lookUpDraft(
     ctx: ToolContext,
     gateway: NonNullable<ToolContext['outboundGateway']>,
     draftId: string,
     account: string,
-  ): Promise<DraftDiscoveryResult> {
+  ): Promise<AccountLookup> {
     let draft: NylasMessage | null;
     try {
       draft = await gateway.getEmailDraft(draftId, account);
     } catch (err) {
       const transient = isTransientFetchError(err);
       ctx.log.error({ err, account, transient }, 'send-draft: draft lookup failed');
-      const detail = err instanceof Error ? err.message : String(err);
-      return {
-        success: false,
-        reason: 'fetch_error',
-        transient,
-        error: `Failed to look up the draft in account '${account}': ${detail}`,
-      };
+      return { kind: 'failed', transient, detail: err instanceof Error ? err.message : String(err) };
     }
 
     if (!draft) {
       ctx.log.debug({ draftId, account }, 'send-draft: draft not in this account');
-      return { success: false, reason: 'not_found', error: draftNotFoundError(draftId, account) };
+      return { kind: 'missing' };
     }
 
-    ctx.log.info(
-      { draftId, account },
-      'send-draft: draft found',
-    );
-    return { success: true, draft, resolvedAccount: account };
+    ctx.log.info({ draftId, account }, 'send-draft: draft found');
+    return { kind: 'found', draft };
   }
 }

@@ -4,7 +4,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { EmailListHandler } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import { createSilentLogger } from '../../../../src/logger.js';
-import type { NylasMessage } from '../../../../src/channels/email/nylas-client.js';
+import { UnsupportedDraftsFilterError, type NylasMessage } from '../../../../src/channels/email/nylas-client.js';
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -168,5 +168,18 @@ describe('EmailListHandler — error handling', () => {
     const result = await handler.execute(makeCtx({ outboundGateway: gateway }));
     expect(result.success).toBe(false);
     expect((result as { error: string }).error).toContain('Failed to list messages');
+  });
+
+  it('tells the model which drafts filter to drop (#2262)', async () => {
+    const gateway = {
+      listEmailMessages: vi.fn().mockRejectedValue(new UnsupportedDraftsFilterError(['from'])),
+    } as unknown as ToolContext['outboundGateway'];
+    const handler = new EmailListHandler();
+    const result = await handler.execute(makeCtx({
+      outboundGateway: gateway,
+      input: { folder: 'DRAFTS', from: 'alice@example.com' },
+    }));
+    expect(result.success).toBe(false);
+    expect((result as { error: string }).error).toMatch(/cannot filter by from/);
   });
 });

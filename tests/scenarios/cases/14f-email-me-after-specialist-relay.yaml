@@ -74,11 +74,19 @@ expected_behaviors:
     description: Opens no retry task for the email.
     check:
       not_called: [task-create]
-  - id: link_and_details_in_body
+  # The link is what the incident's draft carried and the principal never got; the code
+  # check pins it, and the judge scores the prose details.
+  - id: link_in_body
+    weight: important
+    description: The email body carries the Google Doc link.
+    check:
+      called: email-send
+      contains: { body: "1GpD9pQ_essay_refresh" }
+  - id: details_in_body
     weight: important
     description: >
-      The email body carries the Google Doc link and the refresh details (the "last month"
-      timeframe, the PitchBook endnote matching, and the two corrections).
+      The email body carries the refresh details (the "last month" timeframe, the PitchBook
+      endnote matching, and the two corrections).
 failure_modes:
   - Tells the principal the email is in their Gmail Drafts for them to send
   - Calls send-draft on a draft ID, or files a task to retry a send
