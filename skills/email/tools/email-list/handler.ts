@@ -5,7 +5,7 @@
 // Account resolution is handled by the gateway's named-client map.
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
-import type { ListMessagesOptions } from '../../../../src/channels/email/nylas-client.js';
+import { UnsupportedDraftsFilterError, type ListMessagesOptions } from '../../../../src/channels/email/nylas-client.js';
 
 const MAX_LIMIT = 50;
 const DEFAULT_LIMIT = 20;
@@ -83,6 +83,11 @@ export class EmailListHandler implements ToolHandler {
     try {
       messages = await ctx.outboundGateway.listEmailMessages(options, accountId);
     } catch (err) {
+      // The input itself is the problem, so the model is told what to change (#2262).
+      if (err instanceof UnsupportedDraftsFilterError) {
+        ctx.log.warn({ accountId, filters: err.filters }, 'email-list: drafts listing with an unsupported filter');
+        return { success: false, error: err.message };
+      }
       ctx.log.error({ err, accountId }, 'email-list: failed to list messages');
       return { success: false, error: 'Failed to list messages' };
     }

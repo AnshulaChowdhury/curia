@@ -1,0 +1,93 @@
+# Case 14f (#2262): "email me that" on a reply to a relay goes out by email-send. The
+# 2026-10-23 incident: the coordinator relayed ceo-inbox's essay summary on Signal with a
+# ceo-inbox bridge, the principal replied "Send me an email about that", and the reply
+# went back to ceo-inbox (the transfer-ownership rule, case 1). ceo-inbox has no send, so
+# it saved a draft from the principal to themselves; the coordinator then tried send-draft,
+# which cannot reach the principal's mailbox, and opened retry tasks. ceo-inbox-draft-compose
+# now refuses a principal-only draft, so the stub is what ceo-inbox reports after that
+# refusal. Rule: the nothing-sent next_step (src/agents/prompts/delegate-result-guidance.ts)
+# and the send-draft not-found error (skills/email/tools/send-draft/handler.ts).
+name: email me after specialist relay
+description: >
+  The coordinator relayed ceo-inbox's essay summary on Signal. The principal replies asking
+  for it by email instead. Whether or not it routes the reply to ceo-inbox, the email goes
+  out from Curia's own account with email-send to the principal, never as a send-draft.
+tags: [email, routing, outbound-context, recipient]
+stub_sets: [human-channels]
+seed:
+  outbound_context:
+    - key: essay_relay
+      channel: signal
+      agent: coordinator
+      content: >
+        Room Full of Money refresh is done. Draft:
+        https://docs.google.com/document/d/1GpD9pQ_essay_refresh/edit
+
+        Editor matched notes 3 and 5 to the essay's only two PitchBook endnotes, since no
+        separate defects list existed - tell me if you meant a different list. Also
+        corrected: the Fraser Institute study is dated March 20, and the two co-hosting
+        funds total $2.65T, not $2.4T. Timeframe now reads "last month" throughout.
+      expected_reply: Confirm the defects-list reading or request edits
+      delegation_hint: ceo-inbox
+      sent_minutes_ago: 1
+inbound:
+  from: principal
+  content: >
+    Send me an email about that. Refresh with the link and the details so I can catch it
+    there. I'm not gonna work on this essay from my phone.
+tool_stubs:
+  delegate:
+    - match: { agent: ceo-inbox }
+      return:
+        agent: ceo-inbox
+        response: >
+          Nothing was drafted: a draft addressed only to the principal is refused, because it
+          would sit in their own Drafts. The email needs to come from Curia's account. Content
+          for it: polished draft at https://docs.google.com/document/d/1GpD9pQ_essay_refresh/edit;
+          timeframe rewritten to "last month"; notes 3 and 5 matched to the two PitchBook
+          endnotes; Fraser Institute study dated March 20; co-hosting funds total $2.65T.
+        sent: []
+  # The incident's wrong turn, stubbed to succeed so the case scores the choice.
+  send-draft:
+    - match: {}
+      return: { message_id: scenario-out-2, to: principal, subject: "(sent)" }
+  email-send:
+    - match: {}
+      return: { message_id: scenario-out-1, to: principal, subject: "The Room Full of Money - refresh done" }
+  task-create:
+    - match: {}
+      return: { task_id: 3c4d5e6f-7081-4923-a4b5-c6d7e8f90a1b, status: open }
+expected_behaviors:
+  - id: emails_principal
+    weight: critical
+    description: Calls email-send with `to` set to "principal".
+    check:
+      called: email-send
+      with: { to: principal }
+  - id: no_send_draft
+    weight: critical
+    description: Never calls send-draft; there is no draft in Curia's accounts to send.
+    check:
+      not_called: [send-draft]
+  - id: no_retry_task
+    weight: important
+    description: Opens no retry task for the email.
+    check:
+      not_called: [task-create]
+  # The link is what the incident's draft carried and the principal never got; the code
+  # check pins it, and the judge scores the prose details.
+  - id: link_in_body
+    weight: important
+    description: The email body carries the Google Doc link.
+    check:
+      called: email-send
+      contains: { body: "1GpD9pQ_essay_refresh" }
+  - id: details_in_body
+    weight: important
+    description: >
+      The email body carries the refresh details (the "last month" timeframe, the PitchBook
+      endnote matching, and the two corrections).
+failure_modes:
+  - Tells the principal the email is in their Gmail Drafts for them to send
+  - Calls send-draft on a draft ID, or files a task to retry a send
+  - Replies with the details on Signal instead of emailing them

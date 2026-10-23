@@ -4,6 +4,7 @@ import { markdownToHtml } from '../../../../src/format/markdown-to-html.js';
 import { parseAttachmentInputs } from '../../../_shared/parse-attachments.js';
 import { readAttachmentFiles, MAX_ATTACHMENT_BYTES } from '../../../../src/skills/_shared/read-attachments.js';
 import { captureDraftSnapshot } from '../../../_shared/voice-learning-capture.js';
+import { PRINCIPAL_RECIPIENT_ALIAS, parseRecipientReference } from '../../../../src/skills/_shared/recipient-reference.js';
 import {
   MAX_DRAFT_RECIPIENTS,
   checkRawRecipients,
@@ -23,6 +24,58 @@ const NOT_SAVED = 'No draft was saved.';
 // listing or message read in this conversation, or a person's own message). A typo has
 // none, so it fails closed. Curia cannot send these drafts: the principal sends them
 // from Gmail.
+
+// A draft to the principal alone would sit in their own Drafts, from them to them.
+// "Email me that" means mail from Curia's account; on 2026-10-23 it landed here and
+// the principal had to send it to themselves (#2262).
+const PRINCIPAL_ONLY_ERROR =
+  'A draft addressed only to the principal is not saved: it would sit in their own Drafts, from them ' +
+  'to them. When the principal asks to be emailed something, that email comes from Curia\'s own ' +
+  'account. Reply that nothing was drafted, so the coordinator sends it to the principal with ' +
+  `email-send. ${NOT_SAVED}`;
+
+type RecipientLists = Record<'to' | 'cc' | 'to_addresses' | 'cc_addresses', string[]>;
+
+/** True when every recipient is the `principal` alias and no raw address is given. Shape only. */
+function isPrincipalAliasOnly(lists: RecipientLists): boolean {
+  if (lists.to_addresses.length > 0 || lists.cc_addresses.length > 0) return false;
+  const refs = [...lists.to, ...lists.cc];
+  return refs.length > 0 && refs.every((entry) => parseRecipientReference(entry)?.kind === 'principal');
+}
+
+/**
+ * True when every recipient the draft would carry is the principal: a reference to the
+ * principal's contact ID, or a raw address that is the principal's (their resolved
+ * address, or one linked to their contact). Covers what the alias pre-check cannot — the
+ * contact-ID form, and a raw copy of the principal's address beside the alias, which the
+ * To/Cc dedup would collapse to one self-addressed recipient. The principal comes from
+ * the same resolver the alias goes through. When a lookup fails the draft is not refused:
+ * this check redirects a misroute, it is not a security boundary.
+ */
+async function isPrincipalOnlyDraft(
+  ctx: ToolContext,
+  contactIds: readonly string[],
+  rawAddresses: readonly string[],
+): Promise<boolean> {
+  if (contactIds.length + rawAddresses.length === 0 || !ctx.resolveRecipientReference) return false;
+  const principal = await ctx.resolveRecipientReference('email', PRINCIPAL_RECIPIENT_ALIAS, { field: 'to' });
+  if (!principal.ok) {
+    ctx.log.warn({ err: principal.cause }, 'ceo-inbox-draft-compose: principal not resolvable — self-addressed check skipped');
+    return false;
+  }
+  if (!contactIds.every((id) => id === principal.contactId)) return false;
+  for (const address of rawAddresses) {
+    if (address.toLowerCase() === principal.identifier.toLowerCase()) continue;
+    try {
+      const owner = await ctx.contactService?.resolveByChannelIdentity('email', address);
+      if (owner?.contactId !== principal.contactId) return false;
+    } catch (err) {
+      ctx.log.warn({ err }, 'ceo-inbox-draft-compose: raw recipient lookup failed — self-addressed check skipped');
+      return false;
+    }
+  }
+  return true;
+}
 
 export class CeoInboxDraftComposeHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -61,6 +114,10 @@ export class CeoInboxDraftComposeHandler implements ToolHandler {
         error: "A draft needs a To recipient: a contact ID (or \"principal\") in to, or an address copied from the principal's mail in to_addresses.",
       };
     }
+    // The alias form is refused before any lookup; the contact-ID form after resolution below.
+    if (isPrincipalAliasOnly(lists)) {
+      return { success: false, error: PRINCIPAL_ONLY_ERROR };
+    }
     const recipientCount = Object.values(lists).reduce((sum, entries) => sum + entries.length, 0);
     if (recipientCount > MAX_DRAFT_RECIPIENTS) {
       return { success: false, error: `Too many recipients (${recipientCount}); the limit is ${MAX_DRAFT_RECIPIENTS}. No draft was saved.` };
@@ -87,6 +144,11 @@ export class CeoInboxDraftComposeHandler implements ToolHandler {
     if (!toRaw.ok) return { success: false, error: toRaw.error };
     const ccRaw = await checkRawRecipients(ctx, lists.cc_addresses, CC, NOT_SAVED);
     if (!ccRaw.ok) return { success: false, error: ccRaw.error };
+    // Every accepted recipient, before the To/Cc dedup collapses duplicates of the principal.
+    const rawAddresses = [...toRaw.participants, ...ccRaw.participants].map((participant) => participant.email);
+    if (await isPrincipalOnlyDraft(ctx, [...toRefs.contactIds, ...ccRefs.contactIds], rawAddresses)) {
+      return { success: false, error: PRINCIPAL_ONLY_ERROR };
+    }
 
     const to = uniqueParticipants(toRefs.participants, toRaw.participants);
     // Someone on the To line is not repeated on Cc.

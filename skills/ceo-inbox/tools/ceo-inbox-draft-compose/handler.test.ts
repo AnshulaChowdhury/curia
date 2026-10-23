@@ -253,6 +253,49 @@ describe('CeoInboxDraftComposeHandler', () => {
       ]);
     });
 
+    // #2262: "email me that" was delegated here and became a draft from the principal to themselves.
+    it.each([
+      { to: ['principal'] },
+      { to: ['principal#personal'], cc: ['principal'] },
+    ])('refuses a draft addressed only to the principal, and points at email-send (%j)', async (recipients) => {
+      const error = refused(await handler.execute(buildCtx({ ...recipients, subject: 'Refresh done', body: 'Link.' })));
+      expect(error).toMatch(/only to the principal/);
+      expect(error).toContain('email-send');
+      expect(error).toContain('No draft was saved.');
+    });
+
+    it('refuses a draft to the principal\'s contact ID, not just the alias', async () => {
+      const error = refused(await handler.execute(buildCtx({ to: [fixture.principalId], subject: 'Refresh done', body: 'Link.' })));
+      expect(error).toMatch(/only to the principal/);
+    });
+
+    // A sourced raw copy of the principal's address used to skip the check; the To/Cc
+    // dedup then saved a draft to the principal alone (#2268 review).
+    it.each([
+      { to: ['principal'], to_addresses: ['pat@home.example'] },
+      { to: ['principal'], cc_addresses: ['PAT@home.example'] },
+      { to_addresses: ['pat@home.example'] },
+    ])('refuses a principal-only draft that names the principal by raw address (%j)', async (recipients) => {
+      const sources = sourcesWith('pat@home.example');
+      const error = refused(await handler.execute(buildCtx({ ...recipients, subject: 'Refresh done', body: 'Link.' }, sources)));
+      expect(error).toMatch(/only to the principal/);
+    });
+
+    it('still saves a draft to the principal plus a raw address that is someone else', async () => {
+      ok();
+      const sources = sourcesWith('jordan@quillfeather.example');
+      const result = await handler.execute(buildCtx({
+        to: ['principal'], to_addresses: ['jordan@quillfeather.example'], subject: 'Hello', body: 'Hi.',
+      }, sources));
+      expect(result.success).toBe(true);
+    });
+
+    it('still saves a draft to the principal when someone else is on it', async () => {
+      ok();
+      const result = await handler.execute(buildCtx({ to: ['principal', fixture.aliceId], subject: 'Hello', body: 'Hi.' }));
+      expect(result.success).toBe(true);
+    });
+
     it('refuses a reference that matches no contact, and saves nothing', async () => {
       const error = refused(await handler.execute(buildCtx({
         to: ['4fdfd02a-1466-46ca-b37b-13bb564fe3f0'], subject: 'Hello', body: 'Hi.',
