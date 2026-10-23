@@ -2354,7 +2354,7 @@ describe('VoiceRuntime turn-taking: hold, join, coalesce (#2240)', () => {
     // The caller resumes before the hold expires.
     stt.emit({ text: 'Oakbridge', isFinal: false, confidence: 0.9 });
     await delay(80);
-    // Past the first hold's deadline: no turn, because the speech cancelled it.
+    // Past the first hold's deadline: no turn, because the speech restarted it.
     expect(llm.seenMessages).toHaveLength(0);
 
     stt.emit({ text: 'Oakbridge Academy', isFinal: true, speechFinal: true });
@@ -2446,6 +2446,25 @@ describe('VoiceRuntime turn-taking: hold, join, coalesce (#2240)', () => {
     await delay(120);
     await runtime.awaitIdle('hold-short');
     expect(inboundContents(events)).toEqual(['call Dana ok']);
+  });
+
+  it('counts a final that lands after end-of-speech in the turn the hold flushes it into', async () => {
+    const llm = new FakeStreamProvider([replyScript('Calling her.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 60 });
+    await start(runtime, 'hold-open-words');
+
+    stt.emit({ text: 'call Dana', isFinal: true, speechFinal: true });
+    await delay(20);
+    // A final segment with no end-of-speech of its own; "ok" is too short to restart the hold.
+    stt.emit({ text: 'ok', isFinal: true });
+    await delay(100);
+    await runtime.awaitIdle('hold-open-words');
+    expect(inboundContents(events)).toEqual(['call Dana ok']);
+
+    // The late end-of-speech carries no new words and must not count again.
+    stt.emit({ text: '', isFinal: true, speechFinal: true });
+    await runtime.endSession('hold-open-words', 'test');
+    expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 1, bargeInCancels: 0, joinedUtterances: 1 });
   });
 
   /** Working memory whose history reads take `ms`, so a user turn sits in its preamble. */

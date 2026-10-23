@@ -783,6 +783,14 @@ export class VoiceRuntime {
       clearTimeout(session.holdTimer);
       session.holdTimer = null;
     }
+    // A final segment can land after the last end-of-speech (a short "ok", or one
+    // Deepgram finalizes mid-speech) and the hold can fire before its own
+    // end-of-speech. Close it here, or it would count against the next utterance.
+    if (session.wordsSinceEndOfSpeech) {
+      session.wordsSinceEndOfSpeech = false;
+      session.pendingFragments += 1;
+      session.turnStats.utterances += 1;
+    }
     const utterance = session.pendingFinalText.trim();
     const fragments = Math.max(session.pendingFragments, 1);
     session.pendingFinalText = '';
