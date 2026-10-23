@@ -3427,6 +3427,9 @@ export class OutboundGateway {
     // ------------------------------------------------------------------
     // Step 4: Contact promotion (same as send())
     // ------------------------------------------------------------------
+    // No toFromOwnMessage check here, on purpose: a draft send is principal-approved,
+    // and that approval is what makes its To `known` (ADR-047). It holds for the
+    // adapter's gated-fallback draft of a reply to Curia's own message too (#2273).
     await this.promoteOrCreateRecipientContact('email', recipientEmail);
 
     // Emit the audit event — sendEmailDraft() is a genuine wire send and must
