@@ -103,5 +103,7 @@ production.
   was dropped rather than shipped unused. Orphans still expire through the 7-day holds sweep.
   A code-level fix is the next step if this matters.
 - **Release gate.** The 25-series stays on demand; the README says why and when to run it.
-- `trigger-guidance.test.ts`'s worst-turn bound now covers the #2227 triggers (6,678 chars
-  worst; bound 5,000 → 7,000).
+- `trigger-guidance.test.ts`'s worst-turn bound covers the #2227 triggers, each added in the
+  PR that adds it (PR 1: 6,000; PR 3: 7,000, 6,678 chars worst). The CC'd-meeting lines here
+  are not on the worst turn.
+- The CC'd-meeting line defers to `booking-link` when a turn has both: book through the page.
