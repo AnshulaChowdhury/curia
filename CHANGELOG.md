@@ -121,6 +121,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Security
 
+- **workspace-mcp dependencies** — cutoff moved to 2026-10-21, picking up certifi 2026.10.19 and pypdf 6.21.1 in the image; clears a CRITICAL, four MEDIUM and a LOW advisory (GHSA-6q48-6c7w-9gw2, CVE-2026-113792–113795, CVE-2026-113786). (curia-deploy#324)
 - **fastify** — bumped to 5.12.6, clearing a LOW advisory (CVE-2026-107832).
 - **sanitize-html** — bumped to 2.18.1, clearing a MEDIUM advisory (CVE-2026-113650).
 - **markdown-it** — bumped to 15.0.3, clearing a HIGH and a LOW advisory (CVE-2026-111758, CVE-2026-111766).
