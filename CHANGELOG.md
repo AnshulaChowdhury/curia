@@ -157,6 +157,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`email-list` drafts** — `folder: DRAFTS` lists drafts instead of failing on Gmail. (#2262)
 - **`ceo-inbox-draft-compose`** — refuses a draft addressed only to the principal; Curia emails them with `email-send`. (#2262)
 - **Voice turn-taking** — Curia no longer answers mid-sentence pauses; fragments join into one turn. (#2240)
+- **Third-party replies** — Curia sees its question when a contact answers; later turns and task wakes see replies. (#2261)
 - **Empty answers at the output cap** — OpenRouter responses that reasoned to `max_tokens` with no answer are retried. (#1915)
 - **Voice tool audit** — spoken-turn tool calls now record `tool.invoke` and `tool.result`, like text turns. (#1968)
 - **Voice barge-ins** — a stream the caller cancels no longer records an `llm.error` or logs an error. (#1968)
