@@ -97,6 +97,11 @@ Two patterns that pass local checks but fail CI regularly:
 - Vitest for unit and integration tests
 - Integration tests use real Postgres (via Docker), not mocks
 - Unit tests for `src/` live in `tests/unit/` (mirror the source tree). Integration tests live in `tests/integration/`. Skill handler tests stay beside the skill; app tests stay in the app package.
+- **The behavior suites (`pnpm smoke`, `pnpm scenarios`) cost money and are the release gate** (see "Behavior gate" below), not a development check. Every run bills real model calls, agents plus the judge, and day-to-day runs added up to hundreds of dollars a month. While developing, rely on unit and integration tests. Run a suite only when the change is to a prompt or a behavior, and then:
+  - run only the cases the change touches (`--case`, `--tags`), with few runs;
+  - compare against saved baseline transcripts rather than re-running a `main` arm;
+  - get the maintainer's agreement first, stating the cases, the run count and the estimated cost, and report the summary's spend afterwards;
+  - never run a full suite mid-branch to check that nothing else broke. That is the release gate's job.
 
 ### pnpm-workspace.yaml — do not edit during worktree setup
 
@@ -172,7 +177,7 @@ When adding a new agent, ensure it receives the autonomy block via the runtime i
 
 ### Fixing agent behavior
 
-Don't append a paragraph to `system_prompt`. Put the rule on the highest rung that works: code enforcement → injection with its trigger → tool description → lazy playbook → always-on prompt. See [ADR-046](docs/adr/046-agent-behavior-fix-placement.md). `tests/unit/agents/prompt-budget.test.ts` fails CI when a budgeted agent's always-on prompt or local tool definitions grow past budget — the coordinator plus calendar, ceo-inbox, contacts and meeting-debrief (#2025). Prefer a behavioral test (scenario, smoke, or a unit test of the code) over one that pins prompt text.
+Don't append a paragraph to `system_prompt`. Put the rule on the highest rung that works: code enforcement → injection with its trigger → tool description → lazy playbook → always-on prompt. See [ADR-046](docs/adr/046-agent-behavior-fix-placement.md). `tests/unit/agents/prompt-budget.test.ts` fails CI when a budgeted agent's always-on prompt or local tool definitions grow past budget — the coordinator plus calendar, ceo-inbox, contacts and meeting-debrief (#2025). Prefer a behavioral test (scenario, smoke, or a unit test of the code) over one that pins prompt text. Writing a case is free; running one is not (see Testing).
 
 ### Setup wizard — keep the catalog current
 
@@ -400,9 +405,11 @@ Run both behavior suites against the **same `main` commit as the security gate**
 
 ```bash
 docker stop curia-curia-1                       # scenarios refuses to run beside a live instance
-pnpm smoke --model <standard-tier model>        # terminal 1; docs/dev/smoke-tests.md
-pnpm scenarios --model <standard-tier model>    # terminal 2, once smoke prints "Database: throwaway copy"; tests/scenarios/README.md
+CURIA_RELEASE_GATE=1 pnpm smoke --model <standard-tier model>        # terminal 1; docs/dev/smoke-tests.md
+CURIA_RELEASE_GATE=1 pnpm scenarios --model <standard-tier model>    # terminal 2, once smoke prints "Database: throwaway copy"; tests/scenarios/README.md
 ```
+
+`CURIA_RELEASE_GATE=1` marks the run as the release gate. The suites ignore it, but the maintainer's local guard refuses an unfiltered run without it (see Testing).
 
 Run them side by side, smoke first: smoke copies the dev database, and Postgres copies a database only while nothing else is connected to it, so scenarios must start after the copy. Each suite runs 4 cases at a time (`--concurrency`). Measured on 2026-10-05 (#1980): **both suites together took 12 min and OpenRouter billed $2.10**. Each summary prints the run's own spend by agent and judge. On that run the estimate priced cached input as uncached and ran about 2× the bill (estimated $4.39: smoke $2.84, scenarios $1.55, the judge about 10%); #1962 has since fixed the cache accounting; see `docs/dev/smoke-tests.md`. Since #2027 the scenario gate also runs three cases with real delegation (about $0.25 and two minutes more); the other real-delegation cases run on demand (`pnpm scenarios --on-demand`, see `tests/scenarios/README.md`). Since #2025 the scenario gate also runs the specialists' cases: 77 cases, measured on 2026-10-14 at about 38 minutes and $2.87 estimated (the judge about half). Smoke still starts first and finishes well before it.
 

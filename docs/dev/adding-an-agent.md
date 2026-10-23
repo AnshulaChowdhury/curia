@@ -356,7 +356,7 @@ Decide *where* a rule goes before writing it: code enforcement, then injection w
 4. **Policy in the YAML, personality in the identity block.** Every agent gets the office identity block: the coordinator as who it is, every other agent in "writes-as" mode, which binds whatever it writes for the principal or outsiders (spec 13, "Specialists"). The YAML says who gets what information, keeps internals out, and says whose instructions count. Warmth, formality, length and register belong to the office identity's Tone & style and Detail settings, which the principal edits in the console's Personality settings; how readily Curia acts or asks first is the autonomy level. YAML text that sets any of these overrides the principal's own settings.
 5. **Move text to turn guidance only when it has a trigger.** Turn guidance rides in the uncached user message, so moving text that applies on every turn there costs more, not less.
 6. **Move the test with the rule.** Replace unit tests that pin prompt text with tests of the mechanism that now carries the rule. Guard a deletion with the "does not restate" table in `tests/unit/agents/loader.test.ts`; each row names where the rule now lives.
-7. **A/B every cut on the same day** against `origin/main`'s prompt with `pnpm scenarios` (see `tests/scenarios/README.md`), and **lower the budget** in `tests/unit/agents/prompt-budget.test.ts` when the prompt shrinks.
+7. **Measure a cut on the cases it touches.** Run those cases with `pnpm scenarios --case`/`--tags` at a few runs (see `tests/scenarios/README.md`), and compare them with saved transcripts from `main` where they exist. Runs cost money, so agree the cases, the run count and the estimated cost with the maintainer first. Run a fresh `main` arm only when the maintainer asks for a full A/B, and then on the same day. "A/B" in the lessons below means this targeted comparison; the full suites run only at the release gate. **Lower the budget** in `tests/unit/agents/prompt-budget.test.ts` when the prompt shrinks.
 
 ### Lessons
 
@@ -364,8 +364,8 @@ Decide *where* a rule goes before writing it: code enforcement, then injection w
 2. **Prompts and pin comments drift from the toolset.** Cross-check every tool a prompt names against the agent's resolved pins.
 3. **"Enforced in code" means reading the enforcement point.** Where enforcement is partial, keep one clause rather than the paragraph.
 4. **Specs quote prompt text.** Grep `docs/specs/` before deleting.
-5. **A full-suite miss is not a regression until the A/B says so.** Budget a targeted A/B (about 30 minutes, under $2) into the PR rather than reading a single red run.
-6. **Size the verification to the change.** A full A/B is for prompt cuts. A moved heading or a lazily loaded reference needs the unit tests and one full-suite run. Stub a case's whole read surface at once, not one tool per failed run.
+5. **One red run is not a regression.** Re-run that case alone a few times, or compare it with a saved baseline, before changing anything. Don't re-run the suite to check.
+6. **Size the verification to the change.** A moved heading or a lazily loaded reference needs the unit tests only. A rewrite of live prompt text needs its own cases run. The full suites wait for the release gate. Stub a case's whole read surface at once, not one tool per failed run.
 7. **Examples are instructions.** Check a prompt's examples against the behavior checks — "I'll check with my research team" was offered as good phrasing and is exactly what scenario 10's `no_team_voice` check fails.
 8. **A clause that reads as redundant can be the anchor at its trigger.** Delete a restatement only when the general rule reaches that trigger, and let the A/B decide.
 9. **When merging lists, keep catch-alls as catch-alls.** Folding "contacts CRUD belongs to the contacts specialist" into a list of named operations left renames and identity links without a route.
@@ -374,7 +374,7 @@ Decide *where* a rule goes before writing it: code enforcement, then injection w
 12. **Rewrite the prohibition, not the instruction beside it.** The sentence that triggers an action is load-bearing in its exact words; change it only with its own A/B.
 13. **A roster line thinner than the description makes the coordinator do the groundwork.** Say what the specialist loads for itself ("a short brief is enough").
 14. **Where injected guidance sits can matter as much as what it says.** The same words in a block rebuilt before every model call and in a wake message behaved differently. A/B each placement separately.
-15. **On specialists, only removing dead or repeated text was neutral.** Rewrites of live sections changed which tools the model called while pass rates held. Compare call counts over 10 runs, not only behaviors.
+15. **On specialists, only removing dead or repeated text was neutral.** Rewrites of live sections changed which tools the model called while pass rates held. Compare tool-call counts across the runs, not only behaviors.
 
 ### Measuring an agent's context
 
@@ -400,7 +400,7 @@ Pass `--since` / `--until` for a window other than the 30 days ending now. What 
 
 ## Testing Your Agent
 
-Behavior is tested with the two suites in the release gate: `pnpm scenarios` scores agent decisions against stubbed tools (cases can target a specialist with `agent:`; see `tests/scenarios/README.md`), and `pnpm smoke` runs end-to-end turns against a fixture office (see [smoke-tests.md](smoke-tests.md)). Add a case when you add a route or a behavior. For hands-on checks:
+Behavior is tested with the two suites in the release gate: `pnpm scenarios` scores agent decisions against stubbed tools (cases can target a specialist with `agent:`; see `tests/scenarios/README.md`), and `pnpm smoke` runs end-to-end turns against a fixture office (see [smoke-tests.md](smoke-tests.md)). Add a case when you add a route or a behavior. Writing a case is free, but every run bills model calls, so while developing run only the cases you are working on (see "Testing" in the repo's `CLAUDE.md`). For hands-on checks:
 
 1. Start Curia with `docker compose up`
 2. Send a message on the CLI channel: `pnpm cli "your test message"`
