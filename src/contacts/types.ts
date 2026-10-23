@@ -337,6 +337,18 @@ export function meetsMinimumTier(
  *
  * The dispatch tier gate bypass is wired in dispatcher.ts (#953).
  */
+/**
+ * Why a contact was elevated from `unknown` to `known` (ContactService.elevateTierToKnown).
+ * principal-domain and principal-correspondence: evidence the principal knows the sender
+ * (src/contacts/principal-acquaintance.ts, #2227).
+ */
+export type TierElevationReason =
+  | 'correspondence'
+  | 'domain-validated'
+  | 'judgment'
+  | 'principal-domain'
+  | 'principal-correspondence';
+
 export function isAutomatedKind(kind: ContactKind): boolean {
   return kind === 'automated';
 }
@@ -549,5 +561,5 @@ export interface ContactServiceOptions {
   onIdentitiesChanged?: (contactId: string) => void | Promise<void>;
   /** Called after a contact's tier is automatically elevated to 'known'.
    *  Fired with the reason for observability/audit trail. Non-throwing. */
-  onContactElevated?: (contactId: string, reason: 'correspondence' | 'domain-validated' | 'judgment') => void;
+  onContactElevated?: (contactId: string, reason: TierElevationReason) => void;
 }

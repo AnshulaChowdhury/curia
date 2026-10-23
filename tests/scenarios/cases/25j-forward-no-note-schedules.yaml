@@ -13,7 +13,6 @@ description: >
 tags: [principal-scheduling, ps-core, calendar, email-forward]
 delegation: real
 release_gate: false
-known_failure: { issue: "#2227", reason: "Treats a bare forward as FYI and asks the principal instead of reaching the counterpart." }
 autonomy: { score: 84, gating: band }
 stub_sets: [human-channels, calendar-office, calendar-specialist]
 seed:

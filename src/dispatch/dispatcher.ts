@@ -25,7 +25,8 @@ import { extractCodeCandidates, extractShortRelayedCodes } from '../verification
 import { acceptsCodes, registerCodes } from '../verification/track-codes.js';
 import { personTurnSourceText } from '../agents/identifier-sources.js';
 import type { OutboundContextRow } from './outbound-context.js';
-import { inboundTurnGuidance, looksLikeSpotCheckReply, parseSpotCheckVerdicts, spotCheckCandidateText } from './turn-guidance-triggers.js';
+import type { AcquaintanceEvidence } from '../contacts/principal-acquaintance.js';
+import { hasBookingPageLink, inboundTurnGuidance, looksLikeForward, looksLikeMakeRoom, looksLikeSpotCheckReply, parseSpotCheckVerdicts, spotCheckCandidateText } from './turn-guidance-triggers.js';
 import { hasBacklog, type PrincipalBacklogCounts } from '../agents/prompts/backlog-line.js';
 import type { PrincipalBacklogSource } from './principal-backlog.js';
 import { rewriteLlmFailureTurns } from '../memory/llm-failure-turn.js';
@@ -106,6 +107,12 @@ function mergeTaskMetadata(
   };
 }
 
+/** What the dispatcher needs for the principal-acquaintance elevation (#2227). */
+export interface PrincipalAcquaintanceConfig {
+  check: Pick<import('../contacts/principal-acquaintance.js').PrincipalAcquaintanceCheck, 'evidenceFor'>;
+  contacts: Pick<import('../contacts/contact-service.js').ContactService, 'elevateTierToKnown'>;
+}
+
 export interface DispatcherConfig {
   bus: EventBus;
   logger: Logger;
@@ -168,6 +175,11 @@ export interface DispatcherConfig {
    * queued as well. Absent: every note is queued.
    */
   principalIdentities?: readonly ChannelIdentity[];
+  /**
+   * Elevates a verified email sender the principal knows from `unknown` to `known` before
+   * routing (#2227, src/contacts/principal-acquaintance.ts). Absent: no such elevation.
+   */
+  principalAcquaintance?: PrincipalAcquaintanceConfig;
   /**
    * Counts what is waiting on the principal, for the backlog line on principal turns
    * (prompt trim PR 7). Absent: no line.
@@ -272,6 +284,7 @@ export class Dispatcher {
   private gating: AutonomyGating;
   private bullpenService?: BullpenService;
   private principalIdentities?: readonly ChannelIdentity[];
+  private principalAcquaintance?: PrincipalAcquaintanceConfig;
   private principalBacklog?: PrincipalBacklogSource;
   private verification?: VerificationRuntime;
 
@@ -295,6 +308,7 @@ export class Dispatcher {
     this.gating = config.gating ?? 'tier';
     this.bullpenService = config.bullpenService;
     this.principalIdentities = config.principalIdentities;
+    this.principalAcquaintance = config.principalAcquaintance;
     this.principalBacklog = config.principalBacklog;
     this.verification = config.verification;
   }
@@ -473,9 +487,18 @@ export class Dispatcher {
     // just without enriched sender info.
     //
     let senderContext: InboundSenderContext | undefined;
+    // Set when the principal-acquaintance elevation already counted this message toward the
+    // sender's confidence, so Path 3 below does not count it twice (#2227).
+    let messageCounted = false;
+    // What the elevation found, for the turn guidance (#2227).
+    let acquaintanceEvidence: AcquaintanceEvidence | undefined;
     if (this.contactResolver) {
       try {
         senderContext = await this.contactResolver.resolve(payload.channelId, payload.senderId);
+        const acquaintance = await this.elevateIfPrincipalKnows(payload, senderContext);
+        senderContext = acquaintance.senderContext;
+        messageCounted = acquaintance.messageCounted;
+        acquaintanceEvidence = acquaintance.evidence;
 
         // Publish contact event for audit trail.
         // Skip audit for synthetic IDs (primary-user from CLI/smoke-test) to
@@ -584,29 +607,45 @@ export class Dispatcher {
                 }
               }
 
-              // Path 3: judgment elevation — fire-and-forget; updates confidence history for the NEXT
-              // inbound. The trust score for THIS message already used the stored contactConfidence.
-              // Capture tier/kind snapshots before the IIFE so it sees pre-message values even if
-              // senderContext is mutated (e.g. by Path 2 above).
-              if (this.confidencePipeline) {
+              // Path 3: count this message toward the sender's confidence, awaited so the trust
+              // score below is taken after it (#2227). Until then the score read the stored
+              // confidence from before this message, so a recently introduced known contact
+              // (confidence 0) scored 0.24 on email and was declined a meeting at the 0.3
+              // scheduling threshold. A count can only raise confidence (the pipeline returns 0
+              // when it skips), so the larger value is kept. Judgment elevation stays
+              // fire-and-forget: it changes the tier for the NEXT message. Tier/kind snapshots are
+              // taken before it so it sees pre-message values even if Path 2 mutated them.
+              // SECURITY: email elevates only on `senderVerified` mail (SPF, DKIM and DMARC pass),
+              // as the principal-acquaintance path does. A From address is forgeable, and at the
+              // 0.3 scheduling threshold a judgment-elevated `known` email sender can book meetings.
+              if (this.confidencePipeline && !messageCounted) {
                 const contactService = this.contactService;
                 const snapshotTier = senderContext.tier;
                 const snapshotKind = senderContext.kind;
-                void (async () => {
-                  try {
-                    const newConfidence = await this.confidencePipeline!.incrementalUpdate(resolvedContactId, { type: 'message_seen' });
-                    if (
-                      contactService &&
-                      snapshotTier === 'unknown' &&
-                      !isAutomatedKind(snapshotKind) &&
-                      newConfidence >= JUDGMENT_ELEVATION_THRESHOLD
-                    ) {
+                let newConfidence: number | undefined;
+                try {
+                  newConfidence = await this.confidencePipeline.incrementalUpdate(resolvedContactId, { type: 'message_seen' });
+                  senderContext.contactConfidence = Math.max(senderContext.contactConfidence, newConfidence);
+                } catch (err) {
+                  this.logger.warn({ err, contactId: resolvedContactId }, 'Confidence pipeline update failed (non-fatal)');
+                }
+                if (
+                  newConfidence !== undefined &&
+                  contactService &&
+                  snapshotTier === 'unknown' &&
+                  !isAutomatedKind(snapshotKind) &&
+                  (payload.channelId !== 'email' || payload.metadata?.['senderVerified'] === true) &&
+                  newConfidence >= JUDGMENT_ELEVATION_THRESHOLD
+                ) {
+                  const confidence = newConfidence;
+                  void (async () => {
+                    try {
                       await contactService.elevateTierToKnown(resolvedContactId, 'judgment');
+                    } catch (err) {
+                      this.logger.warn({ err, contactId: resolvedContactId, confidence }, 'Judgment elevation failed (non-fatal)');
                     }
-                  } catch (err) {
-                    this.logger.warn({ err, contactId: resolvedContactId }, 'Confidence pipeline or judgment elevation failed (non-fatal)');
-                  }
-                })();
+                  })();
+                }
               }
             }
 
@@ -1072,6 +1111,12 @@ export class Dispatcher {
       verificationCodeReceived,
       // liveTurn and curiaCc gate it inside inboundTurnGuidance.
       spotCheckReply,
+      // Likewise gated there (#2227).
+      forward: looksLikeForward(payload.channelId, payload.content),
+      bookingLink: hasBookingPageLink(payload.content),
+      principalAcquaintance: acquaintanceEvidence,
+      // The principal's own words only: text above any quote or forward marker.
+      makeRoom: looksLikeMakeRoom(spotCheckText),
     });
 
     // The backlog line (prompt trim PR 7): on a principal turn with anything waiting on
@@ -1242,6 +1287,52 @@ export class Dispatcher {
     } catch (err) {
       this.logger.error({ err, ...fields }, 'Failed to queue the principal note — the note is only on the agent.response audit record');
     }
+  }
+
+  /**
+   * A verified email sender still at tier `unknown`, whom the principal knows (same
+   * organization domain, or someone the principal has written to), is elevated to `known`
+   * and resolved again, so this message is authorized as a known contact's (#2227). Without
+   * it a colleague's first email to Curia ran read-only and was declined as a stranger.
+   *
+   * The message is counted toward the sender's confidence before resolving again (Path 3
+   * otherwise counts it after the trust score is taken). A first message would otherwise be
+   * scored on a stored confidence of 0, which keeps a known email sender (0.24) under the
+   * scheduling threshold.
+   *
+   * SECURITY: only for `senderVerified` mail (SPF, DKIM and DMARC pass, set by the email
+   * channel), so the address is not spoofed; and only for kind `person`. The evidence is the
+   * principal's own behavior (their domain, their sent mail), never the sender's claims.
+   */
+  private async elevateIfPrincipalKnows(
+    payload: { channelId: string; senderId: string; metadata?: Record<string, unknown> },
+    ctx: InboundSenderContext,
+  ): Promise<{ senderContext: InboundSenderContext; messageCounted: boolean; evidence?: AcquaintanceEvidence }> {
+    const unchanged = { senderContext: ctx, messageCounted: false };
+    const acquaintance = this.principalAcquaintance;
+    if (!acquaintance || !this.contactResolver || payload.channelId !== 'email') return unchanged;
+    if (!ctx.resolved || ctx.tier !== 'unknown' || ctx.kind !== 'person') return unchanged;
+    if (payload.metadata?.['senderVerified'] !== true) return unchanged;
+    const evidence = await acquaintance.check.evidenceFor(payload.senderId);
+    if (evidence === null) return unchanged;
+    const elevated = await acquaintance.contacts.elevateTierToKnown(ctx.contactId, evidence);
+    if (!elevated) return unchanged;
+    this.logger.info({ contactId: ctx.contactId, evidence }, 'Dispatcher: sender the principal knows elevated to known');
+    let messageCounted = false;
+    if (this.confidencePipeline) {
+      try {
+        await this.confidencePipeline.incrementalUpdate(ctx.contactId, { type: 'message_seen' });
+        messageCounted = true;
+      } catch (err) {
+        // Path 3 counts it later instead; this message is scored on the stored confidence.
+        this.logger.warn({ err, contactId: ctx.contactId }, 'Confidence update after principal-acquaintance elevation failed (non-fatal)');
+      }
+    }
+    return {
+      senderContext: await this.contactResolver.resolve(payload.channelId, payload.senderId),
+      messageCounted,
+      evidence,
+    };
   }
 
   /** True when a send's recipients include one of the principal's verified identities. */

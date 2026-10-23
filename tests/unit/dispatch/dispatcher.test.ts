@@ -2054,6 +2054,39 @@ describe('Dispatcher auto-elevation — Path 3 judgment (#951)', () => {
       channelId: 'email',
       senderId: 'alice@example.com',
       content: 'Hello again',
+      metadata: { senderVerified: true },
+    }));
+
+    await vi.waitFor(() => expect(elevateFn).toHaveBeenCalledWith('test-contact-id', 'judgment'), { timeout: 200 });
+  });
+
+  // #2227: a forged From address must not earn `known` (and with it scheduling at 0.3).
+  it.each([
+    ['unverified mail', { senderVerified: false }],
+    ['mail with no verification result', {}],
+  ])('does not elevate an email sender on %s', async (_label, metadata) => {
+    const { bus, elevateFn } = buildHarness({ confidence: 0.50 });
+
+    await bus.publish('channel', createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'email',
+      senderId: 'alice@example.com',
+      content: 'Hello again',
+      metadata,
+    }));
+
+    await new Promise<void>(r => setTimeout(r, 10));
+    expect(elevateFn).not.toHaveBeenCalledWith(expect.anything(), 'judgment');
+  });
+
+  it('elevates on a non-email channel without a verification flag', async () => {
+    const { bus, elevateFn } = buildHarness({ confidence: 0.22 });
+
+    await bus.publish('channel', createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'signal',
+      senderId: '+15555550100',
+      content: 'Hello again',
     }));
 
     await vi.waitFor(() => expect(elevateFn).toHaveBeenCalledWith('test-contact-id', 'judgment'), { timeout: 200 });

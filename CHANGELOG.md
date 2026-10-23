@@ -68,6 +68,13 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **OpenRouter retries** — logged per attempt and counted on `llm.call`, instead of the SDK retrying silently. (#1915)
 - **Voice toolset** — spoken turns get nine voice tools, not the coordinator's 73; cold first-token 110–170ms faster. (#1968)
 - **Voice brain parity spike** — adds slim-core arms, three models, reasoning effort, real tools, metered spend, cold/warm latency. (#1968)
+- **Principal forwards** — a forward from the principal is handled, not treated as FYI. (#2227)
+- **Senders the principal knows** — verified email senders in `security.principal_org_domains` or the principal's Sent mail start as known. (#2227)
+- **Scheduling trust threshold** — lowered from 0.5 to 0.3 so known email contacts can book meetings (spec 06). (#2227)
+- **`contact.elevated`** — **public API:** new `principal-domain` and `principal-correspondence` reasons. (#2227)
+- **CC'd scheduling** — handed a meeting on a CC, Curia offers specific times instead of asking for availability. (#2227)
+- **Making room** — "move things around" moves the principal's own blocks at autonomy ≥80; below, asks first. (#2227)
+- **Booking links** — Curia books through a counterpart's booking page instead of emailing times, without duplicate invites. (#2227)
 - **KG explorer layout** — nodes spread further apart and labels no longer overlap. (#351)
 - **Console registry** — shows optional capabilities beside a tool's required ones. (#2028)
 - **ADR-048 outcomes** — effort A/B found no winner; the standard tier stays at the model default. (#2044)
@@ -130,6 +137,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Sign-in code scrub** — tracked codes become `[sign-in code]` in notes, reports, memory, sends and replies. (#2017)
 - **Browser code guard** — `web-browser` refuses to type or navigate a sign-in code off its own site. (#2017)
 - **Digest tools** — tasks an outside contact started can't read or acknowledge the principal's digest. (#1320)
+- **Judgment elevation** — email senders become known only on SPF/DKIM/DMARC-verified mail. (#2227)
 
 ### Fixed
 

@@ -304,9 +304,36 @@ The dispatch layer compares `messageTrustScore` against configurable thresholds 
 trust_policy:
   financial_actions: 0.8        # requires high-trust channel + known contact
   data_export: 0.8
-  scheduling: 0.5               # medium channel or known email contact is fine
+  scheduling: 0.3               # a known email contact (0.24 + 0.4 × confidence) is fine
   information_queries: 0.2      # any authenticated message is fine
 ```
+
+Scheduling was 0.5 until #2227. A `known` email contact scores 0.24 plus 0.4 × its contact
+confidence, so at 0.5 nearly every known email correspondent was declined a meeting even
+though the `known` tier allows `schedule_meetings`. Since #2227 the dispatcher also counts
+each inbound message toward its sender's confidence *before* taking the score; it used to count
+it afterwards, for the next message. So a known contact on their first message scores about
+0.24 + 0.4 × 0.25 = 0.34, over 0.3, and a new `unknown` email sender about 0.22, still under.
+
+**Senders the principal knows (#2227).** A new email sender starts at tier `unknown`, which
+runs read-only. Before routing, the dispatcher elevates such a sender to `known` when the
+mail is `senderVerified` (above), the contact is a `person`, and there is evidence the
+principal knows them (`src/contacts/principal-acquaintance.ts`):
+
+- `principal-domain`: the sender's address is exactly on one of the principal's organization
+  domains, listed in `security.principal_org_domains` (empty by default, which turns this
+  rule off). The list is explicit, not derived from the principal's own address. A derived
+  domain could be a shared mail provider, and then anyone with an address there would
+  count.
+- `principal-correspondence`: the principal has sent mail to this address. This is a search
+  of the principal's Sent mail over their Nylas grant, with a 5-second limit. It finds the
+  Sent folder by its `\Sent` attribute and filters by address, so it works on Gmail,
+  Microsoft and IMAP grants alike. Mail the sender sent the principal does not count.
+
+The message is then counted toward the contact's confidence (as for every sender, above), and
+the contact resolved again. So this first message is authorized and scored as a known
+contact's: about 0.34, over the scheduling threshold. Lookup failures and timeouts leave the sender `unknown`. The elevation is
+published as `contact.elevated` with the evidence as its `reason`.
 
 When a request's `messageTrustScore` falls below the required threshold, the Coordinator declines the action: "I'm not able to do that without a higher level of verified trust with you. If you'd like, I can let [CEO name] know you reached out." The Coordinator may still respond in a general, non-action way (introductions, pleasantries, clarifying questions). It never explains the trust system or mentions scores to external senders. Trust thresholds do not apply to the CEO (role: `ceo` or channel: `cli`).
 

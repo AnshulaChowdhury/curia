@@ -120,6 +120,11 @@ export interface SeedContact {
   /** Channel identity used when this contact is the sender. */
   channel: string;
   identifier: string;
+  /**
+   * The principal has sent mail to this (email) contact: the principal-mailbox lookup the
+   * Dispatcher makes for an unknown sender answers yes (#2227).
+   */
+  principalWrote?: boolean;
 }
 
 /** A row in outbound_context. Referenced as `{{entry:<key>}}`. */
@@ -244,6 +249,11 @@ export interface ScenarioInbound {
      */
     to?: string[];
     cc?: string[];
+    /**
+     * The adapter's `senderVerified` (SPF, DKIM and DMARC pass). Unset leaves it out of the
+     * metadata, as before #2227.
+     */
+    senderVerified?: boolean;
   };
 }
 

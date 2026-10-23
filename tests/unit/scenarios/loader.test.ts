@@ -682,6 +682,25 @@ expected_behaviors:
     expect(c.autonomy).toEqual({ score: 84, gating: 'band' });
   });
 
+  it('reads sender_verified and principal_wrote (#2227), and leaves both unset by default', () => {
+    const plain = loadScenarioCase(write('a.yaml', CC));
+    expect(plain.inbound.email?.senderVerified).toBeUndefined();
+    expect(plain.seed.contacts[0]!.principalWrote).toBeUndefined();
+    const c = loadScenarioCase(write('a.yaml', CC
+      .replace('    cc: [curia]\n', '    cc: [curia]\n    sender_verified: true\n')
+      .replace('      identifier: dana@lumen.example.test\n', '      identifier: dana@lumen.example.test\n      principal_wrote: true\n')));
+    expect(c.inbound.email?.senderVerified).toBe(true);
+    expect(c.seed.contacts[0]!.principalWrote).toBe(true);
+  });
+
+  it.each([
+    ['a non-boolean sender_verified', ['    cc: [curia]\n', '    cc: [curia]\n    sender_verified: "yes"\n'], /'sender_verified' must be a boolean/],
+    ['a non-boolean principal_wrote', ['      identifier: dana@lumen.example.test\n', '      identifier: dana@lumen.example.test\n      principal_wrote: 1\n'], /principal_wrote must be true or false/],
+    ['principal_wrote on a non-email contact', ['      channel: email\n      identifier: dana@lumen.example.test\n', '      channel: signal\n      identifier: "+15555550100"\n      principal_wrote: true\n'], /principal_wrote needs an email contact/],
+  ])('rejects %s', (_name, [from, to], error) => {
+    expect(() => loadScenarioCase(write('a.yaml', CC.replace(from!, to!)))).toThrow(error);
+  });
+
   it('leaves the envelope out when a case names neither list', () => {
     const c = loadScenarioCase(write('a.yaml', CC.replace('    to: [dana]\n    cc: [curia]\n', '    nylas_message_id: m-1\n')));
     expect(c.inbound.email?.to).toBeUndefined();

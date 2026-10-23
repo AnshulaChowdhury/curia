@@ -588,6 +588,8 @@ export interface YamlConfig {
       data_export: number;
       financial: number;
     };
+    /** The principal's organization email domains (#2227); a verified sender at one is elevated to known. */
+    principal_org_domains?: string[];
   };
   pii?: {
     /**

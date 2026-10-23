@@ -22,7 +22,13 @@
 export type TurnGuidanceKey =
   | 'principal-reply-shaped'
   | 'verification-code-received'
+  | 'principal-forward'
+  | 'booking-link'
+  | 'make-room'
   | 'non-principal-reply-shaped'
+  | 'principal-colleague'
+  | 'principal-correspondent'
+  | 'acquaintance-time-request'
   | 'spot-check-reply'
   | 'outbound-context'
   | 'outbound-context-task-wake'
@@ -57,6 +63,87 @@ const PRINCIPAL_REPLY_SHAPED = [
 const VERIFICATION_CODE_RECEIVED = [
   'The principal\'s message appears to contain the sign-in code for the verification in your',
   'Sign-in verifications block. If so, enter it now in that session; don\'t ask for it again.',
+];
+
+/**
+ * The principal emailed Curia a forward (#2227). Without this, a bare forward read as FYI:
+ * on the production standard-tier model Curia reached the sender in 2 of 5 runs (scenario
+ * 25j) and asked the principal "Want me to offer them those?" in the rest. Replaces the
+ * reply-shaped note, whose "ask what they are replying to" pulls the other way.
+ */
+const PRINCIPAL_FORWARD = [
+  'The principal forwarded you someone else\'s email. Unless their note says otherwise ("FYI",',
+  '"no action"), a forward means "please handle this": do what the forwarded message asks, on',
+  'the principal\'s behalf, within your autonomy. A meeting request gets scheduled: check the',
+  'calendar and reach the sender with times, or book through a booking link they gave. Don\'t',
+  'ask the principal what they want done; tell them briefly what you did.',
+];
+
+/**
+ * The inbound carries a booking-page link (#2227, bookingPageUrls). Without this, Curia
+ * booked through a counterpart's Calendly in 3 of 5 runs (scenario 25k) and emailed times
+ * in the rest; and every booking was followed by a calendar event of Curia's own, so the
+ * counterpart got two invites. Conditional: the link may be one nobody asked Curia to use.
+ */
+const BOOKING_LINK = [
+  'This message has a booking-page link (Calendly, a Google booking page or similar). When you',
+  'are setting up a meeting with the page\'s owner for the principal, book through the page',
+  'instead of proposing times by email: get the principal\'s free windows from the calendar',
+  'specialist (no holds), open the page with `web-browser`, pick a slot free on both sides and',
+  'book it with the principal\'s name and email. The page sends the invite, so create no event',
+  'or hold of your own. Then confirm the booked time on the thread. Only if the page fails or',
+  'has no slot that fits, offer times by email instead.',
+];
+
+/**
+ * The principal asked Curia to make room for a meeting ("let me move a few things around",
+ * #2227, looksLikeMakeRoom). Without this, at autonomy 84 Curia moved events in 1 of 10 runs
+ * (scenario 25b) and otherwise offered slots over the principal's focus blocks; at 74 it
+ * never asked first (25c, 0/5). What may move was already right: protected events were never
+ * touched. The band rule follows the autonomy engine's high-risk floor (calendar writes, 80).
+ */
+const MAKE_ROOM = [
+  'The principal asked you to make room for this meeting ("move things around", "free up',
+  'time"). Offer only times that will be free: never a slot over an existing event unless that',
+  'event is moved first. Keep to the window they gave. What may move, in this order: the',
+  'principal\'s own blocks (focus time, admin, holds), then small internal meetings, then larger',
+  'internal ones. Never move external meetings, ones with many stakeholders (board, offsite),',
+  'or personal and medical appointments.',
+  '- Autonomy 80 or above: have the calendar specialist move what is needed, then offer the',
+  '  freed times, then tell the principal what moved.',
+  '- Below 80: move nothing, and offer nothing over an existing event. Ask the principal',
+  '  privately, never on the thread, with one specific proposal: what to move, and to when.',
+  '  On the thread, a short holding note to the counterpart (times are coming) is fine.',
+];
+
+/**
+ * The dispatcher raised this sender from `unknown` to `known` on evidence that the principal
+ * knows them (#2227, src/contacts/principal-acquaintance.ts). Says what the evidence was:
+ * without it the coordinator could not tell the sender had been checked, and in scenario
+ * 25m sometimes treated a colleague as unvetted.
+ */
+const PRINCIPAL_COLLEAGUE = [
+  'This sender is a colleague of the principal: their address is on the principal\'s',
+  'organization domain. You had not dealt with them before, so the system made them a known',
+  'contact on that basis.',
+];
+
+const PRINCIPAL_CORRESPONDENT = [
+  'The principal has emailed this sender before (it is in the principal\'s Sent mail). You had',
+  'not dealt with them before, so the system made them a known contact on that basis.',
+];
+
+/**
+ * Follows either acquaintance note. Without it, once the sender was let in, a networking
+ * request was booked into the next two workdays in 3 of 9 runs (scenario 25n).
+ */
+const ACQUAINTANCE_TIME_REQUEST = [
+  'If they ask for the principal\'s time, first read the calendar, even if you will only ask the',
+  'principal: a recommendation names real free times. Then weigh how much it matters. A',
+  'time-bound, internal or sensitive request gets time soon (for a sensitive one, an invite',
+  'title that does not name the matter). A discretionary one (networking, catching up, advice',
+  'for themselves) gets one or two short call or video slots a week or more out, or a private',
+  'ask to the principal with your recommendation. Either way, tell the principal.',
 ];
 
 /** The named verification-code-received lines: one per verification the code was registered for. */
@@ -196,7 +283,11 @@ const EMAIL_CC_REPLY = [
   '`email:<thread id>`), and `account` is the `Account` line.',
 ];
 
-/** The principal CC'd Curia on an email to someone else. */
+/**
+ * The principal CC'd Curia on an email to someone else. The last two lines (#2227): handed a
+ * meeting, Curia asked the counterpart for windows instead of offering times in about a
+ * quarter of runs (scenario 25a, 5 of 18 on main).
+ */
 const EMAIL_CC_PRINCIPAL = [
   'The principal copied you on an email to someone else; you are not the primary recipient.',
   'Read it as a whole and infer what they expect: they may be looping you in, making an',
@@ -205,6 +296,9 @@ const EMAIL_CC_PRINCIPAL = [
   'Only if the intent is genuinely ambiguous (two clearly contradictory readings) ask the',
   'principal, and then on a separate channel (e.g. Signal) or a new email thread, never on',
   'this thread, where third parties would see the question.',
+  'When they hand you a meeting to set up, offer the other person specific times from the',
+  'principal\'s calendar, in the window and format they gave; don\'t ask for their availability.',
+  'If the other person shared a booking page, book through it instead (the booking-link note).',
 ];
 
 /** Any inbound email turn. */
@@ -243,7 +337,13 @@ const SCHEDULER_DELIVERY = [
 const TURN_GUIDANCE: Record<TurnGuidanceKey, readonly string[]> = {
   'principal-reply-shaped': PRINCIPAL_REPLY_SHAPED,
   'verification-code-received': VERIFICATION_CODE_RECEIVED,
+  'principal-forward': PRINCIPAL_FORWARD,
+  'booking-link': BOOKING_LINK,
+  'make-room': MAKE_ROOM,
   'non-principal-reply-shaped': NON_PRINCIPAL_REPLY_SHAPED,
+  'principal-colleague': PRINCIPAL_COLLEAGUE,
+  'principal-correspondent': PRINCIPAL_CORRESPONDENT,
+  'acquaintance-time-request': ACQUAINTANCE_TIME_REQUEST,
   'spot-check-reply': SPOT_CHECK_REPLY,
   'outbound-context': OUTBOUND_CONTEXT,
   'outbound-context-task-wake': OUTBOUND_CONTEXT_TASK_WAKE,
@@ -264,7 +364,15 @@ export const TURN_GUIDANCE_ORDER: readonly TurnGuidanceKey[] = [
   'principal-reply-shaped',
   // Straight after the reply-shaped note: a bare code is not a reply needing clarification.
   'verification-code-received',
+  'principal-forward',
+  // After the forward note: a forwarded booking page is booked through, not answered by email.
+  'booking-link',
+  'make-room',
   'non-principal-reply-shaped',
+  // After the reply contract: who this sender is to the principal, then how to weigh a request.
+  'principal-colleague',
+  'principal-correspondent',
+  'acquaintance-time-request',
   'spot-check-reply',
   'outbound-context',
   'outbound-context-task-wake',

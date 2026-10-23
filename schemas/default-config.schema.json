@@ -179,6 +179,11 @@
             "data_export":       { "type": "number", "minimum": 0, "maximum": 1 },
             "financial":         { "type": "number", "minimum": 0, "maximum": 1 }
           }
+        },
+        "principal_org_domains": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$" }
         }
       }
     },

@@ -321,6 +321,7 @@ seed:
       kind: person                        # person | organization | automated
       channel: email
       identifier: sam@example.test        # always under example.test
+      # principal_wrote: true             # email only: the principal has mailed Sam (see below)
   outbound_context:                       # → {{entry:<key>}}
     - key: offsite
       channel: signal
@@ -465,6 +466,26 @@ inbound:
   email: { nylas_message_id: m-1, to: [dana], cc: [curia] }
 ```
 
+### Senders the principal knows
+
+The Dispatcher elevates a verified `unknown` email sender the principal knows to `known`
+before routing (#2227, `src/contacts/principal-acquaintance.ts`). Two fields drive it:
+
+- `inbound.email.sender_verified: true` is the adapter's `senderVerified` (SPF, DKIM and
+  DMARC pass). The check runs only when it is set. Unset leaves it out of the metadata, so
+  existing cases never meet the rule.
+- `principal_wrote: true` on a seeded email contact means the principal has sent them mail:
+  the run's stand-in for the principal's Sent folder answers yes for that address.
+
+The scenario office's `security.principal_org_domains` is `example.test`, the test
+principal's own domain. So a verified sender at `…@example.test` counts as a colleague, and
+one at `…@lumen.example.test` does not.
+
+The harness Dispatcher scores senders as production does: channel trust from
+`config/channel-trust.yaml`, the `security.trust_score` weights and the confidence pipeline.
+The stack's resolver evaluates production's permission model. So the coordinator sees the
+same trust score and AUTHORIZATION section that production would show it.
+
 After adding a case, run it (`--case`, a few runs) so the CLI records its stub coverage,
 and commit the updated `stub-coverage.json`.
 
@@ -583,6 +604,24 @@ pnpm scenarios --tags ps-core  --model …   # autonomy 84 (band): 25a, 25b, 25d
 pnpm scenarios --tags ps-ask   --model …   # autonomy 74 (band): 25c
 pnpm scenarios --tags ps-prefs --model …   # autonomy 84 + identity scheduling-prefs: 25f–25i
 ```
+
+**Why they stay out of the release gate (#2227).** Each batch needs a run-level fixture:
+autonomy for all three, plus the office identity for ps-prefs. A fixture applies to a whole
+run, so the loader requires `release_gate: false` on any case that sets one. The gate runs
+every case in one stack, at the database's own autonomy. They are also the suite's most
+expensive cases: real delegation, and about $0.05–0.10 a run. All 14 at five runs adds
+roughly $4 and 45 minutes to a gate.
+
+**When to run them instead.** Run all three batches, 9 runs each, before merging a change to:
+- the coordinator's or the calendar specialist's prompts;
+- the turn guidance (`src/agents/prompts/turn-guidance.ts`, `src/dispatch/turn-guidance-triggers.ts`);
+- sender trust or authorization (`src/contacts/principal-acquaintance.ts`, the trust
+  thresholds, `config/role-defaults.yaml`);
+- the calendar tools.
+
+Every critical behavior should hold at 8/9 or better. 25a sits near that line on `main`
+as well: `coffee_shaped` was 7/9 in one 9-run measurement. A miss there is worth reading
+before calling it a regression.
 
 ## A deployment's own agents
 

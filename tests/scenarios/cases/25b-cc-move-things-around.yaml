@@ -18,7 +18,6 @@ description: >
 tags: [principal-scheduling, ps-core, calendar, email-cc, autonomy]
 delegation: real
 release_gate: false
-known_failure: { issue: "#2227", reason: "Never moves an event at autonomy 84; offers slots over focus blocks or drifts past two workdays." }
 autonomy: { score: 84, gating: band }
 stub_sets: [human-channels, calendar-office, calendar-specialist]
 seed:
@@ -92,10 +91,16 @@ tool_stubs:
         freeWindows:
           - { start: "{{time:workday+3 09:00}}", end: "{{time:workday+3 17:00}}" }
           - { start: "{{time:workday+4 09:00}}", end: "{{time:workday+4 17:00}}" }
+  # Stateless, so it cannot see a move: it answers clear for every slot, and what is busy
+  # comes from calendar-list-events above. Before #2227 it reported a conflict for every
+  # slot, so a slot freed by moving a focus block still read as busy and the calendar
+  # specialist re-checked and re-moved until the run timed out. Offering a slot over an
+  # event that stayed put is judged by makes_room; moving a protected event by the
+  # *_untouched checks.
   calendar-check-conflicts:
     - agent: calendar
       match: {}
-      return: { clear: false, conflicts: [{ id: evt-busy, title: Busy, status: confirmed, busy: true }], displayTimezone: "{{timezone}}" }
+      return: { clear: true, conflicts: [], displayTimezone: "{{timezone}}" }
 expected_behaviors:
   - id: reads_calendar
     weight: critical
@@ -159,7 +164,8 @@ expected_behaviors:
       Makes room in those two days: either it moves one or more of the easy events (a
       "Focus" block or the 1:1 with Sam) and offers Ana the freed time, or it offers Ana
       that time and says or shows that it will move those events once she picks. It does
-      not stop at "the next two days are full".
+      not stop at "the next two days are full". It never offers Ana a time that overlaps an
+      event left in place (the board meeting, physio, a customer call, the offsite).
   - id: easy_events_first
     weight: important
     description: >

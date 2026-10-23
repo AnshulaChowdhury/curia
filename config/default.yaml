@@ -258,9 +258,15 @@ security:
   # All values must be in [0.0, 1.0]. Startup fails if this block is absent or malformed.
   trust_thresholds:
     information_query: 0.2   # answering questions, summaries
-    scheduling: 0.5           # calendar changes, meeting requests
+    scheduling: 0.3           # calendar changes, meeting requests (0.5 until #2227: a known email contact scores ~0.24 + 0.4 x confidence)
     data_export: 0.8          # sharing files, forwarding records
     financial: 0.8            # payments, financial commitments
+
+  # The principal's own organization's email domains, e.g. [acme.com] (#2227). A verified
+  # (SPF/DKIM/DMARC pass) email sender at one of these, still tier `unknown`, is treated as a
+  # colleague and elevated to `known` before routing. Empty: the domain rule is off. List
+  # only domains the organization controls, never a shared mail provider (gmail.com).
+  principal_org_domains: []
 
 # Bulk export controls (#201) — item-count threshold, destination allowlisting, and
 # sensitivity ceiling for attachments (OutboundGateway) and MCP Drive/Sheets exports.

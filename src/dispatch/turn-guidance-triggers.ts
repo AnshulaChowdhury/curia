@@ -9,6 +9,7 @@
 
 import type { TurnGuidanceKey } from '../agents/prompts/turn-guidance.js';
 import { isTaskWakeReplyBinding } from './task-wake-reply.js';
+import type { AcquaintanceEvidence } from '../contacts/principal-acquaintance.js';
 
 export interface InboundGuidanceFacts {
   /** A live principal turn (stampOriginator). */
@@ -35,6 +36,85 @@ export interface InboundGuidanceFacts {
    * may score anything is decided here, not by the text.
    */
   spotCheckReply: boolean;
+  /**
+   * Email only: the inbound is a forward (looksLikeForward). Only honoured on a live
+   * principal turn addressed to Curia; a forward Curia is CC'd on is to someone else.
+   * Absent means no.
+   */
+  forward?: boolean;
+  /** The inbound text holds a booking-page link (hasBookingPageLink). Absent means no. */
+  bookingLink?: boolean;
+  /**
+   * The dispatcher elevated this (non-principal) sender on evidence the principal knows
+   * them (#2227). Absent means it did not.
+   */
+  principalAcquaintance?: AcquaintanceEvidence;
+  /**
+   * The message's own text (above any quote) asks to make room in the calendar
+   * (looksLikeMakeRoom). Only honoured on a live principal turn. Absent means no.
+   */
+  makeRoom?: boolean;
+}
+
+// "Make room" language (#2227): the principal offering to move their own commitments. Plain
+// "find some time" is left out: it is how most scheduling requests are phrased, and asks
+// for nothing to move.
+const MAKE_ROOM_PATTERNS: readonly RegExp[] = [
+  /\b(?:move|shift|shuffle|rearrange|juggle)\s+(?:a\s+few\s+|some\s+|a\s+couple\s+(?:of\s+)?)?(?:things|stuff|meetings|commitments)\b/i,
+  /\b(?:move|shift|shuffle|rearrange|juggle|clear)\s+(?:my|the)\s+(?:calendar|schedule|diary)\b/i,
+  /\bmake\s+(?:some\s+)?(?:room|space)\b/i,
+  /\b(?:find|free\s+up|clear|carve\s+out|open\s+up)\s+(?:some\s+)?(?:room|space)\b/i,
+  /\b(?:free\s+up|clear|carve\s+out|open\s+up)\s+(?:some\s+)?time\b/i,
+  // One of the principal's own blocks by name ("I can move my focus block", "push my 1:1"),
+  // the events make-room moves first. Up to two words may name it ("my Thursday focus block").
+  /\b(?:move|shift|push|bump|slide)\s+(?:my|our)\s+(?:[\w'-]+\s+){0,2}(?:block|focus\s+time|hold|1:1|one-on-one|1-on-1)(?=\W|$)/i,
+];
+
+// A refusal ahead of the match in the same clause: "Don't make room by moving my meetings",
+// "I can't move my focus block", "no need to clear my calendar". A clause ends at . ; ! ? , or
+// a line break, so "Don't worry, I'll make some room" is still a request.
+const MAKE_ROOM_NEGATION = /\b(?:don['’]?t|do\s+not|doesn['’]?t|not|never|no\s+need\s+to|can['’]?t|cannot|won['’]?t|shouldn['’]?t|rather\s+not|without)\b/i;
+const CLAUSE_END = /[.;!?,\n]/;
+
+/** Whether the match at `index` has a negation earlier in its clause. */
+function negatedInClause(text: string, index: number): boolean {
+  let start = index;
+  while (start > 0 && !CLAUSE_END.test(text[start - 1]!)) start--;
+  return MAKE_ROOM_NEGATION.test(text.slice(start, index));
+}
+
+/**
+ * Whether the text asks to make room in the calendar ("let me move a few things around").
+ * Lines quoted with `>` are someone else's words and are skipped. The email caller has
+ * already cut quoted mail; this covers a quote typed or pasted into Signal, Slack or SMS.
+ * A refused move ("don't move my meetings, offer another day") is not a request.
+ */
+export function looksLikeMakeRoom(text: string): boolean {
+  const own = text.split('\n').filter((line) => !line.trimStart().startsWith('>')).join('\n');
+  return MAKE_ROOM_PATTERNS.some((p) => {
+    for (const match of own.matchAll(new RegExp(p.source, `${p.flags}g`))) {
+      if (!negatedInClause(own, match.index)) return true;
+    }
+    return false;
+  });
+}
+
+// Booking-page hosts (#2227). A link on the host's root is not a booking page, so each needs
+// a path. Google's two forms: the calendar.app.google short link and the long
+// calendar.google.com/calendar/appointments URL. Microsoft Bookings and Bookings with me
+// live under outlook.office(365).com/book and /bookwithme.
+const BOOKING_PAGE_URL = new RegExp(
+  [
+    String.raw`https?://(?:[\w-]+\.)*(?:calendly\.com|cal\.com|savvycal\.com|zcal\.co|tidycal\.com|youcanbook\.me|acuityscheduling\.com|calendar\.app\.google|meetings(?:-[a-z0-9]+)?\.hubspot\.com)/[^\s/]`,
+    String.raw`https?://calendar\.google\.com/calendar/(?:u/\d+/)?appointments/`,
+    String.raw`https?://outlook\.office(?:365)?\.com/(?:book|bookwithme)/`,
+  ].join('|'),
+  'i',
+);
+
+/** Whether the text holds a link to a scheduling page (Calendly, Google booking pages and similar). */
+export function hasBookingPageLink(content: string): boolean {
+  return BOOKING_PAGE_URL.test(content);
 }
 
 /** Verdicts are short ("2 bad, that was a renewal notice"); a long message is something else. */
@@ -144,6 +224,25 @@ export function spotCheckCandidateText(channelId: string, content: string): stri
   return (quoteAt === -1 ? lines : lines.slice(0, quoteAt)).join('\n').trim();
 }
 
+// A forward's subject prefix: "Fwd:" (Gmail, Apple Mail), "FW:" (Outlook), "Fw:".
+const FORWARD_SUBJECT = /^Subject:\s*(fwd?|fw)\s*:/i;
+
+/**
+ * Whether an inbound email is a forward (#2227): a forward subject prefix, or a Gmail or
+ * Apple Mail forward marker as the first quote marker. Only the first: a reply whose quoted
+ * history holds an older forward is a reply. Not the Outlook underscore separator alone,
+ * which replies carry too; an Outlook forward is caught by its "FW:" subject.
+ */
+export function looksLikeForward(channelId: string, content: string): boolean {
+  if (channelId !== 'email') return false;
+  if (FORWARD_SUBJECT.test(content)) return true;
+  const lines = content.replace(EMAIL_SUBJECT_PREFIX, '').split('\n');
+  const quoteAt = firstQuoteLine(lines);
+  if (quoteAt === -1) return false;
+  const marker = lines[quoteAt]!.trim();
+  return FORWARD_GMAIL.test(marker) || FORWARD_APPLE.test(marker);
+}
+
 export function inboundTurnGuidance(facts: InboundGuidanceFacts): TurnGuidanceKey[] {
   // Machine mail gets nothing more: reply-shaping and reply mechanics do not apply to a
   // message the coordinator must not answer.
@@ -155,16 +254,25 @@ export function inboundTurnGuidance(facts: InboundGuidanceFacts): TurnGuidanceKe
   // A message where Curia is only CC'd is written to someone else ("2 good candidates came
   // through"), so it is never a verdict on Curia's digest either (F1).
   const spotCheckVerdict = facts.liveTurn && facts.spotCheckReply && !facts.curiaCc;
+  const principalForward = facts.liveTurn && facts.forward === true && facts.channelId === 'email' && !facts.curiaCc;
   if (!facts.liveTurn) {
     keys.push('non-principal-reply-shaped');
+    if (facts.principalAcquaintance !== undefined) {
+      keys.push(facts.principalAcquaintance === 'principal-domain' ? 'principal-colleague' : 'principal-correspondent');
+      keys.push('acquaintance-time-request');
+    }
   } else if (entries.length === 0) {
     // A spot-check verdict ("2 bad") is reply-shaped but not ambiguous: the reply-shaped note
     // says to ask what the principal is replying to, spot-check-reply says to act. They give
     // conflicting advice, so the verdict key replaces the note. With an outbound block the
-    // block's keys stay and spot-check-reply is added alongside them (below).
-    if (!spotCheckVerdict) keys.push('principal-reply-shaped');
+    // block's keys stay and spot-check-reply is added alongside them (below). A forward is
+    // self-contained and principal-forward says to act, so it replaces the note too.
+    if (!spotCheckVerdict && !principalForward) keys.push('principal-reply-shaped');
   }
   if (facts.liveTurn && facts.verificationCodeReceived === true) keys.push('verification-code-received');
+  if (principalForward) keys.push('principal-forward');
+  if (facts.bookingLink === true) keys.push('booking-link');
+  if (facts.liveTurn && facts.makeRoom === true) keys.push('make-room');
   if (facts.liveTurn && entries.length > 0) {
     keys.push('outbound-context');
     if (entries.some((m) => isTaskWakeReplyBinding(m))) keys.push('outbound-context-task-wake');
