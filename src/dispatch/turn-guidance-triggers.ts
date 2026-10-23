@@ -65,6 +65,9 @@ const MAKE_ROOM_PATTERNS: readonly RegExp[] = [
   /\bmake\s+(?:some\s+)?(?:room|space)\b/i,
   /\b(?:find|free\s+up|clear|carve\s+out|open\s+up)\s+(?:some\s+)?(?:room|space)\b/i,
   /\b(?:free\s+up|clear|carve\s+out|open\s+up)\s+(?:some\s+)?time\b/i,
+  // One of the principal's own blocks by name ("I can move my focus block", "push my 1:1"),
+  // the events make-room moves first. Up to two words may name it ("my Thursday focus block").
+  /\b(?:move|shift|push|bump|slide)\s+(?:my|our)\s+(?:[\w'-]+\s+){0,2}(?:block|focus\s+time|hold|1:1|one-on-one|1-on-1)(?=\W|$)/i,
 ];
 
 /** Whether the text asks to make room in the calendar ("let me move a few things around"). */

@@ -246,6 +246,10 @@ describe('looksLikeMakeRoom', () => {
     'Please free up time this week for Ana',
     'clear my schedule Friday morning',
     "I'll carve out some time",
+    'I can move my focus block so we can meet tomorrow',
+    'Push my 1:1 with Sam if you need to',
+    'happy to shift my Thursday focus time',
+    'bump my hold on Friday',
   ])('is true for %s', (text) => {
     expect(looksLikeMakeRoom(text)).toBe(true);
   });
@@ -256,6 +260,9 @@ describe('looksLikeMakeRoom', () => {
     'Things have moved quickly on the deal',
     'I made time for it last week',
     'Room 4B is booked',
+    'Can you move my flight to Friday?',
+    'I blocked my calendar for the offsite',
+    'Push my luck and ask for a holdback',
   ])('is false for %s', (text) => {
     expect(looksLikeMakeRoom(text)).toBe(false);
   });
