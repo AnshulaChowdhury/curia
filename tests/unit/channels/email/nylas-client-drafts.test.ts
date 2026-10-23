@@ -63,6 +63,14 @@ describe('NylasClient drafts (#2262)', () => {
       });
     });
 
+    it('passes anyEmail to the drafts query', async () => {
+      await client.listMessages({ folders: ['DRAFT'], anyEmail: 'sam@example.com' });
+      expect(mockDrafts.list).toHaveBeenCalledWith({
+        identifier: 'grant-id',
+        queryParams: { anyEmail: ['sam@example.com'] },
+      });
+    });
+
     it.each([
       { filter: 'from', options: { from: 'alice@example.com' } },
       { filter: 'receivedAfter', options: { receivedAfter: 1792761567 } },

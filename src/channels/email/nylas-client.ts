@@ -300,6 +300,7 @@ export class NylasClient {
           threadId: options?.threadId,
           subject: options?.subject,
           unread: options?.unread,
+          anyEmail: options?.anyEmail,
         });
       }
       // A native search runs on /messages and drops folders (below), so it never lists drafts.
@@ -379,12 +380,16 @@ export class NylasClient {
   }
 
   /** List unsent drafts, newest first (first page only, like listMessages). */
-  async listDrafts(options?: { limit?: number; threadId?: string; subject?: string; unread?: boolean }): Promise<NylasMessage[]> {
+  async listDrafts(
+    options?: { limit?: number; threadId?: string; subject?: string; unread?: boolean; anyEmail?: string },
+  ): Promise<NylasMessage[]> {
     const queryParams: ListDraftsQueryParams = {};
     if (options?.limit !== undefined) queryParams.limit = options.limit;
     if (options?.threadId !== undefined) queryParams.threadId = options.threadId;
     if (options?.subject !== undefined) queryParams.subject = options.subject;
     if (options?.unread !== undefined) queryParams.unread = options.unread;
+    // The drafts query has any_email too, so the address filter carries over (#2268 review).
+    if (options?.anyEmail !== undefined) queryParams.anyEmail = [options.anyEmail];
 
     try {
       const response = await this.nylas.drafts.list({ identifier: this.grantId, queryParams });

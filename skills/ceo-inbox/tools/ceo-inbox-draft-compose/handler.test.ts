@@ -269,6 +269,27 @@ describe('CeoInboxDraftComposeHandler', () => {
       expect(error).toMatch(/only to the principal/);
     });
 
+    // A sourced raw copy of the principal's address used to skip the check; the To/Cc
+    // dedup then saved a draft to the principal alone (#2268 review).
+    it.each([
+      { to: ['principal'], to_addresses: ['pat@home.example'] },
+      { to: ['principal'], cc_addresses: ['PAT@home.example'] },
+      { to_addresses: ['pat@home.example'] },
+    ])('refuses a principal-only draft that names the principal by raw address (%j)', async (recipients) => {
+      const sources = sourcesWith('pat@home.example');
+      const error = refused(await handler.execute(buildCtx({ ...recipients, subject: 'Refresh done', body: 'Link.' }, sources)));
+      expect(error).toMatch(/only to the principal/);
+    });
+
+    it('still saves a draft to the principal plus a raw address that is someone else', async () => {
+      ok();
+      const sources = sourcesWith('jordan@quillfeather.example');
+      const result = await handler.execute(buildCtx({
+        to: ['principal'], to_addresses: ['jordan@quillfeather.example'], subject: 'Hello', body: 'Hi.',
+      }, sources));
+      expect(result.success).toBe(true);
+    });
+
     it('still saves a draft to the principal when someone else is on it', async () => {
       ok();
       const result = await handler.execute(buildCtx({ to: ['principal', fixture.aliceId], subject: 'Hello', body: 'Hi.' }));

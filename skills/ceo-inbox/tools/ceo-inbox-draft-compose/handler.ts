@@ -44,19 +44,37 @@ function isPrincipalAliasOnly(lists: RecipientLists): boolean {
 }
 
 /**
- * True when the resolved references are all the principal's own contact, as when the
- * principal's contact ID is passed instead of the alias. The principal's ID comes from
- * the same resolver the alias goes through. When it cannot be resolved the draft is not
- * refused: this check redirects a misroute, it is not a security boundary.
+ * True when every recipient the draft would carry is the principal: a reference to the
+ * principal's contact ID, or a raw address that is the principal's (their resolved
+ * address, or one linked to their contact). Covers what the alias pre-check cannot — the
+ * contact-ID form, and a raw copy of the principal's address beside the alias, which the
+ * To/Cc dedup would collapse to one self-addressed recipient. The principal comes from
+ * the same resolver the alias goes through. When a lookup fails the draft is not refused:
+ * this check redirects a misroute, it is not a security boundary.
  */
-async function isPrincipalContactOnly(ctx: ToolContext, contactIds: readonly string[]): Promise<boolean> {
-  if (contactIds.length === 0 || !ctx.resolveRecipientReference) return false;
+async function isPrincipalOnlyDraft(
+  ctx: ToolContext,
+  contactIds: readonly string[],
+  rawAddresses: readonly string[],
+): Promise<boolean> {
+  if (contactIds.length + rawAddresses.length === 0 || !ctx.resolveRecipientReference) return false;
   const principal = await ctx.resolveRecipientReference('email', PRINCIPAL_RECIPIENT_ALIAS, { field: 'to' });
   if (!principal.ok) {
     ctx.log.warn({ err: principal.cause }, 'ceo-inbox-draft-compose: principal not resolvable — self-addressed check skipped');
     return false;
   }
-  return contactIds.every((id) => id === principal.contactId);
+  if (!contactIds.every((id) => id === principal.contactId)) return false;
+  for (const address of rawAddresses) {
+    if (address.toLowerCase() === principal.identifier.toLowerCase()) continue;
+    try {
+      const owner = await ctx.contactService?.resolveByChannelIdentity('email', address);
+      if (owner?.contactId !== principal.contactId) return false;
+    } catch (err) {
+      ctx.log.warn({ err }, 'ceo-inbox-draft-compose: raw recipient lookup failed — self-addressed check skipped');
+      return false;
+    }
+  }
+  return true;
 }
 
 export class CeoInboxDraftComposeHandler implements ToolHandler {
@@ -122,16 +140,15 @@ export class CeoInboxDraftComposeHandler implements ToolHandler {
     if (!toRefs.ok) return { success: false, error: toRefs.error };
     const ccRefs = await resolveReferenceRecipients(ctx, lists.cc, CC, NOT_SAVED);
     if (!ccRefs.ok) return { success: false, error: ccRefs.error };
-    if (
-      lists.to_addresses.length === 0 && lists.cc_addresses.length === 0
-      && await isPrincipalContactOnly(ctx, [...toRefs.contactIds, ...ccRefs.contactIds])
-    ) {
-      return { success: false, error: PRINCIPAL_ONLY_ERROR };
-    }
     const toRaw = await checkRawRecipients(ctx, lists.to_addresses, TO, NOT_SAVED);
     if (!toRaw.ok) return { success: false, error: toRaw.error };
     const ccRaw = await checkRawRecipients(ctx, lists.cc_addresses, CC, NOT_SAVED);
     if (!ccRaw.ok) return { success: false, error: ccRaw.error };
+    // Every accepted recipient, before the To/Cc dedup collapses duplicates of the principal.
+    const rawAddresses = [...toRaw.participants, ...ccRaw.participants].map((participant) => participant.email);
+    if (await isPrincipalOnlyDraft(ctx, [...toRefs.contactIds, ...ccRefs.contactIds], rawAddresses)) {
+      return { success: false, error: PRINCIPAL_ONLY_ERROR };
+    }
 
     const to = uniqueParticipants(toRefs.participants, toRaw.participants);
     // Someone on the To line is not repeated on Cc.
