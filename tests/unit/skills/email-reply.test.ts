@@ -160,7 +160,7 @@ describe('EmailReplyHandler — CC modes', () => {
     return makeCtx(input, gateway, {}, { selfEmail });
   }
 
-  it('cc absent (undefined) — auto-populates from original to/cc, excluding primary To and selfEmail', async () => {
+  it('cc absent (undefined) — reply-all keeps the original To on To and CC on CC, excluding selfEmail (#2273)', async () => {
     const gateway = {
       getEmailMessage: vi.fn().mockResolvedValue({
         from: [{ email: 'sender@example.com' }],
@@ -184,23 +184,23 @@ describe('EmailReplyHandler — CC modes', () => {
     if (result.success) {
       const data = result.data as { message_id: string; to: string; subject: string; cc: string };
       expect(data.message_id).toBe('sent-cc-1');
-      expect(data.to).toBe('sender@example.com');
+      // The sender and bob were both on To; curia@example.com (selfEmail) is dropped.
+      expect(data.to).toBe('sender@example.com, bob@example.com');
       expect(data.subject).toBe('Re: Group thread');
-      // sender@example.com is excluded (primary To recipient), curia@example.com is excluded (selfEmail)
-      // bob@example.com and carol@example.com remain
-      expect(data.cc).toBe('bob@example.com, carol@example.com');
+      expect(data.cc).toBe('carol@example.com');
     }
 
-    // Verify the send call received the CC array
     expect(gateway.send).toHaveBeenCalledWith(
       expect.objectContaining({
-        cc: ['bob@example.com', 'carol@example.com'],
+        to: 'sender@example.com',
+        additionalTo: ['bob@example.com'],
+        cc: ['carol@example.com'],
       }),
       expect.anything(),
     );
   });
 
-  it('cc absent — excludes every owned mailbox from reply-all CC', async () => {
+  it('cc absent — excludes every owned mailbox from reply-all To and CC', async () => {
     const gateway = {
       getEmailMessage: vi.fn().mockResolvedValue({
         from: [{ email: 'sender@example.com' }],
@@ -223,10 +223,12 @@ describe('EmailReplyHandler — CC modes', () => {
     expect(result.success).toBe(true);
     expect(gateway.send).toHaveBeenCalledWith(
       expect.objectContaining({
-        cc: ['bob@example.com'],
+        to: 'sender@example.com',
+        additionalTo: ['bob@example.com'],
       }),
       expect.anything(),
     );
+    expect(gateway.send.mock.calls[0]![0]).not.toHaveProperty('cc');
   });
 
   it('reads a secondary mailbox and derives reply-all CC from that thread (#1832)', async () => {
@@ -255,12 +257,13 @@ describe('EmailReplyHandler — CC modes', () => {
       expect.objectContaining({
         accountId: 'personal',
         to: 'sender@example.com',
-        cc: ['bob@example.com', 'carol@example.com'],
+        additionalTo: ['bob@example.com'],
+        cc: ['carol@example.com'],
       }),
       expect.anything(),
     );
     if (result.success) {
-      expect((result.data as { cc: string }).cc).toBe('bob@example.com, carol@example.com');
+      expect((result.data as { cc: string }).cc).toBe('carol@example.com');
     }
   });
 

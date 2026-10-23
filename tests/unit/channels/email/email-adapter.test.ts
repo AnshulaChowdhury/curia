@@ -1304,9 +1304,9 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
     expect(sendArg.cc).toBeUndefined();
   });
 
-  it('includes To recipients in reply-all CC', async () => {
-    // Thread message has an extra address in to[] that is neither the primary recipient
-    // nor selfEmail — it should appear in the outbound CC (reply-all behaviour).
+  it('keeps the other To recipients on To in reply-all (#2273)', async () => {
+    // Thread message has an extra address in to[] that is neither the sender nor
+    // selfEmail — reply-all keeps it on To, as a mail client would.
     const threadMessage = makeMockMessage({
       from: [{ email: CEO_EMAIL }],
       to: [{ email: 'extra@example.com' }],
@@ -1316,9 +1316,41 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
 
     await triggerOutbound(makeOutboundEvent('email:thread-abc'));
 
-    expect(mocks.outboundGateway.send).toHaveBeenCalledWith(
-      expect.objectContaining({ cc: ['extra@example.com'] }),
-      expect.any(Object),
-    );
+    const sendArg = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(sendArg).toMatchObject({ to: CEO_EMAIL, additionalTo: ['extra@example.com'] });
+    expect(sendArg.cc).toBeUndefined();
+  });
+
+  it('when the latest message is ours, keeps every person it was addressed to on To (#2273)', async () => {
+    const threadMessage = makeMockMessage({
+      from: [{ email: SELF_EMAIL }],
+      to: [{ email: CEO_EMAIL }, { email: 'second@example.com' }],
+      cc: [{ email: 'cc@example.com' }, { email: SELF_EMAIL }],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([threadMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    const [sendArg, options] = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(sendArg).toMatchObject({
+      to: CEO_EMAIL,
+      additionalTo: ['second@example.com'],
+      cc: ['cc@example.com'],
+    });
+    // Taken from our own message's To, not a verified sender header (#2071).
+    expect(options).not.toHaveProperty('recipientSource');
+  });
+
+  it('sends nothing when the latest message is ours and addressed only to us', async () => {
+    const threadMessage = makeMockMessage({
+      from: [{ email: SELF_EMAIL }],
+      to: [{ email: SELF_EMAIL }],
+      cc: [],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([threadMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    expect(mocks.outboundGateway.send).not.toHaveBeenCalled();
   });
 });

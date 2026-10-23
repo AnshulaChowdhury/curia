@@ -52,6 +52,30 @@ describe('emailPrincipalRules.extractRecipients', () => {
       cc: ['ok@example.com', 123],
     })).toBeNull();
   });
+
+  it('projects additionalTo between the primary To and CC (#2273)', () => {
+    const request: EmailSendRequest = {
+      channel: 'email',
+      to: 'ceo@example.com',
+      additionalTo: ['second@example.com'],
+      body: 'hi',
+      cc: ['other@example.com'],
+    };
+    expect(emailPrincipalRules.extractRecipients(request)?.map((r) => r.identifier)).toEqual([
+      'ceo@example.com',
+      'second@example.com',
+      'other@example.com',
+    ]);
+  });
+
+  it('returns null when additionalTo is a string rather than an array (fail closed)', () => {
+    expect(emailPrincipalRules.extractRecipients({
+      channel: 'email',
+      to: 'ceo@example.com',
+      additionalTo: 'second@example.com',
+      body: 'hi',
+    })).toBeNull();
+  });
 });
 
 describe('resolveEmailReplyRecipients', () => {
@@ -72,6 +96,18 @@ describe('resolveEmailReplyRecipients', () => {
       'carol@example.com',
     ]);
     expect(fetchMessage).toHaveBeenCalledWith('msg-1', undefined);
+  });
+
+  it('sees the original recipient, not Curia, when replying to a message Curia sent (#2273)', async () => {
+    const fetchMessage = vi.fn().mockResolvedValue({
+      from: [{ email: 'curia@example.com' }],
+      to: [{ email: 'boss@example.com' }, { email: 'bob@example.com' }],
+      cc: [{ email: 'carol@example.com' }],
+    });
+    await expect(resolveEmailReplyRecipients(
+      { reply_to_message_id: 'msg-1', body: 'hi' },
+      { fetchMessage, selfEmails: ['curia@example.com'] },
+    )).resolves.toEqual(['boss@example.com', 'bob@example.com', 'carol@example.com']);
   });
 
   it('trims reply_to_message_id before fetch so the cache key matches the handler (#1832)', async () => {

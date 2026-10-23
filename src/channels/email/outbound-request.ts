@@ -22,8 +22,14 @@ export interface EmailSendRequest {
    *  Used by the gateway to select the right NylasClient from its map.
    *  Defaults to the first configured account when absent. */
   accountId?: string;
-  /** Recipient email address */
+  /** Primary recipient email address. Trust tier, contact creation and provenance key on it. */
   to: string;
+  /**
+   * Further To recipients after `to` — a reply-all keeps everyone the original
+   * was addressed to on To (#2273). Projected, blocked-checked and dispatched
+   * with `to`; primary-recipient logic still uses `to` alone.
+   */
+  additionalTo?: string[];
   subject?: string;
   body: string;
   cc?: string[];
