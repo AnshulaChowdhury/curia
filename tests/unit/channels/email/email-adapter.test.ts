@@ -69,6 +69,7 @@ function makeAdapter(mocks: ReturnType<typeof createMocks>, overrides: Partial<{
   contactCreationMaxPerHour: number;
   ceoEmail: string;
   timezone: string;
+  suppressedSenderEmails: string[];
 }> = {}) {
   return new EmailAdapter({
     accountId: 'curia',
@@ -78,7 +79,7 @@ function makeAdapter(mocks: ReturnType<typeof createMocks>, overrides: Partial<{
     contactService: mocks.contactService,
     pollingIntervalMs: 7_200_000, // 2 hours — never fires in tests, even under vi.advanceTimersByTime(3_600_001)
     selfEmail: SELF_EMAIL,
-    suppressedSenderEmails: [],
+    suppressedSenderEmails: overrides.suppressedSenderEmails ?? [],
     contactCreationMaxPerMessage: overrides.contactCreationMaxPerMessage ?? 10,
     contactCreationMaxPerHour: overrides.contactCreationMaxPerHour ?? 100,
     ceoEmail: overrides.ceoEmail ?? CEO_EMAIL,
@@ -1339,6 +1340,38 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
     });
     // Taken from our own message's To, not a verified sender header (#2071).
     expect(options).not.toHaveProperty('recipientSource');
+    // Those people never wrote to us: no known-tier contact for them.
+    expect(sendArg.toFromOwnMessage).toBe(true);
+  });
+
+  it('does not mark a reply to someone who wrote to us', async () => {
+    const threadMessage = makeMockMessage({ from: [{ email: CEO_EMAIL }], to: [{ email: SELF_EMAIL }], cc: [] });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([threadMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    const sendArg = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(sendArg).not.toHaveProperty('toFromOwnMessage');
+  });
+
+  it('treats a latest message from another owned account as ours', async () => {
+    const otherAccount = 'joseph-assistant@example.com';
+    const multiAccount = makeAdapter(mocks, { suppressedSenderEmails: [SELF_EMAIL, otherAccount] });
+    void multiAccount.start();
+    const threadMessage = makeMockMessage({
+      from: [{ email: otherAccount }],
+      to: [{ email: CEO_EMAIL }],
+      cc: [{ email: otherAccount }],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([threadMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    const [sendArg, options] = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(sendArg).toMatchObject({ to: CEO_EMAIL, toFromOwnMessage: true });
+    expect(sendArg.cc).toBeUndefined();
+    expect(options).not.toHaveProperty('recipientSource');
+    await multiAccount.stop();
   });
 
   it('sends nothing when the latest message is ours and addressed only to us', async () => {

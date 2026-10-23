@@ -704,12 +704,15 @@ export class EmailAdapter implements Channel {
       // message is ours, the reply goes to the people it was addressed to. Our own
       // address is dropped everywhere, so a self-addressed thread resolves to null
       // rather than looping a reply into our own inbox.
+      // Every owned mailbox, not just this account's: a latest message sent
+      // from another of our accounts is still ours.
+      const ownedMailboxes = [this.config.selfEmail, ...this.config.suppressedSenderEmails];
       const recipientSet = deriveEmailReplyRecipientSet({
         originalFrom: threadMessage.from[0]?.email,
         originalTo: threadMessage.to,
         originalCc: threadMessage.cc,
         ccInput: undefined,
-        selfEmails: [this.config.selfEmail],
+        selfEmails: ownedMailboxes,
       });
       if (!recipientSet) {
         logger.warn(
@@ -760,6 +763,8 @@ export class EmailAdapter implements Channel {
         accountId: this.config.accountId,
         to: recipientEmail,
         ...(additionalTo.length > 0 ? { additionalTo } : {}),
+        // These people never wrote to us: no known-tier contact for them (#2273, ADR-047).
+        ...(latestIsOurs ? { toFromOwnMessage: true } : {}),
         subject: `Re: ${baseSubject}`,
         body,
         replyToMessageId: threadMessage.id,
@@ -782,7 +787,7 @@ export class EmailAdapter implements Channel {
       const provenance = replyRecipientSource({
         addressFromHeader: !latestIsOurs,
         recipient: recipientEmail,
-        selfEmails: [this.config.selfEmail],
+        selfEmails: ownedMailboxes,
         headers: threadMessage.headers,
       });
       const fromName = provenance

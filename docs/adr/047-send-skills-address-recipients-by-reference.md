@@ -196,6 +196,8 @@ The tier of such a contact is `known` (#2040). No agent typed the address on eit
 - `send-draft` runs only on a principal-originated task (ADR-017). `email-draft-save` addresses by contact ID, so a draft whose To has no contact was written outside Curia, in practice by the principal;
 - `email-reply` sends to the From of the message being answered, an address that has written to us.
 
+That second premise fails when the message being answered is one Curia sent: the reply then goes to that message's To (#2273), people who have not written to us. `email-reply` and the email adapter mark such a send with `toFromOwnMessage`, a non-wire field on `EmailSendRequest` that a queued payload keeps. The gateway then neither creates a contact for the To nor elevates an existing one. Gate C and the other gates still run on those addresses.
+
 The same function already promotes an existing `unknown` contact to `known` when a send reaches it (correspondence elevation), so a contact it creates gets the same tier. At `unknown`, a reply would be held or dropped by the `unknown_sender` policy, and Gate C would escalate every external send it led to, a relay to the principal included.
 
 Rejected tiers:

@@ -175,6 +175,44 @@ describe('OutboundGateway', () => {
       }));
     });
 
+    it.each([
+      ['a further To', { additionalTo: ['other@example.com'] }],
+      ['a CC', { cc: ['other@example.com'] }],
+    ])('keeps the autonomy gate when the CEO is on To with %s', async (_label, extra) => {
+      const gateway = new OutboundGateway({
+        nylasClients: new Map([['curia', mocks.nylasClient]]),
+        contactService: mocks.contactService,
+        contentFilter: mocks.contentFilter,
+        bus: mocks.bus,
+        principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+        logger: mocks.logger,
+        autonomyService: makeAutonomyService(65),
+      });
+
+      const alone = await gateway.send({ ...baseRequest, to: 'ceo@example.com' });
+      expect(alone.success).toBe(true);
+
+      const withOthers = await gateway.send({ ...baseRequest, to: 'ceo@example.com', ...extra });
+      expect(withOthers.success).toBe(false);
+      expect(withOthers.blockedReason).toContain('autonomy');
+      expect(mocks.nylasClient.sendMessage).toHaveBeenCalledOnce();
+    });
+
+    it('creates no contact for a To copied from Curia\'s own message', async () => {
+      const createContact = vi.fn().mockResolvedValue({ id: 'new-contact' });
+      Object.assign(mocks.contactService, { createContact, linkIdentity: vi.fn().mockResolvedValue(undefined) });
+      const gateway = makeGateway();
+
+      const own = await gateway.send({ ...baseRequest, toFromOwnMessage: true });
+      expect(own.success).toBe(true);
+      expect(createContact).not.toHaveBeenCalled();
+
+      // Control: the same send without the flag creates the contact.
+      const received = await gateway.send(baseRequest);
+      expect(received.success).toBe(true);
+      expect(createContact).toHaveBeenCalledOnce();
+    });
+
     it('refuses a draft with a blocked contact on a further To, and drafts every To otherwise', async () => {
       const createDraft = vi.fn().mockResolvedValue({ id: 'draft-1' });
       (mocks.nylasClient as unknown as Record<string, unknown>).createDraft = createDraft;
@@ -2500,6 +2538,22 @@ describe('OutboundGateway.sendEmailDraft', () => {
 
     expect(result.success).toBe(true);
     expect(nylasClient.sendDraft).toHaveBeenCalledWith(DRAFT_ID);
+  });
+
+  it('keeps the autonomy gate when the draft goes to the CEO and anyone else (#2273)', async () => {
+    const { gateway, nylasClient } = makeGateway({
+      autonomyService: makeAutonomyService(65),
+    });
+    const result = await gateway.sendEmailDraft(DRAFT_ID, 'joseph', {
+      recipientEmail: 'ceo@example.com',
+      body: 'Hi all',
+      subject: 'Update',
+      allRecipients: ['ceo@example.com', 'armin@external.com'],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.blockedReason).toMatch(/autonomy/i);
+    expect(nylasClient.sendDraft).not.toHaveBeenCalled();
   });
 
   it('runs the content filter over the full To+CC envelope so a draft To: principal + CC: third party is not treated as sole-principal (#547)', async () => {

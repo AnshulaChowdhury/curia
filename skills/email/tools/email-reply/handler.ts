@@ -237,6 +237,8 @@ export class EmailReplyHandler implements ToolHandler {
         channel: 'email',
         to: replyTo,
         ...(additionalTo ? { additionalTo } : {}),
+        // These people never wrote to us: no known-tier contact for them (#2273, ADR-047).
+        ...(!recipientSet.toIsOriginalSender ? { toFromOwnMessage: true } : {}),
         subject: replySubject,
         body,
         replyToMessageId,

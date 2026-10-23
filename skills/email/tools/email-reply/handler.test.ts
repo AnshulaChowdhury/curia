@@ -196,8 +196,18 @@ describe('EmailReplyHandler', () => {
           }),
         }),
       );
-      const options = (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mock.calls[0]![1] as Record<string, unknown>;
+      const [request, options] = (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mock.calls[0]! as [Record<string, unknown>, Record<string, unknown>];
       expect(options).not.toHaveProperty('recipientSource');
+      // These people never wrote to us: the gateway must not create known-tier contacts for them.
+      expect(request.toFromOwnMessage).toBe(true);
+    });
+
+    it('does not mark a reply to someone who wrote to us', async () => {
+      const ctx = makeCtx({ reply_to_message_id: 'nylas-msg-1', body: 'Thanks!' });
+      (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'reply-1' });
+      await handler.execute(ctx);
+      const request = (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mock.calls[0]![0] as Record<string, unknown>;
+      expect(request).not.toHaveProperty('toFromOwnMessage');
     });
 
     it('refuses when Curia sent the original only to its own mailboxes', async () => {

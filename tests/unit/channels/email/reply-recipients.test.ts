@@ -60,6 +60,25 @@ describe('deriveEmailReplyRecipientSet', () => {
     });
   });
 
+  it('explicit CC list drops owned mailboxes and addresses already on To', () => {
+    expect(deriveEmailReplyRecipientSet({
+      ...original,
+      ccInput: 'curia+x@example.com, ALICE@example.com, a@example.com, a@example.com',
+    })).toEqual({
+      to: 'alice@example.com',
+      additionalTo: [],
+      cc: ['a@example.com'],
+      toIsOriginalSender: true,
+    });
+  });
+
+  it('explicit CC list leaves a reference such as principal for Gate C to resolve', () => {
+    expect(deriveEmailReplyRecipientSet({
+      ...original,
+      ccInput: 'principal',
+    })?.cc).toEqual(['principal']);
+  });
+
   it('reply-all dedupes case-insensitively across fields and preserves first-seen order', () => {
     expect(deriveEmailReplyRecipientSet({
       originalFrom: 'alice@example.com',
@@ -127,6 +146,16 @@ describe('deriveEmailReplyRecipientSet', () => {
         cc: [],
         toIsOriginalSender: false,
       });
+    });
+
+    it('sender-only and an explicit list do not fall back to the CC\'d people', () => {
+      const onlyOwnedTo = {
+        ...ours,
+        originalTo: [{ email: 'ops@example.com' }],
+        originalCc: [{ email: 'carol@example.com' }],
+      };
+      expect(deriveEmailReplyRecipientSet({ ...onlyOwnedTo, ccInput: '' })).toBeNull();
+      expect(deriveEmailReplyRecipientSet({ ...onlyOwnedTo, ccInput: 'dave@example.com' })).toBeNull();
     });
 
     it('returns null when no recipient outside the owned mailboxes remains', () => {

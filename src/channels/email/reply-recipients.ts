@@ -8,7 +8,10 @@
 // Reply-all keeps everyone on the field they were on (#2273):
 //   - received message: To = sender + the original's other To; CC = original CC.
 //   - message Curia sent: To = the original's To; CC = original CC. A reply goes
-//     to the people Curia wrote to, never back to Curia.
+//     to the people Curia wrote to, never back to Curia. If that To held only
+//     owned mailboxes, the original's CC moves to To.
+// Sender-only and an explicit list keep To as the sender (or, for a message
+// Curia sent, the original's To) and take CC from the caller.
 // Owned mailboxes are dropped from every field.
 
 import { normalizeMailbox } from './reply-recipient-provenance.js';
@@ -94,22 +97,24 @@ export function deriveEmailReplyRecipientSet(opts: {
     toList = take([originalFrom, ...(replyAll ? originalTo : [])]);
     if (replyAll) ccFromOriginal = take(originalCc);
   } else {
-    // Curia sent it: the people it was addressed to. When its To held only owned
-    // mailboxes, the CC'd people are who it was really for.
+    // Curia sent it: the people it was addressed to. On reply-all, when its To
+    // held only owned mailboxes, the CC'd people are who it was really for. The
+    // other modes take CC from the caller only, so they get null instead.
     toList = take(originalTo);
-    if (toList.length === 0) {
-      toList = take(originalCc);
-    } else if (replyAll) {
-      ccFromOriginal = take(originalCc);
+    if (replyAll) {
+      if (toList.length === 0) toList = take(originalCc);
+      else ccFromOriginal = take(originalCc);
     }
   }
 
   const [to, ...additionalTo] = toList;
   if (!to) return null;
 
-  // Explicit list: parsed as written. Sender-only (""): no CC.
+  // Explicit list: as written, minus owned mailboxes and addresses already on To.
+  // A reference such as `principal` passes through for Gate C to resolve.
+  // Sender-only (""): no CC.
   const cc = typeof ccInput === 'string'
-    ? ccInput.split(',').map((addr) => addr.trim()).filter((addr) => addr.length > 0)
+    ? take(ccInput.split(',').map((addr) => addr.trim()).filter((addr) => addr.length > 0))
     : ccFromOriginal;
 
   return { to, additionalTo, cc, toIsOriginalSender };

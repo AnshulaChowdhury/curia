@@ -722,7 +722,8 @@ describe('email-reply cc by reference (#2131)', () => {
       fromVendor,
     );
     expect(result.success).toBe(true);
-    expect(delivered(h)).toEqual(['vendor@thread.example', 'vendor@thread.example']);
+    // The sender is already on To, so the explicit CC drops the duplicate (#2273).
+    expect(delivered(h)).toEqual(['vendor@thread.example']);
     const decision = bus.publish.mock.calls
       .map(([, event]) => event as { type: string; payload: { gate?: string; decision?: string } })
       .find((event) => event.type === 'authorization.decision' && event.payload.gate === 'gate_c');

@@ -150,6 +150,14 @@ describe('resolveEmailReplyRecipients', () => {
     )).resolves.toEqual(['alice@example.com']);
   });
 
+  it('explicit cc "principal" reaches Gate C unresolved', async () => {
+    const fetchMessage = vi.fn().mockResolvedValue(thread);
+    await expect(resolveEmailReplyRecipients(
+      { reply_to_message_id: 'msg-1', body: 'hi', cc: 'principal' },
+      { fetchMessage, selfEmails: ['curia@example.com'] },
+    )).resolves.toEqual(['alice@example.com', 'principal']);
+  });
+
   it('fails closed when reply_to_message_id is missing', async () => {
     const fetchMessage = vi.fn();
     await expect(resolveEmailReplyRecipients(
