@@ -460,10 +460,17 @@ reconsidered for voice.
 
 Production first speech must stay at **p50 under 1 s** (spike: ~660 ms at `none`). Above
 that, put `channels.voice.model` back to `claude-haiku-4-5` while it is still served.
+- **Measured on `llm_ttft_ms`** (`voice llm first token`): turn start to first text delta,
+  the span the spike measured, so the two are comparable.
+- **`voice.ttfa_ms` is recorded beside it** (`voice time-to-first-audio`). It is what the
+  caller hears: prompt assembly, the model, sentence chunking and TTS. Its gap over
+  `llm_ttft_ms` is not the model's, so it is not the gate. A large gap is a reason to look
+  at chunking and TTS rather than the model.
+- Both logged at `debug` before #2245, so there is no Haiku 4.5 production baseline.
 
 ### Production check
 
 Measured after curia-deploy moved `channels.voice.model` (startup log `Voice runtime
 constructed` naming `claude-haiku-5-5`), over at least 5 calls:
 
-_Pending deploy: fill in calls, first-speech p50 / p90, and the date._
+_Pending deploy: fill in calls, `llm_ttft_ms` and `voice.ttfa_ms` p50 / p90, and the date._

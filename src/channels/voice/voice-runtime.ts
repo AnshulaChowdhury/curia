@@ -813,7 +813,8 @@ export class VoiceRuntime {
         onFirstAudio: () => {
           if (ttfaRecorded) return;
           ttfaRecorded = true;
-          this.log.debug(
+          // info: what the caller hears, logged beside llm_ttft_ms for ADR-038's check (#2245).
+          this.log.info(
             { sessionId: session.sessionId, [opts.ttfaLogKey]: Date.now() - turnStartedAt },
             opts.ttfaLogMessage,
           );
