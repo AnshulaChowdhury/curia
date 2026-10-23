@@ -10,9 +10,13 @@ set -e
 docker-entrypoint.sh "$@" &
 PG_PID=$!
 
-# This script is PID 1 in the container, so docker stop sends SIGTERM here,
-# not to Postgres. Forward termination signals to ensure clean DB shutdown.
-trap 'kill -TERM "$PG_PID"' TERM INT
+# This script is PID 1 in the container, so a stop signal comes here, not to
+# Postgres. Forward each signal unchanged, because Postgres gives each one a
+# different shutdown mode: docker stop sends the image's STOPSIGNAL, SIGINT, which
+# is a "fast" shutdown. SIGTERM is a "smart" shutdown, which waits for every client
+# to disconnect and so outlasts Docker's stop timeout while Curia is connected.
+trap 'kill -TERM "$PG_PID"' TERM
+trap 'kill -INT "$PG_PID"' INT
 trap 'kill -QUIT "$PG_PID"' QUIT
 
 # Wait for the REAL server over TCP — never the temporary init server (curia#1350).
@@ -73,5 +77,13 @@ SQL
 
 echo "pgAudit verification passed"
 
-# Bring Postgres back to foreground
-wait $PG_PID
+# Bring Postgres back to foreground. A trapped signal makes `wait` return as soon as
+# the trap runs, while Postgres is still shutting down. If this script exited then,
+# the container would stop and kill Postgres mid-shutdown, so wait again until
+# Postgres has exited.
+while :; do
+  status=0
+  wait "$PG_PID" || status=$?
+  kill -0 "$PG_PID" 2>/dev/null || break
+done
+exit "$status"
