@@ -298,6 +298,7 @@ const EMAIL_CC_PRINCIPAL = [
   'this thread, where third parties would see the question.',
   'When they hand you a meeting to set up, offer the other person specific times from the',
   'principal\'s calendar, in the window and format they gave; don\'t ask for their availability.',
+  'If the other person shared a booking page, book through it instead (the booking-link note).',
 ];
 
 /** Any inbound email turn. */
