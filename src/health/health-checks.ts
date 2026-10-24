@@ -187,6 +187,10 @@ export function checkBus(bus: EventBus): CheckResult {
  * startedAt), a null lastSuccessfulPollAt is acceptable — the first poll may not have
  * completed yet. Outside the grace window, a null value is a stall.
  *
+ * The adapter stamps lastSuccessfulPollAt when the Nylas fetch and handoff finish,
+ * not when the agent turn finishes (#2254). A long turn does not fail this check;
+ * a poll that stops succeeding does.
+ *
  * @param adapter      The email adapter to probe, or undefined when not configured.
  * @param emailStallFactor  Multiplier on pollingIntervalMs to derive the stall threshold.
  * @param startedAt    When the process started — used as the grace period anchor.

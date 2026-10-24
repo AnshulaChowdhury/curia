@@ -24,6 +24,7 @@ import {
   createChannelStalled,
   createChannelDisconnected,
   createChannelReconnect,
+  type InboundMessageEvent,
   type OutboundMessageEvent,
   type OutboundNotificationEvent,
 } from '../../bus/events.js';
@@ -35,6 +36,26 @@ import type { Channel } from '../channel.js';
 // When the agent's response plus the quoted original would exceed this, the quote
 // is silently dropped so the reply still sends.
 const MAX_REPLY_BODY_LENGTH = 50_000;
+
+/**
+ * Default cap on email-triggered agent turns in flight per account (#2254).
+ * Headroom above a short burst of distinct threads; a flood cannot open an
+ * unbounded set of coordinator turns. Same-thread mail stays serial regardless.
+ */
+const DEFAULT_MAX_CONCURRENT_TURNS = 4;
+
+/** One inbound message accepted by the poll and waiting on or in publish. */
+interface QueuedInboundEmail {
+  event: InboundMessageEvent;
+  messageId: string;
+  threadId: string;
+  /** From address as on the message; absent when the sender was missing. */
+  senderEmail: string | undefined;
+  /** Converter sender id (`unknown` when From was missing). */
+  senderId: string;
+  subject: string;
+  senderVerified: boolean;
+}
 
 // KG namespace and key pattern for persisting the poll high-water mark.
 const POLL_STATE_NAMESPACE = 'system:email-poll-state';
@@ -79,6 +100,12 @@ export interface EmailAdapterConfig {
    */
   contactCreationMaxPerHour: number;
   /**
+   * Max inbound turns publishing at once for this account (#2254).
+   * Messages on one thread stay strictly ordered and never run together.
+   * Further threads wait for a free slot. Default: 4.
+   */
+  maxConcurrentTurns?: number;
+  /**
    * IANA timezone (e.g. "America/Toronto") used when rendering the Date line in
    * appended reply quotes. Sourced from the global `TIMEZONE` env var to match
    * the timezone the skills receive via ToolContext.
@@ -108,7 +135,27 @@ export class EmailAdapter implements Channel {
   // by a single repeating interval rather than per-poll re-scheduling.
   private pollTimer?: ReturnType<typeof setInterval>;
   private lastSeenTimestamp: number = 0;
+  /**
+   * Overlap guard for the Nylas fetch and pre-publish work only. Inbound turns
+   * run on the detached runner below (#2254), so a long coordinator turn must
+   * not skip the next poll.
+   */
   private processing = false;
+  private readonly maxConcurrentTurns: number;
+  /** Publishes that have been handed off and have not settled. */
+  private inFlightTurns = 0;
+  /** Settling handles so tests can wait out a detached publish. */
+  private inFlightRuns = new Set<Promise<void>>();
+  /** conversationId → messages waiting to publish, in encounter order. */
+  private readonly pendingByThread = new Map<string, QueuedInboundEmail[]>();
+  /** conversationIds whose publish is in flight. At most one each (#2018). */
+  private readonly runningThreads = new Set<string>();
+  /**
+   * Threads that have a queued head and no free slot, oldest first.
+   * A thread that just finished goes to the back, so one busy thread cannot
+   * hold the only slot while other threads wait.
+   */
+  private slotWaiters: string[] = [];
   /** True between start() and stop() — outbound-queue readiness (#1380). */
   private running = false;
 
@@ -119,7 +166,10 @@ export class EmailAdapter implements Channel {
 
   /** Epoch ms when the adapter was started — used to compute initial stall window. */
   private startedAt: number | null = null;
-  /** Epoch ms of the most recent poll cycle that reached completion (no throw). */
+  /**
+   * Epoch ms of the most recent poll whose Nylas fetch succeeded.
+   * Stamped when the fetch and handoff finish, not when agent turns finish (#2254).
+   */
   private _lastSuccessfulPollAt: number | null = null;
   /** True once channel.stalled has been successfully published this lifecycle. */
   private stalledEmitted = false;
@@ -160,6 +210,13 @@ export class EmailAdapter implements Channel {
 
   constructor(config: EmailAdapterConfig) {
     this.config = config;
+    const maxConcurrentTurns = config.maxConcurrentTurns ?? DEFAULT_MAX_CONCURRENT_TURNS;
+    if (!Number.isInteger(maxConcurrentTurns) || maxConcurrentTurns < 1) {
+      throw new Error(
+        `email maxConcurrentTurns must be a positive integer, got: ${String(maxConcurrentTurns)}`,
+      );
+    }
+    this.maxConcurrentTurns = maxConcurrentTurns;
   }
 
   // ── Public health-probe getters ──────────────────────────────────────────
@@ -178,6 +235,18 @@ export class EmailAdapter implements Channel {
   /** Polling interval in ms — used by the health probe to compute the stall threshold. */
   get pollingIntervalMs(): number {
     return this.config.pollingIntervalMs;
+  }
+
+  /**
+   * Resolves when every detached inbound publish has settled.
+   *
+   * Test-only. `stop()` does not call this: a hung agent turn would block
+   * shutdown. The poll promise is not that wait (#2254).
+   */
+  async drainInFlight(): Promise<void> {
+    while (this.inFlightRuns.size > 0) {
+      await Promise.allSettled([...this.inFlightRuns]);
+    }
   }
 
   isOutboundReady(): boolean {
@@ -354,8 +423,9 @@ export class EmailAdapter implements Channel {
   }
 
   private async poll(): Promise<void> {
-    // Guard against overlapping polls — if a previous poll is still running
-    // (e.g. slow Nylas response or many messages to process), skip this cycle.
+    // Guard against overlapping fetches. A previous poll still inside Nylas or
+    // pre-publish work skips this cycle. An in-flight agent turn does not —
+    // those run on the detached runner and must not stall the inbox (#2254).
     if (this.processing) return;
     this.processing = true;
 
@@ -504,7 +574,10 @@ export class EmailAdapter implements Channel {
             maxLength: 60_000,
           });
 
-          // Publish inbound message to the bus.
+          // Hand the message to the runner. publish runs the agent turn inline,
+          // so the poll must not await it (#2254). The watermark already advanced
+          // above; a later publish rejection is logged on the detached promise
+          // and is not retried.
           const event = createInboundMessage({
             conversationId: converted.conversationId,
             channelId: converted.channelId,
@@ -515,23 +588,16 @@ export class EmailAdapter implements Channel {
               ...(converted.metadata as unknown as Record<string, unknown>),
             },
           });
-          await this.config.bus.publish('channel', event);
+          this.enqueueInbound({
+            event,
+            messageId: msg.id,
+            threadId: msg.threadId,
+            senderEmail: fromEmail,
+            senderId: converted.senderId,
+            subject: msg.subject,
+            senderVerified: converted.metadata.senderVerified,
+          });
           processed++;
-
-          // Warn when the provider's SPF/DKIM/DMARC checks did not all pass.
-          // This is an audit signal — the message is still processed, but the
-          // Coordinator's system prompt instructs it to apply extra skepticism.
-          if (!converted.metadata.senderVerified) {
-            this.config.logger.warn(
-              { senderEmail: converted.senderId, messageId: msg.id },
-              'Email received with senderVerified: false — SPF/DKIM/DMARC did not all pass or headers were absent',
-            );
-          }
-
-          this.config.logger.info(
-            { senderEmail: converted.senderId, subject: msg.subject, threadId: msg.threadId, senderVerified: converted.metadata.senderVerified },
-            'Email received and published to bus',
-          );
         } catch (err) {
           // Log and skip — the high-water mark was already advanced above,
           // so this message will not be retried on the next poll cycle.
@@ -547,6 +613,8 @@ export class EmailAdapter implements Channel {
     }
 
     // ── Post-poll accounting (only reached when listEmailMessages succeeded) ──
+    // Stamped when the fetch and handoff finish. A coordinator turn still
+    // running on the detached runner must not age this out (#2254).
 
     this._lastSuccessfulPollAt = Date.now();
 
@@ -595,6 +663,137 @@ export class EmailAdapter implements Channel {
         );
       }
     }
+  }
+
+  /**
+   * Accept one inbound message. Starts its publish when the thread is idle and
+   * a slot is free; otherwise queues it. Same-thread messages stay in encounter
+   * order and never publish concurrently (#2018, #2254).
+   */
+  private enqueueInbound(item: QueuedInboundEmail): void {
+    const conversationId = item.event.payload.conversationId;
+    const queue = this.pendingByThread.get(conversationId);
+    if (queue) {
+      queue.push(item);
+      if (this.runningThreads.has(conversationId)) {
+        this.config.logger.debug(
+          { accountId: this.config.accountId, messageId: item.messageId, threadId: item.threadId },
+          'Email adapter: inbound message queued behind the in-flight turn on this thread',
+        );
+      }
+    } else {
+      this.pendingByThread.set(conversationId, [item]);
+    }
+    this.scheduleThread(conversationId);
+  }
+
+  private scheduleThread(conversationId: string): void {
+    if (this.runningThreads.has(conversationId)) return;
+    const queue = this.pendingByThread.get(conversationId);
+    if (!queue || queue.length === 0) return;
+    if (this.inFlightTurns >= this.maxConcurrentTurns) {
+      if (!this.slotWaiters.includes(conversationId)) {
+        this.slotWaiters.push(conversationId);
+        const head = queue[0];
+        this.config.logger.info(
+          {
+            accountId: this.config.accountId,
+            messageId: head?.messageId,
+            threadId: head?.threadId,
+            inFlight: this.inFlightTurns,
+            maxConcurrentTurns: this.maxConcurrentTurns,
+          },
+          'Email adapter: in-flight cap reached; inbound message queued',
+        );
+      }
+      return;
+    }
+    this.startThread(conversationId);
+  }
+
+  private startThread(conversationId: string): void {
+    this.slotWaiters = this.slotWaiters.filter((id) => id !== conversationId);
+    const queue = this.pendingByThread.get(conversationId);
+    const item = queue?.shift();
+    if (!queue || !item) {
+      this.pendingByThread.delete(conversationId);
+      return;
+    }
+    if (queue.length === 0) this.pendingByThread.delete(conversationId);
+
+    this.runningThreads.add(conversationId);
+    this.inFlightTurns += 1;
+
+    let run!: Promise<void>;
+    try {
+      run = this.config.bus.publish('channel', item.event)
+        .then(() => {
+          this.logInboundPublished(item);
+        })
+        .catch((err: unknown) => {
+          this.logInboundFailure(err, item);
+        })
+        .finally(() => {
+          this.runningThreads.delete(conversationId);
+          this.inFlightTurns -= 1;
+          this.inFlightRuns.delete(run);
+          // Behind threads that were already waiting on the cap, so a burst on
+          // one thread does not keep every other thread queued.
+          if (this.pendingByThread.has(conversationId) && !this.slotWaiters.includes(conversationId)) {
+            this.slotWaiters.push(conversationId);
+          }
+          this.drainSlotWaiters();
+        });
+    } catch (err) {
+      this.runningThreads.delete(conversationId);
+      this.inFlightTurns -= 1;
+      this.logInboundFailure(err, item);
+      if (this.pendingByThread.has(conversationId) && !this.slotWaiters.includes(conversationId)) {
+        this.slotWaiters.push(conversationId);
+      }
+      this.drainSlotWaiters();
+      return;
+    }
+    this.inFlightRuns.add(run);
+  }
+
+  private drainSlotWaiters(): void {
+    while (this.inFlightTurns < this.maxConcurrentTurns && this.slotWaiters.length > 0) {
+      const conversationId = this.slotWaiters.shift();
+      if (conversationId === undefined) break;
+      if (this.runningThreads.has(conversationId)) continue;
+      if (!this.pendingByThread.has(conversationId)) continue;
+      this.startThread(conversationId);
+    }
+  }
+
+  private logInboundPublished(item: QueuedInboundEmail): void {
+    // Warn when the provider's SPF/DKIM/DMARC checks did not all pass.
+    // The message was still published; the Coordinator's system prompt tells
+    // it to apply extra skepticism.
+    if (!item.senderVerified) {
+      this.config.logger.warn(
+        { senderEmail: item.senderId, messageId: item.messageId },
+        'Email received with senderVerified: false — SPF/DKIM/DMARC did not all pass or headers were absent',
+      );
+    }
+    this.config.logger.info(
+      {
+        senderEmail: item.senderId,
+        subject: item.subject,
+        threadId: item.threadId,
+        senderVerified: item.senderVerified,
+      },
+      'Email received and published to bus',
+    );
+  }
+
+  private logInboundFailure(err: unknown, item: QueuedInboundEmail): void {
+    // The high-water mark already advanced, so this message is not retried.
+    this.config.logger.error(
+      { err, messageId: item.messageId, threadId: item.threadId, senderEmail: item.senderEmail },
+      'Failed to process inbound email — skipping message',
+    );
   }
 
   /**

@@ -478,6 +478,13 @@ export interface YamlConfig {
       /** Slack channel ids (C…) where @mentions are accepted. Empty/absent = all. */
       allowed_channel_ids?: string[];
     };
+    email?: {
+      /**
+       * Max inbound email turns in flight per account. Same-thread messages stay
+       * serial; further threads wait for a slot. Default: 4 (#2254).
+       */
+      max_concurrent_turns?: number;
+    };
     voice?: {
       /** Optional concrete model override for voice turns. Empty/absent = fast tier. */
       model?: string;
@@ -1545,6 +1552,21 @@ export function loadYamlConfig(configDir: string): YamlConfig {
       if (value !== undefined && (typeof value !== 'number' || !Number.isInteger(value) || value < 1)) {
         throw new Error(`verification.${key} must be a positive integer, got: ${String(value)}`);
       }
+    }
+  }
+
+  // Validate channels.email if present. A zero cap would queue every inbound
+  // message forever; a fraction is not a slot count (#2254).
+  const emailChannel = config.channels?.email;
+  if (emailChannel !== undefined) {
+    if (typeof emailChannel !== 'object' || emailChannel === null || Array.isArray(emailChannel)) {
+      throw new Error('channels.email must be a YAML mapping');
+    }
+    const maxConcurrentTurns = emailChannel.max_concurrent_turns;
+    if (maxConcurrentTurns !== undefined && (!Number.isInteger(maxConcurrentTurns) || maxConcurrentTurns < 1)) {
+      throw new Error(
+        `channels.email.max_concurrent_turns must be a positive integer, got: ${String(maxConcurrentTurns)}`,
+      );
     }
   }
 

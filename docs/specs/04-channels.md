@@ -86,9 +86,9 @@ Channels are not started merely by being configured — like skills and agents, 
 Interactive terminal for local dev and testing. Reads from stdin, writes to stdout. Simplest adapter — useful for testing agent logic without external services. **Non-toggleable** (`isToggleable: false`): always starts, cannot be disabled.
 
 ### Email (via Nylas API)
-- **Inbound:** Polls Nylas Messages API at configurable interval (default: 30s)
+- **Inbound:** Polls Nylas Messages API at configurable interval (default: 30s). The poll fetches, filters, and hands each inbound message to a bounded runner, then returns; it does not wait for the agent turn (#2254). One turn runs per thread, in arrival order. Further threads wait once `channels.email.max_concurrent_turns` (default 4) turns are already in flight.
 - **Poll high-water mark (resilience):** the adapter persists its `lastSeenTimestamp` high-water mark via `ConfigStore` (namespace `system:email-poll-state`, key `<accountId>.last_seen_at`) so restarts resume where they left off. This watermark is **code-managed, not LLM-managed**.
-- **Poll observability:** a `channel.poll` audit event is emitted once per poll cycle. A watchdog emits a `channel.stalled` audit event (at most once per adapter lifecycle) when no successful poll completes within `5 × pollingIntervalMs`.
+- **Poll observability:** a `channel.poll` audit event is emitted once per poll cycle when the fetch and handoff finish, not when the agent turn finishes. `processed` counts messages handed to the runner (`fetched = processed + sum(skipped)`). A watchdog emits a `channel.stalled` audit event (at most once per adapter lifecycle) when no successful poll completes within `5 × pollingIntervalMs`.
 - **Outbound:** Sends via Nylas Send API
 - **Conversation ID:** derived from Nylas thread ID (`email:<threadId>`)
 - **Participant extraction:** From/To/CC addresses are extracted and auto-create contacts

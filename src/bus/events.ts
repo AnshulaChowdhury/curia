@@ -1876,7 +1876,11 @@ interface ChannelPollPayload {
   channel: 'email';
   /** Number of messages returned by Nylas (before any filtering). */
   fetched: number;
-  /** Messages that reached bus.publish('channel', inbound.message). */
+  /**
+   * Messages handed to the inbound runner this cycle. Publish is not awaited;
+   * a later rejection is logged and stays in this count (#2254).
+   * `fetched = processed + sum(skipped)`.
+   */
   processed: number;
   /** Per-filter skip breakdown. */
   skipped: {
@@ -1884,12 +1888,12 @@ interface ChannelPollPayload {
     recently_sent: number;
     self: number;
     excluded: number;
-    /** Messages that threw during per-message processing. */
+    /** Messages that threw before handoff (conversion, contact extraction). */
     failed: number;
   };
   /** High-water mark value (epoch seconds) after this poll cycle. */
   lastSeenAt: number;
-  /** Wall-clock duration of the poll cycle in milliseconds. */
+  /** Wall-clock time from fetch start through handoff, in milliseconds. Not the agent turn (#2254). */
   durationMs: number;
 }
 
