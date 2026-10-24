@@ -1,11 +1,12 @@
 {
   "name": "ceo-inbox-download-attachment",
-  "description": "Download an email attachment from the principal's personal inbox by its Nylas attachment ID. Returns the file content ready to pass to file-parse: when temporary-file storage succeeds the output provides a temporary file reference (temp_file_url) instead of content_base64; otherwise it returns base64-encoded content_base64. Use ceo-inbox-read first to find attachment IDs. Enforces a 10 MB size limit.",
-  "version": "0.1.2",
+  "description": "Download an email attachment from the principal's personal inbox. Prefer passing filename (short, readable) from ceo-inbox-read's attachments array — Nylas attachment IDs are long opaque strings that are easy to mistype. attachment_id still works for an exact match. Returns the file content ready to pass to file-parse: when temporary-file storage succeeds the output provides a temporary file reference (temp_file_url) instead of content_base64; otherwise it returns base64-encoded content_base64. Enforces a 10 MB size limit.",
+  "version": "0.2.0",
   "sensitivity": "normal",
   "action_risk": "low",
   "inputs": {
-    "attachment_id": "string (Nylas attachment ID from ceo-inbox-read's attachments array)",
+    "attachment_id": "string? (Nylas attachment ID from ceo-inbox-read's attachments array — optional when filename is provided; long IDs are often mistyped, so prefer filename)",
+    "filename": "string? (exact attachment filename from ceo-inbox-read — preferred over attachment_id; must be unique on the message)",
     "message_id": "string (Nylas message ID the attachment belongs to)"
   },
   "outputs": {
@@ -13,7 +14,8 @@
     "content_base64": "string | undefined (base64-encoded file content — only included when temp_file_url is unavailable, to avoid exceeding the skill output size limit)",
     "filename": "string (original attachment filename)",
     "content_type": "string (MIME type, e.g. 'application/pdf')",
-    "size": "number (actual byte count after download)"
+    "size": "number (actual byte count after download)",
+    "resolved_by": "string (how the attachment was selected: 'id' | 'filename' | 'sole_attachment')"
   },
   "permissions": [],
   "secrets": ["nylas_api_key", "ceo_nylas_grant_id"],

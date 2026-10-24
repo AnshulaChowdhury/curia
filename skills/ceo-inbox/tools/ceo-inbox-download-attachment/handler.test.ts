@@ -8,10 +8,12 @@ import type { Logger } from '../../../../src/logger.js';
 function buildCtx(overrides: Partial<{
   attachment_id: string;
   message_id: string;
+  filename: string;
 }> = {}): ToolContext {
   const input: Record<string, unknown> = {};
   if ('attachment_id' in overrides) input.attachment_id = overrides.attachment_id;
   if ('message_id' in overrides) input.message_id = overrides.message_id;
+  if ('filename' in overrides) input.filename = overrides.filename;
 
   return {
     toolName: 'ceo-inbox-download-attachment',
@@ -83,9 +85,9 @@ describe('CeoInboxDownloadAttachmentHandler', () => {
     mockFetch.mockRestore();
   });
 
-  // ── 1. Missing attachment_id ─────────────────────────────────────────────
+  // ── 1. Missing attachment_id and filename ────────────────────────────────
 
-  it('returns error when attachment_id is missing', async () => {
+  it('returns error when both attachment_id and filename are missing', async () => {
     const ctx = buildCtx({ message_id: MSG_ID });
     // fetch should never be called for a validation error
     mockFetch.mockImplementation(async () => {
@@ -96,7 +98,7 @@ describe('CeoInboxDownloadAttachmentHandler', () => {
 
     expect(result.success).toBe(false);
     if (!result.success) {
-      expect(result.error).toMatch(/attachment_id/i);
+      expect(result.error).toMatch(/attachment_id or filename/i);
     }
     expect(mockFetch).not.toHaveBeenCalled();
   });
@@ -138,12 +140,12 @@ describe('CeoInboxDownloadAttachmentHandler', () => {
     }
   });
 
-  // ── 4. Attachment ID not found on message ────────────────────────────────
+  // ── 4. Attachment ID not found on multi-attachment message ───────────────
 
-  it('returns error when attachment ID is not found on the message', async () => {
+  it('returns error listing attachments when ID misses on a multi-attachment message', async () => {
     const messageResponse = buildMessageResponse([
-      // A different attachment — the requested ATT_ID is absent
       { id: 'att-other', filename: 'other.pdf', content_type: 'application/pdf', size: 1000 },
+      { id: 'att-third', filename: 'third.pdf', content_type: 'application/pdf', size: 2000 },
     ]);
 
     mockFetch.mockImplementation(async (url: Parameters<typeof fetch>[0]) => {
@@ -159,8 +161,10 @@ describe('CeoInboxDownloadAttachmentHandler', () => {
 
     expect(result.success).toBe(false);
     if (!result.success) {
-      // Error should mention the attachment and/or message IDs
       expect(result.error).toContain(ATT_ID);
+      expect(result.error).toContain('other.pdf');
+      expect(result.error).toContain('third.pdf');
+      expect(result.error).toContain('att-other');
     }
     // The download endpoint should never be called
     expect(mockFetch.mock.calls.every((c: Parameters<typeof fetch>) => !String(c[0]).includes('/attachments/'))).toBe(true);
@@ -288,14 +292,94 @@ describe('CeoInboxDownloadAttachmentHandler', () => {
         filename: string;
         content_type: string;
         size: number;
+        resolved_by: string;
       };
       // Verify all expected fields are present
       expect(data.filename).toBe(FILENAME);
       expect(data.content_type).toBe(CONTENT_TYPE);
       expect(data.size).toBe(fileBytes.length);
+      expect(data.resolved_by).toBe('id');
       // Verify base64 round-trips to the original bytes
       const decoded = Buffer.from(data.content_base64, 'base64');
       expect(decoded.equals(fileBytes)).toBe(true);
     }
+  });
+
+  // ── 9. Corrupted ID + sole attachment (2026-10-24 incident fixture) ─────
+
+  it('downloads via sole_attachment when the ID is the 2026-10-24 corrupted fixture', async () => {
+    const realId =
+      'v0:Z29vZ2xlLmNvbSFqb3NlcGhmdW5nLmNhITE3OTI3MTM2MDAhMTc5Mjc5OTk5OS56aXA=:YXBwbGljYXRpb24vemlwOyBuYW1lPSJnb29nbGUuY29tIWpvc2VwaGZ1bmcuY2EhMTc5MjcxMzYwMCExNzkyNzk5OTk5LnppcCI=:814';
+    const corruptedId =
+      'v0:Z29vZ2xlLmNvbSFqb3NlcGhmdW5nLmNhITE3OTI3MTM2MDAhMTc5Mjc5OTk5OS56aXA=:YXBwbGljYXRpb24venppcDsgnamePSJnb29nbGUuY29tIWpvc2VwaGZ1bmcuY2EhMTc5MjcxMzYwMCExNzkyNzk5OTk5LnppcCI=:814';
+    const dmarcFilename = 'google.com!josephfung.ca!1792713600!1792799999.zip';
+    const fileBytes = Buffer.from('PK\x03\x04dmarc');
+    const messageResponse = buildMessageResponse([
+      {
+        id: realId,
+        filename: dmarcFilename,
+        content_type: 'application/zip; name="' + dmarcFilename + '"',
+        size: fileBytes.length,
+      },
+    ]);
+
+    mockFetch.mockImplementation(async (url: Parameters<typeof fetch>[0]) => {
+      const urlStr = String(url);
+      if (urlStr.includes(`/messages/${MSG_ID}`)) {
+        return new Response(JSON.stringify(messageResponse), { status: 200 });
+      }
+      if (urlStr.includes(`/attachments/${encodeURIComponent(realId)}/download`)) {
+        return new Response(fileBytes, { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${urlStr}`);
+    });
+
+    const ctx = buildCtx({ attachment_id: corruptedId, message_id: MSG_ID });
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const data = result.data as { resolved_by: string; filename: string };
+      expect(data.resolved_by).toBe('sole_attachment');
+      expect(data.filename).toBe(dmarcFilename);
+    }
+    expect(ctx.log.warn).toHaveBeenCalled();
+  });
+
+  // ── 10. Filename match on multi-attachment message ───────────────────────
+
+  it('downloads via filename when ID is wrong on a multi-attachment message', async () => {
+    const fileBytes = Buffer.from('wanted-pdf');
+    const messageResponse = buildMessageResponse([
+      { id: 'att-a', filename: FILENAME, content_type: CONTENT_TYPE, size: fileBytes.length },
+      { id: 'att-b', filename: 'other.pdf', content_type: CONTENT_TYPE, size: 50 },
+    ]);
+
+    mockFetch.mockImplementation(async (url: Parameters<typeof fetch>[0]) => {
+      const urlStr = String(url);
+      if (urlStr.includes(`/messages/${MSG_ID}`)) {
+        return new Response(JSON.stringify(messageResponse), { status: 200 });
+      }
+      if (urlStr.includes('/attachments/att-a/download')) {
+        return new Response(fileBytes, { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${urlStr}`);
+    });
+
+    const ctx = buildCtx({
+      attachment_id: 'wrong-id',
+      filename: FILENAME,
+      message_id: MSG_ID,
+    });
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const data = result.data as { resolved_by: string; filename: string; content_base64: string };
+      expect(data.resolved_by).toBe('filename');
+      expect(data.filename).toBe(FILENAME);
+      expect(Buffer.from(data.content_base64, 'base64').equals(fileBytes)).toBe(true);
+    }
+    expect(ctx.log.warn).toHaveBeenCalled();
   });
 });

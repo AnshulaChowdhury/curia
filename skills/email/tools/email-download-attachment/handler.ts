@@ -5,11 +5,13 @@
 //
 // Workflow:
 //   1. Fetch the message to verify the attachment exists and check its size.
-//   2. Enforce a 10 MB cap to prevent large files from consuming excessive memory.
-//   3. Download via outboundGateway.downloadEmailAttachment().
-//   4. Return base64-encoded content plus metadata.
+//   2. Resolve the attachment by ID, filename, or sole-attachment fallback (#2281).
+//   3. Enforce a 10 MB cap to prevent large files from consuming excessive memory.
+//   4. Download via outboundGateway.downloadEmailAttachment().
+//   5. Return base64-encoded content plus metadata.
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
+import { resolveAttachment } from '../../../_shared/resolve-attachment.js';
 import { nylasMessageFailure, validateNylasMessageId } from '../../../../src/channels/email/nylas-message-id.js';
 import { MAX_TEMP_FILE_BYTES } from '../../../../src/skills/temp-file-store.js';
 
@@ -24,22 +26,27 @@ export class EmailDownloadAttachmentHandler implements ToolHandler {
 
     const input =
       ctx.input && typeof ctx.input === 'object' ? (ctx.input as Record<string, unknown>) : {};
-    const { attachment_id: rawAttId, message_id: rawMsgId, account } = input as {
+    const { attachment_id: rawAttId, message_id: rawMsgId, filename: rawFilename, account } = input as {
       attachment_id?: string;
       message_id?: string;
+      filename?: string;
       account?: string;
     };
 
     const attachmentId = typeof rawAttId === 'string' ? rawAttId.trim() : '';
+    const filename = typeof rawFilename === 'string' ? rawFilename.trim() : '';
     const messageId = typeof rawMsgId === 'string' ? rawMsgId.trim() : '';
     const accountId =
       typeof account === 'string' && account.trim() ? account.trim() : undefined;
 
-    if (!attachmentId) {
-      return { success: false, error: 'Missing required input: attachment_id' };
-    }
     if (!messageId) {
       return { success: false, error: 'Missing required input: message_id' };
+    }
+    if (!attachmentId && !filename) {
+      return {
+        success: false,
+        error: 'Missing required input: attachment_id or filename',
+      };
     }
 
     const idError = validateNylasMessageId(messageId);
@@ -57,13 +64,18 @@ export class EmailDownloadAttachmentHandler implements ToolHandler {
       return { success: false, ...nylasMessageFailure(err, messageId, 'Failed to fetch message to verify attachment') };
     }
 
-    const attachment = message.attachments.find((a) => a.id === attachmentId);
-    if (!attachment) {
-      return {
-        success: false,
-        error: `Attachment ${attachmentId} not found on message ${messageId}`,
-      };
+    const resolved = resolveAttachment({
+      attachments: message.attachments,
+      attachmentId,
+      filename,
+      messageId,
+      log: ctx.log,
+      logContext: 'email-download-attachment',
+    });
+    if (!resolved.ok) {
+      return { success: false, error: resolved.error };
     }
+    const { attachment, resolvedBy } = resolved;
 
     if (attachment.size > MAX_TEMP_FILE_BYTES) {
       const sizeMB = (attachment.size / (1024 * 1024)).toFixed(1);
@@ -74,20 +86,26 @@ export class EmailDownloadAttachmentHandler implements ToolHandler {
     }
 
     ctx.log.info(
-      { attachmentId, messageId, filename: attachment.filename, declaredSize: attachment.size },
+      {
+        attachmentId: attachment.id,
+        messageId,
+        filename: attachment.filename,
+        declaredSize: attachment.size,
+        resolvedBy,
+      },
       'email-download-attachment: downloading',
     );
 
     let buffer: Buffer;
     try {
       buffer = await ctx.outboundGateway.downloadEmailAttachment(
-        attachmentId,
+        attachment.id,
         messageId,
         accountId,
       );
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      ctx.log.error({ err, attachmentId, messageId }, 'email-download-attachment: download failed');
+      ctx.log.error({ err, attachmentId: attachment.id, messageId }, 'email-download-attachment: download failed');
       return { success: false, error: `Failed to download attachment "${attachment.filename}": ${detail}` };
     }
 
@@ -96,7 +114,7 @@ export class EmailDownloadAttachmentHandler implements ToolHandler {
     if (buffer.length > MAX_TEMP_FILE_BYTES) {
       const sizeMB = (buffer.length / (1024 * 1024)).toFixed(1);
       ctx.log.warn(
-        { attachmentId, messageId, actualBytes: buffer.length, declaredSize: attachment.size },
+        { attachmentId: attachment.id, messageId, actualBytes: buffer.length, declaredSize: attachment.size },
         'email-download-attachment: actual download size exceeded limit',
       );
       return {
@@ -133,6 +151,7 @@ export class EmailDownloadAttachmentHandler implements ToolHandler {
         filename: attachment.filename,
         content_type: attachment.contentType,
         size: buffer.length,
+        resolved_by: resolvedBy,
         ...(tempFileUrl ? {} : { content_base64: buffer.toString('base64') }),
       },
     };
