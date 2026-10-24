@@ -971,6 +971,8 @@ export class VoiceRuntime {
     let completed = false;
     let spokenForPairing: string | undefined;
     let audioPlayed = false;
+    // A turn that reached a tool may have had side effects, heard or not.
+    let toolInvoked = false;
     try {
       if (!session.markedActive) {
         session.markedActive = true;
@@ -1024,6 +1026,7 @@ export class VoiceRuntime {
         const turnDateResolveTracker = new TurnDateResolveTracker();
         invokeTool = this.toolBridge
           ? async (call: ToolCall) => {
+            toolInvoked = true;
             const result = await this.toolBridge!.invokeTool(call, {
               conversationId: session.conversationId,
               sessionId: session.sessionId,
@@ -1038,6 +1041,7 @@ export class VoiceRuntime {
           }
           : this.config.invokeTool
             ? async (call: ToolCall) => {
+              toolInvoked = true;
               const result = await this.config.invokeTool!(call, {
                 conversationId: session.conversationId,
                 sessionId: session.sessionId,
@@ -1084,7 +1088,11 @@ export class VoiceRuntime {
       this.clearTurnState(session, controller);
       if (!completed) {
         // Only barge-in and endSession abort the controller; endSession sets ending.
-        const cancelledSilently = controller.signal.aborted && !session.ending && !audioPlayed;
+        // A turn that invoked a tool is never joined: rerunning its request in the
+        // next turn could repeat a side effect (a send, a booking). The filler can
+        // finish without a frame, so `audioPlayed` alone does not rule that out.
+        const cancelledSilently =
+          controller.signal.aborted && !session.ending && !audioPlayed && !toolInvoked;
         await this.safePersistIncomplete(opts.persistIncomplete, session, spokenForPairing, cancelledSilently);
       }
     }

@@ -2573,6 +2573,39 @@ describe('VoiceRuntime turn-taking: hold, join, coalesce (#2240)', () => {
     expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 2, bargeInCancels: 1, joinedUtterances: 0 });
   });
 
+  it('never joins a turn that invoked a tool, even when no audio played', async () => {
+    const wm = WorkingMemory.createInMemory();
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'email-send', input: {} }], usage, provenance }],
+      replyScript('Copied Dana.'),
+      replyScript('Copied Dana.'),
+    ]);
+    const invokeTool = vi.fn(async () => {
+      await delay(50);
+      return { content: 'sent' };
+    });
+    // A TTS that yields no frames: the filler finishes without anything heard.
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(0, 1), invokeTool, workingMemory: wm });
+    await start(runtime, 'tool-silent');
+
+    stt.emit({ text: 'email the board the deck', isFinal: true, speechFinal: true });
+    await delay(20);
+    expect(invokeTool).toHaveBeenCalledOnce();
+    stt.emit({ text: 'and cc Dana', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('tool-silent');
+
+    // Joined, the model would see the send request again and could resend it.
+    expect(inboundContents(events)).toEqual(['email the board the deck', 'and cc Dana']);
+    expect(invokeTool).toHaveBeenCalledOnce();
+    const stored = await wm.getHistory('voice:tool-silent', 'coordinator', { raw: true });
+    expect(stored.slice(0, 2)).toEqual([
+      { role: 'user', content: 'email the board the deck' },
+      { role: 'assistant', content: LLM_FAILURE_TURN_CONTENT },
+    ]);
+    await runtime.endSession('tool-silent', 'test');
+    expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 2, bargeInCancels: 1, joinedUtterances: 0 });
+  });
+
   it('drops a pending hold when the session ends', async () => {
     const llm = new FakeStreamProvider([replyScript('Never spoken.')]);
     const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 50 });
