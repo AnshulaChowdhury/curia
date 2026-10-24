@@ -233,8 +233,7 @@ overrides:
   # after a `{ comment }` token. Not a backstop: resolution was 1.10.0, inside that
   # range, so the exposure was live.
   shell-quote: '>=1.11.0'
-  # MED/LOW CVEs from Dependabot, 2026-07-24 (#1518):
-  body-parser: '>=2.3.0'                    # GHSA-v422-hmwv-36x6 (invalid limit disables size enforcement DoS)
+  body-parser: '>=2.4.0'                    # GHSA-27r3-jxmh-p828 (compressed-body DoS)
   # Consumer is @modelcontextprotocol/sdk.
   # Raised off >=2.0.10: that floor admitted 2.0.10-2.1.2, which carry
   # GHSA-rmxm-3fg6-px4f (MED, >=1.19.10 <2.1.3) — the same serveStatic double-decode
