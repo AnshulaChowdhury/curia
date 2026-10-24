@@ -81,6 +81,23 @@ describe('loadScenarioCase', () => {
     expect(c.expectedBehaviors[1]).toEqual({ id: 'silent', description: 'does not answer directly', weight: 'important' });
   });
 
+  it('loads the replies a recipient already sent on an entry (#2261)', () => {
+    const withReplies = VALID.replace(
+      '      delegation_hint: ceo-inbox\n',
+      '      delegation_hint: ceo-inbox\n      recipients: [sam]\n      replies:\n        - { from: sam, content: Thursday works }\n',
+    );
+    const c = loadScenarioCase(write('r.yaml', withReplies));
+    expect(c.seed.outboundContext[0]).toMatchObject({ recipients: ['sam'], replies: [{ from: 'sam', content: 'Thursday works' }] });
+  });
+
+  it('rejects a reply from someone the entry was not sent to (#2261)', () => {
+    const notSent = VALID.replace(
+      '      delegation_hint: ceo-inbox\n',
+      '      delegation_hint: ceo-inbox\n      replies:\n        - { from: sam, content: Thursday works }\n',
+    );
+    expect(() => loadScenarioCase(write('n.yaml', notSent))).toThrow(/replies\[0\]: 'from' must be one of the entry's recipients/);
+  });
+
   it('loads a scheduler inbound (#2024)', () => {
     const c = loadScenarioCase(write('s.yaml', VALID.replace('from: principal', 'from: scheduler')));
     expect(c.inbound).toMatchObject({ from: 'scheduler', content: 'Yes' });

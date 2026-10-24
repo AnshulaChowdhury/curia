@@ -50,6 +50,7 @@ import { PrincipalAcquaintanceCheck } from '../../src/contacts/principal-acquain
  * cases without it never meet this rule (#2227).
  */
 const SCENARIO_ORG_DOMAINS = ['example.test'];
+import { recordedReplyViews } from '../../src/dispatch/outbound-context.js';
 import { formatTaskWakeContent } from '../../src/scheduler/wake-disposition.js';
 import { createTestModeStack, type AutonomyFixture, type OfficeIdentityFixture, type TestModeStack, type TierReasoningOverride } from '../../src/startup/test-mode-stack.js';
 import {
@@ -329,6 +330,7 @@ export async function createScenarioHarness(
 
   const { bus, logger } = stack;
   const outboundContext = createOutboundContextService(stack);
+  const scopedOutbound = scopedOutboundContext(outboundContext, currentScope);
 
   // Production's Dispatcher, given an outbound-context service so it injects the
   // block — narrowed to the run's own entries — the run's own backlog counts, and the
@@ -342,7 +344,7 @@ export async function createScenarioHarness(
     channelPolicies: stack.trustScoring.channelPolicies,
     trustScorerWeights: stack.trustScoring.weights,
     confidencePipeline: stack.trustScoring.confidencePipeline,
-    outboundContextService: scopedOutboundContext(outboundContext, currentScope),
+    outboundContextService: scopedOutbound,
     principalBacklog: scopedPrincipalBacklog(currentScope),
     verification: stack.verification,
     selfEmail: SCENARIO_CURIA_EMAIL,
@@ -548,11 +550,14 @@ export async function createScenarioHarness(
       const inbound = resolvePlaceholders(dated.inbound, seeded.refs);
       // A task wake's body comes from the scheduler's own builder, so the case sees the
       // wake instruction production sends. A wake_at job's payload is the bare envelope.
+      // The scheduler's job has no originator, so the wake lists every recorded reply on
+      // the agent's open sends, as Scheduler.recordedRepliesFor reads them (#2261).
       const wakeTask = inbound.task;
       inboundContent = wakeTask
         ? formatTaskWakeContent(
             { taskId: wakeTask.id, title: wakeTask.title, progress: { notes: wakeTask.notes }, agentId: scenario.agent, tags: wakeTask.tags ?? [] },
             { type: 'task-wake' },
+            recordedReplyViews(await scopedOutbound.getActiveWithReplies(scenario.agent, { taskId: wakeTask.id }), wakeTask.id),
           )
         : inbound.content;
 

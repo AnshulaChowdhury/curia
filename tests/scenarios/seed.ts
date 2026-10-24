@@ -431,6 +431,16 @@ export async function seedRun(scenario: ScenarioCase, deps: SeedDeps): Promise<S
         `UPDATE outbound_context SET created_at = now() - make_interval(mins => $2) WHERE id = $1`,
         [id, entry.sentMinutesAgo ?? 10],
       );
+      // What the Dispatcher records when a recipient writes back (#2261), so a task wake
+      // lists it as production's would.
+      for (const reply of entry.replies ?? []) {
+        const contact = scenario.seed.contacts.find((c) => c.key === reply.from)!;
+        await outboundContext.recordReply([id], {
+          from: contact.displayName,
+          contactId: seeded.refs.get(`contact:${reply.from}`)!,
+          content: reply.content,
+        });
+      }
     }
 
     for (const raw of scenario.seed.bullpen) {

@@ -762,6 +762,10 @@
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "wake keeps one contact's reason from another": {
+      "unstubbed": null,
+      "reason": "Added in #2264 (#2261); not run yet, pending the maintainer's go-ahead for a paid run."
     }
   }
 }
