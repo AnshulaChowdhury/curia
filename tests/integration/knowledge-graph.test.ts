@@ -275,4 +275,41 @@ describeIf('Knowledge Graph Integration', () => {
     expect(ids).toEqual([forward.id, reverse.id, doubled.id].sort());
     expect(facts.filter((f) => f.id === doubled.id)).toHaveLength(1);
   });
+
+  it('getConnectedFactsByKey returns keyed and legacy label matches only', async () => {
+    // Postgres side of the exact-key lookup (#2252): properties.key match (even with
+    // a diverged label), legacy label match with no key, and nothing else.
+    const entity = await store.createNode({
+      type: 'concept',
+      label: `getConnectedFactsByKey entity ${Date.now()}`,
+      properties: {},
+      source: 'integration-test',
+    });
+    const make = (label: string, properties: Record<string, unknown>) =>
+      store.createNode({ type: 'fact', label, properties, source: 'integration-test' });
+    const keyed = await make('k', { key: 'k', value: '1' });
+    const diverged = await make('k_old', { key: 'k', value: '2' });
+    const legacy = await make('k', { value: '3' });
+    const otherKey = await make('k', { key: 'k2', value: '4' });
+    const nullKey = await make('k', { key: null, value: '5' });
+    const unrelated = await make('z', { key: 'z', value: '6' });
+    const archived = await make('k', { key: 'k', value: '7' });
+    const nodes = [keyed, diverged, legacy, otherKey, nullKey, unrelated, archived];
+    createdKgNodeIds.push(entity.id, ...nodes.map((n) => n.id));
+
+    for (const n of nodes) {
+      await store.createEdge({
+        // Link `legacy` in the reverse direction to cover both UNION arms.
+        sourceNodeId: n === legacy ? n.id : entity.id,
+        targetNodeId: n === legacy ? entity.id : n.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'integration-test',
+      });
+    }
+    await store.archiveNode(archived.id);
+
+    const facts = await store.getConnectedFactsByKey(entity.id, 'k');
+    expect(facts.map((f) => f.id).sort()).toEqual([keyed.id, diverged.id, legacy.id].sort());
+  });
 });

@@ -132,6 +132,56 @@ describe('ConfigStore exact-key semantics', () => {
     expect(fixed?.properties.value).toBe('id-v2');
     expect(after).toHaveLength(1);
   });
+
+  describe('duplicate namespace anchors (anchor-create race)', () => {
+    /** Two config:ns anchors; the second already holds key `k`. */
+    async function twoAnchorsWithKeyOnSecond() {
+      await configStore.set('ns', 'other', 'x'); // creates the first anchor
+      const second = await kgStore.createNode({
+        type: 'concept',
+        label: 'config:ns',
+        properties: { category: 'config', namespace: 'ns' },
+        source: 'test',
+      });
+      const stored = await entityMemory.storeFact({
+        entityNodeId: second.id,
+        label: 'k',
+        properties: { key: 'k', value: 'old', namespace: 'ns', exact_key: true },
+        confidence: 0.9,
+        decayClass: 'permanent',
+        source: 'test',
+        exactKey: true,
+      });
+      expect(stored.stored).toBe(true);
+      const anchors = await entityMemory.findEntities('config:ns');
+      // The routing below only matters if the key is NOT on the first anchor.
+      expect(anchors).toHaveLength(2);
+      expect(anchors[1]!.id).toBe(second.id);
+      return { anchors, second };
+    }
+
+    it('updates the key on the anchor that holds it instead of creating a twin', async () => {
+      const { anchors, second } = await twoAnchorsWithKeyOnSecond();
+
+      const result = await configStore.set('ns', 'k', 'new');
+      expect(result.action).toBe('updated');
+
+      const allFacts = (await Promise.all(anchors.map((a) => entityMemory.getFacts(a.id)))).flat();
+      expect(allFacts.filter((f) => f.properties.key === 'k')).toHaveLength(1);
+      const onSecond = await entityMemory.getFacts(second.id);
+      expect(onSecond.find((f) => f.properties.key === 'k')?.properties.value).toBe('new');
+      expect(await configStore.get('ns', 'k')).toBe('new');
+    });
+
+    it('writes a new key to the first anchor', async () => {
+      const { anchors } = await twoAnchorsWithKeyOnSecond();
+
+      await configStore.set('ns', 'fresh', 'v');
+
+      const onFirst = await entityMemory.getFacts(anchors[0]!.id);
+      expect(onFirst.some((f) => f.properties.key === 'fresh')).toBe(true);
+    });
+  });
 });
 
 describe('listConfigEntries', () => {

@@ -60,6 +60,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`web-browser` `clear_site_data`** — clears one host's cookies and storage, recovering half-finished sign-ins; others stay signed in. (#2244)
 - **`browser.settleCapMs`** — **config:** caps the web-browser redirect wait; default 35s, at most 90s. (#2244)
 - **`voice.session.ended` turn stats** — **public API:** optional `turnStats` counts utterances, turns, barge-in cancels and joined fragments. (#2240)
+- **`pnpm repair:config-store-labels`** — reports and realigns config keys mislabelled by the old merge; dry-run by default. (#2252)
 
 ### Changed
 

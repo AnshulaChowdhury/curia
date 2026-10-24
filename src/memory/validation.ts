@@ -231,8 +231,10 @@ export class MemoryValidator {
       properties: { ...options.properties, exact_key: true },
     };
 
-    // Single JOIN — debrief anchors grow unbounded with per-instance keys.
-    const connectedFacts = await this.store.getConnectedFacts(options.entityNodeId);
+    // Key-filtered in the store — debrief anchors grow unbounded with per-instance
+    // keys, so loading every fact (and embedding) per write would scale with the
+    // namespace. The checks below remain the source of truth for a match.
+    const connectedFacts = await this.store.getConnectedFactsByKey(options.entityNodeId, incomingKey);
 
     // Prefer the most recently confirmed match when duplicates somehow exist.
     // Also adopt legacy label-only facts (no properties.key) so a rewrite does

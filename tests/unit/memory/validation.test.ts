@@ -953,6 +953,27 @@ describe('MemoryValidator', () => {
       ).rejects.toThrow(/exactKey requires a string properties\.key/);
     });
 
+    it('looks up only facts that can match the key, not the whole anchor', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const byKey = vi.spyOn(store, 'getConnectedFactsByKey');
+      const all = vi.spyOn(store, 'getConnectedFacts');
+
+      await validator.validate({
+        entityNodeId: entity.id,
+        label: 'seen:abc',
+        properties: { key: 'seen:abc', value: '1' },
+        source: 'test',
+        exactKey: true,
+      });
+
+      expect(byKey).toHaveBeenCalledWith(entity.id, 'seen:abc');
+      // The in-memory backend reuses getConnectedFacts internally; the validator
+      // itself must not call the unfiltered store method.
+      expect(all).not.toHaveBeenCalled();
+    });
+
     it('persists exact_key on create and blocks semantic merge into it', async () => {
       vi.spyOn(EmbeddingService, 'cosineSimilarity').mockReturnValue(0.99);
 

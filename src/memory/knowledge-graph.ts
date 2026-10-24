@@ -97,6 +97,12 @@ interface KnowledgeGraphBackend {
    * so large config anchors do not issue N getNode queries (#2252).
    */
   getConnectedFacts(nodeId: string): Promise<KgNode[]>;
+  /**
+   * Connected facts that can match an exact-key lookup: `properties.key` equals
+   * `key`, or (legacy) no `properties.key` and `label` equals `key`. Narrows in
+   * the database so unrelated facts and their embeddings are never loaded.
+   */
+  getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]>;
   deleteEdge(id: string): Promise<void>;
   updateEdge(id: string, updates: { confidence: number; lastConfirmedAt: Date }): Promise<KgEdge>;
   // Atomic upsert: creates if no matching (src, tgt, type) pair exists in either
@@ -269,6 +275,15 @@ export class KnowledgeGraphStore {
    */
   async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
     return this.backend.getConnectedFacts(nodeId);
+  }
+
+  /**
+   * Connected facts whose `properties.key` equals `key`, plus legacy facts with
+   * no `properties.key` whose label equals it. Exact-key upserts use this so a
+   * large config anchor does not load every fact (and embedding) per write.
+   */
+  async getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]> {
+    return this.backend.getConnectedFactsByKey(nodeId, key);
   }
 
   /**
@@ -696,6 +711,31 @@ class PostgresBackend implements KnowledgeGraphBackend {
             WHERE target_node_id = $1 AND archived_at IS NULL
          )`,
       [nodeId],
+    );
+    return result.rows.map(pgRowToNode);
+  }
+
+  async getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]> {
+    // Same connected-fact set as getConnectedFacts, narrowed to rows that can
+    // match the key. Callers still apply their own exact checks (string type,
+    // namespace) — this only keeps unrelated rows out of the result.
+    const result = await this.pool.query<PgNodeRow>(
+      `SELECT n.*
+       FROM kg_nodes n
+       WHERE n.type = 'fact'
+         AND n.archived_at IS NULL
+         AND (
+           n.properties->>'key' = $2
+           OR (NOT (n.properties ? 'key') AND n.label = $2)
+         )
+         AND n.id IN (
+           SELECT target_node_id FROM kg_edges
+            WHERE source_node_id = $1 AND archived_at IS NULL
+           UNION
+           SELECT source_node_id FROM kg_edges
+            WHERE target_node_id = $1 AND archived_at IS NULL
+         )`,
+      [nodeId, key],
     );
     return result.rows.map(pgRowToNode);
   }
@@ -1241,6 +1281,18 @@ class InMemoryBackend implements KnowledgeGraphBackend {
       if (node?.type === 'fact') facts.push(node);
     }
     return facts;
+  }
+
+  async getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]> {
+    // Mirrors the Postgres filter: `->>'key'` yields text for any JSON scalar,
+    // so compare String(value) for keyed rows; legacy rows have no key at all
+    // (undefined counts as absent — JSON storage drops it).
+    const facts = await this.getConnectedFacts(nodeId);
+    return facts.filter((f) => {
+      const props = f.properties as Record<string, unknown>;
+      if (props.key === undefined) return f.label === key;
+      return props.key !== null && String(props.key) === key;
+    });
   }
 
   async deleteEdge(id: string): Promise<void> {

@@ -138,7 +138,7 @@ export class ConfigStore {
     const anchorSource = opts.anchorSource ?? SYSTEM_CONFIG_SOURCE;
 
     try {
-      const anchor = await this.findOrCreateAnchor(namespace, anchorSource);
+      const anchor = await this.findOrCreateAnchor(namespace, key, anchorSource);
 
       const result = await this.entityMemory.storeFact({
         entityNodeId: anchor.id,
@@ -173,10 +173,31 @@ export class ConfigStore {
     return allFacts.flat();
   }
 
-  private async findOrCreateAnchor(namespace: string, source: string): Promise<{ id: string }> {
+  /**
+   * The anchor a write for `key` should go to. With one anchor (the normal case)
+   * that is it. When the anchor-create race has left several same-label anchors,
+   * write to the one that already holds the key — validateExactKey only searches
+   * the anchor it is given, so picking another would create a twin that get()
+   * and list() then read alongside the original. No match: first anchor.
+   */
+  private async findOrCreateAnchor(
+    namespace: string,
+    key: string,
+    source: string,
+  ): Promise<{ id: string }> {
     const label = anchorLabel(namespace);
     const existing = await this.entityMemory.findEntities(label);
-    if (existing.length > 0) return existing[0]!;
+    if (existing.length === 1) return existing[0]!;
+    if (existing.length > 1) {
+      const factsByAnchor = await Promise.all(
+        existing.map(async (anchor) => ({ anchor, facts: await this.entityMemory.getFacts(anchor.id) })),
+      );
+      const match = matchConfigFact(factsByAnchor.flatMap((a) => a.facts), key);
+      const owner = match
+        ? factsByAnchor.find((a) => a.facts.some((f) => f.id === match.id))?.anchor
+        : undefined;
+      return owner ?? existing[0]!;
+    }
 
     const { entity } = await this.entityMemory.createEntity({
       type: 'concept',
