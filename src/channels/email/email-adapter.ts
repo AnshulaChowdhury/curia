@@ -30,7 +30,11 @@ import {
 } from '../../bus/events.js';
 import { sanitizeOutput } from '../../skills/sanitize.js';
 import { buildReplyQuote } from '../../skills/_shared/reply-quote.js';
-import { EMAIL_INBOUND_TURN_STALL_MS } from '../../health/health-checks.js';
+import {
+  EMAIL_INBOUND_TURN_STALL_MS,
+  WRITE_AHEAD_POLL_FAIL_LIMIT,
+  WRITE_AHEAD_RETRY_LIMIT,
+} from './inbound-stall.js';
 import type { Channel } from '../channel.js';
 
 // Mirrors MAX_BODY_LENGTH in skills/email/tools/email-send/handler.ts and skills/email/tools/email-reply/handler.ts.
@@ -59,6 +63,38 @@ interface QueuedInboundEmail {
   senderVerified: boolean;
   /** Epoch ms when the poll queued this message. */
   queuedAt: number;
+}
+
+function nylasMessageIdOf(event: InboundMessageEvent): string {
+  const id = event.payload.metadata?.nylasMessageId;
+  return typeof id === 'string' && id.length > 0 ? id : event.id;
+}
+
+function queuedFromReplay(
+  event: InboundMessageEvent,
+  messageId: string,
+  deliver: () => Promise<void>,
+): QueuedInboundEmail {
+  const metadata = event.payload.metadata;
+  const threadFromMeta = metadata?.nylasThreadId;
+  const threadId = typeof threadFromMeta === 'string' && threadFromMeta.length > 0
+    ? threadFromMeta
+    : event.payload.conversationId.startsWith('email:')
+      ? event.payload.conversationId.slice('email:'.length)
+      : event.payload.conversationId;
+  const subject = typeof metadata?.subject === 'string' ? metadata.subject : '';
+  const senderId = event.payload.senderId;
+  return {
+    event,
+    deliver,
+    messageId,
+    threadId,
+    senderEmail: senderId.includes('@') ? senderId : undefined,
+    senderId,
+    subject,
+    senderVerified: metadata?.senderVerified === true,
+    queuedAt: Date.now(),
+  };
 }
 
 // KG namespace and key pattern for persisting the poll high-water mark.
@@ -122,6 +158,15 @@ export interface EmailAdapterConfig {
    * to Date.now() on each restart, which is the legacy behaviour).
    */
   configStore?: ConfigStore;
+  /**
+   * Unacknowledged `inbound.message` rows for this account. On start, each
+   * one is delivered again through `deliverPersisted` before the first poll,
+   * so a restart cannot leave write-ahead mail behind the watermark (#2254).
+   * Absent in tests that do not exercise replay.
+   */
+  unacknowledgedInbound?: {
+    listUnacknowledgedInbound(accountId: string): Promise<InboundMessageEvent[]>;
+  };
 }
 
 export class EmailAdapter implements Channel {
@@ -197,12 +242,32 @@ export class EmailAdapter implements Channel {
   private readonly recentlySentIds = new Set<string>();
   private static readonly MAX_SENT_IDS = 200;
 
+  /**
+   * Nylas ids whose `inbound.message` row already exists in this process
+   * (this poll, or replay on start). A watermark rollback re-fetches them;
+   * they must not be written ahead again. Bounded like {@link recentlySentIds}.
+   */
+  private readonly stagedInboundIds = new Set<string>();
+  private static readonly MAX_STAGED_IDS = 200;
+  /** Consecutive write-ahead failures per Nylas message id. */
+  private readonly writeAheadFailures = new Map<string, number>();
+  /** Polls in a row that stopped on a retryable write-ahead failure. */
+  private writeAheadPollFailures = 0;
+
   private trackSentId(id: string): void {
     this.recentlySentIds.add(id);
     // Set preserves insertion order, so values().next() is the oldest entry.
     if (this.recentlySentIds.size > EmailAdapter.MAX_SENT_IDS) {
       const oldest = this.recentlySentIds.values().next().value;
       if (oldest !== undefined) this.recentlySentIds.delete(oldest);
+    }
+  }
+
+  private rememberStagedId(id: string): void {
+    this.stagedInboundIds.add(id);
+    if (this.stagedInboundIds.size > EmailAdapter.MAX_STAGED_IDS) {
+      const oldest = this.stagedInboundIds.values().next().value;
+      if (oldest !== undefined) this.stagedInboundIds.delete(oldest);
     }
   }
 
@@ -281,6 +346,21 @@ export class EmailAdapter implements Channel {
       }
     }
     return oldestQueuedAt === Number.POSITIVE_INFINITY ? null : Date.now() - oldestQueuedAt;
+  }
+
+  /** In-flight turns older than the stall bound. */
+  get inboundStalledTurns(): number {
+    const now = Date.now();
+    let stalled = 0;
+    for (const startedAt of this.inFlightStartedAt.values()) {
+      if (now - startedAt >= EMAIL_INBOUND_TURN_STALL_MS) stalled++;
+    }
+    return stalled;
+  }
+
+  /** True once repeated polls have been unable to write inbound mail ahead. */
+  get inboundWriteAheadDegraded(): boolean {
+    return this.writeAheadPollFailures >= WRITE_AHEAD_POLL_FAIL_LIMIT;
   }
 
   /**
@@ -422,6 +502,9 @@ export class EmailAdapter implements Channel {
     this.stalledEmitted = false;
     this.stalledEmitAttempts = 0;
     this.running = true;
+    // Replay before the interval and the first poll, so a re-fetch of mail
+    // already written ahead is skipped instead of delivered twice.
+    await this.replayUnacknowledgedInbound();
 
     // Poll on interval; also run the watchdog check each tick.
     this.pollTimer = setInterval(() => {
@@ -472,6 +555,44 @@ export class EmailAdapter implements Channel {
     this.config.logger.info('Email adapter stopped');
   }
 
+  /**
+   * Deliver this account's unacknowledged inbound rows before the first poll.
+   * Queued items were never delivered, so this is once. In-flight items may
+   * have partly run, so this is at-least-once, matching a restart that
+   * re-fetched the same mail. A load failure is logged and startup continues;
+   * the rows stay unacknowledged for the next start.
+   */
+  private async replayUnacknowledgedInbound(): Promise<void> {
+    const source = this.config.unacknowledgedInbound;
+    if (!source) return;
+    let events: InboundMessageEvent[];
+    try {
+      events = await source.listUnacknowledgedInbound(this.config.accountId);
+    } catch (err) {
+      this.config.logger.error(
+        { err, accountId: this.config.accountId },
+        'Email adapter: failed to load unacknowledged inbound mail — replay skipped',
+      );
+      return;
+    }
+    if (events.length === 0) return;
+    this.config.logger.info(
+      { accountId: this.config.accountId, count: events.length },
+      'Email adapter: replaying unacknowledged inbound mail',
+    );
+    for (const event of events) {
+      if (!this.running) break;
+      const messageId = nylasMessageIdOf(event);
+      this.rememberStagedId(messageId);
+      const queued = queuedFromReplay(
+        event,
+        messageId,
+        () => this.config.bus.deliverPersisted(event),
+      );
+      if (this.enqueueInbound(queued)) this.logInboundQueued(queued);
+    }
+  }
+
   private async poll(): Promise<void> {
     // Guard against overlapping fetches. A previous poll still inside Nylas or
     // pre-publish work skips this cycle. An in-flight agent turn does not —
@@ -484,7 +605,15 @@ export class EmailAdapter implements Channel {
     const prevWatermark = this.lastSeenTimestamp;
 
     // Per-filter skip counters for the channel.poll audit event.
-    const skipped = { sent_folder: 0, recently_sent: 0, self: 0, excluded: 0, failed: 0 };
+    const skipped = {
+      sent_folder: 0,
+      recently_sent: 0,
+      self: 0,
+      excluded: 0,
+      failed: 0,
+      deferred: 0,
+      already_staged: 0,
+    };
     let fetched = 0;
     let processed = 0;
 
@@ -526,23 +655,37 @@ export class EmailAdapter implements Channel {
       .map((entry) => entry.msg);
 
     // Last watermark that is safe to persist: intentional skips and successful
-    // write-aheads. A write-ahead failure rolls the in-memory mark back here
-    // and stops the batch so the next poll retries (#2254).
+    // write-aheads. A retryable write-ahead failure rolls the in-memory mark
+    // back to include that message and stops the batch (#2254).
     let durableWatermark = prevWatermark;
-    let classified = 0;
+    let endedOnWriteAheadRetry = false;
 
     try {
-      for (const msg of ordered) {
+      for (let index = 0; index < ordered.length; index++) {
+        const msg = ordered[index]!;
         if (!this.running) {
           this.lastSeenTimestamp = durableWatermark;
+          skipped.deferred += ordered.length - index;
           break;
         }
-        // Advance the high-water mark BEFORE processing so a permanently broken
-        // message (e.g. malformed payload) is never retried on the next poll cycle.
-        // +1 ensures the next poll's receivedAfter excludes this exact timestamp
-        // (Nylas timestamps are Unix seconds integers).
+        // Advance the in-memory mark before processing so a permanently broken
+        // message (malformed payload, or write-ahead past its retry budget) is
+        // not retried. A retryable write-ahead failure rolls the mark back.
+        // +1 excludes this exact Unix second: receivedAfter is inclusive.
         if (msg.date >= this.lastSeenTimestamp) {
           this.lastSeenTimestamp = msg.date + 1;
+        }
+
+        // Already persisted in this process (replay, or a previous poll that
+        // rolled the watermark back over a same-second neighbour).
+        if (this.stagedInboundIds.has(msg.id)) {
+          this.config.logger.debug(
+            { messageId: msg.id, accountId: this.config.accountId },
+            'Email skipped — inbound message was already written ahead',
+          );
+          skipped.already_staged++;
+          durableWatermark = this.lastSeenTimestamp;
+          continue;
         }
 
         // ── Layer 1: folder-based detection ──────────────────────────────────
@@ -560,7 +703,6 @@ export class EmailAdapter implements Channel {
             'Email skipped — message is in sent/drafts folder',
           );
           skipped.sent_folder++;
-          classified++;
           durableWatermark = this.lastSeenTimestamp;
           continue;
         }
@@ -578,7 +720,6 @@ export class EmailAdapter implements Channel {
             'Email skipped — matches recently-sent message ID (loop guard)',
           );
           skipped.recently_sent++;
-          classified++;
           durableWatermark = this.lastSeenTimestamp;
           continue;
         }
@@ -603,7 +744,6 @@ export class EmailAdapter implements Channel {
           normalizeForComparison(fromEmail) === normalizeForComparison(this.config.selfEmail)
         ) {
           skipped.self++;
-          classified++;
           durableWatermark = this.lastSeenTimestamp;
           continue;
         }
@@ -621,7 +761,6 @@ export class EmailAdapter implements Channel {
             'Email skipped — sender is in suppressedSenderEmails',
           );
           skipped.excluded++;
-          classified++;
           durableWatermark = this.lastSeenTimestamp;
           continue;
         }
@@ -646,7 +785,6 @@ export class EmailAdapter implements Channel {
             'Failed to process inbound email — skipping message',
           );
           skipped.failed++;
-          classified++;
           durableWatermark = this.lastSeenTimestamp;
           continue;
         }
@@ -664,7 +802,6 @@ export class EmailAdapter implements Channel {
             'Failed to process inbound email — skipping message',
           );
           skipped.failed++;
-          classified++;
           durableWatermark = this.lastSeenTimestamp;
           continue;
         }
@@ -687,21 +824,47 @@ export class EmailAdapter implements Channel {
           const staged = await this.config.bus.stagePublish('channel', event);
           deliver = staged.deliver;
         } catch (err) {
+          const attempts = (this.writeAheadFailures.get(msg.id) ?? 0) + 1;
+          this.writeAheadFailures.set(msg.id, attempts);
+          if (attempts >= WRITE_AHEAD_RETRY_LIMIT) {
+            this.writeAheadFailures.delete(msg.id);
+            this.config.logger.error(
+              {
+                err,
+                messageId: msg.id,
+                threadId: msg.threadId,
+                senderEmail: fromEmail,
+                attempts,
+              },
+              'Inbound email write-ahead failed — skipping message after repeated failures',
+            );
+            skipped.failed++;
+            durableWatermark = this.lastSeenTimestamp;
+            continue;
+          }
           this.config.logger.error(
             {
               err,
               messageId: msg.id,
               threadId: msg.threadId,
               senderEmail: fromEmail,
-              remainingInBatch: ordered.length - classified - 1,
+              attempts,
+              remainingInBatch: ordered.length - index - 1,
             },
-            'Failed to process inbound email — skipping message',
+            'Inbound email write-ahead failed — will retry next poll',
           );
-          skipped.failed++;
-          classified++;
-          this.lastSeenTimestamp = durableWatermark;
+          // Same-second neighbours share `date`. Rolling back only to the
+          // previous success's date+1 would leave this message below the next
+          // receivedAfter. Include its own second; already-staged ids skip
+          // the neighbours this process has written ahead.
+          this.lastSeenTimestamp = Math.min(durableWatermark, msg.date);
+          skipped.deferred += ordered.length - index;
+          endedOnWriteAheadRetry = true;
           break;
         }
+
+        this.writeAheadFailures.delete(msg.id);
+        this.rememberStagedId(msg.id);
 
         const queued: QueuedInboundEmail = {
           event,
@@ -714,16 +877,34 @@ export class EmailAdapter implements Channel {
           senderVerified: converted.metadata.senderVerified,
           queuedAt: Date.now(),
         };
-        if (this.enqueueInbound(queued)) this.logInboundQueued(queued);
+        // stop() during stagePublish drops the message. Leave the watermark
+        // behind it so the row is replayed on the next start, and do not
+        // count it as processed.
+        if (!this.enqueueInbound(queued)) {
+          this.lastSeenTimestamp = durableWatermark;
+          skipped.deferred += ordered.length - index;
+          break;
+        }
+        this.logInboundQueued(queued);
         processed++;
-        classified++;
         durableWatermark = this.lastSeenTimestamp;
       }
     } finally {
       this.processing = false;
     }
 
-    fetched = classified;
+    fetched = messages.length;
+
+    // stop() landed during this poll. Queued mail was dropped, and a message
+    // this cycle already wrote ahead must stay behind the persisted watermark.
+    // Skip the health stamp and channel.poll too: disconnected already fired.
+    if (!this.running) return;
+
+    if (endedOnWriteAheadRetry) {
+      this.writeAheadPollFailures += 1;
+    } else {
+      this.writeAheadPollFailures = 0;
+    }
 
     // ── Post-poll accounting (only reached when listEmailMessages succeeded) ──
     // Stamped when the fetch and write-ahead finish. A coordinator turn still
@@ -941,10 +1122,11 @@ export class EmailAdapter implements Channel {
           accountId: this.config.accountId,
           conversationId,
           ageMs,
+          thresholdMs: EMAIL_INBOUND_TURN_STALL_MS,
           inFlight: this.inFlightTurns,
           pending: this.inboundPending,
         },
-        'Email adapter: inbound turn still running past 15 minutes',
+        'Email adapter: inbound turn still running past the stall bound',
       );
     }
   }

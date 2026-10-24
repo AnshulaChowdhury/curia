@@ -337,4 +337,26 @@ describe('EventBus', () => {
     const staged = await bus.stagePublish('channel', event);
     await expect(staged.deliver()).resolves.toBeUndefined();
   });
+
+  it('deliverPersisted skips the write-ahead and still acknowledges (#2254)', async () => {
+    const onEvent = vi.fn(async () => {});
+    const onDelivered = vi.fn(async () => {});
+    const handler = vi.fn();
+    bus = new EventBus(createLogger('error'), onEvent, onDelivered);
+    bus.subscribe('inbound.message', 'dispatch', handler);
+
+    const event = createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'email',
+      senderId: 'ada@example.com',
+      content: 'Replay me',
+    });
+
+    await bus.deliverPersisted(event);
+
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith(event);
+    expect(onDelivered).toHaveBeenCalledWith(event.id);
+  });
 });

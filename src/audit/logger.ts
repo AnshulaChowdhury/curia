@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Pool, PoolClient } from 'pg';
-import type { BusEvent, LlmCallArchiveContent } from '../bus/events.js';
+import type { BusEvent, InboundMessageEvent, LlmCallArchiveContent } from '../bus/events.js';
 import type { Logger } from '../logger.js';
 import {
   createDbUnavailableAgentError,
@@ -346,6 +346,51 @@ export class AuditLogger {
   }
 
   /**
+   * Unacknowledged `inbound.message` rows for one email account, oldest first.
+   * The email adapter replays these on start through `deliverPersisted`, which
+   * acknowledges the existing row instead of inserting another. Capped so a
+   * large backlog cannot be loaded in one pass. Other event types stay
+   * diagnostic-only via {@link scanForUnacknowledged}.
+   */
+  async listUnacknowledgedInbound(accountId: string): Promise<InboundMessageEvent[]> {
+    const REPLAY_LIMIT = 500;
+    type Row = {
+      id: string;
+      timestamp: Date | string;
+      payload: unknown;
+      parent_event_id: string | null;
+    };
+    let rows: Row[];
+    try {
+      const result = await this.pool.query<Row>(
+        `SELECT id, timestamp, payload, parent_event_id
+         FROM audit_log
+         WHERE acknowledged = false
+           AND event_type = 'inbound.message'
+           AND payload->>'accountId' = $1
+         ORDER BY timestamp ASC
+         LIMIT $2`,
+        [accountId, REPLAY_LIMIT],
+      );
+      rows = result.rows;
+    } catch (err) {
+      this.logger.error(
+        { err, accountId },
+        'Failed to list unacknowledged inbound mail for replay',
+      );
+      throw err;
+    }
+
+    const events: InboundMessageEvent[] = [];
+    for (const row of rows) {
+      const event = inboundEventFromReplayRow(row, this.logger, accountId);
+      if (!event) continue;
+      events.push(event);
+    }
+    return events;
+  }
+
+  /**
    * Scan for audit_log rows that were written but never acknowledged.
    * Called once at startup, after migrations run and before serving requests.
    *
@@ -353,8 +398,8 @@ export class AuditLogger {
    * write-ahead record and completing subscriber delivery. They are flagged
    * here so operators can identify which events may not have been delivered.
    *
-   * Replay of unacknowledged events is a separate feature (not yet implemented).
-   * This scan is diagnostic only.
+   * Email accounts replay their own unacknowledged `inbound.message` rows on
+   * adapter start. This scan stays diagnostic for every other event type.
    */
   async scanForUnacknowledged(): Promise<void> {
     // Cap the number of events included in the log entry to avoid overflowing
@@ -419,4 +464,79 @@ export class AuditLogger {
       'Audit log startup scan: unacknowledged events detected — delivery may have been incomplete on previous run',
     );
   }
+}
+
+interface ReplayInboundPayload {
+  conversationId: string;
+  channelId: string;
+  accountId?: string;
+  senderId: string;
+  content: string;
+  metadata?: Record<string, unknown>;
+}
+
+function isReplayableInboundPayload(value: unknown): value is ReplayInboundPayload {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const payload = value as Record<string, unknown>;
+  if (!nonEmptyString(payload.conversationId)) return false;
+  if (!nonEmptyString(payload.channelId)) return false;
+  if (!nonEmptyString(payload.senderId)) return false;
+  if (typeof payload.content !== 'string') return false;
+  if (payload.accountId !== undefined && typeof payload.accountId !== 'string') return false;
+  if (payload.metadata === undefined) return true;
+  return typeof payload.metadata === 'object'
+    && payload.metadata !== null
+    && !Array.isArray(payload.metadata);
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function inboundEventFromReplayRow(
+  row: {
+    id: string;
+    timestamp: Date | string;
+    payload: unknown;
+    parent_event_id: string | null;
+  },
+  logger: Logger,
+  accountId: string,
+): InboundMessageEvent | undefined {
+  const skip = (err?: unknown) => {
+    logger.error(
+      { err, accountId, eventId: row.id },
+      'Unacknowledged inbound mail has an unreadable payload — replay skipped this row',
+    );
+  };
+  if (!nonEmptyString(row.id)) {
+    skip();
+    return undefined;
+  }
+  let payload: unknown = row.payload;
+  if (typeof payload === 'string') {
+    try {
+      payload = JSON.parse(payload) as unknown;
+    } catch (err) {
+      skip(err);
+      return undefined;
+    }
+  }
+  if (!isReplayableInboundPayload(payload)) {
+    skip();
+    return undefined;
+  }
+  const timestamp = row.timestamp instanceof Date ? row.timestamp : new Date(row.timestamp);
+  if (Number.isNaN(timestamp.getTime())) {
+    skip();
+    return undefined;
+  }
+  return {
+    id: row.id,
+    timestamp,
+    type: 'inbound.message',
+    sourceLayer: 'channel',
+    payload,
+    ...(typeof row.parent_event_id === 'string' ? { parentEventId: row.parent_event_id } : {}),
+  };
 }

@@ -322,3 +322,50 @@ describe('AuditLogger.log — structured columns + hash chain', () => {
     ).rejects.toThrow(/nested AuditLogger\.log/);
   });
 });
+
+describe('AuditLogger.listUnacknowledgedInbound', () => {
+  it('returns readable inbound rows for the account and skips a bad payload', async () => {
+    const rows = [
+      {
+        id: '11111111-1111-1111-1111-111111111111',
+        timestamp: new Date('2026-10-24T12:00:00Z'),
+        payload: {
+          conversationId: 'email:thread-1',
+          channelId: 'email',
+          accountId: 'curia',
+          senderId: 'ada@example.com',
+          content: 'hello',
+          metadata: { nylasMessageId: 'nylas-1' },
+        },
+        parent_event_id: null,
+      },
+      {
+        id: '22222222-2222-2222-2222-222222222222',
+        timestamp: new Date('2026-10-24T12:01:00Z'),
+        payload: { conversationId: 'email:thread-2' },
+        parent_event_id: 'parent-1',
+      },
+    ];
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const pool = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        queries.push({ sql, params });
+        return { rows, rowCount: rows.length };
+      }),
+    };
+    const logger = new AuditLogger(pool as unknown as Pool, createSilentLogger());
+
+    const events = await logger.listUnacknowledgedInbound('curia');
+
+    expect(queries[0]?.sql).toContain("event_type = 'inbound.message'");
+    expect(queries[0]?.sql).toContain("payload->>'accountId' = $1");
+    expect(queries[0]?.params).toEqual(['curia', 500]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      id: rows[0]!.id,
+      type: 'inbound.message',
+      sourceLayer: 'channel',
+      payload: rows[0]!.payload,
+    });
+  });
+});

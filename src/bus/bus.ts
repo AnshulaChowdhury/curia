@@ -186,10 +186,45 @@ export class EventBus {
   }
 
   /**
+   * Deliver an event that is already in the audit log. Does not call the
+   * write-ahead hook, so replaying an unacknowledged `inbound.message` does
+   * not insert a second row for the same id. Subscribers and the
+   * acknowledgement hook still run (#2254).
+   */
+  async deliverPersisted(event: BusEvent): Promise<void> {
+    if (!canPublish(event.sourceLayer, event.type)) {
+      throw new Error(
+        `Layer '${event.sourceLayer}' is not authorized to publish '${event.type}'`,
+      );
+    }
+
+    const unowned = this.unownedAgentTask(event.sourceLayer, event);
+    if (unowned) {
+      this.logger.error(
+        {
+          agentId: unowned.agentId,
+          layer: unowned.layer,
+          eventId: unowned.eventId,
+          originatingEventId: unowned.originatingEventId,
+        },
+        'agent.task published for an agent no registered agent owns',
+      );
+      throw unowned;
+    }
+
+    this.logger.debug(
+      { layer: event.sourceLayer, eventType: event.type, eventId: event.id },
+      'Delivering persisted event',
+    );
+    await this.deliver(event);
+  }
+
+  /**
    * Deliver to subscribers sequentially. Subscriber errors are caught and
    * logged individually so one bad subscriber cannot block the rest.
    * `publish()` awaits this. `publishDetached()` does not. `stagePublish()`
-   * returns it so the caller can await delivery later.
+   * returns it so the caller can await delivery later. `deliverPersisted()`
+   * awaits it without a new write-ahead row.
    */
   private async deliver(event: BusEvent): Promise<void> {
     const handlers = this.subscribers.get(event.type) ?? [];

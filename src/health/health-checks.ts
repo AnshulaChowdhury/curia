@@ -13,30 +13,28 @@ import type { EventBus } from '../bus/bus.js';
 import type { CheckResult } from './types.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
 import type { Logger } from '../logger.js';
+import { EMAIL_INBOUND_TURN_STALL_MS } from '../channels/email/inbound-stall.js';
 
 // -- Structural health interfaces --
 // Using structural typing avoids hard import dependencies on concrete service
 // classes, which would pull in their full dependency graphs. The health module
 // only needs the specific fields/methods it probes — nothing more.
-
-/**
- * An inbound turn held this long, while every concurrency slot is taken,
- * fails the email check even if Nylas polls are still succeeding (#2254).
- * Longer than a normal coordinator turn so one slow reply does not flap.
- */
-export const EMAIL_INBOUND_TURN_STALL_MS = 15 * 60 * 1000;
+// The stall threshold lives in the email channel module; this file imports
+// that constant only, not the adapter class.
 
 export interface EmailAdapterHealth {
   /** Date of the most recent successful poll, or null if none has completed. */
   lastSuccessfulPollAt: Date | null;
   /** Polling interval in ms — used to compute the stall threshold. */
   pollingIntervalMs: number;
-  /** Turns whose delivery has started and not settled. Absent on test doubles. */
-  inboundInFlight?: number;
-  /** Cap those in-flight turns share. Absent on test doubles. */
-  inboundMaxConcurrentTurns?: number;
-  /** Age of the oldest in-flight turn, or null when nothing is running. */
-  oldestInboundInFlightAgeMs?: number | null;
+  /** Age of the oldest queued inbound message, or null when nothing is waiting. */
+  oldestInboundPendingAgeMs: number | null;
+  /** In-flight turns older than the email stall bound. */
+  inboundStalledTurns: number;
+  /** Cap those in-flight turns share. */
+  inboundMaxConcurrentTurns: number;
+  /** True when inbound write-ahead has failed for several polls in a row. */
+  inboundWriteAheadDegraded: boolean;
 }
 
 export interface SignalRpcClientHealth {
@@ -202,9 +200,10 @@ export function checkBus(bus: EventBus): CheckResult {
  *
  * The adapter stamps lastSuccessfulPollAt when the Nylas fetch and handoff finish,
  * not when the agent turn finishes (#2254). A long turn does not fail this check
- * on its own. The check does fail when every inbound slot is held by a turn at
- * least {@link EMAIL_INBOUND_TURN_STALL_MS} old, even if polls are still fresh.
- * A poll that stops succeeding also fails.
+ * on its own. The check fails when queued mail has been waiting at least
+ * {@link EMAIL_INBOUND_TURN_STALL_MS}, when the number of in-flight turns past
+ * that bound is at least the cap, or when several polls in a row could not write
+ * inbound mail ahead. A poll that stops succeeding also fails.
  *
  * @param adapter      The email adapter to probe, or undefined when not configured.
  * @param emailStallFactor  Multiplier on pollingIntervalMs to derive the stall threshold.
@@ -226,16 +225,23 @@ export function checkEmail(
     : now - lastSuccessfulPollAt.getTime() < graceMs;
   if (!pollFresh) return 'fail';
 
-  const { inboundInFlight, inboundMaxConcurrentTurns, oldestInboundInFlightAgeMs } = adapter;
+  // An audit-database outage keeps the Nylas stamp fresh while no mail is
+  // written ahead. Surface that separately from a single poison message,
+  // which the adapter skips and then lets the poll complete.
+  if (adapter.inboundWriteAheadDegraded) return 'fail';
+
+  // Mail waiting is the symptom, whether one thread is wedged or the cap is full.
   if (
-    inboundInFlight !== undefined &&
-    inboundMaxConcurrentTurns !== undefined &&
-    oldestInboundInFlightAgeMs != null &&
-    inboundInFlight >= inboundMaxConcurrentTurns &&
-    oldestInboundInFlightAgeMs >= EMAIL_INBOUND_TURN_STALL_MS
+    adapter.oldestInboundPendingAgeMs != null &&
+    adapter.oldestInboundPendingAgeMs >= EMAIL_INBOUND_TURN_STALL_MS
   ) {
     return 'fail';
   }
+
+  // Every slot is wedged when the turns past the bound fill the cap. The
+  // oldest in-flight age alone changes every time the remaining slot starts
+  // and finishes, while the other slots stay stuck.
+  if (adapter.inboundStalledTurns >= adapter.inboundMaxConcurrentTurns) return 'fail';
   return 'ok';
 }
 

@@ -5,7 +5,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import pino from 'pino';
 import { Writable } from 'node:stream';
-import { EmailAdapter } from '../../../../src/channels/email/email-adapter.js';
+import { EmailAdapter, type EmailAdapterConfig } from '../../../../src/channels/email/email-adapter.js';
 import { createSilentLogger } from '../../../../src/logger.js';
 import type { OutboundGateway } from '../../../../src/skills/outbound-gateway.js';
 import type { ContactService } from '../../../../src/contacts/contact-service.js';
@@ -16,7 +16,12 @@ import {
   type BusEvent,
   type ChannelPollEvent,
 } from '../../../../src/bus/events.js';
-import { EMAIL_INBOUND_TURN_STALL_MS, checkEmail } from '../../../../src/health/health-checks.js';
+import { checkEmail } from '../../../../src/health/health-checks.js';
+import {
+  EMAIL_INBOUND_TURN_STALL_MS,
+  WRITE_AHEAD_RETRY_LIMIT,
+} from '../../../../src/channels/email/inbound-stall.js';
+import type { ConfigStore } from '../../../../src/memory/config-store.js';
 
 const SELF_EMAIL = 'curia@example.com';
 const CEO_EMAIL = 'ceo@example.com';
@@ -51,6 +56,7 @@ function createMocks() {
     stagePublish: vi.fn(async (layer: string, event: BusEvent) => ({
       deliver: () => publish(layer, event),
     })),
+    deliverPersisted: vi.fn(async (event: BusEvent) => publish('channel', event)),
   } as unknown as EventBus;
   const contactService = {
     resolveByChannelIdentity: vi.fn().mockResolvedValue({ id: 'existing' }),
@@ -72,6 +78,8 @@ function makeAdapter(
     pollingIntervalMs: number;
     suppressedSenderEmails: string[];
     logger: ReturnType<typeof createMocks>['logger'];
+    configStore: EmailAdapterConfig['configStore'];
+    unacknowledgedInbound: EmailAdapterConfig['unacknowledgedInbound'];
   }> = {},
 ) {
   return new EmailAdapter({
@@ -88,6 +96,8 @@ function makeAdapter(
     maxConcurrentTurns: overrides.maxConcurrentTurns ?? 4,
     ceoEmail: CEO_EMAIL,
     timezone: 'America/Toronto',
+    configStore: overrides.configStore,
+    unacknowledgedInbound: overrides.unacknowledgedInbound,
   });
 }
 
@@ -381,6 +391,8 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
       self: 1,
       excluded: 1,
       failed: 1,
+      deferred: 0,
+      already_staged: 0,
     });
     const skippedTotal = Object.values(payload.skipped).reduce((sum, n) => sum + n, 0);
     expect(payload.processed + skippedTotal).toBe(payload.fetched);
@@ -497,6 +509,8 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
       self: 1,
       excluded: 0,
       failed: 0,
+      deferred: 0,
+      already_staged: 0,
     });
 
     gate.release('inbound-1');
@@ -635,45 +649,207 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
     const olderDate = nowSec + 10;
     const newerDate = nowSec + 30;
     const publish = mocks.bus.publish as unknown as (layer: string, event: BusEvent) => Promise<void>;
+    let newerAttempts = 0;
     (mocks.bus.stagePublish as ReturnType<typeof vi.fn>).mockImplementation(
       async (layer: string, event: BusEvent) => {
-        if (inboundId(event) === 'newer') throw new Error('audit down');
+        if (inboundId(event) === 'newer' && newerAttempts++ === 0) throw new Error('audit down');
         return { deliver: () => publish(layer, event) };
       },
     );
+    const messages = [
+      makeMockMessage({
+        id: 'newer',
+        threadId: 'thread-new',
+        date: newerDate,
+        from: [{ email: 'new@example.com' }],
+      }),
+      makeMockMessage({
+        id: 'older',
+        threadId: 'thread-old',
+        date: olderDate,
+        from: [{ email: 'old@example.com' }],
+      }),
+    ];
     const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
-    list.mockImplementation(async (opts: { receivedAfter: number }) => {
-      if (opts.receivedAfter >= olderDate + 1) return [];
-      return [
-        makeMockMessage({
-          id: 'newer',
-          threadId: 'thread-new',
-          date: newerDate,
-          from: [{ email: 'new@example.com' }],
-        }),
-        makeMockMessage({
-          id: 'older',
-          threadId: 'thread-old',
-          date: olderDate,
-          from: [{ email: 'old@example.com' }],
-        }),
-      ];
-    });
+    // receivedAfter is an inclusive lower bound: date >= receivedAfter.
+    list.mockImplementation(async (opts: { receivedAfter: number }) => (
+      messages.filter((message) => message.date >= opts.receivedAfter)
+    ));
 
     await adapter.start();
     const first = pollEvents(mocks.bus)[0]!;
     expect(first.payload.processed).toBe(1);
-    expect(first.payload.skipped.failed).toBe(1);
+    expect(first.payload.skipped.failed).toBe(0);
+    expect(first.payload.skipped.deferred).toBe(1);
     expect(first.payload.fetched).toBe(2);
-    expect(failureLogs(entries)).toEqual([
-      expect.objectContaining({ messageId: 'newer', threadId: 'thread-new' }),
-    ]);
+    expect(entries).toContainEqual(expect.objectContaining({
+      msg: 'Inbound email write-ahead failed — will retry next poll',
+      messageId: 'newer',
+      threadId: 'thread-new',
+    }));
+    expect(failureLogs(entries)).toEqual([]);
 
     await pollNow(adapter);
     const secondCall = list.mock.calls[1]![0] as { receivedAfter: number };
     expect(secondCall.receivedAfter).toBe(olderDate + 1);
+    const second = pollEvents(mocks.bus).at(-1)!;
+    expect(second.payload.processed).toBe(1);
+    expect(second.payload.skipped.failed).toBe(0);
+    expect(second.payload.skipped.deferred).toBe(0);
+    expect(second.payload.fetched).toBe(1);
+    const delivered = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .map((args) => args[1] as BusEvent)
+      .filter((event) => inboundId(event) === 'newer');
+    expect(delivered).toHaveLength(1);
 
     await adapter.drainInFlight();
+    await adapter.stop();
+  });
+
+  it('retries a write-ahead failure that shares a second with the message before it', async () => {
+    const mocks = createMocks();
+    const adapter = makeAdapter(mocks);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const sharedDate = nowSec + 20;
+    const publish = mocks.bus.publish as unknown as (layer: string, event: BusEvent) => Promise<void>;
+    let secondAttempts = 0;
+    (mocks.bus.stagePublish as ReturnType<typeof vi.fn>).mockImplementation(
+      async (layer: string, event: BusEvent) => {
+        if (inboundId(event) === 'second' && secondAttempts++ === 0) throw new Error('audit down');
+        return { deliver: () => publish(layer, event) };
+      },
+    );
+    const messages = [
+      makeMockMessage({
+        id: 'first',
+        threadId: 'thread-first',
+        date: sharedDate,
+        from: [{ email: 'first@example.com' }],
+      }),
+      makeMockMessage({
+        id: 'second',
+        threadId: 'thread-second',
+        date: sharedDate,
+        from: [{ email: 'second@example.com' }],
+      }),
+    ];
+    const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
+    list.mockImplementation(async (opts: { receivedAfter: number }) => (
+      messages.filter((message) => message.date >= opts.receivedAfter)
+    ));
+
+    await adapter.start();
+    expect(pollEvents(mocks.bus)[0]!.payload.skipped.deferred).toBe(1);
+
+    await pollNow(adapter);
+    const secondCall = list.mock.calls[1]![0] as { receivedAfter: number };
+    expect(secondCall.receivedAfter).toBe(sharedDate);
+    const second = pollEvents(mocks.bus).at(-1)!;
+    expect(second.payload.fetched).toBe(2);
+    expect(second.payload.processed).toBe(1);
+    expect(second.payload.skipped.already_staged).toBe(1);
+    expect(second.payload.skipped.failed).toBe(0);
+    const delivered = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .map((args) => args[1] as BusEvent)
+      .map((event) => inboundId(event))
+      .filter((id) => id === 'first' || id === 'second');
+    expect(delivered).toEqual(['first', 'second']);
+
+    await adapter.drainInFlight();
+    await adapter.stop();
+  });
+
+  it('skips a message after repeated write-ahead failures and continues the batch', async () => {
+    const mocks = createMocks();
+    const { logger, entries } = collectLogs();
+    const adapter = makeAdapter(mocks, { logger });
+    const nowSec = Math.floor(Date.now() / 1000);
+    const publish = mocks.bus.publish as unknown as (layer: string, event: BusEvent) => Promise<void>;
+    (mocks.bus.stagePublish as ReturnType<typeof vi.fn>).mockImplementation(
+      async (layer: string, event: BusEvent) => {
+        if (inboundId(event) === 'poison') throw new Error('lone surrogate');
+        return { deliver: () => publish(layer, event) };
+      },
+    );
+    const messages = [
+      makeMockMessage({
+        id: 'after',
+        threadId: 'thread-after',
+        date: nowSec + 40,
+        from: [{ email: 'after@example.com' }],
+      }),
+      makeMockMessage({
+        id: 'poison',
+        threadId: 'thread-poison',
+        date: nowSec + 10,
+        from: [{ email: 'poison@example.com' }],
+      }),
+    ];
+    const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
+    list.mockImplementation(async (opts: { receivedAfter: number }) => (
+      messages.filter((message) => message.date >= opts.receivedAfter)
+    ));
+
+    await adapter.start();
+    expect(adapter.inboundWriteAheadDegraded).toBe(false);
+    for (let poll = 1; poll < WRITE_AHEAD_RETRY_LIMIT - 1; poll++) {
+      await pollNow(adapter);
+    }
+    expect(adapter.inboundWriteAheadDegraded).toBe(false);
+    expect(pollEvents(mocks.bus).at(-1)!.payload.skipped.failed).toBe(0);
+
+    await pollNow(adapter);
+    const last = pollEvents(mocks.bus).at(-1)!;
+    expect(last.payload.fetched).toBe(2);
+    expect(last.payload.processed).toBe(1);
+    expect(last.payload.skipped.failed).toBe(1);
+    expect(last.payload.skipped.deferred).toBe(0);
+    expect(adapter.inboundWriteAheadDegraded).toBe(false);
+    expect(entries).toContainEqual(expect.objectContaining({
+      msg: 'Inbound email write-ahead failed — skipping message after repeated failures',
+      messageId: 'poison',
+    }));
+    const delivered = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .map((args) => args[1] as BusEvent)
+      .map((event) => inboundId(event))
+      .filter((id) => id === 'after' || id === 'poison');
+    expect(delivered).toEqual(['after']);
+
+    await adapter.drainInFlight();
+    await adapter.stop();
+  });
+
+  it('fails email health when write-ahead keeps failing across polls', async () => {
+    const mocks = createMocks();
+    const adapter = makeAdapter(mocks, { pollingIntervalMs: 60_000 });
+    const nowSec = Math.floor(Date.now() / 1000);
+    (mocks.bus.stagePublish as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('audit down'));
+    const messages = [
+      makeMockMessage({
+        id: 'later',
+        threadId: 'thread-later',
+        date: nowSec + 40,
+        from: [{ email: 'later@example.com' }],
+      }),
+      makeMockMessage({
+        id: 'first',
+        threadId: 'thread-first',
+        date: nowSec + 10,
+        from: [{ email: 'first@example.com' }],
+      }),
+    ];
+    const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
+    list.mockImplementation(async (opts: { receivedAfter: number }) => (
+      messages.filter((message) => message.date >= opts.receivedAfter)
+    ));
+
+    await adapter.start();
+    await pollNow(adapter);
+    expect(checkEmail(adapter, 3, new Date())).toBe('ok');
+    await pollNow(adapter);
+    expect(adapter.inboundWriteAheadDegraded).toBe(true);
+    expect(checkEmail(adapter, 3, new Date())).toBe('fail');
+
     await adapter.stop();
   });
 
@@ -699,7 +875,8 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
       await vi.advanceTimersByTimeAsync(EMAIL_INBOUND_TURN_STALL_MS);
       expect(checkEmail(adapter, 3, new Date())).toBe('fail');
       expect(entries).toContainEqual(expect.objectContaining({
-        msg: 'Email adapter: inbound turn still running past 15 minutes',
+        msg: 'Email adapter: inbound turn still running past the stall bound',
+        thresholdMs: EMAIL_INBOUND_TURN_STALL_MS,
         conversationId: 'email:thread-stuck',
       }));
     } finally {
@@ -730,11 +907,149 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
       await vi.advanceTimersByTimeAsync(EMAIL_INBOUND_TURN_STALL_MS);
       expect(adapter.inboundInFlight).toBe(1);
       expect(adapter.inboundMaxConcurrentTurns).toBe(4);
+      expect(adapter.inboundStalledTurns).toBe(1);
+      expect(adapter.oldestInboundPendingAgeMs).toBeNull();
       expect(checkEmail(adapter, 3, new Date())).toBe('ok');
     } finally {
       releaseTurn();
       await adapter.drainInFlight();
       await adapter.stop();
     }
+  });
+
+  it('fails email health when queued mail waits past the stall bound', async () => {
+    vi.useFakeTimers();
+    const mocks = createMocks();
+    const adapter = makeAdapter(mocks, { maxConcurrentTurns: 4, pollingIntervalMs: 60_000 });
+    const gate = hangInbound(mocks.bus);
+    const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
+    list.mockResolvedValueOnce([
+      makeMockMessage({
+        id: 'newer',
+        threadId: 'thread-same',
+        date: 1_700_000_200,
+        from: [{ email: 'ada@example.com' }],
+      }),
+      makeMockMessage({
+        id: 'older',
+        threadId: 'thread-same',
+        date: 1_700_000_100,
+        from: [{ email: 'ada@example.com' }],
+      }),
+    ]).mockResolvedValue([]);
+
+    try {
+      await adapter.start();
+      expect(adapter.inboundInFlight).toBe(1);
+      expect(adapter.inboundPending).toBe(1);
+      expect(checkEmail(adapter, 3, new Date())).toBe('ok');
+      await vi.advanceTimersByTimeAsync(EMAIL_INBOUND_TURN_STALL_MS);
+      expect(adapter.inboundStalledTurns).toBe(1);
+      expect(adapter.inboundMaxConcurrentTurns).toBe(4);
+      expect(checkEmail(adapter, 3, new Date())).toBe('fail');
+    } finally {
+      // stop() drops the queued follower before the in-flight turn is released,
+      // so that follower never starts. Fake timers would not fire the drain
+      // timeout while the turn is still hung.
+      const stopping = adapter.stop();
+      gate.release('older');
+      await stopping;
+    }
+  });
+
+  it('does not persist the watermark or emit channel.poll when stop drops the batch', async () => {
+    const mocks = createMocks();
+    const { logger, entries } = collectLogs();
+    const configStore = {
+      get: vi.fn().mockResolvedValue(null),
+      set: vi.fn().mockResolvedValue({ stored: true }),
+    } as unknown as ConfigStore;
+    const adapter = makeAdapter(mocks, { logger, configStore });
+    const publish = mocks.bus.publish as unknown as (layer: string, event: BusEvent) => Promise<void>;
+    let releaseStage: () => void = () => {};
+    let stageEntered: () => void = () => {};
+    const stageEnteredPromise = new Promise<void>((resolve) => {
+      stageEntered = resolve;
+    });
+    (mocks.bus.stagePublish as ReturnType<typeof vi.fn>).mockImplementation(
+      (layer: string, event: BusEvent) => {
+        stageEntered();
+        return new Promise<{ deliver: () => Promise<void> }>((resolve) => {
+          releaseStage = () => resolve({ deliver: () => publish(layer, event) });
+        });
+      },
+    );
+    const nowSec = Math.floor(Date.now() / 1000);
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      makeMockMessage({
+        id: 'mid-poll',
+        threadId: 'thread-mid',
+        date: nowSec + 10,
+        from: [{ email: 'mid@example.com' }],
+      }),
+    ]);
+
+    const starting = adapter.start();
+    await stageEnteredPromise;
+    await adapter.stop();
+    releaseStage();
+    await starting;
+
+    expect(pollEvents(mocks.bus)).toHaveLength(0);
+    expect(configStore.set).not.toHaveBeenCalled();
+    expect(entries).toContainEqual(expect.objectContaining({
+      msg: 'Email adapter stopped with inbound mail still queued — message dropped',
+      messageId: 'mid-poll',
+    }));
+  });
+
+  it('replays unacknowledged inbound mail before the first poll and does not stage it again', async () => {
+    const mocks = createMocks();
+    const replayed = {
+      id: 'event-replayed',
+      timestamp: new Date(),
+      type: 'inbound.message' as const,
+      sourceLayer: 'channel' as const,
+      payload: {
+        conversationId: 'email:thread-replay',
+        channelId: 'email',
+        accountId: 'curia',
+        senderId: 'ada@example.com',
+        content: 'Still waiting',
+        metadata: {
+          nylasMessageId: 'replayed',
+          nylasThreadId: 'thread-replay',
+          subject: 'Waiting',
+          senderVerified: true,
+        },
+      },
+    };
+    const adapter = makeAdapter(mocks, {
+      unacknowledgedInbound: {
+        listUnacknowledgedInbound: vi.fn().mockResolvedValue([replayed]),
+      },
+    });
+    const nowSec = Math.floor(Date.now() / 1000);
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      makeMockMessage({
+        id: 'replayed',
+        threadId: 'thread-replay',
+        date: nowSec + 5,
+        from: [{ email: 'ada@example.com' }],
+      }),
+    ]);
+
+    await adapter.start();
+    await adapter.drainInFlight();
+
+    expect(mocks.bus.deliverPersisted as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(replayed);
+    expect(mocks.bus.stagePublish).not.toHaveBeenCalled();
+    const audit = pollEvents(mocks.bus);
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.payload.fetched).toBe(1);
+    expect(audit[0]!.payload.processed).toBe(0);
+    expect(audit[0]!.payload.skipped.already_staged).toBe(1);
+
+    await adapter.stop();
   });
 });

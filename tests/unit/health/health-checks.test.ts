@@ -3,7 +3,6 @@ import {
   checkDb,
   checkBus,
   checkBrowser,
-  EMAIL_INBOUND_TURN_STALL_MS,
   checkEmail,
   checkScheduler,
   checkSignal,
@@ -11,7 +10,9 @@ import {
   checkSms,
   checkVoice,
   withTimeout,
+  type EmailAdapterHealth,
 } from '../../../src/health/health-checks.js';
+import { EMAIL_INBOUND_TURN_STALL_MS } from '../../../src/channels/email/inbound-stall.js';
 import type { Logger } from '../../../src/logger.js';
 
 // Stub logger — the probe functions (checkDb, checkSignal, checkMcpServers, ...)
@@ -155,6 +156,20 @@ describe('checkBus', () => {
   });
 });
 
+function emailAdapterHealth(
+  overrides: Partial<EmailAdapterHealth> = {},
+): EmailAdapterHealth {
+  return {
+    lastSuccessfulPollAt: null,
+    pollingIntervalMs: 60_000,
+    oldestInboundPendingAgeMs: null,
+    inboundStalledTurns: 0,
+    inboundMaxConcurrentTurns: 4,
+    inboundWriteAheadDegraded: false,
+    ...overrides,
+  };
+}
+
 describe('checkEmail', () => {
   const startedAt = new Date(Date.now() - 60_000); // 60s ago
 
@@ -164,64 +179,90 @@ describe('checkEmail', () => {
 
   it('returns ok within grace window when lastSuccessfulPollAt is null', () => {
     const recentStart = new Date(Date.now() - 1000); // 1s ago
-    const adapter = { lastSuccessfulPollAt: null, pollingIntervalMs: 60_000 } as never;
+    const adapter = emailAdapterHealth({ pollingIntervalMs: 60_000 });
     expect(checkEmail(adapter, 3, recentStart)).toBe('ok');
   });
 
   it('returns fail when null past grace window', () => {
     const oldStart = new Date(Date.now() - 300_000); // 5min ago, grace = 3×60s = 3min
-    const adapter = { lastSuccessfulPollAt: null, pollingIntervalMs: 60_000 } as never;
+    const adapter = emailAdapterHealth({ pollingIntervalMs: 60_000 });
     expect(checkEmail(adapter, 3, oldStart)).toBe('fail');
   });
 
   it('returns ok when last poll is recent', () => {
-    const adapter = {
+    const adapter = emailAdapterHealth({
       lastSuccessfulPollAt: new Date(Date.now() - 30_000), // 30s ago
       pollingIntervalMs: 60_000,
-    } as never;
+    });
     expect(checkEmail(adapter, 3, startedAt)).toBe('ok');
   });
 
   it('returns fail when last poll is stale', () => {
-    const adapter = {
+    const adapter = emailAdapterHealth({
       lastSuccessfulPollAt: new Date(Date.now() - 300_000), // 5min ago, threshold = 3×60s = 3min
       pollingIntervalMs: 60_000,
-    } as never;
+    });
     expect(checkEmail(adapter, 3, startedAt)).toBe('fail');
   });
 
-  it('fails a fresh poll when every inbound slot is held past 15 minutes', () => {
+  it('fails a fresh poll when every inbound slot is past 15 minutes', () => {
     expect(EMAIL_INBOUND_TURN_STALL_MS).toBe(15 * 60 * 1000);
-    const adapter = {
+    const adapter = emailAdapterHealth({
       lastSuccessfulPollAt: new Date(),
       pollingIntervalMs: 30_000,
-      inboundInFlight: 4,
+      inboundStalledTurns: 4,
       inboundMaxConcurrentTurns: 4,
-      oldestInboundInFlightAgeMs: EMAIL_INBOUND_TURN_STALL_MS,
-    };
+    });
     expect(checkEmail(adapter, 3, startedAt)).toBe('fail');
   });
 
-  it('stays ok when a long turn still has a free slot', () => {
-    const adapter = {
+  it('stays ok when a long turn still has a free slot and nothing is queued', () => {
+    const adapter = emailAdapterHealth({
       lastSuccessfulPollAt: new Date(),
       pollingIntervalMs: 30_000,
-      inboundInFlight: 1,
+      inboundStalledTurns: 1,
       inboundMaxConcurrentTurns: 4,
-      oldestInboundInFlightAgeMs: EMAIL_INBOUND_TURN_STALL_MS,
-    };
+    });
     expect(checkEmail(adapter, 3, startedAt)).toBe('ok');
   });
 
-  it('stays ok when the cap is full but the oldest turn is under the bound', () => {
-    const adapter = {
+  it('stays ok when three of four slots are wedged and nothing is queued', () => {
+    const adapter = emailAdapterHealth({
       lastSuccessfulPollAt: new Date(),
       pollingIntervalMs: 30_000,
-      inboundInFlight: 4,
+      inboundStalledTurns: 3,
       inboundMaxConcurrentTurns: 4,
-      oldestInboundInFlightAgeMs: EMAIL_INBOUND_TURN_STALL_MS - 1,
-    };
+    });
     expect(checkEmail(adapter, 3, startedAt)).toBe('ok');
+  });
+
+  it('fails when queued mail has been waiting past the stall bound', () => {
+    const adapter = emailAdapterHealth({
+      lastSuccessfulPollAt: new Date(),
+      pollingIntervalMs: 30_000,
+      inboundStalledTurns: 1,
+      inboundMaxConcurrentTurns: 4,
+      oldestInboundPendingAgeMs: EMAIL_INBOUND_TURN_STALL_MS,
+    });
+    expect(checkEmail(adapter, 3, startedAt)).toBe('fail');
+  });
+
+  it('stays ok when queued mail is younger than the stall bound', () => {
+    const adapter = emailAdapterHealth({
+      lastSuccessfulPollAt: new Date(),
+      pollingIntervalMs: 30_000,
+      oldestInboundPendingAgeMs: EMAIL_INBOUND_TURN_STALL_MS - 1,
+    });
+    expect(checkEmail(adapter, 3, startedAt)).toBe('ok');
+  });
+
+  it('fails a fresh poll when write-ahead has been failing for several polls', () => {
+    const adapter = emailAdapterHealth({
+      lastSuccessfulPollAt: new Date(),
+      pollingIntervalMs: 30_000,
+      inboundWriteAheadDegraded: true,
+    });
+    expect(checkEmail(adapter, 3, startedAt)).toBe('fail');
   });
 });
 
