@@ -285,7 +285,8 @@ export function resolveSystemPromptSources(
     // like essay-editor don't hallucinate account identifiers.
     channelAccounts: {
       email: ctx.channelAccounts.email || undefined,
-      phone: ctx.channelAccounts.phone || undefined,
+      signal: ctx.channelAccounts.signal || undefined,
+      sms: ctx.channelAccounts.sms || undefined,
     },
     // Principal's verified channel identities — injected into ALL agents (#786, #1950).
     principalIdentities: ctx.principalIdentities,
@@ -326,7 +327,7 @@ export interface AgentAssemblyContext {
   securityContextBlock?: string;
   timezone: string;
   /** Curia's own addresses for the "## Your Contact Details" block. */
-  channelAccounts: { email?: string; phone?: string };
+  channelAccounts: { email?: string; signal?: string; sms?: string };
   selfEmails: readonly string[];
   /** Shared, hot-reloaded array (#1514) — passed by reference, never copied. */
   principalIdentities: ChannelIdentity[];

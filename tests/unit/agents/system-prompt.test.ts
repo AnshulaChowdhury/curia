@@ -139,3 +139,47 @@ describe('buildBaseSystemPrompt verification block', () => {
     ).rejects.toThrow(/block 'verification' failed for agent 'coordinator'/);
   });
 });
+
+// ## Your Contact Details labels each number by channel: Signal and SMS/voice are
+// separate accounts, and a single "Phone" line claimed the Signal number took texts.
+describe('buildBaseSystemPrompt own contact numbers', () => {
+  async function contactBlock(channelAccounts: SystemPromptSources['channelAccounts']): Promise<string | null> {
+    const prompt = await buildBaseSystemPrompt(
+      { agentId: 'calendar', systemPrompt: 'Body.', channelAccounts },
+      { now: NOW, logger },
+    );
+    const start = prompt.indexOf('## Your Contact Details');
+    if (start === -1) return null;
+    return prompt.slice(start, prompt.indexOf('\n\n', prompt.indexOf('- ', start)));
+  }
+
+  it('renders one combined line when Signal and SMS share a number, compared by digits', async () => {
+    const block = await contactBlock({ signal: '+1 (555) 000-1111', sms: '+15550001111' });
+    expect(block).toContain('- Phone (Signal and SMS): +15550001111');
+    expect(block).not.toContain('- Signal:');
+    expect(block).not.toContain('- SMS:');
+  });
+
+  it('renders separate Signal and SMS lines when the numbers differ', async () => {
+    const block = await contactBlock({ email: 'curia@example.com', signal: '+15550001111', sms: '+15550002222' });
+    expect(block).toContain('- Email: curia@example.com\n- Signal: +15550001111\n- SMS: +15550002222');
+    expect(block).not.toContain('Signal and SMS');
+  });
+
+  it('renders only the Signal line when there is no SMS number', async () => {
+    const block = await contactBlock({ signal: '+15550001111' });
+    expect(block).toContain('- Signal: +15550001111');
+    expect(block).not.toContain('Phone');
+  });
+
+  it('renders only the SMS line when there is no Signal number', async () => {
+    const block = await contactBlock({ sms: '+15550002222' });
+    expect(block).toContain('- SMS: +15550002222');
+    expect(block).not.toContain('- Signal:');
+  });
+
+  it('renders no phone line, and no block, when neither number is set', async () => {
+    expect(await contactBlock({ email: 'curia@example.com' })).not.toMatch(/Phone|Signal/);
+    expect(await contactBlock({})).toBeNull();
+  });
+});
