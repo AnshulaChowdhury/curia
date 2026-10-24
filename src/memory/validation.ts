@@ -164,10 +164,17 @@ export class MemoryValidator {
     // 5. No duplicate found — return validated fact data for the caller to persist.
     //    The caller owns ID generation and the store write so that it can coordinate
     //    with edge creation atomically. We only provide what we've computed here:
-    //    the validated inputs plus the embedding from the dedup scan above.
+    //    the validated inputs plus the embedding from the dedup scan above — and only
+    //    when similarity and document prefixes match. Otherwise the store must embed
+    //    as document (ADR-051); passing the similarity vector would stamp the wrong
+    //    purpose into the node.
     //    Timestamps are intentionally omitted — the store always stamps its own
     //    createdAt/lastConfirmedAt on INSERT; any value we set here would be ignored.
-    return this.buildCreateResult(options, newEmbedding);
+    const { prefixes } = this.embeddingService.profile;
+    return this.buildCreateResult(
+      options,
+      prefixes.similarity === prefixes.document ? newEmbedding : undefined,
+    );
   }
 
   /**
