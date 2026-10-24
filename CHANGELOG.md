@@ -59,6 +59,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`kg.nodes_merged` bus event** — new audit event for each knowledge-graph node merge; public bus surface. (#2233)
 - **`web-browser` `clear_site_data`** — clears one host's cookies and storage, recovering half-finished sign-ins; others stay signed in. (#2244)
 - **`browser.settleCapMs`** — **config:** caps the web-browser redirect wait; default 35s, at most 90s. (#2244)
+- **`voice.session.ended` turn stats** — **public API:** optional `turnStats` counts utterances, turns, barge-in cancels and joined fragments. (#2240)
 
 ### Changed
 
@@ -150,6 +151,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`send-draft`** — finds drafts by ID, fixing Gmail 400s; missing drafts no longer read as transient. (#2262)
 - **`email-list` drafts** — `folder: DRAFTS` lists drafts instead of failing on Gmail. (#2262)
 - **`ceo-inbox-draft-compose`** — refuses a draft addressed only to the principal; Curia emails them with `email-send`. (#2262)
+- **Voice turn-taking** — Curia no longer answers mid-sentence pauses; fragments join into one turn. (#2240)
 - **Empty answers at the output cap** — OpenRouter responses that reasoned to `max_tokens` with no answer are retried. (#1915)
 - **Voice tool audit** — spoken-turn tool calls now record `tool.invoke` and `tool.result`, like text turns. (#1968)
 - **Voice barge-ins** — a stream the caller cancels no longer records an `llm.error` or logs an error. (#1968)

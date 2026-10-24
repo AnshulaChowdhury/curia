@@ -76,7 +76,9 @@ describe('DeepgramSttProvider', () => {
     expect(url.searchParams.get('sample_rate')).toBe('16000');
     expect(url.searchParams.get('channels')).toBe('1');
     expect(url.searchParams.get('interim_results')).toBe('true');
-    expect(url.searchParams.get('endpointing')).toBe('true');
+    // An explicit threshold: bare `true` meant Deepgram's 10 ms default (#2240).
+    expect(url.searchParams.get('endpointing')).toBe('400');
+    expect(url.searchParams.get('utterance_end_ms')).toBe('1000');
     expect(url.searchParams.get('language')).toBe('en');
   });
 
