@@ -1974,12 +1974,14 @@ describe('VoiceRuntime opening greeting (#1596)', () => {
       // Curia's own opening row. Without this the null sender closes the call
       // to contact recall (#1892).
       synthetic: true,
+      summarize: 'background',
     });
     expect(addTurn).toHaveBeenNthCalledWith(2, 'voice:g4', 'coordinator', {
       role: 'assistant',
       content: 'Hey boss.',
     }, {
       channelId: 'voice',
+      summarize: 'background',
     });
   });
 
@@ -2016,6 +2018,7 @@ describe('VoiceRuntime opening greeting (#1596)', () => {
     }, {
       senderContactId: '11111111-1111-1111-1111-111111111111',
       channelId: 'voice',
+      summarize: 'background',
     });
   });
 

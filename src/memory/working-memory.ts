@@ -66,6 +66,11 @@ interface StorageBackend {
   getPersonTurns(conversationId: string, agentId: string): Promise<string[]>;
   /** Delete all turns whose expires_at is in the past. Returns the number of rows deleted. */
   purgeExpired(): Promise<number>;
+  /**
+   * Wait for in-flight background summarization. Resolves when every pass
+   * that was queued at the call has settled, or when `timeoutMs` elapses.
+   */
+  drainSummarization(timeoutMs: number): Promise<void>;
 }
 
 /**
@@ -76,11 +81,12 @@ interface StorageBackend {
  * while production uses Postgres.
  *
  * When a `SummarizationConfig` is provided, the Postgres backend automatically
- * summarizes old turns once the active count exceeds `threshold`. A voice write
- * returns after the insert and runs that pass in the background; other channels
- * wait for it. Passes for one conversation and agent are serialized. Summarized
- * turns are marked `archived = true` in the DB (retained for audit) and replaced
- * in active context by a condensed synthetic system turn. See spec §01-memory-system.md.
+ * summarizes old turns once the active count exceeds `threshold`. A write that
+ * passes `summarize: 'background'` (voice does) returns after the insert and
+ * runs that pass in the background; other writes wait for it. Passes for one
+ * conversation and agent are serialized. Summarized turns are marked
+ * `archived = true` in the DB (retained for audit) and replaced in active
+ * context by a condensed synthetic system turn. See spec §01-memory-system.md.
  */
 export class WorkingMemory {
   private backend: StorageBackend;
@@ -163,6 +169,15 @@ export class WorkingMemory {
   /** Delete all turns whose expires_at is in the past. Called by DreamEngine nightly. */
   async purgeExpired(): Promise<number> {
     return this.backend.purgeExpired();
+  }
+
+  /**
+   * Wait for background summarization before the pool closes. The default
+   * covers one condensation call. A pass still running after that is left
+   * in flight.
+   */
+  async drainSummarization(timeoutMs = 5_000): Promise<void> {
+    await this.backend.drainSummarization(timeoutMs);
   }
 }
 
@@ -361,15 +376,16 @@ class PostgresBackend implements StorageBackend {
 
     // After writing, check whether we've crossed the summarization threshold.
     // Summarization is best-effort: the turn row is already stored.
-    // Voice returns here and runs the pass in the background — awaiting the
-    // condensation call is 4–5s of silence before the spoken reply (#2266).
-    // Other channels still wait. A failure of an inline pass is logged and
-    // swallowed here so the caller is not failed for a condensation error;
-    // a background failure is logged at warn on the chain instead.
+    // `summarize: 'background'` (set by VoiceRuntime) returns here and runs
+    // the pass off this call — awaiting the condensation call is 4–5s of
+    // silence before a spoken reply (#2266). Other writes still wait.
+    // A failure of an inline pass is logged and swallowed here so the caller
+    // is not failed for a condensation error; a background failure is logged
+    // at warn on the chain instead.
     // DB retries for the post-LLM persistence half live inside maybeSummarize —
     // wrapping the whole call would re-bill the summarization LLM on a DB blip.
     if (this.summarization) {
-      const background = attribution.channelId === 'voice';
+      const background = attribution.summarize === 'background';
       try {
         await this.scheduleSummarization(conversationId, agentId, background);
       } catch (err) {
@@ -383,8 +399,8 @@ class PostgresBackend implements StorageBackend {
 
   /**
    * Queue a summarization pass behind any in-flight pass for this conversation
-   * and agent. Voice callers get a resolved promise immediately; the pass
-   * continues on the chain. Other callers wait until this pass settles.
+   * and agent. Background callers get a resolved promise immediately; the pass
+   * continues on the chain. Inline callers wait until this pass settles.
    */
   private scheduleSummarization(
     conversationId: string,
@@ -429,6 +445,32 @@ class PostgresBackend implements StorageBackend {
 
     if (background) return Promise.resolve();
     return run;
+  }
+
+  async drainSummarization(timeoutMs: number): Promise<void> {
+    const pending = [...this.summarizationTail.values()];
+    if (pending.length === 0) return;
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(pending),
+        new Promise<void>(resolve => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            resolve();
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    if (timedOut) {
+      this.logger.warn(
+        { pending: pending.length },
+        'working_memory: summarization drain timed out before in-flight passes finished',
+      );
+    }
   }
 
   async getPersonTurns(conversationId: string, agentId: string): Promise<string[]> {
@@ -607,8 +649,8 @@ class PostgresBackend implements StorageBackend {
    * a condensed synthetic system turn at the head of the kept window.
    *
    * Failures propagate to {@link scheduleSummarization}. An inline caller logs
-   * them and continues; a voice caller has already returned, and the chain logs
-   * them at warn. The next add() retries. A failed pass is preferable to
+   * them and continues; a background caller has already returned, and the chain
+   * logs them at warn. The next add() retries. A failed pass is preferable to
    * failing the turn: the row is already stored.
    */
   private async maybeSummarize(
@@ -710,7 +752,8 @@ class PostgresBackend implements StorageBackend {
     });
 
     if (response.type === 'error') {
-      // Propagates to add()'s catch — full AgentError struct preserved in the log there.
+      // Propagates to scheduleSummarization (inline: add()'s error log; background: chain warn).
+      // The full AgentError struct is preserved on the thrown error for that log.
       throw Object.assign(
         new Error(`working_memory: summarization LLM call failed — ${response.error.message}`),
         { agentError: response.error },
@@ -818,7 +861,7 @@ class PostgresBackend implements StorageBackend {
           'working_memory: ROLLBACK failed after transaction error — connection may be in bad state',
         );
       }
-      // Propagate to add()'s catch so the non-fatal policy is applied at the call site.
+      // Propagate to scheduleSummarization (inline: add()'s error log; background: chain warn).
       throw err;
     } finally {
       // Guard release() so it cannot replace the original error with its own exception.
@@ -904,5 +947,9 @@ class InMemoryBackend implements StorageBackend {
 
   async purgeExpired(): Promise<number> {
     return 0; // No expiry mechanism in in-memory backend
+  }
+
+  async drainSummarization(): Promise<void> {
+    // In-memory storage does not summarize.
   }
 }

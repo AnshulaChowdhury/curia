@@ -410,7 +410,7 @@ describe('WorkingMemory — context summarization', () => {
       logger,
       { threshold: 20, keepWindow: 10, provider, model: 'claude-3-5-haiku-20241022' },
     );
-    const voice = { channelId: 'voice' } as const;
+    const voice = { summarize: 'background' as const };
 
     await memory.addTurn('conv-a', AGENT, { role: 'user', content: 'first' }, voice);
     await vi.waitFor(() => expect(started).toEqual(['a']));
@@ -454,7 +454,7 @@ describe('WorkingMemory — context summarization', () => {
     );
 
     await expect(
-      memory.addTurn(CONV, AGENT, { role: 'user', content: 'Message' }, { channelId: 'voice' }),
+      memory.addTurn(CONV, AGENT, { role: 'user', content: 'Message' }, { summarize: 'background' }),
     ).resolves.toBeUndefined();
 
     await vi.waitFor(() => expect(warn).toHaveBeenCalledOnce());
@@ -463,5 +463,132 @@ describe('WorkingMemory — context summarization', () => {
       expect.stringContaining('background summarization failed'),
     );
     expect(error).not.toHaveBeenCalled();
+  });
+
+  function overThresholdPool(): DbPool {
+    const queryHandler = (sql: string): QueryResult<unknown> => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      if (normalized.startsWith('INSERT INTO working_memory')) return { rows: [] };
+      if (normalized.startsWith('SELECT COUNT(*)')) return { rows: [{ count: '21' }] };
+      if (normalized.startsWith('SELECT id, role')) {
+        return { rows: [{ id: makeId(0), role: 'user', content: 'Old', created_at: new Date() }] };
+      }
+      if (normalized.startsWith('SELECT created_at')) {
+        return { rows: [{ created_at: new Date('2026-01-01T12:00:10Z') }] };
+      }
+      return { rows: [] };
+    };
+    return buildMockPool(queryHandler);
+  }
+
+  const summaryResponse = {
+    type: 'text' as const,
+    content: 'summary',
+    usage: {
+      inputTokens: 1,
+      outputTokens: 1,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+    },
+    provenance: { requestedModel: 'fake', actualModel: 'fake', providerRequestId: 'req_sum' },
+  };
+
+  it('keeps a voice-channel write inline unless summarize is background', async () => {
+    let releaseChat: () => void = () => {};
+    const gate = new Promise<void>(resolve => { releaseChat = resolve; });
+    let chats = 0;
+    const provider: LLMProvider = {
+      id: 'mock',
+      chat: async () => {
+        chats += 1;
+        await gate;
+        return summaryResponse;
+      },
+    };
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const memory = WorkingMemory.createWithPostgres(overThresholdPool(), logger, {
+      threshold: 20,
+      keepWindow: 10,
+      provider,
+      model: 'claude-3-5-haiku-20241022',
+    });
+
+    let settled = false;
+    const pending = memory.addTurn(
+      CONV,
+      AGENT,
+      { role: 'user', content: 'hi' },
+      { channelId: 'voice' },
+    ).then(() => { settled = true; });
+    await vi.waitFor(() => expect(chats).toBe(1));
+    expect(settled).toBe(false);
+    releaseChat();
+    await pending;
+    expect(settled).toBe(true);
+  });
+
+  it('drainSummarization waits for an in-flight background pass', async () => {
+    let releaseChat: () => void = () => {};
+    const gate = new Promise<void>(resolve => { releaseChat = resolve; });
+    const provider: LLMProvider = {
+      id: 'mock',
+      chat: async () => {
+        await gate;
+        return summaryResponse;
+      },
+    };
+    const info = vi.fn();
+    const logger = { debug: vi.fn(), info, warn: vi.fn(), error: vi.fn() } as never;
+    const memory = WorkingMemory.createWithPostgres(overThresholdPool(), logger, {
+      threshold: 20,
+      keepWindow: 10,
+      provider,
+      model: 'claude-3-5-haiku-20241022',
+    });
+
+    await memory.addTurn(CONV, AGENT, { role: 'user', content: 'hi' }, { summarize: 'background' });
+    const draining = memory.drainSummarization(2_000);
+    let drainSettled = false;
+    void draining.then(() => { drainSettled = true; });
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(drainSettled).toBe(false);
+
+    releaseChat();
+    await draining;
+    expect(info.mock.calls.some(call => call[1] === 'working_memory: summarization complete')).toBe(true);
+  });
+
+  it('drainSummarization warns when a pass outlasts the timeout', async () => {
+    let releaseChat: () => void = () => {};
+    const gate = new Promise<void>(resolve => { releaseChat = resolve; });
+    let started = false;
+    const provider: LLMProvider = {
+      id: 'mock',
+      chat: async () => {
+        started = true;
+        await gate;
+        return summaryResponse;
+      },
+    };
+    const warn = vi.fn();
+    const info = vi.fn();
+    const logger = { debug: vi.fn(), info, warn, error: vi.fn() } as never;
+    const memory = WorkingMemory.createWithPostgres(overThresholdPool(), logger, {
+      threshold: 20,
+      keepWindow: 10,
+      provider,
+      model: 'claude-3-5-haiku-20241022',
+    });
+
+    await memory.addTurn(CONV, AGENT, { role: 'user', content: 'hi' }, { summarize: 'background' });
+    await vi.waitFor(() => expect(started).toBe(true));
+    await memory.drainSummarization(20);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ pending: 1 }),
+      expect.stringContaining('summarization drain timed out'),
+    );
+
+    releaseChat();
+    await vi.waitFor(() => expect(info).toHaveBeenCalled());
   });
 });
