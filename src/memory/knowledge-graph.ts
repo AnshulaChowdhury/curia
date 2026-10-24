@@ -15,6 +15,9 @@ import { createNodeId, createEdgeId, SENSITIVITY_LEVELS } from './types.js';
 import { EmbeddingService } from './embedding.js';
 import { embeddingStamp, type EmbeddingPurpose } from './embedding-profiles.js';
 
+/** Longest withAdvisoryLock() waits for another holder before failing (Postgres interval). */
+const ADVISORY_LOCK_TIMEOUT = '10s';
+
 // -- Public option interfaces --
 
 export interface CreateNodeOptions {
@@ -103,6 +106,11 @@ interface KnowledgeGraphBackend {
    * the database so unrelated facts and their embeddings are never loaded.
    */
   getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]>;
+  /**
+   * Run `fn` while holding a database-wide mutex named `lockKey`, so callers in
+   * other processes serialize on the same name. `fn` may use any connection.
+   */
+  withAdvisoryLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T>;
   deleteEdge(id: string): Promise<void>;
   updateEdge(id: string, updates: { confidence: number; lastConfirmedAt: Date }): Promise<KgEdge>;
   // Atomic upsert: creates if no matching (src, tgt, type) pair exists in either
@@ -284,6 +292,15 @@ export class KnowledgeGraphStore {
    */
   async getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]> {
     return this.backend.getConnectedFactsByKey(nodeId, key);
+  }
+
+  /**
+   * Run `fn` under a database-wide mutex named `lockKey` (a transaction-scoped
+   * Postgres advisory lock), so a check-then-create in `fn` is safe against the
+   * same call in another process. Locks are never nested; hold one only briefly.
+   */
+  async withAdvisoryLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+    return this.backend.withAdvisoryLock(lockKey, fn);
   }
 
   /**
@@ -738,6 +755,33 @@ class PostgresBackend implements KnowledgeGraphBackend {
       [nodeId, key],
     );
     return result.rows.map(pgRowToNode);
+  }
+
+  async withAdvisoryLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+    // The lock lives on its own connection inside a transaction that does no work:
+    // COMMIT (or ROLLBACK, or the connection dropping) releases it. `fn` runs its
+    // queries on other pool connections in autocommit, so its writes are durable
+    // before the lock is released and the next holder sees them.
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // A stuck holder surfaces as a lock_timeout error rather than a silent hang.
+      // set_config(..., true) is SET LOCAL with a bind parameter.
+      await client.query(`SELECT set_config('lock_timeout', $1, true)`, [ADVISORY_LOCK_TIMEOUT]);
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [lockKey]);
+      const result = await fn();
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        this.logger.error({ err: rollbackErr, lockKey }, 'kg: advisory lock rollback failed');
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   async deleteEdge(id: string): Promise<void> {
@@ -1293,6 +1337,11 @@ class InMemoryBackend implements KnowledgeGraphBackend {
       if (props.key === undefined) return f.label === key;
       return props.key !== null && String(props.key) === key;
     });
+  }
+
+  async withAdvisoryLock<T>(_lockKey: string, fn: () => Promise<T>): Promise<T> {
+    // One process owns an in-memory graph, so there is no other holder to exclude.
+    return fn();
   }
 
   async deleteEdge(id: string): Promise<void> {

@@ -124,8 +124,8 @@ const FUZZY_SEARCH_LIMIT = 5;
  * when the caller does not specify one. Without a classifier, nodes default to 'internal'.
  */
 export class EntityMemory {
-  /** In-flight exact-key writes, keyed by entity + key; see storeFact(). */
-  private exactKeyWrites = new Map<string, Promise<void>>();
+  /** Settles when the last queued exact-key write in this process finishes; see storeFact(). */
+  private exactKeyWriteTail: Promise<void> = Promise.resolve();
 
   constructor(
     private store: KnowledgeGraphStore,
@@ -562,16 +562,16 @@ export class EntityMemory {
    *
    * Exact-key writes (#2252) are serialized per (entity, key): the validator's
    * find-or-create is check-then-act, so two overlapping writes of a missing key
-   * would otherwise both create a fact. A process-local queue is enough because
-   * a running Curia holds the instance lock (ADR-051) — no second process writes
-   * the same database.
+   * would otherwise both create a fact. The write runs under a database advisory
+   * lock named for the entity and key, which also excludes a second Curia process
+   * — the instance lock (ADR-051) is advisory and does not stop one from starting.
    */
   async storeFact(options: StoreFactOptions): Promise<StoreFactResult> {
     const exactKey = options.exactKey === true
       ? (options.properties as Record<string, unknown> | undefined)?.key
       : undefined;
     if (typeof exactKey === 'string') {
-      return this.withExactKeyLock(`${options.entityNodeId}\u0000${exactKey}`, () =>
+      return this.withExactKeyLock(`kg-exact-key:${options.entityNodeId}:${exactKey}`, () =>
         this.storeFactUnserialized(options),
       );
     }
@@ -579,21 +579,21 @@ export class EntityMemory {
   }
 
   /**
-   * Runs `fn` after every earlier call with the same lock key has settled.
-   * The map only holds keys with a write in flight, so it does not grow.
+   * Runs `fn` under the database lock `lockKey`. Exact-key writes in this process
+   * also queue behind one another first, so it holds at most one lock connection
+   * at a time and cannot drain the pool while `fn` needs connections of its own.
+   * Config writes are low-volume, so queueing different keys costs little.
    */
   private async withExactKeyLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.exactKeyWrites.get(lockKey) ?? Promise.resolve();
+    const previous = this.exactKeyWriteTail;
     let release!: () => void;
     const current = new Promise<void>((resolve) => { release = resolve; });
-    const tail = previous.then(() => current);
-    this.exactKeyWrites.set(lockKey, tail);
+    this.exactKeyWriteTail = previous.then(() => current);
     await previous;
     try {
-      return await fn();
+      return await this.store.withAdvisoryLock(lockKey, fn);
     } finally {
       release();
-      if (this.exactKeyWrites.get(lockKey) === tail) this.exactKeyWrites.delete(lockKey);
     }
   }
 
