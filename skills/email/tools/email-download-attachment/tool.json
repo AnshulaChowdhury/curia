@@ -1,12 +1,12 @@
 {
   "name": "email-download-attachment",
-  "description": "Download an email attachment. Prefer passing filename (short, readable) from email-get's attachments array — Nylas attachment IDs are long opaque strings that are easy to mistype. attachment_id still works for an exact match. The output provides EITHER temp_file_url (a file:// URL to the bytes on disk, returned when temp storage is available) OR content_base64 (base64-encoded file content, returned only when temp storage is unavailable) — never both, to stay under the output size limit. When content_base64 is present, pass it and content_type directly to file-parse for processing; when only temp_file_url is present, use it for binary-safe Drive uploads (see the temp_file_url output field). Enforces a 10 MB size limit.",
+  "description": "Download an email attachment. Prefer filename from email-get (short, reliable); attachment_id also works. Returns EITHER temp_file_url (file:// bytes on disk) OR content_base64 (for file-parse) — never both. Use temp_file_url for binary-safe Drive uploads. 10 MB limit.",
   "version": "1.1.0",
   "sensitivity": "normal",
   "action_risk": "low",
   "inputs": {
-    "attachment_id": "string? (Nylas attachment ID from email-get's attachments array — optional when filename is provided; long IDs are often mistyped, so prefer filename)",
-    "filename": "string? (exact attachment filename from email-get — preferred over attachment_id; must be unique on the message)",
+    "attachment_id": "string? (Nylas attachment ID; optional when filename is set — prefer filename)",
+    "filename": "string? (exact filename from email-get — preferred; must be unique on the message)",
     "message_id": "string (Nylas message ID the attachment belongs to)",
     "account": "string? (named account to read from, as configured under Settings → Channels → Email → Email accounts. Defaults to the primary account.)"
   },
@@ -16,7 +16,7 @@
     "filename": "string (original attachment filename)",
     "content_type": "string (MIME type, e.g. 'application/pdf')",
     "size": "number (actual byte count after download)",
-    "resolved_by": "string (how the attachment was selected: 'id' | 'filename' | 'sole_attachment')"
+    "resolved_by": "string ('id' | 'filename' | 'sole_attachment')"
   },
   "permissions": [],
   "secrets": [],
