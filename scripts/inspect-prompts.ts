@@ -70,6 +70,13 @@ export interface PromptInputsSnapshot {
   /** Verified + active only (readPrincipalIdentitySnapshot) — the fields the block renders. */
   principal_identities: Array<{ channel: string; channel_identifier: string; label: string | null }>;
   principal_primary_email: string | null;
+  /** The ### Principal Profile fields (#2226); null when the database has no principal. */
+  principal_profile: {
+    display_name: string;
+    preferred_name: string | null;
+    title: string | null;
+    pronouns: string | null;
+  } | null;
   /** `phone` is a legacy alias of `signal` for curia-deploy's loader. */
   channel_accounts: { email: string | null; signal: string | null; sms: string | null; phone: string | null };
   /**
@@ -101,6 +108,7 @@ export async function buildPromptInputsSnapshot(
   if (!rc.autonomyService) throw new Error('coordinator runtime config has no autonomyService');
   if (!rc.principalIdentities) throw new Error('coordinator runtime config has no principalIdentities');
   if (!rc.principalPrimaryEmail) throw new Error('coordinator runtime config has no principalPrimaryEmail');
+  if (!rc.principalProfile) throw new Error('coordinator runtime config has no principalProfile');
   if (!rc.channelAccounts) throw new Error('coordinator runtime config has no channelAccounts');
   if (!rc.agentContactId) throw new Error('coordinator runtime config has no agentContactId');
   const timezone = rc.timezone?.trim();
@@ -131,6 +139,14 @@ export async function buildPromptInputsSnapshot(
     })),
     // null is legitimate for these three: no primary email set, no mailbox, no Signal.
     principal_primary_email: rc.principalPrimaryEmail.current ?? null,
+    principal_profile: rc.principalProfile.current
+      ? {
+        display_name: rc.principalProfile.current.displayName,
+        preferred_name: rc.principalProfile.current.preferredName,
+        title: rc.principalProfile.current.title,
+        pronouns: rc.principalProfile.current.pronouns,
+      }
+      : null,
     channel_accounts: {
       email: rc.channelAccounts.email ?? null,
       signal: rc.channelAccounts.signal ?? null,

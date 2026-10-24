@@ -517,6 +517,10 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-14T20:17:18.967Z"
     },
+    "principal pronouns unset email": {
+      "unstubbed": null,
+      "reason": "Not yet measured: the case needs a billed run, which waits for the maintainer's go-ahead (#2226)."
+    },
     "principal reply no internals": {
       "unstubbed": 0,
       "runs": 5,

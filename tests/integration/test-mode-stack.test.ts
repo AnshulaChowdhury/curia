@@ -122,6 +122,7 @@ describeIf('test-mode stack', () => {
       const expected = formatWhoYouServeBlock(
         rc.principalIdentities ?? [],
         rc.principalPrimaryEmail?.current ?? null,
+        rc.principalProfile?.current ?? null,
       );
       if (expected) {
         expect(rendered).toContain(expected);

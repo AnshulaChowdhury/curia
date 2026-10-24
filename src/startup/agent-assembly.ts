@@ -40,7 +40,7 @@ import {
   resolvePinnedSkills,
   type PinResolution,
 } from '../skills/pin-resolution.js';
-import type { ChannelIdentity, PrincipalPrimaryEmailRef } from '../contacts/types.js';
+import type { ChannelIdentity, PrincipalPrimaryEmailRef, PrincipalProfile, PrincipalProfileRef } from '../contacts/types.js';
 import { findPrimaryEmailIdentity } from '../agents/principal-contact-block.js';
 import type { ContactService } from '../contacts/contact-service.js';
 import type { ConversationEntityState } from '../entity-context/conversation-entities.js';
@@ -209,6 +209,7 @@ export type SystemPromptSourceContext = Pick<
   | 'channelAccounts'
   | 'principalIdentities'
   | 'principalPrimaryEmail'
+  | 'principalProfile'
   | 'agentContactId'
   | 'verification'
   | 'browserSessionAlive'
@@ -230,6 +231,7 @@ export const SYSTEM_PROMPT_SOURCE_CONTEXT_KEYS = [
   'channelAccounts',
   'principalIdentities',
   'principalPrimaryEmail',
+  'principalProfile',
   'agentContactId',
   'verification',
   'browserSessionAlive',
@@ -291,6 +293,7 @@ export function resolveSystemPromptSources(
     // Principal's verified channel identities — injected into ALL agents (#786, #1950).
     principalIdentities: ctx.principalIdentities,
     principalPrimaryEmail: ctx.principalPrimaryEmail,
+    principalProfile: ctx.principalProfile,
     // Coordinator-only roster block. Specialists that opt in via inject_specialists
     // keep the bootstrap ${available_specialists} placeholder instead.
     availableSpecialists: isCoordinator ? ctx.agentRegistry.specialistSummary() : undefined,
@@ -332,6 +335,7 @@ export interface AgentAssemblyContext {
   /** Shared, hot-reloaded array (#1514) — passed by reference, never copied. */
   principalIdentities: ChannelIdentity[];
   principalPrimaryEmail: PrincipalPrimaryEmailRef;
+  principalProfile: PrincipalProfileRef;
   agentContactId?: string;
   principalContactId?: string;
   /** Delegated sign-in verifications (#2017); injected per turn into the coordinator and ceo-inbox. */
@@ -506,10 +510,22 @@ export function assembleAgents(
 export async function readPrincipalIdentitySnapshot(
   contactService: Pick<ContactService, 'getContactWithIdentities'>,
   principalContactId: string,
-): Promise<{ identities: ChannelIdentity[]; primaryEmail: string | null }> {
+): Promise<{ identities: ChannelIdentity[]; primaryEmail: string | null; profile: PrincipalProfile | null }> {
   const withIdentities = await contactService.getContactWithIdentities(principalContactId);
   const identities = (withIdentities?.identities ?? []).filter((id) => id.verified && id.status === 'active');
-  return { identities, primaryEmail: withIdentities?.contact.primaryEmail ?? null };
+  const contact = withIdentities?.contact;
+  return {
+    identities,
+    primaryEmail: contact?.primaryEmail ?? null,
+    profile: contact
+      ? {
+        displayName: contact.displayName,
+        preferredName: contact.preferredName,
+        title: contact.title,
+        pronouns: contact.pronouns,
+      }
+      : null,
+  };
 }
 
 /**

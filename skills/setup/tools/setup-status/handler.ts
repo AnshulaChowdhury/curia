@@ -11,6 +11,7 @@ type CompletionCheck =
   | { type: 'behavioral_preferences' }
   | { type: 'scheduler_has_active_debrief' }
   | { type: 'always_available' }
+  | { type: 'principal_profile' }
   | { type: 'vault_secrets_all'; keys: string[] };
 
 interface CatalogTask {
@@ -148,6 +149,19 @@ export class SetupStatusHandler implements ToolHandler {
         );
       }
 
+      // The principal's pronouns are the marker for "told Curia how to refer to me": the
+      // preferred name and title have working defaults, pronouns do not (#2226). A failed
+      // lookup reads as pending rather than failing the whole status call.
+      let profileDone = false;
+      if (ctx.contactService) {
+        try {
+          const principal = await ctx.contactService.findContactBySystemRole('principal');
+          profileDone = !!principal?.pronouns?.trim();
+        } catch (err) {
+          ctx.log.warn({ err }, 'setup-status: principal profile lookup failed — reporting pending');
+        }
+      }
+
       const annotated: CatalogTaskWithStatus[] = tasks.map(task => {
         let done = false;
         // Cast to include undefined: catalog.yaml is loaded without per-entry validation,
@@ -164,6 +178,9 @@ export class SetupStatusHandler implements ToolHandler {
               break;
             case 'always_available':
               done = true;
+              break;
+            case 'principal_profile':
+              done = profileDone;
               break;
             case 'vault_secrets_all':
               done = check.keys.every(k => secretPresent(ctx, k));

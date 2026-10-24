@@ -91,7 +91,7 @@ import { ConfidencePipeline } from '../contacts/confidence-pipeline.js';
 import { loadAuthConfig } from '../contacts/config-loader.js';
 import { AuthorizationService } from '../contacts/authorization.js';
 import type { TrustScorerWeights } from '../dispatch/trust-scorer.js';
-import type { ChannelIdentity, ChannelPolicyConfig, PrincipalPrimaryEmailRef } from '../contacts/types.js';
+import type { ChannelIdentity, ChannelPolicyConfig, PrincipalPrimaryEmailRef, PrincipalProfileRef } from '../contacts/types.js';
 import { OutboundContextService } from '../dispatch/outbound-context.js';
 import { OutboundContentFilter } from '../dispatch/outbound-filter.js';
 import {
@@ -805,10 +805,12 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     const principalContact = await contactService.findContactBySystemRole('principal');
     const principalIdentities: ChannelIdentity[] = [];
     const principalPrimaryEmail: PrincipalPrimaryEmailRef = { current: null };
+    const principalProfile: PrincipalProfileRef = { current: null };
     if (principalContact) {
       const snapshot = await readPrincipalIdentitySnapshot(contactService, principalContact.id);
       principalIdentities.push(...snapshot.identities);
       principalPrimaryEmail.current = snapshot.primaryEmail;
+      principalProfile.current = snapshot.profile;
       // The same gaps production logs at boot, so a smoke, scenario or snapshot run on
       // a prompt without them says why (shared helper; see agent-assembly.ts).
       warnings.push(...principalIdentitySnapshotGaps(snapshot));
@@ -979,6 +981,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       selfEmails,
       principalIdentities,
       principalPrimaryEmail,
+      principalProfile,
       agentContactId,
       principalContactId: principalContact?.id,
       // The per-turn sign-in verification block (#2017), same gating as production.

@@ -1,5 +1,5 @@
 name: setup-wizard
-version: "0.3.2"
+version: "0.4.0"
 role: specialist
 description: >
   Resumable first-conversation concierge and setup guide. Invoke when the principal
@@ -40,7 +40,11 @@ system_prompt: |
      - A cron expression matching their preference (e.g. "0 17 * * 1-5" for 5pm
        weekdays, "0 16 * * 5" for 4pm Fridays)
      - task payload: { "type": "debrief", "task": "Generate end-of-day summary" }
-  3. **Capability tour:** Call tool-registry and return the top 5–6 things ready
+  3. **How to refer to them:** Ask how they want to be addressed: what to call them,
+     their pronouns, and their title. Pronouns matter most, since emails go out in
+     their name. Then call contact-update with contact_id "principal" and only the
+     fields they gave (preferredName, pronouns, title).
+  4. **Capability tour:** Call tool-registry and return the top 5–6 things ready
      right now in plain language grouped by area.
 
   Then ask: "What's the one thing you'd most like me to help with — email,
@@ -117,5 +121,6 @@ pinned_skills:
   - tool-registry
   - memory-store
   - executive-profile-update
+  - contact-update
 allow_discovery: false
 inject_specialists: false

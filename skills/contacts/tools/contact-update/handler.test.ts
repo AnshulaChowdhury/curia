@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import pino from 'pino';
 import { ContactUpdateHandler } from './handler.js';
 import { ContactService } from '../../../../src/contacts/contact-service.js';
@@ -114,6 +114,38 @@ describe('ContactUpdateHandler', () => {
 
     expect(result.success).toBe(false);
     expect((result as { success: false; error: string }).error).toMatch(/No contact exists/);
+  });
+
+  // ── The "principal" alias (#2226) ─────────────────────────────────────────
+
+  it('resolves contact_id "principal" to the principal contact and writes the profile fields', async () => {
+    const principal = await contactService.createContact({ displayName: 'Avery Testwell', source: 'ceo_stated' });
+    vi.spyOn(contactService, 'findContactBySystemRole').mockResolvedValue(principal);
+    const ctx = makeCtx({
+      input: { contact_id: 'principal', fields: { pronouns: 'she/her', preferredName: 'Avy' } },
+      contactService,
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect((result as { success: true; data: { contact_id: string } }).data.contact_id).toBe(principal.id);
+    const stored = await contactService.getContact(principal.id);
+    expect(stored?.pronouns).toBe('she/her');
+    expect(stored?.preferredName).toBe('Avy');
+  });
+
+  it('returns a clear error for "principal" when no principal exists yet', async () => {
+    vi.spyOn(contactService, 'findContactBySystemRole').mockResolvedValue(null);
+    const ctx = makeCtx({
+      input: { contact_id: 'principal', fields: { pronouns: 'they/them' } },
+      contactService,
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(false);
+    expect((result as { success: false; error: string }).error).toMatch(/No principal contact/);
   });
 
   // ── Happy path ────────────────────────────────────────────────────────────

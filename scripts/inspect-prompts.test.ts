@@ -32,6 +32,9 @@ function coordinatorConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
       { channel: 'signal', channelIdentifier: '+15550001111', label: null, verified: true, status: 'active' },
     ],
     principalPrimaryEmail: { current: 'p@example.com' },
+    principalProfile: {
+      current: { displayName: 'Pat Principal', preferredName: 'Pat', title: 'CEO', pronouns: null },
+    },
     ...overrides,
   } as unknown as AgentConfig;
 }
@@ -70,6 +73,7 @@ describe('buildPromptInputsSnapshot', () => {
         { channel: 'signal', channel_identifier: '+15550001111', label: null },
       ],
       principal_primary_email: 'p@example.com',
+      principal_profile: { display_name: 'Pat Principal', preferred_name: 'Pat', title: 'CEO', pronouns: null },
       // phone mirrors signal for curia-deploy's loader until it reads signal/sms.
       channel_accounts: { email: 'curia@example.com', signal: '+15550003333', sms: null, phone: '+15550003333' },
       disabled_skills: ['calendar', 'ceo-inbox'],
@@ -107,6 +111,7 @@ describe('buildPromptInputsSnapshot', () => {
     // Every-agent fields: absent must not read as "a principal with no identities".
     ['principalIdentities', { principalIdentities: undefined }],
     ['principalPrimaryEmail', { principalPrimaryEmail: undefined }],
+    ['principalProfile', { principalProfile: undefined }],
     ['channelAccounts', { channelAccounts: undefined }],
     ['agentContactId', { agentContactId: undefined }],
   ] as const)('refuses to emit a snapshot when the coordinator has no %s', async (_field, overrides) => {
