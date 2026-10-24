@@ -5,6 +5,7 @@ import type { OutboundContextRow } from '../../../../src/dispatch/outbound-conte
 import { OutboundContextService } from '../../../../src/dispatch/outbound-context.js';
 import { createSilentLogger, type Logger } from '../../../../src/logger.js';
 import type { LLMProvider, LLMResponse, LLMStreamEvent, Message } from '../../../../src/agents/llm/provider.js';
+import { ABORTED_TOOL_RESULT } from '../../../../src/agents/llm/streaming-turn.js';
 import { DATE_RESOLVE_GUARDRAIL } from '../../../../src/agents/prompts/date-resolve-guardrail.js';
 import { VOICE_ASYNC_OFFRAMP_GUIDANCE } from '../../../../src/agents/prompts/voice-async-offramp.js';
 import {
@@ -660,8 +661,11 @@ describe('VoiceRuntime', () => {
     const followUp = llm.seenMessages.findIndex((msgs) =>
       msgs.some((m) => m.content === 'never mind the lookup'),
     );
-    expect(llm.streamStartedAt[followUp]! - bargeAt).toBeLessThan(100);
+    // toolSettled staying false is the proof the follow-up did not wait on the
+    // tool. The clock is only a margin under the 15s skill timeout: a loaded
+    // runner can miss a tight bound even when the logic is right (#2265 review).
     expect(toolSettled).toBe(false);
+    expect(llm.streamStartedAt[followUp]! - bargeAt).toBeLessThan(1_000);
 
     const idle = await Promise.race([
       runtime.awaitIdle('tool-barge').then(() => 'idle' as const),
@@ -683,11 +687,11 @@ describe('VoiceRuntime', () => {
 
     const flat = JSON.stringify(llm.seenMessages);
     expect(flat).not.toContain(lateResult);
-    expect(flat).not.toContain('Tool execution cancelled');
+    expect(flat).not.toContain(ABORTED_TOOL_RESULT);
     const stored = await wm.getHistory('voice:tool-barge', 'coordinator', { raw: true });
     const storedFlat = JSON.stringify(stored);
     expect(storedFlat).not.toContain(lateResult);
-    expect(storedFlat).not.toContain('Tool execution cancelled');
+    expect(storedFlat).not.toContain(ABORTED_TOOL_RESULT);
   });
 
   it("hands the tool bridge the turn's inbound.message id, the parent of its tool audit (#1968)", async () => {

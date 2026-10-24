@@ -9,6 +9,7 @@ import type {
   ToolCall,
 } from '../../../../src/agents/llm/provider.js';
 import {
+  ABORTED_TOOL_RESULT,
   DEFAULT_STREAMING_MAX_ROUNDS,
   StreamUnsupportedError,
   assertStreamingProvider,
@@ -286,7 +287,7 @@ describe('runStreamingToolLoop (#1552)', () => {
     expect(result.messages[1]).toEqual(
       buildUserToolResultMessage([
         { id: 'call_1', content: 'first-ok' },
-        { id: 'call_2', content: 'Tool execution cancelled (turn aborted).', isError: true },
+        { id: 'call_2', content: ABORTED_TOOL_RESULT, isError: true },
       ]),
     );
   });

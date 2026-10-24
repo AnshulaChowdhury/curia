@@ -23,6 +23,7 @@ import type {
 } from '../../agents/llm/provider.js';
 import type { AgentError } from '../../errors/types.js';
 import {
+  ABORTED_TOOL_RESULT,
   DEFAULT_STREAMING_MAX_ROUNDS,
   StreamUnsupportedError,
   assertStreamingProvider,
@@ -42,9 +43,6 @@ const EXHAUSTION_FALLBACK = 'Sorry, I could not finish that — please try again
 
 /** Placeholder when voice has no invokeTool bridge (should not happen in production). */
 const MISSING_INVOKE_TOOL_RESULT = 'Tool execution is not wired for voice turns yet.';
-
-/** Fed back only when the turn is already aborting, so the model never sees it. */
-const ABORTED_TOOL_RESULT = 'Tool execution cancelled (turn aborted).';
 
 /**
  * Start the tool, but resolve as soon as the turn aborts. The call keeps

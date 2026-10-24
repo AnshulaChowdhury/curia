@@ -401,7 +401,7 @@ describe('VoiceTurnRunner', () => {
 });
 
 describe('VoiceTurnRunner barge-in during a tool call (#2265)', () => {
-  it('unwinds a tool that never resolves within 100ms and discards the late result', async () => {
+  it('unwinds a hung tool call before the tool settles and discards the late result', async () => {
     const lateResult = 'LATE_SECRET_RESULT_should_not_leak';
     let releaseTool: (result: { content: string }) => void = () => {};
     const gate = new Promise<{ content: string }>((resolve) => {
@@ -437,7 +437,10 @@ describe('VoiceTurnRunner barge-in during a tool call (#2265)', () => {
       runner.runTurn({ messages: [{ role: 'user', content: 'look it up' }], signal: controller.signal })
         .then((result) => ({ kind: 'done' as const, result })),
       new Promise<{ kind: 'timeout' }>((resolve) => {
-        setTimeout(() => resolve({ kind: 'timeout' }), 100);
+        // Same margin as the runtime test: under the 15s skill timeout, not a
+        // tight wall-clock proof. A hang fails here; a correct unwind returns
+        // as soon as the abort listener runs.
+        setTimeout(() => resolve({ kind: 'timeout' }), 1_000);
       }),
     ]);
     expect(outcome.kind).toBe('done');
