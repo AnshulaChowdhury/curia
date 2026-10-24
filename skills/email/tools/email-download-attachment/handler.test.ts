@@ -5,6 +5,11 @@ import { EmailDownloadAttachmentHandler } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import { createSilentLogger } from '../../../../src/logger.js';
 import type { NylasMessage } from '../../../../src/channels/email/nylas-client.js';
+import {
+  DMARC_REAL_ATTACHMENT_ID,
+  DMARC_CORRUPTED_ATTACHMENT_ID,
+  DMARC_FILENAME,
+} from '../../../_shared/resolve-attachment.fixtures.js';
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -174,16 +179,11 @@ describe('EmailDownloadAttachmentHandler — successful download', () => {
   });
 
   it('downloads via sole_attachment for the 2026-10-24 corrupted ID fixture', async () => {
-    const realId =
-      'v0:Z29vZ2xlLmNvbSFqb3NlcGhmdW5nLmNhITE3OTI3MTM2MDAhMTc5Mjc5OTk5OS56aXA=:YXBwbGljYXRpb24vemlwOyBuYW1lPSJnb29nbGUuY29tIWpvc2VwaGZ1bmcuY2EhMTc5MjcxMzYwMCExNzkyNzk5OTk5LnppcCI=:814';
-    const corruptedId =
-      'v0:Z29vZ2xlLmNvbSFqb3NlcGhmdW5nLmNhITE3OTI3MTM2MDAhMTc5Mjc5OTk5OS56aXA=:YXBwbGljYXRpb24venppcDsgnamePSJnb29nbGUuY29tIWpvc2VwaGZ1bmcuY2EhMTc5MjcxMzYwMCExNzkyNzk5OTk5LnppcCI=:814';
-    const dmarcFilename = 'google.com!josephfung.ca!1792713600!1792799999.zip';
     const content = Buffer.from('PK\x03\x04dmarc');
     const msg = makeMessage({
       attachments: [{
-        id: realId,
-        filename: dmarcFilename,
+        id: DMARC_REAL_ATTACHMENT_ID,
+        filename: DMARC_FILENAME,
         contentType: 'application/zip',
         size: content.length,
       }],
@@ -191,7 +191,7 @@ describe('EmailDownloadAttachmentHandler — successful download', () => {
     const download = vi.fn().mockResolvedValue(content);
     const handler = new EmailDownloadAttachmentHandler();
     const result = await handler.execute(makeCtx({
-      input: { attachment_id: corruptedId, message_id: 'msg-1' },
+      input: { attachment_id: DMARC_CORRUPTED_ATTACHMENT_ID, message_id: 'msg-1' },
       outboundGateway: makeMockGateway({
         getEmailMessage: vi.fn().mockResolvedValue(msg),
         downloadEmailAttachment: download,
@@ -201,8 +201,8 @@ describe('EmailDownloadAttachmentHandler — successful download', () => {
     expect(result.success).toBe(true);
     const data = (result as { data: Record<string, unknown> }).data;
     expect(data.resolved_by).toBe('sole_attachment');
-    expect(data.filename).toBe(dmarcFilename);
-    expect(download).toHaveBeenCalledWith(realId, 'msg-1', undefined);
+    expect(data.filename).toBe(DMARC_FILENAME);
+    expect(download).toHaveBeenCalledWith(DMARC_REAL_ATTACHMENT_ID, 'msg-1', undefined);
   });
 
   it('downloads via filename when ID is wrong on a multi-attachment message', async () => {

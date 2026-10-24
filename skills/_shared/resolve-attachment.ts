@@ -46,6 +46,20 @@ export interface ResolveAttachmentOptions {
 }
 
 /**
+ * True when the caller supplied a usable attachment_id and/or filename after trim.
+ * Handlers use this before fetching the message; the helper owns trim for matching.
+ */
+export function attachmentSelectorPresent(options: {
+  attachmentId?: string;
+  filename?: string;
+}): boolean {
+  return Boolean(
+    (typeof options.attachmentId === 'string' && options.attachmentId.trim()) ||
+      (typeof options.filename === 'string' && options.filename.trim()),
+  );
+}
+
+/**
  * Format the attachments that exist on a message for an error string the model
  * can use on the next attempt (filename is the recommended retry key).
  */
@@ -54,81 +68,126 @@ export function formatAttachmentListing(attachments: readonly ResolvableAttachme
     return 'Message has no attachments.';
   }
   const lines = attachments.map(
-    (a) => `- filename=${JSON.stringify(a.filename)} size=${a.size} id=${a.id}`,
+    (a) =>
+      `- filename=${JSON.stringify(a.filename)} content_type=${JSON.stringify(a.contentType)} ` +
+      `size=${a.size} id=${a.id}`,
   );
   return `Attachments on this message:\n${lines.join('\n')}`;
 }
 
+function filenameMatches(attachment: ResolvableAttachment, filenameRaw: string, filenameKey: string): boolean {
+  // Exact match first so names with leading/trailing whitespace still work when
+  // the model copies the JSON.stringify form from the listing. Trimmed equality
+  // covers the common case where the model (or the listing reader) strips spaces.
+  return (
+    attachment.filename === filenameRaw ||
+    attachment.filename === filenameKey ||
+    attachment.filename.trim() === filenameKey
+  );
+}
+
 /**
  * Resolve an attachment by exact ID, then unique filename, then sole-attachment
- * fallback. Returns a structured error listing available attachments when none
- * of those succeed.
+ * fallback (only when no filename was supplied). Returns a structured error
+ * listing available attachments when none of those succeed.
  */
 export function resolveAttachment(options: ResolveAttachmentOptions): ResolveAttachmentResult {
+  // Helper owns normalization — handlers pass raw input strings through.
   const attachmentId = options.attachmentId?.trim() ?? '';
-  const filename = options.filename?.trim() ?? '';
+  const filenameRaw = typeof options.filename === 'string' ? options.filename : '';
+  const filenameKey = filenameRaw.trim();
   const { attachments, messageId, log, logContext } = options;
+
+  if (attachments.length === 0) {
+    return {
+      ok: false,
+      error: `Message ${messageId} has no attachments — check message_id.`,
+    };
+  }
 
   if (attachmentId) {
     const byId = attachments.find((a) => a.id === attachmentId);
     if (byId) {
+      if (filenameKey && !filenameMatches(byId, filenameRaw, filenameKey)) {
+        log.warn(
+          {
+            messageId,
+            requestedAttachmentId: attachmentId,
+            requestedFilename: filenameRaw,
+            resolvedAttachmentId: byId.id,
+            resolvedFilename: byId.filename,
+            resolvedBy: 'id',
+          },
+          `${logContext}: attachment_id and filename disagree; using attachment_id`,
+        );
+      }
       return { ok: true, attachment: byId, resolvedBy: 'id' };
     }
   }
 
-  if (filename) {
-    const byName = attachments.filter((a) => a.filename === filename);
+  if (filenameKey) {
+    const byName = attachments.filter((a) => filenameMatches(a, filenameRaw, filenameKey));
     if (byName.length === 1) {
       const attachment = byName[0]!;
-      log.warn(
-        {
-          messageId,
-          requestedAttachmentId: attachmentId || undefined,
-          resolvedAttachmentId: attachment.id,
-          filename,
-          resolvedBy: 'filename',
-        },
-        `${logContext}: resolved attachment by filename after ID miss`,
-      );
+      const payload = {
+        messageId,
+        requestedAttachmentId: attachmentId || undefined,
+        resolvedAttachmentId: attachment.id,
+        filename: attachment.filename,
+        resolvedBy: 'filename' as const,
+      };
+      if (attachmentId) {
+        // Mistranscription recovery — the signal the issue asked for.
+        log.warn(payload, `${logContext}: resolved attachment by filename after ID miss`);
+      } else {
+        // Recommended happy path once the model passes filename alone.
+        log.info(payload, `${logContext}: resolved attachment by filename`);
+      }
       return { ok: true, attachment, resolvedBy: 'filename' };
     }
     if (byName.length > 1) {
       return {
         ok: false,
         error:
-          `Filename ${JSON.stringify(filename)} matches ${byName.length} attachments on ` +
-          `message ${messageId} — pass attachment_id to disambiguate. ` +
+          `Filename ${JSON.stringify(filenameRaw)} matches ${byName.length} attachments on ` +
+          `message ${messageId} — copy the id exactly as listed below to disambiguate. ` +
           formatAttachmentListing(attachments),
       };
     }
+    // Explicit filename that matched nothing: do not sole-fallback. A readable
+    // wrong name is positive evidence the agent expects a different file
+    // (e.g. sibling message in a reply chain).
   }
 
-  if (attachments.length === 1) {
+  // Sole-attachment only when the model did not assert a filename. A garbled or
+  // made-up ID on a one-attachment message is the #2281 recovery path.
+  if (!filenameKey && attachments.length === 1) {
     const attachment = attachments[0]!;
     log.warn(
       {
         messageId,
         requestedAttachmentId: attachmentId || undefined,
-        requestedFilename: filename || undefined,
         resolvedAttachmentId: attachment.id,
         resolvedBy: 'sole_attachment',
       },
-      `${logContext}: resolved sole attachment after ID/filename miss`,
+      `${logContext}: resolved sole attachment after ID miss`,
     );
     return { ok: true, attachment, resolvedBy: 'sole_attachment' };
   }
 
-  const requested = attachmentId
-    ? `Attachment ${attachmentId}`
-    : filename
-      ? `Attachment with filename ${JSON.stringify(filename)}`
+  const requestedParts: string[] = [];
+  if (attachmentId) requestedParts.push(`id ${attachmentId}`);
+  if (filenameKey) requestedParts.push(`filename ${JSON.stringify(filenameRaw)}`);
+  const requested =
+    requestedParts.length > 0
+      ? `Attachment (${requestedParts.join(', ')})`
       : 'Attachment';
 
   return {
     ok: false,
     error:
       `${requested} not found on message ${messageId}. ` +
-      `Pass filename (preferred) or the exact attachment_id from the message's attachments list. ` +
+      `Pass filename (preferred) or copy the exact attachment_id from the list below. ` +
       formatAttachmentListing(attachments),
   };
 }

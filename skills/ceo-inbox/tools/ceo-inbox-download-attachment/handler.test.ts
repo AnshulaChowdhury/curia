@@ -2,6 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { CeoInboxDownloadAttachmentHandler } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { Logger } from '../../../../src/logger.js';
+import {
+  DMARC_REAL_ATTACHMENT_ID,
+  DMARC_CORRUPTED_ATTACHMENT_ID,
+  DMARC_FILENAME,
+} from '../../../_shared/resolve-attachment.fixtures.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -308,17 +313,12 @@ describe('CeoInboxDownloadAttachmentHandler', () => {
   // ── 9. Corrupted ID + sole attachment (2026-10-24 incident fixture) ─────
 
   it('downloads via sole_attachment when the ID is the 2026-10-24 corrupted fixture', async () => {
-    const realId =
-      'v0:Z29vZ2xlLmNvbSFqb3NlcGhmdW5nLmNhITE3OTI3MTM2MDAhMTc5Mjc5OTk5OS56aXA=:YXBwbGljYXRpb24vemlwOyBuYW1lPSJnb29nbGUuY29tIWpvc2VwaGZ1bmcuY2EhMTc5MjcxMzYwMCExNzkyNzk5OTk5LnppcCI=:814';
-    const corruptedId =
-      'v0:Z29vZ2xlLmNvbSFqb3NlcGhmdW5nLmNhITE3OTI3MTM2MDAhMTc5Mjc5OTk5OS56aXA=:YXBwbGljYXRpb24venppcDsgnamePSJnb29nbGUuY29tIWpvc2VwaGZ1bmcuY2EhMTc5MjcxMzYwMCExNzkyNzk5OTk5LnppcCI=:814';
-    const dmarcFilename = 'google.com!josephfung.ca!1792713600!1792799999.zip';
     const fileBytes = Buffer.from('PK\x03\x04dmarc');
     const messageResponse = buildMessageResponse([
       {
-        id: realId,
-        filename: dmarcFilename,
-        content_type: 'application/zip; name="' + dmarcFilename + '"',
+        id: DMARC_REAL_ATTACHMENT_ID,
+        filename: DMARC_FILENAME,
+        content_type: 'application/zip; name="' + DMARC_FILENAME + '"',
         size: fileBytes.length,
       },
     ]);
@@ -328,20 +328,20 @@ describe('CeoInboxDownloadAttachmentHandler', () => {
       if (urlStr.includes(`/messages/${MSG_ID}`)) {
         return new Response(JSON.stringify(messageResponse), { status: 200 });
       }
-      if (urlStr.includes(`/attachments/${encodeURIComponent(realId)}/download`)) {
+      if (urlStr.includes(`/attachments/${encodeURIComponent(DMARC_REAL_ATTACHMENT_ID)}/download`)) {
         return new Response(fileBytes, { status: 200 });
       }
       throw new Error(`Unexpected fetch: ${urlStr}`);
     });
 
-    const ctx = buildCtx({ attachment_id: corruptedId, message_id: MSG_ID });
+    const ctx = buildCtx({ attachment_id: DMARC_CORRUPTED_ATTACHMENT_ID, message_id: MSG_ID });
     const result = await handler.execute(ctx);
 
     expect(result.success).toBe(true);
     if (result.success) {
       const data = result.data as { resolved_by: string; filename: string };
       expect(data.resolved_by).toBe('sole_attachment');
-      expect(data.filename).toBe(dmarcFilename);
+      expect(data.filename).toBe(DMARC_FILENAME);
     }
     expect(ctx.log.warn).toHaveBeenCalled();
   });

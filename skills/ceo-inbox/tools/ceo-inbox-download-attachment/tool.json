@@ -1,13 +1,13 @@
 {
   "name": "ceo-inbox-download-attachment",
-  "description": "Download an email attachment from the principal's personal inbox. Prefer filename from ceo-inbox-read (short, reliable); attachment_id also works. Returns temp_file_url when temp storage succeeds, else content_base64 for file-parse. 10 MB limit.",
+  "description": "Download an email attachment from the principal's personal inbox. Pass filename from ceo-inbox-read (preferred) or the exact attachment_id. Returns temp_file_url when temporary-file storage succeeds, otherwise content_base64; pass either to file-parse. Enforces a 10 MB size limit.",
   "version": "0.2.0",
   "sensitivity": "normal",
   "action_risk": "low",
   "inputs": {
-    "attachment_id": "string? (Nylas attachment ID; optional when filename is set — prefer filename)",
-    "filename": "string? (exact filename from ceo-inbox-read — preferred; must be unique on the message)",
-    "message_id": "string (Nylas message ID the attachment belongs to)"
+    "message_id": "string (Nylas message ID the attachment belongs to)",
+    "filename": "string? (attachment filename from ceo-inbox-read; preferred, must be unique on the message)",
+    "attachment_id": "string? (exact attachment ID; only needed when filenames repeat)"
   },
   "outputs": {
     "temp_file_url": "string | undefined (file:// URL of the downloaded bytes on disk — for binary-safe Drive uploads, pass this as create_drive_file's fileUrl param and use the `filename` field as the file_name param to preserve the original attachment name)",

@@ -12,7 +12,10 @@
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
 import { CeoNylasClient } from '../../../_shared/ceo-nylas-client.js';
-import { resolveAttachment } from '../../../_shared/resolve-attachment.js';
+import {
+  attachmentSelectorPresent,
+  resolveAttachment,
+} from '../../../_shared/resolve-attachment.js';
 import { nylasMessageFailure, validateNylasMessageId } from '../../../../src/channels/email/nylas-message-id.js';
 import { MAX_TEMP_FILE_BYTES } from '../../../../src/skills/temp-file-store.js';
 
@@ -25,17 +28,16 @@ export class CeoInboxDownloadAttachmentHandler implements ToolHandler {
     const input =
       ctx.input && typeof ctx.input === 'object' ? (ctx.input as Record<string, unknown>) : {};
 
-    const attachmentId =
-      typeof input.attachment_id === 'string' ? input.attachment_id.trim() : '';
-    const filename =
-      typeof input.filename === 'string' ? input.filename.trim() : '';
+    // Pass selector strings through untrimmed — resolveAttachment owns normalization.
+    const attachmentId = typeof input.attachment_id === 'string' ? input.attachment_id : undefined;
+    const filename = typeof input.filename === 'string' ? input.filename : undefined;
     const messageId =
       typeof input.message_id === 'string' ? input.message_id.trim() : '';
 
     if (!messageId) {
       return { success: false, error: 'message_id is required' };
     }
-    if (!attachmentId && !filename) {
+    if (!attachmentSelectorPresent({ attachmentId, filename })) {
       return {
         success: false,
         error: 'attachment_id or filename is required',

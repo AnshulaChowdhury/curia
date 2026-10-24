@@ -2,22 +2,15 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   resolveAttachment,
   formatAttachmentListing,
+  attachmentSelectorPresent,
   type ResolvableAttachment,
 } from './resolve-attachment.js';
+import {
+  DMARC_REAL_ATTACHMENT_ID,
+  DMARC_CORRUPTED_ATTACHMENT_ID,
+  DMARC_FILENAME,
+} from './resolve-attachment.fixtures.js';
 import type { Logger } from '../../src/logger.js';
-
-/** Real ID from the 2026-10-24 DMARC incident (#2281). */
-const REAL_ID =
-  'v0:Z29vZ2xlLmNvbSFqb3NlcGhmdW5nLmNhITE3OTI3MTM2MDAhMTc5Mjc5OTk5OS56aXA=:YXBwbGljYXRpb24vemlwOyBuYW1lPSJnb29nbGUuY29tIWpvc2VwaGZ1bmcuY2EhMTc5MjcxMzYwMCExNzkyNzk5OTk5LnppcCI=:814';
-
-/**
- * Corrupted ID the model actually passed: half-decoded the base64 content-type
- * segment and wrote the literal `name` back into the ID.
- */
-const CORRUPTED_ID =
-  'v0:Z29vZ2xlLmNvbSFqb3NlcGhmdW5nLmNhITE3OTI3MTM2MDAhMTc5Mjc5OTk5OS56aXA=:YXBwbGljYXRpb24venppcDsgnamePSJnb29nbGUuY29tIWpvc2VwaGZ1bmcuY2EhMTc5MjcxMzYwMCExNzkyNzk5OTk5LnppcCI=:814';
-
-const DMARC_FILENAME = 'google.com!josephfung.ca!1792713600!1792799999.zip';
 
 function makeLog(): Logger {
   return {
@@ -32,17 +25,30 @@ function att(
   id: string,
   filename: string,
   size = 814,
+  contentType = 'application/zip',
 ): ResolvableAttachment {
-  return { id, filename, contentType: 'application/zip', size };
+  return { id, filename, contentType, size };
 }
+
+describe('attachmentSelectorPresent', () => {
+  it('is false when both are missing or whitespace', () => {
+    expect(attachmentSelectorPresent({})).toBe(false);
+    expect(attachmentSelectorPresent({ attachmentId: '  ', filename: '  ' })).toBe(false);
+  });
+
+  it('is true when either selector is non-empty after trim', () => {
+    expect(attachmentSelectorPresent({ attachmentId: 'att-1' })).toBe(true);
+    expect(attachmentSelectorPresent({ filename: 'a.pdf' })).toBe(true);
+  });
+});
 
 describe('resolveAttachment', () => {
   it('resolves by exact ID without warning', () => {
     const log = makeLog();
-    const attachment = att(REAL_ID, DMARC_FILENAME);
+    const attachment = att(DMARC_REAL_ATTACHMENT_ID, DMARC_FILENAME);
     const result = resolveAttachment({
       attachments: [attachment],
-      attachmentId: REAL_ID,
+      attachmentId: DMARC_REAL_ATTACHMENT_ID,
       messageId: '1a16d5ec7cd97903',
       log,
       logContext: 'test',
@@ -54,10 +60,10 @@ describe('resolveAttachment', () => {
 
   it('falls back to sole_attachment for the 2026-10-24 corrupted ID fixture', () => {
     const log = makeLog();
-    const attachment = att(REAL_ID, DMARC_FILENAME);
+    const attachment = att(DMARC_REAL_ATTACHMENT_ID, DMARC_FILENAME);
     const result = resolveAttachment({
       attachments: [attachment],
-      attachmentId: CORRUPTED_ID,
+      attachmentId: DMARC_CORRUPTED_ATTACHMENT_ID,
       messageId: '1a16d5ec7cd97903',
       log,
       logContext: 'test',
@@ -70,16 +76,16 @@ describe('resolveAttachment', () => {
     });
     expect(log.warn).toHaveBeenCalledOnce();
     expect(vi.mocked(log.warn).mock.calls[0]![0]).toMatchObject({
-      requestedAttachmentId: CORRUPTED_ID,
-      resolvedAttachmentId: REAL_ID,
+      requestedAttachmentId: DMARC_CORRUPTED_ATTACHMENT_ID,
+      resolvedAttachmentId: DMARC_REAL_ATTACHMENT_ID,
       resolvedBy: 'sole_attachment',
     });
   });
 
-  it('resolves by filename when ID misses on a multi-attachment message', () => {
+  it('warns when resolving by filename after an ID miss', () => {
     const log = makeLog();
-    const wanted = att('att-a', 'report.pdf', 100);
-    const other = att('att-b', 'photo.jpg', 200);
+    const wanted = att('att-a', 'report.pdf', 100, 'application/pdf');
+    const other = att('att-b', 'photo.jpg', 200, 'image/jpeg');
     const result = resolveAttachment({
       attachments: [wanted, other],
       attachmentId: 'garble',
@@ -91,6 +97,7 @@ describe('resolveAttachment', () => {
 
     expect(result).toEqual({ ok: true, attachment: wanted, resolvedBy: 'filename' });
     expect(log.warn).toHaveBeenCalledOnce();
+    expect(log.info).not.toHaveBeenCalled();
     expect(vi.mocked(log.warn).mock.calls[0]![0]).toMatchObject({
       requestedAttachmentId: 'garble',
       resolvedAttachmentId: 'att-a',
@@ -99,7 +106,7 @@ describe('resolveAttachment', () => {
     });
   });
 
-  it('resolves by filename when no ID is given', () => {
+  it('resolves by filename at info (not warn) when no ID is given', () => {
     const log = makeLog();
     const wanted = att('att-a', 'report.pdf');
     const other = att('att-b', 'photo.jpg');
@@ -116,12 +123,32 @@ describe('resolveAttachment', () => {
       expect(result.resolvedBy).toBe('filename');
       expect(result.attachment.id).toBe('att-a');
     }
+    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.info).toHaveBeenCalledOnce();
+  });
+
+  it('uses attachment_id when it matches even if filename names a different attachment', () => {
+    const log = makeLog();
+    const a = att('att-a', 'report.pdf', 100, 'application/pdf');
+    const b = att('att-b', 'photo.jpg', 200, 'image/jpeg');
+    const result = resolveAttachment({
+      attachments: [a, b],
+      attachmentId: 'att-a',
+      filename: 'photo.jpg',
+      messageId: 'msg-1',
+      log,
+      logContext: 'test',
+    });
+
+    expect(result).toEqual({ ok: true, attachment: a, resolvedBy: 'id' });
+    expect(log.warn).toHaveBeenCalledOnce();
+    expect(vi.mocked(log.warn).mock.calls[0]![1]).toMatch(/disagree/);
   });
 
   it('fails with listing when ID and filename miss on a multi-attachment message', () => {
     const log = makeLog();
-    const a = att('att-a', 'report.pdf', 100);
-    const b = att('att-b', 'photo.jpg', 200);
+    const a = att('att-a', 'report.pdf', 100, 'application/pdf');
+    const b = att('att-b', 'photo.jpg', 200, 'image/jpeg');
     const result = resolveAttachment({
       attachments: [a, b],
       attachmentId: 'wrong',
@@ -137,17 +164,16 @@ describe('resolveAttachment', () => {
       expect(result.error).toContain('report.pdf');
       expect(result.error).toContain('photo.jpg');
       expect(result.error).toContain('att-a');
-      expect(result.error).toContain('att-b');
+      expect(result.error).toContain('content_type=');
       expect(result.error).toContain('size=100');
-      expect(result.error).toContain('size=200');
     }
     expect(log.warn).not.toHaveBeenCalled();
   });
 
-  it('fails when filename is ambiguous (two attachments share the name)', () => {
+  it('fails when filename is ambiguous and tells the model to copy the listed id exactly', () => {
     const log = makeLog();
-    const a = att('att-a', 'dup.pdf', 10);
-    const b = att('att-b', 'dup.pdf', 20);
+    const a = att('att-a', 'dup.pdf', 10, 'application/pdf');
+    const b = att('att-b', 'dup.pdf', 20, 'application/pdf');
     const result = resolveAttachment({
       attachments: [a, b],
       attachmentId: 'wrong',
@@ -160,28 +186,50 @@ describe('resolveAttachment', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toMatch(/matches 2 attachments/i);
+      expect(result.error).toMatch(/copy the id exactly/i);
       expect(result.error).toContain('att-a');
       expect(result.error).toContain('att-b');
+      expect(result.error).toContain('content_type=');
     }
   });
 
-  it('falls back to sole_attachment when both ID and filename miss on a one-attachment message', () => {
+  it('does not sole-fallback when an explicit filename misses on a one-attachment message', () => {
     const log = makeLog();
-    const attachment = att(REAL_ID, DMARC_FILENAME);
+    const attachment = att(DMARC_REAL_ATTACHMENT_ID, DMARC_FILENAME);
     const result = resolveAttachment({
       attachments: [attachment],
-      attachmentId: CORRUPTED_ID,
+      attachmentId: DMARC_CORRUPTED_ATTACHMENT_ID,
       filename: 'other.zip',
       messageId: 'msg-1',
       log,
       logContext: 'test',
     });
 
-    expect(result).toEqual({
-      ok: true,
-      attachment,
-      resolvedBy: 'sole_attachment',
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain('other.zip');
+      expect(result.error).toContain(DMARC_FILENAME);
+    }
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it('matches a filename that has leading/trailing whitespace on the attachment', () => {
+    const log = makeLog();
+    const padded = att('att-a', '  report.pdf  ', 100, 'application/pdf');
+    const other = att('att-b', 'photo.jpg', 200, 'image/jpeg');
+    const result = resolveAttachment({
+      attachments: [padded, other],
+      filename: '  report.pdf  ',
+      messageId: 'msg-1',
+      log,
+      logContext: 'test',
     });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.attachment.id).toBe('att-a');
+      expect(result.resolvedBy).toBe('filename');
+    }
   });
 
   it('filename match is case-sensitive', () => {
@@ -201,6 +249,22 @@ describe('resolveAttachment', () => {
       expect(result.error).toContain('Report.pdf');
     }
   });
+
+  it('returns a dedicated error when the message has no attachments', () => {
+    const log = makeLog();
+    const result = resolveAttachment({
+      attachments: [],
+      attachmentId: 'any',
+      messageId: 'msg-empty',
+      log,
+      logContext: 'test',
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'Message msg-empty has no attachments — check message_id.',
+    });
+  });
 });
 
 describe('formatAttachmentListing', () => {
@@ -208,12 +272,12 @@ describe('formatAttachmentListing', () => {
     expect(formatAttachmentListing([])).toBe('Message has no attachments.');
   });
 
-  it('lists filename, size, and id per attachment', () => {
+  it('lists filename, content_type, size, and id per attachment', () => {
     const listing = formatAttachmentListing([
-      att('att-1', 'a.pdf', 10),
-      att('att-2', 'b.png', 20),
+      att('att-1', 'a.pdf', 10, 'application/pdf'),
+      att('att-2', 'b.png', 20, 'image/png'),
     ]);
-    expect(listing).toContain('filename="a.pdf" size=10 id=att-1');
-    expect(listing).toContain('filename="b.png" size=20 id=att-2');
+    expect(listing).toContain('filename="a.pdf" content_type="application/pdf" size=10 id=att-1');
+    expect(listing).toContain('filename="b.png" content_type="image/png" size=20 id=att-2');
   });
 });

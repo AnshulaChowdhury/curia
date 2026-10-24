@@ -11,7 +11,10 @@
 //   5. Return base64-encoded content plus metadata.
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
-import { resolveAttachment } from '../../../_shared/resolve-attachment.js';
+import {
+  attachmentSelectorPresent,
+  resolveAttachment,
+} from '../../../_shared/resolve-attachment.js';
 import { nylasMessageFailure, validateNylasMessageId } from '../../../../src/channels/email/nylas-message-id.js';
 import { MAX_TEMP_FILE_BYTES } from '../../../../src/skills/temp-file-store.js';
 
@@ -33,8 +36,9 @@ export class EmailDownloadAttachmentHandler implements ToolHandler {
       account?: string;
     };
 
-    const attachmentId = typeof rawAttId === 'string' ? rawAttId.trim() : '';
-    const filename = typeof rawFilename === 'string' ? rawFilename.trim() : '';
+    // Pass selector strings through untrimmed — resolveAttachment owns normalization.
+    const attachmentId = typeof rawAttId === 'string' ? rawAttId : undefined;
+    const filename = typeof rawFilename === 'string' ? rawFilename : undefined;
     const messageId = typeof rawMsgId === 'string' ? rawMsgId.trim() : '';
     const accountId =
       typeof account === 'string' && account.trim() ? account.trim() : undefined;
@@ -42,7 +46,7 @@ export class EmailDownloadAttachmentHandler implements ToolHandler {
     if (!messageId) {
       return { success: false, error: 'Missing required input: message_id' };
     }
-    if (!attachmentId && !filename) {
+    if (!attachmentSelectorPresent({ attachmentId, filename })) {
       return {
         success: false,
         error: 'Missing required input: attachment_id or filename',

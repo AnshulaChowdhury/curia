@@ -1,13 +1,13 @@
 {
   "name": "email-download-attachment",
-  "description": "Download an email attachment. Prefer filename from email-get (short, reliable); attachment_id also works. Returns EITHER temp_file_url (file:// bytes on disk) OR content_base64 (for file-parse) — never both. Use temp_file_url for binary-safe Drive uploads. 10 MB limit.",
+  "description": "Download an email attachment. Pass filename from email-get (preferred) or the exact attachment_id. Returns EITHER temp_file_url (a file:// URL, when temp storage is available) OR content_base64 — never both. Pass content_base64 with content_type to file-parse; use temp_file_url for binary-safe Drive uploads. Enforces a 10 MB size limit.",
   "version": "1.1.0",
   "sensitivity": "normal",
   "action_risk": "low",
   "inputs": {
-    "attachment_id": "string? (Nylas attachment ID; optional when filename is set — prefer filename)",
-    "filename": "string? (exact filename from email-get — preferred; must be unique on the message)",
     "message_id": "string (Nylas message ID the attachment belongs to)",
+    "filename": "string? (attachment filename from email-get; preferred, must be unique on the message)",
+    "attachment_id": "string? (exact attachment ID; only needed when filenames repeat)",
     "account": "string? (named account to read from, as configured under Settings → Channels → Email → Email accounts. Defaults to the primary account.)"
   },
   "outputs": {
