@@ -681,17 +681,20 @@ class PostgresBackend implements KnowledgeGraphBackend {
   }
 
   async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
+    // Dedup via IN (UNION …) so a fact with two edge types is returned once —
+    // matches InMemoryBackend. Each arm uses idx_kg_edges_source / _target.
     const result = await this.pool.query<PgNodeRow>(
       `SELECT n.*
        FROM kg_nodes n
-       INNER JOIN kg_edges e
-         ON e.archived_at IS NULL
-        AND (
-             (e.source_node_id = $1 AND e.target_node_id = n.id)
-          OR (e.target_node_id = $1 AND e.source_node_id = n.id)
-            )
        WHERE n.type = 'fact'
-         AND n.archived_at IS NULL`,
+         AND n.archived_at IS NULL
+         AND n.id IN (
+           SELECT target_node_id FROM kg_edges
+            WHERE source_node_id = $1 AND archived_at IS NULL
+           UNION
+           SELECT source_node_id FROM kg_edges
+            WHERE target_node_id = $1 AND archived_at IS NULL
+         )`,
       [nodeId],
     );
     return result.rows.map(pgRowToNode);

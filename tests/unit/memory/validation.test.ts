@@ -864,6 +864,79 @@ describe('MemoryValidator', () => {
       }
     });
 
+    it('does not adopt a label-only fact with a conflicting namespace (corrupted meta-index)', async () => {
+      // Old semantic merge left {label: travel_detection, namespace: travel_detection_v2}.
+      // Adopting it on a travel_detection write would overwrite namespace and drop
+      // travel_detection_v2 from list_namespaces.
+      const index = await store.createNode({
+        type: 'concept', label: 'config-store-index', properties: {}, source: 'test',
+      });
+      const corrupted = await store.createNode({
+        type: 'fact',
+        label: 'travel_detection',
+        properties: { namespace: 'travel_detection_v2' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: index.id,
+        targetNodeId: corrupted.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const result = await validator.validate({
+        entityNodeId: index.id,
+        label: 'travel_detection',
+        properties: {
+          key: 'travel_detection',
+          namespace: 'travel_detection',
+        },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(result.action).toBe('create');
+      if (result.action === 'create') {
+        expect(result.validated.properties.namespace).toBe('travel_detection');
+      }
+
+      // Corrupted fact must be untouched.
+      const still = await store.getNode(corrupted.id);
+      expect(still!.properties.namespace).toBe('travel_detection_v2');
+      expect(still!.properties.key).toBeUndefined();
+    });
+
+    it('adopts a legacy label-only fact when namespace already matches', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const legacy = await store.createNode({
+        type: 'fact',
+        label: 'writing_guide_url',
+        properties: { value: 'old', namespace: 'ns' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: legacy.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'writing_guide_url',
+        properties: { key: 'writing_guide_url', value: 'new', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(result.action).toBe('update');
+      if (result.action === 'update') {
+        expect(result.existingNodeId).toBe(legacy.id);
+      }
+    });
+
     it('throws when exactKey is set without a string properties.key', async () => {
       const entity = await store.createNode({
         type: 'concept', label: 'config:ns', properties: {}, source: 'test',

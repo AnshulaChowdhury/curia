@@ -57,11 +57,20 @@ const SAMPLE_DUP_ROWS = [
   {
     anchor_label: 'config:travel_detection',
     key: 'processed_event_ids_3',
-    fact_ids: [
-      '11111111-1111-1111-1111-111111111111',
-      '33333333-3333-3333-3333-333333333333',
+    facts: [
+      {
+        id: '33333333-3333-3333-3333-333333333333',
+        label: 'processed_event_ids_3',
+        last_confirmed_at: '2026-10-20T12:00:00.000Z',
+        value_preview: '["e3"]',
+      },
+      {
+        id: '11111111-1111-1111-1111-111111111111',
+        label: 'processed_event_ids_1',
+        last_confirmed_at: '2026-10-01T12:00:00.000Z',
+        value_preview: '["e1","e2"]',
+      },
     ],
-    labels: ['processed_event_ids_1', 'processed_event_ids_3'],
   },
 ];
 
@@ -91,18 +100,51 @@ describe('parseMismatchRows', () => {
 });
 
 describe('parseDuplicateRows', () => {
-  it('maps duplicate-key groups', () => {
+  it('maps duplicate-key groups with ordered facts', () => {
     expect(parseDuplicateRows(SAMPLE_DUP_ROWS)).toEqual([
       {
         anchorLabel: 'config:travel_detection',
         key: 'processed_event_ids_3',
-        factIds: [
-          '11111111-1111-1111-1111-111111111111',
-          '33333333-3333-3333-3333-333333333333',
+        facts: [
+          {
+            id: '33333333-3333-3333-3333-333333333333',
+            label: 'processed_event_ids_3',
+            lastConfirmedAt: '2026-10-20T12:00:00.000Z',
+            valuePreview: '["e3"]',
+          },
+          {
+            id: '11111111-1111-1111-1111-111111111111',
+            label: 'processed_event_ids_1',
+            lastConfirmedAt: '2026-10-01T12:00:00.000Z',
+            valuePreview: '["e1","e2"]',
+          },
         ],
-        labels: ['processed_event_ids_1', 'processed_event_ids_3'],
       },
     ]);
+  });
+
+  it('accepts facts as a JSON string (pg driver variants)', () => {
+    const row = {
+      anchor_label: 'config:ns',
+      key: 'k',
+      facts: JSON.stringify([
+        {
+          id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          label: 'k',
+          last_confirmed_at: '2026-01-01T00:00:00.000Z',
+          value_preview: 'v',
+        },
+        {
+          id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+          label: 'old',
+          last_confirmed_at: '2025-01-01T00:00:00.000Z',
+          value_preview: 'old',
+        },
+      ]),
+    };
+    const parsed = parseDuplicateRows([row]);
+    expect(parsed[0]!.facts).toHaveLength(2);
+    expect(parsed[0]!.facts[0]!.id).toBe('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
   });
 });
 
@@ -114,6 +156,7 @@ describe('runRepair', () => {
     expect(result.dryRun).toBe(true);
     expect(result.mismatched).toHaveLength(2);
     expect(result.duplicates).toHaveLength(1);
+    expect(result.duplicates[0]!.facts).toHaveLength(2);
     expect(result.updatedCount).toBe(0);
     expect(pool.query).toHaveBeenCalledTimes(2);
     expect(pool.query.mock.calls[0]![0]).toBe(LIST_MISMATCHED_SQL);
@@ -146,11 +189,12 @@ describe('runRepair', () => {
     expect(pool.query).toHaveBeenCalledTimes(2);
   });
 
-  it('duplicate query groups by anchor label so cross-anchor twins are visible', () => {
-    // Regression: GROUP BY a.id missed twins on two same-label anchors from the
-    // anchor-create race. The SQL must group by a.label and count DISTINCT f.id.
-    expect(LIST_DUPLICATE_KEYS_SQL).toMatch(/GROUP BY a\.label/);
-    expect(LIST_DUPLICATE_KEYS_SQL).toMatch(/count\(DISTINCT f\.id\)/);
+  it('duplicate query dedupes then json_aggs by recency across anchor labels', () => {
+    // Cross-anchor twins from the create race must still appear (GROUP BY label).
+    expect(LIST_DUPLICATE_KEYS_SQL).toMatch(/SELECT DISTINCT/);
+    expect(LIST_DUPLICATE_KEYS_SQL).toMatch(/json_agg/);
+    expect(LIST_DUPLICATE_KEYS_SQL).toMatch(/ORDER BY last_confirmed_at DESC/);
+    expect(LIST_DUPLICATE_KEYS_SQL).toMatch(/GROUP BY anchor_label, key/);
     expect(LIST_DUPLICATE_KEYS_SQL).not.toMatch(/GROUP BY a\.id/);
   });
 });
@@ -168,6 +212,10 @@ describe('formatRepairReport', () => {
     expect(report).toContain('duplicate (anchor, key) groups: 1');
     expect(report).toContain('processed_event_ids_1 → processed_event_ids_3');
     expect(report).toContain('--apply');
+    expect(report).toContain('[current]');
+    expect(report).toContain('value=["e3"]');
+    expect(report).toContain('value=["e1","e2"]');
+    expect(report).toContain('33333333-3333-3333-3333-333333333333');
   });
 
   it('reports a clean database as zero work', () => {

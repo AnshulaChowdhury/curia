@@ -165,4 +165,114 @@ describeIf('Knowledge Graph Integration', () => {
     const facts = await entityMemory.getFacts(entity.id);
     expect(facts.length).toBeGreaterThanOrEqual(1);
   });
+
+  it('getConnectedFacts returns each fact once across edge directions and types', async () => {
+    // Covers the Postgres SQL that backs EntityMemory.getFacts + both dedup paths
+    // (#2252 re-review): both directions, archived edge/fact, non-fact neighbour,
+    // and a doubly-linked fact (two edge types) must not duplicate.
+    const entity = await store.createNode({
+      type: 'concept',
+      label: `getConnectedFacts entity ${Date.now()}`,
+      properties: {},
+      source: 'integration-test',
+    });
+    const forward = await store.createNode({
+      type: 'fact',
+      label: 'forward fact',
+      properties: { key: 'fwd' },
+      source: 'integration-test',
+    });
+    const reverse = await store.createNode({
+      type: 'fact',
+      label: 'reverse fact',
+      properties: { key: 'rev' },
+      source: 'integration-test',
+    });
+    const doubled = await store.createNode({
+      type: 'fact',
+      label: 'doubled fact',
+      properties: { key: 'dbl' },
+      source: 'integration-test',
+    });
+    const archivedFact = await store.createNode({
+      type: 'fact',
+      label: 'archived fact',
+      properties: { key: 'arch' },
+      source: 'integration-test',
+    });
+    const viaArchivedEdge = await store.createNode({
+      type: 'fact',
+      label: 'via archived edge',
+      properties: { key: 'arch-edge' },
+      source: 'integration-test',
+    });
+    const nonFact = await store.createNode({
+      type: 'person',
+      label: `non-fact neighbour ${Date.now()}`,
+      properties: {},
+      source: 'integration-test',
+    });
+    createdKgNodeIds.push(
+      entity.id, forward.id, reverse.id, doubled.id,
+      archivedFact.id, viaArchivedEdge.id, nonFact.id,
+    );
+
+    await store.createEdge({
+      sourceNodeId: entity.id,
+      targetNodeId: forward.id,
+      type: 'relates_to',
+      properties: {},
+      source: 'integration-test',
+    });
+    await store.createEdge({
+      sourceNodeId: reverse.id,
+      targetNodeId: entity.id,
+      type: 'relates_to',
+      properties: {},
+      source: 'integration-test',
+    });
+    await store.createEdge({
+      sourceNodeId: entity.id,
+      targetNodeId: doubled.id,
+      type: 'relates_to',
+      properties: {},
+      source: 'integration-test',
+    });
+    await store.createEdge({
+      sourceNodeId: entity.id,
+      targetNodeId: doubled.id,
+      type: 'mentioned_in',
+      properties: {},
+      source: 'integration-test',
+    });
+    await store.createEdge({
+      sourceNodeId: entity.id,
+      targetNodeId: archivedFact.id,
+      type: 'relates_to',
+      properties: {},
+      source: 'integration-test',
+    });
+    const archivedEdge = await store.createEdge({
+      sourceNodeId: entity.id,
+      targetNodeId: viaArchivedEdge.id,
+      type: 'relates_to',
+      properties: {},
+      source: 'integration-test',
+    });
+    await store.createEdge({
+      sourceNodeId: entity.id,
+      targetNodeId: nonFact.id,
+      type: 'relates_to',
+      properties: {},
+      source: 'integration-test',
+    });
+
+    await store.archiveNode(archivedFact.id);
+    await store.archiveEdge(archivedEdge.id);
+
+    const facts = await store.getConnectedFacts(entity.id);
+    const ids = facts.map((f) => f.id).sort();
+    expect(ids).toEqual([forward.id, reverse.id, doubled.id].sort());
+    expect(facts.filter((f) => f.id === doubled.id)).toHaveLength(1);
+  });
 });

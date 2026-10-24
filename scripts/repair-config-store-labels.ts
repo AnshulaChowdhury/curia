@@ -44,11 +44,20 @@ export interface MismatchedConfigFact {
   valuePreview: string;
 }
 
+/** One fact in a duplicate-key group, newest-confirmed first. */
+export interface DuplicateKeyFact {
+  id: string;
+  label: string;
+  /** ISO timestamp from last_confirmed_at (ConfigStore.get tiebreak). */
+  lastConfirmedAt: string;
+  valuePreview: string;
+}
+
 export interface DuplicateKeyGroup {
   anchorLabel: string;
   key: string;
-  factIds: string[];
-  labels: string[];
+  /** Newest-confirmed first; facts[0] is what ConfigStore.get returns. */
+  facts: DuplicateKeyFact[];
 }
 
 export interface RepairResult {
@@ -92,32 +101,50 @@ export const LIST_MISMATCHED_SQL = `
 
 /**
  * Duplicate (anchor, key) groups — remaining corruption after label realign.
- * Does not bump last_confirmed_at; operators decide which twin to keep.
+ * Dedupes in a subquery so a fact linked to two same-label anchors is not
+ * counted twice, then json_agg ORDER BY last_confirmed_at so the report can
+ * mark the current (ConfigStore.get) copy and show values side by side.
  */
 export const LIST_DUPLICATE_KEYS_SQL = `
   SELECT
-    a.label AS anchor_label,
-    f.properties->>'key' AS key,
-    array_agg(DISTINCT f.id::text) AS fact_ids,
-    array_agg(DISTINCT f.label) AS labels
-  FROM kg_nodes f
-  JOIN kg_edges e
-    ON e.archived_at IS NULL
-   AND (e.source_node_id = f.id OR e.target_node_id = f.id)
-  JOIN kg_nodes a
-    ON a.id = CASE
-         WHEN e.source_node_id = f.id THEN e.target_node_id
-         ELSE e.source_node_id
-       END
-  WHERE f.type = 'fact'
-    AND f.archived_at IS NULL
-    AND a.type = 'concept'
-    AND a.archived_at IS NULL
-    AND a.label LIKE 'config:%'
-    AND f.properties ? 'key'
-  GROUP BY a.label, f.properties->>'key'
-  HAVING count(DISTINCT f.id) > 1
-  ORDER BY a.label, f.properties->>'key'
+    anchor_label,
+    key,
+    json_agg(
+      json_build_object(
+        'id', id,
+        'label', label,
+        'last_confirmed_at', last_confirmed_at,
+        'value_preview', value_preview
+      )
+      ORDER BY last_confirmed_at DESC NULLS LAST, id
+    ) AS facts
+  FROM (
+    SELECT DISTINCT
+      a.label AS anchor_label,
+      f.properties->>'key' AS key,
+      f.id,
+      f.label,
+      f.last_confirmed_at,
+      left(coalesce(f.properties->>'value', ''), 120) AS value_preview
+    FROM kg_nodes f
+    JOIN kg_edges e
+      ON e.archived_at IS NULL
+     AND (e.source_node_id = f.id OR e.target_node_id = f.id)
+    JOIN kg_nodes a
+      ON a.id = CASE
+           WHEN e.source_node_id = f.id THEN e.target_node_id
+           ELSE e.source_node_id
+         END
+    WHERE f.type = 'fact'
+      AND f.archived_at IS NULL
+      AND a.type = 'concept'
+      AND a.archived_at IS NULL
+      AND a.label LIKE 'config:%'
+      AND f.properties ? 'key'
+  ) AS distinct_facts
+  GROUP BY anchor_label, key
+  HAVING count(*) > 1
+  ORDER BY anchor_label, key
 `;
 
 /**
@@ -165,6 +192,34 @@ export function parseMismatchRows(rows: unknown[]): MismatchedConfigFact[] {
   });
 }
 
+function parseDuplicateFacts(raw: unknown): DuplicateKeyFact[] {
+  const parsed = typeof raw === 'string' ? JSON.parse(raw) as unknown : raw;
+  if (!Array.isArray(parsed)) {
+    throw new Error('repair-config-store-labels: expected facts JSON array');
+  }
+  return parsed.map((item, i) => {
+    if (item === null || typeof item !== 'object') {
+      throw new Error(`repair-config-store-labels: facts[${i}] is not an object`);
+    }
+    const fact = item as Record<string, unknown>;
+    const lastConfirmed = fact['last_confirmed_at'];
+    let lastConfirmedAt: string;
+    if (lastConfirmed instanceof Date) {
+      lastConfirmedAt = lastConfirmed.toISOString();
+    } else if (typeof lastConfirmed === 'string') {
+      lastConfirmedAt = lastConfirmed;
+    } else {
+      throw new Error(`repair-config-store-labels: facts[${i}].last_confirmed_at missing`);
+    }
+    return {
+      id: requireString(fact, 'id'),
+      label: requireString(fact, 'label'),
+      lastConfirmedAt,
+      valuePreview: requireString(fact, 'value_preview'),
+    };
+  });
+}
+
 export function parseDuplicateRows(rows: unknown[]): DuplicateKeyGroup[] {
   return rows.map((raw) => {
     if (raw === null || typeof raw !== 'object') {
@@ -174,8 +229,7 @@ export function parseDuplicateRows(rows: unknown[]): DuplicateKeyGroup[] {
     return {
       anchorLabel: requireString(row, 'anchor_label'),
       key: requireString(row, 'key'),
-      factIds: requireStringArray(row, 'fact_ids'),
-      labels: requireStringArray(row, 'labels'),
+      facts: parseDuplicateFacts(row['facts']),
     };
   });
 }
@@ -233,8 +287,15 @@ export function formatRepairReport(result: RepairResult): string {
   if (result.duplicates.length > 0) {
     lines.push('');
     lines.push('  Duplicate keys (manual review — values may disagree):');
+    lines.push('  (first fact is [current] — what ConfigStore.get returns by recency)');
     for (const d of result.duplicates) {
-      lines.push(`    ${d.anchorLabel} / ${d.key}: ${d.factIds.length} facts (labels: ${d.labels.join(', ')})`);
+      lines.push(`    ${d.anchorLabel} / ${d.key}: ${d.facts.length} facts`);
+      d.facts.forEach((f, i) => {
+        const marker = i === 0 ? ' [current]' : '';
+        lines.push(
+          `      ${f.id}  label=${f.label}  confirmed=${f.lastConfirmedAt}  value=${f.valuePreview}${marker}`,
+        );
+      });
     }
   }
 

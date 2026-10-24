@@ -4,9 +4,8 @@ import type { KnowledgeGraphStore } from './knowledge-graph.js';
 import { EmbeddingService } from './embedding.js';
 import { embeddingStamp } from './embedding-profiles.js';
 import type { StoreFactOptions, ValidationResult } from './types.js';
-
-/** Must match `SYSTEM_CONFIG_SOURCE` in config-store.ts — kept here to avoid a cycle. */
-const CONFIG_STORE_SYSTEM_SOURCE = 'system:config-store';
+// Value import — config-store only type-imports EntityMemory, so no runtime cycle.
+import { SYSTEM_CONFIG_SOURCE } from './config-store.js';
 
 // Spec line 126: max writes per agent per task
 // Exported so tests can exhaust the limit without hard-coding the magic number.
@@ -67,7 +66,7 @@ function isExactKeyProtected(
  * (`system:checkpoint/...`), which must stay capped (spec 01 §Rate Limiting).
  */
 function isConfigStoreSystemSource(source: string): boolean {
-  return source === CONFIG_STORE_SYSTEM_SOURCE;
+  return source === SYSTEM_CONFIG_SOURCE;
 }
 
 /**
@@ -212,10 +211,13 @@ export class MemoryValidator {
   /**
    * Exact-key upsert for opaque identifiers (config-store). Never compares
    * embeddings. Matches properties.key, or a legacy label-only fact whose
-   * label equals the key (adopts it and stamps key/exact_key).
+   * label equals the key (adopts it and stamps key/exact_key) — but never a
+   * fact that already carries a conflicting `properties.namespace` (meta-index
+   * rows corrupted by the old semantic merge).
    */
   private async validateExactKey(options: StoreFactOptions): Promise<ValidationResult> {
-    const incomingKey = (options.properties as Record<string, unknown> | undefined)?.key;
+    const incomingProps = (options.properties ?? {}) as Record<string, unknown>;
+    const incomingKey = incomingProps.key;
     if (typeof incomingKey !== 'string') {
       // Programmer error — silently creating would pile up permanent duplicates.
       throw new Error(
@@ -234,14 +236,20 @@ export class MemoryValidator {
 
     // Prefer the most recently confirmed match when duplicates somehow exist.
     // Also adopt legacy label-only facts (no properties.key) so a rewrite does
-    // not create a twin that list() would show twice.
+    // not create a twin that list() would show twice — unless the fact already
+    // names a different namespace (corrupted index fact from #2252).
     let bestMatch: { id: string; properties: Record<string, unknown>; confirmedAt: number } | undefined;
 
     for (const targetNode of connectedFacts) {
       const props = targetNode.properties as Record<string, unknown>;
       const existingKey = props.key;
       const keyMatch = existingKey === incomingKey;
-      const legacyLabelMatch = existingKey === undefined && targetNode.label === incomingKey;
+      const namespaceOk =
+        props.namespace === undefined || props.namespace === incomingProps.namespace;
+      const legacyLabelMatch =
+        existingKey === undefined
+        && targetNode.label === incomingKey
+        && namespaceOk;
       if (!keyMatch && !legacyLabelMatch) continue;
 
       const confirmedAt = targetNode.temporal.lastConfirmedAt.getTime();
