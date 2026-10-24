@@ -19,14 +19,12 @@ import {
 import { checkEmail } from '../../../../src/health/health-checks.js';
 import {
   EMAIL_INBOUND_TURN_STALL_MS,
+  EMAIL_POLL_PAGE_SIZE,
+  MAX_STAGED_INBOUND_IDS,
   WRITE_AHEAD_POLL_FAIL_LIMIT,
   WRITE_AHEAD_RETRY_LIMIT,
 } from '../../../../src/channels/email/inbound-stall.js';
-import {
-  EMAIL_POLL_PAGE_SIZE,
-  INBOUND_REPLAY_LIMIT,
-  MAX_STAGED_INBOUND_IDS,
-} from '../../../../src/audit/inbound-replay.js';
+import { INBOUND_REPLAY_LIMIT } from '../../../../src/audit/inbound-replay.js';
 import type { ConfigStore } from '../../../../src/memory/config-store.js';
 
 const SELF_EMAIL = 'curia@example.com';

@@ -91,6 +91,20 @@ describeIf('listUnacknowledgedInbound replay window (#2254)', () => {
     }));
   });
 
+  it('does not warn about a row that aged out before the warning window', async () => {
+    const accountId = `replay-ancient-${randomUUID()}`;
+    const { logger, entries } = collectLogs();
+    const scoped = new AuditLogger(pool, logger);
+    await write(accountId, `ancient-${accountId}`, new Date(Date.now() - 10 * 24 * HOUR_MS));
+
+    const events = await scoped.listUnacknowledgedInbound(accountId);
+
+    expect(events).toEqual([]);
+    expect(entries).not.toContainEqual(expect.objectContaining({
+      msg: 'Unacknowledged inbound mail older than the replay window was left out',
+    }));
+  });
+
   it('omits a row when a later row shares its nylas id, acknowledged or not', async () => {
     const accountId = `replay-later-${randomUUID()}`;
     const nylasMessageId = `same-${accountId}`;

@@ -16,7 +16,11 @@ import {
 } from './hash-chain.js';
 import { writeLlmCallArchive } from './llm-call-archive.js';
 import { stripNullBytes } from './strip-null-bytes.js';
-import { INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS } from './inbound-replay.js';
+import {
+  INBOUND_REPLAY_AGED_OUT_WARN_HOURS,
+  INBOUND_REPLAY_LIMIT,
+  INBOUND_REPLAY_MAX_AGE_HOURS,
+} from './inbound-replay.js';
 
 /**
  * True while {@link AuditLogger} holds the hash-chain write transaction.
@@ -354,7 +358,8 @@ export class AuditLogger {
    * account and `metadata.nylasMessageId`. That later row is the one a
    * re-fetch handled, so replaying the earlier one would answer the mail
    * again. Rows with no Nylas id cannot be matched and are replayed. Rows
-   * older than the window are counted and logged, not returned.
+   * older than the window are not returned; recently aged-out ones are
+   * counted and logged. `metadata.receivedAt` comes back as a `Date`.
    *
    * The email adapter delivers the result through `deliverPersisted`, which
    * acknowledges the existing row instead of inserting another. Capped at
@@ -410,8 +415,10 @@ export class AuditLogger {
   }
 
   /**
-   * Rows outside the replay window stay unacknowledged. Log the count and the
-   * oldest timestamp so they are visible instead of disappearing.
+   * Rows outside the replay window stay unacknowledged forever (the table is
+   * append-only), so counting all of them would warn on every boot. Count
+   * only rows that aged out within {@link INBOUND_REPLAY_AGED_OUT_WARN_HOURS};
+   * older ones are already reported by {@link scanForUnacknowledged}.
    */
   private async warnWhenInboundReplayTruncatedByAge(accountId: string): Promise<void> {
     type Excluded = { count: string; oldest: Date | string | null };
@@ -423,8 +430,9 @@ export class AuditLogger {
          WHERE acknowledged = false
            AND event_type = 'inbound.message'
            AND payload->>'accountId' = $1
-           AND timestamp <= now() - ($2::int * interval '1 hour')`,
-        [accountId, INBOUND_REPLAY_MAX_AGE_HOURS],
+           AND timestamp <= now() - ($2::int * interval '1 hour')
+           AND timestamp > now() - ($3::int * interval '1 hour')`,
+        [accountId, INBOUND_REPLAY_MAX_AGE_HOURS, INBOUND_REPLAY_AGED_OUT_WARN_HOURS],
       );
       excluded = result.rows[0];
     } catch (err) {
@@ -442,6 +450,7 @@ export class AuditLogger {
         count,
         oldestTimestamp: excluded?.oldest ?? null,
         maxAgeHours: INBOUND_REPLAY_MAX_AGE_HOURS,
+        warnWindowHours: INBOUND_REPLAY_AGED_OUT_WARN_HOURS,
       },
       'Unacknowledged inbound mail older than the replay window was left out',
     );
@@ -594,7 +603,23 @@ function inboundEventFromReplayRow(
     timestamp,
     type: 'inbound.message',
     sourceLayer: 'channel',
-    payload,
+    payload: { ...payload, ...rehydrateMetadata(payload.metadata) },
     ...(typeof row.parent_event_id === 'string' ? { parentEventId: row.parent_event_id } : {}),
   };
+}
+
+/**
+ * JSONB stores `metadata.receivedAt` as an ISO string. The live event carries
+ * the `Date` the converter built, so a replayed event must too. A missing or
+ * unparseable value is left as it is.
+ */
+function rehydrateMetadata(
+  metadata: Record<string, unknown> | undefined,
+): { metadata?: Record<string, unknown> } {
+  if (metadata === undefined) return {};
+  const raw = metadata.receivedAt;
+  if (typeof raw !== 'string') return { metadata };
+  const receivedAt = new Date(raw);
+  if (Number.isNaN(receivedAt.getTime())) return { metadata };
+  return { metadata: { ...metadata, receivedAt } };
 }

@@ -3,7 +3,11 @@ import { AuditLogger } from '../../../src/audit/logger.js';
 import { createSilentLogger } from '../../../src/logger.js';
 import { createInboundMessage, createLlmCall } from '../../../src/bus/events.js';
 import { GENESIS_HASH, computeEntryHash, toHashTimestamp } from '../../../src/audit/hash-chain.js';
-import { INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS } from '../../../src/audit/inbound-replay.js';
+import {
+  INBOUND_REPLAY_AGED_OUT_WARN_HOURS,
+  INBOUND_REPLAY_LIMIT,
+  INBOUND_REPLAY_MAX_AGE_HOURS,
+} from '../../../src/audit/inbound-replay.js';
 import type { Pool } from 'pg';
 
 // Minimal mock pool that captures what gets written to the DB.
@@ -403,11 +407,48 @@ describe('AuditLogger.listUnacknowledgedInbound', () => {
           count: 2,
           oldestTimestamp: oldest,
           maxAgeHours: INBOUND_REPLAY_MAX_AGE_HOURS,
+          warnWindowHours: INBOUND_REPLAY_AGED_OUT_WARN_HOURS,
         },
         msg: 'Unacknowledged inbound mail older than the replay window was left out',
       },
     ]);
     const countQuery = pool.queries.find((query) => query.sql.includes('MIN(timestamp)'));
-    expect(countQuery?.params).toEqual(['curia', INBOUND_REPLAY_MAX_AGE_HOURS]);
+    expect(countQuery?.sql).toContain("timestamp > now() - ($3::int * interval '1 hour')");
+    expect(countQuery?.params).toEqual([
+      'curia',
+      INBOUND_REPLAY_MAX_AGE_HOURS,
+      INBOUND_REPLAY_AGED_OUT_WARN_HOURS,
+    ]);
+  });
+
+  it('rehydrates metadata.receivedAt as a Date, as the live event carries it', async () => {
+    const receivedAt = '2026-10-24T11:59:00.000Z';
+    const pool = poolFor([
+      { ...readable, payload: { ...readable.payload, metadata: { nylasMessageId: 'nylas-1', receivedAt } } },
+    ]);
+    const logger = new AuditLogger(pool as unknown as Pool, createSilentLogger());
+
+    const [event] = await logger.listUnacknowledgedInbound('curia');
+
+    const replayed = event!.payload.metadata?.receivedAt;
+    expect(replayed).toBeInstanceOf(Date);
+    expect((replayed as Date).toISOString()).toBe(receivedAt);
+  });
+
+  it('leaves a missing or unparseable receivedAt as it is', async () => {
+    const pool = poolFor([
+      readable,
+      {
+        ...readable,
+        id: '33333333-3333-3333-3333-333333333333',
+        payload: { ...readable.payload, metadata: { nylasMessageId: 'nylas-3', receivedAt: 'not-a-date' } },
+      },
+    ]);
+    const logger = new AuditLogger(pool as unknown as Pool, createSilentLogger());
+
+    const events = await logger.listUnacknowledgedInbound('curia');
+
+    expect(events[0]!.payload.metadata).toEqual({ nylasMessageId: 'nylas-1' });
+    expect(events[1]!.payload.metadata?.receivedAt).toBe('not-a-date');
   });
 });

@@ -29,16 +29,13 @@ import {
   type OutboundNotificationEvent,
 } from '../../bus/events.js';
 import { isDbUnavailableError } from '../../db/resilience.js';
-import {
-  EMAIL_POLL_PAGE_SIZE,
-  INBOUND_REPLAY_LIMIT,
-  INBOUND_REPLAY_MAX_AGE_HOURS,
-  MAX_STAGED_INBOUND_IDS,
-} from '../../audit/inbound-replay.js';
+import { INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS } from '../../audit/inbound-replay.js';
 import { sanitizeOutput } from '../../skills/sanitize.js';
 import { buildReplyQuote } from '../../skills/_shared/reply-quote.js';
 import {
   EMAIL_INBOUND_TURN_STALL_MS,
+  EMAIL_POLL_PAGE_SIZE,
+  MAX_STAGED_INBOUND_IDS,
   WRITE_AHEAD_POLL_FAIL_LIMIT,
   WRITE_AHEAD_RETRY_LIMIT,
 } from './inbound-stall.js';

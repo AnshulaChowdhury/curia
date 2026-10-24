@@ -1,7 +1,7 @@
 // Bounds for replaying unacknowledged inbound.message rows on email start.
 //
-// The audit logger and the email adapter both use these so the staged-id set
-// cannot be smaller than one replay plus a poll page.
+// The audit query needs these. Email-adapter sizing that depends on them
+// (the staged-id set) lives in channels/email/inbound-stall.ts.
 
 /** How many unacknowledged inbound rows one account loads on start. */
 export const INBOUND_REPLAY_LIMIT = 500;
@@ -13,12 +13,10 @@ export const INBOUND_REPLAY_LIMIT = 500;
  */
 export const INBOUND_REPLAY_MAX_AGE_HOURS = 24;
 
-/** Nylas list page size used by the email poll. */
-export const EMAIL_POLL_PAGE_SIZE = 25;
-
 /**
- * Nylas ids already written ahead in this process. Sized for a full replay
- * plus one poll page, so the oldest replayed id is still present when the
- * watermark is behind it and the next poll re-fetches that page.
+ * Rows that aged out of the replay window within this many hours are counted
+ * and warned about on start. Older rows stay unacknowledged forever and are
+ * already reported by the startup scan, so warning about them every boot
+ * would only be noise.
  */
-export const MAX_STAGED_INBOUND_IDS = INBOUND_REPLAY_LIMIT + EMAIL_POLL_PAGE_SIZE;
+export const INBOUND_REPLAY_AGED_OUT_WARN_HOURS = 7 * 24;

@@ -1,8 +1,20 @@
-// Stall and write-ahead limits for the email inbound runner.
+// Stall, write-ahead, and sizing limits for the email inbound runner.
 //
 // Lives beside the adapter so the health probe can import the threshold
 // without the adapter importing the health module (that module stays on
 // structural interfaces and does not depend on channel classes).
+
+import { INBOUND_REPLAY_LIMIT } from '../../audit/inbound-replay.js';
+
+/** Nylas list page size used by the email poll. */
+export const EMAIL_POLL_PAGE_SIZE = 25;
+
+/**
+ * Nylas ids already written ahead in this process. Sized for a full replay
+ * plus one poll page, so the oldest replayed id is still present when the
+ * watermark is behind it and the next poll re-fetches that page.
+ */
+export const MAX_STAGED_INBOUND_IDS = INBOUND_REPLAY_LIMIT + EMAIL_POLL_PAGE_SIZE;
 
 /** An in-flight turn or a queued message held this long fails the email check. */
 export const EMAIL_INBOUND_TURN_STALL_MS = 15 * 60 * 1000;
