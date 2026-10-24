@@ -9,7 +9,7 @@ import {
   DMARC_REAL_ATTACHMENT_ID,
   DMARC_CORRUPTED_ATTACHMENT_ID,
   DMARC_FILENAME,
-} from './resolve-attachment.fixtures.js';
+} from './__fixtures__/resolve-attachment.js';
 import type { Logger } from '../../src/logger.js';
 
 function makeLog(): Logger {
@@ -145,7 +145,7 @@ describe('resolveAttachment', () => {
     expect(vi.mocked(log.warn).mock.calls[0]![1]).toMatch(/disagree/);
   });
 
-  it('fails with listing when ID and filename miss on a multi-attachment message', () => {
+  it('fails with listing and warns on selector miss for a multi-attachment message', () => {
     const log = makeLog();
     const a = att('att-a', 'report.pdf', 100, 'application/pdf');
     const b = att('att-b', 'photo.jpg', 200, 'image/jpeg');
@@ -167,7 +167,12 @@ describe('resolveAttachment', () => {
       expect(result.error).toContain('content_type=');
       expect(result.error).toContain('size=100');
     }
-    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledOnce();
+    expect(vi.mocked(log.warn).mock.calls[0]![0]).toMatchObject({
+      requestedAttachmentId: 'wrong',
+      attachmentCount: 2,
+      resolvedBy: 'none',
+    });
   });
 
   it('fails when filename is ambiguous and tells the model to copy the listed id exactly', () => {
@@ -193,7 +198,7 @@ describe('resolveAttachment', () => {
     }
   });
 
-  it('does not sole-fallback when an explicit filename misses on a one-attachment message', () => {
+  it('does not sole-fallback when an explicit filename misses; warns with resolvedBy none', () => {
     const log = makeLog();
     const attachment = att(DMARC_REAL_ATTACHMENT_ID, DMARC_FILENAME);
     const result = resolveAttachment({
@@ -210,10 +215,35 @@ describe('resolveAttachment', () => {
       expect(result.error).toContain('other.zip');
       expect(result.error).toContain(DMARC_FILENAME);
     }
-    expect(log.warn).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledOnce();
+    expect(vi.mocked(log.warn).mock.calls[0]![0]).toMatchObject({
+      requestedAttachmentId: DMARC_CORRUPTED_ATTACHMENT_ID,
+      requestedFilename: 'other.zip',
+      attachmentCount: 1,
+      resolvedBy: 'none',
+    });
   });
 
-  it('matches a filename that has leading/trailing whitespace on the attachment', () => {
+  it('matches when the model sends a trimmed name and the attachment has padded whitespace', () => {
+    const log = makeLog();
+    const padded = att('att-a', '  report.pdf  ', 100, 'application/pdf');
+    const other = att('att-b', 'photo.jpg', 200, 'image/jpeg');
+    const result = resolveAttachment({
+      attachments: [padded, other],
+      filename: 'report.pdf',
+      messageId: 'msg-1',
+      log,
+      logContext: 'test',
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.attachment.id).toBe('att-a');
+      expect(result.resolvedBy).toBe('filename');
+    }
+  });
+
+  it('matches when the model copies a padded filename exactly from the listing', () => {
     const log = makeLog();
     const padded = att('att-a', '  report.pdf  ', 100, 'application/pdf');
     const other = att('att-b', 'photo.jpg', 200, 'image/jpeg');
@@ -232,6 +262,21 @@ describe('resolveAttachment', () => {
     }
   });
 
+  it('prefers exact filename match over a trimmed near-collision', () => {
+    const log = makeLog();
+    const exact = att('att-exact', 'a.pdf', 10, 'application/pdf');
+    const padded = att('att-padded', 'a.pdf ', 20, 'application/pdf');
+    const result = resolveAttachment({
+      attachments: [exact, padded],
+      filename: 'a.pdf',
+      messageId: 'msg-1',
+      log,
+      logContext: 'test',
+    });
+
+    expect(result).toEqual({ ok: true, attachment: exact, resolvedBy: 'filename' });
+  });
+
   it('filename match is case-sensitive', () => {
     const log = makeLog();
     const a = att('att-a', 'Report.pdf');
@@ -248,6 +293,11 @@ describe('resolveAttachment', () => {
     if (!result.ok) {
       expect(result.error).toContain('Report.pdf');
     }
+    expect(log.warn).toHaveBeenCalledOnce();
+    expect(vi.mocked(log.warn).mock.calls[0]![0]).toMatchObject({
+      requestedFilename: 'report.pdf',
+      resolvedBy: 'none',
+    });
   });
 
   it('returns a dedicated error when the message has no attachments', () => {

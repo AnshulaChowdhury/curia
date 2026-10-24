@@ -75,15 +75,27 @@ export function formatAttachmentListing(attachments: readonly ResolvableAttachme
   return `Attachments on this message:\n${lines.join('\n')}`;
 }
 
-function filenameMatches(attachment: ResolvableAttachment, filenameRaw: string, filenameKey: string): boolean {
-  // Exact match first so names with leading/trailing whitespace still work when
-  // the model copies the JSON.stringify form from the listing. Trimmed equality
-  // covers the common case where the model (or the listing reader) strips spaces.
-  return (
-    attachment.filename === filenameRaw ||
-    attachment.filename === filenameKey ||
-    attachment.filename.trim() === filenameKey
-  );
+/**
+ * Match filename in two passes: exact (preserves whitespace the model copied from
+ * a listing), then trimmed equality. Exact wins so `"a.pdf"` does not collide with
+ * `"a.pdf "` when both exist on the message.
+ */
+function matchAttachmentsByFilename(
+  attachments: readonly ResolvableAttachment[],
+  filenameRaw: string,
+  filenameKey: string,
+): ResolvableAttachment[] {
+  const exact = attachments.filter((a) => a.filename === filenameRaw);
+  if (exact.length > 0) return exact;
+  return attachments.filter((a) => a.filename.trim() === filenameKey);
+}
+
+function filenameConflictsWithResolved(
+  attachment: ResolvableAttachment,
+  filenameRaw: string,
+  filenameKey: string,
+): boolean {
+  return matchAttachmentsByFilename([attachment], filenameRaw, filenameKey).length === 0;
 }
 
 /**
@@ -108,7 +120,7 @@ export function resolveAttachment(options: ResolveAttachmentOptions): ResolveAtt
   if (attachmentId) {
     const byId = attachments.find((a) => a.id === attachmentId);
     if (byId) {
-      if (filenameKey && !filenameMatches(byId, filenameRaw, filenameKey)) {
+      if (filenameKey && filenameConflictsWithResolved(byId, filenameRaw, filenameKey)) {
         log.warn(
           {
             messageId,
@@ -126,7 +138,7 @@ export function resolveAttachment(options: ResolveAttachmentOptions): ResolveAtt
   }
 
   if (filenameKey) {
-    const byName = attachments.filter((a) => filenameMatches(a, filenameRaw, filenameKey));
+    const byName = matchAttachmentsByFilename(attachments, filenameRaw, filenameKey);
     if (byName.length === 1) {
       const attachment = byName[0]!;
       const payload = {
@@ -182,6 +194,21 @@ export function resolveAttachment(options: ResolveAttachmentOptions): ResolveAtt
     requestedParts.length > 0
       ? `Attachment (${requestedParts.join(', ')})`
       : 'Attachment';
+
+  // Selector miss with no recovery — keep mistranscription rates visible now that
+  // filename is the recommended key and sole-attachment no longer covers a wrong name.
+  if (attachmentId || filenameKey) {
+    log.warn(
+      {
+        messageId,
+        requestedAttachmentId: attachmentId || undefined,
+        requestedFilename: filenameKey ? filenameRaw : undefined,
+        attachmentCount: attachments.length,
+        resolvedBy: 'none',
+      },
+      `${logContext}: attachment selector miss`,
+    );
+  }
 
   return {
     ok: false,

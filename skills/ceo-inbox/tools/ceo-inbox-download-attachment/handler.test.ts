@@ -6,7 +6,7 @@ import {
   DMARC_REAL_ATTACHMENT_ID,
   DMARC_CORRUPTED_ATTACHMENT_ID,
   DMARC_FILENAME,
-} from '../../../_shared/resolve-attachment.fixtures.js';
+} from '../../../_shared/__fixtures__/resolve-attachment.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
