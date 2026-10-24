@@ -30,6 +30,7 @@ import {
 } from '../../bus/events.js';
 import { sanitizeOutput } from '../../skills/sanitize.js';
 import { buildReplyQuote } from '../../skills/_shared/reply-quote.js';
+import { EMAIL_INBOUND_TURN_STALL_MS } from '../../health/health-checks.js';
 import type { Channel } from '../channel.js';
 
 // Mirrors MAX_BODY_LENGTH in skills/email/tools/email-send/handler.ts and skills/email/tools/email-reply/handler.ts.
@@ -37,16 +38,17 @@ import type { Channel } from '../channel.js';
 // is silently dropped so the reply still sends.
 const MAX_REPLY_BODY_LENGTH = 50_000;
 
-/**
- * Default cap on email-triggered agent turns in flight per account (#2254).
- * Headroom above a short burst of distinct threads; a flood cannot open an
- * unbounded set of coordinator turns. Same-thread mail stays serial regardless.
- */
-const DEFAULT_MAX_CONCURRENT_TURNS = 4;
+/** How long stop() waits for turns already running before shutdown continues. */
+const STOP_DRAIN_MS = 5_000;
 
-/** One inbound message accepted by the poll and waiting on or in publish. */
+/**
+ * One inbound message whose write-ahead succeeded. Delivery starts only when
+ * the thread is idle and a concurrency slot is free.
+ */
 interface QueuedInboundEmail {
   event: InboundMessageEvent;
+  /** Starts subscriber delivery. Write-ahead already finished in the poll. */
+  deliver: () => Promise<void>;
   messageId: string;
   threadId: string;
   /** From address as on the message; absent when the sender was missing. */
@@ -55,6 +57,8 @@ interface QueuedInboundEmail {
   senderId: string;
   subject: string;
   senderVerified: boolean;
+  /** Epoch ms when the poll queued this message. */
+  queuedAt: number;
 }
 
 // KG namespace and key pattern for persisting the poll high-water mark.
@@ -100,11 +104,12 @@ export interface EmailAdapterConfig {
    */
   contactCreationMaxPerHour: number;
   /**
-   * Max inbound turns publishing at once for this account (#2254).
+   * Max inbound turns in flight at once for this account (#2254).
+   * Required. Bootstrap applies `channels.email.max_concurrent_turns` (default 4).
    * Messages on one thread stay strictly ordered and never run together.
-   * Further threads wait for a free slot. Default: 4.
+   * Further threads wait for a free slot. The cap does not bound the queue.
    */
-  maxConcurrentTurns?: number;
+  maxConcurrentTurns: number;
   /**
    * IANA timezone (e.g. "America/Toronto") used when rendering the Date line in
    * appended reply quotes. Sourced from the global `TIMEZONE` env var to match
@@ -142,20 +147,25 @@ export class EmailAdapter implements Channel {
    */
   private processing = false;
   private readonly maxConcurrentTurns: number;
-  /** Publishes that have been handed off and have not settled. */
+  /** Deliveries that have started and have not settled. */
   private inFlightTurns = 0;
-  /** Settling handles so tests can wait out a detached publish. */
+  /** Settling handles so stop() and tests can wait out a detached delivery. */
   private inFlightRuns = new Set<Promise<void>>();
-  /** conversationId → messages waiting to publish, in encounter order. */
+  /** conversationId → epoch ms when its current delivery started. */
+  private readonly inFlightStartedAt = new Map<string, number>();
+  /** conversationIds already warned for the turn currently in flight. */
+  private readonly stallWarned = new Set<string>();
+  /** conversationId → messages waiting to deliver, in message-date order. */
   private readonly pendingByThread = new Map<string, QueuedInboundEmail[]>();
-  /** conversationIds whose publish is in flight. At most one each (#2018). */
+  /** conversationIds whose delivery is in flight. At most one each (#2018). */
   private readonly runningThreads = new Set<string>();
   /**
    * Threads that have a queued head and no free slot, oldest first.
-   * A thread that just finished goes to the back, so one busy thread cannot
-   * hold the only slot while other threads wait.
+   * A Set keeps insertion order: membership is O(1), and moving a thread to
+   * the back is delete + add. A thread that just finished goes to the back,
+   * so one busy thread cannot hold the only slot while other threads wait.
    */
-  private slotWaiters: string[] = [];
+  private readonly slotWaiters = new Set<string>();
   /** True between start() and stop() — outbound-queue readiness (#1380). */
   private running = false;
 
@@ -210,13 +220,12 @@ export class EmailAdapter implements Channel {
 
   constructor(config: EmailAdapterConfig) {
     this.config = config;
-    const maxConcurrentTurns = config.maxConcurrentTurns ?? DEFAULT_MAX_CONCURRENT_TURNS;
-    if (!Number.isInteger(maxConcurrentTurns) || maxConcurrentTurns < 1) {
+    if (!Number.isInteger(config.maxConcurrentTurns) || config.maxConcurrentTurns < 1) {
       throw new Error(
-        `email maxConcurrentTurns must be a positive integer, got: ${String(maxConcurrentTurns)}`,
+        `email maxConcurrentTurns must be a positive integer, got: ${String(config.maxConcurrentTurns)}`,
       );
     }
-    this.maxConcurrentTurns = maxConcurrentTurns;
+    this.maxConcurrentTurns = config.maxConcurrentTurns;
   }
 
   // ── Public health-probe getters ──────────────────────────────────────────
@@ -237,11 +246,47 @@ export class EmailAdapter implements Channel {
     return this.config.pollingIntervalMs;
   }
 
+  /** Deliveries started and not yet settled. */
+  get inboundInFlight(): number {
+    return this.inFlightTurns;
+  }
+
+  /** Messages written ahead and still waiting for a slot or their thread. */
+  get inboundPending(): number {
+    let pending = 0;
+    for (const queue of this.pendingByThread.values()) pending += queue.length;
+    return pending;
+  }
+
+  /** Cap applied to {@link inboundInFlight}. */
+  get inboundMaxConcurrentTurns(): number {
+    return this.maxConcurrentTurns;
+  }
+
+  /** Age of the oldest in-flight turn, or null when nothing is running. */
+  get oldestInboundInFlightAgeMs(): number | null {
+    let oldestStart = Number.POSITIVE_INFINITY;
+    for (const startedAt of this.inFlightStartedAt.values()) {
+      if (startedAt < oldestStart) oldestStart = startedAt;
+    }
+    return oldestStart === Number.POSITIVE_INFINITY ? null : Date.now() - oldestStart;
+  }
+
+  /** Age of the oldest queued message, or null when the queues are empty. */
+  get oldestInboundPendingAgeMs(): number | null {
+    let oldestQueuedAt = Number.POSITIVE_INFINITY;
+    for (const queue of this.pendingByThread.values()) {
+      for (const item of queue) {
+        if (item.queuedAt < oldestQueuedAt) oldestQueuedAt = item.queuedAt;
+      }
+    }
+    return oldestQueuedAt === Number.POSITIVE_INFINITY ? null : Date.now() - oldestQueuedAt;
+  }
+
   /**
-   * Resolves when every detached inbound publish has settled.
-   *
-   * Test-only. `stop()` does not call this: a hung agent turn would block
-   * shutdown. The poll promise is not that wait (#2254).
+   * Resolves when every detached inbound delivery has settled.
+   * `stop()` waits on this for {@link STOP_DRAIN_MS}, then continues so a hung
+   * turn cannot block process exit (#2254).
    */
   async drainInFlight(): Promise<void> {
     while (this.inFlightRuns.size > 0) {
@@ -382,6 +427,7 @@ export class EmailAdapter implements Channel {
     this.pollTimer = setInterval(() => {
       void this.poll();
       void this.checkWatchdog();
+      this.warnLongRunningTurns();
     }, pollingIntervalMs);
     logger.info({ pollingIntervalMs }, 'Email adapter started — polling Nylas');
 
@@ -398,11 +444,15 @@ export class EmailAdapter implements Channel {
   }
 
   async stop(): Promise<void> {
+    // Gate the runner before dropping queues. A turn that settles while stop()
+    // is in progress must not start the next one.
     this.running = false;
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = undefined;
     }
+    this.dropPendingInbound();
+    await this.drainInFlightBounded();
     this.startedAt = null;
     // Await the disconnect publication before returning so a graceful stop() does
     // not resolve (or lose the event during immediate shutdown) while the readiness
@@ -468,10 +518,25 @@ export class EmailAdapter implements Channel {
       return;
     }
 
-    fetched = messages.length;
+    // Nylas returns newest-first. Same-thread mail must run oldest-first, so
+    // sort by date before the loop. The watermark does not depend on order.
+    const ordered = messages
+      .map((msg, index) => ({ msg, index }))
+      .sort((a, b) => a.msg.date - b.msg.date || a.index - b.index)
+      .map((entry) => entry.msg);
+
+    // Last watermark that is safe to persist: intentional skips and successful
+    // write-aheads. A write-ahead failure rolls the in-memory mark back here
+    // and stops the batch so the next poll retries (#2254).
+    let durableWatermark = prevWatermark;
+    let classified = 0;
 
     try {
-      for (const msg of messages) {
+      for (const msg of ordered) {
+        if (!this.running) {
+          this.lastSeenTimestamp = durableWatermark;
+          break;
+        }
         // Advance the high-water mark BEFORE processing so a permanently broken
         // message (e.g. malformed payload) is never retried on the next poll cycle.
         // +1 ensures the next poll's receivedAfter excludes this exact timestamp
@@ -495,6 +560,8 @@ export class EmailAdapter implements Channel {
             'Email skipped — message is in sent/drafts folder',
           );
           skipped.sent_folder++;
+          classified++;
+          durableWatermark = this.lastSeenTimestamp;
           continue;
         }
 
@@ -511,6 +578,8 @@ export class EmailAdapter implements Channel {
             'Email skipped — matches recently-sent message ID (loop guard)',
           );
           skipped.recently_sent++;
+          classified++;
+          durableWatermark = this.lastSeenTimestamp;
           continue;
         }
 
@@ -534,6 +603,8 @@ export class EmailAdapter implements Channel {
           normalizeForComparison(fromEmail) === normalizeForComparison(this.config.selfEmail)
         ) {
           skipped.self++;
+          classified++;
+          durableWatermark = this.lastSeenTimestamp;
           continue;
         }
 
@@ -550,11 +621,14 @@ export class EmailAdapter implements Channel {
             'Email skipped — sender is in suppressedSenderEmails',
           );
           skipped.excluded++;
+          classified++;
+          durableWatermark = this.lastSeenTimestamp;
           continue;
         }
 
+        let converted;
         try {
-          const converted = convertNylasMessage(msg, this.config.selfEmail);
+          converted = convertNylasMessage(msg, this.config.selfEmail);
 
           // Auto-create contacts from participants before publishing the inbound
           // event, so the contact resolver in the dispatch layer can find them.
@@ -563,60 +637,100 @@ export class EmailAdapter implements Channel {
             converted.metadata.subject,
             converted.senderId,
           );
-
-          // Sanitize email content to mitigate prompt injection from external senders.
-          // This strips known injection patterns (system/instruction/prompt tags) before
-          // the content reaches the LLM's context window.
-          const sanitizedContent = sanitizeOutput(converted.content, {
-            // Use a large limit here — body truncation already happened in the converter.
-            // We pass maxLength large enough to never double-truncate; the converter's
-            // 50KB cap + subject prefix keeps us well under this ceiling.
-            maxLength: 60_000,
-          });
-
-          // Hand the message to the runner. publish runs the agent turn inline,
-          // so the poll must not await it (#2254). The watermark already advanced
-          // above; a later publish rejection is logged on the detached promise
-          // and is not retried.
-          const event = createInboundMessage({
-            conversationId: converted.conversationId,
-            channelId: converted.channelId,
-            accountId: this.config.accountId,
-            senderId: converted.senderId,
-            content: sanitizedContent,
-            metadata: {
-              ...(converted.metadata as unknown as Record<string, unknown>),
-            },
-          });
-          this.enqueueInbound({
-            event,
-            messageId: msg.id,
-            threadId: msg.threadId,
-            senderEmail: fromEmail,
-            senderId: converted.senderId,
-            subject: msg.subject,
-            senderVerified: converted.metadata.senderVerified,
-          });
-          processed++;
         } catch (err) {
-          // Log and skip — the high-water mark was already advanced above,
-          // so this message will not be retried on the next poll cycle.
+          // Conversion and contact extraction are not retried. The watermark
+          // advanced above on purpose so a permanently broken payload cannot
+          // wedge the inbox.
           this.config.logger.error(
             { err, messageId: msg.id, threadId: msg.threadId, senderEmail: fromEmail },
             'Failed to process inbound email — skipping message',
           );
           skipped.failed++;
+          classified++;
+          durableWatermark = this.lastSeenTimestamp;
+          continue;
         }
+
+        // A sanitize throw is a pre-handoff skip. It must not abort the poll.
+        let sanitizedContent: string;
+        try {
+          // Strips known injection patterns before the content reaches the LLM.
+          // The converter already capped the body; this ceiling only prevents a
+          // second truncation.
+          sanitizedContent = sanitizeOutput(converted.content, { maxLength: 60_000 });
+        } catch (err) {
+          this.config.logger.error(
+            { err, messageId: msg.id, threadId: msg.threadId, senderEmail: fromEmail },
+            'Failed to process inbound email — skipping message',
+          );
+          skipped.failed++;
+          classified++;
+          durableWatermark = this.lastSeenTimestamp;
+          continue;
+        }
+
+        const event = createInboundMessage({
+          conversationId: converted.conversationId,
+          channelId: converted.channelId,
+          accountId: this.config.accountId,
+          senderId: converted.senderId,
+          content: sanitizedContent,
+          metadata: {
+            ...(converted.metadata as unknown as Record<string, unknown>),
+          },
+        });
+
+        // Write-ahead before the watermark may move past this message. Delivery
+        // of the agent turn stays on the runner (#2254).
+        let deliver: () => Promise<void>;
+        try {
+          const staged = await this.config.bus.stagePublish('channel', event);
+          deliver = staged.deliver;
+        } catch (err) {
+          this.config.logger.error(
+            {
+              err,
+              messageId: msg.id,
+              threadId: msg.threadId,
+              senderEmail: fromEmail,
+              remainingInBatch: ordered.length - classified - 1,
+            },
+            'Failed to process inbound email — skipping message',
+          );
+          skipped.failed++;
+          classified++;
+          this.lastSeenTimestamp = durableWatermark;
+          break;
+        }
+
+        const queued: QueuedInboundEmail = {
+          event,
+          deliver,
+          messageId: msg.id,
+          threadId: msg.threadId,
+          senderEmail: fromEmail,
+          senderId: converted.senderId,
+          subject: msg.subject,
+          senderVerified: converted.metadata.senderVerified,
+          queuedAt: Date.now(),
+        };
+        if (this.enqueueInbound(queued)) this.logInboundQueued(queued);
+        processed++;
+        classified++;
+        durableWatermark = this.lastSeenTimestamp;
       }
     } finally {
       this.processing = false;
     }
 
+    fetched = classified;
+
     // ── Post-poll accounting (only reached when listEmailMessages succeeded) ──
-    // Stamped when the fetch and handoff finish. A coordinator turn still
+    // Stamped when the fetch and write-ahead finish. A coordinator turn still
     // running on the detached runner must not age this out (#2254).
 
     this._lastSuccessfulPollAt = Date.now();
+    this.warnLongRunningTurns();
 
     // Emit one channel.poll audit event per cycle so operators can verify the
     // adapter is alive and measure throughput over time.
@@ -666,11 +780,17 @@ export class EmailAdapter implements Channel {
   }
 
   /**
-   * Accept one inbound message. Starts its publish when the thread is idle and
-   * a slot is free; otherwise queues it. Same-thread messages stay in encounter
-   * order and never publish concurrently (#2018, #2254).
+   * Accept one inbound message whose write-ahead already succeeded. Starts
+   * delivery when the thread is idle and a slot is free; otherwise queues it.
+   * Same-thread messages stay in queue order and never run concurrently
+   * (#2018, #2254). Returns false when the adapter is stopped and the message
+   * was dropped.
    */
-  private enqueueInbound(item: QueuedInboundEmail): void {
+  private enqueueInbound(item: QueuedInboundEmail): boolean {
+    if (!this.running) {
+      this.logDroppedInbound(item);
+      return false;
+    }
     const conversationId = item.event.payload.conversationId;
     const queue = this.pendingByThread.get(conversationId);
     if (queue) {
@@ -685,15 +805,17 @@ export class EmailAdapter implements Channel {
       this.pendingByThread.set(conversationId, [item]);
     }
     this.scheduleThread(conversationId);
+    return true;
   }
 
   private scheduleThread(conversationId: string): void {
+    if (!this.running) return;
     if (this.runningThreads.has(conversationId)) return;
     const queue = this.pendingByThread.get(conversationId);
     if (!queue || queue.length === 0) return;
     if (this.inFlightTurns >= this.maxConcurrentTurns) {
-      if (!this.slotWaiters.includes(conversationId)) {
-        this.slotWaiters.push(conversationId);
+      if (!this.slotWaiters.has(conversationId)) {
+        this.slotWaiters.add(conversationId);
         const head = queue[0];
         this.config.logger.info(
           {
@@ -701,6 +823,7 @@ export class EmailAdapter implements Channel {
             messageId: head?.messageId,
             threadId: head?.threadId,
             inFlight: this.inFlightTurns,
+            pending: this.inboundPending,
             maxConcurrentTurns: this.maxConcurrentTurns,
           },
           'Email adapter: in-flight cap reached; inbound message queued',
@@ -712,7 +835,8 @@ export class EmailAdapter implements Channel {
   }
 
   private startThread(conversationId: string): void {
-    this.slotWaiters = this.slotWaiters.filter((id) => id !== conversationId);
+    if (!this.running) return;
+    this.slotWaiters.delete(conversationId);
     const queue = this.pendingByThread.get(conversationId);
     const item = queue?.shift();
     if (!queue || !item) {
@@ -723,54 +847,110 @@ export class EmailAdapter implements Channel {
 
     this.runningThreads.add(conversationId);
     this.inFlightTurns += 1;
+    const startedAt = Date.now();
+    this.inFlightStartedAt.set(conversationId, startedAt);
 
-    let run!: Promise<void>;
-    try {
-      run = this.config.bus.publish('channel', item.event)
-        .then(() => {
-          this.logInboundPublished(item);
-        })
-        .catch((err: unknown) => {
-          this.logInboundFailure(err, item);
-        })
-        .finally(() => {
-          this.runningThreads.delete(conversationId);
-          this.inFlightTurns -= 1;
-          this.inFlightRuns.delete(run);
-          // Behind threads that were already waiting on the cap, so a burst on
-          // one thread does not keep every other thread queued.
-          if (this.pendingByThread.has(conversationId) && !this.slotWaiters.includes(conversationId)) {
-            this.slotWaiters.push(conversationId);
-          }
-          this.drainSlotWaiters();
-        });
-    } catch (err) {
-      this.runningThreads.delete(conversationId);
-      this.inFlightTurns -= 1;
-      this.logInboundFailure(err, item);
-      if (this.pendingByThread.has(conversationId) && !this.slotWaiters.includes(conversationId)) {
-        this.slotWaiters.push(conversationId);
-      }
-      this.drainSlotWaiters();
-      return;
-    }
+    // One chain for a sync throw and a rejection. Bookkeeping lives in finally
+    // so the two paths cannot drift.
+    const run = Promise.resolve()
+      .then(() => item.deliver())
+      .then(
+        () => {
+          this.logInboundCompleted(item, Date.now() - startedAt);
+        },
+        (err: unknown) => {
+          this.logInboundTurnFailure(err, item);
+        },
+      )
+      .finally(() => {
+        this.runningThreads.delete(conversationId);
+        this.inFlightTurns -= 1;
+        this.inFlightStartedAt.delete(conversationId);
+        this.stallWarned.delete(conversationId);
+        this.inFlightRuns.delete(run);
+        if (!this.running) return;
+        // Behind threads that were already waiting on the cap, so a burst on
+        // one thread does not keep every other thread queued.
+        if (this.pendingByThread.has(conversationId)) {
+          this.slotWaiters.delete(conversationId);
+          this.slotWaiters.add(conversationId);
+        }
+        this.drainSlotWaiters();
+      });
     this.inFlightRuns.add(run);
   }
 
   private drainSlotWaiters(): void {
-    while (this.inFlightTurns < this.maxConcurrentTurns && this.slotWaiters.length > 0) {
-      const conversationId = this.slotWaiters.shift();
+    if (!this.running) return;
+    while (this.inFlightTurns < this.maxConcurrentTurns && this.slotWaiters.size > 0) {
+      const conversationId = this.slotWaiters.values().next().value;
       if (conversationId === undefined) break;
+      this.slotWaiters.delete(conversationId);
       if (this.runningThreads.has(conversationId)) continue;
       if (!this.pendingByThread.has(conversationId)) continue;
       this.startThread(conversationId);
     }
   }
 
-  private logInboundPublished(item: QueuedInboundEmail): void {
-    // Warn when the provider's SPF/DKIM/DMARC checks did not all pass.
-    // The message was still published; the Coordinator's system prompt tells
-    // it to apply extra skepticism.
+  /** Wait for in-flight turns, but only up to STOP_DRAIN_MS. */
+  private async drainInFlightBounded(): Promise<void> {
+    if (this.inFlightRuns.size === 0) return;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timeoutId = setTimeout(() => {
+        this.config.logger.warn(
+          { accountId: this.config.accountId, inFlight: this.inFlightTurns },
+          'Email adapter stop: in-flight turns still running after drain timeout',
+        );
+        resolve();
+      }, STOP_DRAIN_MS);
+    });
+    await Promise.race([this.drainInFlight(), timeout]);
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
+
+  private dropPendingInbound(): void {
+    for (const queue of this.pendingByThread.values()) {
+      for (const item of queue) this.logDroppedInbound(item);
+    }
+    this.pendingByThread.clear();
+    this.slotWaiters.clear();
+  }
+
+  private logDroppedInbound(item: QueuedInboundEmail): void {
+    this.config.logger.error(
+      {
+        accountId: this.config.accountId,
+        messageId: item.messageId,
+        threadId: item.threadId,
+        conversationId: item.event.payload.conversationId,
+      },
+      'Email adapter stopped with inbound mail still queued — message dropped',
+    );
+  }
+
+  private warnLongRunningTurns(): void {
+    const now = Date.now();
+    for (const [conversationId, startedAt] of this.inFlightStartedAt) {
+      const ageMs = now - startedAt;
+      if (ageMs < EMAIL_INBOUND_TURN_STALL_MS) continue;
+      if (this.stallWarned.has(conversationId)) continue;
+      this.stallWarned.add(conversationId);
+      this.config.logger.warn(
+        {
+          accountId: this.config.accountId,
+          conversationId,
+          ageMs,
+          inFlight: this.inFlightTurns,
+          pending: this.inboundPending,
+        },
+        'Email adapter: inbound turn still running past 15 minutes',
+      );
+    }
+  }
+
+  /** Receipt signal. Fires at handoff, including when delivery later rejects. */
+  private logInboundQueued(item: QueuedInboundEmail): void {
     if (!item.senderVerified) {
       this.config.logger.warn(
         { senderEmail: item.senderId, messageId: item.messageId },
@@ -782,17 +962,39 @@ export class EmailAdapter implements Channel {
         senderEmail: item.senderId,
         subject: item.subject,
         threadId: item.threadId,
+        messageId: item.messageId,
         senderVerified: item.senderVerified,
+        inFlight: this.inFlightTurns,
+        pending: this.inboundPending,
       },
-      'Email received and published to bus',
+      'Email received and queued',
     );
   }
 
-  private logInboundFailure(err: unknown, item: QueuedInboundEmail): void {
-    // The high-water mark already advanced, so this message is not retried.
+  private logInboundCompleted(item: QueuedInboundEmail, durationMs: number): void {
+    this.config.logger.info(
+      {
+        senderEmail: item.senderId,
+        subject: item.subject,
+        threadId: item.threadId,
+        messageId: item.messageId,
+        conversationId: item.event.payload.conversationId,
+        durationMs,
+      },
+      'Inbound email turn completed',
+    );
+  }
+
+  private logInboundTurnFailure(err: unknown, item: QueuedInboundEmail): void {
     this.config.logger.error(
-      { err, messageId: item.messageId, threadId: item.threadId, senderEmail: item.senderEmail },
-      'Failed to process inbound email — skipping message',
+      {
+        err,
+        messageId: item.messageId,
+        threadId: item.threadId,
+        conversationId: item.event.payload.conversationId,
+        senderEmail: item.senderEmail,
+      },
+      'Inbound email turn failed after handoff — not retried',
     );
   }
 

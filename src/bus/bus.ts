@@ -41,6 +41,14 @@ type OnEventHook = (event: BusEvent) => void | Promise<void>;
 // signalling that delivery was attempted for all registered handlers.
 type OnDeliveredHook = (eventId: string) => void | Promise<void>;
 
+/**
+ * A write-ahead that has not started subscriber delivery.
+ * `deliver()` starts it once; a second call returns the same promise.
+ */
+export interface StagedDelivery {
+  deliver(): Promise<void>;
+}
+
 export class EventBus {
   // Keyed by EventType so dispatch is O(1) lookup rather than scanning all subscribers.
   private subscribers = new Map<EventType, EventHandler[]>();
@@ -108,6 +116,31 @@ export class EventBus {
   }
 
   /**
+   * Persist the event, then hand back delivery for the caller to start.
+   * Resolves once the write-ahead hook has succeeded and does not invoke
+   * subscribers. Authorization failures and a throwing write-ahead reject
+   * before any subscriber runs, same as {@link publish}.
+   *
+   * {@link StagedDelivery.deliver} starts subscriber delivery once and returns
+   * that promise. Subscriber errors are swallowed inside delivery, so the
+   * promise still resolves; they are logged. `publishDetached` is the wrong
+   * tool when the caller must know when delivery settles: it starts delivery
+   * immediately and does not return the promise. Email inbound uses this split
+   * so the poll can persist `inbound.message` before the watermark moves, while
+   * the agent turn stays detached and ordered (#2254).
+   */
+  async stagePublish(layer: Layer, event: BusEvent): Promise<StagedDelivery> {
+    await this.writeAhead(layer, event);
+    let started: Promise<void> | undefined;
+    return {
+      deliver: () => {
+        started ??= this.deliver(event);
+        return started;
+      },
+    };
+  }
+
+  /**
    * Permission check plus the audit write-ahead. Throws before any subscriber
    * runs. A write-ahead failure must not look like a delivered event.
    */
@@ -155,7 +188,8 @@ export class EventBus {
   /**
    * Deliver to subscribers sequentially. Subscriber errors are caught and
    * logged individually so one bad subscriber cannot block the rest.
-   * `publish()` awaits this; `publishDetached()` does not.
+   * `publish()` awaits this. `publishDetached()` does not. `stagePublish()`
+   * returns it so the caller can await delivery later.
    */
   private async deliver(event: BusEvent): Promise<void> {
     const handlers = this.subscribers.get(event.type) ?? [];

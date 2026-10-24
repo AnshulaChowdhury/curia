@@ -1874,11 +1874,17 @@ interface ChannelPollPayload {
   accountId: string;
   /** Channel identifier — always 'email' for this event. */
   channel: 'email';
-  /** Number of messages returned by Nylas (before any filtering). */
+  /**
+   * Messages classified this cycle. Equals the Nylas result length unless a
+   * write-ahead failure stopped the batch; the rest are retried next poll.
+   * `fetched = processed + sum(skipped)`.
+   */
   fetched: number;
   /**
-   * Messages handed to the inbound runner this cycle. Publish is not awaited;
-   * a later rejection is logged and stays in this count (#2254).
+   * Messages whose `inbound.message` write-ahead succeeded this cycle,
+   * including ones still queued for a free slot. Subscriber delivery is not
+   * awaited. A later delivery failure is logged and stays in this count; it
+   * is not moved into `skipped.failed` (#2254).
    * `fetched = processed + sum(skipped)`.
    */
   processed: number;
@@ -1888,7 +1894,7 @@ interface ChannelPollPayload {
     recently_sent: number;
     self: number;
     excluded: number;
-    /** Messages that threw before handoff (conversion, contact extraction). */
+    /** Threw before handoff (conversion, contact extraction, write-ahead). */
     failed: number;
   };
   /** High-water mark value (epoch seconds) after this poll cycle. */

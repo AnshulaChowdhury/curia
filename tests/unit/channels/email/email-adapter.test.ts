@@ -41,9 +41,15 @@ function makeMockMessage(overrides: Partial<NylasMessage> = {}): NylasMessage {
 function createMocks() {
   const logger = createLogger('error');
 
+  const publish = vi.fn().mockResolvedValue(undefined);
   const bus = {
     subscribe: vi.fn(),
-    publish: vi.fn().mockResolvedValue(undefined),
+    publish,
+    // Write-ahead resolves immediately. Delivery records the event on publish
+    // when the runner starts the turn, which is what these tests assert.
+    stagePublish: vi.fn(async (layer: string, event: BusEvent) => ({
+      deliver: () => publish(layer, event),
+    })),
   } as unknown as EventBus;
 
   const contactService = {
@@ -82,6 +88,7 @@ function makeAdapter(mocks: ReturnType<typeof createMocks>, overrides: Partial<{
     suppressedSenderEmails: overrides.suppressedSenderEmails ?? [],
     contactCreationMaxPerMessage: overrides.contactCreationMaxPerMessage ?? 10,
     contactCreationMaxPerHour: overrides.contactCreationMaxPerHour ?? 100,
+    maxConcurrentTurns: 4,
     ceoEmail: overrides.ceoEmail ?? CEO_EMAIL,
     timezone: overrides.timezone ?? 'America/Toronto',
   });
@@ -454,6 +461,7 @@ describe('EmailAdapter — inbound poll: suppressedSenderEmails', () => {
       suppressedSenderEmails: ['curia@example.com'],
       contactCreationMaxPerMessage: 10,
       contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 4,
       ceoEmail: CEO_EMAIL,
       timezone: 'America/Toronto',
     });
@@ -485,6 +493,7 @@ describe('EmailAdapter — inbound poll: suppressedSenderEmails', () => {
       suppressedSenderEmails: ['CURIA@EXAMPLE.COM'],
       contactCreationMaxPerMessage: 10,
       contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 4,
       ceoEmail: CEO_EMAIL,
       timezone: 'America/Toronto',
     });
@@ -516,6 +525,7 @@ describe('EmailAdapter — inbound poll: suppressedSenderEmails', () => {
       suppressedSenderEmails: ['curia@example.com'],
       contactCreationMaxPerMessage: 10,
       contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 4,
       ceoEmail: CEO_EMAIL,
       timezone: 'America/Toronto',
     });
@@ -590,6 +600,7 @@ describe('EmailAdapter — outbound.notification subscriber', () => {
       suppressedSenderEmails: [],
       contactCreationMaxPerMessage: 10,
       contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 4,
       ceoEmail: CEO_EMAIL,
       timezone: 'America/Toronto',
     });
@@ -1203,6 +1214,7 @@ describe('EmailAdapter — inbound poll: self-loop hardening', () => {
       suppressedSenderEmails: [],
       contactCreationMaxPerMessage: 10,
       contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 4,
       ceoEmail: CEO_EMAIL,
       timezone: 'America/Toronto',
     });

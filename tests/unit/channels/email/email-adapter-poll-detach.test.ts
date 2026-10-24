@@ -16,7 +16,7 @@ import {
   type BusEvent,
   type ChannelPollEvent,
 } from '../../../../src/bus/events.js';
-import { checkEmail } from '../../../../src/health/health-checks.js';
+import { EMAIL_INBOUND_TURN_STALL_MS, checkEmail } from '../../../../src/health/health-checks.js';
 
 const SELF_EMAIL = 'curia@example.com';
 const CEO_EMAIL = 'ceo@example.com';
@@ -42,9 +42,15 @@ function makeMockMessage(overrides: Partial<NylasMessage> = {}): NylasMessage {
 
 function createMocks() {
   const logger = createSilentLogger();
+  const publish = vi.fn().mockResolvedValue(undefined);
   const bus = {
     subscribe: vi.fn(),
-    publish: vi.fn().mockResolvedValue(undefined),
+    publish,
+    // Write-ahead resolves here. Delivery goes through publish, so tests that
+    // hang or reject publish are hanging the agent turn, not the poll.
+    stagePublish: vi.fn(async (layer: string, event: BusEvent) => ({
+      deliver: () => publish(layer, event),
+    })),
   } as unknown as EventBus;
   const contactService = {
     resolveByChannelIdentity: vi.fn().mockResolvedValue({ id: 'existing' }),
@@ -79,11 +85,9 @@ function makeAdapter(
     suppressedSenderEmails: overrides.suppressedSenderEmails ?? [],
     contactCreationMaxPerMessage: 10,
     contactCreationMaxPerHour: 100,
+    maxConcurrentTurns: overrides.maxConcurrentTurns ?? 4,
     ceoEmail: CEO_EMAIL,
     timezone: 'America/Toronto',
-    ...(overrides.maxConcurrentTurns !== undefined
-      ? { maxConcurrentTurns: overrides.maxConcurrentTurns }
-      : {}),
   });
 }
 
@@ -195,7 +199,6 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
     expect(audit[0]!.payload.fetched).toBe(1);
     expect(audit[0]!.payload.processed).toBe(1);
     expect(audit[0]!.payload.skipped.failed).toBe(0);
-    expect(audit[0]!.payload.durationMs).toBeLessThan(1_000);
 
     releaseTurn();
     await adapter.drainInFlight();
@@ -293,6 +296,10 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
 
     await adapter.start();
     expect(gate.started).toEqual(['a1']);
+    expect(adapter.inboundInFlight).toBe(1);
+    expect(adapter.inboundPending).toBe(2);
+    expect(adapter.oldestInboundPendingAgeMs).toBeGreaterThanOrEqual(0);
+    expect(adapter.oldestInboundInFlightAgeMs).toBeGreaterThanOrEqual(0);
 
     gate.release('a1');
     await vi.waitFor(() => {
@@ -308,9 +315,9 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
     await adapter.stop();
   });
 
-  it('defaults the cap to 4', async () => {
+  it('runs at most the configured cap of 4', async () => {
     const mocks = createMocks();
-    const adapter = makeAdapter(mocks);
+    const adapter = makeAdapter(mocks, { maxConcurrentTurns: 4 });
     const gate = hangInbound(mocks.bus);
     const messages = ['t1', 't2', 't3', 't4', 't5'].map((id) =>
       makeMockMessage({ id, threadId: `thread-${id}`, from: [{ email: `${id}@example.com` }] }),
@@ -387,7 +394,7 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
     await adapter.stop();
   });
 
-  it('logs a detached publish failure with messageId and threadId', async () => {
+  it('logs a delivery failure after handoff, and still warns when the sender is unverified', async () => {
     const mocks = createMocks();
     const { logger, entries } = collectLogs();
     const adapter = makeAdapter(mocks, { logger });
@@ -406,9 +413,18 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
     expect(audit).toHaveLength(1);
     expect(audit[0]!.payload.processed).toBe(1);
     expect(audit[0]!.payload.skipped.failed).toBe(0);
-    expect(failureLogs(entries)).toEqual([
-      expect.objectContaining({ messageId: 'msg-fail', threadId: 'thread-fail' }),
-    ]);
+    // Pre-handoff failures keep a different message. This rejection is delivery.
+    expect(failureLogs(entries)).toEqual([]);
+    expect(entries).toContainEqual(expect.objectContaining({
+      msg: 'Email received with senderVerified: false — SPF/DKIM/DMARC did not all pass or headers were absent',
+      messageId: 'msg-fail',
+    }));
+    expect(entries).toContainEqual(expect.objectContaining({
+      msg: 'Inbound email turn failed after handoff — not retried',
+      messageId: 'msg-fail',
+      threadId: 'thread-fail',
+      conversationId: 'email:thread-fail',
+    }));
 
     await adapter.stop();
   });
@@ -433,6 +449,7 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
       success: true,
       messageId: 'sent-loop-id',
     });
+    // Thread lookup for the outbound reply (limit 1), not the next inbox poll.
     list.mockResolvedValueOnce([live]);
     await triggerOutbound(createOutboundMessage({
       conversationId: 'email:thread-live',
@@ -486,5 +503,238 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
     gate.release('legit-2');
     await adapter.drainInFlight();
     await adapter.stop();
+  });
+
+  it('runs the older message first when Nylas returns the thread newest-first', async () => {
+    const mocks = createMocks();
+    const adapter = makeAdapter(mocks);
+    const gate = hangInbound(mocks.bus);
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      makeMockMessage({
+        id: 'newer',
+        threadId: 'thread-same',
+        date: 1_700_000_100,
+        from: [{ email: 'ada@example.com' }],
+      }),
+      makeMockMessage({
+        id: 'older',
+        threadId: 'thread-same',
+        date: 1_700_000_000,
+        from: [{ email: 'ada@example.com' }],
+      }),
+    ]);
+
+    await adapter.start();
+    expect(gate.started).toEqual(['older']);
+
+    gate.release('older');
+    await vi.waitFor(() => {
+      expect(gate.started).toEqual(['older', 'newer']);
+    });
+    gate.release('newer');
+    await adapter.drainInFlight();
+    await adapter.stop();
+  });
+
+  it('serves a thread already waiting before one that arrives in a later poll', async () => {
+    const mocks = createMocks();
+    const adapter = makeAdapter(mocks, { maxConcurrentTurns: 1 });
+    const gate = hangInbound(mocks.bus);
+    const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
+    list
+      .mockResolvedValueOnce([
+        makeMockMessage({ id: 'a1', threadId: 'thread-a', from: [{ email: 'a@example.com' }] }),
+        makeMockMessage({ id: 'b1', threadId: 'thread-b', from: [{ email: 'b@example.com' }] }),
+      ])
+      .mockResolvedValueOnce([
+        makeMockMessage({ id: 'c1', threadId: 'thread-c', from: [{ email: 'c@example.com' }] }),
+      ]);
+
+    await adapter.start();
+    expect(gate.started).toEqual(['a1']);
+
+    await pollNow(adapter);
+    expect(gate.started).toEqual(['a1']);
+
+    gate.release('a1');
+    await vi.waitFor(() => {
+      expect(gate.started).toEqual(['a1', 'b1']);
+    });
+
+    gate.release('b1');
+    await vi.waitFor(() => {
+      expect(gate.started).toEqual(['a1', 'b1', 'c1']);
+    });
+    gate.release('c1');
+    await adapter.drainInFlight();
+    await adapter.stop();
+  });
+
+  it('does not start a queued turn after stop()', async () => {
+    vi.useFakeTimers();
+    const mocks = createMocks();
+    const { logger, entries } = collectLogs();
+    const adapter = makeAdapter(mocks, {
+      logger,
+      maxConcurrentTurns: 1,
+      pollingIntervalMs: 7_200_000,
+    });
+    const gate = hangInbound(mocks.bus);
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      makeMockMessage({ id: 'busy', threadId: 'thread-a', from: [{ email: 'a@example.com' }] }),
+      makeMockMessage({ id: 'queued', threadId: 'thread-b', from: [{ email: 'b@example.com' }] }),
+    ]);
+
+    await adapter.start();
+    expect(gate.started).toEqual(['busy']);
+
+    const stopping = adapter.stop();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await stopping;
+
+    gate.release('busy');
+    await adapter.drainInFlight();
+    expect(gate.started).toEqual(['busy']);
+    expect(entries).toContainEqual(expect.objectContaining({
+      msg: 'Email adapter stopped with inbound mail still queued — message dropped',
+      messageId: 'queued',
+      threadId: 'thread-b',
+      conversationId: 'email:thread-b',
+    }));
+  });
+
+  it('skips a second poll while the first is still extracting participants', async () => {
+    const mocks = createMocks();
+    const adapter = makeAdapter(mocks);
+    let releaseResolve: (value: { id: string }) => void = () => {};
+    const held = new Promise<{ id: string }>((resolve) => {
+      releaseResolve = resolve;
+    });
+    (mocks.contactService.resolveByChannelIdentity as ReturnType<typeof vi.fn>).mockReturnValue(held);
+    const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
+    list.mockResolvedValue([
+      makeMockMessage({ id: 'held', threadId: 'thread-held', from: [{ email: 'ada@example.com' }] }),
+    ]);
+
+    const starting = adapter.start();
+    await Promise.resolve();
+    await pollNow(adapter);
+    expect(list).toHaveBeenCalledTimes(1);
+
+    releaseResolve({ id: 'existing' });
+    await starting;
+    await adapter.drainInFlight();
+    await adapter.stop();
+  });
+
+  it('keeps the watermark at the last write-ahead and retries the rest', async () => {
+    const mocks = createMocks();
+    const { logger, entries } = collectLogs();
+    const adapter = makeAdapter(mocks, { logger });
+    const nowSec = Math.floor(Date.now() / 1000);
+    const olderDate = nowSec + 10;
+    const newerDate = nowSec + 30;
+    const publish = mocks.bus.publish as unknown as (layer: string, event: BusEvent) => Promise<void>;
+    (mocks.bus.stagePublish as ReturnType<typeof vi.fn>).mockImplementation(
+      async (layer: string, event: BusEvent) => {
+        if (inboundId(event) === 'newer') throw new Error('audit down');
+        return { deliver: () => publish(layer, event) };
+      },
+    );
+    const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
+    list.mockImplementation(async (opts: { receivedAfter: number }) => {
+      if (opts.receivedAfter >= olderDate + 1) return [];
+      return [
+        makeMockMessage({
+          id: 'newer',
+          threadId: 'thread-new',
+          date: newerDate,
+          from: [{ email: 'new@example.com' }],
+        }),
+        makeMockMessage({
+          id: 'older',
+          threadId: 'thread-old',
+          date: olderDate,
+          from: [{ email: 'old@example.com' }],
+        }),
+      ];
+    });
+
+    await adapter.start();
+    const first = pollEvents(mocks.bus)[0]!;
+    expect(first.payload.processed).toBe(1);
+    expect(first.payload.skipped.failed).toBe(1);
+    expect(first.payload.fetched).toBe(2);
+    expect(failureLogs(entries)).toEqual([
+      expect.objectContaining({ messageId: 'newer', threadId: 'thread-new' }),
+    ]);
+
+    await pollNow(adapter);
+    const secondCall = list.mock.calls[1]![0] as { receivedAfter: number };
+    expect(secondCall.receivedAfter).toBe(olderDate + 1);
+
+    await adapter.drainInFlight();
+    await adapter.stop();
+  });
+
+  it('fails email health when every slot is held past 15 minutes', async () => {
+    vi.useFakeTimers();
+    const mocks = createMocks();
+    const { logger, entries } = collectLogs();
+    const adapter = makeAdapter(mocks, {
+      logger,
+      maxConcurrentTurns: 1,
+      pollingIntervalMs: 60_000,
+    });
+    const gate = hangInbound(mocks.bus);
+    const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
+    list.mockResolvedValueOnce([
+      makeMockMessage({ id: 'stuck', threadId: 'thread-stuck', from: [{ email: 'ada@example.com' }] }),
+    ]).mockResolvedValue([]);
+
+    try {
+      await adapter.start();
+      expect(checkEmail(adapter, 3, new Date())).toBe('ok');
+
+      await vi.advanceTimersByTimeAsync(EMAIL_INBOUND_TURN_STALL_MS);
+      expect(checkEmail(adapter, 3, new Date())).toBe('fail');
+      expect(entries).toContainEqual(expect.objectContaining({
+        msg: 'Email adapter: inbound turn still running past 15 minutes',
+        conversationId: 'email:thread-stuck',
+      }));
+    } finally {
+      gate.release('stuck');
+      await adapter.drainInFlight();
+      await adapter.stop();
+    }
+  });
+
+  it('stays email-ok when a long turn still has a free slot', async () => {
+    vi.useFakeTimers();
+    const mocks = createMocks();
+    const adapter = makeAdapter(mocks, { maxConcurrentTurns: 4, pollingIntervalMs: 60_000 });
+    let releaseTurn: () => void = () => {};
+    (mocks.bus.publish as ReturnType<typeof vi.fn>).mockImplementation((_layer: string, event: BusEvent) => {
+      if (event.type !== 'inbound.message') return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        releaseTurn = resolve;
+      });
+    });
+    const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
+    list.mockResolvedValueOnce([
+      makeMockMessage({ id: 'slow', threadId: 'thread-slow', from: [{ email: 'ada@example.com' }] }),
+    ]).mockResolvedValue([]);
+
+    try {
+      await adapter.start();
+      await vi.advanceTimersByTimeAsync(EMAIL_INBOUND_TURN_STALL_MS);
+      expect(adapter.inboundInFlight).toBe(1);
+      expect(adapter.inboundMaxConcurrentTurns).toBe(4);
+      expect(checkEmail(adapter, 3, new Date())).toBe('ok');
+    } finally {
+      releaseTurn();
+      await adapter.drainInFlight();
+      await adapter.stop();
+    }
   });
 });

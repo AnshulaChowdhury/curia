@@ -21,10 +21,10 @@ channels:
   max_message_bytes: 102400   # 100KB — inbound messages exceeding this are rejected before routing
   email:
     # Max coordinator turns one mailbox may have in flight from inbound mail.
-    # The poll returns after the Nylas fetch and handoff; it does not wait for
-    # those turns. Messages on one thread stay in order and never run together.
-    # Further threads wait for a free slot. 4 covers a short burst without
-    # letting a flood open an unbounded set of coordinator turns (#2254).
+    # The poll returns after the Nylas fetch and write-ahead; it does not wait
+    # for those turns. Messages on one thread stay in date order and never run
+    # together. Further threads wait for a free slot. The cap bounds concurrent
+    # turns only — queued messages stay in memory until a slot frees (#2254).
     max_concurrent_turns: 4
   # Signal / Slack channel activation is controlled by vault credentials + the channel
   # registry (Settings → Channels), not this file. Trust policies live in channel-trust.yaml.

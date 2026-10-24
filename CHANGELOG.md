@@ -150,7 +150,11 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 - **Attachment download** — recovers from garbled Nylas IDs via filename or sole-attachment fallback. (#2281)
 - **Email poll** — detaches agent turns, so health stays accurate and other threads are not stuck behind one. (#2254)
-- **`channel.poll`** — **public API:** `processed` and `durationMs` cover the fetch and handoff, not the agent turn. (#2254)
+- **Email watermark** — advances only after inbound write-ahead, so a restart cannot skip queued mail. (#2254)
+- **Email health** — fails when every inbound slot is held by a turn past 15 minutes. (#2254)
+- **Email stop** — drops queued inbound mail and stops starting turns while the process shuts down. (#2254)
+- **`channel.poll`** — **public API:** `processed` counts a successful inbound write-ahead, not the agent turn. (#2254)
+- **`EventBus.stagePublish`** — **public API:** persists the event, then returns delivery for the caller to start. (#2254)
 - **`async-offramp`** — returns after the task is durably queued, without waiting on the coordinator. (#2265)
 - **Voice tool barge-in** — a stalled tool call no longer holds the turn; its late result is discarded. (#2265)
 - **Voice summarization** — runs in the background, so crossing the threshold no longer delays the reply. (#2266)

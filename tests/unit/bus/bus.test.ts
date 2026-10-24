@@ -278,4 +278,63 @@ describe('EventBus', () => {
     await expect(bus.publishDetached('channel', event)).rejects.toThrow(/audit insert failed/);
     expect(handler).not.toHaveBeenCalled();
   });
+
+  it('stagePublish resolves after write-ahead and before deliver is called (#2254)', async () => {
+    const onEvent = vi.fn(async () => {});
+    const handler = vi.fn();
+    bus = new EventBus(createLogger('error'), onEvent);
+    bus.subscribe('inbound.message', 'dispatch', handler);
+
+    const event = createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'cli',
+      senderId: 'user',
+      content: 'Hello',
+    });
+
+    const staged = await bus.stagePublish('channel', event);
+    expect(onEvent).toHaveBeenCalledWith(event);
+    expect(handler).not.toHaveBeenCalled();
+
+    await staged.deliver();
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith(event);
+
+    await staged.deliver();
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it('stagePublish rejects a failing write-ahead before subscribers run (#2254)', async () => {
+    const onEvent = vi.fn(async () => {
+      throw new Error('audit insert failed');
+    });
+    const handler = vi.fn();
+    bus = new EventBus(createLogger('error'), onEvent);
+    bus.subscribe('inbound.message', 'dispatch', handler);
+
+    const event = createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'cli',
+      senderId: 'user',
+      content: 'Hello',
+    });
+
+    await expect(bus.stagePublish('channel', event)).rejects.toThrow(/audit insert failed/);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('a subscriber throw does not reject stagePublish or deliver (#2254)', async () => {
+    bus.subscribe('inbound.message', 'dispatch', async () => {
+      throw new Error('subscriber blew up');
+    });
+    const event = createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'cli',
+      senderId: 'user',
+      content: 'Hello',
+    });
+
+    const staged = await bus.stagePublish('channel', event);
+    await expect(staged.deliver()).resolves.toBeUndefined();
+  });
 });

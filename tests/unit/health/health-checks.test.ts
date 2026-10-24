@@ -3,6 +3,7 @@ import {
   checkDb,
   checkBus,
   checkBrowser,
+  EMAIL_INBOUND_TURN_STALL_MS,
   checkEmail,
   checkScheduler,
   checkSignal,
@@ -187,6 +188,40 @@ describe('checkEmail', () => {
       pollingIntervalMs: 60_000,
     } as never;
     expect(checkEmail(adapter, 3, startedAt)).toBe('fail');
+  });
+
+  it('fails a fresh poll when every inbound slot is held past 15 minutes', () => {
+    expect(EMAIL_INBOUND_TURN_STALL_MS).toBe(15 * 60 * 1000);
+    const adapter = {
+      lastSuccessfulPollAt: new Date(),
+      pollingIntervalMs: 30_000,
+      inboundInFlight: 4,
+      inboundMaxConcurrentTurns: 4,
+      oldestInboundInFlightAgeMs: EMAIL_INBOUND_TURN_STALL_MS,
+    };
+    expect(checkEmail(adapter, 3, startedAt)).toBe('fail');
+  });
+
+  it('stays ok when a long turn still has a free slot', () => {
+    const adapter = {
+      lastSuccessfulPollAt: new Date(),
+      pollingIntervalMs: 30_000,
+      inboundInFlight: 1,
+      inboundMaxConcurrentTurns: 4,
+      oldestInboundInFlightAgeMs: EMAIL_INBOUND_TURN_STALL_MS,
+    };
+    expect(checkEmail(adapter, 3, startedAt)).toBe('ok');
+  });
+
+  it('stays ok when the cap is full but the oldest turn is under the bound', () => {
+    const adapter = {
+      lastSuccessfulPollAt: new Date(),
+      pollingIntervalMs: 30_000,
+      inboundInFlight: 4,
+      inboundMaxConcurrentTurns: 4,
+      oldestInboundInFlightAgeMs: EMAIL_INBOUND_TURN_STALL_MS - 1,
+    };
+    expect(checkEmail(adapter, 3, startedAt)).toBe('ok');
   });
 });
 

@@ -1946,7 +1946,9 @@ async function main(): Promise<void> {
         ceoEmail: principalEmail,
         contactCreationMaxPerMessage: yamlConfig.contact_creation_limits?.max_per_message ?? 10,
         contactCreationMaxPerHour: yamlConfig.contact_creation_limits?.max_per_hour ?? 100,
-        maxConcurrentTurns: yamlConfig.channels?.email?.max_concurrent_turns,
+        // default.yaml is 4. Applying it here matches the neighbouring limits,
+        // so a config that omits the key still boots with a cap (#2254).
+        maxConcurrentTurns: yamlConfig.channels?.email?.max_concurrent_turns ?? 4,
         timezone: config.timezone,
         // Persist the poll high-water mark so restarts resume from where we left off
         // rather than silently dropping messages that arrived during downtime (#846).

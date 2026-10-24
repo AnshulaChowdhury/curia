@@ -19,11 +19,24 @@ import type { Logger } from '../logger.js';
 // classes, which would pull in their full dependency graphs. The health module
 // only needs the specific fields/methods it probes — nothing more.
 
+/**
+ * An inbound turn held this long, while every concurrency slot is taken,
+ * fails the email check even if Nylas polls are still succeeding (#2254).
+ * Longer than a normal coordinator turn so one slow reply does not flap.
+ */
+export const EMAIL_INBOUND_TURN_STALL_MS = 15 * 60 * 1000;
+
 export interface EmailAdapterHealth {
   /** Date of the most recent successful poll, or null if none has completed. */
   lastSuccessfulPollAt: Date | null;
   /** Polling interval in ms — used to compute the stall threshold. */
   pollingIntervalMs: number;
+  /** Turns whose delivery has started and not settled. Absent on test doubles. */
+  inboundInFlight?: number;
+  /** Cap those in-flight turns share. Absent on test doubles. */
+  inboundMaxConcurrentTurns?: number;
+  /** Age of the oldest in-flight turn, or null when nothing is running. */
+  oldestInboundInFlightAgeMs?: number | null;
 }
 
 export interface SignalRpcClientHealth {
@@ -188,8 +201,10 @@ export function checkBus(bus: EventBus): CheckResult {
  * completed yet. Outside the grace window, a null value is a stall.
  *
  * The adapter stamps lastSuccessfulPollAt when the Nylas fetch and handoff finish,
- * not when the agent turn finishes (#2254). A long turn does not fail this check;
- * a poll that stops succeeding does.
+ * not when the agent turn finishes (#2254). A long turn does not fail this check
+ * on its own. The check does fail when every inbound slot is held by a turn at
+ * least {@link EMAIL_INBOUND_TURN_STALL_MS} old, even if polls are still fresh.
+ * A poll that stops succeeding also fails.
  *
  * @param adapter      The email adapter to probe, or undefined when not configured.
  * @param emailStallFactor  Multiplier on pollingIntervalMs to derive the stall threshold.
@@ -206,11 +221,22 @@ export function checkEmail(
   const now = Date.now();
   const graceMs = emailStallFactor * pollingIntervalMs;
 
-  if (lastSuccessfulPollAt === null) {
-    // Still within the startup grace window — no successful poll yet is expected.
-    return now - startedAt.getTime() < graceMs ? 'ok' : 'fail';
+  const pollFresh = lastSuccessfulPollAt === null
+    ? now - startedAt.getTime() < graceMs
+    : now - lastSuccessfulPollAt.getTime() < graceMs;
+  if (!pollFresh) return 'fail';
+
+  const { inboundInFlight, inboundMaxConcurrentTurns, oldestInboundInFlightAgeMs } = adapter;
+  if (
+    inboundInFlight !== undefined &&
+    inboundMaxConcurrentTurns !== undefined &&
+    oldestInboundInFlightAgeMs != null &&
+    inboundInFlight >= inboundMaxConcurrentTurns &&
+    oldestInboundInFlightAgeMs >= EMAIL_INBOUND_TURN_STALL_MS
+  ) {
+    return 'fail';
   }
-  return now - lastSuccessfulPollAt.getTime() < graceMs ? 'ok' : 'fail';
+  return 'ok';
 }
 
 /**

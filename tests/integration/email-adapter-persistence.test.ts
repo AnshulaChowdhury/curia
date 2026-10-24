@@ -81,6 +81,7 @@ function makeAdapterConfig(
     suppressedSenderEmails: [],
     contactCreationMaxPerMessage: 10,
     contactCreationMaxPerHour: 100,
+    maxConcurrentTurns: 4,
     timezone: 'UTC',
     configStore,
   };
