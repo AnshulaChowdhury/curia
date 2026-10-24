@@ -165,11 +165,20 @@ export function persistableContactId(contactId: string | null | undefined): stri
   return contactId.toLowerCase();
 }
 
+/** When the summarization pass runs relative to this write. Omitted means inline. */
+export type AddTurnSummarize = 'inline' | 'background';
+
 export interface AddTurnAttribution {
   /** Resolved contact UUID for a user turn. Non-UUIDs are stored as null. */
   senderContactId?: string | null;
   /** Channel the turn arrived on (`signal`, `email`, `voice`, …). */
   channelId?: string | null;
+  /**
+   * `background` returns once the row is stored and runs the condensation pass
+   * off the caller's critical path. Voice turns set this so a threshold
+   * crossing is not silence before the reply (#2266). Omitted means `inline`.
+   */
+  summarize?: AddTurnSummarize;
   /**
    * True when this is a row Curia wrote to itself rather than a message from a
    * person (#1892). Only ever set by the path that minted the turn; anything
@@ -190,6 +199,8 @@ export function normalizeAddTurnAttribution(meta: AddTurnAttribution | undefined
   createdAt: Date | null;
   /** True when the caller passed a sender id that is not a contact UUID. */
   senderDropped: boolean;
+  /** Only an explicit `background` leaves the pass off the caller's await. */
+  summarize: AddTurnSummarize;
 } {
   const rawSender = meta?.senderContactId;
   const senderContactId = persistableContactId(rawSender) ?? null;
@@ -205,7 +216,14 @@ export function normalizeAddTurnAttribution(meta: AddTurnAttribution | undefined
   }
   // Strict equality, not truthiness: only an explicit `true` marks a row as
   // Curia's own. Anything else means a person said it.
-  return { senderContactId, channelId, synthetic: meta?.synthetic === true, createdAt, senderDropped };
+  return {
+    senderContactId,
+    channelId,
+    synthetic: meta?.synthetic === true,
+    createdAt,
+    senderDropped,
+    summarize: meta?.summarize === 'background' ? 'background' : 'inline',
+  };
 }
 
 /**

@@ -3437,6 +3437,14 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.error({ err }, 'Error releasing the instance lock during shutdown');
     }
+    // A background summarization pass may still be inside its LLM call. Wait
+    // for it to persist before pool.end(), or the persist fails and logs a
+    // warn on every deploy (#2266).
+    try {
+      await memory.drainSummarization();
+    } catch (err) {
+      logger.error({ err }, 'Error draining working-memory summarization during shutdown');
+    }
     try {
       await pool.end();
     } catch (err) {

@@ -1166,6 +1166,8 @@ export class VoiceRuntime {
             // spoken replies still come back later (#1892).
             channelId: 'voice',
             synthetic: true,
+            // Condensation must not sit on the spoken-turn path (#2266).
+            summarize: 'background',
           });
           try {
             await this.config.workingMemory.addTurn(session.conversationId, VOICE_HISTORY_AGENT_ID, {
@@ -1173,6 +1175,7 @@ export class VoiceRuntime {
               content: finalText,
             }, {
               channelId: 'voice',
+              summarize: 'background',
             });
           } catch (assistantErr) {
             // Cue landed but the spoken reply did not — next loadTurnContext will
@@ -1543,6 +1546,7 @@ export class VoiceRuntime {
         content: assistantContent,
       }, {
         channelId: 'voice',
+        summarize: 'background',
       });
     } catch (err) {
       this.log.warn(
@@ -1623,6 +1627,7 @@ export class VoiceRuntime {
         }, {
           senderContactId: persistableCallerContactId(session.caller.contactId) ?? null,
           channelId: 'voice',
+          summarize: 'background',
         });
         userTurnPersisted = true;
       } catch (err) {
@@ -1695,6 +1700,7 @@ export class VoiceRuntime {
             content: finalText,
           }, {
             channelId: 'voice',
+            summarize: 'background',
           });
         } catch (err) {
           this.log.warn(
