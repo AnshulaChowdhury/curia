@@ -148,6 +148,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Attachment download** — recovers from garbled Nylas IDs via filename or sole-attachment fallback. (#2281)
 - **`async-offramp`** — returns after the task is durably queued, without waiting on the coordinator. (#2265)
 - **Voice tool barge-in** — a stalled tool call no longer holds the turn; its late result is discarded. (#2265)
 - **Voice summarization** — runs in the background, so crossing the threshold no longer delays the reply. (#2266)

@@ -5,6 +5,11 @@ import { EmailDownloadAttachmentHandler } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import { createSilentLogger } from '../../../../src/logger.js';
 import type { NylasMessage } from '../../../../src/channels/email/nylas-client.js';
+import {
+  DMARC_REAL_ATTACHMENT_ID,
+  DMARC_CORRUPTED_ATTACHMENT_ID,
+  DMARC_FILENAME,
+} from '../../../_shared/__fixtures__/resolve-attachment.js';
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -69,18 +74,20 @@ describe('EmailDownloadAttachmentHandler — validation', () => {
     expect((result as { error: string }).error).toContain('outboundGateway');
   });
 
-  it('returns error when attachment_id is missing', async () => {
+  it('returns error when both attachment_id and filename are missing', async () => {
     const handler = new EmailDownloadAttachmentHandler();
     const result = await handler.execute(makeCtx({ input: { message_id: 'msg-1' } }));
     expect(result.success).toBe(false);
-    expect((result as { error: string }).error).toContain('attachment_id');
+    expect((result as { error: string }).error).toMatch(/attachment_id or filename/);
   });
 
-  it('returns error when attachment_id is empty string', async () => {
+  it('returns error when attachment_id and filename are empty strings', async () => {
     const handler = new EmailDownloadAttachmentHandler();
-    const result = await handler.execute(makeCtx({ input: { attachment_id: '  ', message_id: 'msg-1' } }));
+    const result = await handler.execute(makeCtx({
+      input: { attachment_id: '  ', filename: '  ', message_id: 'msg-1' },
+    }));
     expect(result.success).toBe(false);
-    expect((result as { error: string }).error).toContain('attachment_id');
+    expect((result as { error: string }).error).toMatch(/attachment_id or filename/);
   });
 
   it('returns error when message_id is missing', async () => {
@@ -99,15 +106,24 @@ describe('EmailDownloadAttachmentHandler — validation', () => {
 });
 
 describe('EmailDownloadAttachmentHandler — attachment verification', () => {
-  it('returns error when attachment ID is not found on the message', async () => {
-    // Message has att-1; we request att-9 which does not exist.
+  it('returns error listing attachments when ID misses on a multi-attachment message', async () => {
+    const multi = makeMessage({
+      attachments: [
+        { id: 'att-1', filename: 'report.pdf', contentType: 'application/pdf', size: 4096 },
+        { id: 'att-2', filename: 'photo.jpg', contentType: 'image/jpeg', size: 2048 },
+      ],
+    });
     const handler = new EmailDownloadAttachmentHandler();
     const result = await handler.execute(makeCtx({
       input: { attachment_id: 'att-9', message_id: 'msg-1' },
+      outboundGateway: makeMockGateway({ getEmailMessage: vi.fn().mockResolvedValue(multi) }),
     }));
     expect(result.success).toBe(false);
-    expect((result as { error: string }).error).toContain('att-9');
-    expect((result as { error: string }).error).toContain('msg-1');
+    const error = (result as { error: string }).error;
+    expect(error).toContain('att-9');
+    expect(error).toContain('msg-1');
+    expect(error).toContain('report.pdf');
+    expect(error).toContain('photo.jpg');
   });
 
   it('returns error when attachment size exceeds 10 MB limit', async () => {
@@ -159,6 +175,78 @@ describe('EmailDownloadAttachmentHandler — successful download', () => {
     expect(data.filename).toBe('report.pdf');
     expect(data.content_type).toBe('application/pdf');
     expect(data.size).toBe(content.length);
+    expect(data.resolved_by).toBe('id');
+  });
+
+  it('downloads via sole_attachment for the 2026-10-24 corrupted ID fixture', async () => {
+    const content = Buffer.from('PK\x03\x04dmarc');
+    const msg = makeMessage({
+      attachments: [{
+        id: DMARC_REAL_ATTACHMENT_ID,
+        filename: DMARC_FILENAME,
+        contentType: 'application/zip',
+        size: content.length,
+      }],
+    });
+    const download = vi.fn().mockResolvedValue(content);
+    const handler = new EmailDownloadAttachmentHandler();
+    const result = await handler.execute(makeCtx({
+      input: { attachment_id: DMARC_CORRUPTED_ATTACHMENT_ID, message_id: 'msg-1' },
+      outboundGateway: makeMockGateway({
+        getEmailMessage: vi.fn().mockResolvedValue(msg),
+        downloadEmailAttachment: download,
+      }),
+    }));
+
+    expect(result.success).toBe(true);
+    const data = (result as { data: Record<string, unknown> }).data;
+    expect(data.resolved_by).toBe('sole_attachment');
+    expect(data.filename).toBe(DMARC_FILENAME);
+    expect(download).toHaveBeenCalledWith(DMARC_REAL_ATTACHMENT_ID, 'msg-1', undefined);
+  });
+
+  it('downloads via filename when ID is wrong on a multi-attachment message', async () => {
+    const content = Buffer.from('wanted');
+    const multi = makeMessage({
+      attachments: [
+        { id: 'att-a', filename: 'report.pdf', contentType: 'application/pdf', size: 100 },
+        { id: 'att-b', filename: 'photo.jpg', contentType: 'image/jpeg', size: 200 },
+      ],
+    });
+    const download = vi.fn().mockResolvedValue(content);
+    const handler = new EmailDownloadAttachmentHandler();
+    const result = await handler.execute(makeCtx({
+      input: { attachment_id: 'wrong', filename: 'report.pdf', message_id: 'msg-1' },
+      outboundGateway: makeMockGateway({
+        getEmailMessage: vi.fn().mockResolvedValue(multi),
+        downloadEmailAttachment: download,
+      }),
+    }));
+
+    expect(result.success).toBe(true);
+    const data = (result as { data: Record<string, unknown> }).data;
+    expect(data.resolved_by).toBe('filename');
+    expect(data.filename).toBe('report.pdf');
+    expect(download).toHaveBeenCalledWith('att-a', 'msg-1', undefined);
+  });
+
+  it('fails with listing when filename is ambiguous on a multi-attachment message', async () => {
+    const multi = makeMessage({
+      attachments: [
+        { id: 'att-a', filename: 'dup.pdf', contentType: 'application/pdf', size: 100 },
+        { id: 'att-b', filename: 'dup.pdf', contentType: 'application/pdf', size: 200 },
+      ],
+    });
+    const handler = new EmailDownloadAttachmentHandler();
+    const result = await handler.execute(makeCtx({
+      input: { attachment_id: 'wrong', filename: 'dup.pdf', message_id: 'msg-1' },
+      outboundGateway: makeMockGateway({ getEmailMessage: vi.fn().mockResolvedValue(multi) }),
+    }));
+    expect(result.success).toBe(false);
+    const error = (result as { error: string }).error;
+    expect(error).toMatch(/matches 2 attachments/i);
+    expect(error).toContain('att-a');
+    expect(error).toContain('att-b');
   });
 
   it('returns error when downloadEmailAttachment throws', async () => {
