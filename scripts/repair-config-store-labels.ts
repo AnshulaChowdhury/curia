@@ -4,26 +4,26 @@
 // after semantic dedup merged similar keys (#2252).
 //
 // What it fixes:
-//   UPDATE kg_nodes SET label = properties->>'key'
+//   UPDATE kg_nodes SET label = properties->>'key', embedding = NULL, embedding_model = NULL
 //   for fact nodes hanging off a config:<namespace> anchor where
 //   label IS DISTINCT FROM properties->>'key'.
+//   Clearing the embedding avoids leaving a vector for the old label (reembed:kg
+//   would skip these rows because embedding_model is unchanged). exactKey writes
+//   do not need the vector; a later optional reembed can refill if desired.
 //
 // What it cannot fix:
 //   Values overwritten by the merge are gone from the graph. The script lists
-//   each mismatched row (anchor, old label, key, value preview) so an operator
-//   can see which keys were lost; recovering those values is out of scope.
+//   each mismatched row and any duplicate (anchor, key) groups so an operator
+//   can see remaining corruption.
 //
 // Dry-run (default): report only. Pass --apply to write.
+// Does NOT bump last_confirmed_at — that would flip the recency tiebreak toward
+// realigned stale twins when duplicate-key facts remain.
 //
 // Run:  pnpm run repair:config-store-labels
 //       pnpm run repair:config-store-labels -- --apply
-//
-// On prod (container already has DATABASE_URL):
-//   docker exec curia-curia-1 ./node_modules/.bin/tsx \
-//     scripts/repair-config-store-labels.ts
-//   docker exec curia-curia-1 ./node_modules/.bin/tsx \
-//     scripts/repair-config-store-labels.ts --apply
 
+import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 import pino from 'pino';
 
@@ -37,31 +37,36 @@ export type PoolLike = {
 
 export interface MismatchedConfigFact {
   id: string;
-  anchorLabel: string;
+  /** All config anchors this fact is linked to (deduped). */
+  anchorLabels: string[];
   label: string;
   key: string;
-  /** Truncated value for operator review — overwritten siblings are not recoverable. */
   valuePreview: string;
+}
+
+export interface DuplicateKeyGroup {
+  anchorLabel: string;
+  key: string;
+  factIds: string[];
+  labels: string[];
 }
 
 export interface RepairResult {
   dryRun: boolean;
   mismatched: MismatchedConfigFact[];
+  duplicates: DuplicateKeyGroup[];
   /** Rows updated when dryRun is false; always 0 in dry-run. */
   updatedCount: number;
 }
 
 /**
- * Config-anchor facts where the node label no longer matches properties.key.
- * Joins through relates_to in either direction. Only non-archived concept
- * anchors whose label starts with `config:` — the meta-index
- * (`config-store-index`) is excluded because its facts use label=namespace
- * without a parallel key property.
+ * One row per fact id. Aggregates anchors so a fact linked to duplicate
+ * config:ns anchors (anchor-create race) is not double-counted.
  */
 export const LIST_MISMATCHED_SQL = `
-  SELECT DISTINCT
+  SELECT
     f.id,
-    a.label AS anchor_label,
+    array_agg(DISTINCT a.label ORDER BY a.label) AS anchor_labels,
     f.label,
     f.properties->>'key' AS key,
     left(coalesce(f.properties->>'value', ''), 120) AS value_preview
@@ -81,13 +86,50 @@ export const LIST_MISMATCHED_SQL = `
     AND a.label LIKE 'config:%'
     AND f.properties ? 'key'
     AND f.label IS DISTINCT FROM f.properties->>'key'
-  ORDER BY a.label, f.properties->>'key', f.id
+  GROUP BY f.id, f.label, f.properties
+  ORDER BY min(a.label), f.properties->>'key', f.id
 `;
 
+/**
+ * Duplicate (anchor, key) groups — remaining corruption after label realign.
+ * Does not bump last_confirmed_at; operators decide which twin to keep.
+ */
+export const LIST_DUPLICATE_KEYS_SQL = `
+  SELECT
+    a.label AS anchor_label,
+    f.properties->>'key' AS key,
+    array_agg(f.id::text ORDER BY f.last_confirmed_at DESC, f.id) AS fact_ids,
+    array_agg(f.label ORDER BY f.last_confirmed_at DESC, f.id) AS labels
+  FROM kg_nodes f
+  JOIN kg_edges e
+    ON e.archived_at IS NULL
+   AND (e.source_node_id = f.id OR e.target_node_id = f.id)
+  JOIN kg_nodes a
+    ON a.id = CASE
+         WHEN e.source_node_id = f.id THEN e.target_node_id
+         ELSE e.source_node_id
+       END
+  WHERE f.type = 'fact'
+    AND f.archived_at IS NULL
+    AND a.type = 'concept'
+    AND a.archived_at IS NULL
+    AND a.label LIKE 'config:%'
+    AND f.properties ? 'key'
+  GROUP BY a.id, a.label, f.properties->>'key'
+  HAVING count(*) > 1
+  ORDER BY a.label, f.properties->>'key'
+`;
+
+/**
+ * Realign label to properties.key and clear the stale embedding. Clearing both
+ * embedding and embedding_model satisfies kg_nodes_embedding_model_stamped.
+ * Does not touch last_confirmed_at (recency tiebreak for duplicate keys).
+ */
 export const APPLY_BY_IDS_SQL = `
   UPDATE kg_nodes
   SET label = properties->>'key',
-      last_confirmed_at = now()
+      embedding = NULL,
+      embedding_model = NULL
   WHERE id = ANY($1::uuid[])
 `;
 
@@ -99,6 +141,14 @@ function requireString(row: Record<string, unknown>, field: string): string {
   return v;
 }
 
+function requireStringArray(row: Record<string, unknown>, field: string): string[] {
+  const v = row[field];
+  if (!Array.isArray(v) || !v.every((x) => typeof x === 'string')) {
+    throw new Error(`repair-config-store-labels: expected string[] column "${field}"`);
+  }
+  return v as string[];
+}
+
 export function parseMismatchRows(rows: unknown[]): MismatchedConfigFact[] {
   return rows.map((raw) => {
     if (raw === null || typeof raw !== 'object') {
@@ -107,10 +157,25 @@ export function parseMismatchRows(rows: unknown[]): MismatchedConfigFact[] {
     const row = raw as Record<string, unknown>;
     return {
       id: requireString(row, 'id'),
-      anchorLabel: requireString(row, 'anchor_label'),
+      anchorLabels: requireStringArray(row, 'anchor_labels'),
       label: requireString(row, 'label'),
       key: requireString(row, 'key'),
       valuePreview: requireString(row, 'value_preview'),
+    };
+  });
+}
+
+export function parseDuplicateRows(rows: unknown[]): DuplicateKeyGroup[] {
+  return rows.map((raw) => {
+    if (raw === null || typeof raw !== 'object') {
+      throw new Error('repair-config-store-labels: duplicate row is not an object');
+    }
+    const row = raw as Record<string, unknown>;
+    return {
+      anchorLabel: requireString(row, 'anchor_label'),
+      key: requireString(row, 'key'),
+      factIds: requireStringArray(row, 'fact_ids'),
+      labels: requireStringArray(row, 'labels'),
     };
   });
 }
@@ -122,8 +187,11 @@ export async function runRepair(
   const listed = await pool.query(LIST_MISMATCHED_SQL);
   const mismatched = parseMismatchRows(listed.rows);
 
+  const dupListed = await pool.query(LIST_DUPLICATE_KEYS_SQL);
+  const duplicates = parseDuplicateRows(dupListed.rows);
+
   if (!options.apply || mismatched.length === 0) {
-    return { dryRun: !options.apply, mismatched, updatedCount: 0 };
+    return { dryRun: !options.apply, mismatched, duplicates, updatedCount: 0 };
   }
 
   const ids = mismatched.map((m) => m.id);
@@ -131,6 +199,7 @@ export async function runRepair(
   return {
     dryRun: false,
     mismatched,
+    duplicates,
     updatedCount: updated.rowCount ?? 0,
   };
 }
@@ -141,38 +210,50 @@ export function formatRepairReport(result: RepairResult): string {
     `config-store label repair (#2252) — ${mode}`,
     '',
     `  mismatched facts: ${result.mismatched.length}`,
+    `  duplicate (anchor, key) groups: ${result.duplicates.length}`,
     ...(result.dryRun ? [] : [`  rows updated:     ${result.updatedCount}`]),
     '',
   ];
 
   if (result.mismatched.length === 0) {
-    lines.push('  (none — label and properties.key already agree on every config fact)');
-    return lines.join('\n');
-  }
-
-  lines.push('  id                                   | anchor                    | label → key');
-  lines.push('  -------------------------------------+---------------------------+---------------------------');
-  for (const m of result.mismatched) {
-    const id = m.id.padEnd(36);
-    const anchor = m.anchorLabel.slice(0, 25).padEnd(25);
-    lines.push(`  ${id} | ${anchor} | ${m.label} → ${m.key}`);
-    if (m.valuePreview.length > 0) {
-      lines.push(`      value: ${m.valuePreview}`);
+    lines.push('  (no label≠key mismatches)');
+  } else {
+    lines.push('  id                                   | anchors                   | label → key');
+    lines.push('  -------------------------------------+---------------------------+---------------------------');
+    for (const m of result.mismatched) {
+      const id = m.id.padEnd(36);
+      const anchors = m.anchorLabels.join(',').slice(0, 25).padEnd(25);
+      lines.push(`  ${id} | ${anchors} | ${m.label} → ${m.key}`);
+      if (m.valuePreview.length > 0) {
+        lines.push(`      value: ${m.valuePreview}`);
+      }
     }
   }
+
+  if (result.duplicates.length > 0) {
+    lines.push('');
+    lines.push('  Duplicate keys (manual review — values may disagree):');
+    for (const d of result.duplicates) {
+      lines.push(`    ${d.anchorLabel} / ${d.key}: ${d.factIds.length} facts (labels: ${d.labels.join(', ')})`);
+    }
+  }
+
   lines.push('');
   lines.push(
     '  Note: values overwritten by the original merge cannot be recovered from the graph.',
   );
   if (result.dryRun) {
-    lines.push('  Re-run with --apply to set each label to properties.key.');
-    lines.push('  After apply, embeddings still reflect the old label until `pnpm reembed:kg`.');
+    lines.push('  Re-run with --apply to set each label to properties.key and clear stale embeddings.');
+  } else if (result.updatedCount > 0) {
+    lines.push(
+      '  Embeddings for repaired rows were cleared (exactKey writes do not need them).',
+    );
   }
   return lines.join('\n');
 }
 
-// CLI entry point — only runs when executed directly (not when imported by tests)
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+// CLI entry — pathToFileURL handles '#', '?', '%' in the checkout path.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const main = async (): Promise<void> => {
     const apply = process.argv.includes('--apply');
     const databaseUrl = process.env['DATABASE_URL'];
@@ -189,6 +270,7 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
         {
           dryRun: result.dryRun,
           mismatchedCount: result.mismatched.length,
+          duplicateGroups: result.duplicates.length,
           updatedCount: result.updatedCount,
         },
         'repair-config-store-labels: done',

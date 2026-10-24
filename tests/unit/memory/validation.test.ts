@@ -666,17 +666,40 @@ describe('MemoryValidator', () => {
     });
 
     it('updates the matching key and returns newLabel even when cosine would merge', async () => {
-      // Force semantic path to see a near-duplicate so this is not a vacuous pass
-      // against the fake embedder (which rarely scores similar stems above threshold).
+      // Force high cosine so this is not a vacuous pass against the fake embedder.
       vi.spyOn(EmbeddingService, 'cosineSimilarity').mockReturnValue(0.99);
 
       const entity = await store.createNode({
         type: 'concept', label: 'config:ns', properties: {}, source: 'test',
       });
+      // Prose fact without properties.key — semantic merge still applies.
+      const prose = await store.createNode({
+        type: 'fact',
+        label: 'Bob lives in Kitchener',
+        properties: { note: 'prose' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: prose.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+      const semanticProse = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'Bob lives in Kitchener',
+        properties: { note: 'updated' },
+        source: 'test',
+      });
+      expect(semanticProse.action).toBe('update');
+
+      // Config-style fact with a string key — semantic write of a *different* key
+      // must create (isExactKeyProtected), not merge.
       const existing = await store.createNode({
         type: 'fact',
         label: 'processed_event_ids_1',
-        properties: { key: 'processed_event_ids_1', value: '["a"]', namespace: 'ns' },
+        properties: { key: 'processed_event_ids_1', value: '["a"]', namespace: 'ns', exact_key: true },
         source: 'test',
       });
       await store.createEdge({
@@ -687,14 +710,13 @@ describe('MemoryValidator', () => {
         source: 'test',
       });
 
-      // Without exactKey, forced cosine ≥ factDedup → update (the production bug).
-      const semantic = await validator.validate({
+      const semanticIntoConfig = await validator.validate({
         entityNodeId: entity.id,
         label: 'processed_event_ids_2',
         properties: { key: 'processed_event_ids_2', value: '["b"]', namespace: 'ns' },
         source: 'test',
       });
-      expect(semantic.action).toBe('update');
+      expect(semanticIntoConfig.action).toBe('create');
 
       // With exactKey, different key → create despite high cosine.
       const exact = await validator.validate({
@@ -719,6 +741,7 @@ describe('MemoryValidator', () => {
         expect(sameKey.existingNodeId).toBe(existing.id);
         expect(sameKey.newLabel).toBe('processed_event_ids_1');
         expect(sameKey.mergedProperties.value).toBe('["a","c"]');
+        expect(sameKey.mergedProperties.exact_key).toBe(true);
       }
     });
 
@@ -753,7 +776,7 @@ describe('MemoryValidator', () => {
       expect(result.action).toBe('create');
     });
 
-    it('still rate-limits exactKey writes', async () => {
+    it('still rate-limits exactKey writes from agent sources', async () => {
       const entity = await store.createNode({
         type: 'concept', label: 'config:ns', properties: {}, source: 'test',
       });
@@ -770,6 +793,81 @@ describe('MemoryValidator', () => {
         exactKey: true,
       });
       expect(result.action).toBe('rate_limited');
+    });
+
+    it('exempts system: sources from the rate limit', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      for (let i = 0; i < 50; i++) {
+        validator.recordWrite('system:config-store');
+      }
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'watermark',
+        properties: { key: 'watermark', value: 't51', namespace: 'email' },
+        source: 'system:config-store',
+        exactKey: true,
+      });
+      expect(result.action).toBe('create');
+    });
+
+    it('throws when exactKey is set without a string properties.key', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+
+      await expect(
+        validator.validate({
+          entityNodeId: entity.id,
+          label: 'orphan',
+          properties: { value: 'x' },
+          source: 'test',
+          exactKey: true,
+        }),
+      ).rejects.toThrow(/exactKey requires a string properties\.key/);
+    });
+
+    it('persists exact_key on create and blocks semantic merge into it', async () => {
+      vi.spyOn(EmbeddingService, 'cosineSimilarity').mockReturnValue(0.99);
+
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const created = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'foo_1',
+        properties: { key: 'foo_1', value: 'a', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(created.action).toBe('create');
+      if (created.action !== 'create') return;
+      expect(created.validated.properties.exact_key).toBe(true);
+
+      const fact = await store.createNode({
+        type: 'fact',
+        label: 'foo_1',
+        properties: created.validated.properties,
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: fact.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      // Semantic write without exactKey must not merge into the protected fact.
+      const semantic = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'foo_2',
+        properties: { key: 'foo_2', value: 'b', namespace: 'ns' },
+        source: 'test',
+      });
+      expect(semantic.action).toBe('create');
     });
   });
 

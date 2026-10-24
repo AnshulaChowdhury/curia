@@ -28,7 +28,7 @@ function row(id: string, at: string, payload: Record<string, unknown>): AuditLog
 function makeQueue(opts: {
   pages?: SeqPage[];
   stored?: string | null;
-  setResult?: { stored: boolean };
+  setResult?: { stored: boolean; action?: string };
   existingSeqs?: string[];
 }) {
   const pages = [...(opts.pages ?? [{ rows: [], hasMore: false }])];
@@ -36,7 +36,11 @@ function makeQueue(opts: {
     pages.shift() ?? { rows: [], hasMore: false });
   const hasEventAtSeq = vi.fn(async (_type: string, seq: string) => (opts.existingSeqs ?? []).includes(seq));
   const get = vi.fn().mockResolvedValue(opts.stored ?? null);
-  const set = vi.fn().mockResolvedValue(opts.setResult ?? { stored: true });
+  const set = vi.fn().mockResolvedValue(
+    opts.setResult
+      ? { stored: opts.setResult.stored, action: opts.setResult.action ?? 'created' }
+      : { stored: true, action: 'created' },
+  );
   const logger = createSilentLogger();
   const warn = vi.spyOn(logger, 'warn');
   const queue = new ReportQueue({

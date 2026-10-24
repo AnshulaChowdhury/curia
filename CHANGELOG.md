@@ -155,7 +155,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`channel.poll`** — **public API:** `processed` is write-ahead; `fetched` is the Nylas count; `deferred` and `already_staged` added. (#2254)
 - **`EventBus.stagePublish`** — **public API:** persists the event, then returns delivery for the caller to start. (#2254)
 - **`EventBus.deliverPersisted`** — **public API:** delivers an already-persisted event without writing it again. (#2254)
-- **`config-store`** — similar keys no longer overwrite each other via KG semantic dedup. (#2252)
+- **`config-store`** — similar keys no longer overwrite each other via KG semantic dedup; exact-key marker, system rate-limit exemption, shared ConfigStore path. (#2252)
 - **`async-offramp`** — returns after the task is durably queued, without waiting on the coordinator. (#2265)
 - **Voice tool barge-in** — a stalled tool call no longer holds the turn; its late result is discarded. (#2265)
 - **Voice summarization** — runs in the background, so crossing the threshold no longer delays the reply. (#2266)

@@ -136,9 +136,11 @@ export interface StoreFactOptions {
    * same entity only when `properties.key` equals the incoming `properties.key`
    * (exact string equality). Used by config-store, where keys are opaque
    * identifiers — similar stems like `foo_1` / `foo_2` must never merge (#2252).
-   * Callers must set `properties.key`. Rate limiting and entity-existence checks
-   * still apply. On a key match the validator also returns `newLabel` so the
-   * caller's update keeps `label` aligned with the key.
+   * Callers must set a string `properties.key` (throws if missing). The validator
+   * also persists `properties.exact_key: true` so a later semantic write without
+   * this flag cannot merge into the fact (same pattern as `multi_valued`). Rate
+   * limiting and entity-existence checks still apply. On a key match the
+   * validator returns `newLabel` so the caller's update keeps `label` aligned.
    */
   exactKey?: boolean;
 }

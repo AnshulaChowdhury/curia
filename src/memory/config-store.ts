@@ -1,29 +1,69 @@
 // src/memory/config-store.ts
 //
-// Lightweight KG-backed key-value store for system infrastructure code.
-// Mirrors the logic in skills/config-store/handler.ts but without ToolContext
-// overhead, so non-agent callers (e.g. EmailAdapter, ceo-inbox-list) can read
-// and write config values directly.
+// KG-backed key-value store for system infrastructure and the config-store skill.
+// Non-agent callers (EmailAdapter, ceo-inbox-list, …) use it directly; the skill
+// handler delegates get/set/list here so exact-key semantics live in one place (#2252).
 //
-// Storage model (same as the skill):
+// Storage model:
 //   Namespace anchor: type=concept, label="config:{namespace}"
-//   Per-key facts on the anchor: label=key, properties: { key, value, namespace }, decayClass=permanent
+//   Per-key facts on the anchor:
+//     label=key, properties: { key, value, namespace, exact_key: true }, decayClass=permanent
 //
 // Writes use storeFact with exactKey: true so opaque config keys never merge via
-// label embedding similarity (#2252). Same-key writes update the existing fact in
-// place; distinct keys (foo_1 vs foo_2) always create separate facts. Soft
-// rejections (result.stored === false, e.g. rate limit) are logged and non-fatal
-// for heartbeat use — the prior value remains valid.
+// label embedding similarity. Same-key writes update in place; distinct keys always
+// create separate facts. Soft rejections (result.stored === false) are logged and
+// non-fatal for heartbeat use — the prior value remains valid.
+//
+// System writes use source `system:config-store`, which the validator exempts from
+// the per-task rate limit (nothing resets a process-lifetime counter for it).
 
 import type { EntityMemory } from './entity-memory.js';
+import type { KgNode } from './types.js';
 import type { Logger } from '../logger.js';
 
-// Fixed source string — never attributed to any agent task, so not subject to
-// per-task rate limiting.
-const SYSTEM_SOURCE = 'system:config-store';
+/** Fixed source for infrastructure callers — exempt from MemoryValidator rate limits. */
+export const SYSTEM_CONFIG_SOURCE = 'system:config-store';
 
 function anchorLabel(namespace: string): string {
   return `config:${namespace}`;
+}
+
+/**
+ * Pick the fact for a config key. Prefer properties.key; fall back to label only
+ * when properties.key is absent (legacy / hand-crafted facts). When label and key
+ * disagree after a historical semantic merge, properties.key wins — never return
+ * a fact whose properties.key is a different string (#2252).
+ */
+function confirmedAtMs(f: KgNode): number {
+  return f.temporal?.lastConfirmedAt?.getTime() ?? 0;
+}
+
+export function matchConfigFact(facts: KgNode[], key: string): KgNode | undefined {
+  const byPropKey = facts.filter((f) => (f.properties.key as string | undefined) === key);
+  if (byPropKey.length > 0) {
+    return byPropKey.sort((a, b) => confirmedAtMs(b) - confirmedAtMs(a))[0];
+  }
+  // Legacy: no properties.key on the node — match label, most recent first.
+  const byLabel = facts.filter(
+    (f) => f.properties.key === undefined && f.label === key,
+  );
+  return byLabel.sort((a, b) => confirmedAtMs(b) - confirmedAtMs(a))[0];
+}
+
+export function listConfigEntries(facts: KgNode[]): Array<{ key: string; value: string }> {
+  return facts.map((f) => ({
+    key: (f.properties.key as string | undefined) ?? f.label,
+    value: f.properties.value as string,
+  }));
+}
+
+export interface ConfigStoreSetOptions {
+  /** Defaults to 0.9 for system callers; the skill passes 1.0. */
+  confidence?: number;
+  /** Defaults to SYSTEM_CONFIG_SOURCE. */
+  source?: string;
+  /** Defaults to SYSTEM_CONFIG_SOURCE for newly created anchors. */
+  anchorSource?: string;
 }
 
 export class ConfigStore {
@@ -38,50 +78,50 @@ export class ConfigStore {
    *
    * Propagates infrastructure errors (DB down, KG unavailable, etc.) so callers
    * can distinguish "key not found" (null) from "read failed" (thrown error).
-   * Callers that want fall-through-on-error behaviour must catch explicitly.
    */
   async get(namespace: string, key: string): Promise<string | null> {
-    const anchors = await this.entityMemory.findEntities(anchorLabel(namespace));
-    if (anchors.length === 0) return null;
-
-    const allFacts = await Promise.all(anchors.map((a) => this.entityMemory.getFacts(a.id)));
-    const facts = allFacts.flat();
-
-    // Match on properties.key only — label can diverge after a historical semantic
-    // merge (#2252). Pick the most-recently confirmed fact when duplicates exist
-    // (e.g. a race between two concurrent anchor-create calls).
-    const matching = facts.filter(
-      (f) => (f.properties.key as string | undefined) === key,
-    );
-    const fact = matching.sort(
-      (a, b) => b.temporal.lastConfirmedAt.getTime() - a.temporal.lastConfirmedAt.getTime(),
-    )[0];
-
+    const facts = await this.loadNamespaceFacts(namespace);
+    if (facts === null) return null;
+    const fact = matchConfigFact(facts, key);
     if (!fact) return null;
     return (fact.properties.value as string) ?? null;
   }
 
   /**
-   * Write or update a value. Propagates infrastructure errors after logging so
-   * callers (e.g. EmailAdapter.poll) can catch and emit their own diagnostic.
-   * A soft storeFact rejection (result.stored === false) is logged as a warning
-   * and does not throw — the prior value is still valid in that case. Returns
-   * `{ stored }` so callers that need to react to a soft-reject (e.g. hold a
-   * watermark rather than advance it) can do so; existing callers that just
-   * `await` this and discard the result are unaffected (additive change).
+   * List every entry in a namespace. Returns [] when the namespace has never been
+   * written to. Used by the skill's retrieve-all path.
    */
-  async set(namespace: string, key: string, value: string): Promise<{ stored: boolean }> {
+  async list(namespace: string): Promise<Array<{ key: string; value: string }>> {
+    const facts = await this.loadNamespaceFacts(namespace);
+    if (facts === null) return [];
+    return listConfigEntries(facts);
+  }
+
+  /**
+   * Write or update a value. Soft storeFact rejection is logged and returned as
+   * `{ stored: false }` without throwing. Infrastructure errors are logged and
+   * rethrown.
+   */
+  async set(
+    namespace: string,
+    key: string,
+    value: string,
+    opts: ConfigStoreSetOptions = {},
+  ): Promise<{ stored: boolean; action: string }> {
+    const source = opts.source ?? SYSTEM_CONFIG_SOURCE;
+    const confidence = opts.confidence ?? 0.9;
+    const anchorSource = opts.anchorSource ?? SYSTEM_CONFIG_SOURCE;
+
     try {
-      const anchor = await this.findOrCreateAnchor(namespace);
+      const anchor = await this.findOrCreateAnchor(namespace, anchorSource);
 
       const result = await this.entityMemory.storeFact({
         entityNodeId: anchor.id,
         label: key,
-        properties: { key, value, namespace },
-        confidence: 0.9,
+        properties: { key, value, namespace, exact_key: true },
+        confidence,
         decayClass: 'permanent',
-        source: SYSTEM_SOURCE,
-        // Opaque keys — never merge via label embedding similarity (#2252).
+        source,
         exactKey: true,
       });
 
@@ -92,17 +132,21 @@ export class ConfigStore {
         );
       }
 
-      return { stored: result.stored };
+      return { stored: result.stored, action: result.action };
     } catch (err) {
-      // Log at the ConfigStore level for observability, then rethrow so callers
-      // can emit their own domain-specific diagnostic (e.g. "failed to persist
-      // poll watermark") without relying on log correlation.
       this.logger.error({ err, namespace, key }, 'ConfigStore.set: failed to write value');
       throw err;
     }
   }
 
-  private async findOrCreateAnchor(namespace: string): Promise<{ id: string }> {
+  private async loadNamespaceFacts(namespace: string): Promise<KgNode[] | null> {
+    const anchors = await this.entityMemory.findEntities(anchorLabel(namespace));
+    if (anchors.length === 0) return null;
+    const allFacts = await Promise.all(anchors.map((a) => this.entityMemory.getFacts(a.id)));
+    return allFacts.flat();
+  }
+
+  private async findOrCreateAnchor(namespace: string, source: string): Promise<{ id: string }> {
     const label = anchorLabel(namespace);
     const existing = await this.entityMemory.findEntities(label);
     if (existing.length > 0) return existing[0]!;
@@ -111,7 +155,7 @@ export class ConfigStore {
       type: 'concept',
       label,
       properties: { category: 'config', namespace },
-      source: SYSTEM_SOURCE,
+      source,
     });
     return entity;
   }

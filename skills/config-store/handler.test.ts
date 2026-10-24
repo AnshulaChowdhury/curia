@@ -143,13 +143,16 @@ describe('ConfigStoreHandler', () => {
     expect(valueFact.label).toBe('writing_guide_url');
     expect(valueFact.properties.value).toBe('https://docs.example.com');
     expect(valueFact.properties.namespace).toBe('writing_config');
+    expect(valueFact.properties.exact_key).toBe(true);
     expect(valueFact.decayClass).toBe('permanent');
     expect(valueFact.exactKey).toBe(true);
 
-    // Verify the namespace registration fact
+    // Verify the namespace registration fact (also exactKey)
     const nsFact = mem.storeFact.mock.calls[1]![0];
     expect(nsFact.label).toBe('writing_config');
     expect(nsFact.properties.namespace).toBe('writing_config');
+    expect(nsFact.properties.key).toBe('writing_config');
+    expect(nsFact.exactKey).toBe(true);
     expect(nsFact.decayClass).toBe('permanent');
   });
 
@@ -384,6 +387,31 @@ describe('ConfigStoreHandler', () => {
     if (result.success) {
       const data = result.data as { found: boolean };
       expect(data.found).toBe(false);
+    }
+  });
+
+  it('falls back to label when properties.key is absent (legacy single-key retrieve)', async () => {
+    const handler = new ConfigStoreHandler();
+    const mem = makeEntityMemory({
+      findEntities: vi.fn().mockResolvedValue([{ id: 'anchor-1' }]),
+      getFacts: vi.fn().mockResolvedValue([
+        {
+          id: 'f1',
+          label: 'writing_guide_url',
+          properties: { value: 'https://docs.example.com' },
+          temporal: { lastConfirmedAt: new Date('2026-01-01T00:00:00Z') },
+        },
+      ]),
+    });
+    const ctx = makeCtx(mem, { action: 'retrieve', namespace: 'writing_config', key: 'writing_guide_url' });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const data = result.data as { found: boolean; value: string };
+      expect(data.found).toBe(true);
+      expect(data.value).toBe('https://docs.example.com');
     }
   });
 
