@@ -133,6 +133,40 @@ describe('ConfigStore exact-key semantics', () => {
     expect(after).toHaveLength(1);
   });
 
+  it('creates one fact when overlapping writes target the same missing key', async () => {
+    await configStore.set('ns', 'other', 'x'); // anchor exists; key 'k' does not
+    const results = await Promise.all(
+      [0, 1, 2, 3, 4].map((i) => configStore.set('ns', 'k', `v${i}`)),
+    );
+    expect(results.every((r) => r.stored)).toBe(true);
+    expect(results.filter((r) => r.action === 'created')).toHaveLength(1);
+
+    const anchors = await entityMemory.findEntities('config:ns');
+    const facts = await entityMemory.getFacts(anchors[0]!.id);
+    expect(facts.filter((f) => f.properties.key === 'k')).toHaveLength(1);
+    // Writes are applied in call order, so the last one wins.
+    expect(await configStore.get('ns', 'k')).toBe('v4');
+  });
+
+  it('lets the next same-key write proceed after one fails', async () => {
+    await configStore.set('ns', 'other', 'x');
+    vi.spyOn(kgStore, 'createNode').mockRejectedValueOnce(new Error('db down'));
+    const [first, second] = await Promise.allSettled([
+      configStore.set('ns', 'k', 'v1'),
+      configStore.set('ns', 'k', 'v2'),
+    ]);
+    expect(first.status).toBe('rejected');
+    expect(second.status).toBe('fulfilled');
+    expect(await configStore.get('ns', 'k')).toBe('v2');
+  });
+
+  it('keeps concurrent writes to different keys as separate facts', async () => {
+    await configStore.set('ns', 'other', 'x');
+    const results = await Promise.all(['a', 'b', 'c'].map((k) => configStore.set('ns', k, k)));
+    expect(results.map((r) => r.action)).toEqual(['created', 'created', 'created']);
+    for (const k of ['a', 'b', 'c']) expect(await configStore.get('ns', k)).toBe(k);
+  });
+
   describe('duplicate namespace anchors (anchor-create race)', () => {
     /** Two config:ns anchors; the second already holds key `k`. */
     async function twoAnchorsWithKeyOnSecond() {

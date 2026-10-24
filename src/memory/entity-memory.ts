@@ -124,6 +124,9 @@ const FUZZY_SEARCH_LIMIT = 5;
  * when the caller does not specify one. Without a classifier, nodes default to 'internal'.
  */
 export class EntityMemory {
+  /** In-flight exact-key writes, keyed by entity + key; see storeFact(). */
+  private exactKeyWrites = new Map<string, Promise<void>>();
+
   constructor(
     private store: KnowledgeGraphStore,
     private validator: MemoryValidator,
@@ -556,8 +559,45 @@ export class EntityMemory {
    * deduplication but NOT contradiction detection. Contradiction detection
    * requires callers to invoke validator.validateContradiction() directly when
    * they have attribute metadata and a confidence value to compare against.
+   *
+   * Exact-key writes (#2252) are serialized per (entity, key): the validator's
+   * find-or-create is check-then-act, so two overlapping writes of a missing key
+   * would otherwise both create a fact. A process-local queue is enough because
+   * a running Curia holds the instance lock (ADR-051) — no second process writes
+   * the same database.
    */
   async storeFact(options: StoreFactOptions): Promise<StoreFactResult> {
+    const exactKey = options.exactKey === true
+      ? (options.properties as Record<string, unknown> | undefined)?.key
+      : undefined;
+    if (typeof exactKey === 'string') {
+      return this.withExactKeyLock(`${options.entityNodeId}\u0000${exactKey}`, () =>
+        this.storeFactUnserialized(options),
+      );
+    }
+    return this.storeFactUnserialized(options);
+  }
+
+  /**
+   * Runs `fn` after every earlier call with the same lock key has settled.
+   * The map only holds keys with a write in flight, so it does not grow.
+   */
+  private async withExactKeyLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.exactKeyWrites.get(lockKey) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => current);
+    this.exactKeyWrites.set(lockKey, tail);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.exactKeyWrites.get(lockKey) === tail) this.exactKeyWrites.delete(lockKey);
+    }
+  }
+
+  private async storeFactUnserialized(options: StoreFactOptions): Promise<StoreFactResult> {
     // Use contradiction detection when the fact carries `attribute` metadata,
     // since an attribute-based fact can directly contradict an existing one
     // (same entity, same attribute, different value). For facts without attribute
