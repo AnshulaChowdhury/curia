@@ -28,16 +28,16 @@ function anchorLabel(namespace: string): string {
   return `config:${namespace}`;
 }
 
+function confirmedAtMs(f: KgNode): number {
+  return f.temporal?.lastConfirmedAt?.getTime() ?? 0;
+}
+
 /**
  * Pick the fact for a config key. Prefer properties.key; fall back to label only
  * when properties.key is absent (legacy / hand-crafted facts). When label and key
  * disagree after a historical semantic merge, properties.key wins — never return
  * a fact whose properties.key is a different string (#2252).
  */
-function confirmedAtMs(f: KgNode): number {
-  return f.temporal?.lastConfirmedAt?.getTime() ?? 0;
-}
-
 export function matchConfigFact(facts: KgNode[], key: string): KgNode | undefined {
   const byPropKey = facts.filter((f) => (f.properties.key as string | undefined) === key);
   if (byPropKey.length > 0) {
@@ -50,9 +50,29 @@ export function matchConfigFact(facts: KgNode[], key: string): KgNode | undefine
   return byLabel.sort((a, b) => confirmedAtMs(b) - confirmedAtMs(a))[0];
 }
 
+/**
+ * List entries keyed for display. One row per logical key: prefers a fact that
+ * has properties.key over a legacy label-only twin, then most-recently confirmed.
+ */
 export function listConfigEntries(facts: KgNode[]): Array<{ key: string; value: string }> {
-  return facts.map((f) => ({
-    key: (f.properties.key as string | undefined) ?? f.label,
+  const byKey = new Map<string, KgNode>();
+  for (const f of facts) {
+    const key = (f.properties.key as string | undefined) ?? f.label;
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, f);
+      continue;
+    }
+    const existingHasKey = typeof existing.properties.key === 'string';
+    const incomingHasKey = typeof f.properties.key === 'string';
+    if (incomingHasKey && !existingHasKey) {
+      byKey.set(key, f);
+    } else if (incomingHasKey === existingHasKey && confirmedAtMs(f) > confirmedAtMs(existing)) {
+      byKey.set(key, f);
+    }
+  }
+  return [...byKey.entries()].map(([key, f]) => ({
+    key,
     value: f.properties.value as string,
   }));
 }
@@ -64,6 +84,11 @@ export interface ConfigStoreSetOptions {
   source?: string;
   /** Defaults to SYSTEM_CONFIG_SOURCE for newly created anchors. */
   anchorSource?: string;
+  /**
+   * When true, skip warn/error logging here so a wrapping caller (the skill
+   * handler) can own the single log line and avoid duplicates.
+   */
+  quiet?: boolean;
 }
 
 export class ConfigStore {
@@ -98,9 +123,9 @@ export class ConfigStore {
   }
 
   /**
-   * Write or update a value. Soft storeFact rejection is logged and returned as
-   * `{ stored: false }` without throwing. Infrastructure errors are logged and
-   * rethrown.
+   * Write or update a value. Soft storeFact rejection is logged (unless quiet)
+   * and returned as `{ stored: false }` without throwing. Infrastructure errors
+   * are logged (unless quiet) and rethrown.
    */
   async set(
     namespace: string,
@@ -125,7 +150,7 @@ export class ConfigStore {
         exactKey: true,
       });
 
-      if (!result.stored) {
+      if (!result.stored && !opts.quiet) {
         this.logger.warn(
           { namespace, key, action: result.action },
           'ConfigStore.set: storeFact rejected the write — prior value still in effect',
@@ -134,7 +159,9 @@ export class ConfigStore {
 
       return { stored: result.stored, action: result.action };
     } catch (err) {
-      this.logger.error({ err, namespace, key }, 'ConfigStore.set: failed to write value');
+      if (!opts.quiet) {
+        this.logger.error({ err, namespace, key }, 'ConfigStore.set: failed to write value');
+      }
       throw err;
     }
   }

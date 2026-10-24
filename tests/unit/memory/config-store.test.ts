@@ -4,7 +4,7 @@
 // Uses a real in-memory EntityMemory so storeFact runs through MemoryValidator.
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { ConfigStore, matchConfigFact } from '../../../src/memory/config-store.js';
+import { ConfigStore, matchConfigFact, listConfigEntries } from '../../../src/memory/config-store.js';
 import { EntityMemory } from '../../../src/memory/entity-memory.js';
 import { KnowledgeGraphStore } from '../../../src/memory/knowledge-graph.js';
 import { EmbeddingService } from '../../../src/memory/embedding.js';
@@ -131,6 +131,48 @@ describe('ConfigStore exact-key semantics', () => {
     expect(fixed?.label).toBe('sheet_id.2026');
     expect(fixed?.properties.value).toBe('id-v2');
     expect(after).toHaveLength(1);
+  });
+});
+
+describe('listConfigEntries', () => {
+  it('dedupes a legacy label-only twin against a keyed fact', () => {
+    const facts = [
+      {
+        id: 'legacy',
+        type: 'fact' as const,
+        label: 'writing_guide_url',
+        properties: { value: 'old' },
+        temporal: {
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          lastConfirmedAt: new Date('2026-01-01T00:00:00Z'),
+          confidence: 1,
+          decayClass: 'permanent' as const,
+          source: 'test',
+        },
+        sensitivity: 'internal' as const,
+        aliases: [],
+        identitySource: 'label' as const,
+      },
+      {
+        id: 'keyed',
+        type: 'fact' as const,
+        label: 'writing_guide_url',
+        properties: { key: 'writing_guide_url', value: 'new' },
+        temporal: {
+          createdAt: new Date('2026-06-01T00:00:00Z'),
+          lastConfirmedAt: new Date('2026-06-01T00:00:00Z'),
+          confidence: 1,
+          decayClass: 'permanent' as const,
+          source: 'test',
+        },
+        sensitivity: 'internal' as const,
+        aliases: [],
+        identitySource: 'label' as const,
+      },
+    ];
+    expect(listConfigEntries(facts)).toEqual([
+      { key: 'writing_guide_url', value: 'new' },
+    ]);
   });
 });
 

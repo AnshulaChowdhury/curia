@@ -76,11 +76,13 @@ export class ConfigStoreHandler implements ToolHandler {
     let storeResult: { stored: boolean; action: string };
 
     try {
+      // quiet: ConfigStore would otherwise duplicate the warn/error lines below.
       const configStore = new ConfigStore(ctx.entityMemory!, ctx.log);
       storeResult = await configStore.set(namespace, key, value, {
         confidence: 1.0,
         source: writeSource,
         anchorSource: 'skill:config-store',
+        quiet: true,
       });
 
       if (!storeResult.stored) {
@@ -209,16 +211,21 @@ export class ConfigStoreHandler implements ToolHandler {
       indexNodeId = indexNodes[0]!.id;
     }
 
-    // Guard on properties.key (and legacy label) so we do not call storeFact when
-    // the namespace is already registered — exactKey would update, but skipping
-    // avoids a needless write against the agent task rate limit.
+    // Same rule as matchConfigFact: prefer properties.key / properties.namespace.
+    // Do NOT match on label alone — a fact corrupted by the old semantic merge
+    // can have label='travel_detection' with properties.namespace='travel_detection_v2',
+    // and a label-only guard would permanently block re-registering travel_detection.
     const existingFacts = await ctx.entityMemory!.getFacts(indexNodeId);
-    const alreadyRegistered = existingFacts.some(
-      (f) =>
-        (f.properties.key as string | undefined) === namespace
-        || (f.properties.namespace as string | undefined) === namespace
-        || f.label === namespace,
-    );
+    const alreadyRegistered = existingFacts.some((f) => {
+      const propKey = f.properties.key as string | undefined;
+      if (typeof propKey === 'string') return propKey === namespace;
+      const propNs = f.properties.namespace as string | undefined;
+      if (typeof propNs === 'string') return propNs === namespace;
+      // True legacy: neither key nor namespace property — label is the only signal.
+      return f.properties.key === undefined
+        && f.properties.namespace === undefined
+        && f.label === namespace;
+    });
     if (alreadyRegistered) {
       ctx.log.debug({ namespace }, 'Namespace already in meta-index — skipping duplicate registration');
       return;

@@ -249,7 +249,7 @@ describe('ConfigStoreHandler', () => {
         .mockResolvedValueOnce([{ id: 'index-existing' }]), // index lookup
       // getFacts returns the namespace already registered in the index
       getFacts: vi.fn().mockResolvedValue([
-        { id: 'nf1', label: 'travel', properties: { namespace: 'travel' } },
+        { id: 'nf1', label: 'travel', properties: { key: 'travel', namespace: 'travel' } },
       ]),
     });
     const ctx = makeCtx(mem, { action: 'store', namespace: 'travel', key: 'aeroplan', value: 'AC123456' });
@@ -261,6 +261,39 @@ describe('ConfigStoreHandler', () => {
     expect(mem.storeFact).toHaveBeenCalledTimes(1);
     expect(mem.storeFact.mock.calls[0]![0].entityNodeId).toBe('anchor-existing');
     expect(mem.storeFact.mock.calls[0]![0].label).toBe('aeroplan');
+  });
+
+  it('re-registers a namespace whose index fact was corrupted by semantic merge', async () => {
+    // Old bug left {label:'travel_detection', properties:{namespace:'travel_detection_v2'}}.
+    // A label-only guard would skip registering travel_detection forever.
+    const handler = new ConfigStoreHandler();
+    const mem = makeEntityMemory({
+      findEntities: vi.fn()
+        .mockResolvedValueOnce([{ id: 'anchor-existing' }])
+        .mockResolvedValueOnce([{ id: 'index-existing' }]),
+      getFacts: vi.fn().mockResolvedValue([
+        {
+          id: 'nf1',
+          label: 'travel_detection',
+          properties: { namespace: 'travel_detection_v2' },
+        },
+      ]),
+    });
+    const ctx = makeCtx(mem, {
+      action: 'store',
+      namespace: 'travel_detection',
+      key: 'k',
+      value: 'v',
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    // Value fact + namespace registration (corrupted label must not block).
+    expect(mem.storeFact).toHaveBeenCalledTimes(2);
+    expect(mem.storeFact.mock.calls[1]![0].label).toBe('travel_detection');
+    expect(mem.storeFact.mock.calls[1]![0].properties.key).toBe('travel_detection');
+    expect(mem.storeFact.mock.calls[1]![0].exactKey).toBe(true);
   });
 
   // ── Retrieve: input validation ───────────────────────────────────────────

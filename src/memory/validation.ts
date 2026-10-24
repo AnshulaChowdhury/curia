@@ -3,7 +3,10 @@ import type { KnowledgeGraphStore } from './knowledge-graph.js';
 // EmbeddingService.cosineSimilarity() at runtime.
 import { EmbeddingService } from './embedding.js';
 import { embeddingStamp } from './embedding-profiles.js';
-import type { KgEdge, StoreFactOptions, ValidationResult } from './types.js';
+import type { StoreFactOptions, ValidationResult } from './types.js';
+
+/** Must match `SYSTEM_CONFIG_SOURCE` in config-store.ts — kept here to avoid a cycle. */
+const CONFIG_STORE_SYSTEM_SOURCE = 'system:config-store';
 
 // Spec line 126: max writes per agent per task
 // Exported so tests can exhaust the limit without hard-coding the magic number.
@@ -58,9 +61,13 @@ function isExactKeyProtected(
   return true;
 }
 
-/** System infrastructure sources are not per-task keyed and are never reset. */
-function isSystemSource(source: string): boolean {
-  return source.startsWith('system:');
+/**
+ * Only ConfigStore's fixed source is exempt from the per-task write cap.
+ * Broader `system:` matching would also exempt checkpoint fact extraction
+ * (`system:checkpoint/...`), which must stay capped (spec 01 §Rate Limiting).
+ */
+function isConfigStoreSystemSource(source: string): boolean {
+  return source === CONFIG_STORE_SYSTEM_SOURCE;
 }
 
 /**
@@ -95,9 +102,10 @@ export class MemoryValidator {
    * doesn't call this internally because the caller owns the store write.
    */
   recordWrite(agentTaskKey: string): void {
-    // system:* sources are process-lifetime and never reset — counting them
-    // would trip the limit after 50 ConfigStore / infrastructure writes.
-    if (isSystemSource(agentTaskKey)) return;
+    // ConfigStore's source is process-lifetime and never reset — counting it
+    // would trip the limit after 50 infrastructure writes. Other system:
+    // sources (e.g. checkpoint extraction) must still be capped.
+    if (isConfigStoreSystemSource(agentTaskKey)) return;
     const count = this.writeCounts.get(agentTaskKey) ?? 0;
     this.writeCounts.set(agentTaskKey, count + 1);
   }
@@ -123,9 +131,10 @@ export class MemoryValidator {
    * - 'create' with validated fact data (label, properties, temporal, embedding) ready to persist
    */
   async validate(options: StoreFactOptions): Promise<ValidationResult> {
-    // 1. Rate limiting — per agent+task source. system:* is exempt: those sources
-    //    are process-lifetime (ConfigStore, heartbeats) and nothing resets them.
-    if (!isSystemSource(options.source)) {
+    // 1. Rate limiting — per agent+task source. Only ConfigStore's fixed source
+    //    is exempt (process-lifetime, never reset). Checkpoint extraction and
+    //    other system: sources stay capped.
+    if (!isConfigStoreSystemSource(options.source)) {
       const writeCount = this.writeCounts.get(options.source) ?? 0;
       if (writeCount >= MAX_WRITES_PER_AGENT_TASK) {
         return {
@@ -146,32 +155,20 @@ export class MemoryValidator {
       };
     }
 
-    // 4. Deduplication — scoped to the entity's edges, not a global scan.
-    //    Spec line 115: "same entity + similar label" prevents cross-entity false matches
-    //    and avoids a full table scan as the fact count grows.
-    const entityEdges = await this.store.getEdgesForNode(options.entityNodeId);
-
-    // Exact-key path (#2252): config keys are opaque identifiers, not prose. Semantic
-    // merge of near-identical labels (e.g. processed_event_ids_1 vs _2) silently
-    // destroys distinct values. Match only on properties.key.
+    // Exact-key path (#2252): config keys are opaque identifiers, not prose.
     if (options.exactKey === true) {
-      return this.validateExactKey(options, entityEdges);
+      return this.validateExactKey(options);
     }
+
+    // 4. Deduplication — one JOIN for connected facts, then early-exit on the
+    //    first cosine hit (spec line 115: same entity + similar label).
+    const connectedFacts = await this.store.getConnectedFacts(options.entityNodeId);
 
     const newEmbedding = await this.embeddingService.embed(options.label, 'similarity');
     // The threshold belongs to the model that produced the scores (ADR-051).
     const dedupThreshold = this.embeddingService.profile.thresholds.factDedup;
 
-    // Resolve connected nodes in parallel — sequential getNode was O(N) round trips
-    // on large anchors (same issue as exactKey; semantic path shares the walk).
-    const targetIds = entityEdges.map((edge) =>
-      edge.sourceNodeId === options.entityNodeId ? edge.targetNodeId : edge.sourceNodeId,
-    );
-    const targetNodes = await Promise.all(targetIds.map((id) => this.store.getNode(id)));
-
-    for (const targetNode of targetNodes) {
-      // Only compare against existing fact nodes that have been embedded
-      if (!targetNode || targetNode.type !== 'fact') continue;
+    for (const targetNode of connectedFacts) {
       if (!targetNode.embedding) continue;
       // A vector from another model or document prefix is not comparable (ADR-051).
       if (targetNode.embeddingModel !== embeddingStamp(this.embeddingService.profile)) continue;
@@ -214,13 +211,10 @@ export class MemoryValidator {
 
   /**
    * Exact-key upsert for opaque identifiers (config-store). Never compares
-   * embeddings. Finds a fact whose `properties.key` equals the incoming key;
-   * updates that node (and realigns its label) or creates a new one.
+   * embeddings. Matches properties.key, or a legacy label-only fact whose
+   * label equals the key (adopts it and stamps key/exact_key).
    */
-  private async validateExactKey(
-    options: StoreFactOptions,
-    entityEdges: KgEdge[],
-  ): Promise<ValidationResult> {
+  private async validateExactKey(options: StoreFactOptions): Promise<ValidationResult> {
     const incomingKey = (options.properties as Record<string, unknown> | undefined)?.key;
     if (typeof incomingKey !== 'string') {
       // Programmer error — silently creating would pile up permanent duplicates.
@@ -235,31 +229,26 @@ export class MemoryValidator {
       properties: { ...options.properties, exact_key: true },
     };
 
-    // Resolve all connected nodes in one parallel round — debrief anchors grow
-    // unbounded with per-instance keys; sequential getNode was O(N) SELECTs.
-    const targetIds = [
-      ...new Set(
-        entityEdges.map((edge) =>
-          edge.sourceNodeId === options.entityNodeId ? edge.targetNodeId : edge.sourceNodeId,
-        ),
-      ),
-    ];
-    const targetNodes = await Promise.all(targetIds.map((id) => this.store.getNode(id)));
+    // Single JOIN — debrief anchors grow unbounded with per-instance keys.
+    const connectedFacts = await this.store.getConnectedFacts(options.entityNodeId);
 
     // Prefer the most recently confirmed match when duplicates somehow exist.
+    // Also adopt legacy label-only facts (no properties.key) so a rewrite does
+    // not create a twin that list() would show twice.
     let bestMatch: { id: string; properties: Record<string, unknown>; confirmedAt: number } | undefined;
 
-    for (const targetNode of targetNodes) {
-      if (!targetNode || targetNode.type !== 'fact') continue;
-
-      const existingKey = (targetNode.properties as Record<string, unknown>).key;
-      if (existingKey !== incomingKey) continue;
+    for (const targetNode of connectedFacts) {
+      const props = targetNode.properties as Record<string, unknown>;
+      const existingKey = props.key;
+      const keyMatch = existingKey === incomingKey;
+      const legacyLabelMatch = existingKey === undefined && targetNode.label === incomingKey;
+      if (!keyMatch && !legacyLabelMatch) continue;
 
       const confirmedAt = targetNode.temporal.lastConfirmedAt.getTime();
       if (!bestMatch || confirmedAt > bestMatch.confirmedAt) {
         bestMatch = {
           id: targetNode.id,
-          properties: targetNode.properties as Record<string, unknown>,
+          properties: props,
           confirmedAt,
         };
       }
@@ -278,10 +267,8 @@ export class MemoryValidator {
       };
     }
 
-    return this.buildCreateResult(
-      optionsWithMarker,
-      this.embeddingForCreate(await this.embeddingService.embed(options.label, 'similarity')),
-    );
+    // Exact-key matching never uses embeddings — let the store embed as document.
+    return this.buildCreateResult(optionsWithMarker, undefined);
   }
 
   /**

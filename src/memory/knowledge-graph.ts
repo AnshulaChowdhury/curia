@@ -91,6 +91,12 @@ interface KnowledgeGraphBackend {
   addAlias(nodeId: string, alias: string): Promise<boolean>;
   createEdge(edge: KgEdge): Promise<void>;
   getEdgesForNode(nodeId: string): Promise<KgEdge[]>;
+  /**
+   * Fact nodes connected to `nodeId` by a non-archived edge (either direction).
+   * One round trip on Postgres (JOIN); used by exact-key upsert and getFacts
+   * so large config anchors do not issue N getNode queries (#2252).
+   */
+  getConnectedFacts(nodeId: string): Promise<KgNode[]>;
   deleteEdge(id: string): Promise<void>;
   updateEdge(id: string, updates: { confidence: number; lastConfirmedAt: Date }): Promise<KgEdge>;
   // Atomic upsert: creates if no matching (src, tgt, type) pair exists in either
@@ -255,6 +261,14 @@ export class KnowledgeGraphStore {
   /** Retrieve a node by ID, or undefined if not found */
   async getNode(id: string): Promise<KgNode | undefined> {
     return this.backend.getNode(id);
+  }
+
+  /**
+   * Fact nodes linked to an entity (either edge direction). Single JOIN on
+   * Postgres — prefer this over getEdges + N× getNode for large anchors (#2252).
+   */
+  async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
+    return this.backend.getConnectedFacts(nodeId);
   }
 
   /**
@@ -664,6 +678,23 @@ class PostgresBackend implements KnowledgeGraphBackend {
       [nodeId],
     );
     return result.rows.map(pgRowToEdge);
+  }
+
+  async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
+    const result = await this.pool.query<PgNodeRow>(
+      `SELECT n.*
+       FROM kg_nodes n
+       INNER JOIN kg_edges e
+         ON e.archived_at IS NULL
+        AND (
+             (e.source_node_id = $1 AND e.target_node_id = n.id)
+          OR (e.target_node_id = $1 AND e.source_node_id = n.id)
+            )
+       WHERE n.type = 'fact'
+         AND n.archived_at IS NULL`,
+      [nodeId],
+    );
+    return result.rows.map(pgRowToNode);
   }
 
   async deleteEdge(id: string): Promise<void> {
@@ -1192,6 +1223,21 @@ class InMemoryBackend implements KnowledgeGraphBackend {
       }
     }
     return results;
+  }
+
+  async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
+    const facts: KgNode[] = [];
+    const seen = new Set<string>();
+    for (const edge of this.edges.values()) {
+      if (this.archivedEdges.has(edge.id)) continue;
+      if (edge.sourceNodeId !== nodeId && edge.targetNodeId !== nodeId) continue;
+      const otherId = edge.sourceNodeId === nodeId ? edge.targetNodeId : edge.sourceNodeId;
+      if (seen.has(otherId) || this.archivedNodes.has(otherId)) continue;
+      seen.add(otherId);
+      const node = this.nodes.get(otherId);
+      if (node?.type === 'fact') facts.push(node);
+    }
+    return facts;
   }
 
   async deleteEdge(id: string): Promise<void> {

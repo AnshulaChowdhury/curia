@@ -98,8 +98,8 @@ export const LIST_DUPLICATE_KEYS_SQL = `
   SELECT
     a.label AS anchor_label,
     f.properties->>'key' AS key,
-    array_agg(f.id::text ORDER BY f.last_confirmed_at DESC, f.id) AS fact_ids,
-    array_agg(f.label ORDER BY f.last_confirmed_at DESC, f.id) AS labels
+    array_agg(DISTINCT f.id::text) AS fact_ids,
+    array_agg(DISTINCT f.label) AS labels
   FROM kg_nodes f
   JOIN kg_edges e
     ON e.archived_at IS NULL
@@ -115,8 +115,8 @@ export const LIST_DUPLICATE_KEYS_SQL = `
     AND a.archived_at IS NULL
     AND a.label LIKE 'config:%'
     AND f.properties ? 'key'
-  GROUP BY a.id, a.label, f.properties->>'key'
-  HAVING count(*) > 1
+  GROUP BY a.label, f.properties->>'key'
+  HAVING count(DISTINCT f.id) > 1
   ORDER BY a.label, f.properties->>'key'
 `;
 

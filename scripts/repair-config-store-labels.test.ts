@@ -145,6 +145,14 @@ describe('runRepair', () => {
     expect(result.updatedCount).toBe(0);
     expect(pool.query).toHaveBeenCalledTimes(2);
   });
+
+  it('duplicate query groups by anchor label so cross-anchor twins are visible', () => {
+    // Regression: GROUP BY a.id missed twins on two same-label anchors from the
+    // anchor-create race. The SQL must group by a.label and count DISTINCT f.id.
+    expect(LIST_DUPLICATE_KEYS_SQL).toMatch(/GROUP BY a\.label/);
+    expect(LIST_DUPLICATE_KEYS_SQL).toMatch(/count\(DISTINCT f\.id\)/);
+    expect(LIST_DUPLICATE_KEYS_SQL).not.toMatch(/GROUP BY a\.id/);
+  });
 });
 
 describe('formatRepairReport', () => {

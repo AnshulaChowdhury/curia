@@ -760,31 +760,10 @@ export class EntityMemory {
    * returned by query() as relationships instead.
    */
   async getFacts(entityNodeId: string): Promise<KgNode[]> {
-    const edges = await this.store.getEdgesForNode(entityNodeId);
-    const facts: KgNode[] = [];
-
-    for (const edge of edges) {
-      // Edges are bidirectional — find the node on the other side of each edge
-      const otherId = edge.sourceNodeId === entityNodeId
-        ? edge.targetNodeId
-        : edge.sourceNodeId;
-
-      const node = await this.store.getNode(otherId);
-      if (!node) {
-        // Dangling edge — referenced node no longer exists (referential integrity violation).
-        // @TODO: emit a bus event for the audit logger once bus access is available here.
-        this.logger.error(
-          { edgeId: edge.id, nodeId: otherId, entityNodeId },
-          'getFacts: dangling edge detected — referenced node does not exist',
-        );
-        continue;
-      }
-      if (node.type === FACT_TYPE) {
-        facts.push(node);
-      }
-    }
-
-    return facts;
+    // Single JOIN (Postgres) / one walk (in-memory) — avoids N getNode round
+    // trips on large config anchors (#2252). Dangling edges are simply absent
+    // from the join result rather than logged here.
+    return this.store.getConnectedFacts(entityNodeId);
   }
 
   /**

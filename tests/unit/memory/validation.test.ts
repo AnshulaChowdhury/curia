@@ -795,7 +795,7 @@ describe('MemoryValidator', () => {
       expect(result.action).toBe('rate_limited');
     });
 
-    it('exempts system: sources from the rate limit', async () => {
+    it('exempts system:config-store from the rate limit', async () => {
       const entity = await store.createNode({
         type: 'concept', label: 'config:ns', properties: {}, source: 'test',
       });
@@ -811,6 +811,57 @@ describe('MemoryValidator', () => {
         exactKey: true,
       });
       expect(result.action).toBe('create');
+    });
+
+    it('still rate-limits system:checkpoint sources (not ConfigStore)', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'person', properties: {}, source: 'test',
+      });
+      const checkpointSource = 'system:checkpoint/conversation:c1/agent:coordinator/channel:email';
+      for (let i = 0; i < 50; i++) {
+        validator.recordWrite(checkpointSource);
+      }
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'one more fact',
+        source: checkpointSource,
+      });
+      expect(result.action).toBe('rate_limited');
+    });
+
+    it('adopts a legacy label-only fact on exactKey write (no twin)', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const legacy = await store.createNode({
+        type: 'fact',
+        label: 'writing_guide_url',
+        properties: { value: 'old' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: legacy.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'writing_guide_url',
+        properties: { key: 'writing_guide_url', value: 'new', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(result.action).toBe('update');
+      if (result.action === 'update') {
+        expect(result.existingNodeId).toBe(legacy.id);
+        expect(result.mergedProperties.key).toBe('writing_guide_url');
+        expect(result.mergedProperties.exact_key).toBe(true);
+        expect(result.mergedProperties.value).toBe('new');
+      }
     });
 
     it('throws when exactKey is set without a string properties.key', async () => {
