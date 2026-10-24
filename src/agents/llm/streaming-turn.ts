@@ -54,6 +54,12 @@ import type {
  */
 export const DEFAULT_STREAMING_MAX_ROUNDS = 8;
 
+/**
+ * tool_result content when a turn aborts before a call is answered.
+ * Voice's barge-in race uses the same string, so the two cannot drift (#2265).
+ */
+export const ABORTED_TOOL_RESULT = 'Tool execution cancelled (turn aborted).';
+
 const DEFAULT_MISSING_INVOKE_TOOL_RESULT =
   'Tool execution is not wired for this streaming turn.';
 
@@ -466,7 +472,7 @@ export async function runStreamingToolLoop(
           if (!answered.has(call.id)) {
             toolResults.push({
               id: call.id,
-              content: 'Tool execution cancelled (turn aborted).',
+              content: ABORTED_TOOL_RESULT,
               isError: true,
             });
           }
