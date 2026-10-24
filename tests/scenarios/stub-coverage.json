@@ -764,8 +764,10 @@
       "recordedAt": "2026-10-08T17:20:23.923Z"
     },
     "wake keeps one contact's reason from another": {
-      "unstubbed": null,
-      "reason": "First run (2026-10-24, 5 runs, all behaviors 100%) had 1 refused delegate to calendar; that stub was added after it, so the record awaits a rerun."
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-24T14:11:23.608Z"
     }
   }
 }
