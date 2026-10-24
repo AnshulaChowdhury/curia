@@ -149,6 +149,8 @@ import { ApprovalDelivery } from './autonomy/approval-delivery.js';
 import { ReactionApprovalMapper } from './autonomy/reaction-approval-mapper.js';
 import { DEFAULT_REACTION_INTENTS } from './autonomy/reaction-intent.js';
 import { AutonomyScoringPass } from './autonomy/scoring-pass.js';
+import { ActivityService } from './activity/activity-service.js';
+import { ActivitySummarizer } from './activity/summarizer.js';
 import type { ScoringPassConfig } from './autonomy/scoring-pass.js';
 import { BrowserService } from './browser/browser-service.js';
 import { OfficeIdentityService } from './identity/service.js';
@@ -2268,6 +2270,26 @@ async function main(): Promise<void> {
   const scoringPass = new AutonomyScoringPass(actionLogRepo, autonomyService, scoringProvider, logger, scoringPassConfig);
   logger.info({ scoringPassConfig }, 'AutonomyScoringPass configured');
 
+  // Console activity feed (#2251). The summarizer writes a one-line activity.summary
+  // when a conversational job with no visible actions completes, on the fast tier so
+  // each chat turn adds one cheap call; the feed reads those rows and never calls a model.
+  const activitySummaryModel = modelRouter.resolve('fast').model;
+  const activitySummarizer = new ActivitySummarizer({
+    bus,
+    llm: new TelemetryLlmProvider(resolveProviderForModel(activitySummaryModel, 'ActivitySummarizer'), bus, logger, 'activity-summarizer', modelRegistry),
+    model: activitySummaryModel,
+    logger,
+  });
+  activitySummarizer.register();
+  const activityService = new ActivityService({
+    auditLogRepo,
+    actionLogRepo,
+    contactService,
+    schedulerService,
+    officeTimezone: config.timezone,
+    logger,
+  });
+
   const llmCallArchiveRetentionDays = llmCallArchiveCfg?.hotRetentionDays ?? 90;
   const dreamEngine = new DreamEngine(
     pool,
@@ -3276,6 +3298,7 @@ async function main(): Promise<void> {
     // Powers GET /api/health with real probes and canary state (#434).
     healthService,
     auditLogRepo,
+    activityFeed: activityService,
     smsWebhookBridge,
     memoryRetention,
     // Console Memory → Documents (#1821, #1822).

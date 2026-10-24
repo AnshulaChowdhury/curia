@@ -9,9 +9,10 @@ import {
   fetchAttention,
   fetchActivity,
   aggregateAttention,
-  mapDirective,
+  activityHref,
+  agentLabel,
+  formatActivityTime,
   getGreeting,
-  type SceneDirective,
 } from './dashboard-utils.js';
 
 // Minimal fetch mock mirroring api.test.ts — returns a Response-like object.
@@ -204,49 +205,6 @@ describe('aggregateAttention', () => {
   });
 });
 
-describe('mapDirective', () => {
-  const base = { id: 'x', logicalTs: 1000 };
-
-  it('maps agent lifecycle directives', () => {
-    expect(mapDirective({ ...base, kind: 'agent.state', agentId: 'analyst', state: 'active' })).toEqual({
-      id: 'x', logicalTs: 1000, actor: 'analyst', text: 'started working.',
-    });
-    expect(mapDirective({ ...base, kind: 'agent.state', agentId: 'analyst', state: 'error' })?.text).toBe('ran into an error.');
-    expect(mapDirective({ ...base, kind: 'agent.walk', agentId: 'coordinator', targetAgentId: 'analyst' })?.text)
-      .toBe('handed off to analyst.');
-  });
-
-  it('maps speak with and without content', () => {
-    expect(mapDirective({ ...base, kind: 'agent.speak', agentId: 'counsel', content: 'hello there' })?.text)
-      .toBe('said “hello there”.');
-    expect(mapDirective({ ...base, kind: 'agent.speak', agentId: 'counsel' })?.text).toBe('sent a message.');
-  });
-
-  it('maps think start/stop with a tool name', () => {
-    expect(mapDirective({ ...base, kind: 'agent.think', agentId: 'analyst', phase: 'start', toolName: 'kg-search' })?.text)
-      .toBe('started using kg-search.');
-    expect(mapDirective({ ...base, kind: 'agent.think', agentId: 'analyst', phase: 'stop' })?.text)
-      .toBe('finished thinking.');
-  });
-
-  it('maps task, tube, deliver and badge directives', () => {
-    expect(mapDirective({ ...base, kind: 'claw.deliver', agentId: 'scheduler', jobId: 'j1' })?.text)
-      .toBe('delivered a completed job.');
-    expect(mapDirective({ ...base, kind: 'task.appear', taskId: 't1', title: 'Q3 board pack' })).toEqual({
-      id: 'x', logicalTs: 1000, actor: 'tasks', text: 'new task: Q3 board pack.',
-    });
-    expect(mapDirective({ ...base, kind: 'tube.in' })?.actor).toBe('inbound');
-    expect(mapDirective({ ...base, kind: 'badge', badgeKind: 'human.decision', label: 'Escalated for review' })).toEqual({
-      id: 'x', logicalTs: 1000, actor: 'operator', text: 'Escalated for review',
-    });
-    expect(mapDirective({ ...base, kind: 'badge', badgeKind: 'autonomy.blocked', label: 'Blocked' })?.actor).toBe('autonomy');
-  });
-
-  it('drops unknown kinds', () => {
-    expect(mapDirective({ ...base, kind: 'some.future.kind' } as SceneDirective)).toBeNull();
-  });
-});
-
 describe('fetchAttention', () => {
   it('aggregates across the four endpoints on the happy path', async () => {
     vi.stubGlobal('fetch', mockFetchByUrl({
@@ -272,38 +230,80 @@ describe('fetchAttention', () => {
 });
 
 describe('fetchActivity', () => {
-  it('maps directives newest-first', async () => {
-    vi.stubGlobal('fetch', mockFetch(200, {
-      directives: [
-        { id: 'a', logicalTs: 100, kind: 'agent.state', agentId: 'x', state: 'active' },
-        { id: 'b', logicalTs: 200, kind: 'agent.state', agentId: 'y', state: 'error' },
-      ],
-    }));
-    const lines = await fetchActivity();
-    expect(lines.map(l => l.id)).toEqual(['b', 'a']); // newest (higher logicalTs) first
+  const item = {
+    id: 'a', ts: '2026-10-24T13:00:00.000Z', actor: 'coordinator', headline: 'drafted a reply to John Doe',
+    details: [], outcome: 'success', autonomy: null, link: null,
+  };
+
+  it('returns the items and the timezone the backend wrote', async () => {
+    vi.stubGlobal('fetch', mockFetch(200, { items: [item], hasMore: false, timezone: 'America/Toronto' }));
+    const data = await fetchActivity();
+    expect(data.items.map(i => i.id)).toEqual(['a']);
+    expect(data.timezone).toBe('America/Toronto');
   });
 
-  it('scopes the request with a from= lookback so assertTimelineScope accepts it', async () => {
-    const fetchMock = mockFetch(200, { directives: [] });
+  it('asks /api/activity for the last 24h, 20 items', async () => {
+    const fetchMock = mockFetch(200, { items: [], timezone: 'UTC' });
     vi.stubGlobal('fetch', fetchMock);
     const before = Date.now() - 24 * 60 * 60 * 1000;
     await fetchActivity();
     const after = Date.now() - 24 * 60 * 60 * 1000;
-    expect(fetchMock).toHaveBeenCalledOnce();
     const url = String(fetchMock.mock.calls[0]![0]);
-    expect(url).toMatch(/^\/api\/antfarm\/timeline\?/);
+    expect(url).toMatch(/^\/api\/activity\?/);
     const params = new URL(url, 'http://test').searchParams;
     expect(params.get('limit')).toBe('20');
     const fromMs = Date.parse(params.get('from')!);
-    expect(Number.isFinite(fromMs)).toBe(true);
-    // from should be ~now-24h, allowing for the call itself.
     expect(fromMs).toBeGreaterThanOrEqual(before - 1000);
     expect(fromMs).toBeLessThanOrEqual(after + 1000);
   });
 
-  it('throws when the 200 body is missing its directives array', async () => {
+  it('throws when the 200 body is missing its items array', async () => {
     vi.stubGlobal('fetch', mockFetch(200, {}));
     await expect(fetchActivity()).rejects.toThrow(/unexpected response/);
+  });
+});
+
+describe('activityHref', () => {
+  it('links a scheduled job to its page', () => {
+    expect(activityHref({ kind: 'job', jobId: 'j-1' })).toBe('/jobs/j-1');
+  });
+
+  it('links a conversation to an Ant Farm replay of its window', () => {
+    const href = activityHref({ kind: 'conversation', conversationId: 'conv 1', from: '2026-10-24T09:00:00.000Z', to: '2026-10-24T09:05:00.000Z' })!;
+    const url = new URL(href, 'http://test');
+    expect(url.pathname).toBe('/antfarm/');
+    expect(url.searchParams.get('conversationId')).toBe('conv 1');
+    expect(url.searchParams.get('from')).toBe('2026-10-24T09:00:00.000Z');
+    expect(url.searchParams.get('to')).toBe('2026-10-24T09:05:00.000Z');
+  });
+
+  it('returns null without a link', () => {
+    expect(activityHref(null)).toBeNull();
+  });
+});
+
+describe('formatActivityTime', () => {
+  it('formats in the given timezone, not the browser\'s', () => {
+    const ts = '2026-10-24T13:00:00.000Z';
+    const now = new Date('2026-10-24T14:00:00.000Z');
+    expect(formatActivityTime(ts, 'America/Toronto', now)).toMatch(/^09.00/);
+    expect(formatActivityTime(ts, 'Asia/Tokyo', now)).toMatch(/^(22.00|10.00)/);
+  });
+
+  it('adds the date for an item from before today', () => {
+    const now = new Date('2026-10-24T14:00:00.000Z');
+    expect(formatActivityTime('2026-10-23T20:00:00.000Z', 'America/Toronto', now)).toMatch(/Oct 23/);
+    expect(formatActivityTime('2026-10-24T13:00:00.000Z', 'America/Toronto', now)).not.toMatch(/Oct/);
+  });
+
+  it('falls back to the browser zone on a bad zone name', () => {
+    expect(() => formatActivityTime('2026-10-24T13:00:00.000Z', 'Not/AZone')).not.toThrow();
+  });
+});
+
+describe('agentLabel', () => {
+  it('turns an agent id into words', () => {
+    expect(agentLabel('ceo-inbox')).toBe('ceo inbox');
   });
 });
 

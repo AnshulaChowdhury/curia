@@ -274,106 +274,79 @@ export async function fetchAttention(signal?: AbortSignal): Promise<AttentionIte
   });
 }
 
-// ── Activity (interpreted Ant Farm timeline) ──────────────────────────────────
+// ── Activity (job-level feed, GET /api/activity) ─────────────────────────────
 
-// Minimal mirror of @curia/shared-types SceneDirective (the console isn't a
-// shared-types consumer; we mirror only the fields we render). The timeline
-// returns interpreted directives, not raw audit rows — see the issue's
-// documented tradeoff.
-export interface SceneDirective {
-  id: string;
-  logicalTs: number;
-  kind: string;
-  agentId?: string;
-  targetAgentId?: string;
-  state?: string;
-  phase?: string;
-  toolName?: string;
-  content?: string;
-  jobId?: string;
-  taskId?: string | null;
-  title?: string;
-  badgeKind?: string;
-  label?: string;
-  channelId?: string;
-  conversationId?: string;
-}
+// Mirrors src/activity/types.ts. One item per job, already in words; the
+// backend never puts tool names or message bodies in it (#2251).
+export type ActivityLink =
+  | { kind: 'job'; jobId: string }
+  | { kind: 'conversation'; conversationId: string; from: string; to: string };
 
-export interface ActivityLine {
+export interface ActivityItem {
   id: string;
-  logicalTs: number;
+  ts: string;
   actor: string;
-  text: string;
+  headline: string;
+  details: string[];
+  outcome: 'success' | 'partial' | 'failed';
+  autonomy: 'autonomous' | 'approved' | null;
+  link: ActivityLink | null;
 }
 
-function truncate(text: string, max = 80): string {
-  const trimmed = text.trim();
-  return trimmed.length > max ? `${trimmed.slice(0, max - 1)}…` : trimmed;
+export interface ActivityFeedData {
+  items: ActivityItem[];
+  /** IANA timezone the backend wrote dates in — the principal's. Times use it too. */
+  timezone: string;
 }
 
-// Map one interpreted directive to a readable "<actor> <text>" line. Returns
-// null for kinds we don't surface (they're dropped from the feed).
-export function mapDirective(d: SceneDirective): ActivityLine | null {
-  const base = { id: d.id, logicalTs: d.logicalTs };
-  const agent = d.agentId ?? 'an agent';
-
-  switch (d.kind) {
-    case 'claw.deliver':
-      return { ...base, actor: agent, text: 'delivered a completed job.' };
-    case 'agent.state':
-      return { ...base, actor: agent, text: d.state === 'error' ? 'ran into an error.' : 'started working.' };
-    case 'agent.walk':
-      return { ...base, actor: agent, text: `handed off to ${d.targetAgentId ?? 'another agent'}.` };
-    case 'agent.speak':
-      return {
-        ...base,
-        actor: agent,
-        text: d.content ? `said “${truncate(d.content)}”.` : 'sent a message.',
-      };
-    case 'agent.think':
-      if (d.phase === 'start') {
-        return { ...base, actor: agent, text: d.toolName ? `started using ${d.toolName}.` : 'started thinking.' };
-      }
-      return { ...base, actor: agent, text: d.toolName ? `finished using ${d.toolName}.` : 'finished thinking.' };
-    case 'tube.in':
-      return { ...base, actor: 'inbound', text: 'a message arrived.' };
-    case 'tube.out':
-      return { ...base, actor: d.agentId ?? 'outbound', text: 'sent a reply out.' };
-    case 'task.appear':
-      return { ...base, actor: 'tasks', text: d.title ? `new task: ${truncate(d.title)}.` : 'a new task appeared.' };
-    case 'task.trash':
-      return { ...base, actor: 'tasks', text: 'a task was cleared.' };
-    case 'badge':
-      return {
-        ...base,
-        actor: d.badgeKind === 'autonomy.blocked' ? 'autonomy' : 'operator',
-        text: d.label ? truncate(d.label) : 'flagged an event.',
-      };
-    default:
-      return null;
-  }
-}
-
-// Lookback window for the home Recent Activity card. Matches Ant Farm's
-// default 24h preload; also satisfies assertTimelineScope (requires ≥1 filter).
+// Lookback window for the home Recent Activity card.
 const ACTIVITY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
-// GET /api/antfarm/timeline?from=<now-24h>&limit=20 → interpreted lines, newest first.
-export async function fetchActivity(signal?: AbortSignal): Promise<ActivityLine[]> {
+// GET /api/activity?from=<now-24h>&limit=20 → newest first.
+export async function fetchActivity(signal?: AbortSignal): Promise<ActivityFeedData> {
   const from = new Date(Date.now() - ACTIVITY_LOOKBACK_MS).toISOString();
   const params = new URLSearchParams({ from, limit: '20' });
-  const data = await fetchJson<{ directives?: SceneDirective[] }>(
-    `/api/antfarm/timeline?${params.toString()}`,
+  const data = await fetchJson<{ items?: ActivityItem[]; timezone?: unknown }>(
+    `/api/activity?${params.toString()}`,
     signal,
   );
-  const directives = requireArray<SceneDirective>(data.directives, '/api/antfarm/timeline');
-  const lines: ActivityLine[] = [];
-  for (const d of directives) {
-    const line = mapDirective(d);
-    if (line) lines.push(line);
+  const items = requireArray<ActivityItem>(data.items, '/api/activity');
+  const timezone = typeof data.timezone === 'string' && data.timezone.length > 0
+    ? data.timezone
+    : Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return { items, timezone };
+}
+
+// Where a click on an item goes: the job's page, or an Ant Farm replay of the
+// conversation's window (Ant Farm is its own SPA at /antfarm/, so a plain href).
+export function activityHref(link: ActivityLink | null): string | null {
+  if (!link) return null;
+  if (link.kind === 'job') return `/jobs/${encodeURIComponent(link.jobId)}`;
+  const params = new URLSearchParams({ conversationId: link.conversationId, from: link.from, to: link.to });
+  return `/antfarm/?${params.toString()}`;
+}
+
+// Clock time in the principal's timezone, with the date for items before today
+// (the card spans 24 hours). A bad zone name falls back to the browser's.
+export function formatActivityTime(ts: string, timezone: string, now: Date = new Date()): string {
+  const d = new Date(ts);
+  const fmt = (zone: string | undefined): string => {
+    const opts = zone ? { timeZone: zone } : {};
+    const day = (x: Date) => x.toLocaleDateString('en-CA', opts);
+    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', ...opts });
+    if (day(d) === day(now)) return time;
+    return `${d.toLocaleDateString([], { month: 'short', day: 'numeric', ...opts })} ${time}`;
+  };
+  try {
+    return fmt(timezone);
+  } catch {
+    return fmt(undefined);
   }
-  // Newest first regardless of the endpoint's ordering.
-  return lines.sort((a, b) => b.logicalTs - a.logicalTs);
+}
+
+// "ceo-inbox" → "ceo inbox": the muted agent name beside each item.
+export function agentLabel(agentId: string): string {
+  return agentId.replace(/[-_]+/g, ' ').trim() || 'agent';
 }
 
 // ── Greeting ──────────────────────────────────────────────────────────────────

@@ -248,4 +248,13 @@ describe('Bus Permissions', () => {
       expect(canSubscribe(layer, 'kg.nodes_merged')).toBe(false);
     }
   });
+
+  it('allows only the system layer to publish and subscribe to activity.summary (#2251)', () => {
+    expect(canPublish('system', 'activity.summary')).toBe(true);
+    expect(canSubscribe('system', 'activity.summary')).toBe(true);
+    for (const layer of ['channel', 'dispatch', 'agent', 'execution'] as const) {
+      expect(canPublish(layer, 'activity.summary')).toBe(false);
+      expect(canSubscribe(layer, 'activity.summary')).toBe(false);
+    }
+  });
 });

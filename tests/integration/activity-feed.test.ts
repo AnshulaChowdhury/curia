@@ -1,0 +1,128 @@
+// Integration tests for the activity feed's read path (#2251): AuditLogRepo.findActivityJobs
+// against real Postgres, then ActivityService over it.
+
+import { randomUUID } from 'node:crypto';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import pg from 'pg';
+import { AuditLogRepo } from '../../src/audit/audit-log-repo.js';
+import { ActivityService } from '../../src/activity/activity-service.js';
+import { createSilentLogger } from '../../src/logger.js';
+
+const { Pool } = pg;
+const DATABASE_URL = process.env.DATABASE_URL;
+const describeIf = DATABASE_URL ? describe : describe.skip;
+
+describeIf('activity feed read path', () => {
+  let pool: pg.Pool;
+  let repo: AuditLogRepo;
+  const logger = createSilentLogger();
+  const sourceLayer = 'test-activity-feed';
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: DATABASE_URL });
+    repo = new AuditLogRepo(pool, logger);
+    await pool.query('SELECT 1 FROM audit_log LIMIT 0');
+  });
+
+  afterAll(async () => {
+    await pool.end();
+  });
+
+  /** A day in 2019 nobody else writes to, so the shared test DB cannot interfere. */
+  function isolatedDay(): Date {
+    const day = Math.floor(Math.random() * 300);
+    return new Date(Date.UTC(2019, 0, 1) + day * 86_400_000);
+  }
+
+  async function seed(opts: {
+    timestamp: Date;
+    eventType: string;
+    payload?: Record<string, unknown>;
+    conversationId?: string;
+    parentEventId?: string | null;
+    outcome?: string | null;
+  }): Promise<string> {
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO audit_log (id, timestamp, event_type, source_layer, source_id, payload, conversation_id, parent_event_id, outcome)
+       VALUES ($1, $2, $3, $4, 'coordinator', $5::jsonb, $6, $7, $8)`,
+      [id, opts.timestamp, opts.eventType, sourceLayer, JSON.stringify(opts.payload ?? {}), opts.conversationId ?? 'conv-activity', opts.parentEventId ?? null, opts.outcome ?? null],
+    );
+    return id;
+  }
+
+  async function seedArchiveJob(at: Date, subject: string): Promise<string> {
+    const taskId = await seed({ timestamp: at, eventType: 'agent.task', payload: { agentId: 'coordinator', channelId: 'email', content: 'x' } });
+    const invokeId = await seed({
+      timestamp: new Date(at.getTime() + 1000), eventType: 'tool.invoke', parentEventId: taskId,
+      payload: { toolName: 'ceo-inbox-archive', input: { message_id: subject } },
+    });
+    await seed({
+      timestamp: new Date(at.getTime() + 2000), eventType: 'tool.result', parentEventId: invokeId, outcome: 'success',
+      payload: { toolName: 'ceo-inbox-archive', result: { success: true, data: { subject } } },
+    });
+    return taskId;
+  }
+
+  it('returns the newest jobs when the window holds more than the limit', async () => {
+    const day = isolatedDay();
+    const taskIds: string[] = [];
+    for (let i = 0; i < 25; i++) {
+      taskIds.push(await seedArchiveJob(new Date(day.getTime() + i * 30 * 60_000), `job-${i}`));
+    }
+    const from = day;
+    const to = new Date(day.getTime() + 86_400_000);
+
+    const page = await repo.findActivityJobs({ from, to, limit: 20 });
+    expect(page.hasMore).toBe(true);
+    expect(page.roots.map((r) => r.id)).toEqual(taskIds.slice(5).reverse());
+    // Each root's invoke and result came with it.
+    expect(page.children.filter((r) => r.eventType === 'tool.result')).toHaveLength(20);
+
+    // Through the service: newest first, oldest five left out.
+    const service = new ActivityService({
+      auditLogRepo: repo,
+      contactService: {
+        getContact: async () => undefined,
+        findContactBySystemRole: async () => null,
+        resolveByChannelIdentity: async () => null,
+      },
+      officeTimezone: 'UTC',
+      logger,
+    });
+    const feed = await service.list({ from, to, limit: 20 });
+    expect(feed.items).toHaveLength(20);
+    expect(feed.items[0]!.id).toBe(taskIds[24]);
+    expect(feed.items[19]!.id).toBe(taskIds[5]);
+    expect(feed.items.every((i) => i.headline === 'archived an email')).toBe(true);
+    const ts = feed.items.map((i) => i.ts);
+    expect(ts).toEqual([...ts].sort().reverse());
+  });
+
+  it('reads delegated specialist work and the summary under the root, not as roots', async () => {
+    const day = isolatedDay();
+    const rootId = await seed({ timestamp: day, eventType: 'agent.task', payload: { agentId: 'coordinator', channelId: 'signal', content: 'x' } });
+    const specialistId = await seed({
+      timestamp: new Date(day.getTime() + 1000), eventType: 'agent.task', conversationId: 'delegate-1',
+      payload: { agentId: 'calendar', channelId: 'internal', content: 'y', metadata: { delegationOrigin: { taskEventId: rootId } } },
+    });
+    const nestedId = await seed({
+      timestamp: new Date(day.getTime() + 2000), eventType: 'agent.task', conversationId: 'delegate-2',
+      payload: { agentId: 'contacts', channelId: 'internal', content: 'z', metadata: { delegationOrigin: { taskEventId: specialistId } } },
+    });
+    const invokeId = await seed({
+      timestamp: new Date(day.getTime() + 3000), eventType: 'tool.invoke', parentEventId: nestedId,
+      payload: { toolName: 'contact-create', input: { name: 'Jane Roe' } },
+    });
+    await seed({
+      timestamp: new Date(day.getTime() + 4000), eventType: 'tool.result', parentEventId: invokeId, outcome: 'success',
+      payload: { toolName: 'contact-create', result: { success: true, data: { display_name: 'Jane Roe' } } },
+    });
+    await seed({ timestamp: new Date(day.getTime() + 5000), eventType: 'activity.summary', parentEventId: rootId, payload: { summary: 'set up a meeting' } });
+
+    const page = await repo.findActivityJobs({ from: day, to: new Date(day.getTime() + 86_400_000), limit: 20 });
+    expect(page.roots.map((r) => r.id)).toEqual([rootId]);
+    expect(page.delegated.map((r) => r.id).sort()).toEqual([specialistId, nestedId].sort());
+    expect(page.children.map((r) => r.eventType).sort()).toEqual(['activity.summary', 'tool.invoke', 'tool.result']);
+  });
+});
