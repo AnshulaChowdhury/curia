@@ -63,6 +63,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **`ToolContext.outboundContext`** — `register()` takes `recipientContactIds`; entry rows gain `recipientContactIds` and `recipientMessages` (migration 104). (#2261)
 - **Behavior suite usage** — docs make smoke and scenarios a release gate; development runs only targeted cases.
 - **Voice model** — ADR-038 moves voice to Haiku 5.5 with thinking off, keeping its own prompt. (#2245)
 - **Voice latency logs** — first-token (with model) and time-to-first-audio now log at info. (#2245)
@@ -143,6 +144,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Browser code guard** — `web-browser` refuses to type or navigate a sign-in code off its own site. (#2017)
 - **Digest tools** — tasks an outside contact started can't read or acknowledge the principal's digest. (#1320)
 - **Judgment elevation** — email senders become known only on SPF/DKIM/DMARC-verified mail. (#2227)
+- **Contact-visible outbound context** — contacts see only their own entries, one-to-one, on authenticated channels; their wakes likewise. (#2261)
 
 ### Fixed
 
@@ -157,6 +159,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`email-list` drafts** — `folder: DRAFTS` lists drafts instead of failing on Gmail. (#2262)
 - **`ceo-inbox-draft-compose`** — refuses a draft addressed only to the principal; Curia emails them with `email-send`. (#2262)
 - **Voice turn-taking** — Curia no longer answers mid-sentence pauses; fragments join into one turn. (#2240)
+- **Third-party replies** — Curia sees its question when a contact answers; later turns and task wakes see replies. (#2261)
 - **Empty answers at the output cap** — OpenRouter responses that reasoned to `max_tokens` with no answer are retried. (#1915)
 - **Voice tool audit** — spoken-turn tool calls now record `tool.invoke` and `tool.result`, like text turns. (#1968)
 - **Voice barge-ins** — a stream the caller cancels no longer records an `llm.error` or logs an error. (#1968)

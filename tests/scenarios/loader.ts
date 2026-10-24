@@ -74,8 +74,9 @@ const VERIFICATION_DELIVERIES: readonly SeedVerification['delivery'][] = ['email
 const VERIFICATION_STATUSES: readonly SeedVerification['status'][] = ['pending', 'expired', 'satisfied', 'abandoned'];
 const BACKLOG_KEYS = ['decay_warnings', 'pending_approvals', 'principal_tasks'] as const;
 const CONTACT_KEYS = ['key', 'display_name', 'tier', 'kind', 'role', 'channel', 'identifier', 'principal_wrote'] as const;
-const ENTRY_KEYS = ['key', 'channel', 'agent', 'content', 'expected_reply', 'delegation_hint', 'metadata', 'sent_minutes_ago', 'expires_in_hours', 'resume'] as const;
+const ENTRY_KEYS = ['key', 'channel', 'agent', 'content', 'expected_reply', 'delegation_hint', 'metadata', 'recipients', 'replies', 'sent_minutes_ago', 'expires_in_hours', 'resume'] as const;
 const RESUME_KEYS = ['agent', 'original_task', 'context'] as const;
+const REPLY_KEYS = ['from', 'content'] as const;
 const THREAD_KEYS = ['key', 'topic', 'creator', 'participants', 'content', 'mentions'] as const;
 const INBOUND_KEYS = ['from', 'channel', 'content', 'thread', 'author', 'requester', 'email', 'task'] as const;
 const EMAIL_KEYS = ['nylas_message_id', 'account', 'auto_generated', 'auto_generated_signals', 'to', 'cc', 'sender_verified'] as const;
@@ -383,6 +384,17 @@ function parseOutbound(raw: Raw, file: string): SeedOutboundEntry[] {
         context: str(resumeRaw, 'context', file, `${where}.resume`),
       };
     }
+    const recipients = e['recipients'] !== undefined ? strList(e, 'recipients', file, where, true) : undefined;
+    const replies = e['replies'] !== undefined
+      ? list(e, 'replies', file).map((r, j) => {
+          const at = `${where}.replies[${j}]`;
+          onlyKeys(r, REPLY_KEYS, file, at);
+          const from = str(r, 'from', file, at);
+          // Only a recipient's message is recorded on an entry (the Dispatcher's match).
+          if (!recipients?.includes(from)) throw new CaseError(file, `${at}: 'from' must be one of the entry's recipients`);
+          return { from, content: str(r, 'content', file, at) };
+        })
+      : undefined;
     return {
       key: str(e, 'key', file, where),
       channelId: str(e, 'channel', file, where),
@@ -391,6 +403,8 @@ function parseOutbound(raw: Raw, file: string): SeedOutboundEntry[] {
       expectedReply: optStr(e, 'expected_reply', file, where),
       delegationHint: optStr(e, 'delegation_hint', file, where),
       ...(metadata ? { metadata } : {}),
+      ...(recipients ? { recipients } : {}),
+      ...(replies ? { replies } : {}),
       sentMinutesAgo: optNum(e, 'sent_minutes_ago', file, where),
       expiresInHours: optNum(e, 'expires_in_hours', file, where),
       ...(resume ? { resume } : {}),

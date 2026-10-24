@@ -332,6 +332,9 @@ seed:
       expected_reply: approval to send
       delegation_hint: ceo-inbox
       metadata: { bind_reply: true }      # optional
+      recipients: [sam]                   # optional: contact keys it was sent to (#2261)
+      replies:                            # optional: what they already sent back; a task
+        - { from: sam, content: … }       #   wake lists it (from: one of recipients)
       sent_minutes_ago: 12                # optional, default 10
       resume:                             # optional → metadata.resume_token, {{resume_token:<key>}}
         agent: research-analyst           #   a relayed clarification (encodeResumeToken)
