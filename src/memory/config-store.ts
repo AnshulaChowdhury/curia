@@ -9,14 +9,11 @@
 //   Namespace anchor: type=concept, label="config:{namespace}"
 //   Per-key facts on the anchor: label=key, properties: { key, value, namespace }, decayClass=permanent
 //
-// Writes use confidence=0.9 so the dedup path auto-resolves updates. The skill
-// uses 1.0, which would produce a 'conflict' result when writing the same key
-// twice. At 0.9, the second write (equal cosine similarity, higher confidence
-// than the stored 0.9 only on the very first write — after that equal) may
-// produce conflict too, but the storeFact dedup logic treats the first stored
-// node as authoritative and updates its properties in place for the 'update'
-// action. Handling: log a warning and continue — the value stored on the
-// PREVIOUS call is still valid, so a failed write is non-fatal for heartbeat use.
+// Writes use storeFact with exactKey: true so opaque config keys never merge via
+// label embedding similarity (#2252). Same-key writes update the existing fact in
+// place; distinct keys (foo_1 vs foo_2) always create separate facts. Soft
+// rejections (result.stored === false, e.g. rate limit) are logged and non-fatal
+// for heartbeat use — the prior value remains valid.
 
 import type { EntityMemory } from './entity-memory.js';
 import type { Logger } from '../logger.js';
@@ -50,12 +47,11 @@ export class ConfigStore {
     const allFacts = await Promise.all(anchors.map((a) => this.entityMemory.getFacts(a.id)));
     const facts = allFacts.flat();
 
-    // Primary match on label; fallback on properties.key for forward-compat.
-    // Pick the most-recently confirmed fact when there are duplicates (e.g. from
-    // a race between two concurrent anchor-create calls, which is unlikely in
-    // practice but possible across restarts).
+    // Match on properties.key only — label can diverge after a historical semantic
+    // merge (#2252). Pick the most-recently confirmed fact when duplicates exist
+    // (e.g. a race between two concurrent anchor-create calls).
     const matching = facts.filter(
-      (f) => f.label === key || (f.properties.key as string | undefined) === key,
+      (f) => (f.properties.key as string | undefined) === key,
     );
     const fact = matching.sort(
       (a, b) => b.temporal.lastConfirmedAt.getTime() - a.temporal.lastConfirmedAt.getTime(),
@@ -78,13 +74,6 @@ export class ConfigStore {
     try {
       const anchor = await this.findOrCreateAnchor(namespace);
 
-      // confidence=0.9 (not 1.0) so the dedup path can auto-resolve updates:
-      // a second write with equal cosine similarity and 0.9 confidence against
-      // an existing 0.9 node triggers 'conflict', but a first write at 0.9
-      // followed by a second at 0.9 on the same label uses the dedup
-      // 'auto_resolved' path when the new value has the same or higher confidence.
-      // In practice the write may occasionally be rejected with stored=false;
-      // we log and continue — the prior value is still valid.
       const result = await this.entityMemory.storeFact({
         entityNodeId: anchor.id,
         label: key,
@@ -92,6 +81,8 @@ export class ConfigStore {
         confidence: 0.9,
         decayClass: 'permanent',
         source: SYSTEM_SOURCE,
+        // Opaque keys — never merge via label embedding similarity (#2252).
+        exactKey: true,
       });
 
       if (!result.stored) {

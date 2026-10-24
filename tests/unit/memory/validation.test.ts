@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { MemoryValidator } from '../../../src/memory/validation.js';
 import { KnowledgeGraphStore } from '../../../src/memory/knowledge-graph.js';
 import { EmbeddingService } from '../../../src/memory/embedding.js';
@@ -628,6 +628,148 @@ describe('MemoryValidator', () => {
 
       // Existing is multi-valued with value c2; incoming has no value → values differ → create
       expect(result.action).toBe('create');
+    });
+  });
+
+  describe('exact-key facts (StoreFactOptions.exactKey)', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('creates when no fact shares properties.key', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const existing = await store.createNode({
+        type: 'fact',
+        label: 'foo_1',
+        properties: { key: 'foo_1', value: 'a', namespace: 'ns' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: existing.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'foo_2',
+        properties: { key: 'foo_2', value: 'b', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+
+      expect(result.action).toBe('create');
+    });
+
+    it('updates the matching key and returns newLabel even when cosine would merge', async () => {
+      // Force semantic path to see a near-duplicate so this is not a vacuous pass
+      // against the fake embedder (which rarely scores similar stems above threshold).
+      vi.spyOn(EmbeddingService, 'cosineSimilarity').mockReturnValue(0.99);
+
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const existing = await store.createNode({
+        type: 'fact',
+        label: 'processed_event_ids_1',
+        properties: { key: 'processed_event_ids_1', value: '["a"]', namespace: 'ns' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: existing.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      // Without exactKey, forced cosine ≥ factDedup → update (the production bug).
+      const semantic = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'processed_event_ids_2',
+        properties: { key: 'processed_event_ids_2', value: '["b"]', namespace: 'ns' },
+        source: 'test',
+      });
+      expect(semantic.action).toBe('update');
+
+      // With exactKey, different key → create despite high cosine.
+      const exact = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'processed_event_ids_2',
+        properties: { key: 'processed_event_ids_2', value: '["b"]', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(exact.action).toBe('create');
+
+      // Same key → update with newLabel so label stays aligned.
+      const sameKey = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'processed_event_ids_1',
+        properties: { key: 'processed_event_ids_1', value: '["a","c"]', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(sameKey.action).toBe('update');
+      if (sameKey.action === 'update') {
+        expect(sameKey.existingNodeId).toBe(existing.id);
+        expect(sameKey.newLabel).toBe('processed_event_ids_1');
+        expect(sameKey.mergedProperties.value).toBe('["a","c"]');
+      }
+    });
+
+    it('keeps one-character key differences as separate facts under forced high cosine', async () => {
+      vi.spyOn(EmbeddingService, 'cosineSimilarity').mockReturnValue(0.99);
+
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:debrief', properties: {}, source: 'test',
+      });
+      const existing = await store.createNode({
+        type: 'fact',
+        label: 'prompted:j0a3bljsikn3jdv',
+        properties: { key: 'prompted:j0a3bljsikn3jdv', value: '1', namespace: 'debrief' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: existing.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'prompted:j0a3bljsik3njdv',
+        properties: { key: 'prompted:j0a3bljsik3njdv', value: '1', namespace: 'debrief' },
+        source: 'test',
+        exactKey: true,
+      });
+
+      expect(result.action).toBe('create');
+    });
+
+    it('still rate-limits exactKey writes', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const agentTaskKey = 'agent:test/task:exact-key-rate';
+      for (let i = 0; i < 50; i++) {
+        validator.recordWrite(agentTaskKey);
+      }
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'k',
+        properties: { key: 'k', value: 'v', namespace: 'ns' },
+        source: agentTaskKey,
+        exactKey: true,
+      });
+      expect(result.action).toBe('rate_limited');
     });
   });
 

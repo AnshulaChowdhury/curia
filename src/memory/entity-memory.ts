@@ -633,9 +633,12 @@ export class EntityMemory {
       }
 
       case 'update': {
-        // Near-duplicate detected — merge properties into the existing node.
+        // Near-duplicate (or exact-key match) — merge properties into the existing
+        // node. exactKey upserts also pass newLabel so label stays aligned with
+        // properties.key (#2252); semantic merges leave the label alone.
         await this.store.updateNode(result.existingNodeId, {
           properties: result.mergedProperties,
+          ...(result.newLabel !== undefined ? { label: result.newLabel } : {}),
         });
         this.validator.recordWrite(options.source);
 

@@ -3,7 +3,7 @@ import type { KnowledgeGraphStore } from './knowledge-graph.js';
 // EmbeddingService.cosineSimilarity() at runtime.
 import { EmbeddingService } from './embedding.js';
 import { embeddingStamp } from './embedding-profiles.js';
-import type { StoreFactOptions, ValidationResult } from './types.js';
+import type { KgEdge, StoreFactOptions, ValidationResult } from './types.js';
 
 // Spec line 126: max writes per agent per task
 // Exported so tests can exhaust the limit without hard-coding the magic number.
@@ -112,6 +112,14 @@ export class MemoryValidator {
     //    Spec line 115: "same entity + similar label" prevents cross-entity false matches
     //    and avoids a full table scan as the fact count grows.
     const entityEdges = await this.store.getEdgesForNode(options.entityNodeId);
+
+    // Exact-key path (#2252): config keys are opaque identifiers, not prose. Semantic
+    // merge of near-identical labels (e.g. processed_event_ids_1 vs _2) silently
+    // destroys distinct values. Match only on properties.key; still rate-limit.
+    if (options.exactKey === true) {
+      return this.validateExactKey(options, entityEdges);
+    }
+
     const newEmbedding = await this.embeddingService.embed(options.label, 'similarity');
     // The threshold belongs to the model that produced the scores (ADR-051).
     const dedupThreshold = this.embeddingService.profile.thresholds.factDedup;
@@ -159,13 +167,88 @@ export class MemoryValidator {
     //    the validated inputs plus the embedding from the dedup scan above.
     //    Timestamps are intentionally omitted — the store always stamps its own
     //    createdAt/lastConfirmedAt on INSERT; any value we set here would be ignored.
+    return this.buildCreateResult(options, newEmbedding);
+  }
+
+  /**
+   * Exact-key upsert for opaque identifiers (config-store). Never compares
+   * embeddings. Finds a fact whose `properties.key` equals the incoming key;
+   * updates that node (and realigns its label) or creates a new one.
+   */
+  private async validateExactKey(
+    options: StoreFactOptions,
+    entityEdges: KgEdge[],
+  ): Promise<ValidationResult> {
+    const incomingKey = (options.properties as Record<string, unknown> | undefined)?.key;
+    if (typeof incomingKey !== 'string') {
+      // Misconfigured caller — without a key we cannot upsert safely. Create a
+      // new fact rather than risk merging into an unrelated near-match. The
+      // create still goes through rate limiting (already checked above).
+      return this.buildCreateResult(options, await this.embeddingForCreate(options.label));
+    }
+
+    // Prefer the most recently confirmed match when duplicates somehow exist
+    // (e.g. a race before exactKey landed). Updating one leaves any older twin
+    // for the repair script / operator; we must not merge across different keys.
+    let bestMatch: { id: string; properties: Record<string, unknown>; confirmedAt: number } | undefined;
+
+    for (const edge of entityEdges) {
+      const targetId = edge.sourceNodeId === options.entityNodeId
+        ? edge.targetNodeId
+        : edge.sourceNodeId;
+      const targetNode = await this.store.getNode(targetId);
+      if (!targetNode || targetNode.type !== 'fact') continue;
+
+      const existingKey = (targetNode.properties as Record<string, unknown>).key;
+      if (existingKey !== incomingKey) continue;
+
+      const confirmedAt = targetNode.temporal.lastConfirmedAt.getTime();
+      if (!bestMatch || confirmedAt > bestMatch.confirmedAt) {
+        bestMatch = {
+          id: targetNode.id,
+          properties: targetNode.properties as Record<string, unknown>,
+          confirmedAt,
+        };
+      }
+    }
+
+    if (bestMatch) {
+      return {
+        action: 'update',
+        existingNodeId: bestMatch.id,
+        mergedProperties: {
+          ...bestMatch.properties,
+          ...(options.properties ?? {}),
+        },
+        // Keep label === key so retrieve and the mismatch query stay clean.
+        newLabel: options.label,
+      };
+    }
+
+    return this.buildCreateResult(options, await this.embeddingForCreate(options.label));
+  }
+
+  /**
+   * Embedding to pass through on create when the profile uses the same vector
+   * for similarity and document storage; otherwise undefined so the store embeds
+   * as document. Mirrors the semantic-dedup create path.
+   */
+  private async embeddingForCreate(label: string): Promise<number[] | undefined> {
     const { prefixes } = this.embeddingService.profile;
+    if (prefixes.similarity !== prefixes.document) return undefined;
+    return this.embeddingService.embed(label, 'similarity');
+  }
+
+  private buildCreateResult(
+    options: StoreFactOptions,
+    embedding: number[] | undefined,
+  ): ValidationResult {
     return {
       action: 'create',
       validated: {
         label: options.label,
         properties: options.properties ?? {},
-        ...(prefixes.similarity === prefixes.document ? { embedding: newEmbedding } : {}),
+        ...(embedding ? { embedding } : {}),
         provenance: {
           confidence: options.confidence ?? 0.7,
           decayClass: options.decayClass ?? 'slow_decay',

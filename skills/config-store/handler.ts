@@ -97,6 +97,9 @@ export class ConfigStoreHandler implements ToolHandler {
         // Config values are permanent — stable URLs / IDs the principal provides once
         decayClass: 'permanent',
         source: writeSource,
+        // Keys are opaque identifiers — never merge via label embedding similarity
+        // (processed_event_ids_1 vs _2 would otherwise overwrite each other). #2252
+        exactKey: true,
       });
 
       if (!storeResult.stored) {
@@ -175,12 +178,12 @@ export class ConfigStoreHandler implements ToolHandler {
       const facts = allFacts.flat();
 
       if (key) {
-        // Primary match: label. Fallback: properties.key, which may differ from the label
-        // if a fact was stored with a mismatched label (e.g. a year-rollover bug that wrote
-        // label="sheet_id.2025" but properties.key="sheet_id.2026"). The fallback makes
-        // retrieve resilient to that class of data corruption.
-        const fact = facts.find((f) => f.label === key)
-          ?? facts.find((f) => (f.properties.key as string | undefined) === key);
+        // Match on properties.key only. Label was historically used as a primary
+        // match, but semantic dedup left label ≠ key (e.g. label=processed_event_ids_1
+        // with properties.key=processed_event_ids_3). Matching label first returned
+        // the wrong value for the original key. After exactKey writes + the repair
+        // script, label === key again; properties.key remains the source of truth. #2252
+        const fact = facts.find((f) => (f.properties.key as string | undefined) === key);
         if (!fact) {
           return { success: true, data: { found: false, key } };
         }

@@ -1,13 +1,19 @@
 // skills/config-store/handler.test.ts
 //
-// All KG calls are mocked. No Postgres or real entityMemory needed.
-// Tests cover: input validation, store (create + reuse anchor, meta-index),
+// Mocked KG calls cover input validation, store (create + reuse anchor, meta-index),
 // retrieve (single key, all keys, missing namespace/key), list_namespaces.
+// The "exact-key semantics (real validator)" suite wires a real in-memory
+// EntityMemory + MemoryValidator so storeFact runs the production dedup path (#2252).
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ConfigStoreHandler } from './handler.js';
 import type { ToolContext } from '../../src/skills/types.js';
 import pino from 'pino';
+import { EntityMemory } from '../../src/memory/entity-memory.js';
+import { KnowledgeGraphStore } from '../../src/memory/knowledge-graph.js';
+import { EmbeddingService } from '../../src/memory/embedding.js';
+import { MemoryValidator } from '../../src/memory/validation.js';
+import { createSilentLogger } from '../../src/logger.js';
 
 function makeEntityMemory(overrides: Record<string, unknown> = {}) {
   return {
@@ -138,6 +144,7 @@ describe('ConfigStoreHandler', () => {
     expect(valueFact.properties.value).toBe('https://docs.example.com');
     expect(valueFact.properties.namespace).toBe('writing_config');
     expect(valueFact.decayClass).toBe('permanent');
+    expect(valueFact.exactKey).toBe(true);
 
     // Verify the namespace registration fact
     const nsFact = mem.storeFact.mock.calls[1]![0];
@@ -285,16 +292,16 @@ describe('ConfigStoreHandler', () => {
     }
   });
 
-  it('returns found:true via properties.key fallback when label does not match (label/key mismatch)', async () => {
-    // Regression: a fact stored with label "sheet_id.2025" but properties.key "sheet_id.2026"
-    // must be discoverable when retrieve("sheet_id.2026") is called.
+  it('returns found:true via properties.key when label diverged (historical semantic merge)', async () => {
+    // After a semantic merge, label may still be the first key while properties.key
+    // holds the last write. Retrieve matches properties.key only (#2252).
     const handler = new ConfigStoreHandler();
     const mem = makeEntityMemory({
       findEntities: vi.fn().mockResolvedValue([{ id: 'anchor-1' }]),
       getFacts: vi.fn().mockResolvedValue([
         {
           id: 'f1',
-          label: 'sheet_id.2025',  // wrong label from year-rollover bug
+          label: 'sheet_id.2025',
           properties: { key: 'sheet_id.2026', value: 'real-sheet-id', namespace: 't2125' },
         },
       ]),
@@ -309,6 +316,40 @@ describe('ConfigStoreHandler', () => {
       expect(data.found).toBe(true);
       expect(data.key).toBe('sheet_id.2026');
       expect(data.value).toBe('real-sheet-id');
+    }
+  });
+
+  it('does not return a fact whose properties.key differs from the requested key (even if label matches)', async () => {
+    // Acceptance: retrieve by key never returns a fact with a different properties.key.
+    // Label-first matching previously returned the merged value for the original key.
+    const handler = new ConfigStoreHandler();
+    const mem = makeEntityMemory({
+      findEntities: vi.fn().mockResolvedValue([{ id: 'anchor-1' }]),
+      getFacts: vi.fn().mockResolvedValue([
+        {
+          id: 'f1',
+          label: 'processed_event_ids_1',
+          properties: {
+            key: 'processed_event_ids_3',
+            value: '["only-third"]',
+            namespace: 'travel_detection',
+          },
+        },
+      ]),
+    });
+    const ctx = makeCtx(mem, {
+      action: 'retrieve',
+      namespace: 'travel_detection',
+      key: 'processed_event_ids_1',
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const data = result.data as { found: boolean; key: string };
+      expect(data.found).toBe(false);
+      expect(data.key).toBe('processed_event_ids_1');
     }
   });
 
@@ -439,5 +480,117 @@ describe('ConfigStoreHandler', () => {
       const data = result.data as { namespaces: string[] };
       expect(data.namespaces).toHaveLength(0);
     }
+  });
+});
+
+describe('ConfigStoreHandler exact-key semantics (real validator)', () => {
+  let entityMemory: EntityMemory;
+  let handler: ConfigStoreHandler;
+
+  beforeEach(() => {
+    const embeddingService = EmbeddingService.createForTesting();
+    const store = KnowledgeGraphStore.createInMemory(embeddingService);
+    const validator = new MemoryValidator(store, embeddingService);
+    entityMemory = new EntityMemory(store, validator, embeddingService, createSilentLogger());
+    handler = new ConfigStoreHandler();
+  });
+
+  function ctx(input: Record<string, unknown>): ToolContext {
+    return {
+      input,
+      entityMemory,
+      log: pino({ level: 'silent' }),
+      memoryWriteSource: 'agent:test/task:exact-key/channel:cli',
+    } as unknown as ToolContext;
+  }
+
+  it('stores foo_1, foo_2, foo_3 as three facts and retrieves each value', async () => {
+    // Acceptance: distinct suffix keys stay separate through the real storeFact path.
+    for (const [key, value] of [
+      ['foo_1', 'one'],
+      ['foo_2', 'two'],
+      ['foo_3', 'three'],
+    ] as const) {
+      const storeResult = await handler.execute(
+        ctx({ action: 'store', namespace: 'travel_detection', key, value }),
+      );
+      expect(storeResult.success).toBe(true);
+      if (storeResult.success) {
+        const data = storeResult.data as { stored: boolean; action: string };
+        expect(data.stored).toBe(true);
+        expect(data.action).toBe('created');
+      }
+    }
+
+    for (const [key, value] of [
+      ['foo_1', 'one'],
+      ['foo_2', 'two'],
+      ['foo_3', 'three'],
+    ] as const) {
+      const retrieveResult = await handler.execute(
+        ctx({ action: 'retrieve', namespace: 'travel_detection', key }),
+      );
+      expect(retrieveResult.success).toBe(true);
+      if (retrieveResult.success) {
+        const data = retrieveResult.data as { found: boolean; value: string };
+        expect(data.found).toBe(true);
+        expect(data.value).toBe(value);
+      }
+    }
+
+    const anchors = await entityMemory.findEntities('config:travel_detection');
+    expect(anchors).toHaveLength(1);
+    const facts = await entityMemory.getFacts(anchors[0]!.id);
+    // Value facts only (meta-index is a separate anchor); three keys → three facts.
+    expect(facts.filter((f) => typeof f.properties.key === 'string')).toHaveLength(3);
+  });
+
+  it('stores the same key twice as an in-place update (no duplicate fact)', async () => {
+    const first = await handler.execute(
+      ctx({ action: 'store', namespace: 'ns', key: 'aeroplan', value: 'AC1' }),
+    );
+    expect(first.success).toBe(true);
+    if (first.success) {
+      expect((first.data as { action: string }).action).toBe('created');
+    }
+
+    const second = await handler.execute(
+      ctx({ action: 'store', namespace: 'ns', key: 'aeroplan', value: 'AC2' }),
+    );
+    expect(second.success).toBe(true);
+    if (second.success) {
+      const data = second.data as { stored: boolean; action: string };
+      expect(data.stored).toBe(true);
+      expect(data.action).toBe('updated');
+    }
+
+    const retrieveResult = await handler.execute(
+      ctx({ action: 'retrieve', namespace: 'ns', key: 'aeroplan' }),
+    );
+    expect(retrieveResult.success).toBe(true);
+    if (retrieveResult.success) {
+      expect((retrieveResult.data as { value: string }).value).toBe('AC2');
+    }
+
+    const anchors = await entityMemory.findEntities('config:ns');
+    const facts = await entityMemory.getFacts(anchors[0]!.id);
+    expect(facts.filter((f) => f.properties.key === 'aeroplan')).toHaveLength(1);
+  });
+
+  it('keeps recurring-instance keys as separate facts', async () => {
+    const keyA = 'seen:04ncurue_20260921T213000Z';
+    const keyB = 'seen:04ncurue_20261019T213000Z';
+
+    await handler.execute(ctx({ action: 'store', namespace: 'debrief', key: keyA, value: '1' }));
+    await handler.execute(ctx({ action: 'store', namespace: 'debrief', key: keyB, value: '1' }));
+
+    const a = await handler.execute(ctx({ action: 'retrieve', namespace: 'debrief', key: keyA }));
+    const b = await handler.execute(ctx({ action: 'retrieve', namespace: 'debrief', key: keyB }));
+    expect(a.success && (a.data as { found: boolean }).found).toBe(true);
+    expect(b.success && (b.data as { found: boolean }).found).toBe(true);
+
+    const anchors = await entityMemory.findEntities('config:debrief');
+    const facts = await entityMemory.getFacts(anchors[0]!.id);
+    expect(facts.map((f) => f.properties.key).sort()).toEqual([keyA, keyB].sort());
   });
 });
