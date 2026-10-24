@@ -136,6 +136,102 @@ describe('OutboundGateway', () => {
     expect(mocks.contentFilter.check).not.toHaveBeenCalled();
   });
 
+  describe('every To and CC recipient (#2273)', () => {
+    const blockedOnly = (address: string) => (channel: string, identifier: string) => Promise.resolve(
+      identifier === address
+        ? { contactId: 'blocked-1', displayName: 'Blocked', role: null, tier: 'blocked', kind: 'person', kgNodeId: null, verified: true }
+        : null,
+    );
+    const makeGateway = () => new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+      logger: mocks.logger,
+    });
+
+    it.each([
+      ['a CC', { cc: ['blocked@example.com'] }],
+      ['a further To', { additionalTo: ['blocked@example.com'] }],
+    ])('refuses a send with a blocked contact on %s', async (_label, extra) => {
+      (mocks.contactService.resolveByChannelIdentity as ReturnType<typeof vi.fn>)
+        .mockImplementation(blockedOnly('blocked@example.com'));
+
+      const result = await makeGateway().send({ ...baseRequest, ...extra });
+
+      expect(result.success).toBe(false);
+      expect(result.blockedReason).toBe('Recipient is blocked');
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('dispatches every To address to Nylas, primary first', async () => {
+      const result = await makeGateway().send({ ...baseRequest, additionalTo: ['second@example.com'], cc: ['cc@example.com'] });
+
+      expect(result.success).toBe(true);
+      expect(mocks.nylasClient.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+        to: [{ email: 'recipient@example.com' }, { email: 'second@example.com' }],
+        cc: [{ email: 'cc@example.com' }],
+      }));
+    });
+
+    it.each([
+      ['a further To', { additionalTo: ['other@example.com'] }],
+      ['a CC', { cc: ['other@example.com'] }],
+    ])('keeps the autonomy gate when the CEO is on To with %s', async (_label, extra) => {
+      const gateway = new OutboundGateway({
+        nylasClients: new Map([['curia', mocks.nylasClient]]),
+        contactService: mocks.contactService,
+        contentFilter: mocks.contentFilter,
+        bus: mocks.bus,
+        principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+        logger: mocks.logger,
+        autonomyService: makeAutonomyService(65),
+      });
+
+      const alone = await gateway.send({ ...baseRequest, to: 'ceo@example.com' });
+      expect(alone.success).toBe(true);
+
+      const withOthers = await gateway.send({ ...baseRequest, to: 'ceo@example.com', ...extra });
+      expect(withOthers.success).toBe(false);
+      expect(withOthers.blockedReason).toContain('autonomy');
+      expect(mocks.nylasClient.sendMessage).toHaveBeenCalledOnce();
+    });
+
+    it('creates no contact for a To copied from Curia\'s own message', async () => {
+      const createContact = vi.fn().mockResolvedValue({ id: 'new-contact' });
+      Object.assign(mocks.contactService, { createContact, linkIdentity: vi.fn().mockResolvedValue(undefined) });
+      const gateway = makeGateway();
+
+      const own = await gateway.send({ ...baseRequest, toFromOwnMessage: true });
+      expect(own.success).toBe(true);
+      expect(createContact).not.toHaveBeenCalled();
+
+      // Control: the same send without the flag creates the contact.
+      const received = await gateway.send(baseRequest);
+      expect(received.success).toBe(true);
+      expect(createContact).toHaveBeenCalledOnce();
+    });
+
+    it('refuses a draft with a blocked contact on a further To, and drafts every To otherwise', async () => {
+      const createDraft = vi.fn().mockResolvedValue({ id: 'draft-1' });
+      (mocks.nylasClient as unknown as Record<string, unknown>).createDraft = createDraft;
+      (mocks.contactService.resolveByChannelIdentity as ReturnType<typeof vi.fn>)
+        .mockImplementation(blockedOnly('blocked@example.com'));
+      const gateway = makeGateway();
+
+      const blocked = await gateway.createEmailDraft({ ...baseRequest, additionalTo: ['blocked@example.com'] });
+      expect(blocked).toEqual({ success: false, blockedReason: 'Recipient is blocked' });
+      expect(createDraft).not.toHaveBeenCalled();
+
+      const drafted = await gateway.createEmailDraft({ ...baseRequest, additionalTo: ['second@example.com'] });
+      expect(drafted.success).toBe(true);
+      expect(createDraft).toHaveBeenCalledWith(expect.objectContaining({
+        to: [{ email: 'recipient@example.com' }, { email: 'second@example.com' }],
+      }));
+    });
+  });
+
   it('allows sends to non-blocked contacts and returns success with messageId', async () => {
     // The contact is confirmed — should proceed normally
     (mocks.contactService.resolveByChannelIdentity as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -2442,6 +2538,22 @@ describe('OutboundGateway.sendEmailDraft', () => {
 
     expect(result.success).toBe(true);
     expect(nylasClient.sendDraft).toHaveBeenCalledWith(DRAFT_ID);
+  });
+
+  it('keeps the autonomy gate when the draft goes to the CEO and anyone else (#2273)', async () => {
+    const { gateway, nylasClient } = makeGateway({
+      autonomyService: makeAutonomyService(65),
+    });
+    const result = await gateway.sendEmailDraft(DRAFT_ID, 'joseph', {
+      recipientEmail: 'ceo@example.com',
+      body: 'Hi all',
+      subject: 'Update',
+      allRecipients: ['ceo@example.com', 'armin@external.com'],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.blockedReason).toMatch(/autonomy/i);
+    expect(nylasClient.sendDraft).not.toHaveBeenCalled();
   });
 
   it('runs the content filter over the full To+CC envelope so a draft To: principal + CC: third party is not treated as sole-principal (#547)', async () => {

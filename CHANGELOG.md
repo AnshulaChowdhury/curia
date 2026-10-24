@@ -129,6 +129,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Security
 
+- **Blocked contacts on CC** — email sends and drafts refuse a blocked contact anywhere on To or CC. (#2273)
+- **Principal-addressed email** — autonomy and identity gates still run when anyone besides the principal receives it. (#2273)
 - **workspace-mcp dependencies** — cutoff moved to 2026-10-21, picking up certifi 2026.10.19 and pypdf 6.21.1 in the image; clears a CRITICAL, four MEDIUM and a LOW advisory (GHSA-6q48-6c7w-9gw2, CVE-2026-113792–113795, CVE-2026-113786). (curia-deploy#324)
 - **fastify** — bumped to 5.12.6, clearing a LOW advisory (CVE-2026-107832).
 - **sanitize-html** — bumped to 2.18.1, clearing a MEDIUM advisory (CVE-2026-113650).
@@ -142,6 +144,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Email reply-all** — keeps every original To recipient on To; replies to Curia's own messages reach their recipients. (#2273)
 - **`curia-postgres` shutdown** — `docker stop` now lets Postgres finish shutting down instead of killing it midway.
 - **`send-draft`** — finds drafts by ID, fixing Gmail 400s; missing drafts no longer read as transient. (#2262)
 - **`email-list` drafts** — `folder: DRAFTS` lists drafts instead of failing on Gmail. (#2262)

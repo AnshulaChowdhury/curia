@@ -147,7 +147,7 @@ describe('EmailReplyHandler', () => {
     ctx.selfEmails = ['alice+tag@example.com'];
     (ctx.outboundGateway!.getEmailMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
       from: [{ email: 'Alice@example.com', name: 'Alice' }],
-      to: [],
+      to: [{ email: 'bob@example.com', name: 'Bob' }],
       cc: [],
       subject: 'Sent',
       body: '',
@@ -162,6 +162,72 @@ describe('EmailReplyHandler', () => {
     expect(result.success).toBe(true);
     const options = (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mock.calls[0]![1] as Record<string, unknown>;
     expect(options).not.toHaveProperty('recipientSource');
+    expect(options).not.toHaveProperty('recipientDisplayName');
+  });
+
+  describe('replying to a message Curia sent (#2273)', () => {
+    it('addresses the original recipient, not Curia, and never CCs Curia', async () => {
+      const ctx = makeCtx({ reply_to_message_id: 'nylas-msg-1', body: 'Update on the three.' });
+      ctx.selfEmails = ['nathan@example.com'];
+      (ctx.outboundGateway!.getEmailMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
+        from: [{ email: 'nathan@example.com', name: 'Nathan' }],
+        to: [{ email: 'boss@example.com' }, { email: 'partner@example.com' }],
+        cc: [{ email: 'Nathan@example.com' }, { email: 'ea@example.com' }],
+        subject: 'Re: Tutoring shortlist',
+        body: '',
+        date: 0,
+      });
+      (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+        success: true, messageId: 'reply-123',
+      });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect((result.data as Record<string, unknown>).to).toBe('boss@example.com, partner@example.com');
+        expect((result.data as Record<string, unknown>).cc).toBe('ea@example.com');
+      }
+      expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(
+        expect.objectContaining({ to: 'boss@example.com', additionalTo: ['partner@example.com'], cc: ['ea@example.com'] }),
+        expect.objectContaining({
+          holdRecipe: expect.objectContaining({
+            description: 'Email reply to boss@example.com, partner@example.com — "Re: Tutoring shortlist"',
+          }),
+        }),
+      );
+      const [request, options] = (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mock.calls[0]! as [Record<string, unknown>, Record<string, unknown>];
+      expect(options).not.toHaveProperty('recipientSource');
+      // These people never wrote to us: the gateway must not create known-tier contacts for them.
+      expect(request.toFromOwnMessage).toBe(true);
+    });
+
+    it('does not mark a reply to someone who wrote to us', async () => {
+      const ctx = makeCtx({ reply_to_message_id: 'nylas-msg-1', body: 'Thanks!' });
+      (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'reply-1' });
+      await handler.execute(ctx);
+      const request = (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mock.calls[0]![0] as Record<string, unknown>;
+      expect(request).not.toHaveProperty('toFromOwnMessage');
+    });
+
+    it('refuses when Curia sent the original only to its own mailboxes', async () => {
+      const ctx = makeCtx({ reply_to_message_id: 'nylas-msg-1', body: 'Note to self' });
+      ctx.selfEmails = ['nathan@example.com', 'ops@example.com'];
+      (ctx.outboundGateway!.getEmailMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
+        from: [{ email: 'nathan@example.com' }],
+        to: [{ email: 'ops@example.com' }, { email: 'nathan+x@example.com' }],
+        cc: [],
+        subject: 'Self',
+        body: '',
+        date: 0,
+      });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/sent by Curia to no one else/);
+      expect(ctx.outboundGateway!.send).not.toHaveBeenCalled();
+    });
   });
 
   it('drops reply provenance when authentication did not pass (#2071)', async () => {
@@ -684,7 +750,12 @@ describe('EmailReplyHandler', () => {
         date: 0,
       });
       expect((await handler.execute(replyAll)).success).toBe(true);
-      expect(sentCc(replyAll)).toEqual(['principal@ignored.example', 'dave@example.com']);
+      // Reply-all keeps the original To on To (#2273); CC is the original CC.
+      expect(sentCc(replyAll)).toEqual(['dave@example.com']);
+      expect((replyAll.outboundGateway!.send as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toMatchObject({
+        to: 'alice@example.com',
+        additionalTo: ['principal@ignored.example'],
+      });
 
       for (const ctx of [literal, senderOnly, replyAll]) {
         expect(ctx.outboundGateway!.resolveRecipientReference).not.toHaveBeenCalled();

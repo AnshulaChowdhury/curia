@@ -122,23 +122,26 @@ export async function resolveEmailReplyRecipients(
     selfEmails: deps.selfEmails,
   });
   if (!set) return null;
-  return [set.to, ...set.cc];
+  return [set.to, ...set.additionalTo, ...set.cc];
 }
 
+const isStringListOrAbsent = (value: unknown): value is string[] | undefined =>
+  value === undefined || (Array.isArray(value) && value.every((r) => typeof r === 'string'));
+
 /**
- * Project an email outbound request onto To + CC identifiers.
+ * Project an email outbound request onto To (primary first) + CC identifiers.
  * Every address is principal-eligible (there is no email group-id analogue).
  */
 function extractEmailRecipients(request: unknown): ProjectedRecipient[] | null {
   if (!isEmailSendRequest(request)) return null;
-  // `isEmailSendRequest` only guards `to`/`body`; `cc` is unchecked. Reject any
-  // malformed `cc` (non-array throws at the spread; a string spreads into
-  // char-sized "recipients") so projection stays fail-closed (ADR-035).
-  const cc = request.cc;
-  if (cc !== undefined && (!Array.isArray(cc) || cc.some((r) => typeof r !== 'string'))) {
+  // `isEmailSendRequest` only guards `to`/`body`; `additionalTo` and `cc` are
+  // unchecked. Reject a malformed list (non-array throws at the spread; a string
+  // spreads into char-sized "recipients") so projection stays fail-closed (ADR-035).
+  const { additionalTo, cc } = request;
+  if (!isStringListOrAbsent(additionalTo) || !isStringListOrAbsent(cc)) {
     return null;
   }
-  return [request.to, ...(cc ?? [])]
+  return [request.to, ...(additionalTo ?? []), ...(cc ?? [])]
     .filter((e) => e.length > 0)
     .map((identifier) => ({ identifier, principalEligible: true }));
 }

@@ -22,8 +22,14 @@ export interface EmailSendRequest {
    *  Used by the gateway to select the right NylasClient from its map.
    *  Defaults to the first configured account when absent. */
   accountId?: string;
-  /** Recipient email address */
+  /** Primary recipient email address. Trust tier, contact creation and provenance key on it. */
   to: string;
+  /**
+   * Further To recipients after `to` — a reply-all keeps everyone the original
+   * was addressed to on To (#2273). Projected, blocked-checked and dispatched
+   * with `to`. Contact creation and provenance still use `to` alone.
+   */
+  additionalTo?: string[];
   subject?: string;
   body: string;
   cc?: string[];
@@ -49,6 +55,13 @@ export interface EmailSendRequest {
    * is `email_participant`. Not sent to the provider.
    */
   recipientDisplayName?: string;
+  /**
+   * True when `to` was copied from a message Curia sent, not from someone who
+   * wrote to us (#2273). The gateway then neither creates a contact for it nor
+   * elevates an existing one: ADR-047's `known` tier assumes the address wrote
+   * to us. Not sent to the provider; kept on a queued payload.
+   */
+  toFromOwnMessage?: boolean;
   /**
    * The assistant's signature, rendered after the body and before any quote (prompt
    * trim PR 6). Code-owned text, not part of `body`, so the content filter and the

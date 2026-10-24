@@ -392,6 +392,11 @@ function loggableContactId(contactId: string): string {
   return isUuid(contactId) ? contactId : redactId(contactId);
 }
 
+/** Every To address of an email request, primary first (#2273). */
+function emailToAddresses(request: EmailSendRequest): string[] {
+  return [request.to, ...(request.additionalTo ?? [])];
+}
+
 /**
  * The once-per-window relay-budget notice (#1320), addressed exactly as the held relay was:
  * same channel, account and principal address, with the body replaced and any threading or
@@ -1008,6 +1013,21 @@ export class OutboundGateway {
       );
     }
 
+    // The rest of the envelope (further To, CC): a blocked contact anywhere on
+    // it is refused, not only the primary (#2273). Fail-open, as above.
+    const blockedOther = await this.findBlockedRecipient(
+      request.channel,
+      this.personRecipients(request).filter((id) => id.toLowerCase() !== recipientId.toLowerCase()),
+      { failClosed: false },
+    );
+    if (blockedOther?.kind === 'blocked') {
+      this.log.warn(
+        { channel: request.channel, recipientId: redactId(blockedOther.identifier), contactId: blockedOther.contactId },
+        'outbound-gateway: send blocked — a recipient is blocked',
+      );
+      return { success: false, blockedReason: 'Recipient is blocked' };
+    }
+
     // After Step 1 so a blocked recipient is reported as blocked, not as an
     // unresolved identity (#1818).
     const identityBlock = await this.blockForUnresolvedIdentity({
@@ -1107,7 +1127,7 @@ export class OutboundGateway {
                 ...withoutRecipientReferences(options.reExecRecipe.partialPayload ?? {}),
                 // The display shows the resolved addresses; the stored payload keeps the references.
                 ...(request.channel === 'email'
-                  ? { to: request.to, ...(request.cc && request.cc.length > 0 ? { cc: request.cc.join(', ') } : {}) }
+                  ? { to: emailToAddresses(request).join(', '), ...(request.cc && request.cc.length > 0 ? { cc: request.cc.join(', ') } : {}) }
                   : {}),
                 export_items: items.map((i) => ({ node_id: i.nodeId, label: i.label, sensitivity: i.sensitivity })),
               },
@@ -1426,12 +1446,15 @@ export class OutboundGateway {
       }
       const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchEmail(toSend));
       if (result.success && !result.queued) {
-        await this.promoteOrCreateRecipientContact(
-          'email',
-          recipientId,
-          toSend.recipientSource,
-          toSend.recipientDisplayName,
-        );
+        // A To copied from Curia's own message has not written to us (#2273).
+        if (toSend.toFromOwnMessage !== true) {
+          await this.promoteOrCreateRecipientContact(
+            'email',
+            recipientId,
+            toSend.recipientSource,
+            toSend.recipientDisplayName,
+          );
+        }
         await this.publishDelivered({
           channel: 'email',
           recipientId,
@@ -1673,7 +1696,7 @@ export class OutboundGateway {
           await this.promoteOrCreateRecipientContact('signal', row.payload.recipient);
         } else if (row.payload.channel === 'sms') {
           await this.promoteOrCreateRecipientContact('sms', row.payload.recipient);
-        } else if (row.payload.channel === 'email') {
+        } else if (row.payload.channel === 'email' && row.payload.toFromOwnMessage !== true) {
           const provenance = emailProvenanceFromPayload(row.payload);
           await this.promoteOrCreateRecipientContact(
             'email',
@@ -1792,7 +1815,7 @@ export class OutboundGateway {
     const displayPayload = enrichGatewayApprovalPayload(
       withoutRecipientReferences(recipe.partialPayload ?? {}),
       request.channel === 'email'
-        ? { to: request.to, cc: request.cc?.join(', '), subject: request.subject, body: request.body }
+        ? { to: emailToAddresses(request).join(', '), cc: request.cc?.join(', '), subject: request.subject, body: request.body }
         : request.channel === 'slack'
           // `recipient` is the field the approval renderer shows (#2033).
           ? { slackChannelId: request.slackChannelId, recipient: request.slackUserId ?? request.slackChannelId, message: request.message }
@@ -2355,6 +2378,40 @@ export class OutboundGateway {
     return unmatched;
   }
 
+  /**
+   * The first of `identifiers` that is a blocked contact on `channel` (#2273).
+   * The primary recipient's own check also captures its tier; this covers the
+   * rest of the envelope (further To, CC), so a blocked contact anywhere on it
+   * is refused. On a lookup error, `failClosed` returns `lookup-failed`;
+   * otherwise that identifier is logged and skipped, as the primary check does.
+   */
+  private async findBlockedRecipient(
+    channel: string,
+    identifiers: readonly string[],
+    opts: { failClosed: boolean },
+  ): Promise<{ kind: 'blocked'; identifier: string; contactId: string } | { kind: 'lookup-failed'; identifier: string } | null> {
+    const seen = new Set<string>();
+    for (const identifier of identifiers) {
+      const key = identifier.toLowerCase();
+      if (identifier.length === 0 || seen.has(key)) continue;
+      seen.add(key);
+      try {
+        const contact = await this.contactService.resolveByChannelIdentity(channel, identifier);
+        // Uses tier for the blocked check (issue #945); tier='blocked' == old status='blocked'.
+        if (contact !== null && contact.tier === 'blocked') {
+          return { kind: 'blocked', identifier, contactId: contact.contactId };
+        }
+      } catch (err) {
+        this.log.warn(
+          { err, channel, recipientId: redactId(identifier), failClosed: opts.failClosed },
+          'outbound-gateway: blocked-contact lookup failed for a non-primary recipient',
+        );
+        if (opts.failClosed) return { kind: 'lookup-failed', identifier };
+      }
+    }
+    return null;
+  }
+
   /** Append the unmatched-recipient note to a blocked result (#2033). */
   private withUnmatchedRecipientNote(
     result: OutboundSendResult,
@@ -2369,14 +2426,14 @@ export class OutboundGateway {
   }
 
   /**
-   * Check whether the primary recipient is the principal (the human Curia serves).
-   * Uses the first principal-eligible identifier from `projectRecipients` (email
-   * `to`, Signal `recipient`, Slack `slackUserId`) against verified identities.
+   * Check whether the principal (the human Curia serves) is the send's only
+   * recipient, over the full projection: email To, further To and CC (#2273),
+   * Signal `recipient`, Slack `slackUserId`. A principal on To with anyone else
+   * on the send is not agent-to-principal communication, so the autonomy gate
+   * and the identity gate still run.
    */
   private isPrincipalRecipient(request: OutboundSendRequest): boolean {
-    const primary = this.projectRecipients(request).find((r) => r.principalEligible);
-    if (!primary) return false;
-    return this.isPrincipalOnChannel(request.channel, primary.identifier);
+    return this.buildFilterRecipients(request).principalIsSoleRecipient;
   }
 
   /**
@@ -3017,6 +3074,23 @@ export class OutboundGateway {
       return { success: false, blockedReason: 'Contact resolution failed; draft not created' };
     }
 
+    // The rest of the envelope (#2273), fail-closed for the same reason as above.
+    const blockedOther = await this.findBlockedRecipient(
+      'email',
+      [...(request.additionalTo ?? []), ...(request.cc ?? [])],
+      { failClosed: true },
+    );
+    if (blockedOther?.kind === 'blocked') {
+      this.log.warn(
+        { channel: 'email', recipientId: redactId(blockedOther.identifier), contactId: blockedOther.contactId },
+        'outbound-gateway: draft blocked — a recipient is blocked',
+      );
+      return { success: false, blockedReason: 'Recipient is blocked' };
+    }
+    if (blockedOther?.kind === 'lookup-failed') {
+      return { success: false, blockedReason: 'Contact resolution failed; draft not created' };
+    }
+
     const toDraft: EmailSendRequest = { ...request };
     this.signEmail(toDraft, false);
     return this.dispatchEmailDraft(toDraft);
@@ -3088,9 +3162,17 @@ export class OutboundGateway {
         { draftId },
         'outbound-gateway: autonomy gate skipped — humanApproved flag set (principal-authorized draft send, see ADR-017)',
       );
-    } else if (this.autonomyService && this.isPrincipalOnChannel('email', draftMeta.recipientEmail)) {
-      // Agent-to-principal: principal-bound draft sends bypass the autonomy gate.
-      // Same rationale as the send() principal bypass — see isPrincipalRecipient() comment.
+    } else if (
+      this.autonomyService
+      && this.buildRecipientSet(
+        draftMeta.allRecipients && draftMeta.allRecipients.length > 0
+          ? draftMeta.allRecipients
+          : [draftMeta.recipientEmail],
+      ).principalIsSoleRecipient
+    ) {
+      // Agent-to-principal: a draft whose only recipient is the principal bypasses
+      // the autonomy gate. Same rationale as the send() principal bypass — see
+      // isPrincipalRecipient() comment.
       this.log.info(
         { draftId, channel: 'email' },
         'outbound-gateway: autonomy gate skipped — draft recipient is principal (agent-to-principal communication)',
@@ -3161,12 +3243,27 @@ export class OutboundGateway {
       );
     }
 
+    // The rest of the draft's envelope (#2273). Fail-open, as above.
+    const draftOthers = (draftMeta.allRecipients ?? [])
+      .filter((r) => r.toLowerCase() !== recipientEmail.toLowerCase());
+    const blockedOther = await this.findBlockedRecipient('email', draftOthers, { failClosed: false });
+    if (blockedOther?.kind === 'blocked') {
+      this.log.warn(
+        { draftId, recipientId: redactId(blockedOther.identifier), contactId: blockedOther.contactId },
+        'outbound-gateway: draft send blocked — a recipient is blocked',
+      );
+      return { success: false, blockedReason: 'Recipient is blocked' };
+    }
+
     // After Step 1, same rule as send() (#1818). A draft that leaves the
-    // mailbox is an external message; humanApproved skips the gate.
+    // mailbox is an external message; humanApproved skips the gate. The rest
+    // of the envelope rides as CC so a principal on To does not skip the gate
+    // for everyone else (#2273).
     const identityBlock = await this.blockForUnresolvedIdentity({
       request: {
         channel: 'email',
         to: recipientEmail,
+        ...(draftOthers.length > 0 ? { cc: draftOthers } : {}),
         subject: draftMeta.subject,
         body,
       },
@@ -3345,6 +3442,9 @@ export class OutboundGateway {
     // ------------------------------------------------------------------
     // Step 4: Contact promotion (same as send())
     // ------------------------------------------------------------------
+    // No toFromOwnMessage check here, on purpose: a draft send is principal-approved,
+    // and that approval is what makes its To `known` (ADR-047). It holds for the
+    // adapter's gated-fallback draft of a reply to Curia's own message too (#2273).
     await this.promoteOrCreateRecipientContact('email', recipientEmail);
 
     // Emit the audit event — sendEmailDraft() is a genuine wire send and must
@@ -3674,7 +3774,7 @@ export class OutboundGateway {
 
     try {
       const sendOptions: SendEmailOptions = {
-        to: [{ email: request.to }],
+        to: emailToAddresses(request).map((email) => ({ email })),
         cc: request.cc?.map((email) => ({ email })),
         subject: request.subject ?? '',
         body: htmlBody,
@@ -3734,7 +3834,7 @@ export class OutboundGateway {
 
     try {
       const sendOptions: SendEmailOptions = {
-        to: [{ email: request.to }],
+        to: emailToAddresses(request).map((email) => ({ email })),
         cc: request.cc?.map((email) => ({ email })),
         subject: request.subject ?? '',
         body: htmlBody,

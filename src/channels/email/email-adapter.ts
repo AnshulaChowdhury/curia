@@ -12,6 +12,7 @@ import type { Logger } from '../../logger.js';
 import type { OutboundGateway } from '../../skills/outbound-gateway.js';
 import type { EmailSendRequest } from './outbound-request.js';
 import { replyDisplayName, replyRecipientSource } from './reply-recipient-provenance.js';
+import { deriveEmailReplyRecipientSet } from './reply-recipients.js';
 import type { ContactService } from '../../contacts/contact-service.js';
 import type { PrincipalEmailRef } from '../../contacts/types.js';
 import { resolvePrincipalEmail } from '../../contacts/types.js';
@@ -698,56 +699,38 @@ export class EmailAdapter implements Channel {
         return;
       }
 
-      const latestFromEmail = threadMessage.from[0]?.email;
-
-      // If the latest message was sent BY us, the human's address is in 'to'.
-      // normalizeForComparison handles casing and plus-addressing variations.
-      const latestIsOurs =
-        latestFromEmail !== undefined &&
-        normalizeForComparison(latestFromEmail) === normalizeForComparison(this.config.selfEmail);
-
-      // When the latest message is ours, find the first non-self address in 'to'.
-      // to[] can contain multiple recipients (e.g. a thread with a CC'd third party);
-      // picking the first non-self address is best-effort for 1:1 conversations.
-      // TODO: proper group-email support would need to track the original sender from
-      // the inbound message rather than inferring the recipient from the thread.
-      const recipientEmail = latestIsOurs
-        ? threadMessage.to.find(
-            (r) => normalizeForComparison(r.email) !== normalizeForComparison(this.config.selfEmail),
-          )?.email
-        : latestFromEmail;
-
-      if (!recipientEmail) {
+      // Reply-all, the same derivation the email-reply skill uses (#2273): a received
+      // message goes to its sender plus its other To, CC to its CC; when the latest
+      // message is ours, the reply goes to the people it was addressed to. Our own
+      // address is dropped everywhere, so a self-addressed thread resolves to null
+      // rather than looping a reply into our own inbox.
+      // Every owned mailbox, not just this account's: a latest message sent
+      // from another of our accounts is still ours.
+      const ownedMailboxes = [this.config.selfEmail, ...this.config.suppressedSenderEmails];
+      const recipientSet = deriveEmailReplyRecipientSet({
+        originalFrom: threadMessage.from[0]?.email,
+        originalTo: threadMessage.to,
+        originalCc: threadMessage.cc,
+        ccInput: undefined,
+        selfEmails: ownedMailboxes,
+      });
+      if (!recipientSet) {
         logger.warn(
-          { threadId, messageId: threadMessage.id, latestIsOurs },
-          'Cannot reply — could not resolve human recipient from thread',
+          { threadId, messageId: threadMessage.id },
+          'Cannot reply — no recipient outside our own mailbox in the latest thread message',
         );
         return;
       }
+      const latestIsOurs = !recipientSet.toIsOriginalSender;
+      const recipientEmail = recipientSet.to;
+      const additionalTo = recipientSet.additionalTo;
+      const ccAddresses = recipientSet.cc;
 
-      // Guard: if the resolved recipient is still our own address (e.g. a self-addressed
-      // thread or malformed to[] list), bail out rather than looping a reply to our own
-      // inbox. This would produce a misleading "sent" log with no human ever receiving it.
-      if (normalizeForComparison(recipientEmail) === normalizeForComparison(this.config.selfEmail)) {
-        logger.error(
-          { threadId, messageId: threadMessage.id, latestIsOurs },
-          'Cannot reply — resolved recipient is selfEmail; thread may be self-addressed or to[] is malformed',
+      if (additionalTo.length > 0 || ccAddresses.length > 0) {
+        logger.debug(
+          { additionalTo, ccAddresses, latestIsOurs },
+          'sendOutboundReply: reply-all including further To and CC recipients',
         );
-        return;
-      }
-
-      // Reply-all: include To and CC recipients from the thread message, excluding self and the primary recipient.
-      // Both to[] and cc[] are candidates — mirrors the email-reply skill's reply-all logic.
-      const ccAddresses = [...(threadMessage.to ?? []), ...(threadMessage.cc ?? [])]
-        .map((r) => r.email)
-        .filter(
-          (email) =>
-            normalizeForComparison(email) !== normalizeForComparison(this.config.selfEmail) &&
-            normalizeForComparison(email) !== normalizeForComparison(recipientEmail),
-        );
-
-      if (ccAddresses.length > 0) {
-        logger.debug({ ccAddresses, count: ccAddresses.length }, 'sendOutboundReply: reply-all including CC recipients');
       }
 
       // Strip any existing "Re:" prefix before prepending our own to avoid
@@ -779,6 +762,9 @@ export class EmailAdapter implements Channel {
         channel: 'email' as const,
         accountId: this.config.accountId,
         to: recipientEmail,
+        ...(additionalTo.length > 0 ? { additionalTo } : {}),
+        // These people never wrote to us: no known-tier contact for them (#2273, ADR-047).
+        ...(latestIsOurs ? { toFromOwnMessage: true } : {}),
         subject: `Re: ${baseSubject}`,
         body,
         replyToMessageId: threadMessage.id,
@@ -801,7 +787,7 @@ export class EmailAdapter implements Channel {
       const provenance = replyRecipientSource({
         addressFromHeader: !latestIsOurs,
         recipient: recipientEmail,
-        selfEmails: [this.config.selfEmail],
+        selfEmails: ownedMailboxes,
         headers: threadMessage.headers,
       });
       const fromName = provenance
@@ -848,7 +834,7 @@ export class EmailAdapter implements Channel {
     //   partialPayload: { account } — the draft's account; draft_id is filled in by
     //                                 linkGatedAction() after the draft is created below
     //   description: human-readable label for the pending_approval row + notification
-    const recipientLabel = sendRequest.to;
+    const recipientLabel = [sendRequest.to, ...(sendRequest.additionalTo ?? [])].join(', ');
     const subjectLabel = sendRequest.subject;
     const result = await outboundGateway.send(sendRequest, {
       taskEventId: context.taskEventId,
