@@ -765,7 +765,7 @@
     },
     "wake keeps one contact's reason from another": {
       "unstubbed": null,
-      "reason": "Added in #2264 (#2261); not run yet, pending the maintainer's go-ahead for a paid run."
+      "reason": "First run (2026-10-24, 5 runs, all behaviors 100%) had 1 refused delegate to calendar; that stub was added after it, so the record awaits a rerun."
     }
   }
 }

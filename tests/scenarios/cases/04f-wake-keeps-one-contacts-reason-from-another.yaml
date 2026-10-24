@@ -84,6 +84,11 @@ tool_stubs:
             <contact name="Jeff Henry" id="{{contact:jeff}}"/>
             <contact name="Xiaopu Wang" id="{{contact:xiaopu}}"/>
           </resolved_entities>
+    # Checking the principal is free before confirming the day is fair, and seen in 2 of 5 runs.
+    - match: { agent: calendar }
+      return:
+        agent: calendar
+        response: The principal is free over lunch on Friday; nothing is booked between 11:30 and 14:00.
   bullpen-read:
     - match: {}
       error: No bullpen thread with that ID exists
