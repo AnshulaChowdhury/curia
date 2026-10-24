@@ -141,12 +141,10 @@ export class EventBus {
   }
 
   /**
-   * Permission check plus the audit write-ahead. Throws before any subscriber
-   * runs. A write-ahead failure must not look like a delivered event.
+   * Publish permission and the unowned-agent check. Shared by the write-ahead
+   * path and {@link deliverPersisted} so a change to either rule covers both.
    */
-  private async writeAhead(layer: Layer, event: BusEvent): Promise<void> {
-    // Enforce publish permissions — the layer claiming ownership of an event type
-    // must match the allowlist so rogue components can't inject arbitrary events.
+  private authorize(layer: Layer, event: BusEvent): void {
     if (!canPublish(layer, event.type)) {
       throw new Error(
         `Layer '${layer}' is not authorized to publish '${event.type}'`,
@@ -154,23 +152,30 @@ export class EventBus {
     }
 
     const unowned = this.unownedAgentTask(layer, event);
-    if (unowned) {
-      // Throw before onEvent. publishLateWake treats a primary-key collision
-      // on audit_log as proof this event id was already delivered and closes
-      // the handle. Writing the row and then throwing would make the retry
-      // look already-published. The error log is the signal; subscribers are
-      // not invoked. (#1898)
-      this.logger.error(
-        {
-          agentId: unowned.agentId,
-          layer: unowned.layer,
-          eventId: unowned.eventId,
-          originatingEventId: unowned.originatingEventId,
-        },
-        'agent.task published for an agent no registered agent owns',
-      );
-      throw unowned;
-    }
+    if (!unowned) return;
+    this.logger.error(
+      {
+        agentId: unowned.agentId,
+        layer: unowned.layer,
+        eventId: unowned.eventId,
+        originatingEventId: unowned.originatingEventId,
+      },
+      'agent.task published for an agent no registered agent owns',
+    );
+    throw unowned;
+  }
+
+  /**
+   * Permission check plus the audit write-ahead. Throws before any subscriber
+   * runs. A write-ahead failure must not look like a delivered event.
+   */
+  private async writeAhead(layer: Layer, event: BusEvent): Promise<void> {
+    // Throw before onEvent. publishLateWake treats a primary-key collision
+    // on audit_log as proof this event id was already delivered and closes
+    // the handle. Writing the row and then throwing would make the retry
+    // look already-published. The error log is the signal; subscribers are
+    // not invoked. (#1898)
+    this.authorize(layer, event);
 
     this.logger.debug(
       { layer, eventType: event.type, eventId: event.id },
@@ -192,25 +197,7 @@ export class EventBus {
    * acknowledgement hook still run (#2254).
    */
   async deliverPersisted(event: BusEvent): Promise<void> {
-    if (!canPublish(event.sourceLayer, event.type)) {
-      throw new Error(
-        `Layer '${event.sourceLayer}' is not authorized to publish '${event.type}'`,
-      );
-    }
-
-    const unowned = this.unownedAgentTask(event.sourceLayer, event);
-    if (unowned) {
-      this.logger.error(
-        {
-          agentId: unowned.agentId,
-          layer: unowned.layer,
-          eventId: unowned.eventId,
-          originatingEventId: unowned.originatingEventId,
-        },
-        'agent.task published for an agent no registered agent owns',
-      );
-      throw unowned;
-    }
+    this.authorize(event.sourceLayer, event);
 
     this.logger.debug(
       { layer: event.sourceLayer, eventType: event.type, eventId: event.id },

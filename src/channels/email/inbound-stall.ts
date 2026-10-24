@@ -10,14 +10,16 @@ export const EMAIL_INBOUND_TURN_STALL_MS = 15 * 60 * 1000;
 /**
  * Consecutive write-ahead failures for one Nylas message before the poll
  * skips it. A deterministic audit failure (for example a lone surrogate in
- * the subject) must not wedge every newer message behind it.
+ * the subject) must not wedge every newer message behind it. A database
+ * outage does not count: that mail is retried until the database answers.
  */
 export const WRITE_AHEAD_RETRY_LIMIT = 3;
 
 /**
  * Consecutive polls that stop on a retryable write-ahead failure before
  * email health fails. One poison message is skipped on its last attempt, so
- * that poll completes and the counter resets. An audit-database outage keeps
- * ending polls on the next message and stays visible.
+ * that poll completes and the counter resets. A database outage retries the
+ * same message and still increments this counter, so health stays failed
+ * for the length of the outage.
  */
 export const WRITE_AHEAD_POLL_FAIL_LIMIT = 3;

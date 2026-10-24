@@ -28,6 +28,13 @@ import {
   type OutboundMessageEvent,
   type OutboundNotificationEvent,
 } from '../../bus/events.js';
+import { isDbUnavailableError } from '../../db/resilience.js';
+import {
+  EMAIL_POLL_PAGE_SIZE,
+  INBOUND_REPLAY_LIMIT,
+  INBOUND_REPLAY_MAX_AGE_HOURS,
+  MAX_STAGED_INBOUND_IDS,
+} from '../../audit/inbound-replay.js';
 import { sanitizeOutput } from '../../skills/sanitize.js';
 import { buildReplyQuote } from '../../skills/_shared/reply-quote.js';
 import {
@@ -63,6 +70,8 @@ interface QueuedInboundEmail {
   senderVerified: boolean;
   /** Epoch ms when the poll queued this message. */
   queuedAt: number;
+  /** True when this item was loaded from an unacknowledged audit row. */
+  replayed?: boolean;
 }
 
 function nylasMessageIdOf(event: InboundMessageEvent): string {
@@ -94,6 +103,7 @@ function queuedFromReplay(
     subject,
     senderVerified: metadata?.senderVerified === true,
     queuedAt: Date.now(),
+    replayed: true,
   };
 }
 
@@ -248,7 +258,6 @@ export class EmailAdapter implements Channel {
    * they must not be written ahead again. Bounded like {@link recentlySentIds}.
    */
   private readonly stagedInboundIds = new Set<string>();
-  private static readonly MAX_STAGED_IDS = 200;
   /** Consecutive write-ahead failures per Nylas message id. */
   private readonly writeAheadFailures = new Map<string, number>();
   /** Polls in a row that stopped on a retryable write-ahead failure. */
@@ -265,7 +274,7 @@ export class EmailAdapter implements Channel {
 
   private rememberStagedId(id: string): void {
     this.stagedInboundIds.add(id);
-    if (this.stagedInboundIds.size > EmailAdapter.MAX_STAGED_IDS) {
+    if (this.stagedInboundIds.size > MAX_STAGED_INBOUND_IDS) {
       const oldest = this.stagedInboundIds.values().next().value;
       if (oldest !== undefined) this.stagedInboundIds.delete(oldest);
     }
@@ -556,11 +565,14 @@ export class EmailAdapter implements Channel {
   }
 
   /**
-   * Deliver this account's unacknowledged inbound rows before the first poll.
-   * Queued items were never delivered, so this is once. In-flight items may
-   * have partly run, so this is at-least-once, matching a restart that
-   * re-fetched the same mail. A load failure is logged and startup continues;
-   * the rows stay unacknowledged for the next start.
+   * Deliver this account's recent unacknowledged inbound rows before the first poll.
+   *
+   * Only the last {@link INBOUND_REPLAY_MAX_AGE_HOURS} hours are loaded, and a
+   * row is omitted when a later `inbound.message` in that window has the same
+   * Nylas message id. A turn that was mid-flight when the process died may
+   * already have sent its reply. Replay is at-least-once for that case, the
+   * same as the re-fetch it replaces. A load failure is logged and startup
+   * continues; the rows stay unacknowledged for the next start.
    */
   private async replayUnacknowledgedInbound(): Promise<void> {
     const source = this.config.unacknowledgedInbound;
@@ -577,9 +589,19 @@ export class EmailAdapter implements Channel {
     }
     if (events.length === 0) return;
     this.config.logger.info(
-      { accountId: this.config.accountId, count: events.length },
+      {
+        accountId: this.config.accountId,
+        count: events.length,
+        maxAgeHours: INBOUND_REPLAY_MAX_AGE_HOURS,
+      },
       'Email adapter: replaying unacknowledged inbound mail',
     );
+    if (events.length === INBOUND_REPLAY_LIMIT) {
+      this.config.logger.warn(
+        { accountId: this.config.accountId, count: events.length, limit: INBOUND_REPLAY_LIMIT },
+        'Email adapter: inbound replay hit its limit — further rows in the window wait for the next start',
+      );
+    }
     for (const event of events) {
       if (!this.running) break;
       const messageId = nylasMessageIdOf(event);
@@ -624,7 +646,7 @@ export class EmailAdapter implements Channel {
       messages = await this.config.outboundGateway.listEmailMessages({
         receivedAfter: this.lastSeenTimestamp,
         unread: true,
-        limit: 25,
+        limit: EMAIL_POLL_PAGE_SIZE,
         // Request raw headers so the converter can extract Authentication-Results
         // and compute senderVerified (SPF/DKIM/DMARC). Without this flag, Nylas
         // omits headers from the response entirely and senderVerified will be false.
@@ -824,9 +846,16 @@ export class EmailAdapter implements Channel {
           const staged = await this.config.bus.stagePublish('channel', event);
           deliver = staged.deliver;
         } catch (err) {
-          const attempts = (this.writeAheadFailures.get(msg.id) ?? 0) + 1;
-          this.writeAheadFailures.set(msg.id, attempts);
-          if (attempts >= WRITE_AHEAD_RETRY_LIMIT) {
+          // A database outage fails every write-ahead. Counting it toward the
+          // per-message budget would skip real mail after about 90s, and
+          // replay cannot recover a row that was never written. Outages still
+          // end the poll on a write-ahead failure, so health goes red.
+          const outage = isDbUnavailableError(err);
+          const attempts = outage
+            ? (this.writeAheadFailures.get(msg.id) ?? 0)
+            : (this.writeAheadFailures.get(msg.id) ?? 0) + 1;
+          if (!outage) this.writeAheadFailures.set(msg.id, attempts);
+          if (!outage && attempts >= WRITE_AHEAD_RETRY_LIMIT) {
             this.writeAheadFailures.delete(msg.id);
             this.config.logger.error(
               {
@@ -849,6 +878,7 @@ export class EmailAdapter implements Channel {
               threadId: msg.threadId,
               senderEmail: fromEmail,
               attempts,
+              outage,
               remainingInBatch: ordered.length - index - 1,
             },
             'Inbound email write-ahead failed — will retry next poll',
@@ -1133,6 +1163,22 @@ export class EmailAdapter implements Channel {
 
   /** Receipt signal. Fires at handoff, including when delivery later rejects. */
   private logInboundQueued(item: QueuedInboundEmail): void {
+    if (item.replayed) {
+      this.config.logger.info(
+        {
+          senderEmail: item.senderId,
+          subject: item.subject,
+          threadId: item.threadId,
+          messageId: item.messageId,
+          senderVerified: item.senderVerified,
+          replayed: true,
+          inFlight: this.inFlightTurns,
+          pending: this.inboundPending,
+        },
+        'Unacknowledged inbound mail queued for replay',
+      );
+      return;
+    }
     if (!item.senderVerified) {
       this.config.logger.warn(
         { senderEmail: item.senderId, messageId: item.messageId },

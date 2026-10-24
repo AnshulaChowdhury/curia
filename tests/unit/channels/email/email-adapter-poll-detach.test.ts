@@ -19,8 +19,14 @@ import {
 import { checkEmail } from '../../../../src/health/health-checks.js';
 import {
   EMAIL_INBOUND_TURN_STALL_MS,
+  WRITE_AHEAD_POLL_FAIL_LIMIT,
   WRITE_AHEAD_RETRY_LIMIT,
 } from '../../../../src/channels/email/inbound-stall.js';
+import {
+  EMAIL_POLL_PAGE_SIZE,
+  INBOUND_REPLAY_LIMIT,
+  MAX_STAGED_INBOUND_IDS,
+} from '../../../../src/audit/inbound-replay.js';
 import type { ConfigStore } from '../../../../src/memory/config-store.js';
 
 const SELF_EMAIL = 'curia@example.com';
@@ -1005,6 +1011,7 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
 
   it('replays unacknowledged inbound mail before the first poll and does not stage it again', async () => {
     const mocks = createMocks();
+    const { logger, entries } = collectLogs();
     const replayed = {
       id: 'event-replayed',
       timestamp: new Date(),
@@ -1020,11 +1027,12 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
           nylasMessageId: 'replayed',
           nylasThreadId: 'thread-replay',
           subject: 'Waiting',
-          senderVerified: true,
+          senderVerified: false,
         },
       },
     };
     const adapter = makeAdapter(mocks, {
+      logger,
       unacknowledgedInbound: {
         listUnacknowledgedInbound: vi.fn().mockResolvedValue([replayed]),
       },
@@ -1049,7 +1057,108 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
     expect(audit[0]!.payload.fetched).toBe(1);
     expect(audit[0]!.payload.processed).toBe(0);
     expect(audit[0]!.payload.skipped.already_staged).toBe(1);
+    expect(entries).toContainEqual(expect.objectContaining({
+      msg: 'Unacknowledged inbound mail queued for replay',
+      messageId: 'replayed',
+      replayed: true,
+    }));
+    expect(entries.some((entry) => entry.msg === 'Email received and queued')).toBe(false);
+    expect(entries.some((entry) => (
+      entry.msg === 'Email received with senderVerified: false — SPF/DKIM/DMARC did not all pass or headers were absent'
+    ))).toBe(false);
 
+    await adapter.stop();
+  });
+
+  it('warns when inbound replay fills its limit', async () => {
+    const mocks = createMocks();
+    const { logger, entries } = collectLogs();
+    const events = Array.from({ length: INBOUND_REPLAY_LIMIT }, (_, index) => ({
+      id: `event-replay-${index}`,
+      timestamp: new Date(),
+      type: 'inbound.message' as const,
+      sourceLayer: 'channel' as const,
+      payload: {
+        conversationId: `email:thread-${index}`,
+        channelId: 'email',
+        accountId: 'curia',
+        senderId: 'ada@example.com',
+        content: 'queued',
+        metadata: { nylasMessageId: `nylas-${index}`, nylasThreadId: `thread-${index}` },
+      },
+    }));
+    const adapter = makeAdapter(mocks, {
+      logger,
+      unacknowledgedInbound: {
+        listUnacknowledgedInbound: vi.fn().mockResolvedValue(events),
+      },
+    });
+
+    await adapter.start();
+    expect(entries).toContainEqual(expect.objectContaining({
+      msg: 'Email adapter: inbound replay hit its limit — further rows in the window wait for the next start',
+      count: INBOUND_REPLAY_LIMIT,
+      limit: INBOUND_REPLAY_LIMIT,
+    }));
+    expect(MAX_STAGED_INBOUND_IDS).toBe(INBOUND_REPLAY_LIMIT + EMAIL_POLL_PAGE_SIZE);
+
+    await adapter.drainInFlight();
+    await adapter.stop();
+  });
+
+  it('retries a database outage without skipping the message', async () => {
+    const mocks = createMocks();
+    const { logger, entries } = collectLogs();
+    const adapter = makeAdapter(mocks, { logger, pollingIntervalMs: 60_000 });
+    const nowSec = Math.floor(Date.now() / 1000);
+    const publish = mocks.bus.publish as unknown as (layer: string, event: BusEvent) => Promise<void>;
+    const outagePolls = WRITE_AHEAD_POLL_FAIL_LIMIT + 2;
+    let attempts = 0;
+    (mocks.bus.stagePublish as ReturnType<typeof vi.fn>).mockImplementation(
+      async (layer: string, event: BusEvent) => {
+        if (attempts++ < outagePolls) {
+          throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+        }
+        return { deliver: () => publish(layer, event) };
+      },
+    );
+    const messages = [
+      makeMockMessage({
+        id: 'during-outage',
+        threadId: 'thread-outage',
+        date: nowSec + 15,
+        from: [{ email: 'ada@example.com' }],
+      }),
+    ];
+    const list = mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>;
+    list.mockImplementation(async (opts: { receivedAfter: number }) => (
+      messages.filter((message) => message.date >= opts.receivedAfter)
+    ));
+
+    await adapter.start();
+    for (let poll = 1; poll < outagePolls; poll++) await pollNow(adapter);
+    const duringOutage = pollEvents(mocks.bus);
+    expect(duringOutage).toHaveLength(outagePolls);
+    for (const poll of duringOutage) {
+      expect(poll.payload.skipped.failed).toBe(0);
+      expect(poll.payload.processed).toBe(0);
+    }
+    expect(adapter.inboundWriteAheadDegraded).toBe(true);
+    expect(checkEmail(adapter, 3, new Date())).toBe('fail');
+    expect(entries.some((entry) => (
+      entry.msg === 'Inbound email write-ahead failed — skipping message after repeated failures'
+    ))).toBe(false);
+
+    await pollNow(adapter);
+    const recovered = pollEvents(mocks.bus).at(-1)!;
+    expect(recovered.payload.processed).toBe(1);
+    expect(recovered.payload.skipped.failed).toBe(0);
+    const delivered = (mocks.bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .map((args) => args[1] as BusEvent)
+      .filter((event) => inboundId(event) === 'during-outage');
+    expect(delivered).toHaveLength(1);
+
+    await adapter.drainInFlight();
     await adapter.stop();
   });
 });

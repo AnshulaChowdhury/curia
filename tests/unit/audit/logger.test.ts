@@ -3,6 +3,7 @@ import { AuditLogger } from '../../../src/audit/logger.js';
 import { createSilentLogger } from '../../../src/logger.js';
 import { createInboundMessage, createLlmCall } from '../../../src/bus/events.js';
 import { GENESIS_HASH, computeEntryHash, toHashTimestamp } from '../../../src/audit/hash-chain.js';
+import { INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS } from '../../../src/audit/inbound-replay.js';
 import type { Pool } from 'pg';
 
 // Minimal mock pool that captures what gets written to the DB.
@@ -324,48 +325,89 @@ describe('AuditLogger.log — structured columns + hash chain', () => {
 });
 
 describe('AuditLogger.listUnacknowledgedInbound', () => {
-  it('returns readable inbound rows for the account and skips a bad payload', async () => {
-    const rows = [
-      {
-        id: '11111111-1111-1111-1111-111111111111',
-        timestamp: new Date('2026-10-24T12:00:00Z'),
-        payload: {
-          conversationId: 'email:thread-1',
-          channelId: 'email',
-          accountId: 'curia',
-          senderId: 'ada@example.com',
-          content: 'hello',
-          metadata: { nylasMessageId: 'nylas-1' },
-        },
-        parent_event_id: null,
-      },
-      {
-        id: '22222222-2222-2222-2222-222222222222',
-        timestamp: new Date('2026-10-24T12:01:00Z'),
-        payload: { conversationId: 'email:thread-2' },
-        parent_event_id: 'parent-1',
-      },
-    ];
+  const readable = {
+    id: '11111111-1111-1111-1111-111111111111',
+    timestamp: new Date('2026-10-24T12:00:00Z'),
+    payload: {
+      conversationId: 'email:thread-1',
+      channelId: 'email',
+      accountId: 'curia',
+      senderId: 'ada@example.com',
+      content: 'hello',
+      metadata: { nylasMessageId: 'nylas-1' },
+    },
+    parent_event_id: null,
+  };
+  const unreadable = {
+    id: '22222222-2222-2222-2222-222222222222',
+    timestamp: new Date('2026-10-24T12:01:00Z'),
+    payload: { conversationId: 'email:thread-2' },
+    parent_event_id: 'parent-1',
+  };
+
+  function poolFor(rows: unknown[], excluded: { count: string; oldest: Date | null } = { count: '0', oldest: null }) {
     const queries: Array<{ sql: string; params?: unknown[] }> = [];
     const pool = {
       query: vi.fn(async (sql: string, params?: unknown[]) => {
         queries.push({ sql, params });
+        if (sql.includes('MIN(timestamp)')) {
+          return { rows: [excluded], rowCount: 1 };
+        }
         return { rows, rowCount: rows.length };
       }),
+      queries,
     };
+    return pool;
+  }
+
+  it('returns readable inbound rows for the account and skips a bad payload', async () => {
+    const pool = poolFor([readable, unreadable]);
     const logger = new AuditLogger(pool as unknown as Pool, createSilentLogger());
 
     const events = await logger.listUnacknowledgedInbound('curia');
 
-    expect(queries[0]?.sql).toContain("event_type = 'inbound.message'");
-    expect(queries[0]?.sql).toContain("payload->>'accountId' = $1");
-    expect(queries[0]?.params).toEqual(['curia', 500]);
+    const list = pool.queries.find((query) => query.sql.includes('NOT EXISTS'));
+    expect(list?.sql).toContain("a.payload->>'accountId' = $1");
+    expect(list?.sql).toContain("later.payload->'metadata'->>'nylasMessageId'");
+    expect(list?.sql).toContain("now() - ($3::int * interval '1 hour')");
+    expect(list?.params).toEqual(['curia', INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS]);
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
-      id: rows[0]!.id,
+      id: readable.id,
       type: 'inbound.message',
       sourceLayer: 'channel',
-      payload: rows[0]!.payload,
+      payload: readable.payload,
     });
+  });
+
+  it('warns with the count and oldest timestamp when rows fall outside the window', async () => {
+    const oldest = new Date('2026-01-01T00:00:00Z');
+    const pool = poolFor([readable], { count: '2', oldest });
+    const warns: Array<{ fields: Record<string, unknown>; msg: string }> = [];
+    const logger = new AuditLogger(pool as unknown as Pool, {
+      error: () => {},
+      warn: (fields: Record<string, unknown>, msg: string) => {
+        warns.push({ fields, msg });
+      },
+      info: () => {},
+      debug: () => {},
+    } as unknown as ReturnType<typeof createSilentLogger>);
+
+    const events = await logger.listUnacknowledgedInbound('curia');
+
+    expect(events).toHaveLength(1);
+    expect(warns).toEqual([
+      {
+        fields: {
+          accountId: 'curia',
+          count: 2,
+          oldestTimestamp: oldest,
+          maxAgeHours: INBOUND_REPLAY_MAX_AGE_HOURS,
+        },
+        msg: 'Unacknowledged inbound mail older than the replay window was left out',
+      },
+    ]);
+    const countQuery = pool.queries.find((query) => query.sql.includes('MIN(timestamp)'));
+    expect(countQuery?.params).toEqual(['curia', INBOUND_REPLAY_MAX_AGE_HOURS]);
   });
 });

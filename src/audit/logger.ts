@@ -16,6 +16,7 @@ import {
 } from './hash-chain.js';
 import { writeLlmCallArchive } from './llm-call-archive.js';
 import { stripNullBytes } from './strip-null-bytes.js';
+import { INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS } from './inbound-replay.js';
 
 /**
  * True while {@link AuditLogger} holds the hash-chain write transaction.
@@ -346,31 +347,49 @@ export class AuditLogger {
   }
 
   /**
-   * Unacknowledged `inbound.message` rows for one email account, oldest first.
-   * The email adapter replays these on start through `deliverPersisted`, which
-   * acknowledges the existing row instead of inserting another. Capped so a
-   * large backlog cannot be loaded in one pass. Other event types stay
-   * diagnostic-only via {@link scanForUnacknowledged}.
+   * Unacknowledged `inbound.message` rows for one email account from the last
+   * {@link INBOUND_REPLAY_MAX_AGE_HOURS} hours, oldest first.
+   *
+   * A row is omitted when a later `inbound.message` in that window shares its
+   * account and `metadata.nylasMessageId`. That later row is the one a
+   * re-fetch handled, so replaying the earlier one would answer the mail
+   * again. Rows with no Nylas id cannot be matched and are replayed. Rows
+   * older than the window are counted and logged, not returned.
+   *
+   * The email adapter delivers the result through `deliverPersisted`, which
+   * acknowledges the existing row instead of inserting another. Capped at
+   * {@link INBOUND_REPLAY_LIMIT}. Other event types stay diagnostic-only via
+   * {@link scanForUnacknowledged}.
    */
   async listUnacknowledgedInbound(accountId: string): Promise<InboundMessageEvent[]> {
-    const REPLAY_LIMIT = 500;
     type Row = {
       id: string;
       timestamp: Date | string;
       payload: unknown;
       parent_event_id: string | null;
     };
+    await this.warnWhenInboundReplayTruncatedByAge(accountId);
+
     let rows: Row[];
     try {
       const result = await this.pool.query<Row>(
-        `SELECT id, timestamp, payload, parent_event_id
-         FROM audit_log
-         WHERE acknowledged = false
-           AND event_type = 'inbound.message'
-           AND payload->>'accountId' = $1
-         ORDER BY timestamp ASC
+        `SELECT a.id, a.timestamp, a.payload, a.parent_event_id
+         FROM audit_log a
+         WHERE a.acknowledged = false
+           AND a.event_type = 'inbound.message'
+           AND a.payload->>'accountId' = $1
+           AND a.timestamp > now() - ($3::int * interval '1 hour')
+           AND NOT EXISTS (
+             SELECT 1 FROM audit_log later
+             WHERE later.event_type = 'inbound.message'
+               AND later.timestamp > a.timestamp
+               AND later.timestamp > now() - ($3::int * interval '1 hour')
+               AND later.payload->>'accountId' = a.payload->>'accountId'
+               AND later.payload->'metadata'->>'nylasMessageId' = a.payload->'metadata'->>'nylasMessageId'
+           )
+         ORDER BY a.timestamp ASC
          LIMIT $2`,
-        [accountId, REPLAY_LIMIT],
+        [accountId, INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS],
       );
       rows = result.rows;
     } catch (err) {
@@ -391,6 +410,44 @@ export class AuditLogger {
   }
 
   /**
+   * Rows outside the replay window stay unacknowledged. Log the count and the
+   * oldest timestamp so they are visible instead of disappearing.
+   */
+  private async warnWhenInboundReplayTruncatedByAge(accountId: string): Promise<void> {
+    type Excluded = { count: string; oldest: Date | string | null };
+    let excluded: Excluded | undefined;
+    try {
+      const result = await this.pool.query<Excluded>(
+        `SELECT COUNT(*)::text AS count, MIN(timestamp) AS oldest
+         FROM audit_log
+         WHERE acknowledged = false
+           AND event_type = 'inbound.message'
+           AND payload->>'accountId' = $1
+           AND timestamp <= now() - ($2::int * interval '1 hour')`,
+        [accountId, INBOUND_REPLAY_MAX_AGE_HOURS],
+      );
+      excluded = result.rows[0];
+    } catch (err) {
+      this.logger.error(
+        { err, accountId },
+        'Failed to count inbound mail outside the replay window',
+      );
+      return;
+    }
+    const count = parseInt(excluded?.count ?? '0', 10);
+    if (!Number.isFinite(count) || count <= 0) return;
+    this.logger.warn(
+      {
+        accountId,
+        count,
+        oldestTimestamp: excluded?.oldest ?? null,
+        maxAgeHours: INBOUND_REPLAY_MAX_AGE_HOURS,
+      },
+      'Unacknowledged inbound mail older than the replay window was left out',
+    );
+  }
+
+  /**
    * Scan for audit_log rows that were written but never acknowledged.
    * Called once at startup, after migrations run and before serving requests.
    *
@@ -398,8 +455,9 @@ export class AuditLogger {
    * write-ahead record and completing subscriber delivery. They are flagged
    * here so operators can identify which events may not have been delivered.
    *
-   * Email accounts replay their own unacknowledged `inbound.message` rows on
-   * adapter start. This scan stays diagnostic for every other event type.
+   * Email accounts replay their own recent unacknowledged `inbound.message`
+   * rows on adapter start. This scan stays diagnostic for every other event
+   * type, and for inbound mail outside that replay window.
    */
   async scanForUnacknowledged(): Promise<void> {
     // Cap the number of events included in the log entry to avoid overflowing
