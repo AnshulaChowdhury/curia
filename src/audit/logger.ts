@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Pool, PoolClient } from 'pg';
-import type { BusEvent, LlmCallArchiveContent } from '../bus/events.js';
+import type { BusEvent, InboundMessageEvent, LlmCallArchiveContent } from '../bus/events.js';
 import type { Logger } from '../logger.js';
 import {
   createDbUnavailableAgentError,
@@ -16,6 +16,11 @@ import {
 } from './hash-chain.js';
 import { writeLlmCallArchive } from './llm-call-archive.js';
 import { stripNullBytes } from './strip-null-bytes.js';
+import {
+  INBOUND_REPLAY_AGED_OUT_WARN_HOURS,
+  INBOUND_REPLAY_LIMIT,
+  INBOUND_REPLAY_MAX_AGE_HOURS,
+} from './inbound-replay.js';
 
 /**
  * True while {@link AuditLogger} holds the hash-chain write transaction.
@@ -346,6 +351,112 @@ export class AuditLogger {
   }
 
   /**
+   * Unacknowledged `inbound.message` rows for one email account from the last
+   * {@link INBOUND_REPLAY_MAX_AGE_HOURS} hours, oldest first.
+   *
+   * A row is omitted when a later `inbound.message` in that window shares its
+   * account and `metadata.nylasMessageId`. That later row is the one a
+   * re-fetch handled, so replaying the earlier one would answer the mail
+   * again. Rows with no Nylas id cannot be matched and are replayed. Rows
+   * older than the window are not returned; recently aged-out ones are
+   * counted and logged. `metadata.receivedAt` comes back as a `Date`.
+   *
+   * The email adapter delivers the result through `deliverPersisted`, which
+   * acknowledges the existing row instead of inserting another. Capped at
+   * {@link INBOUND_REPLAY_LIMIT}. Other event types stay diagnostic-only via
+   * {@link scanForUnacknowledged}.
+   */
+  async listUnacknowledgedInbound(accountId: string): Promise<InboundMessageEvent[]> {
+    type Row = {
+      id: string;
+      timestamp: Date | string;
+      payload: unknown;
+      parent_event_id: string | null;
+    };
+    await this.warnWhenInboundReplayTruncatedByAge(accountId);
+
+    let rows: Row[];
+    try {
+      const result = await this.pool.query<Row>(
+        `SELECT a.id, a.timestamp, a.payload, a.parent_event_id
+         FROM audit_log a
+         WHERE a.acknowledged = false
+           AND a.event_type = 'inbound.message'
+           AND a.payload->>'accountId' = $1
+           AND a.timestamp > now() - ($3::int * interval '1 hour')
+           AND NOT EXISTS (
+             SELECT 1 FROM audit_log later
+             WHERE later.event_type = 'inbound.message'
+               AND later.timestamp > a.timestamp
+               AND later.timestamp > now() - ($3::int * interval '1 hour')
+               AND later.payload->>'accountId' = a.payload->>'accountId'
+               AND later.payload->'metadata'->>'nylasMessageId' = a.payload->'metadata'->>'nylasMessageId'
+           )
+         ORDER BY a.timestamp ASC
+         LIMIT $2`,
+        [accountId, INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS],
+      );
+      rows = result.rows;
+    } catch (err) {
+      this.logger.error(
+        { err, accountId },
+        'Failed to list unacknowledged inbound mail for replay',
+      );
+      throw err;
+    }
+
+    const events: InboundMessageEvent[] = [];
+    for (const row of rows) {
+      const event = inboundEventFromReplayRow(row, this.logger, accountId);
+      if (!event) continue;
+      events.push(event);
+    }
+    return events;
+  }
+
+  /**
+   * Rows outside the replay window stay unacknowledged forever (the table is
+   * append-only), so counting all of them would warn on every boot. Count
+   * only rows that aged out within {@link INBOUND_REPLAY_AGED_OUT_WARN_HOURS};
+   * older ones are already reported by {@link scanForUnacknowledged}.
+   */
+  private async warnWhenInboundReplayTruncatedByAge(accountId: string): Promise<void> {
+    type Excluded = { count: string; oldest: Date | string | null };
+    let excluded: Excluded | undefined;
+    try {
+      const result = await this.pool.query<Excluded>(
+        `SELECT COUNT(*)::text AS count, MIN(timestamp) AS oldest
+         FROM audit_log
+         WHERE acknowledged = false
+           AND event_type = 'inbound.message'
+           AND payload->>'accountId' = $1
+           AND timestamp <= now() - ($2::int * interval '1 hour')
+           AND timestamp > now() - ($3::int * interval '1 hour')`,
+        [accountId, INBOUND_REPLAY_MAX_AGE_HOURS, INBOUND_REPLAY_AGED_OUT_WARN_HOURS],
+      );
+      excluded = result.rows[0];
+    } catch (err) {
+      this.logger.error(
+        { err, accountId },
+        'Failed to count inbound mail outside the replay window',
+      );
+      return;
+    }
+    const count = parseInt(excluded?.count ?? '0', 10);
+    if (!Number.isFinite(count) || count <= 0) return;
+    this.logger.warn(
+      {
+        accountId,
+        count,
+        oldestTimestamp: excluded?.oldest ?? null,
+        maxAgeHours: INBOUND_REPLAY_MAX_AGE_HOURS,
+        warnWindowHours: INBOUND_REPLAY_AGED_OUT_WARN_HOURS,
+      },
+      'Unacknowledged inbound mail older than the replay window was left out',
+    );
+  }
+
+  /**
    * Scan for audit_log rows that were written but never acknowledged.
    * Called once at startup, after migrations run and before serving requests.
    *
@@ -353,8 +464,9 @@ export class AuditLogger {
    * write-ahead record and completing subscriber delivery. They are flagged
    * here so operators can identify which events may not have been delivered.
    *
-   * Replay of unacknowledged events is a separate feature (not yet implemented).
-   * This scan is diagnostic only.
+   * Email accounts replay their own recent unacknowledged `inbound.message`
+   * rows on adapter start. This scan stays diagnostic for every other event
+   * type, and for inbound mail outside that replay window.
    */
   async scanForUnacknowledged(): Promise<void> {
     // Cap the number of events included in the log entry to avoid overflowing
@@ -419,4 +531,95 @@ export class AuditLogger {
       'Audit log startup scan: unacknowledged events detected — delivery may have been incomplete on previous run',
     );
   }
+}
+
+interface ReplayInboundPayload {
+  conversationId: string;
+  channelId: string;
+  accountId?: string;
+  senderId: string;
+  content: string;
+  metadata?: Record<string, unknown>;
+}
+
+function isReplayableInboundPayload(value: unknown): value is ReplayInboundPayload {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const payload = value as Record<string, unknown>;
+  if (!nonEmptyString(payload.conversationId)) return false;
+  if (!nonEmptyString(payload.channelId)) return false;
+  if (!nonEmptyString(payload.senderId)) return false;
+  if (typeof payload.content !== 'string') return false;
+  if (payload.accountId !== undefined && typeof payload.accountId !== 'string') return false;
+  if (payload.metadata === undefined) return true;
+  return typeof payload.metadata === 'object'
+    && payload.metadata !== null
+    && !Array.isArray(payload.metadata);
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function inboundEventFromReplayRow(
+  row: {
+    id: string;
+    timestamp: Date | string;
+    payload: unknown;
+    parent_event_id: string | null;
+  },
+  logger: Logger,
+  accountId: string,
+): InboundMessageEvent | undefined {
+  const skip = (err?: unknown) => {
+    logger.error(
+      { err, accountId, eventId: row.id },
+      'Unacknowledged inbound mail has an unreadable payload — replay skipped this row',
+    );
+  };
+  if (!nonEmptyString(row.id)) {
+    skip();
+    return undefined;
+  }
+  let payload: unknown = row.payload;
+  if (typeof payload === 'string') {
+    try {
+      payload = JSON.parse(payload) as unknown;
+    } catch (err) {
+      skip(err);
+      return undefined;
+    }
+  }
+  if (!isReplayableInboundPayload(payload)) {
+    skip();
+    return undefined;
+  }
+  const timestamp = row.timestamp instanceof Date ? row.timestamp : new Date(row.timestamp);
+  if (Number.isNaN(timestamp.getTime())) {
+    skip();
+    return undefined;
+  }
+  return {
+    id: row.id,
+    timestamp,
+    type: 'inbound.message',
+    sourceLayer: 'channel',
+    payload: { ...payload, ...rehydrateMetadata(payload.metadata) },
+    ...(typeof row.parent_event_id === 'string' ? { parentEventId: row.parent_event_id } : {}),
+  };
+}
+
+/**
+ * JSONB stores `metadata.receivedAt` as an ISO string. The live event carries
+ * the `Date` the converter built, so a replayed event must too. A missing or
+ * unparseable value is left as it is.
+ */
+function rehydrateMetadata(
+  metadata: Record<string, unknown> | undefined,
+): { metadata?: Record<string, unknown> } {
+  if (metadata === undefined) return {};
+  const raw = metadata.receivedAt;
+  if (typeof raw !== 'string') return { metadata };
+  const receivedAt = new Date(raw);
+  if (Number.isNaN(receivedAt.getTime())) return { metadata };
+  return { metadata: { ...metadata, receivedAt } };
 }

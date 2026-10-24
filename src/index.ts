@@ -440,8 +440,9 @@ async function main(): Promise<void> {
 
   // 3b. Startup scan — flag any events that were written but never acknowledged.
   // These indicate the process crashed between write-ahead and delivery on a
-  // previous run. Logged at warn level for operator visibility; replay is a
-  // separate future feature.
+  // previous run. Logged at warn level for operator visibility. Email adapters
+  // replay their own unacknowledged inbound.message rows on start; every other
+  // event type stays diagnostic here.
   await auditLogger.scanForUnacknowledged();
 
   // 4. Message bus — the write-ahead hook ensures every event is durably
@@ -1946,10 +1947,16 @@ async function main(): Promise<void> {
         ceoEmail: principalEmail,
         contactCreationMaxPerMessage: yamlConfig.contact_creation_limits?.max_per_message ?? 10,
         contactCreationMaxPerHour: yamlConfig.contact_creation_limits?.max_per_hour ?? 100,
+        // default.yaml is 4. Applying it here matches the neighbouring limits,
+        // so a config that omits the key still boots with a cap (#2254).
+        maxConcurrentTurns: yamlConfig.channels?.email?.max_concurrent_turns ?? 4,
         timezone: config.timezone,
         // Persist the poll high-water mark so restarts resume from where we left off
         // rather than silently dropping messages that arrived during downtime (#846).
         configStore: entityMemory ? new ConfigStore(entityMemory, logger) : undefined,
+        // Replay this account's unacknowledged inbound.message rows before the
+        // first poll, so a deploy cannot leave write-ahead mail behind the watermark.
+        unacknowledgedInbound: auditLogger,
       }));
     }
     // Divergence guard (#964): the registry gate marked email enabled + resolvable, yet no
@@ -3298,13 +3305,16 @@ async function main(): Promise<void> {
   // the HTTP server, pool, and other already-started resources are closed cleanly.
   const shutdown = async (exitCode = 0) => {
     logger.info('Shutting down...');
-    for (const adapter of emailAdapters) {
+    // Parallel so several mailboxes share one drain budget. A sequential stop
+    // waits 5s per hung account and can outlast Docker's default 10s grace
+    // before Signal, Slack, and the pool close (#2254).
+    await Promise.allSettled(emailAdapters.map(async (adapter) => {
       try {
         await adapter.stop();
       } catch (err) {
         logger.error({ err }, 'Error stopping email adapter during shutdown');
       }
-    }
+    }));
     if (signalCallBridge) {
       try {
         // Stop before signalAdapter/voiceAdapter: the bridge shares the Signal

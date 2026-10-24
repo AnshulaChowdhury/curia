@@ -149,6 +149,12 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Fixed
 
 - **Attachment download** — recovers from garbled Nylas IDs via filename or sole-attachment fallback. (#2281)
+- **Email poll** — detaches turns, drops the queue on stop, and shuts mailboxes down together. (#2254)
+- **Email durability** — writes mail ahead, replays it for a day, and skips only a poison row. (#2254)
+- **Email health** — fails when queued mail, every in-flight slot, or inbound write-ahead stays stuck. (#2254)
+- **`channel.poll`** — **public API:** `processed` is write-ahead; `fetched` is the Nylas count; `deferred` and `already_staged` added. (#2254)
+- **`EventBus.stagePublish`** — **public API:** persists the event, then returns delivery for the caller to start. (#2254)
+- **`EventBus.deliverPersisted`** — **public API:** delivers an already-persisted event without writing it again. (#2254)
 - **`async-offramp`** — returns after the task is durably queued, without waiting on the coordinator. (#2265)
 - **Voice tool barge-in** — a stalled tool call no longer holds the turn; its late result is discarded. (#2265)
 - **Voice summarization** — runs in the background, so crossing the threshold no longer delays the reply. (#2266)

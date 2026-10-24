@@ -57,6 +57,13 @@
             }
           }
         },
+        "email": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_concurrent_turns": { "type": "integer", "minimum": 1 }
+          }
+        },
         "max_message_bytes": { "type": "integer", "minimum": 1 }
       }
     },

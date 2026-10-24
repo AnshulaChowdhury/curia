@@ -45,6 +45,7 @@ function makeAdapterConfig(
     suppressedSenderEmails: [],
     contactCreationMaxPerMessage: 10,
     contactCreationMaxPerHour: 100,
+    maxConcurrentTurns: 4,
     timezone: 'UTC',
     // no configStore — watermark persistence not under test here
   };

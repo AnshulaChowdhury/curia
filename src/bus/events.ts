@@ -1874,9 +1874,20 @@ interface ChannelPollPayload {
   accountId: string;
   /** Channel identifier — always 'email' for this event. */
   channel: 'email';
-  /** Number of messages returned by Nylas (before any filtering). */
+  /**
+   * Messages returned by Nylas this cycle.
+   * `fetched = processed + sum(skipped)`. Mail left for a later poll is
+   * `skipped.deferred`, so a write-ahead retry or a mid-poll stop still
+   * satisfies the equality.
+   */
   fetched: number;
-  /** Messages that reached bus.publish('channel', inbound.message). */
+  /**
+   * Messages whose `inbound.message` write-ahead succeeded this cycle,
+   * including ones still queued for a free slot. Subscriber delivery is not
+   * awaited. A later delivery failure is logged and stays in this count; it
+   * is not moved into `skipped.failed` (#2254).
+   * `fetched = processed + sum(skipped)`.
+   */
   processed: number;
   /** Per-filter skip breakdown. */
   skipped: {
@@ -1884,12 +1895,26 @@ interface ChannelPollPayload {
     recently_sent: number;
     self: number;
     excluded: number;
-    /** Messages that threw during per-message processing. */
+    /**
+     * Threw before handoff and will not be retried (conversion, contact
+     * extraction, or write-ahead past its retry budget).
+     */
     failed: number;
+    /**
+     * Left for a later poll: the message whose write-ahead will be retried,
+     * the unvisited tail behind it, or mail this poll dropped because the
+     * adapter had stopped.
+     */
+    deferred: number;
+    /**
+     * Already written ahead in this process (replay, or an earlier poll).
+     * Counted so the watermark can move past it without delivering it again.
+     */
+    already_staged: number;
   };
   /** High-water mark value (epoch seconds) after this poll cycle. */
   lastSeenAt: number;
-  /** Wall-clock duration of the poll cycle in milliseconds. */
+  /** Wall-clock time from fetch start through handoff, in milliseconds. Not the agent turn (#2254). */
   durationMs: number;
 }
 

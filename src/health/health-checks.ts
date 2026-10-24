@@ -13,17 +13,28 @@ import type { EventBus } from '../bus/bus.js';
 import type { CheckResult } from './types.js';
 import type { Scheduler } from '../scheduler/scheduler.js';
 import type { Logger } from '../logger.js';
+import { EMAIL_INBOUND_TURN_STALL_MS } from '../channels/email/inbound-stall.js';
 
 // -- Structural health interfaces --
 // Using structural typing avoids hard import dependencies on concrete service
 // classes, which would pull in their full dependency graphs. The health module
 // only needs the specific fields/methods it probes — nothing more.
+// The stall threshold lives in the email channel module; this file imports
+// that constant only, not the adapter class.
 
 export interface EmailAdapterHealth {
   /** Date of the most recent successful poll, or null if none has completed. */
   lastSuccessfulPollAt: Date | null;
   /** Polling interval in ms — used to compute the stall threshold. */
   pollingIntervalMs: number;
+  /** Age of the oldest queued inbound message, or null when nothing is waiting. */
+  oldestInboundPendingAgeMs: number | null;
+  /** In-flight turns older than the email stall bound. */
+  inboundStalledTurns: number;
+  /** Cap those in-flight turns share. */
+  inboundMaxConcurrentTurns: number;
+  /** True when inbound write-ahead has failed for several polls in a row. */
+  inboundWriteAheadDegraded: boolean;
 }
 
 export interface SignalRpcClientHealth {
@@ -187,6 +198,13 @@ export function checkBus(bus: EventBus): CheckResult {
  * startedAt), a null lastSuccessfulPollAt is acceptable — the first poll may not have
  * completed yet. Outside the grace window, a null value is a stall.
  *
+ * The adapter stamps lastSuccessfulPollAt when the Nylas fetch and handoff finish,
+ * not when the agent turn finishes (#2254). A long turn does not fail this check
+ * on its own. The check fails when queued mail has been waiting at least
+ * {@link EMAIL_INBOUND_TURN_STALL_MS}, when the number of in-flight turns past
+ * that bound is at least the cap, or when several polls in a row could not write
+ * inbound mail ahead. A poll that stops succeeding also fails.
+ *
  * @param adapter      The email adapter to probe, or undefined when not configured.
  * @param emailStallFactor  Multiplier on pollingIntervalMs to derive the stall threshold.
  * @param startedAt    When the process started — used as the grace period anchor.
@@ -202,11 +220,29 @@ export function checkEmail(
   const now = Date.now();
   const graceMs = emailStallFactor * pollingIntervalMs;
 
-  if (lastSuccessfulPollAt === null) {
-    // Still within the startup grace window — no successful poll yet is expected.
-    return now - startedAt.getTime() < graceMs ? 'ok' : 'fail';
+  const pollFresh = lastSuccessfulPollAt === null
+    ? now - startedAt.getTime() < graceMs
+    : now - lastSuccessfulPollAt.getTime() < graceMs;
+  if (!pollFresh) return 'fail';
+
+  // An audit-database outage keeps the Nylas stamp fresh while no mail is
+  // written ahead. Surface that separately from a single poison message,
+  // which the adapter skips and then lets the poll complete.
+  if (adapter.inboundWriteAheadDegraded) return 'fail';
+
+  // Mail waiting is the symptom, whether one thread is wedged or the cap is full.
+  if (
+    adapter.oldestInboundPendingAgeMs != null &&
+    adapter.oldestInboundPendingAgeMs >= EMAIL_INBOUND_TURN_STALL_MS
+  ) {
+    return 'fail';
   }
-  return now - lastSuccessfulPollAt.getTime() < graceMs ? 'ok' : 'fail';
+
+  // Every slot is wedged when the turns past the bound fill the cap. The
+  // oldest in-flight age alone changes every time the remaining slot starts
+  // and finishes, while the other slots stay stuck.
+  if (adapter.inboundStalledTurns >= adapter.inboundMaxConcurrentTurns) return 'fail';
+  return 'ok';
 }
 
 /**

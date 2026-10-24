@@ -176,6 +176,7 @@ describe('Draft Fallback Flow Integration', () => {
         ceoEmail: 'ceo@company.com',
         contactCreationMaxPerMessage: 10,
         contactCreationMaxPerHour: 100,
+        maxConcurrentTurns: 4,
         timezone: 'America/Toronto',
       });
 
@@ -255,6 +256,7 @@ describe('Draft Fallback Flow Integration', () => {
         ceoEmail: 'ceo@company.com',
         contactCreationMaxPerMessage: 10,
         contactCreationMaxPerHour: 100,
+        maxConcurrentTurns: 4,
         timezone: 'America/Toronto',
       });
 
@@ -322,6 +324,7 @@ describe('Draft Fallback Flow Integration', () => {
         ceoEmail: 'ceo@company.com',
         contactCreationMaxPerMessage: 10,
         contactCreationMaxPerHour: 100,
+        maxConcurrentTurns: 4,
         timezone: 'America/Toronto',
       });
 
@@ -338,6 +341,7 @@ describe('Draft Fallback Flow Integration', () => {
         ceoEmail: 'ceo@company.com',
         contactCreationMaxPerMessage: 10,
         contactCreationMaxPerHour: 100,
+        maxConcurrentTurns: 4,
         timezone: 'America/Toronto',
       });
 
