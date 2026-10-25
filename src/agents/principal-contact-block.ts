@@ -127,14 +127,13 @@ const PROFILE_VALUE_MAX_CHARS = 80;
 /**
  * A profile value made safe to put on one prompt line, or null when it is empty.
  * Contact fields are writable by agents and the console, so a value is untrusted:
- * control characters (newlines included) become spaces, runs of whitespace
- * collapse, and the length is capped. It is rendered in quotes, so what is left
- * reads as data.
+ * control characters (C0 and C1, newlines included) and line or paragraph
+ * separators become spaces, runs of whitespace collapse, and the length is
+ * capped. It is rendered in quotes, so what is left reads as data.
  */
 export function cleanedProfileValue(raw: string | null | undefined): string | null {
   if (!raw) return null;
-  // eslint-disable-next-line no-control-regex -- stripping control characters is the point
-  const cleaned = raw.replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, ' ').replace(/\s+/g, ' ').trim();
+  const cleaned = raw.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, ' ').replace(/\s+/g, ' ').trim();
   return cleaned ? cleaned.slice(0, PROFILE_VALUE_MAX_CHARS) : null;
 }
 

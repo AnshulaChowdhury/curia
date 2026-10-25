@@ -131,6 +131,23 @@ describeIf('test-mode stack', () => {
         expect(rendered).not.toContain('Principal Contact Details');
       }
     });
+
+    it('reloads the principal profile after a write, as production does', async () => {
+      // Shared DB: skip when no principal, and restore the original value afterward.
+      const principal = await stack.contactService.findContactBySystemRole('principal');
+      if (!principal) return;
+      const original = principal.pronouns ?? null;
+      const marker = `xe/xem ${randomUUID().slice(0, 8)}`;
+      const profile = stack.agent('coordinator').runtimeConfig.principalProfile!;
+      try {
+        await stack.contactService.updateContactFields(principal.id, { pronouns: marker });
+        await vi.waitFor(() => expect(profile.current?.pronouns).toBe(marker));
+        expect(await stack.renderSystemPrompt('coordinator')).toContain(`- Pronouns: "${marker}"`);
+      } finally {
+        await stack.contactService.updateContactFields(principal.id, { pronouns: original });
+        await vi.waitFor(() => expect(profile.current?.pronouns ?? null).toBe(original));
+      }
+    });
   });
 
   describe('no outbound message can leave the process', () => {

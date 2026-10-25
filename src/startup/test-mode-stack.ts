@@ -791,7 +791,26 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       entityMemory = new EntityMemory(kgStore, new MemoryValidator(kgStore, embeddingService), embeddingService, logger);
     }
     const bullpenService = BullpenService.createWithPostgres(pool, logger);
-    const contactService = ContactService.createWithPostgres(pool, entityMemory, logger);
+    const principalIdentities: ChannelIdentity[] = [];
+    const principalPrimaryEmail: PrincipalPrimaryEmailRef = { current: null };
+    const principalProfile: PrincipalProfileRef = { current: null };
+    let principalContactId: string | null = null;
+    // Production reloads these after a write to the principal's identities or profile,
+    // so a later turn of a multi-turn case sees what contact-update saved. The
+    // generation drops a slower, older read, as in src/index.ts (#1514).
+    let refreshGeneration = 0;
+    const contactService = ContactService.createWithPostgres(pool, entityMemory, logger, {
+      onIdentitiesChanged: async (contactId: string) => {
+        if (contactId !== principalContactId) return;
+        const myGeneration = ++refreshGeneration;
+        const snapshot = await readPrincipalIdentitySnapshot(contactService, contactId);
+        if (myGeneration !== refreshGeneration) return;
+        principalIdentities.length = 0;
+        principalIdentities.push(...snapshot.identities);
+        principalPrimaryEmail.current = snapshot.primaryEmail;
+        principalProfile.current = snapshot.profile;
+      },
+    });
     // Production's permission model (#2227): without it every known contact reached the
     // coordinator with no AUTHORIZATION section, unlike production. Fatal on a bad file, as
     // in production.
@@ -803,10 +822,8 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     const agentContactId = agentIdentity.contactId;
 
     const principalContact = await contactService.findContactBySystemRole('principal');
-    const principalIdentities: ChannelIdentity[] = [];
-    const principalPrimaryEmail: PrincipalPrimaryEmailRef = { current: null };
-    const principalProfile: PrincipalProfileRef = { current: null };
     if (principalContact) {
+      principalContactId = principalContact.id;
       const snapshot = await readPrincipalIdentitySnapshot(contactService, principalContact.id);
       principalIdentities.push(...snapshot.identities);
       principalPrimaryEmail.current = snapshot.primaryEmail;
