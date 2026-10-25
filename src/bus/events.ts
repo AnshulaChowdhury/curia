@@ -51,7 +51,7 @@ interface InboundReactionPayload {
   metadata?: Record<string, unknown>;
 }
 
-interface AgentTaskPayload {
+export interface AgentTaskPayload {
   agentId: string;
   conversationId: string;
   channelId: string;

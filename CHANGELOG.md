@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Turn lanes** — per-conversation lock and injection config, default off and inert. (#2018)
 - **Memory → Documents** — console page to browse, view, search and download OKF working documents. (#1821)
 - **Documents editing** — edit, create, archive and restore in the console; stale saves conflict, never overwrite. (#1822)
 - **`document.console_action` bus event** — **public API:** audits each console change to a working document. (#1822)
@@ -149,6 +150,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Synthetic notices** — approval, drift-pause and suspension wakes set `syntheticTurn`. (#2018)
 - **Attachment download** — recovers from garbled Nylas IDs via filename or sole-attachment fallback. (#2281)
 - **Email poll** — detaches turns, drops the queue on stop, and shuts mailboxes down together. (#2254)
 - **Email durability** — writes mail ahead, replays it for a day, and skips only a poison row. (#2254)
