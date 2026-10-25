@@ -97,6 +97,14 @@ describe('TurnLanes', () => {
       off.release('task-a');
       off.release('task-a');
       off.cancelReservation('task-a');
+      off.deferAudit('task-a', 'inbound-1', {
+        conversationId: 'conv-1',
+        agentId: 'coordinator',
+        drainPoint: 'turn_start',
+      });
+      await off.flushRetained(async () => {
+        throw new Error('flush should not run while lanes are off');
+      });
       expect(off.inputSignal('task-a').aborted).toBe(false);
       await off.intakeSettled('inbound-1');
     });
@@ -396,6 +404,47 @@ describe('TurnLanes', () => {
       expect(stranger.aborted).toBe(false);
       gate.takeQueued('task-a');
       expect(signal.aborted).toBe(true);
+    });
+  });
+
+  describe('retained audit', () => {
+    it('leaves a stored follow-up unresolved on release and drains it after the audit retry', async () => {
+      const gate = lanes();
+      await gate.acquire(holder('a'));
+      const ticket = queued(gate.tryInject('conv-1', input()));
+      let resolved = false;
+      void ticket.then(() => { resolved = true; });
+      expect(gate.takeQueued('task-a')).toHaveLength(1);
+      gate.deferAudit('task-a', 'inbound-1', {
+        conversationId: 'conv-1',
+        agentId: 'coordinator',
+        drainPoint: 'turn_start',
+      });
+      gate.release('task-a');
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+
+      let attempts = 0;
+      await gate.flushRetained(async () => {
+        attempts += 1;
+        throw new Error('audit down');
+      });
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+      expect(attempts).toBe(1);
+
+      await gate.flushRetained(async () => { attempts += 1; });
+      await expect(ticket).resolves.toEqual({ kind: 'drained', hostTaskEventId: 'task-a' });
+      expect(attempts).toBe(2);
+    });
+
+    it('returns a follow-up that was taken but never stored', async () => {
+      const gate = lanes();
+      await gate.acquire(holder('a'));
+      const ticket = queued(gate.tryInject('conv-1', input()));
+      expect(gate.takeQueued('task-a')).toHaveLength(1);
+      gate.release('task-a');
+      await expect(ticket).resolves.toEqual({ kind: 'returned', reason: 'holder_ended' });
     });
   });
 

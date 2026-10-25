@@ -423,6 +423,28 @@ export class AgentRuntime {
   }
 
   /**
+   * Audit events for follow-ups already stored in working memory. The ticket
+   * stays unresolved until this publish succeeds, so handleInbound does not
+   * persist the same row again. A failure is logged inside the lane and left
+   * parked for the next flush.
+   */
+  private async flushRetainedAudits(): Promise<void> {
+    const lanes = this.config.turnLanes;
+    if (!lanes?.enabled) return;
+    const { bus } = this.config;
+    await lanes.flushRetained(async (retained) => {
+      await bus.publish('agent', createAgentTaskInputInjected({
+        hostTaskEventId: retained.hostTaskEventId,
+        inboundEventId: retained.input.inboundEventId,
+        conversationId: retained.audit.conversationId,
+        agentId: retained.audit.agentId,
+        drainPoint: retained.audit.drainPoint,
+        senderContactId: retained.input.senderContactId,
+      }));
+    });
+  }
+
+  /**
    * Publish agent.response. The lane is released first: the content-block rewrite
    * task is published by a subscriber of this event, and it has to be able to
    * acquire the same conversation (#2018).
@@ -492,6 +514,14 @@ export class AgentRuntime {
       // before that still has to drop the hold or the next message waits out
       // the lane timeout.
       this.releaseLane(taskEvent.id);
+      try {
+        await this.flushRetainedAudits();
+      } catch (flushErr) {
+        this.config.logger.error(
+          { err: flushErr, taskEventId: taskEvent.id },
+          'Failed to flush a retained follow-up audit',
+        );
+      }
       // Clean up the rate limit entry for this task so the validator's writeCounts map
       // doesn't grow unboundedly over many tasks in a long-running process.
       // The key mirrors the source provenance string used by skills during this task.
@@ -1670,15 +1700,38 @@ export class AgentRuntime {
               synthetic: false,
               injectedIntoTaskId: taskEvent.id,
             });
+            // The row is stored. A later audit failure must not return this
+            // ticket as holder_ended, or handleInbound persists it again.
+            lanes.deferAudit(taskEvent.id, input.inboundEventId, {
+              conversationId,
+              agentId,
+              drainPoint,
+            });
           }
-          await bus.publish('agent', createAgentTaskInputInjected({
-            hostTaskEventId: taskEvent.id,
-            inboundEventId: input.inboundEventId,
-            conversationId,
-            agentId,
-            drainPoint,
-            senderContactId: input.senderContactId,
-          }));
+          let audited = false;
+          try {
+            await bus.publish('agent', createAgentTaskInputInjected({
+              hostTaskEventId: taskEvent.id,
+              inboundEventId: input.inboundEventId,
+              conversationId,
+              agentId,
+              drainPoint,
+              senderContactId: input.senderContactId,
+            }));
+            audited = true;
+          } catch (err) {
+            if (!memory) throw err;
+            logger.error(
+              {
+                err,
+                agentId,
+                conversationId,
+                hostTaskEventId: taskEvent.id,
+                inboundEventId: input.inboundEventId,
+              },
+              'Stored follow-up audit failed — the ticket stays open until the retry',
+            );
+          }
           budget.maxTurns += lanes.extraRoundsPerInjection;
           if (input.liveTurn && hostIsPrincipal) turnState.liveTurn = true;
           // Ids only. The body, the label, and the guidance stay off the log.
@@ -1690,16 +1743,19 @@ export class AgentRuntime {
               inboundEventId: input.inboundEventId,
               senderContactId: input.senderContactId,
               drainPoint,
+              audited,
             },
-            'Drained a same-contact follow-up into the live turn',
+            audited
+              ? 'Drained a same-contact follow-up into the live turn'
+              : 'Stored a same-contact follow-up; audit retry is still pending',
           );
           framed.push(frameInjectedInput(input, {
             exitDrain: drainPoint === 'exit',
             timezone: this.config.timezone,
           }));
-          // Confirm this input before the next one. A throw later must not
-          // send an already-stored follow-up back as its own turn.
-          lanes.confirmDrained(taskEvent.id, [input.inboundEventId]);
+          // Confirm only after the audit event is published. A later throw
+          // must not send an already-stored follow-up back as its own turn.
+          if (audited) lanes.confirmDrained(taskEvent.id, [input.inboundEventId]);
         }
         return framed;
       };

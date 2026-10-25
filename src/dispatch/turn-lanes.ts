@@ -23,7 +23,7 @@
 // handleInbound and the tool loop interleave only at await points, and the reservation has
 // to be visible to the next arrival before this call returns.
 
-import type { AgentTaskEvent, AgentTaskPayload } from '../bus/events.js';
+import type { AgentTaskEvent, AgentTaskPayload, InjectionDrainPoint } from '../bus/events.js';
 import { isDelegatedSpecialistTask, parseTaskOriginator } from '../agents/delegated-task-context.js';
 import type { Logger } from '../logger.js';
 import { isUuid } from '../util/uuid.js';
@@ -98,6 +98,20 @@ interface Queued {
   ticket: Promise<TicketResult>;
   resolve: (result: TicketResult) => void;
   settled: boolean;
+  /** Set once working memory has the row. Release must not hand this ticket back. */
+  persisted: boolean;
+  audit?: RetainedFollowUp['audit'];
+}
+
+/** A stored follow-up whose audit publish has not succeeded yet. */
+export interface RetainedFollowUp {
+  hostTaskEventId: string;
+  input: InjectableInput;
+  audit: {
+    conversationId: string;
+    agentId: string;
+    drainPoint: InjectionDrainPoint;
+  };
 }
 
 interface Waiter {
@@ -269,6 +283,11 @@ export class TurnLanes {
   private readonly settledIntake: string[] = [];
   private readonly settledIntakeIds = new Set<string>();
   private readonly drainedListeners: Array<(hostTaskEventId: string, input: InjectableInput) => void> = [];
+  /**
+   * Stored, not yet audited. Survives release so the ticket stays unresolved
+   * until the audit publish succeeds. A fresh task must not persist the row again.
+   */
+  private readonly retained: Array<{ hostTaskEventId: string; item: Queued }> = [];
   /** Never aborted. Returned when this task does not hold a lane. */
   private readonly idleSignal = new AbortController().signal;
 
@@ -430,10 +449,11 @@ export class TurnLanes {
   }
 
   /**
-   * Idempotent. Marks the hold closed, resolves undrained tickets as
-   * `holder_ended`, and grants the next waiter. A task that does not hold the
-   * lane (including one that fail-opened) is a no-op, so it cannot release
-   * someone else's turn.
+   * Idempotent. Marks the hold closed, resolves inputs that were never
+   * persisted as `holder_ended`, and grants the next waiter. A follow-up
+   * already stored in working memory stays unresolved for an audit retry.
+   * A task that does not hold the lane (including one that fail-opened) is a
+   * no-op, so it cannot release someone else's turn.
    */
   release(taskEventId: string): void {
     if (!this.enabled) return;
@@ -445,6 +465,10 @@ export class TurnLanes {
     lane.pending.clear();
     for (const item of undrained) {
       if (item.settled) continue;
+      if (item.persisted && item.audit) {
+        this.retained.push({ hostTaskEventId: taskEventId, item });
+        continue;
+      }
       item.settled = true;
       item.resolve({ kind: 'returned', reason: 'holder_ended' });
     }
@@ -457,6 +481,60 @@ export class TurnLanes {
     this.logger.debug({ conversationId, taskEventId: releasedId }, 'turn-lanes: released');
     this.grantNext(conversationId, lane);
     if (!lane.holder && lane.waiters.length === 0) this.lanes.delete(conversationId);
+  }
+
+  /**
+   * Runtime: working memory accepted this follow-up and the audit event has
+   * not been published yet. Release will park the ticket instead of returning it.
+   */
+  deferAudit(taskEventId: string, inboundEventId: string, audit: RetainedFollowUp['audit']): void {
+    if (!this.enabled) return;
+    const item = this.laneHeldBy(taskEventId)?.pending.get(inboundEventId);
+    if (!item || item.settled) return;
+    item.persisted = true;
+    item.audit = audit;
+  }
+
+  /**
+   * Publish the audit for follow-ups parked by release. Resolves each ticket
+   * as drained only after `publish` succeeds. A failure puts that item back
+   * and leaves its ticket unresolved.
+   */
+  async flushRetained(publish: (retained: RetainedFollowUp) => Promise<void>): Promise<void> {
+    if (!this.enabled) return;
+    const batch = this.retained.splice(0, this.retained.length);
+    for (const entry of batch) {
+      if (entry.item.settled) continue;
+      if (!entry.item.audit) {
+        this.retained.push(entry);
+        this.logger.error(
+          { hostTaskEventId: entry.hostTaskEventId, inboundEventId: entry.item.input.inboundEventId },
+          'turn-lanes: retained follow-up is missing its audit record',
+        );
+        continue;
+      }
+      const retained: RetainedFollowUp = {
+        hostTaskEventId: entry.hostTaskEventId,
+        input: entry.item.input,
+        audit: entry.item.audit,
+      };
+      try {
+        await publish(retained);
+      } catch (err) {
+        this.retained.push(entry);
+        this.logger.error(
+          {
+            err,
+            hostTaskEventId: retained.hostTaskEventId,
+            inboundEventId: retained.input.inboundEventId,
+          },
+          'turn-lanes: retained follow-up audit retry failed',
+        );
+        continue;
+      }
+      entry.item.settled = true;
+      entry.item.resolve({ kind: 'drained', hostTaskEventId: entry.hostTaskEventId });
+    }
   }
 
   /**
@@ -661,7 +739,7 @@ export class TurnLanes {
 
   private makeQueued(input: InjectableInput): Queued {
     const { promise, resolve } = deferred<TicketResult>();
-    return { input, ticket: promise, resolve, settled: false };
+    return { input, ticket: promise, resolve, settled: false, persisted: false };
   }
 
   private findQueued(lane: Lane, inboundEventId: string): Queued | undefined {
