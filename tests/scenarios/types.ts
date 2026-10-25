@@ -265,6 +265,28 @@ export interface ScenarioInbound {
      */
     senderVerified?: boolean;
   };
+  /**
+   * A second message published while the first turn is still running (#2018).
+   * Capture still expects one reply: the follow-up joins that turn when injection
+   * is on, and a second turn on the same conversation fails the run.
+   */
+  followup?: ScenarioFollowup;
+}
+
+/** When the harness publishes `ScenarioInbound.followup`. */
+export type ScenarioFollowupAfter = 'first_tool_call' | { ms: number };
+
+/**
+ * A same-conversation message sent during the turn under test (#2018).
+ * `from` is `principal` or a seeded contact key. Injection only lands it in
+ * the live turn when that sender is the same contact as the holder.
+ */
+export interface ScenarioFollowup {
+  after: ScenarioFollowupAfter;
+  from: string;
+  content: string;
+  /** Defaults to the inbound's channel. */
+  channel?: string;
 }
 
 /**

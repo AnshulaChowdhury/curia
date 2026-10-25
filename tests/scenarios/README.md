@@ -367,6 +367,11 @@ inbound:
   channel: cli                            # principal only; default cli
   thread: brief                           # bullpen only
   content: "Yes"                          # every kind but task-wake
+  followup:                               # optional; a second message while this turn runs (#2018)
+    after: first_tool_call                # or { ms: N } (an integer, 1..120000)
+    from: principal                       # principal or a seeded contact key
+    content: "actually, use email for the code, not SMS"
+    channel: signal                       # optional; defaults to this inbound's channel
   email: { nylas_message_id: …, account: ops, auto_generated: false }   # email inbound only
   # email: { to: [dana], cc: [curia] }    # optional envelope; see Email envelopes
   task:                                   # task-wake only, in place of content
@@ -752,3 +757,22 @@ release:
   the resume.
 
 Raise either to `critical` only once a larger sample clears 80% with room.
+
+### Mid-turn follow-up
+
+`inbound.followup` publishes a second message on the same conversation while the first
+turn is still running (#2018). `after: first_tool_call` holds that call until the
+follow-up is queued, or for five seconds so a run with injection off still finishes.
+`after: { ms: N }` waits, then publishes, and does not hold the tool. The harness does
+not await either publish: awaiting the host waits for the whole turn, and awaiting the
+follow-up waits until it is drained, which cannot happen while the first tool is held.
+
+Capture still expects one reply. With injection on, the follow-up joins that turn.
+With it off, the harness errors the run before publishing: a second live turn on
+the same conversation is not a second reply, so it must not be scored. If the
+follow-up is published and not queued within five seconds, the run fails the same
+way. `26-mid-turn-correction` therefore stays `release_gate: false` until
+`dispatch.turnInjection.enabled` is on. It is not a `known_failure`: that marker
+would hide a real miss after the flag is turned on. A follow-up is only valid on
+a channel inbound (`principal` or a seeded contact), and `from` is the same kind
+of sender. It carries no email envelope.
