@@ -60,6 +60,7 @@ export type SystemPromptSources = Pick<
   | 'agentContactId'
   | 'principalIdentities'
   | 'principalPrimaryEmail'
+  | 'principalProfile'
   | 'errorBudget'
   | 'verification'
   | 'browserSessionAlive'
@@ -157,10 +158,13 @@ export async function buildBaseSystemPrompt(
   // no identities the whole section stays omitted — do not render a complete-set
   // claim over nothing.
   const { principalIdentities } = sources;
-  if (principalIdentities && principalIdentities.length > 0) {
+  // The profile (name, pronouns, title) renders even with no identities: the
+  // pronoun rule matters whatever channels are set up (#2226).
+  {
     const block = formatWhoYouServeBlock(
-      principalIdentities,
+      principalIdentities ?? [],
       sources.principalPrimaryEmail?.current ?? null,
+      sources.principalProfile?.current ?? null,
     );
     if (block) preambleParts.push(block);
   }

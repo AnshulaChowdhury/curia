@@ -123,6 +123,7 @@ export function measureAgentContext(agentName: string, sources: AgentSources): A
     selfEmails: [],
     principalIdentities: [],
     principalPrimaryEmail: { current: null },
+    principalProfile: { current: null },
     principalContactId: PRINCIPAL_CONTACT_ID,
     lateDelivery: { ttlMinutes: 60, sweepIntervalMinutes: 5 },
   });

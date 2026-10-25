@@ -73,7 +73,7 @@ import { loadMcpServers, loadSkillsConfig, registerMcpProjectedSkills, type McpS
 import type { McpSession } from './skills/mcp-client.js';
 import { ContactService } from './contacts/contact-service.js';
 import { NodeMergeService } from './kg-merge/service.js';
-import type { ChannelIdentity, Contact, PrincipalEmailRef, PrincipalPrimaryEmailRef } from './contacts/types.js';
+import type { ChannelIdentity, Contact, PrincipalEmailRef, PrincipalPrimaryEmailRef, PrincipalProfileRef } from './contacts/types.js';
 import { ConfidencePipeline } from './contacts/confidence-pipeline.js';
 import { DedupService } from './contacts/dedup-service.js';
 import { ContactResolver } from './contacts/contact-resolver.js';
@@ -866,6 +866,8 @@ async function main(): Promise<void> {
   // Designated primary (contacts.primary_email), not the first verified email.
   // Same mutable-holder pattern so the prompt block sees a post-boot update (#1950).
   const principalPrimaryEmail: PrincipalPrimaryEmailRef = { current: null };
+  // Name, preferred name, title and pronouns, refreshed with the identities (#2226).
+  const principalProfile: PrincipalProfileRef = { current: null };
 
   // Monotonic guard against overlapping refreshes (#1514). onIdentitiesChanged is
   // fire-and-forget, so two mutations in quick succession (e.g. add + verify, or a
@@ -879,6 +881,7 @@ async function main(): Promise<void> {
       principalIdentities.length = 0;
       principalEmail.current = '';
       principalPrimaryEmail.current = null;
+      principalProfile.current = null;
       return;
     }
     const myGeneration = ++refreshGeneration;
@@ -892,6 +895,7 @@ async function main(): Promise<void> {
     principalEmail.current =
       principalIdentities.find((id) => id.channel === 'email')?.channelIdentifier ?? '';
     principalPrimaryEmail.current = snapshot.primaryEmail;
+    principalProfile.current = snapshot.profile;
     // The prompt builder drops an unmatched primary and an empty identity set quietly
     // (it must never render an unverified address or a complete-set claim over
     // nothing), so every agent's prompt changes with no signal. Say so here instead.
@@ -1819,7 +1823,7 @@ async function main(): Promise<void> {
   const sendEvidence = new SendEvidenceCollector({
     auditLogRepo,
     // Read per call: principal identities hot-reload in place (#1514).
-    principalBlock: () => formatWhoYouServeBlock(principalIdentities, principalPrimaryEmail.current),
+    principalBlock: () => formatWhoYouServeBlock(principalIdentities, principalPrimaryEmail.current, principalProfile.current),
     logger,
   });
   const bandReview = autonomyGating === 'band'
@@ -2742,6 +2746,7 @@ async function main(): Promise<void> {
     // Shared hot-reload array/holder (#1514) — passed by reference.
     principalIdentities,
     principalPrimaryEmail,
+    principalProfile,
     agentContactId: agentIdentityContactId,
     principalContactId: principalContact?.id,
     // Delegated sign-in verifications (#2017): coordinator and ceo-inbox get the live list

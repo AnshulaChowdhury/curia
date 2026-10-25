@@ -442,6 +442,9 @@ const AUTO_VERIFIED_SOURCES: ReadonlySet<IdentitySource> = new Set([
  */
 export const NAME_NEAR_MISS_THRESHOLD = 0.95;
 
+/** Canonical fields the principal's prompt block reads. A write to one refreshes it. */
+export const PRINCIPAL_PROMPT_FIELDS = ['primaryEmail', 'preferredName', 'title', 'pronouns'] as const;
+
 /**
  * ContactService manages the lifecycle of contacts and their channel identities.
  *
@@ -509,9 +512,10 @@ export class ContactService {
   }
 
   /**
-   * Ask identity subscribers to reload after a committed `primary_email` write.
-   * That column is not an identity row, so link/unlink would not otherwise
-   * refresh the principal prompt block. (#1950)
+   * Ask identity subscribers to reload after a committed write to a column the
+   * principal prompt block shows: `primary_email` (#1950), or the profile's
+   * `preferred_name`, `title` and `pronouns` (#2226). None is an identity row,
+   * so link/unlink would not otherwise refresh the block.
    */
   notePrimaryEmailChanged(contactId: string): void {
     this.notifyIdentitiesChanged(contactId);
@@ -1520,7 +1524,7 @@ export class ContactService {
    * case-insensitively. Throws with a descriptive message if not found.
    *
    * Callers that pass `client` must call `notePrimaryEmailChanged` after COMMIT
-   * when `fields` includes `primaryEmail`. The pool path (no client) notifies
+   * when `fields` includes `primaryEmail`, `preferredName`, `title` or `pronouns`. The pool path (no client) notifies
    * itself once the write commits.
    */
   async updateContactFields(
@@ -1567,7 +1571,7 @@ export class ContactService {
     const stored = await this.updateStoredContact(updated, client);
     // A caller-supplied client has not committed yet; that caller notifies
     // after COMMIT. The pool path commits inside updateStoredContact.
-    if (!client && 'primaryEmail' in definedFields) {
+    if (!client && PRINCIPAL_PROMPT_FIELDS.some((key) => key in definedFields)) {
       this.notePrimaryEmailChanged(contactId);
     }
     return stored;

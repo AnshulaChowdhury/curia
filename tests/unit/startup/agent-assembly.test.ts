@@ -177,6 +177,7 @@ function buildContext(provider: LLMProvider, configs: AgentYamlConfig[]): AgentA
     selfEmails: ['curia@example.com'],
     principalIdentities: [principalIdentity()],
     principalPrimaryEmail: { current: 'principal@example.com' },
+    principalProfile: { current: null },
     agentContactId: AGENT_CONTACT_ID,
     principalContactId: PRINCIPAL_CONTACT_ID,
     lateDelivery: { ttlMinutes: 60, sweepIntervalMinutes: 5 },
@@ -315,7 +316,7 @@ describe('resolveSystemPromptSources', () => {
   const SOURCE_FIELDS = [
     'agentId', 'systemPrompt', 'officeIdentityService', 'securityContextBlock', 'availableSpecialists',
     'autonomyService', 'timezone', 'channelAccounts', 'agentContactId', 'principalIdentities',
-    'principalPrimaryEmail', 'errorBudget', 'verification', 'browserSessionAlive',
+    'principalPrimaryEmail', 'principalProfile', 'errorBudget', 'verification', 'browserSessionAlive',
   ] as const;
 
   it('is exactly the prompt half of the runtime config assembleAgent builds', () => {
@@ -721,6 +722,15 @@ describe('principalIdentitySnapshotGaps', () => {
     source: 'ceo_stated',
     createdAt: new Date(),
     updatedAt: new Date(),
+  });
+
+  it('says only the contact details go when a profile keeps the section rendering (#2226)', () => {
+    const profile = { displayName: 'Avery Testwell', preferredName: null, title: null, pronouns: null };
+    const [withProfile] = principalIdentitySnapshotGaps({ identities: [], primaryEmail: null, profile });
+    expect(withProfile).toContain('### Principal Contact Details');
+    expect(withProfile).not.toContain('## Who you serve section');
+    const [without] = principalIdentitySnapshotGaps({ identities: [], primaryEmail: null, profile: null });
+    expect(without).toContain('## Who you serve section');
   });
 
   it('reports nothing when the primary matches a listed identity, or none is set', () => {

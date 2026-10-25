@@ -1236,6 +1236,49 @@ describe('AgentRuntime', () => {
     expect(systemMsg).toContain('Other addresses:\n- email: other@example.com (label: "personal")');
   });
 
+  it('reads principalProfile each turn, so a pronoun saved in chat shows from the next turn (#2226)', async () => {
+    const provider = createMockProvider('OK');
+    const principalProfile = {
+      current: { displayName: 'Avery Testwell', preferredName: null, title: null, pronouns: null } as
+        { displayName: string; preferredName: string | null; title: string | null; pronouns: string | null },
+    };
+    const runtime = new AgentRuntime({
+      agentId: 'research-analyst',
+      systemPrompt: 'Base prompt.',
+      provider,
+      resolvedModel: 'mock-model',
+      bus,
+      logger: createLogger('error'),
+      principalProfile,
+    });
+    runtime.register();
+
+    const sendTurn = async (n: number): Promise<string> => {
+      await bus.publish('dispatch', createAgentTask({
+        agentId: 'research-analyst',
+        conversationId: `conv-profile-${n}`,
+        channelId: 'cli',
+        senderId: 'user',
+        content: 'Hello',
+        parentEventId: `parent-profile-${n}`,
+      }));
+      const calls = (provider.chat as ReturnType<typeof vi.fn>).mock.calls;
+      return calls[calls.length - 1]![0].messages[0]!.content as string;
+    };
+
+    const first = await sendTurn(1);
+    expect(first).toContain('## Who you serve');
+    expect(first).toContain('- Name: "Avery Testwell"');
+    expect(first).toContain('Pronouns: not set');
+    // No identities: the profile stands alone.
+    expect(first).not.toContain('Principal Contact Details');
+
+    principalProfile.current = { ...principalProfile.current, pronouns: 'she/her' };
+    const second = await sendTurn(2);
+    expect(second).toContain('- Pronouns: "she/her"');
+    expect(second).not.toContain('Pronouns: not set');
+  });
+
   it('injects ### Principal Contact Details on scheduler-dispatched tasks', async () => {
     const provider = createMockProvider('OK');
     const runtime = new AgentRuntime({
