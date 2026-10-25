@@ -222,7 +222,13 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Curia
 
   // Dispatcher — subscribes to inbound.message + agent.response.
   // Registered after agents so agent.task already has handlers.
-  const dispatcher = new Dispatcher({ bus, logger, contactResolver, channelPolicies: undefined });
+  const dispatcher = new Dispatcher({
+    bus,
+    logger,
+    contactResolver,
+    channelPolicies: undefined,
+    turnLanes: stack.turnLanes,
+  });
   dispatcher.register();
 
   // Production's BullpenDispatcher, but acting only on the posts a targeted case makes.

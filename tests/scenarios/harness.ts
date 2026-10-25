@@ -347,6 +347,7 @@ export async function createScenarioHarness(
     outboundContextService: scopedOutbound,
     principalBacklog: scopedPrincipalBacklog(currentScope),
     verification: stack.verification,
+    turnLanes: stack.turnLanes,
     selfEmail: SCENARIO_CURIA_EMAIL,
     // Production's check against the run's own seed: the principal's email identities as
     // the stack read them, and a mailbox whose Sent folder is the run's principal_wrote

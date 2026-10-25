@@ -5,9 +5,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import pino from 'pino';
 import type { Logger } from '../../../src/logger.js';
-import type { AgentTaskPayload } from '../../../src/bus/events.js';
+import { createAgentTask, type AgentTaskPayload } from '../../../src/bus/events.js';
 import {
   TurnLanes,
+  holderFromAgentTask,
   type InjectableInput,
   type LaneHolder,
   type TryInjectResult,
@@ -441,6 +442,14 @@ describe('TurnLanes', () => {
       gate.release(a.taskEventId);
       gate.release('task-v');
     });
+
+    it('keeps an unresolved stamp when a later acquire claims the contact is resolved', async () => {
+      const gate = lanes();
+      await gate.reserve(holder('a', { originatorResolved: false }));
+      await gate.acquire(holder('a', { originatorResolved: true }));
+      expect(gate.tryInject('conv-1', input()).kind).toBe('not_injected');
+      gate.release('task-a');
+    });
   });
 
   describe('intake', () => {
@@ -456,5 +465,83 @@ describe('TurnLanes', () => {
       gate.markIntakeSettled('e1');
       await gate.intakeSettled('e1');
     });
+  });
+});
+
+describe('holderFromAgentTask', () => {
+  function stamped(originator: Record<string, unknown> | undefined, id = 'task-1') {
+    const event = createAgentTask({
+      agentId: 'coordinator',
+      conversationId: 'conv-1',
+      channelId: 'email',
+      senderId: 'sender',
+      content: 'hi',
+      ...(originator ? { metadata: { originator } } : {}),
+      parentEventId: 'parent',
+    });
+    return holderFromAgentTask({ ...event, id });
+  }
+
+  const principal = {
+    contactId: CONTACT_A,
+    systemRole: 'principal',
+    channel: 'email',
+    initiatedAt: 't',
+    tier: 'principal',
+  };
+
+  it('fails closed for an unresolved email and for a UUID-shaped Signal ACI', () => {
+    expect(stamped({
+      contactId: 'stranger@example.com',
+      systemRole: null,
+      channel: 'email',
+      initiatedAt: 't',
+      tier: 'unknown',
+    }).originatorResolved).toBe(false);
+    // An unresolved Signal sender keeps the raw ACI. UUID shape is not resolution.
+    expect(stamped({
+      contactId: CONTACT_A,
+      systemRole: null,
+      channel: 'signal',
+      initiatedAt: 't',
+      tier: 'unknown',
+    }).originatorResolved).toBe(false);
+  });
+
+  it('treats a copied principal, agent, or known-tier stamp as resolved', () => {
+    expect(stamped(principal).originatorResolved).toBe(true);
+    expect(stamped(principal).originatorIsPrincipal).toBe(true);
+    expect(stamped({
+      contactId: CONTACT_B,
+      systemRole: null,
+      channel: 'email',
+      initiatedAt: 't',
+      tier: 'known',
+    }).originatorResolved).toBe(true);
+    expect(stamped({
+      contactId: CONTACT_B,
+      systemRole: 'agent',
+      channel: 'email',
+      initiatedAt: 't',
+      tier: 'trusted',
+    }).originatorIsPrincipal).toBe(false);
+  });
+
+  it('uses the dispatcher admission and does not infer past it', () => {
+    const event = createAgentTask({
+      agentId: 'coordinator',
+      conversationId: 'conv-1',
+      channelId: 'email',
+      senderId: 'sender',
+      content: 'hi',
+      metadata: { originator: principal },
+      parentEventId: 'parent',
+    });
+    const task = { ...event, id: 'task-admit' };
+    expect(holderFromAgentTask(task, { originatorResolved: false }).originatorResolved).toBe(false);
+    expect(holderFromAgentTask(task, { originatorResolved: true }).originatorResolved).toBe(true);
+    const emailOriginator = { ...principal, contactId: 'person@example.com' };
+    const raw = { ...event, id: 'task-raw', payload: { ...event.payload, metadata: { originator: emailOriginator } } };
+    expect(holderFromAgentTask(raw, { originatorResolved: true }).originatorResolved).toBe(false);
   });
 });

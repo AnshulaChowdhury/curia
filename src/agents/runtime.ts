@@ -6,6 +6,7 @@ import {
 } from './llm/streaming-turn.js';
 import type { EventBus } from '../bus/bus.js';
 import { createAgentResponse, createAgentError, createToolInvoke, createToolResult, createLlmCall, createLlmError, createContextBudget, createModelFallbackEngaged, createDelegationTimedOut, createDelegationRequesterContext, createDelegationPrincipalNote, type AgentResponseFailureReason, type AgentTaskEvent } from '../bus/events.js';
+import { holderFromAgentTask, type TurnLanes } from '../dispatch/turn-lanes.js';
 import type { Tier } from './llm/model-router.js';
 import { ContextBudget } from './llm/context-budget.js';
 import { DEFAULT_SAFETY_MARGIN } from './llm/token-estimator.js';
@@ -332,6 +333,11 @@ export interface AgentConfig {
   lateDeliveryTtlMinutes?: number;
   lateDeliverySweepIntervalMinutes?: number;
   /**
+   * Per-conversation turn lane (#2018). Absent, or present with the flag off:
+   * every task runs immediately and no lane method is called.
+   */
+  turnLanes?: TurnLanes;
+  /**
    * Conversation-scoped contact IDs (#1818). When set, identities resolved by
    * a delegation are remembered and re-injected next turn from the current
    * contact row — working memory does not keep tool results.
@@ -393,10 +399,39 @@ export class AgentRuntime {
     this.config.bus.subscribe('agent.task', 'agent', async (event) => {
       const taskEvent = event as AgentTaskEvent;
       if (taskEvent.payload.agentId !== this.config.agentId) return;
+      const lanes = this.config.turnLanes;
+      // The flag is a property. Calling a method while it is off would show up
+      // in the flag-off spy, and today's concurrent turns must not touch the lane.
+      if (lanes?.enabled && lanes.isLaned(taskEvent.payload)) {
+        await lanes.acquire(holderFromAgentTask(taskEvent));
+      }
       await this.handleTask(taskEvent);
     });
 
     this.config.logger.info({ agentId: this.config.agentId }, 'Agent registered');
+  }
+
+  /**
+   * Drop this task's hold. Idempotent, and a no-op when the flag is off or this
+   * task does not hold the lane (including a waiter that fail-opened).
+   */
+  private releaseLane(taskEventId: string): void {
+    const lanes = this.config.turnLanes;
+    if (!lanes?.enabled) return;
+    lanes.release(taskEventId);
+  }
+
+  /**
+   * Publish agent.response. The lane is released first: the content-block rewrite
+   * task is published by a subscriber of this event, and it has to be able to
+   * acquire the same conversation (#2018).
+   */
+  private async publishAgentResponse(
+    taskEvent: AgentTaskEvent,
+    event: ReturnType<typeof createAgentResponse>,
+  ): Promise<void> {
+    this.releaseLane(taskEvent.id);
+    await this.config.bus.publish('agent', event);
   }
 
   /**
@@ -452,6 +487,10 @@ export class AgentRuntime {
         this.config.logger.error({ err: publishErr }, 'Failed to publish error response');
       }
     } finally {
+      // Backstop. Every response path releases before it publishes; a throw
+      // before that still has to drop the hold or the next message waits out
+      // the lane timeout.
+      this.releaseLane(taskEvent.id);
       // Clean up the rate limit entry for this task so the validator's writeCounts map
       // doesn't grow unboundedly over many tasks in a long-running process.
       // The key mirrors the source provenance string used by skills during this task.
@@ -1731,7 +1770,7 @@ export class AgentRuntime {
                 ...failedSkillsPayload(),
                 parentEventId: taskEvent.id,
               });
-              await bus.publish('agent', clarificationResponse);
+              await this.publishAgentResponse(taskEvent, clarificationResponse);
 
               logger.info(
                 { agentId, conversationId, question: pendingClarification.question.slice(0, 100) },
@@ -1796,7 +1835,7 @@ export class AgentRuntime {
                 ...failedSkillsPayload(),
                 parentEventId: taskEvent.id,
               });
-              await bus.publish('agent', escalationResponse);
+              await this.publishAgentResponse(taskEvent, escalationResponse);
 
               logger.info(
                 {
@@ -2776,7 +2815,7 @@ export class AgentRuntime {
       ...failedSkillsPayload(),
       parentEventId: taskEvent.id,
     });
-    await bus.publish('agent', responseEvent);
+    await this.publishAgentResponse(taskEvent, responseEvent);
 
     // Bullpen read-watermark (#1065, #1901). Stamp the woke thread always, ambient
     // threads that are not an open handoff, and ambient handoffs this turn actually
@@ -3600,7 +3639,7 @@ export class AgentRuntime {
     reason: 'maxTurns',
     sliceCostUsd?: number,
   ): Promise<void> {
-    const { agentId, bus, logger } = this.config;
+    const { agentId, logger } = this.config;
     logger.info(
       { agentId, taskId, done: checkpoint.done, total: checkpoint.total, budget, reason, sliceCostUsd },
       'Resumable task hit turn budget — pausing from last checkpoint',
@@ -3629,7 +3668,7 @@ export class AgentRuntime {
       }),
       parentEventId: taskEvent.id,
     });
-    await bus.publish('agent', responseEvent);
+    await this.publishAgentResponse(taskEvent, responseEvent);
   }
 
   /**
@@ -3723,9 +3762,9 @@ export class AgentRuntime {
     /** User-facing text replacing the generic failure message (#2201). */
     content: string = LLM_FAILURE_USER_MESSAGE,
   ): Promise<void> {
-    const { agentId, bus } = this.config;
+    const { agentId } = this.config;
     const { conversationId } = taskEvent.payload;
-    const structuredFailure = agentErr ? mapAgentErrorToResponseFields(agentErr) : undefined;
+    const structuredFailure = agentErr ? mapAgentErrorToResponseFields(agentErr) : undefined
     const failedSkillsFields =
       handoff && handoff.failedSkills.length > 0
         ? {
@@ -3746,7 +3785,7 @@ export class AgentRuntime {
       ...failedSkillsFields,
       parentEventId: taskEvent.id,
     });
-    await bus.publish('agent', responseEvent);
+    await this.publishAgentResponse(taskEvent, responseEvent);
     // Marker only affects the next turn's history, so it must not delay the user's
     // error reply — maybeSummarize inside addTurn can issue an LLM call (#1767).
     // Must not throw: a memory failure here would re-enter handleTask's catch

@@ -16,6 +16,7 @@ import type { InboundSenderContext, TaskOriginator, ContactTier, ContactKind } f
 import { createLogger } from '../../../src/logger.js';
 import type { Logger } from '../../../src/logger.js';
 import { sanitizeNylasMessageId } from '../../../src/dispatch/email-metadata.js';
+import { TurnLanes } from '../../../src/dispatch/turn-lanes.js';
 
 // Minimal provenance block for all mock LLM responses — satisfies the required field.
 const MOCK_PROVENANCE = { requestedModel: 'mock-model', actualModel: 'mock-model', providerRequestId: 'msg_mock_000' } as const;
@@ -2873,4 +2874,90 @@ describe('Dispatcher — spot-check verdict turn guidance', () => {
       expect(tasks[0]!.payload.metadata?.spotCheckVerdicts).toEqual([{ n: 2, verdict: 'bad' }]);
     });
   });
+});
+
+describe('content-block rewrite acquires the lane (R-3, #2018)', () => {
+  it('runs the rewrite that is published inside the blocked reply', async () => {
+    const logger = createLogger('error');
+    const bus = new EventBus(logger);
+    const lanes = new TurnLanes({
+      enabled: true,
+      maxInjectionsPerTurn: 5,
+      laneWaitTimeoutMs: 60_000,
+      logger,
+    });
+    let calls = 0;
+    const provider: LLMProvider = {
+      id: 'mock',
+      chat: vi.fn(async () => {
+        calls += 1;
+        const content = calls === 1
+          ? 'The calendar specialist found 4 events.'
+          : 'Here is the rewritten reply.';
+        return {
+          type: 'text' as const,
+          content,
+          usage: { inputTokens: 1, outputTokens: 1, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+          provenance: MOCK_PROVENANCE,
+        };
+      }),
+    };
+    new AgentRuntime({
+      agentId: 'coordinator',
+      systemPrompt: 'x',
+      provider,
+      resolvedModel: 'mock-model',
+      bus,
+      logger,
+      turnLanes: lanes,
+    }).register();
+    const dispatcher = new Dispatcher({ bus, logger, turnLanes: lanes });
+    dispatcher.register();
+
+    const outbound: OutboundMessageEvent[] = [];
+    bus.subscribe('outbound.message', 'channel', async (event) => {
+      const message = event as OutboundMessageEvent;
+      outbound.push(message);
+      if (!message.payload.content.includes('calendar specialist')) return;
+      await bus.publish('dispatch', createOutboundBlocked({
+        blockId: 'block_lane',
+        conversationId: 'email:thread-99',
+        channelId: 'email',
+        content: message.payload.content,
+        recipientId: 'alice@example.com',
+        reason: 'llm-judge-audience-leak: named internal agent',
+        findings: [{ rule: 'llm-judge-audience-leak', detail: 'named internal agent' }],
+        parentEventId: message.id,
+      }));
+    });
+
+    const task = createAgentTask({
+      agentId: 'coordinator',
+      conversationId: 'email:thread-99',
+      channelId: 'email',
+      senderId: 'alice@example.com',
+      content: 'Original inbound',
+      parentEventId: 'inbound-1',
+    });
+    dispatcher.registerExternalTaskRouting(task.id, {
+      channelId: 'email',
+      conversationId: 'email:thread-99',
+      senderId: 'alice@example.com',
+      originator: {
+        contactId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        systemRole: 'principal',
+        channel: 'email',
+        initiatedAt: new Date().toISOString(),
+        tier: 'principal',
+      },
+    });
+
+    await bus.publish('system', task);
+
+    expect(calls).toBe(2);
+    expect(outbound.map((message) => message.payload.content)).toEqual([
+      'The calendar specialist found 4 events.',
+      'Here is the rewritten reply.',
+    ]);
+  }, 5_000);
 });

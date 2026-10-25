@@ -56,7 +56,7 @@
 //     production also drops a number whose channel is disabled in the registry.
 
 import * as path from 'node:path';
-import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveLateDeliveryConfig, resolveTasksConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
+import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveLateDeliveryConfig, resolveTasksConfig, resolveTurnInjectionConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
 import { createVerificationRuntime, type VerificationRuntime } from '../verification/index.js';
 import { createLogger, type Logger } from '../logger.js';
 import { createPool, type DbPool } from '../db/connection.js';
@@ -94,6 +94,7 @@ import type { TrustScorerWeights } from '../dispatch/trust-scorer.js';
 import type { ChannelIdentity, ChannelPolicyConfig, PrincipalPrimaryEmailRef, PrincipalProfileRef } from '../contacts/types.js';
 import { OutboundContextService } from '../dispatch/outbound-context.js';
 import { OutboundContentFilter } from '../dispatch/outbound-filter.js';
+import { TurnLanes } from '../dispatch/turn-lanes.js';
 import {
   acquireRunningDelegation,
   findInFlightPendingDelegation,
@@ -400,6 +401,12 @@ export interface TestModeStack {
    * Offline stacks hold providers that throw.
    */
   llmProviders: ReadonlyMap<string, LLMProvider>;
+  /**
+   * The process-wide turn lane (#2018), shared with every agent runtime. Harnesses
+   * that build their own Dispatcher pass this same instance. The flag comes from
+   * config and defaults to off.
+   */
+  turnLanes: TurnLanes;
   /** Every assembled agent, already registered on the bus. */
   agents: AssembledAgent[];
   /**
@@ -978,6 +985,13 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     }
 
     // ── Agents (same builder as src/index.ts) ──────────────────────────────
+    const turnInjection = resolveTurnInjectionConfig(yamlConfig.dispatch);
+    const turnLanes = new TurnLanes({
+      enabled: turnInjection.enabled,
+      maxInjectionsPerTurn: turnInjection.maxInjectionsPerTurn,
+      laneWaitTimeoutMs: turnInjection.laneWaitTimeoutMs,
+      logger,
+    });
     const agents = assembleAgents(agentConfigs, {
       logger,
       bus,
@@ -1011,6 +1025,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       ),
       conversationEntities,
       // No taskRepo or workingDocsRepo — see header.
+      turnLanes,
     });
     for (const assembled of agents) {
       new AgentRuntime(assembled.runtimeConfig).register();
@@ -1076,6 +1091,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
         confidencePipeline: new ConfidencePipeline(contactService, logger),
       },
       llmProviders: providerRegistry,
+      turnLanes,
       agents,
       disabledTools,
       snapshotMcpTools: snapshotMcp.tools,

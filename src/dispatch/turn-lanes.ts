@@ -23,8 +23,8 @@
 // loop interleave only at await points, and the reservation has to be visible to the next
 // arrival before this call returns.
 
-import type { AgentTaskPayload } from '../bus/events.js';
-import { isDelegatedSpecialistTask } from '../agents/delegated-task-context.js';
+import type { AgentTaskEvent, AgentTaskPayload } from '../bus/events.js';
+import { isDelegatedSpecialistTask, parseTaskOriginator } from '../agents/delegated-task-context.js';
 import type { Logger } from '../logger.js';
 import { isUuid } from '../util/uuid.js';
 
@@ -136,6 +136,42 @@ export interface TurnLanesOptions {
 }
 
 const IMMEDIATE: LaneGrant = Object.freeze({ waitedMs: 0, timedOut: false });
+
+/**
+ * Build the holder stamp for a task.
+ *
+ * `admission` is set only by the dispatcher, which saw the contact resolver.
+ * That stamp is taken at reserve and a later acquire of the same task does not
+ * replace it. Synthetic publishers never reserve. Their copied originator is
+ * treated as resolved only when it cannot be the unresolved branch: a UUID
+ * contact id, plus a system role or a tier of known, trusted, or principal.
+ * An unresolved stamp stores the raw sender id, a null role, and tier unknown.
+ * A Signal ACI is a UUID and still fails that check.
+ */
+export function holderFromAgentTask(
+  task: AgentTaskEvent,
+  admission?: { originatorResolved: boolean },
+): LaneHolder {
+  const originator = parseTaskOriginator(task.payload.metadata?.['originator']);
+  const contactId = originator?.contactId ?? null;
+  const role = originator?.systemRole;
+  const tier = originator?.tier;
+  const trustedRole = role === 'principal' || role === 'agent' || role === 'system';
+  const resolvedTier = tier === 'known' || tier === 'trusted' || tier === 'principal';
+  const inferred = isUuid(contactId) && (trustedRole || resolvedTier);
+  const originatorResolved = admission
+    ? admission.originatorResolved === true && isUuid(contactId)
+    : inferred;
+  return {
+    taskEventId: task.id,
+    conversationId: task.payload.conversationId,
+    originatorContactId: contactId,
+    originatorResolved,
+    originatorIsPrincipal: role === 'principal',
+    liveTurn: task.payload.liveTurn === true,
+    synthetic: task.payload.syntheticTurn === true,
+  };
+}
 
 /**
  * Returns a bounded string for the framing line. Newlines and other

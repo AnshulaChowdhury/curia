@@ -20,7 +20,7 @@
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { runner } from 'node-pg-migrate';
-import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveReportFallbackConfig, resolveIdentityGateMode, resolveAutonomyGating, resolveVerificationConfig, resolveRelayBudgetConfig } from './config.js';
+import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveReportFallbackConfig, resolveIdentityGateMode, resolveAutonomyGating, resolveVerificationConfig, resolveRelayBudgetConfig, resolveTurnInjectionConfig } from './config.js';
 import { createVerificationRuntime } from './verification/index.js';
 import { createLogger } from './logger.js';
 import { HttpAdapter } from './channels/http/http-adapter.js';
@@ -39,6 +39,7 @@ import { OpenRouterProvider } from './agents/llm/openrouter.js';
 import { BedrockProvider } from './agents/llm/bedrock.js';
 import { AgentRuntime } from './agents/runtime.js';
 import { Dispatcher } from './dispatch/dispatcher.js';
+import { TurnLanes } from './dispatch/turn-lanes.js';
 import { createPrincipalBacklogSource } from './dispatch/principal-backlog.js';
 import { CliAdapter } from './channels/cli/cli-adapter.js';
 import { discoverAgentManifests } from './agents/loader.js';
@@ -2733,6 +2734,14 @@ async function main(): Promise<void> {
   // assembleAgent() so smoke, scenarios and the render script get the same agents.
   // `browserService` is a reassigned `let`; the liveness closure needs a stable binding.
   const assemblyBrowserService = browserService;
+  const turnInjection = resolveTurnInjectionConfig(yamlConfig.dispatch);
+  const turnLanes = new TurnLanes({
+    enabled: turnInjection.enabled,
+    maxInjectionsPerTurn: turnInjection.maxInjectionsPerTurn,
+    laneWaitTimeoutMs: turnInjection.laneWaitTimeoutMs,
+    logger,
+  });
+  logger.info({ enabled: turnInjection.enabled }, 'Turn lanes initialized');
   const assemblyContext: AgentAssemblyContext = {
     logger,
     bus,
@@ -2779,6 +2788,7 @@ async function main(): Promise<void> {
     conversationEntities,
     workingDocsRepo,
     taskRepo,
+    turnLanes,
   };
   for (const agentConfig of agentConfigs) {
     let assembled: AssembledAgent;
@@ -3089,6 +3099,7 @@ async function main(): Promise<void> {
       : undefined,
     principalBacklog: createPrincipalBacklogSource(pool),
     verification: verificationRuntime,
+    turnLanes,
   });
   dispatcher.register();
   // Deferred delegations wake in the originating conversation (#1893). The
