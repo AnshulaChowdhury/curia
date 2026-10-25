@@ -491,7 +491,8 @@ export async function setupRoutes(
       return reply.status(503).send({ error: 'Name suggestion is unavailable.' });
     }
 
-    // extract() routes to the 'standard' tier and is errors-as-values: a provider
+    // extract() runs on the 'fast' tier here: 16 tokens leaves no room for thinking,
+    // and boot keeps fast on a model that can turn it off (#2224). It is errors-as-values: a provider
     // failure is meant to come back as { ok: false }, never a throw. The
     // try/catch is belt-and-suspenders — an unexpected rejection (e.g. a future
     // provider impl, or a bug in the routing layer) is funneled into the same
@@ -502,7 +503,7 @@ export async function setupRoutes(
     try {
       result = await infraLlmService
         .scoped({ toolName: 'wizard-suggest-name', conversationId: 'setup' })
-        .extract(SUGGEST_NAME_PROMPT, { maxTokens: 16 });
+        .extract(SUGGEST_NAME_PROMPT, { maxTokens: 16, tier: 'fast' });
     } catch (err) {
       logger.warn({ err }, 'POST /api/setup/suggest-name: LLM call threw unexpectedly — frontend will fall back');
       return reply.status(502).send({ error: 'Could not generate a suggestion.' });

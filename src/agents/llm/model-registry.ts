@@ -62,10 +62,12 @@ export interface ModelMetadata {
    */
   rejectsSamplingParams?: boolean;
   /**
-   * The model runs adaptive thinking when a request leaves `thinking` unset.
-   * A fact about the model, not a request rule: unset reasoning gets the
-   * provider default (ADR-048 §3). AnthropicProvider reads it only to size
-   * `max_tokens` for a request that will think.
+   * The model thinks when a request sends no reasoning setting. A fact about
+   * the model, not a request rule: unset reasoning gets the provider default
+   * (ADR-048 §3). AnthropicProvider reads it only to size `max_tokens` for a
+   * request that will think. Without `none` in `reasoning`, it also fails
+   * canTurnThinkingOff. On an OpenRouter entry it is set from a measurement at
+   * the small-cap call sites (#2224).
    */
   thinksByDefault?: boolean;
   /**
@@ -154,13 +156,8 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
   //
   // Opus 5.5 cannot turn thinking off. The API returns a 400 for `disabled` at
   // every effort, so its `reasoning` entry leaves out `none`. A call site that
-  // sends `none` gets the model's default thinking.
-  //
-  // Do not set Opus 5.5 as the fast-tier model, the standard-tier model, or
-  // either judge's model. The 10-token classifier runs on the fast-tier model.
-  // The drift detector runs on the standard-tier model at 200 tokens and reads a
-  // failed call as no drift. The judges cap their output at 200 to 1,200 tokens.
-  // Opus 5.5 spends those output caps on thinking.
+  // sends `none` gets the model's default thinking, so boot refuses it on a
+  // small-cap call site (canTurnThinkingOff, small-cap-models.ts, #2224).
   'claude-opus-5-5': {
     provider: 'anthropic',
     contextWindow: 1_000_000,
@@ -273,6 +270,8 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
     capabilities: ['vision', 'coding', 'streaming', 'tools'],
     // OpenRouter supported_efforts. No `none`: the judges run Gemini's default
     // `minimal` thinking today, and `none` at a call site must not change that.
+    // Not `thinksByDefault`: at that default it answered 27 of 27 small-cap
+    // calls with no reasoning tokens (2026-10-25, #2224).
     reasoning: { control: 'openrouter-effort', efforts: ['low', 'medium', 'high'] },
     maxOutputTokens: 8_192,
   },
@@ -351,6 +350,10 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
     // require_parameters (ADR-048). No `none`: on a hard task the model then
     // writes its working into the visible reply.
     reasoning: { control: 'openrouter-effort', efforts: ['low', 'high', 'max'] },
+    // Measured 2026-10-25 (#2224): the 10-token classifier returned no text on
+    // 6 of 6 calls, and drift checks used up to 582 output tokens, 536 of them
+    // reasoning. Boot keeps it off the small-cap call sites.
+    thinksByDefault: true,
     maxOutputTokens: 32_768,
   },
   'z-ai/glm-5.3-flash': {
@@ -502,6 +505,18 @@ export class ModelRegistry {
   /** True when the model thinks unless the request disables it. False for unknown models. */
   thinksByDefault(modelId: string): boolean {
     return this.getModel(modelId)?.thinksByDefault === true;
+  }
+
+  /**
+   * True when a `NO_REASONING` request gets an answer without thinking: the
+   * entry lists `none`, or the model does not think by default. False for
+   * unknown models. Boot requires it of every model on a small-cap call site
+   * (#2224).
+   */
+  canTurnThinkingOff(modelId: string): boolean {
+    const entry = this.getModel(modelId);
+    if (!entry) return false;
+    return entry.reasoning?.efforts.includes('none') === true || entry.thinksByDefault !== true;
   }
 
   /** How the model takes a reasoning effort, or undefined when Curia sends it none. */
