@@ -13,6 +13,7 @@ import { EntityMemory } from '../../src/memory/entity-memory.js';
 import { MemoryValidator } from '../../src/memory/validation.js';
 import { ConfigStore } from '../../src/memory/config-store.js';
 import { createLogger, createSilentLogger } from '../../src/logger.js';
+import { requireCuriaTestDatabase } from './require-test-db.js';
 
 const { Pool } = pg;
 
@@ -39,14 +40,21 @@ describeIf('ConfigStore exact-key writes across processes', () => {
   let b: Stack;
   // Unique per run: integration files share one database (#2183).
   const namespace = `it_exact_key_${Date.now()}`;
+  // Teardown deletes rows only once the database check has passed.
+  let onTestDatabase = false;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     a = makeStack();
     b = makeStack();
+    // Refuse anything but the isolated test database before writing a single row.
+    // Both pools use the same DATABASE_URL, so checking one covers the other.
+    await requireCuriaTestDatabase(a.pool);
+    onTestDatabase = true;
   });
 
   afterAll(async () => {
     try {
+      if (!onTestDatabase) return;
       // The anchor and every fact on it; edges cascade from their nodes.
       await a.pool.query(
         `DELETE FROM kg_nodes WHERE id IN (

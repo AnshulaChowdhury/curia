@@ -763,6 +763,9 @@ class PostgresBackend implements KnowledgeGraphBackend {
     // queries on other pool connections in autocommit, so its writes are durable
     // before the lock is released and the next holder sees them.
     const client = await this.pool.connect();
+    // Set when ROLLBACK fails: the connection may still be in the transaction and
+    // holding the lock, so it must be destroyed, not returned to the pool.
+    let discard: Error | undefined;
     try {
       await client.query('BEGIN');
       // A stuck holder surfaces as a lock_timeout error rather than a silent hang.
@@ -776,11 +779,16 @@ class PostgresBackend implements KnowledgeGraphBackend {
       try {
         await client.query('ROLLBACK');
       } catch (rollbackErr) {
-        this.logger.error({ err: rollbackErr, lockKey }, 'kg: advisory lock rollback failed');
+        discard = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+        this.logger.error(
+          { err: rollbackErr, lockKey },
+          'kg: advisory lock rollback failed — discarding the connection so it cannot keep the lock',
+        );
       }
       throw err;
     } finally {
-      client.release();
+      // A truthy argument makes pg destroy the client instead of pooling it.
+      client.release(discard);
     }
   }
 

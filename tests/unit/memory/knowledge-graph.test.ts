@@ -1,6 +1,50 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { KnowledgeGraphStore } from '../../../src/memory/knowledge-graph.js';
 import { EmbeddingService } from '../../../src/memory/embedding.js';
+import { createSilentLogger } from '../../../src/logger.js';
+import type { DbPool } from '../../../src/db/connection.js';
+
+describe('KnowledgeGraphStore.withAdvisoryLock (Postgres)', () => {
+  /** A pool whose single client fails the given statements. */
+  function fakePool(failing: RegExp[]) {
+    const release = vi.fn();
+    const query = vi.fn(async (sql: string) => {
+      if (failing.some((re) => re.test(sql))) throw new Error(`failed: ${sql}`);
+      return { rows: [], rowCount: 0 };
+    });
+    const pool = { connect: vi.fn(async () => ({ query, release })) } as unknown as DbPool;
+    const store = KnowledgeGraphStore.createWithPostgres(
+      pool,
+      EmbeddingService.createForTesting(),
+      createSilentLogger(),
+    );
+    return { store, query, release };
+  }
+
+  it('returns the connection to the pool after COMMIT', async () => {
+    const { store, query, release } = fakePool([]);
+    await expect(store.withAdvisoryLock('k', async () => 'done')).resolves.toBe('done');
+    expect(query.mock.calls.map((c) => c[0])).toContain('COMMIT');
+    expect(release).toHaveBeenCalledWith(undefined);
+  });
+
+  it('returns the connection after a clean ROLLBACK and rethrows the callback error', async () => {
+    const { store, release } = fakePool([]);
+    await expect(
+      store.withAdvisoryLock('k', async () => { throw new Error('write failed'); }),
+    ).rejects.toThrow('write failed');
+    expect(release).toHaveBeenCalledWith(undefined);
+  });
+
+  it('destroys the connection when ROLLBACK fails, so it cannot keep holding the lock', async () => {
+    const { store, release } = fakePool([/^ROLLBACK$/]);
+    await expect(
+      store.withAdvisoryLock('k', async () => { throw new Error('write failed'); }),
+    ).rejects.toThrow('write failed');
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release.mock.calls[0]![0]).toBeInstanceOf(Error);
+  });
+});
 
 describe('KnowledgeGraphStore', () => {
   let store: KnowledgeGraphStore;
