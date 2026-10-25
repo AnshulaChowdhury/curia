@@ -134,7 +134,15 @@ export class InfraLlmService {
     options: InfraLlmExtractOptions | undefined,
     scope: InfraLlmScope,
   ): Promise<InfraLlmResult> {
-    const resolved = this.modelRouter.resolve(options?.tier ?? 'standard');
+    // Validate before resolve(): resolve throws on an unknown tier, and this service returns
+    // errors as values. Only fast and standard are offered — not powerful — to keep the
+    // surface (and its cost) narrow.
+    const tier = options?.tier ?? 'standard';
+    if (tier !== 'fast' && tier !== 'standard') {
+      this.logger.error({ tier, toolName: scope.toolName }, 'infraLlm.extract: invalid tier');
+      return { ok: false, error: `invalid infraLlm tier "${String(tier)}"` };
+    }
+    const resolved = this.modelRouter.resolve(tier);
     const start = Date.now();
 
     // Build message — plain text or mixed vision content
