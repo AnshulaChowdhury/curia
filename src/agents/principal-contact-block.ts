@@ -158,21 +158,16 @@ export function formatPrincipalProfileBlock(profile: PrincipalProfile | null | u
   const title = cleanedProfileValue(profile.title);
   const pronouns = cleanedProfileValue(profile.pronouns);
 
-  const lines = ['### Principal Profile', `- Name: ${quoteProfileValue(name)}`];
-  if (preferred && preferred.toLowerCase() !== name.toLowerCase()) lines.push(`- Goes by: ${quoteProfileValue(preferred)}`);
+  // The name appears nowhere else in the system prompt (contact details are addresses only).
+  const goesBy = preferred && preferred.toLowerCase() !== name.toLowerCase() ? ` (goes by ${quoteProfileValue(preferred)})` : '';
+  const lines = ['### Principal Profile', `- Name: ${quoteProfileValue(name)}${goesBy}`];
   if (title) lines.push(`- Title: ${quoteProfileValue(title)}`);
-  if (pronouns) {
-    lines.push(`- Pronouns: ${quoteProfileValue(pronouns)}`);
-  } else {
-    lines.push(
-      '- Pronouns: not set. Refer to the principal by name or with they/them, and never infer pronouns from the name.',
-    );
-  }
   lines.push(
-    // Always on, not part of the unset branch: it covers every other contact too, and
-    // would otherwise vanish the day the principal sets their own pronouns.
-    'For any other person, use the pronouns on their contact. If none are on file, use their name or they/them, and never infer pronouns from the name.',
-    'When the principal tells you what to call them, their pronouns or their title, save it with contact-update, contact_id "principal" (preferredName, pronouns, title).',
+    `- Pronouns: ${pronouns ? quoteProfileValue(pronouns) : 'not set'}`,
+    // One rule for everyone, so it stays when the principal's pronouns are set.
+    'Use the pronouns on file for anyone, the principal included. With none on file, use the name or they/them; never guess from a name.',
+    // The tool documents the "principal" alias; the prompt only says when to save.
+    'When the principal tells you their pronouns, preferred name or title, save it to their contact.',
   );
   return lines.join('\n');
 }

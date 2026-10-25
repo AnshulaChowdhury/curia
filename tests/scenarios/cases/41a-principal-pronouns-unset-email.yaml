@@ -1,6 +1,6 @@
 # Case 41a (#2226): the principal has no pronouns on file, and Curia writes to a third party
 # about them. Rule: `### Principal Profile` in `## Who you serve` (src/agents/principal-contact-block.ts)
-# says to use the name or they/them and never infer pronouns from the name.
+# says to use the name or they/them and never guess pronouns from a name.
 # Found in 5 of 15 runs of the principal-scheduling cases on deepseek/deepseek-v4.1-flash:
 # "Avery wants to connect... he'll move his own commitments".
 #
