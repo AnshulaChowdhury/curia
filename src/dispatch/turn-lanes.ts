@@ -336,10 +336,6 @@ export class TurnLanes {
   /** Runtime: take queued input. Tickets stay pending until confirmDrained or release. */
   takeQueued(taskEventId: string): InjectableInput[] {
     if (!this.enabled) return [];
-    return this.takeQueuedHeld(taskEventId);
-  }
-
-  private takeQueuedHeld(taskEventId: string): InjectableInput[] {
     const lane = this.laneHeldBy(taskEventId);
     if (!lane) return [];
     const taken = lane.queue.splice(0, lane.queue.length);
@@ -381,10 +377,6 @@ export class TurnLanes {
    */
   closeIfIdle(taskEventId: string): boolean {
     if (!this.enabled) return true;
-    return this.closeIfIdleHeld(taskEventId);
-  }
-
-  private closeIfIdleHeld(taskEventId: string): boolean {
     const lane = this.laneHeldBy(taskEventId);
     if (!lane) return true;
     if (lane.queue.length > 0) return false;
@@ -400,10 +392,6 @@ export class TurnLanes {
    */
   release(taskEventId: string): void {
     if (!this.enabled) return;
-    this.releaseHeld(taskEventId);
-  }
-
-  private releaseHeld(taskEventId: string): void {
     const found = this.findHeld(taskEventId);
     if (!found) return;
     const { conversationId, lane } = found;
@@ -480,13 +468,7 @@ export class TurnLanes {
   }
 
   private join(holder: LaneHolder, acquire: boolean): Promise<LaneGrant> {
-    return this.joinHeld(holder, acquire);
-  }
-
-  private joinHeld(holder: LaneHolder, acquire: boolean): Promise<LaneGrant> {
-    // Freeze the stamp before any map update. Later reads, including the
-    // fail-open timer, use this copy so a mutated caller object cannot move
-    // the waiter onto another conversation.
+    // Copy the stamp once; later reads use the copy.
     const stamped = copyHolder(holder);
     if (stamped.taskEventId.length === 0 || stamped.conversationId.length === 0) {
       this.logger.warn(
