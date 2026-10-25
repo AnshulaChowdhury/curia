@@ -952,9 +952,13 @@ class PostgresBackend implements KnowledgeGraphBackend {
     // filter sit closer (facts that name their entity, mostly), the matching nodes never
     // arrive (#2248). Ordering by the computed similarity rather than `embedding <=> $1`
     // keeps the index out, as NodeMergeService.candidates does; the filter then runs before
-    // any distance is computed. Graphs are thousands of nodes, where the scan costs a few
-    // milliseconds (measurements in #2248). hnsw.iterative_scan was rejected: it is still
-    // approximate, and missed matches in the #2238 measurements.
+    // any distance is computed. hnsw.iterative_scan and a partial index over non-fact nodes
+    // were measured and rejected: both still approximate, they returned 78-82% of the true
+    // top-k on clustered vectors (#2248).
+    // TODO(#2248): the scan costs about 15 ms (entities only) and 27 ms (sensitivity ceiling
+    // alone, which passes most rows) at 7.5k nodes, but 170 / 330 ms at 50k. Revisit
+    // (halfvec storage, or iterative_scan for the permissive sensitivity-only case) before
+    // graphs grow that large.
     const result = extraClauses.length === 0
       ? await this.pool.query<PgNodeRow & { similarity: number }>(
         `SELECT *, 1 - (embedding <=> $1::vector) AS similarity
