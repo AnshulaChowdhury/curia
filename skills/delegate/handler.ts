@@ -72,15 +72,28 @@ const INTERRUPTED_WAIT_MESSAGE =
   'The specialist is still working. Its result will arrive as a separate follow-up after this turn. Do not delegate this work again.';
 
 /** What the response promise resolves with: the specialist's text, and the message sends its
- *  runtime recorded (`agent.response.sends`; absent on a paused result). `interrupted` is set
- *  when a queued follow-up ended the wait before the specialist replied. */
+ *  runtime recorded (`agent.response.sends`; absent on a paused result). A queued follow-up
+ *  does not resolve this — it rejects `InterruptedWait`, because `bus.publish` of the
+ *  specialist task stays pending until that turn finishes. */
 interface SpecialistReply {
   content: string;
   sends?: string[];
-  interrupted?: {
-    delegateEventId: string;
-    delegateConversationId: string;
-  };
+}
+
+/** Rejected when a queued follow-up ends the wait (#2018). Not a specialist failure:
+ *  the catch maps it to `in_progress` and keeps the running claim. */
+interface InterruptedWait {
+  __interruptedWait: true;
+  delegateEventId: string;
+  delegateConversationId: string;
+}
+
+function isInterruptedWait(err: unknown): err is InterruptedWait {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as InterruptedWait).__interruptedWait === true
+  );
 }
 
 /** Sentinel shape rejected by the response promise when a specialist returns isError with
@@ -753,20 +766,21 @@ export class DelegateHandler implements ToolHandler {
           }
         }, specialistTimeoutMs);
 
-        // A queued same-contact follow-up ends the wait. The specialist task is
-        // still published below, and the running claim stays so its late result
-        // can be matched. This is not the timeout reason (#2018).
+        // A queued same-contact follow-up ends the wait. Reject, the way the
+        // timer does. Resolving would not release Promise.all: bus.publish of
+        // the specialist task stays pending until that turn finishes, so the
+        // late-delivery handle would be written only after the response it
+        // should catch. The claim stays so the late result can be matched.
+        // This is not the timeout reason (#2018).
         const endForInput = (): void => {
           if (settled) return;
           settled = true;
           clearTimeout(timeoutHandle);
-          resolve({
-            content: '',
-            interrupted: {
-              delegateEventId: taskEvent.id,
-              delegateConversationId: conversationId,
-            },
-          });
+          reject({
+            __interruptedWait: true,
+            delegateEventId: taskEvent.id,
+            delegateConversationId: conversationId,
+          } satisfies InterruptedWait);
         };
         const inputSignal = ctx.inputSignal;
         if (inputSignal) {
@@ -841,32 +855,14 @@ export class DelegateHandler implements ToolHandler {
       // while responsePromise had no rejection handler yet — causing an unhandledRejection
       // that crashes the process. Promise.all attaches handlers to both promises immediately,
       // closing that window. See: https://github.com/josephfung/curia/issues/73
-      // retainRunningClaim is set when the wait timer fires, and when a queued
-      // follow-up ends the wait. Both leave the specialist running. A specialist
-      // that reports reason 'timeout' does not, and retaining the claim would
-      // block the conversation until the sweep re-delivered the answer.
-      const [{ content: response, sends, interrupted }] = await Promise.all([
+      // retainRunningClaim for a timeout or an interrupted wait is set in the
+      // catch. Both leave the specialist running. A specialist that reports
+      // reason 'timeout' does not, and retaining the claim would block the
+      // conversation until the sweep re-delivered the answer.
+      const [{ content: response, sends }] = await Promise.all([
         responsePromise,
         ctx.bus.publish('dispatch', taskEvent),
       ]);
-      if (interrupted) {
-        retainRunningClaim = true;
-        ctx.log.info(
-          { targetAgent: agent, delegateEventId: interrupted.delegateEventId },
-          'Delegate wait ended because a follow-up was queued; the specialist keeps running',
-        );
-        return {
-          success: true,
-          data: {
-            agent,
-            in_progress: true,
-            reason: 'interrupted',
-            delegate_event_id: interrupted.delegateEventId,
-            delegate_conversation_id: interrupted.delegateConversationId,
-            message: INTERRUPTED_WAIT_MESSAGE,
-          },
-        };
-      }
       ctx.log.info({ targetAgent: agent }, 'Specialist responded');
 
       // Clarification protocol detection: the runtime emits a JSON response
@@ -1009,6 +1005,24 @@ export class DelegateHandler implements ToolHandler {
         },
       };
     } catch (err) {
+      if (isInterruptedWait(err)) {
+        retainRunningClaim = true;
+        ctx.log.info(
+          { targetAgent: agent, delegateEventId: err.delegateEventId },
+          'Delegate wait ended because a follow-up was queued; the specialist keeps running',
+        );
+        return {
+          success: true,
+          data: {
+            agent,
+            in_progress: true,
+            reason: 'interrupted',
+            delegate_event_id: err.delegateEventId,
+            delegate_conversation_id: err.delegateConversationId,
+            message: INTERRUPTED_WAIT_MESSAGE,
+          },
+        };
+      }
       if (isStructuredDelegateFailure(err)) {
         // The wait timer started the specialist and set delegateEventId. Keep
         // the claim so the timeout subscriber can promote it. A specialist

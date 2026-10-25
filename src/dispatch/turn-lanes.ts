@@ -397,7 +397,13 @@ export class TurnLanes {
     return { kind: 'queued', ticket: queued.ticket };
   }
 
-  /** Runtime: take queued input. Tickets stay pending until confirmDrained or release. */
+  /**
+   * Runtime: take queued input. Tickets stay pending until confirmDrained or release.
+   * A non-empty take replaces the input abort controller. Listeners that already
+   * hold the aborted signal stay aborted; the next `inputSignal()` is open until
+   * another follow-up is queued. An empty take leaves the controller alone, so a
+   * delegate already waiting on it still hears the next enqueue.
+   */
   takeQueued(taskEventId: string): InjectableInput[] {
     if (!this.enabled) return [];
     const lane = this.laneHeldBy(taskEventId);
@@ -408,6 +414,7 @@ export class TurnLanes {
       lane.pending.set(item.input.inboundEventId, item);
       inputs.push(item.input);
     }
+    if (taken.length > 0) lane.inputAbort = new AbortController();
     return inputs;
   }
 
@@ -563,9 +570,11 @@ export class TurnLanes {
   }
 
   /**
-   * Aborts when a follow-up is queued on this holder, and stays aborted.
-   * Call after acquire: a signal taken before this task holds the lane never
-   * aborts. An unknown task gets a signal that stays open.
+   * Aborts when a follow-up is queued on this holder. Taking that input
+   * replaces the controller, so this means "something is queued now", not
+   * "something was queued earlier in the turn". A signal already handed out
+   * stays aborted. Call after acquire: a signal taken before this task holds
+   * the lane never aborts. An unknown task gets a signal that stays open.
    */
   inputSignal(taskEventId: string): AbortSignal {
     if (!this.enabled) return this.idleSignal;

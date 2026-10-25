@@ -2019,6 +2019,45 @@ describe('DelegateHandler dispatch claim (#1893)', () => {
     expect(claim.releaseRunning).not.toHaveBeenCalled();
   });
 
+  it('ends the wait while the specialist publish is still in flight (#2018)', async () => {
+    const bus = new EventBus(logger);
+    let releaseSpecialist: (() => void) | undefined;
+    const specialist = new Promise<void>((resolve) => {
+      releaseSpecialist = resolve;
+    });
+    let entered = false;
+    bus.subscribe('agent.task', 'agent', async (event) => {
+      if (event.type !== 'agent.task') return;
+      entered = true;
+      await specialist;
+    });
+    const claim = holdingClaim();
+    const inputSignal = new AbortController();
+    const pending = handler.execute(makeCtx(
+      { agent: 'calendar', task: 'Book the room', timeout_ms: 60_000 },
+      { bus, agentRegistry: registry(), openDelegationLookup: claim.lookup, inputSignal: inputSignal.signal, ...origin() },
+    ));
+    await vi.waitFor(() => expect(entered).toBe(true));
+    inputSignal.abort();
+    const result = await pending;
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const data = result.data as {
+      in_progress?: boolean;
+      reason?: string;
+      failed?: boolean;
+      possibly_succeeded?: boolean;
+    };
+    expect(data.in_progress).toBe(true);
+    expect(data.reason).toBe('interrupted');
+    expect(data.failed).toBeUndefined();
+    expect(data.possibly_succeeded).toBeUndefined();
+    expect(claim.releaseRunning).not.toHaveBeenCalled();
+    expect(releaseSpecialist).toEqual(expect.any(Function));
+    releaseSpecialist!();
+  });
+
   it('a claim conflict does not dispatch, whatever the brief says', async () => {
     const { bus, published } = respondingBus('specialist done');
     const releaseRunning = vi.fn(async () => {});

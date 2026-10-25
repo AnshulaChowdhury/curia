@@ -393,7 +393,7 @@ describe('TurnLanes', () => {
       gate.release(a.taskEventId);
     });
 
-    it('aborts inputSignal on the first queued follow-up and leaves it aborted', async () => {
+    it('aborts inputSignal while a follow-up is queued and opens a fresh one once that input is taken', async () => {
       const gate = lanes();
       await gate.acquire(holder('a'));
       const signal = gate.inputSignal('task-a');
@@ -403,6 +403,23 @@ describe('TurnLanes', () => {
       expect(signal.aborted).toBe(true);
       expect(stranger.aborted).toBe(false);
       gate.takeQueued('task-a');
+      expect(signal.aborted).toBe(true);
+      const next = gate.inputSignal('task-a');
+      expect(next.aborted).toBe(false);
+      expect(next).not.toBe(signal);
+      gate.tryInject('conv-1', input({ inboundEventId: 'inbound-2' }));
+      expect(signal.aborted).toBe(true);
+      expect(next.aborted).toBe(true);
+      expect(stranger.aborted).toBe(false);
+    });
+
+    it('keeps the current inputSignal when takeQueued finds nothing', async () => {
+      const gate = lanes();
+      await gate.acquire(holder('a'));
+      const signal = gate.inputSignal('task-a');
+      expect(gate.takeQueued('task-a')).toEqual([]);
+      expect(gate.inputSignal('task-a')).toBe(signal);
+      gate.tryInject('conv-1', input());
       expect(signal.aborted).toBe(true);
     });
   });
