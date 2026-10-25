@@ -5,6 +5,8 @@ import {
   describerRefs,
   formatTally,
   hasDescriber,
+  isVisibleTool,
+  researchKind,
   type DescribeContext,
   type ToolCall,
 } from '../../../src/activity/describers.js';
@@ -59,6 +61,16 @@ describe('describeToolCall', () => {
     expect(describeToolCall(allDay, ctx())?.text).toBe('scheduled “Offsite” on Oct 31');
     expect(describeToolCall(allDay, ctx({}, 'Pacific/Honolulu'))?.text).toBe('scheduled “Offsite” on Oct 31');
     expect(describeToolCall(allDay, ctx({}, 'Pacific/Kiritimati'))?.text).toBe('scheduled “Offsite” on Oct 31');
+  });
+
+  it('treats Object.prototype names as unregistered tools', () => {
+    for (const name of ['constructor', 'toString', '__proto__']) {
+      expect(hasDescriber(name)).toBe(false);
+      expect(isVisibleTool(name)).toBe(false);
+      expect(researchKind(name)).toBeUndefined();
+      expect(describerRefs(call(name, {}, null))).toEqual([]);
+      expect(describeToolCall(call(name, {}, null), ctx())).toBeNull();
+    }
   });
 
   it('describes a failure as a "couldn\'t" line', () => {

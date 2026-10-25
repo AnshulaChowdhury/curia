@@ -575,9 +575,15 @@ const DESCRIBERS: Record<string, Describer> = {
   'activity-log': HIDDEN,
 };
 
+// Own keys only: DESCRIBERS is a plain object, so a tool named "constructor" or
+// "toString" would otherwise resolve to an Object.prototype member.
+function lookup(toolName: string): Describer | undefined {
+  return Object.hasOwn(DESCRIBERS, toolName) ? DESCRIBERS[toolName] : undefined;
+}
+
 /** True when the registry has an entry for this tool (hidden entries count). */
 export function hasDescriber(toolName: string): boolean {
-  return Object.hasOwn(DESCRIBERS, toolName);
+  return lookup(toolName) !== undefined;
 }
 
 /** Names of every tool with a describer. */
@@ -587,18 +593,18 @@ export function describedToolNames(): string[] {
 
 /** True when a successful call of this tool would show in the feed as a line or count. */
 export function isVisibleTool(toolName: string): boolean {
-  const d = DESCRIBERS[toolName];
+  const d = lookup(toolName);
   return d !== undefined && d.prominence !== 'hidden';
 }
 
 /** Research kind of a web tool, or undefined. */
 export function researchKind(toolName: string): ResearchKind | undefined {
-  return DESCRIBERS[toolName]?.research;
+  return lookup(toolName)?.research;
 }
 
 /** Name references a call needs resolved; empty for tools without a describer. */
 export function describerRefs(call: ToolCall): string[] {
-  return DESCRIBERS[call.toolName]?.refs?.(call) ?? [];
+  return lookup(call.toolName)?.refs?.(call) ?? [];
 }
 
 /**
@@ -606,7 +612,7 @@ export function describerRefs(call: ToolCall): string[] {
  * then treats it as hidden.
  */
 export function describeToolCall(call: ToolCall, ctx: DescribeContext): ToolDescription | null {
-  const d = DESCRIBERS[call.toolName];
+  const d = lookup(call.toolName);
   if (!d) return null;
   const base = { tally: d.tally, research: d.research };
   if (d.prominence === 'hidden') return { prominence: 'hidden', text: '', ...base };
