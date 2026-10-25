@@ -1927,6 +1927,18 @@ async function main(): Promise<void> {
     );
   }
 
+  // Built before the email adapters so a same-thread follow-up can be released
+  // at the dispatcher's decision. The flag still defaults off.
+  const turnInjection = resolveTurnInjectionConfig(yamlConfig.dispatch);
+  const turnLanes = new TurnLanes({
+    enabled: turnInjection.enabled,
+    maxInjectionsPerTurn: turnInjection.maxInjectionsPerTurn,
+    extraRoundsPerInjection: turnInjection.extraRoundsPerInjection,
+    laneWaitTimeoutMs: turnInjection.laneWaitTimeoutMs,
+    logger,
+  });
+  logger.info({ enabled: turnInjection.enabled }, 'Turn lanes initialized');
+
   // Construct one EmailAdapter per resolved account (but don't start any yet —
   // adapters must not poll until the dispatcher is registered, otherwise inbound.message
   // events have no subscriber and are permanently dropped because each adapter advances
@@ -1964,6 +1976,7 @@ async function main(): Promise<void> {
         // Replay this account's unacknowledged inbound.message rows before the
         // first poll, so a deploy cannot leave write-ahead mail behind the watermark.
         unacknowledgedInbound: auditLogger,
+        turnLanes,
       }));
     }
     // Divergence guard (#964): the registry gate marked email enabled + resolvable, yet no
@@ -2734,14 +2747,6 @@ async function main(): Promise<void> {
   // assembleAgent() so smoke, scenarios and the render script get the same agents.
   // `browserService` is a reassigned `let`; the liveness closure needs a stable binding.
   const assemblyBrowserService = browserService;
-  const turnInjection = resolveTurnInjectionConfig(yamlConfig.dispatch);
-  const turnLanes = new TurnLanes({
-    enabled: turnInjection.enabled,
-    maxInjectionsPerTurn: turnInjection.maxInjectionsPerTurn,
-    laneWaitTimeoutMs: turnInjection.laneWaitTimeoutMs,
-    logger,
-  });
-  logger.info({ enabled: turnInjection.enabled }, 'Turn lanes initialized');
   const assemblyContext: AgentAssemblyContext = {
     logger,
     bus,

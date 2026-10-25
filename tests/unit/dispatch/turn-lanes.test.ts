@@ -24,6 +24,7 @@ function lanes(overrides: { enabled?: boolean; max?: number; timeoutMs?: number;
   return new TurnLanes({
     enabled: overrides.enabled ?? true,
     maxInjectionsPerTurn: overrides.max ?? 5,
+    extraRoundsPerInjection: 2,
     laneWaitTimeoutMs: overrides.timeoutMs ?? 60_000,
     logger: overrides.logger ?? pino({ level: 'silent' }),
   });

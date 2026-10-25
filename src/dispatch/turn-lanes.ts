@@ -131,6 +131,8 @@ interface Intake {
 export interface TurnLanesOptions {
   enabled: boolean;
   maxInjectionsPerTurn: number;
+  /** Extra tool-loop rounds granted per drained follow-up. The runtime reads this. */
+  extraRoundsPerInjection: number;
   laneWaitTimeoutMs: number;
   logger: Logger;
 }
@@ -250,7 +252,10 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
  */
 export class TurnLanes {
   readonly enabled: boolean;
-  private readonly maxInjectionsPerTurn: number;
+  /** Cap on follow-ups accepted onto one hold. The runtime sizes maxRounds from this. */
+  readonly maxInjectionsPerTurn: number;
+  /** Added to the turn budget once per drained follow-up. */
+  readonly extraRoundsPerInjection: number;
   private readonly laneWaitTimeoutMs: number;
   private readonly logger: Logger;
   private readonly lanes = new Map<string, Lane>();
@@ -274,11 +279,15 @@ export class TurnLanes {
     if (!Number.isInteger(opts.maxInjectionsPerTurn) || opts.maxInjectionsPerTurn <= 0) {
       throw new Error(`turn lanes: maxInjectionsPerTurn must be a positive integer, got: ${opts.maxInjectionsPerTurn}`);
     }
+    if (!Number.isInteger(opts.extraRoundsPerInjection) || opts.extraRoundsPerInjection <= 0) {
+      throw new Error(`turn lanes: extraRoundsPerInjection must be a positive integer, got: ${opts.extraRoundsPerInjection}`);
+    }
     if (!Number.isInteger(opts.laneWaitTimeoutMs) || opts.laneWaitTimeoutMs <= 0) {
       throw new Error(`turn lanes: laneWaitTimeoutMs must be a positive integer, got: ${opts.laneWaitTimeoutMs}`);
     }
     this.enabled = opts.enabled;
     this.maxInjectionsPerTurn = opts.maxInjectionsPerTurn;
+    this.extraRoundsPerInjection = opts.extraRoundsPerInjection;
     this.laneWaitTimeoutMs = opts.laneWaitTimeoutMs;
     this.logger = opts.logger;
   }

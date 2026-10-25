@@ -5,8 +5,9 @@ import {
   type StreamingTurnOpenStreamParams,
 } from './llm/streaming-turn.js';
 import type { EventBus } from '../bus/bus.js';
-import { createAgentResponse, createAgentError, createToolInvoke, createToolResult, createLlmCall, createLlmError, createContextBudget, createModelFallbackEngaged, createDelegationTimedOut, createDelegationRequesterContext, createDelegationPrincipalNote, type AgentResponseFailureReason, type AgentTaskEvent } from '../bus/events.js';
+import { createAgentResponse, createAgentError, createToolInvoke, createToolResult, createLlmCall, createLlmError, createContextBudget, createModelFallbackEngaged, createDelegationTimedOut, createDelegationRequesterContext, createDelegationPrincipalNote, createAgentTaskInputInjected, isInjectionDrainPoint, type AgentResponseFailureReason, type AgentTaskEvent, type InjectionDrainPoint } from '../bus/events.js';
 import { holderFromAgentTask, type TurnLanes } from '../dispatch/turn-lanes.js';
+import { frameInjectedInput } from './injected-input.js';
 import type { Tier } from './llm/model-router.js';
 import { ContextBudget } from './llm/context-budget.js';
 import { DEFAULT_SAFETY_MARGIN } from './llm/token-estimator.js';
@@ -1648,16 +1649,76 @@ export class AgentRuntime {
       let lastLlmUsage: LLMUsage | undefined;
       let lastLlmProvenance: LLMCallProvenance | undefined;
 
+      // Same-contact follow-ups join this turn only when the lane is on and
+      // this task holds it. The flag check is first so a disabled lane is
+      // never asked (#2018, R-1). liveTurn starts as the task stamped it and
+      // moves to true only for a live follow-up on a principal host.
+      const lanes = this.config.turnLanes;
+      const laned = lanes?.enabled === true && lanes.isLaned(taskEvent.payload);
+      const turnState = { liveTurn: taskEvent.payload.liveTurn === true };
+      const hostIsPrincipal = laned && holderFromAgentTask(taskEvent).originatorIsPrincipal === true;
+      const drainInjected = async (drainPoint: InjectionDrainPoint): Promise<Message[]> => {
+        if (!laned || !lanes) return [];
+        const inputs = lanes.takeQueued(taskEvent.id);
+        if (inputs.length === 0) return [];
+        const framed: Message[] = [];
+        const ids: string[] = [];
+        for (const input of inputs) {
+          if (memory) {
+            await memory.addTurn(conversationId, agentId, { role: 'user', content: input.originalContent }, {
+              senderContactId: input.senderContactId,
+              channelId: input.channelId,
+              synthetic: false,
+              injectedIntoTaskId: taskEvent.id,
+            });
+          }
+          await bus.publish('agent', createAgentTaskInputInjected({
+            hostTaskEventId: taskEvent.id,
+            inboundEventId: input.inboundEventId,
+            conversationId,
+            agentId,
+            drainPoint,
+            senderContactId: input.senderContactId,
+          }));
+          budget.maxTurns += lanes.extraRoundsPerInjection;
+          if (input.liveTurn && hostIsPrincipal) turnState.liveTurn = true;
+          // Ids only. The body, the label, and the guidance stay off the log.
+          logger.info(
+            {
+              agentId,
+              conversationId,
+              hostTaskEventId: taskEvent.id,
+              inboundEventId: input.inboundEventId,
+              senderContactId: input.senderContactId,
+              drainPoint,
+            },
+            'Drained a same-contact follow-up into the live turn',
+          );
+          framed.push(frameInjectedInput(input, {
+            exitDrain: drainPoint === 'exit',
+            timezone: this.config.timezone,
+          }));
+          ids.push(input.inboundEventId);
+        }
+        lanes.confirmDrained(taskEvent.id, ids);
+        return framed;
+      };
+
       // Text turns are intentionally non-cancellable today (same as pre-#1563):
       // chatWithRetry does not take an AbortSignal, and openStream ignores
       // params.signal. The controller is kept reachable as a required-arg
       // placeholder for a future turn-level cancel/timeout.
       const turnAbort = new AbortController();
+      const injectionRoom = laned && lanes
+        ? lanes.maxInjectionsPerTurn * lanes.extraRoundsPerInjection + 1
+        : 0;
       const streamResult = await runStreamingToolLoop(messages, {
         provider,
         model: streamModel,
         tools: workingToolDefs,
-        maxRounds: budget.maxTurns,
+        // The allowance is fixed at the start. Draining later raises budget.maxTurns;
+        // maxRounds already includes every follow-up this hold can accept.
+        maxRounds: budget.maxTurns + injectionRoom,
         signal: turnAbort.signal,
         logger,
         openStream: async function* (this: AgentRuntime, params: StreamingTurnOpenStreamParams) {
@@ -1702,7 +1763,29 @@ export class AgentRuntime {
               );
             }
             maybeAppendCheckpointBudgetNudge(workingMessages);
+            if (!laned) return;
+            const drainPoint = round === 0 ? 'turn_start' : `round:${round}`;
+            if (!isInjectionDrainPoint(drainPoint)) return;
+            const drained = await drainInjected(drainPoint);
+            for (const message of drained) workingMessages.push(message);
           },
+          ...(laned && lanes ? {
+            beforeFinish: async (): Promise<{ action: 'finish' } | { action: 'continue'; append: Message[] }> => {
+              if (lanes.closeIfIdle(taskEvent.id)) return { action: 'finish' };
+              // The budget was already spent. Return the follow-up so it runs
+              // as the next turn instead of being dropped. This release is
+              // before the assistant row is persisted; a returned follow-up
+              // can read history before that write settles (#2018).
+              if (budget.turnsUsed + 1 >= budget.maxTurns) {
+                this.releaseLane(taskEvent.id);
+                return { action: 'finish' };
+              }
+              const append = await drainInjected('exit');
+              if (append.length === 0) return { action: 'finish' };
+              budget.turnsUsed += 1;
+              return { action: 'continue', append };
+            },
+          } : {}),
           onToolUse: async ({ toolCalls, messages: workingMessages }) => {
             // Match former while-loop order: increment, nudge (uses updated
             // turnsUsed), then enforce maxTurns before invoking tools.
@@ -2034,7 +2117,7 @@ export class AgentRuntime {
             conversationId,
             parentEventId: invokeEvent.id,
             taskMetadata: taskEvent.payload.metadata,
-            liveTurn: taskEvent.payload.liveTurn,
+            liveTurn: turnState.liveTurn,
             delegationGuard,
             turnDateResolveResults: turnDateResolveTracker.snapshot(),
             senderId: taskEvent.payload.senderId,

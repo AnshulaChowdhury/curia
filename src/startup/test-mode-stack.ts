@@ -989,6 +989,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     const turnLanes = new TurnLanes({
       enabled: turnInjection.enabled,
       maxInjectionsPerTurn: turnInjection.maxInjectionsPerTurn,
+      extraRoundsPerInjection: turnInjection.extraRoundsPerInjection,
       laneWaitTimeoutMs: turnInjection.laneWaitTimeoutMs,
       logger,
     });

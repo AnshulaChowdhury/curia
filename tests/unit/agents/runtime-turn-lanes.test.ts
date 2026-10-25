@@ -69,6 +69,7 @@ function lanes(enabled: boolean, logger = pino({ level: 'silent' }), timeoutMs =
   return new TurnLanes({
     enabled,
     maxInjectionsPerTurn: 5,
+    extraRoundsPerInjection: 2,
     laneWaitTimeoutMs: timeoutMs,
     logger,
   });
