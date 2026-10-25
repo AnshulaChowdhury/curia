@@ -29,6 +29,19 @@ export type InfraLlmResult =
   | { ok: true; text: string }
   | { ok: false; error: string };
 
+export interface InfraLlmExtractOptions {
+  maxTokens?: number;
+  /** For vision: base64 image + MIME type. */
+  image?: { base64: string; mediaType: string };
+  /**
+   * Model tier. Default 'standard'. Pick 'fast' for short structured verdicts: every call
+   * here asks for no reasoning, but a model whose registry entry can't turn reasoning off
+   * (the standard tier can be one) ignores that and may spend the whole output budget
+   * thinking. The shadow judge did exactly that for a month (#2191).
+   */
+  tier?: 'fast' | 'standard';
+}
+
 /**
  * Constrained LLM interface exposed to skills via ctx.infraLlm.
  * Only classify and extract operations — no raw chat.
@@ -37,12 +50,8 @@ export interface InfraLlm {
   /** Quick yes/no classification — routed to 'fast' tier. */
   classify(prompt: string): Promise<InfraLlmResult>;
 
-  /** Structured extraction — routed to 'standard' tier. */
-  extract(prompt: string, options?: {
-    maxTokens?: number;
-    /** For vision: base64 image + MIME type. */
-    image?: { base64: string; mediaType: string };
-  }): Promise<InfraLlmResult>;
+  /** Structured extraction — routed to the 'standard' tier unless `tier` says otherwise. */
+  extract(prompt: string, options?: InfraLlmExtractOptions): Promise<InfraLlmResult>;
 }
 
 /**
@@ -122,10 +131,10 @@ export class InfraLlmService {
 
   private async doExtract(
     prompt: string,
-    options: { maxTokens?: number; image?: { base64: string; mediaType: string } } | undefined,
+    options: InfraLlmExtractOptions | undefined,
     scope: InfraLlmScope,
   ): Promise<InfraLlmResult> {
-    const resolved = this.modelRouter.resolve('standard');
+    const resolved = this.modelRouter.resolve(options?.tier ?? 'standard');
     const start = Date.now();
 
     // Build message — plain text or mixed vision content

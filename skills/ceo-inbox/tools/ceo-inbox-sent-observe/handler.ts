@@ -608,11 +608,13 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
         chunks.push(judgePairs.slice(i, i + JUDGE_CHUNK_SIZE));
       }
 
-      // No maxTokens override: the infraLlm default leaves room for the model's reasoning
-      // tokens, which the old 1500 cap did not (#2191).
+      // Fast tier, so the judge runs with reasoning off. The standard tier can't turn reasoning
+      // off, and on this task it reasoned through the whole output budget, 4000 tokens and
+      // three retries, and returned no verdict, which also overran the tool timeout (#2191).
+      // The default token budget is ample for a verdict array.
       const verdicts = await Promise.all(
         chunks.map(async (chunk, chunkIndex) => {
-          const res = await infraLlm.extract(buildShadowJudgePrompt(chunk));
+          const res = await infraLlm.extract(buildShadowJudgePrompt(chunk), { tier: 'fast' });
           const judged = res.ok
             ? parseShadowJudgeResult(res.text, chunk.map((p) => p.sourceMessageId))
             : null;
