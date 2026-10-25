@@ -1662,7 +1662,6 @@ export class AgentRuntime {
         const inputs = lanes.takeQueued(taskEvent.id);
         if (inputs.length === 0) return [];
         const framed: Message[] = [];
-        const ids: string[] = [];
         for (const input of inputs) {
           if (memory) {
             await memory.addTurn(conversationId, agentId, { role: 'user', content: input.originalContent }, {
@@ -1698,9 +1697,10 @@ export class AgentRuntime {
             exitDrain: drainPoint === 'exit',
             timezone: this.config.timezone,
           }));
-          ids.push(input.inboundEventId);
+          // Confirm this input before the next one. A throw later must not
+          // send an already-stored follow-up back as its own turn.
+          lanes.confirmDrained(taskEvent.id, [input.inboundEventId]);
         }
-        lanes.confirmDrained(taskEvent.id, ids);
         return framed;
       };
 
@@ -1772,12 +1772,10 @@ export class AgentRuntime {
           ...(laned && lanes ? {
             beforeFinish: async (): Promise<{ action: 'finish' } | { action: 'continue'; append: Message[] }> => {
               if (lanes.closeIfIdle(taskEvent.id)) return { action: 'finish' };
-              // The budget was already spent. Return the follow-up so it runs
-              // as the next turn instead of being dropped. This release is
-              // before the assistant row is persisted; a returned follow-up
-              // can read history before that write settles (#2018).
+              // The budget was already spent. Leave the follow-up queued.
+              // publishAgentResponse releases after the assistant row is stored,
+              // and that release returns the ticket as holder_ended (ADR-053 §5).
               if (budget.turnsUsed + 1 >= budget.maxTurns) {
-                this.releaseLane(taskEvent.id);
                 return { action: 'finish' };
               }
               const append = await drainInjected('exit');

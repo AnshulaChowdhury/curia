@@ -1091,6 +1091,9 @@ export class EmailAdapter implements Channel {
         },
       )
       .finally(() => {
+        // The dispatcher settles intake after it accepts the inbound. A
+        // write-ahead failure never gets there, and this call is idempotent.
+        if (lanes?.enabled) lanes.markIntakeSettled(item.event.id);
         this.releaseRunningThread(conversationId, item.messageId);
         this.inFlightTurns -= 1;
         this.inFlightStartedAt.delete(item.messageId);

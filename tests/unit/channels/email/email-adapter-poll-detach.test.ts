@@ -354,6 +354,38 @@ describe('EmailAdapter — poll does not wait for the agent turn (#2254)', () =>
     await adapter.stop();
   });
 
+  it('settles intake when the inbound publish fails so the thread can continue', async () => {
+    const mocks = createMocks();
+    const lanes = new TurnLanes({
+      enabled: true,
+      maxInjectionsPerTurn: 5,
+      extraRoundsPerInjection: 2,
+      laneWaitTimeoutMs: 60_000,
+      logger: pino({ level: 'silent' }),
+    });
+    const adapter = makeAdapter(mocks, { maxConcurrentTurns: 4, turnLanes: lanes });
+    const publish = mocks.bus.publish as ReturnType<typeof vi.fn>;
+    const started: string[] = [];
+    publish.mockImplementation((_layer: string, event: BusEvent) => {
+      const id = inboundId(event);
+      if (!id) return Promise.resolve();
+      started.push(id);
+      if (id === 'first') return Promise.reject(new Error('write-ahead failed'));
+      return Promise.resolve();
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      makeMockMessage({ id: 'first', threadId: 'thread-same', from: [{ email: 'ada@example.com' }] }),
+      makeMockMessage({ id: 'second', threadId: 'thread-same', from: [{ email: 'ada@example.com' }] }),
+    ]);
+
+    await adapter.start();
+    await vi.waitFor(() => {
+      expect(started).toEqual(['first', 'second']);
+    });
+    await adapter.drainInFlight();
+    await adapter.stop();
+  });
+
   it('caps concurrent turns and continues the oldest waiting thread first', async () => {
     const mocks = createMocks();
     const adapter = makeAdapter(mocks, { maxConcurrentTurns: 1 });

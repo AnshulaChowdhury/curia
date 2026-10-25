@@ -77,6 +77,11 @@ interface HarnessOptions {
   contacts?: Record<string, ReturnType<typeof person>>;
   unresolved?: boolean;
   scannerFindings?: boolean;
+  /** Scanner throws. The message is still dispatched, and it must not join a turn. */
+  scannerThrows?: boolean;
+  /** No scanner configured. Same admission result as a throw. */
+  scannerAbsent?: boolean;
+  errorBudget?: { maxTurns: number; maxConsecutiveErrors: number };
   memory?: WorkingMemory;
   execution?: boolean;
   /** Default true. Turn-start and thrown-host cases must not wait on the model. */
@@ -115,15 +120,29 @@ function harness(options: HarnessOptions = {}) {
       return contacts[senderId] ?? { resolved: false, channel, senderId };
     },
   } as unknown as ContactResolver;
-  const scanner = options.scannerFindings
-    ? {
-        scan: (raw: string) => ({
-          sanitizedContent: raw,
-          riskScore: 1,
-          findings: [{ pattern: 'ignore', match: 'ignore' }],
-        }),
-      } as unknown as InboundScanner
-    : undefined;
+  const scanner = options.scannerAbsent
+    ? undefined
+    : options.scannerThrows
+      ? {
+          scan: () => {
+            throw new Error('scanner blew up');
+          },
+        } as unknown as InboundScanner
+      : options.scannerFindings
+        ? {
+            scan: (raw: string) => ({
+              sanitizedContent: raw,
+              riskScore: 1,
+              findings: [{ pattern: 'ignore', match: 'ignore' }],
+            }),
+          } as unknown as InboundScanner
+        : {
+            scan: (raw: string) => ({
+              sanitizedContent: raw,
+              riskScore: 0,
+              findings: [],
+            }),
+          } as unknown as InboundScanner;
   const invokes: Array<{ liveTurn?: boolean; taskMetadata?: Record<string, unknown> }> = [];
   const execution = {
     invoke: vi.fn(async (_name: string, _input: unknown, _caller: unknown, invokeOptions: { liveTurn?: boolean; taskMetadata?: Record<string, unknown> }) => {
@@ -164,6 +183,7 @@ function harness(options: HarnessOptions = {}) {
     turnLanes: lanes,
     memory,
     timezone: 'America/Toronto',
+    ...(options.errorBudget ? { errorBudget: options.errorBudget } : {}),
     ...(options.execution === false ? {} : { executionLayer: execution }),
   }).register();
 
@@ -420,6 +440,84 @@ describe('turn injection (#2018)', () => {
     flagged.held.resolve();
     await Promise.all([a, b]);
     expect(flagged.injected).toHaveLength(0);
+  });
+
+  it('does not inject when the scanner throws or is not configured', async () => {
+    const thrown = harness({ scannerThrows: true });
+    thrown.script.push(text('one'), text('two'));
+    const host = thrown.bus.publish('channel', thrown.inbound('host'));
+    await vi.waitFor(() => expect(thrown.chats).toHaveLength(1));
+    const follow = thrown.bus.publish('channel', thrown.inbound('use email'));
+    await vi.waitFor(() => expect(thrown.tasks).toHaveLength(2));
+    expect(thrown.tryInject).not.toHaveBeenCalled();
+    thrown.held.resolve();
+    await Promise.all([host, follow]);
+    expect(thrown.injected).toHaveLength(0);
+    expect(thrown.tasks.filter((task) => task.payload.content.includes('use email'))).toHaveLength(1);
+
+    const absent = harness({ scannerAbsent: true });
+    absent.script.push(text('one'), text('two'));
+    const absentHost = absent.bus.publish('channel', absent.inbound('host'));
+    await vi.waitFor(() => expect(absent.chats).toHaveLength(1));
+    const absentFollow = absent.bus.publish('channel', absent.inbound('use email'));
+    await vi.waitFor(() => expect(absent.tasks).toHaveLength(2));
+    expect(absent.tryInject).not.toHaveBeenCalled();
+    absent.held.resolve();
+    await Promise.all([absentHost, absentFollow]);
+    expect(absent.injected).toHaveLength(0);
+  });
+
+  it('a budget-exhausted exit keeps the follow-up until the assistant row is stored', async () => {
+    const h = harness({ errorBudget: { maxTurns: 1, maxConsecutiveErrors: 5 } });
+    h.script.push(text('host reply'), text('follow-up reply'));
+    const host = h.bus.publish('channel', h.inbound('start'));
+    await vi.waitFor(() => expect(h.chats).toHaveLength(1));
+    const followEvent = h.inbound('use email');
+    const follow = h.bus.publish('channel', followEvent);
+    await vi.waitFor(() => {
+      expect(h.tryInject.mock.results.some((result) => result.type === 'return' && result.value.kind === 'queued')).toBe(true);
+    });
+    h.held.resolve();
+    await Promise.all([host, follow]);
+    expect(h.tasks).toHaveLength(2);
+    expect(h.injected).toHaveLength(0);
+    expect(h.responses.map((event) => event.payload.content)).toContain('host reply');
+    const followChat = h.chats.find((messages) => transcript(messages).includes('use email'));
+    expect(followChat).toBeDefined();
+    expect(transcript(followChat)).toContain('host reply');
+  });
+
+  it('confirms each drained follow-up before persisting the next', async () => {
+    const memory = WorkingMemory.createInMemory();
+    const original = memory.addTurn.bind(memory);
+    let injectedWrites = 0;
+    vi.spyOn(memory, 'addTurn').mockImplementation(async (...args) => {
+      const opts = args[3];
+      if (opts?.injectedIntoTaskId) {
+        injectedWrites += 1;
+        if (injectedWrites === 2) throw new Error('second persist failed');
+      }
+      return original(...args);
+    });
+    const h = harness({ memory, execution: true });
+    h.script.push(toolUse('lookup'), text('host reply'), text('own turn'));
+    const host = h.bus.publish('channel', h.inbound('start'));
+    await vi.waitFor(() => expect(h.chats).toHaveLength(1));
+    const firstEvent = h.inbound('first follow');
+    const secondEvent = h.inbound('second follow');
+    const first = h.bus.publish('channel', firstEvent);
+    const second = h.bus.publish('channel', secondEvent);
+    await vi.waitFor(() => {
+      const queued = h.tryInject.mock.results.filter((result) => result.type === 'return' && result.value.kind === 'queued');
+      expect(queued).toHaveLength(2);
+    });
+    h.held.resolve();
+    await Promise.all([host, first, second]);
+    const turns = await memory.getHistory('email:thread-1', 'coordinator', { raw: true });
+    expect(turns.filter((turn) => turn.content === 'first follow')).toHaveLength(1);
+    expect(h.tasks.filter((task) => task.payload.content.includes('first follow'))).toHaveLength(0);
+    expect(h.tasks.filter((task) => task.payload.content.includes('second follow'))).toHaveLength(1);
+    expect(h.injected.map((event) => event.payload.inboundEventId)).toEqual([firstEvent.id]);
   });
 
   it('R-12: an injected follow-up does not create a second routing task', async () => {
