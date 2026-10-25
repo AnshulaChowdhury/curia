@@ -23,6 +23,37 @@ describe('coordinator scenario cases', () => {
     expect(cases.length).toBeGreaterThanOrEqual(10);
   });
 
+  it('case 26 scores a text-button click as a miss and leaves other session actions on the choice page (#2018)', () => {
+    const scenario = cases.find(c => c.sourceFile.endsWith('26-mid-turn-correction.yaml'));
+    expect(scenario).toBeDefined();
+    if (!scenario) return;
+    const page = (args: Record<string, unknown>): string => {
+      const stub = matchToolStub('web-browser', args, scenario.toolStubs);
+      const content = (stub?.return as { content?: unknown } | undefined)?.content;
+      return typeof content === 'string' ? content : '';
+    };
+    const session = { session_id: 's-26' };
+    expect(page({ ...session, action: 'click', selector: '[g1f0e2]' })).toContain('Check your email');
+    expect(page({ ...session, action: 'click', selector: 'g1f0e2' })).toContain('Check your email');
+    expect(page({ ...session, action: 'click', selector: '[g1f0e1]' })).toContain('Check your phone');
+    expect(page({ ...session, action: 'click', selector: 'g1f0e1' })).toContain('Check your phone');
+    const other = page({ ...session, action: 'click', selector: 'button:has-text("Text me the code")' });
+    expect(other).toContain('How should we send');
+    expect(other).not.toContain('Check your email');
+    const critical = scenario.expectedBehaviors.filter(b => b.weight === 'critical').map(b => b.check);
+    expect(critical).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'any_of',
+        checks: [
+          expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { action: 'click', selector: '[g1f0e2]' } }),
+          expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { action: 'click', selector: 'g1f0e2' } }),
+        ],
+      }),
+      expect.objectContaining({ kind: 'not_called', tools: ['web-browser'], with: { action: 'click', selector: '[g1f0e1]' } }),
+      expect.objectContaining({ kind: 'not_called', tools: ['web-browser'], with: { action: 'click', selector: 'g1f0e1' } }),
+    ]));
+  });
+
   it('cover the ten behaviors #1956 names', () => {
     // Case files are numbered by the issue's list; every number must be present.
     const numbers = new Set(cases.map(c => Number(path.basename(c.sourceFile).slice(0, 2))));

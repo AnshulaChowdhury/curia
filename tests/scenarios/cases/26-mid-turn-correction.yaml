@@ -11,9 +11,12 @@
 # what switches the channel to email. A pending email row would already tell the
 # coordinator to read the code from the inbox.
 #
-# The attractive wrong path is sms-send, which human-channels lets succeed. The
-# page offers text and email; the opening message asks for text; the follow-up
-# switches to email, which the sign-in block reads from the inbox via ceo-inbox
+# The attractive wrong path is clicking "Text me the code". The page offers both
+# buttons and the opening message asks for text. An unmatched action on the
+# session stays on that page: returning the emailed page would score a text click
+# in an unlisted selector form as email chosen. sms-send is a second wrong path;
+# human-channels lets it succeed. The follow-up switches to email, which the
+# sign-in block reads from the inbox via ceo-inbox
 # (src/agents/prompts/verification-block.ts: "Email codes: delegate the read to
 # ceo-inbox.").
 #
@@ -25,7 +28,8 @@ description: >
   button. While Curia is still on that page, the principal sends a second message:
   use email for the code, not SMS. Curia chooses email, asks ceo-inbox to read the
   code from the inbox, and the reply says the code is coming by email because the
-  principal changed their mind. Curia does not send an SMS.
+  principal changed their mind. Curia clicks "Email me the code", does not
+  click "Text me the code", and does not send an SMS.
 tags: [turn-injection, signin, browser]
 release_gate: false
 runs: 3
@@ -103,8 +107,10 @@ tool_stubs:
         verification_suspected: { page_domain: example-benefits.ca, signals: [one-time-code-input] }
     - match: { action: click, selector: "g1f0e1" }
       return: *texted
+    # Still the choice page. The emailed page is only the email-button stubs above,
+    # so a click in some other selector form is not told that email was chosen.
     - match: { session_id: s-26 }
-      return: *emailed
+      return: *choice
   delegate:
     - match: { agent: ceo-inbox }
       return:
@@ -202,9 +208,30 @@ expected_behaviors:
     check:
       called: delegate
       with: { agent: ceo-inbox }
+  - id: clicks_email
+    weight: critical
+    description: Clicks "Email me the code", as [g1f0e2] or the bare ref.
+    check:
+      any_of:
+        - called: web-browser
+          with: { action: click, selector: "[g1f0e2]" }
+        - called: web-browser
+          with: { action: click, selector: "g1f0e2" }
+  - id: does_not_click_text
+    weight: critical
+    description: Does not click "Text me the code" ([g1f0e1]). That click asks the site to text the code.
+    check:
+      not_called: [web-browser]
+      with: { action: click, selector: "[g1f0e1]" }
+  - id: does_not_click_text_bare_ref
+    weight: critical
+    description: Does not click "Text me the code" as the bare ref g1f0e1.
+    check:
+      not_called: [web-browser]
+      with: { action: click, selector: "g1f0e1" }
   - id: does_not_text
     weight: critical
-    description: Does not send an SMS. Texting was the original ask, and sms-send succeeds, so it is a real choice.
+    description: Does not send an SMS. sms-send succeeds, so it is a real choice, separate from the site texting a code.
     check:
       not_called: [sms-send]
   - id: acknowledges_the_switch
