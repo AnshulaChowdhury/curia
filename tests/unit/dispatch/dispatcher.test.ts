@@ -2976,6 +2976,7 @@ describe('a failed task publish releases the lane (#2018)', () => {
     const lanes = new TurnLanes({
       enabled: true,
       maxInjectionsPerTurn: 5,
+      extraRoundsPerInjection: 2,
       laneWaitTimeoutMs: 60_000,
       logger,
     });
