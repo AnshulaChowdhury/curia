@@ -3764,7 +3764,7 @@ export class AgentRuntime {
   ): Promise<void> {
     const { agentId } = this.config;
     const { conversationId } = taskEvent.payload;
-    const structuredFailure = agentErr ? mapAgentErrorToResponseFields(agentErr) : undefined
+    const structuredFailure = agentErr ? mapAgentErrorToResponseFields(agentErr) : undefined;
     const failedSkillsFields =
       handoff && handoff.failedSkills.length > 0
         ? {

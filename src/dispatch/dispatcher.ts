@@ -1192,10 +1192,12 @@ export class Dispatcher {
     // publish below. Awaiting it here would wait for a grant that nothing else
     // can settle until this function reaches that publish.
     const lanes = this.turnLanes;
+    let reserved = false;
     if (lanes?.enabled && lanes.isLaned(taskEvent.payload)) {
       void lanes.reserve(holderFromAgentTask(taskEvent, {
         originatorResolved: senderContext?.resolved === true,
       }));
+      reserved = true;
     }
 
     // Store routing info keyed by the task event ID so we can look it up
@@ -1215,7 +1217,20 @@ export class Dispatcher {
       senderLabel: senderContext?.resolved ? senderContext.displayName : payload.senderId,
     });
 
-    await this.bus.publish('dispatch', taskEvent);
+    try {
+      await this.bus.publish('dispatch', taskEvent);
+    } catch (err) {
+      // writeAhead rejects before any subscriber. Nothing else will release
+      // this reservation, and a leaked hold makes every later message on the
+      // conversation wait out the fail-open and then run without the lane.
+      if (reserved && lanes) lanes.release(taskEvent.id);
+      this.taskRouting.delete(taskEvent.id);
+      this.logger.error(
+        { err, taskEventId: taskEvent.id, conversationId: payload.conversationId },
+        'Task publish failed — released the turn lane',
+      );
+      throw err;
+    }
   }
 
   private async handleAgentError(event: AgentErrorEvent): Promise<void> {

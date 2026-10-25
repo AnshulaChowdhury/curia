@@ -2961,3 +2961,72 @@ describe('content-block rewrite acquires the lane (R-3, #2018)', () => {
     ]);
   }, 5_000);
 });
+
+describe('a failed task publish releases the lane (#2018)', () => {
+  it('grants the next holder immediately when write-ahead throws', async () => {
+    const logger = createLogger('error');
+    let failedTaskId: string | undefined;
+    const bus = new EventBus(logger, async (event) => {
+      if (event.type === 'agent.task' && failedTaskId === undefined) {
+        failedTaskId = event.id;
+        throw new Error('audit write failed');
+      }
+    });
+    const lanes = new TurnLanes({
+      enabled: true,
+      maxInjectionsPerTurn: 5,
+      laneWaitTimeoutMs: 60_000,
+      logger,
+    });
+    const release = vi.spyOn(lanes, 'release');
+    const dispatcher = new Dispatcher({
+      bus,
+      logger,
+      turnLanes: lanes,
+      contactResolver: makeResolverWithContact({
+        contactConfidence: 1,
+        tier: 'principal',
+        systemRole: 'principal',
+      }),
+    });
+    dispatcher.register();
+    const outbound: OutboundMessageEvent[] = [];
+    bus.subscribe('outbound.message', 'channel', (event) => {
+      outbound.push(event as OutboundMessageEvent);
+    });
+
+    await bus.publish('channel', createInboundMessage({
+      conversationId: 'cli:conv-leak',
+      channelId: 'cli',
+      senderId: 'user',
+      content: 'first',
+    }));
+    expect(failedTaskId).toBeDefined();
+    expect(release).toHaveBeenCalledWith(failedTaskId);
+
+    await bus.publish('agent', createAgentResponse({
+      agentId: 'coordinator',
+      conversationId: 'cli:conv-leak',
+      content: 'should not send',
+      parentEventId: failedTaskId!,
+    }));
+    expect(outbound).toHaveLength(0);
+
+    const grant = lanes.acquire({
+      taskEventId: 'task-next',
+      conversationId: 'cli:conv-leak',
+      originatorContactId: null,
+      originatorResolved: false,
+      originatorIsPrincipal: false,
+      liveTurn: false,
+      synthetic: false,
+    });
+    await expect(Promise.race([
+      grant,
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error('next holder was not granted')), 500);
+      }),
+    ])).resolves.toEqual({ waitedMs: 0, timedOut: false });
+    lanes.release('task-next');
+  });
+});
