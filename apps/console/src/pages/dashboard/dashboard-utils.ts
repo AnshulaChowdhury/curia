@@ -326,22 +326,56 @@ export function activityHref(link: ActivityLink | null): string | null {
   return `/antfarm/?${params.toString()}`;
 }
 
-// Clock time in the principal's timezone, with the date for items before today
-// (the card spans 24 hours). A bad zone name falls back to the browser's.
-export function formatActivityTime(ts: string, timezone: string, now: Date = new Date()): string {
-  const d = new Date(ts);
-  const fmt = (zone: string | undefined): string => {
-    const opts = zone ? { timeZone: zone } : {};
-    const day = (x: Date) => x.toLocaleDateString('en-CA', opts);
-    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', ...opts });
-    if (day(d) === day(now)) return time;
-    return `${d.toLocaleDateString([], { month: 'short', day: 'numeric', ...opts })} ${time}`;
-  };
+// Run a formatter in the principal's timezone; a bad zone name falls back to the browser's.
+function inZone<T>(timezone: string, fn: (opts: { timeZone?: string }) => T): T {
   try {
-    return fmt(timezone);
+    return fn({ timeZone: timezone });
   } catch {
-    return fmt(undefined);
+    return fn({});
   }
+}
+
+// Clock time of an item in the principal's timezone. The day goes on the group row above.
+export function formatActivityTime(ts: string, timezone: string): string {
+  const d = new Date(ts);
+  return inZone(timezone, (opts) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', ...opts }));
+}
+
+export interface ActivityDayGroup {
+  /** YYYY-MM-DD in the principal's timezone. */
+  key: string;
+  /** "Yesterday", "Oct 21", or null for today (today's items need no day row). */
+  label: string | null;
+  items: ActivityItem[];
+}
+
+// Split newest-first items into runs of the same day in the principal's timezone.
+export function groupActivityByDay(items: ActivityItem[], timezone: string, now: Date = new Date()): ActivityDayGroup[] {
+  return inZone(timezone, (opts) => {
+    const dayKey = (d: Date) => d.toLocaleDateString('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit', ...opts });
+    const today = dayKey(now);
+    const [y, m, d] = today.split('-').map(Number) as [number, number, number];
+    // Calendar arithmetic on the date itself, so a DST change cannot skip or repeat a day.
+    const yesterday = new Date(Date.UTC(y, m - 1, d - 1)).toISOString().slice(0, 10);
+
+    const groups: ActivityDayGroup[] = [];
+    for (const item of items) {
+      const date = new Date(item.ts);
+      const key = dayKey(date);
+      let group = groups[groups.length - 1];
+      if (!group || group.key !== key) {
+        const label = key === today
+          ? null
+          : key === yesterday
+            ? 'Yesterday'
+            : date.toLocaleDateString([], { month: 'short', day: 'numeric', ...opts });
+        group = { key, label, items: [] };
+        groups.push(group);
+      }
+      group.items.push(item);
+    }
+    return groups;
+  });
 }
 
 // "ceo-inbox" → "ceo inbox": the muted agent name beside each item.

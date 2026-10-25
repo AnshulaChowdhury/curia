@@ -12,6 +12,7 @@ import {
   activityHref,
   agentLabel,
   formatActivityTime,
+  groupActivityByDay,
   getGreeting,
 } from './dashboard-utils.js';
 
@@ -285,19 +286,52 @@ describe('activityHref', () => {
 describe('formatActivityTime', () => {
   it('formats in the given timezone, not the browser\'s', () => {
     const ts = '2026-10-24T13:00:00.000Z';
-    const now = new Date('2026-10-24T14:00:00.000Z');
-    expect(formatActivityTime(ts, 'America/Toronto', now)).toMatch(/^09.00/);
-    expect(formatActivityTime(ts, 'Asia/Tokyo', now)).toMatch(/^(22.00|10.00)/);
+    expect(formatActivityTime(ts, 'America/Toronto')).toMatch(/^09.00/);
+    expect(formatActivityTime(ts, 'Asia/Tokyo')).toMatch(/^(22.00|10.00)/);
   });
 
-  it('adds the date for an item from before today', () => {
-    const now = new Date('2026-10-24T14:00:00.000Z');
-    expect(formatActivityTime('2026-10-23T20:00:00.000Z', 'America/Toronto', now)).toMatch(/Oct 23/);
-    expect(formatActivityTime('2026-10-24T13:00:00.000Z', 'America/Toronto', now)).not.toMatch(/Oct/);
+  it('shows only the time, even for an older item', () => {
+    expect(formatActivityTime('2026-10-20T13:00:00.000Z', 'America/Toronto')).not.toMatch(/Oct/);
   });
 
   it('falls back to the browser zone on a bad zone name', () => {
     expect(() => formatActivityTime('2026-10-24T13:00:00.000Z', 'Not/AZone')).not.toThrow();
+  });
+});
+
+describe('groupActivityByDay', () => {
+  const item = (id: string, ts: string) => ({
+    id, ts, actor: 'coordinator', headline: 'x', details: [], outcome: 'success' as const, autonomy: null, link: null,
+  });
+  // 10:00 on Oct 24 in Toronto.
+  const now = new Date('2026-10-24T14:00:00.000Z');
+
+  it('labels today null, then Yesterday, then the date', () => {
+    const groups = groupActivityByDay([
+      item('a', '2026-10-24T13:00:00.000Z'),
+      item('b', '2026-10-24T05:00:00.000Z'), // 01:00 Oct 24 Toronto
+      item('c', '2026-10-24T03:00:00.000Z'), // 23:00 Oct 23 Toronto: yesterday, though the UTC date is today
+      item('d', '2026-10-21T15:00:00.000Z'),
+    ], 'America/Toronto', now);
+    expect(groups.map(g => [g.label, g.items.map(i => i.id)])).toEqual([
+      [null, ['a', 'b']],
+      ['Yesterday', ['c']],
+      ['Oct 21', ['d']],
+    ]);
+  });
+
+  it('gives the first group a day row when nothing is from today', () => {
+    const groups = groupActivityByDay([item('a', '2026-10-23T15:00:00.000Z')], 'America/Toronto', now);
+    expect(groups[0]!.label).toBe('Yesterday');
+  });
+
+  it('handles yesterday across a month boundary', () => {
+    const groups = groupActivityByDay([item('a', '2026-10-31T15:00:00.000Z')], 'America/Toronto', new Date('2026-11-01T15:00:00.000Z'));
+    expect(groups[0]!.label).toBe('Yesterday');
+  });
+
+  it('does not throw on a bad zone name', () => {
+    expect(() => groupActivityByDay([item('a', '2026-10-23T15:00:00.000Z')], 'Not/AZone', now)).not.toThrow();
   });
 });
 

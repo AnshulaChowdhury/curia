@@ -1,15 +1,17 @@
 // ActivityFeed — "what's been happening?": what Curia did in the last 24 hours,
 // one line per job (GET /api/activity?from=<now-24h>&limit=20, #2251). Each item
 // is already in words ("drafted a reply to John Doe"); the card adds the time in
-// the principal's timezone, a muted agent name, and a link to the job or a replay
+// the principal's timezone (earlier days under a day row), a muted agent name, and a link to the job or a replay
 // of the conversation.
 
+import { Fragment } from 'react';
 import { Link } from '@tanstack/react-router';
 import {
   activityHref,
   agentLabel,
   fetchActivity,
   formatActivityTime,
+  groupActivityByDay,
   type ActivityItem,
 } from './dashboard-utils.js';
 import { useAsyncData } from './useAsyncData.js';
@@ -54,27 +56,32 @@ export function ActivityFeed() {
 
       {data && data.items.length > 0 && (
         <div className="dash-activity">
-          {data.items.map(item => {
-            const note = autonomyNote(item);
-            return (
-              <div key={item.id} className={`dash-activity-item ${item.outcome === 'failed' ? 'failed' : ''}`}>
-                <span className="dash-activity-time">{formatActivityTime(item.ts, data.timezone)}</span>
-                <div className="dash-activity-text">
-                  <Headline item={item} />
-                  <span className="dash-activity-meta">
-                    {agentLabel(item.actor)}{note ? ` · ${note}` : ''}
-                  </span>
-                  {item.details.length > 0 && (
-                    <ul className="dash-activity-details">
-                      {item.details.map((d, i) => (
-                        <li key={i} className={`dash-activity-detail ${d.startsWith("couldn't") ? 'failed' : ''}`}>{d}</li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              </div>
-            );
-          })}
+          {groupActivityByDay(data.items, data.timezone).map(group => (
+            <Fragment key={group.key}>
+              {group.label && <div className="dash-activity-day">{group.label}</div>}
+              {group.items.map(item => {
+                const note = autonomyNote(item);
+                return (
+                  <div key={item.id} className={`dash-activity-item ${item.outcome === 'failed' ? 'failed' : ''}`}>
+                    <span className="dash-activity-time">{formatActivityTime(item.ts, data.timezone)}</span>
+                    <div className="dash-activity-text">
+                      <Headline item={item} />
+                      <span className="dash-activity-meta">
+                        {agentLabel(item.actor)}{note ? ` · ${note}` : ''}
+                      </span>
+                      {item.details.length > 0 && (
+                        <ul className="dash-activity-details">
+                          {item.details.map((d, i) => (
+                            <li key={i} className={`dash-activity-detail ${d.startsWith("couldn't") ? 'failed' : ''}`}>{d}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </Fragment>
+          ))}
         </div>
       )}
     </article>
