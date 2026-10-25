@@ -587,6 +587,33 @@ describe('EntityMemory.resolveOrCreate — fuzzy auto-resolve end-to-end', () =>
     if (result.kind !== 'ambiguous') throw new Error('narrowing');
     expect(result.candidates).toHaveLength(1);
   });
+
+  // #2248: facts were dropped only after the top 5 were taken, so 5 closer facts left no
+  // candidate and a duplicate entity was created.
+  it('resolves to the entity when more facts than the candidate limit sit closer', async () => {
+    const { mem, store } = makeEntityMemory();
+    const embeddingService = EmbeddingService.createForTesting();
+    const queryLabel = 'Acme Corp';
+    const queryEmbedding = await embeddingService.embed(queryLabel, 'similarity');
+
+    // The entity scores about 0.95 (above fuzzyResolve); the facts score 1.0.
+    const norm = Math.sqrt(queryEmbedding.reduce((s, v) => s + v * v, 0));
+    const entityEmbedding = queryEmbedding.map((v, i) => v * 0.95 + (i === 0 ? norm * Math.sqrt(1 - 0.95 * 0.95) : 0));
+    expect(EmbeddingService.cosineSimilarity(queryEmbedding, entityEmbedding)).toBeGreaterThanOrEqual(FUZZY_RESOLVE_THRESHOLD);
+    const entity = await store.createNode({
+      type: 'organization', label: 'ACME Corporation', properties: {}, source: 'test', embedding: entityEmbedding,
+    });
+    for (let i = 0; i < 6; i++) {
+      await store.createNode({ type: 'fact', label: `Acme Corp fact ${i}`, properties: {}, source: 'test', embedding: queryEmbedding });
+    }
+
+    const result = await mem.resolveOrCreate({ label: queryLabel, type: 'organization', source: 'test' });
+
+    expect(result.kind).toBe('found');
+    if (result.kind !== 'found') throw new Error('narrowing');
+    expect(result.node.id).toBe(entity.id);
+    expect(await store.findNodesByType('organization')).toHaveLength(1);
+  });
 });
 
 describe('EntityMemory.findEntities — alias awareness', () => {

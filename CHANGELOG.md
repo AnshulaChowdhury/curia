@@ -159,6 +159,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **KG semantic search** — filters apply before the limit, so closer facts no longer hide entities or create duplicates. (#2248)
 - **Shadow judge** — runs on the fast tier with reasoning off, so sent-observe stops timing out. (#2191)
 - **Recent activity card** — loads for signed-in console users instead of failing with a Bearer token error. (#2285)
 - **Recent activity card** — shows the newest jobs in the window, not the day's oldest rows. (#2251)
