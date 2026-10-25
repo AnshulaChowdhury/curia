@@ -13,6 +13,7 @@ import {
   createSystemRestart,
   createDocumentConsoleAction,
   createKgNodesMerged,
+  createActivitySummary,
   type BusEvent,
 } from '../../../src/bus/events.js';
 
@@ -209,6 +210,20 @@ describe('Event Types', () => {
     expect(event.payload.principalIdentitiesTransferred).toEqual(['sms: +15550002']);
     expect(event.payload.principalPrimaryFieldsFilled).toEqual({ primary_email: 'me@x.com' });
     expect(event.id).toBeTruthy();
+  });
+
+  it('creates an activity.summary event parented on its task (#2251)', () => {
+    const event = createActivitySummary({
+      agentId: 'coordinator',
+      conversationId: 'conv-1',
+      taskEventId: 'task-1',
+      summary: 'provided two essay ideas',
+      parentEventId: 'task-1',
+    });
+    expect(event.type).toBe('activity.summary');
+    expect(event.sourceLayer).toBe('system');
+    expect(event.parentEventId).toBe('task-1');
+    expect(event.payload).toEqual({ agentId: 'coordinator', conversationId: 'conv-1', taskEventId: 'task-1', summary: 'provided two essay ideas' });
   });
 
   it('type narrows via discriminated union', () => {

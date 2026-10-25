@@ -33,6 +33,7 @@ import { healthRoutes } from './routes/health.js';
 import { agentRoutes } from './routes/agents.js';
 import { jobRoutes } from './routes/jobs.js';
 import { antfarmRoutes } from './routes/antfarm.js';
+import { activityRoutes } from './routes/activity.js';
 import { antfarmStaticRoutes } from './routes/antfarm-static.js';
 import { antfarmAssetsRoutes } from './routes/antfarm-assets.js';
 import { messageRoutes } from './routes/messages.js';
@@ -152,6 +153,8 @@ export interface HttpAdapterConfig {
   entityMemory?: import('../../memory/entity-memory.js').EntityMemory;
   /** Backs GET /api/antfarm/timeline (replay window queries). */
   auditLogRepo?: AuditLogRepo;
+  /** Backs GET /api/activity, the console home's job-level feed (#2251). */
+  activityFeed?: import('../../activity/activity-service.js').ActivityFeedSource;
   /**
    * Telnyx SMS webhook bridge — HttpAdapter mounts POST /api/webhooks/telnyx/sms
    * and delegates to the handler installed by SmsAdapter.start() (ADR-036).
@@ -397,6 +400,15 @@ export class HttpAdapter implements Channel {
       await this.app.register(antfarmRoutes, {
         auditLogRepo: this.config.auditLogRepo,
         eventRouter: this.eventRouter,
+        webAppBootstrapSecret,
+        sessions,
+        logger,
+      });
+    }
+
+    if (this.config.activityFeed) {
+      await this.app.register(activityRoutes, {
+        activity: this.config.activityFeed,
         webAppBootstrapSecret,
         sessions,
         logger,

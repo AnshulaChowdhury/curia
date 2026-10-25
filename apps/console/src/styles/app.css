@@ -501,15 +501,30 @@ input:focus, textarea:focus, select:focus {
   min-width: 0;
 }
 .dash-activity-item:last-child { border-bottom: none; }
+.dash-activity-day {
+  padding: 12px 0 5px;
+  border-bottom: 1px solid var(--app-border-soft);
+  font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--app-fg-subtle);
+}
 .dash-activity-time {
   font-family: 'JetBrains Mono', monospace; font-size: 11px;
-  color: var(--app-fg-subtle); flex: none; width: 44px; padding-top: 2px;
+  color: var(--app-fg-subtle); flex: none; width: 64px; white-space: nowrap; padding-top: 2px;
 }
 .dash-activity-text {
   flex: 1; min-width: 0; font-size: 13px; line-height: 1.45; color: var(--app-fg-muted);
   overflow-wrap: anywhere;
 }
 .dash-activity-text strong { color: var(--app-fg); font-weight: 600; }
+.dash-activity-headline { color: var(--app-fg); }
+a.dash-activity-headline { text-decoration: none; }
+a.dash-activity-headline:hover { text-decoration: underline; }
+.dash-activity-meta { color: var(--app-fg-subtle); font-size: 12px; margin-left: 6px; }
+.dash-activity-details { margin: 2px 0 0; padding-left: 16px; font-size: 12px; }
+.dash-activity-item.failed .dash-activity-headline,
+.dash-activity-detail.failed { color: var(--app-destructive); }
+.dash-activity-partial { color: var(--app-amber); }
+.dash-activity-more { padding-top: 10px; }
 
 /* Ask Curia CTA */
 .dash-ask {

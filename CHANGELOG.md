@@ -15,6 +15,9 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Console activity feed** — home page lists what Curia did, one plain-language line per job. (#2251)
+- **`activity.summary` bus event** — **public API:** one fast-tier summary per conversational job, stored for the feed. (#2251)
+- **Ant Farm replay links** — URL can preselect a conversation and time window. (#2251)
 - **Memory → Documents** — console page to browse, view, search and download OKF working documents. (#1821)
 - **Documents editing** — edit, create, archive and restore in the console; stale saves conflict, never overwrite. (#1822)
 - **`document.console_action` bus event** — **public API:** audits each console change to a working document. (#1822)
@@ -64,6 +67,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **`activity-log`** — uses the shared activity describers; each action gains a readable `summary` line. (#2251)
 - **`ToolContext.outboundContext`** — `register()` takes `recipientContactIds`; entry rows gain `recipientContactIds` and `recipientMessages` (migration 104). (#2261)
 - **Behavior suite usage** — docs make smoke and scenarios a release gate; development runs only targeted cases.
 - **Voice model** — ADR-038 moves voice to Haiku 5.5 with thinking off, keeping its own prompt. (#2245)
@@ -149,6 +153,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Recent activity card** — shows the newest jobs in the window, not the day's oldest rows. (#2251)
 - **Attachment download** — recovers from garbled Nylas IDs via filename or sole-attachment fallback. (#2281)
 - **Email poll** — detaches turns, drops the queue on stop, and shuts mailboxes down together. (#2254)
 - **Email durability** — writes mail ahead, replays it for a day, and skips only a poison row. (#2254)

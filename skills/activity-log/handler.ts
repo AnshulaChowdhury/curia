@@ -9,6 +9,7 @@ import { readAuditToolName } from '../../src/audit/legacy-tool-events.js';
 import type { ActionLogRow } from '../../src/autonomy/action-log-types.js';
 import { getRecapEligibleToolNames } from '../../src/skills/recap-skills.js';
 import { toLocalIso, formatDisplayTimezone } from '../../src/time/timestamp.js';
+import { describeToolCall, extractSuccessDetail, extractTarget } from '../../src/activity/describers.js';
 
 const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 
@@ -93,6 +94,8 @@ function summarizeToolResult(
   target: string;
   outcome: 'completed' | 'failed';
   detail: string | null;
+  /** The console feed's describer line ("emailed jane@example.com"); null when none applies. */
+  summary: string | null;
   autonomy: 'autonomous' | 'approved' | 'unknown';
 } | null {
   const toolName = readAuditToolName(row.payload, {
@@ -127,6 +130,7 @@ function summarizeToolResult(
     target,
     outcome: success ? 'completed' : 'failed',
     detail: success ? extractSuccessDetail(toolName, result?.data) : (result?.error ?? null),
+    summary: describeSummary(toolName, success, result?.data, tz),
     autonomy,
   };
 }
@@ -152,50 +156,18 @@ function matchAutonomyOutcome(
   return 'unknown';
 }
 
-function extractTarget(toolName: string, result?: { success?: boolean; data?: unknown; error?: string }): string {
-  const data = asRecord(result?.data);
-  if (!data) return toolName;
-
-  if (toolName === 'calendar-respond-to-invite') {
-    const event = asRecord(data.event);
-    const title = typeof event?.title === 'string' ? event.title : null;
-    const response = typeof data.response === 'string' ? data.response : null;
-    if (title && response) return `${response} — ${title}`;
-    if (title) return title;
-    if (response) return response;
-  }
-
-  if (toolName.startsWith('email-') || toolName === 'signal-send' || toolName === 'send-draft') {
-    const to = data.to ?? data.recipient;
-    if (typeof to === 'string') return to;
-    if (Array.isArray(to) && typeof to[0] === 'string') return to[0];
-  }
-
-  if (toolName.startsWith('calendar-')) {
-    const event = asRecord(data.event);
-    if (typeof event?.title === 'string') return event.title;
-  }
-
-  if (typeof data.description === 'string') return data.description;
-  if (typeof data.title === 'string') return data.title;
-  if (typeof data.subject === 'string') return data.subject;
-
-  return toolName;
-}
-
-function extractSuccessDetail(toolName: string, data: unknown): string | null {
+/**
+ * The shared describer's line for this result (src/activity/describers.ts).
+ * A tool.result row carries no tool input and names are not resolved here, so
+ * recipients read as their address, or "a contact" when only an id is known.
+ */
+function describeSummary(toolName: string, success: boolean, data: unknown, tz?: string): string | null {
   const record = asRecord(data);
-  if (!record) return null;
-
-  if (toolName === 'calendar-respond-to-invite') {
-    const response = typeof record.response === 'string' ? record.response : null;
-    const released = Array.isArray(record.releasedHolds) ? record.releasedHolds.length : null;
-    if (response && released !== null) return `RSVP ${response}; released ${released} hold(s)`;
-    if (response) return `RSVP ${response}`;
-  }
-
-  if (typeof record.message === 'string') return record.message;
-  return null;
+  const desc = describeToolCall(
+    { toolName, input: {}, data: success ? record : null, ok: success },
+    { name: () => null, timezone: tz ?? 'UTC' },
+  );
+  return desc && desc.prominence !== 'hidden' ? desc.text : null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

@@ -19,6 +19,7 @@ import {
   type RegistryAgent,
 } from './layout/desk-layout.js';
 import { totalAnimationDurationMs } from './conductor/schedule.js';
+import { readReplayParams } from './replay-params.js';
 
 function filterDirectives(
   directives: SceneDirective[],
@@ -147,22 +148,24 @@ export function App() {
     }
   }, [fetchTimeline, live.streamOpenTs, liveMode]);
 
-  // Preload the last-24h window on arrival so the page lands ready to play (just hit Play).
-  // Runs once after auth succeeds. The input fields get local wall-clock strings for display;
-  // the fetch uses ISO timestamps so the server parses absolute instants regardless of its tz.
+  // Preload a window on arrival so the page lands ready to play (just hit Play): the last
+  // 24h, or the window and conversation in the URL when the console's activity feed linked
+  // here (#2251). Runs once after auth succeeds. The input fields get local wall-clock strings
+  // for display; the fetch uses ISO timestamps so the server parses absolute instants
+  // regardless of its tz.
   const didPreload = useRef(false);
   useEffect(() => {
     if (authed !== true || didPreload.current) return;
     didPreload.current = true;
-    const now = new Date();
-    const start = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const { from: start, to: end, conversationId } = readReplayParams(window.location.search);
     setFrom(toDatetimeLocal(start));
-    setTo(toDatetimeLocal(now));
+    setTo(toDatetimeLocal(end));
+    if (conversationId) setFilterConversation(conversationId);
     // fetchTimeline already surfaces failures via `error` (shown in the control bar); catch here
     // so the rejection isn't unhandled. Intentionally do NOT reset didPreload — a failed preload
     // shows the error and waits for a manual "Load window" rather than auto-retrying every render.
-    loadWindow(start.toISOString(), now.toISOString()).catch((err) => {
-      clientWarn('24h preload failed; error shown in control bar', err);
+    loadWindow(start.toISOString(), end.toISOString(), conversationId || undefined).catch((err) => {
+      clientWarn('window preload failed; error shown in control bar', err);
     });
   }, [authed, loadWindow]);
 
