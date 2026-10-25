@@ -962,8 +962,10 @@ export type LateDelegationReviewOutcome =
   | 'update_failed';
 
 // DelegationTimedOutPayload — published by the agent layer (runtime) when a delegate wait
-// times out with the specialist possibly still running, right after the failure is escalated
-// to the principal backlog. The LateDelegationSubscriber turns this into a durable handle.
+// ends with the specialist still running. A timer expiry is escalated to the principal
+// backlog first. An interrupted wait (a same-contact follow-up queued on the turn) is not
+// a failure and opens no review task. The LateDelegationSubscriber turns either into a
+// durable handle; `cause` does not change that handle.
 interface DelegationTimedOutPayload {
   /** The delegate agent.task event id — the specialist stamps it as parentEventId on its
    *  eventual agent.response, so it is the correlation key for the whole mechanism. */
@@ -991,6 +993,12 @@ interface DelegationTimedOutPayload {
   reviewTaskId?: string;
   /** The delegate wait that elapsed, in ms — sets the handle's TTL floor. */
   waitTimeoutMs?: number;
+  /**
+   * Why the wait ended. `wait_timeout` is the delegate timer. `interrupted` is a
+   * queued same-contact follow-up; the specialist keeps running and nothing is
+   * escalated. Callers may omit it: `createDelegationTimedOut` fills `wait_timeout`.
+   */
+  cause?: 'wait_timeout' | 'interrupted';
 }
 
 // DelegationLateResolvedPayload — published by the system layer when a pending delegation
@@ -2747,7 +2755,10 @@ export function createDelegationTimedOut(
     timestamp: new Date(),
     type: 'delegation.timed_out',
     sourceLayer: 'agent',
-    payload,
+    payload: {
+      ...payload,
+      cause: payload.cause ?? 'wait_timeout',
+    },
     parentEventId,
   };
 }

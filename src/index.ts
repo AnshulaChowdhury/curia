@@ -2786,6 +2786,7 @@ async function main(): Promise<void> {
       : undefined,
     defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs,
     lateDelivery: {
+      enabled: lateDeliveryConfig.enabled,
       ttlMinutes: lateDeliveryConfig.ttlMinutes,
       sweepIntervalMinutes: lateDeliveryConfig.sweepIntervalMinutes,
     },

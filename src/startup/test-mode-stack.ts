@@ -1020,7 +1020,11 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       verification,
       browserSessionAlive: options.browserSessionAlive,
       defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs,
-      lateDelivery: { ttlMinutes: lateDelivery.ttlMinutes, sweepIntervalMinutes: lateDelivery.sweepIntervalMinutes },
+      lateDelivery: {
+        enabled: lateDelivery.enabled,
+        ttlMinutes: lateDelivery.ttlMinutes,
+        sweepIntervalMinutes: lateDelivery.sweepIntervalMinutes,
+      },
       bullpenService: readOnlyBullpen(
         options.wrapBullpenService ? options.wrapBullpenService(bullpenService) : bullpenService,
       ),

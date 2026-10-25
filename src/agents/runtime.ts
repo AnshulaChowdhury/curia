@@ -103,6 +103,7 @@ import {
   findAlreadyDeliveredKey,
   parseDelegateFailureData,
   parseDelegateInFlightData,
+  parseDelegateInProgressData,
   seedAlreadyDelivered,
   type DelegationFailureInfo,
 } from './delegation-guard.js';
@@ -333,6 +334,11 @@ export interface AgentConfig {
    */
   lateDeliveryTtlMinutes?: number;
   lateDeliverySweepIntervalMinutes?: number;
+  /**
+   * `delegate.lateDelivery.enabled`. A queued follow-up ends a laned delegate
+   * wait only when this is on. Omitted means on, matching the config default.
+   */
+  lateDeliveryEnabled?: boolean;
   /**
    * Per-conversation turn lane (#2018). Absent, or present with the flag off:
    * every task runs immediately and no lane method is called.
@@ -2176,6 +2182,13 @@ export class AgentRuntime {
             turnDateResolveResults: turnDateResolveTracker.snapshot(),
             senderId: taskEvent.payload.senderId,
             identifierSources,
+            // After acquire, and only on delegate. A signal taken before this
+            // task holds the lane never aborts. Late delivery off keeps today's
+            // wait: no signal is passed.
+            ...(toolCall.name === 'delegate'
+              && laned && lanes && this.config.lateDeliveryEnabled !== false
+              ? { inputSignal: lanes.inputSignal(taskEvent.id) }
+              : {}),
           };
 
           const startTime = Date.now();
@@ -2521,14 +2534,51 @@ export class AgentRuntime {
               skillInput !== null &&
               !Array.isArray(skillInput)
             ) {
+              const delegateInput = skillInput as Record<string, unknown>;
+              const delegateTask = typeof delegateInput['task'] === 'string' ? delegateInput['task'] : '';
+              // A queued follow-up ends the wait. That is not a failure: no guard
+              // record, no escalation, no review task. The specialist keeps running
+              // and its result arrives later as its own wake (#2018).
+              const delegateInProgress = parseDelegateInProgressData(result.data, logger);
+              if (delegateInProgress) {
+                try {
+                  await bus.publish('agent', createDelegationTimedOut(
+                    {
+                      delegateEventId: delegateInProgress.delegateEventId,
+                      delegateConversationId: delegateInProgress.delegateConversationId,
+                      targetAgent: delegateInProgress.agent,
+                      delegateTask,
+                      agentId,
+                      conversationId,
+                      channelId: taskEvent.payload.channelId,
+                      senderId: taskEvent.payload.senderId,
+                      originTaskEventId: taskEvent.id,
+                      ...(originator !== undefined && {
+                        originator: originator as unknown as Record<string, unknown>,
+                      }),
+                      cause: 'interrupted',
+                    },
+                    taskEvent.id,
+                  ));
+                } catch (err) {
+                  logger.error(
+                    {
+                      err,
+                      agentId,
+                      conversationId,
+                      targetAgent: delegateInProgress.agent,
+                      delegateEventId: delegateInProgress.delegateEventId,
+                    },
+                    'Failed to publish delegation.timed_out — a late specialist response will not be delivered',
+                  );
+                }
+              }
               const delegatePaused = parseDelegatePausedData(result.data, logger);
-              if (!delegatePaused) {
+              if (!delegateInProgress && !delegatePaused) {
                 // An already_in_flight refusal was queued before the result was recorded,
                 // above, so the audit event carries the same `queued` the model sees.
                 const delegateFailure = parseDelegateFailureData(result.data, logger);
                 if (delegateFailure) {
-                  const delegateInput = skillInput as Record<string, unknown>;
-                  const delegateTask = typeof delegateInput['task'] === 'string' ? delegateInput['task'] : '';
                   const dKey = delegationKey(delegateFailure.agent, delegateTask);
                   if (
                     delegateFailure.declined === true

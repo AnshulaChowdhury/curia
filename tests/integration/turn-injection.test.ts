@@ -1,6 +1,7 @@
 // Mid-turn injection (#2018, E-1..E-10 and the dispatcher admission rules).
 // No database: an in-memory bus, an in-memory working memory, and a scripted model.
-// The delegate early-return (E-4) lands with the input signal in the next PR.
+// E-4's delegate wait is the execution layer returning in_progress when the
+// runtime passes an input signal. The handler itself is covered in unit tests.
 
 import { describe, it, expect, vi } from 'vitest';
 import { AgentRuntime } from '../../src/agents/runtime.js';
@@ -87,6 +88,8 @@ interface HarnessOptions {
   execution?: boolean;
   /** Default true. Turn-start and thrown-host cases must not wait on the model. */
   holdFirst?: boolean;
+  /** Delegate invoke waits until inputSignal aborts, then returns in_progress. */
+  delegateInterrupt?: boolean;
   /** Audit write-ahead. A throw rejects the publish before subscribers run. */
   onEvent?: (event: BusEvent) => Promise<void>;
 }
@@ -146,10 +149,29 @@ function harness(options: HarnessOptions = {}) {
               findings: [],
             }),
           } as unknown as InboundScanner;
-  const invokes: Array<{ liveTurn?: boolean; taskMetadata?: Record<string, unknown> }> = [];
+  const invokes: Array<{ name: string; liveTurn?: boolean; taskMetadata?: Record<string, unknown> }> = [];
   const execution = {
-    invoke: vi.fn(async (_name: string, _input: unknown, _caller: unknown, invokeOptions: { liveTurn?: boolean; taskMetadata?: Record<string, unknown> }) => {
-      invokes.push({ liveTurn: invokeOptions?.liveTurn, taskMetadata: invokeOptions?.taskMetadata });
+    invoke: vi.fn(async (name: string, _input: unknown, _caller: unknown, invokeOptions: { liveTurn?: boolean; taskMetadata?: Record<string, unknown>; inputSignal?: AbortSignal }) => {
+      invokes.push({ name, liveTurn: invokeOptions?.liveTurn, taskMetadata: invokeOptions?.taskMetadata });
+      if (options.delegateInterrupt && name === 'delegate') {
+        const signal = invokeOptions?.inputSignal;
+        if (!signal) throw new Error('delegate wait expected an input signal');
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return {
+          success: true,
+          data: {
+            agent: 'researcher',
+            in_progress: true,
+            reason: 'interrupted',
+            delegate_event_id: 'delegate-e4',
+            delegate_conversation_id: 'delegate-conv-e4',
+            message: 'The specialist is still working. Its result will arrive as a separate follow-up after this turn. Do not delegate this work again.',
+          },
+        };
+      }
       return { success: true, data: { ok: true } };
     }),
   } as unknown as ExecutionLayer;
@@ -204,6 +226,58 @@ function harness(options: HarnessOptions = {}) {
 }
 
 describe('turn injection (#2018)', () => {
+  it('E-4: a follow-up during a delegate wait is drained next round, and the late wake runs after', async () => {
+    const h = harness({ delegateInterrupt: true, holdFirst: false });
+    h.script.push(toolUse('delegate'), text('folded the follow-up'), text('wake reply'));
+    const timedOut: Array<{ cause?: string; reviewTaskId?: string; delegateEventId: string }> = [];
+    h.bus.subscribe('delegation.timed_out', 'system', (event) => {
+      if (event.type !== 'delegation.timed_out') return;
+      timedOut.push({
+        cause: event.payload.cause,
+        reviewTaskId: event.payload.reviewTaskId,
+        delegateEventId: event.payload.delegateEventId,
+      });
+    });
+    const host = h.bus.publish('channel', h.inbound('start the lookup'));
+    await vi.waitFor(() => expect(h.invokes.some((call) => call.name === 'delegate')).toBe(true));
+    const followEvent = h.inbound('use email instead');
+    const follow = h.bus.publish('channel', followEvent);
+    await Promise.all([host, follow]);
+
+    expect(timedOut).toEqual([{
+      cause: 'interrupted',
+      reviewTaskId: undefined,
+      delegateEventId: 'delegate-e4',
+    }]);
+    expect(h.tasks.filter((task) => task.payload.content.includes('use email instead'))).toHaveLength(0);
+    expect(transcript(h.chats[0])).not.toContain('use email instead');
+    expect(transcript(h.chats[1])).toContain('use email instead');
+    expect(transcript(h.chats[1])).toContain('New message from');
+    expect(h.responses[0]!.payload.content).toBe('folded the follow-up');
+    expect(h.invokes.filter((call) => call.name === 'task-create')).toHaveLength(0);
+    expect(h.acked).toContain(followEvent.id);
+
+    const wake = createAgentTask({
+      agentId: 'coordinator',
+      conversationId: 'email:thread-1',
+      channelId: 'email',
+      senderId: 'scheduler',
+      content: 'LATE-WAKE-BRIEF',
+      syntheticTurn: true,
+      parentEventId: 'wake-parent',
+      metadata: {
+        originator: { contactId: CONTACT_A, systemRole: 'principal', channel: 'email', tier: 'principal' },
+        lateDelegation: { agent: 'researcher', task: 'look up the code' },
+      },
+    });
+    await h.bus.publish('dispatch', wake);
+    const wakeChat = h.chats.find((messages) => transcript(messages).includes('LATE-WAKE-BRIEF'));
+    expect(wakeChat).toBeDefined();
+    expect(transcript(wakeChat)).not.toContain('New message from');
+    expect(transcript(h.chats[1])).not.toContain('LATE-WAKE-BRIEF');
+    expect(h.tasks.some((task) => task.payload.content === 'LATE-WAKE-BRIEF')).toBe(true);
+  });
+
   it('E-5: a second principal message on an idle conversation is drained at turn start', async () => {
     const memory = WorkingMemory.createInMemory();
     const original = memory.getHistory.bind(memory);

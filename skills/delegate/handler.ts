@@ -67,11 +67,20 @@ import {
   SPECIALIST_DECLINE_REASON,
 } from '../../src/agents/specialist-decline.js';
 
+/** Shown to the coordinator when a queued follow-up ends the wait (#2018). */
+const INTERRUPTED_WAIT_MESSAGE =
+  'The specialist is still working. Its result will arrive as a separate follow-up after this turn. Do not delegate this work again.';
+
 /** What the response promise resolves with: the specialist's text, and the message sends its
- *  runtime recorded (`agent.response.sends`; absent on a paused result). */
+ *  runtime recorded (`agent.response.sends`; absent on a paused result). `interrupted` is set
+ *  when a queued follow-up ended the wait before the specialist replied. */
 interface SpecialistReply {
   content: string;
   sends?: string[];
+  interrupted?: {
+    delegateEventId: string;
+    delegateConversationId: string;
+  };
 }
 
 /** Sentinel shape rejected by the response promise when a specialist returns isError with
@@ -744,6 +753,27 @@ export class DelegateHandler implements ToolHandler {
           }
         }, specialistTimeoutMs);
 
+        // A queued same-contact follow-up ends the wait. The specialist task is
+        // still published below, and the running claim stays so its late result
+        // can be matched. This is not the timeout reason (#2018).
+        const endForInput = (): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutHandle);
+          resolve({
+            content: '',
+            interrupted: {
+              delegateEventId: taskEvent.id,
+              delegateConversationId: conversationId,
+            },
+          });
+        };
+        const inputSignal = ctx.inputSignal;
+        if (inputSignal) {
+          if (inputSignal.aborted) endForInput();
+          else inputSignal.addEventListener('abort', endForInput, { once: true });
+        }
+
         ctx.bus!.subscribe('agent.response', 'system', async (event) => {
           if (settled) return; // Skip processing after settlement — prevents double-resolve
           try {
@@ -811,14 +841,32 @@ export class DelegateHandler implements ToolHandler {
       // while responsePromise had no rejection handler yet — causing an unhandledRejection
       // that crashes the process. Promise.all attaches handlers to both promises immediately,
       // closing that window. See: https://github.com/josephfung/curia/issues/73
-      // retainRunningClaim is set only when the wait timer itself fires — that
-      // rejection carries delegateEventId, which is what the runtime promotes.
-      // A specialist that reports reason 'timeout' does not, and retaining the
-      // claim would block the conversation until the sweep re-delivered the answer.
-      const [{ content: response, sends }] = await Promise.all([
+      // retainRunningClaim is set when the wait timer fires, and when a queued
+      // follow-up ends the wait. Both leave the specialist running. A specialist
+      // that reports reason 'timeout' does not, and retaining the claim would
+      // block the conversation until the sweep re-delivered the answer.
+      const [{ content: response, sends, interrupted }] = await Promise.all([
         responsePromise,
         ctx.bus.publish('dispatch', taskEvent),
       ]);
+      if (interrupted) {
+        retainRunningClaim = true;
+        ctx.log.info(
+          { targetAgent: agent, delegateEventId: interrupted.delegateEventId },
+          'Delegate wait ended because a follow-up was queued; the specialist keeps running',
+        );
+        return {
+          success: true,
+          data: {
+            agent,
+            in_progress: true,
+            reason: 'interrupted',
+            delegate_event_id: interrupted.delegateEventId,
+            delegate_conversation_id: interrupted.delegateConversationId,
+            message: INTERRUPTED_WAIT_MESSAGE,
+          },
+        };
+      }
       ctx.log.info({ targetAgent: agent }, 'Specialist responded');
 
       // Clarification protocol detection: the runtime emits a JSON response

@@ -344,7 +344,7 @@ export interface AgentAssemblyContext {
   /** True while a browser session id is live. Absent when no browser service runs. */
   browserSessionAlive?: (sessionId: string) => boolean;
   defaultDelegateTimeoutMs?: number;
-  lateDelivery: { ttlMinutes: number; sweepIntervalMinutes: number };
+  lateDelivery: { enabled?: boolean; ttlMinutes: number; sweepIntervalMinutes: number };
   bullpenService?: BullpenService;
   conversationEntities?: ConversationEntityState;
   workingDocsRepo?: WorkingDocsRepo;
@@ -477,6 +477,7 @@ export function assembleAgent(agentConfig: AgentYamlConfig, ctx: AgentAssemblyCo
     // Lets the runtime look up a delegate target's expected_duration_seconds (#387).
     agentRegistry: ctx.agentRegistry,
     defaultDelegateTimeoutMs: ctx.defaultDelegateTimeoutMs,
+    lateDeliveryEnabled: ctx.lateDelivery.enabled ?? true,
     lateDeliveryTtlMinutes: ctx.lateDelivery.ttlMinutes,
     lateDeliverySweepIntervalMinutes: ctx.lateDelivery.sweepIntervalMinutes,
     bullpenService: ctx.bullpenService,
