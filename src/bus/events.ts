@@ -71,12 +71,12 @@ export interface AgentTaskPayload {
   liveTurn?: boolean;
   /** Synthetic-turn signal (#1892). Like `liveTurn`, a DISTINCT top-level field rather than a
    *  `metadata` key, so a skill forwarding the metadata bag cannot set it by accident. Stamped
-   *  `true` only by the paths that re-enter an agent with a brief Curia wrote to itself: the
-   *  content-filter rewrite, a late specialist result, and the secret-capture resume. The runtime
-   *  forwards it to `working_memory.synthetic`, where contact recall reads it to tell Curia's own
-   *  row apart from an unattributed human message. Absent means "a person said this", which is the
-   *  fail-closed reading — a mislabelled human turn would drop its conversation from the
-   *  shared-conversation check and leak that person's words into another contact's recall. */
+   *  `true` when an internal producer re-enters an agent with a brief Curia wrote to itself,
+   *  rather than a person's message. The runtime forwards it to `working_memory.synthetic`,
+   *  where contact recall reads it to tell Curia's own row apart from an unattributed human
+   *  message. Absent means "a person said this", which is the fail-closed reading — a
+   *  mislabelled human turn would drop its conversation from the shared-conversation check
+   *  and leak that person's words into another contact's recall. */
   syntheticTurn?: boolean;
   /** Resolved sender context from the contact resolver. Undefined if contacts not configured. */
   senderContext?: import('../contacts/types.js').InboundSenderContext;

@@ -138,7 +138,7 @@ export interface TurnLanesOptions {
 const IMMEDIATE: LaneGrant = Object.freeze({ waitedMs: 0, timedOut: false });
 
 /**
- * True when a string is safe to place in the framing line. Newlines and other
+ * Returns a bounded string for the framing line. Newlines and other
  * control characters would let a display name break out of that line. The
  * message body is not passed through here.
  */

@@ -396,6 +396,24 @@ describe('TurnLanes', () => {
       await expect(queued(follow)).resolves.toEqual({ kind: 'returned', reason: 'holder_ended' });
     });
 
+    it('times out only the waiter whose wait elapsed and keeps the rest in order', async () => {
+      vi.useFakeTimers();
+      const gate = lanes({ timeoutMs: 60_000 });
+      const a = holder('a');
+      await gate.acquire(a);
+      const grantB = gate.acquire(holder('b'));
+      await vi.advanceTimersByTimeAsync(10_000);
+      const grantC = gate.acquire(holder('c'));
+      let cSettled = false;
+      void grantC.then(() => { cSettled = true; });
+      await vi.advanceTimersByTimeAsync(50_000);
+      await expect(grantB).resolves.toEqual({ waitedMs: 60_000, timedOut: true });
+      expect(cSettled).toBe(false);
+      gate.release(a.taskEventId);
+      await expect(grantC).resolves.toEqual({ waitedMs: 50_000, timedOut: false });
+      gate.release('task-c');
+    });
+
     it('still fail-opens on the original conversation if the caller mutates the holder', async () => {
       vi.useFakeTimers();
       const gate = lanes({ timeoutMs: 40_000 });

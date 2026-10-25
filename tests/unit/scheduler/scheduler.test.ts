@@ -1537,11 +1537,15 @@ describe('Scheduler', () => {
         payload: { agentId: 'agent-1', conversationId: 'c1', content: 'done' },
       });
       // handleCompletion is not awaited by the subscriber. The notice is published
-      // after completeJobRun and getJob resolve.
-      for (let i = 0; i < 5; i += 1) await Promise.resolve();
-
-      const notify = (bus.publish.mock.calls as [string, { type: string; payload: { conversationId?: string; syntheticTurn?: boolean; content?: string } }][])
+      // after completeJobRun and getJob resolve. Wait on that publish rather than
+      // a fixed number of microtasks.
+      type Published = [string, { type: string; payload: { conversationId?: string; syntheticTurn?: boolean; content?: string } }];
+      const findNotify = (): Published | undefined => (bus.publish.mock.calls as Published[])
         .find(([, event]) => event.type === 'agent.task' && event.payload.content?.includes('schedule_suspended'));
+      await vi.waitFor(() => {
+        expect(findNotify()).toBeDefined();
+      });
+      const notify = findNotify();
       expect(notify?.[1].payload.syntheticTurn).toBe(true);
       expect(notify?.[1].payload.conversationId).toBe('scheduler:job-1');
     });
