@@ -132,10 +132,14 @@ describeIf('test-mode stack', () => {
       }
     });
 
-    it('reloads the principal profile after a write, as production does', async () => {
-      // Shared DB: skip when no principal, and restore the original value afterward.
+    it('reloads the principal profile after a write, as production does', async (ctx) => {
+      // Shared DB: other suites delete the principal, so a missing one reports as
+      // skipped, not passed. The original value is restored afterward.
       const principal = await stack.contactService.findContactBySystemRole('principal');
-      if (!principal) return;
+      if (!principal || stack.agent('coordinator').runtimeConfig.principalProfile?.current == null) {
+        ctx.skip('no principal in the shared test database at boot');
+        return;
+      }
       const original = principal.pronouns ?? null;
       const marker = `xe/xem ${randomUUID().slice(0, 8)}`;
       const profile = stack.agent('coordinator').runtimeConfig.principalProfile!;
