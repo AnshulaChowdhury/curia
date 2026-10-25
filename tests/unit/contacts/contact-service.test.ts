@@ -1252,13 +1252,27 @@ describe('ContactService', () => {
       });
       onIdentitiesChanged.mockClear();
 
-      await svc.updateContactFields(contact.id, { title: 'Director' });
+      await svc.updateContactFields(contact.id, { timezone: 'America/Toronto' });
       expect(onIdentitiesChanged).not.toHaveBeenCalled();
 
       await svc.updateContactFields(contact.id, { primaryEmail: 'primary-notify@example.com' });
       expect(onIdentitiesChanged).toHaveBeenCalledTimes(1);
       expect(onIdentitiesChanged).toHaveBeenCalledWith(contact.id);
     });
+
+    it.each(['preferredName', 'title', 'pronouns'] as const)(
+      'notifies subscribers when %s is committed, since the principal prompt block shows it (#2226)',
+      async (field) => {
+        const onIdentitiesChanged = vi.fn();
+        const svc = ContactService.createInMemory(entityMemory, { onIdentitiesChanged });
+        const contact = await svc.createContact({ displayName: 'Profile Notify', source: 'test' });
+        onIdentitiesChanged.mockClear();
+
+        await svc.updateContactFields(contact.id, { [field]: 'value' });
+        expect(onIdentitiesChanged).toHaveBeenCalledTimes(1);
+        expect(onIdentitiesChanged).toHaveBeenCalledWith(contact.id);
+      },
+    );
   });
 
   describe('elevateTierToKnown', () => {

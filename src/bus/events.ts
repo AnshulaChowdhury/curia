@@ -504,6 +504,19 @@ interface ContactMergedPayload {
   mergedAt: Date;
 }
 
+// activity.summary — published by ActivitySummarizer (src/activity/summarizer.ts) once a
+// conversational job with no visible actions completes (#2251). The console activity feed
+// reads it back from audit_log, so the feed itself never calls a model. parentEventId is the
+// job's agent.task id, which is how the feed finds it.
+interface ActivitySummaryPayload {
+  agentId: string;
+  conversationId: string;
+  /** The agent.task event id the summary describes (also the event's parentEventId). */
+  taskEventId: string;
+  /** Short past-tense phrase: "provided two essay ideas". Never a quote of the conversation. */
+  summary: string;
+}
+
 // kg.nodes_merged — published by NodeMergeService after the principal merges two
 // knowledge-graph nodes from the console (#2233). Committed state only: the publish runs
 // after COMMIT. This is an audit record of what the merge decided, not an undo log: the
@@ -1451,6 +1464,12 @@ export interface DocumentConsoleActionEvent extends BaseEvent {
   payload: DocumentConsoleActionPayload;
 }
 
+export interface ActivitySummaryEvent extends BaseEvent {
+  type: 'activity.summary';
+  sourceLayer: 'system';
+  payload: ActivitySummaryPayload;
+}
+
 export interface KgNodesMergedEvent extends BaseEvent {
   type: 'kg.nodes_merged';
   sourceLayer: 'system';
@@ -2005,6 +2024,7 @@ export type BusEvent =
   | SystemRestartEvent       // System: operator-initiated process restart (#1765)
   | DocumentConsoleActionEvent // System: principal edited the document store from the console (#1822)
   | KgNodesMergedEvent       // Console: two knowledge-graph nodes merged (#2233)
+  | ActivitySummaryEvent     // System: one-line summary of a finished conversational job (#2251)
   | ConversationCheckpointEvent // Checkpoint pipeline: Dispatch fires after inactivity window
   | CheckpointExtractionSkippedEvent // Checkpoint pipeline: KG extraction skipped for trust policy (#1290)
   | LlmCallEvent             // Spec 10: LLM API call provenance (model, tokens, cost, hashes)
@@ -2917,6 +2937,20 @@ export function createDocumentConsoleAction(payload: DocumentConsoleActionPayloa
     type: 'document.console_action',
     sourceLayer: 'system',
     payload,
+  };
+}
+
+export function createActivitySummary(
+  payload: ActivitySummaryPayload & { parentEventId: string },
+): ActivitySummaryEvent {
+  const { parentEventId, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'activity.summary',
+    sourceLayer: 'system',
+    payload: rest,
+    parentEventId,
   };
 }
 

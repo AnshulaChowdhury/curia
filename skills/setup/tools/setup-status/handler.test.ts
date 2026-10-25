@@ -70,6 +70,8 @@ function makeCtx(overrides: Partial<{
   behavioralPreferences: string[];
   activeJobs: Array<{ intentAnchor?: string | null; status?: string }>;
   secretError: Error;
+  principal: { pronouns: string | null } | null;
+  principalLookupError: Error;
 }> = {}): ToolContext {
   const secrets = overrides.secrets ?? {};
   return {
@@ -92,6 +94,12 @@ function makeCtx(overrides: Partial<{
         constraints: [],
       }),
     } as unknown as ToolContext['officeIdentityService'],
+    contactService: {
+      findContactBySystemRole: vi.fn(async () => {
+        if (overrides.principalLookupError) throw overrides.principalLookupError;
+        return overrides.principal ?? null;
+      }),
+    } as unknown as ToolContext['contactService'],
     schedulerService: {
       // Honor the status filter so future regressions to this filter logic are caught:
       // if a filter is provided, only return jobs matching that status.
@@ -126,6 +134,21 @@ describe('setup-status', () => {
       const data = (result as { success: true; data: { tasks: Array<{ id: string; status: string }> } }).data;
       const persona = data.tasks.find(t => t.id === 'persona');
       expect(persona?.status).toBe('pending');
+    });
+
+    it.each([
+      ['pronouns are set', { principal: { pronouns: 'she/her' } }, 'done'],
+      ['pronouns are blank', { principal: { pronouns: '  ' } }, 'pending'],
+      ['pronouns are unset', { principal: { pronouns: null } }, 'pending'],
+      ['there is no principal', { principal: null }, 'pending'],
+      ['the lookup fails', { principalLookupError: new Error('db down') }, 'pending'],
+    ] as const)('principal_profile: when %s, status is %s', async (_name, overrides, expected) => {
+      const result = await handler.execute(makeCtx(overrides));
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: { tasks: Array<{ id: string; status: string; docs_url: string | null }> } }).data;
+      const task = data.tasks.find(t => t.id === 'principal_profile');
+      expect(task?.status).toBe(expected);
+      expect(task?.docs_url).toBe('/core-concepts/how-curia-refers-to-you');
     });
 
     it('debrief: done when an active job with debrief in intentAnchor exists', async () => {

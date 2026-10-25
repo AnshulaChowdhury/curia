@@ -517,6 +517,22 @@ export interface PrincipalPrimaryEmailRef {
   current: string | null;
 }
 
+/**
+ * How the principal is to be referred to, read from their contact row.
+ * `displayName` is always set on a contact; the rest are null until someone states them.
+ */
+export interface PrincipalProfile {
+  displayName: string;
+  preferredName: string | null;
+  title: string | null;
+  pronouns: string | null;
+}
+
+/** Mutable holder for the principal's profile, refreshed in place like {@link PrincipalEmailRef}. */
+export interface PrincipalProfileRef {
+  current: PrincipalProfile | null;
+}
+
 /** Resolve a ceoEmail config that may be a plain string (tests) or a live ref. */
 export function resolvePrincipalEmail(email: string | PrincipalEmailRef | undefined): string {
   if (email === undefined) return '';

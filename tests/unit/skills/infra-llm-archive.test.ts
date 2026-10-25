@@ -53,3 +53,54 @@ describe('InfraLlmService archive (#2042)', () => {
     });
   });
 });
+
+// #2191: extract can run on the fast tier, which can turn reasoning off; the standard tier
+// stays the default for every other caller.
+describe('InfraLlmService extract tier', () => {
+  function setup(): { service: InfraLlmService; chat: ReturnType<typeof vi.fn>; registry: ModelRegistry } {
+    const logger = createSilentLogger();
+    const registry = new ModelRegistry(logger);
+    const router = new ModelRouter({
+      tiers: {
+        fast: { model: 'claude-haiku-5-5' },
+        standard: { model: 'claude-sonnet-4-6' },
+        powerful: { model: 'claude-opus-4-6' },
+      },
+      default_tier: 'standard',
+    }, registry, logger);
+    const chat = vi.fn(async (req: { model: string }): Promise<LLMResponse> => ({
+      type: 'text',
+      content: '[]',
+      usage: { inputTokens: 1, outputTokens: 1, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+      provenance: { requestedModel: req.model, actualModel: req.model, providerRequestId: 'req' },
+    }));
+    const provider = { id: 'anthropic', chat } as unknown as LLMProvider;
+    const bus = { publish: vi.fn(async () => {}) } as unknown as EventBus;
+    return { service: new InfraLlmService(provider, router, bus, logger, registry), chat, registry };
+  }
+
+  it('routes to the standard tier by default', async () => {
+    const { service, chat } = setup();
+    await service.scoped({ toolName: 't' }).extract('p');
+    expect(chat.mock.calls[0]![0]).toMatchObject({ model: 'claude-sonnet-4-6' });
+  });
+
+  it('routes to the fast tier when asked, still with reasoning off', async () => {
+    const { service, chat, registry } = setup();
+    // The request below only proves what is asked for; this proves the fast model honours it,
+    // so the provider will actually send thinking disabled.
+    expect(registry.honorsReasoningEffort('claude-haiku-5-5', 'none')).toBe(true);
+    await service.scoped({ toolName: 't' }).extract('p', { tier: 'fast' });
+    expect(chat.mock.calls[0]![0]).toMatchObject({
+      model: 'claude-haiku-5-5',
+      options: { max_tokens: 4000, reasoning: { effort: 'none' } },
+    });
+  });
+
+  it('returns an error value for a tier outside fast and standard, without calling the model', async () => {
+    const { service, chat } = setup();
+    const result = await service.scoped({ toolName: 't' }).extract('p', { tier: 'powerful' as unknown as 'fast' });
+    expect(result).toEqual({ ok: false, error: 'invalid infraLlm tier "powerful"' });
+    expect(chat).not.toHaveBeenCalled();
+  });
+});

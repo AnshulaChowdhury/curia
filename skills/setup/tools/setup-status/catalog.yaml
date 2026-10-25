@@ -12,6 +12,16 @@ tasks:
     credential_how_to: null
     docs_url: null
 
+  - id: principal_profile
+    label: "How Curia refers to you"
+    value_prop: "Your preferred name, pronouns and title, so emails written on your behalf never guess — takes one conversation turn, no credentials."
+    tier: instant
+    handoff: in-chat
+    completion_check:
+      type: principal_profile
+    credential_how_to: "Tell Curia what to call you, your pronouns and your title; it saves them on your contact. You can also set them in the console under Contacts → your principal."
+    docs_url: /core-concepts/how-curia-refers-to-you
+
   - id: debrief
     label: "Scheduled debrief"
     value_prop: "Regular digest at end of day or end of week — takes one conversation turn, no credentials."

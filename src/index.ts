@@ -73,7 +73,7 @@ import { loadMcpServers, loadSkillsConfig, registerMcpProjectedSkills, type McpS
 import type { McpSession } from './skills/mcp-client.js';
 import { ContactService } from './contacts/contact-service.js';
 import { NodeMergeService } from './kg-merge/service.js';
-import type { ChannelIdentity, Contact, PrincipalEmailRef, PrincipalPrimaryEmailRef } from './contacts/types.js';
+import type { ChannelIdentity, Contact, PrincipalEmailRef, PrincipalPrimaryEmailRef, PrincipalProfileRef } from './contacts/types.js';
 import { ConfidencePipeline } from './contacts/confidence-pipeline.js';
 import { DedupService } from './contacts/dedup-service.js';
 import { ContactResolver } from './contacts/contact-resolver.js';
@@ -149,6 +149,8 @@ import { ApprovalDelivery } from './autonomy/approval-delivery.js';
 import { ReactionApprovalMapper } from './autonomy/reaction-approval-mapper.js';
 import { DEFAULT_REACTION_INTENTS } from './autonomy/reaction-intent.js';
 import { AutonomyScoringPass } from './autonomy/scoring-pass.js';
+import { ActivityService } from './activity/activity-service.js';
+import { ActivitySummarizer } from './activity/summarizer.js';
 import type { ScoringPassConfig } from './autonomy/scoring-pass.js';
 import { BrowserService } from './browser/browser-service.js';
 import { OfficeIdentityService } from './identity/service.js';
@@ -864,6 +866,8 @@ async function main(): Promise<void> {
   // Designated primary (contacts.primary_email), not the first verified email.
   // Same mutable-holder pattern so the prompt block sees a post-boot update (#1950).
   const principalPrimaryEmail: PrincipalPrimaryEmailRef = { current: null };
+  // Name, preferred name, title and pronouns, refreshed with the identities (#2226).
+  const principalProfile: PrincipalProfileRef = { current: null };
 
   // Monotonic guard against overlapping refreshes (#1514). onIdentitiesChanged is
   // fire-and-forget, so two mutations in quick succession (e.g. add + verify, or a
@@ -877,6 +881,7 @@ async function main(): Promise<void> {
       principalIdentities.length = 0;
       principalEmail.current = '';
       principalPrimaryEmail.current = null;
+      principalProfile.current = null;
       return;
     }
     const myGeneration = ++refreshGeneration;
@@ -890,6 +895,7 @@ async function main(): Promise<void> {
     principalEmail.current =
       principalIdentities.find((id) => id.channel === 'email')?.channelIdentifier ?? '';
     principalPrimaryEmail.current = snapshot.primaryEmail;
+    principalProfile.current = snapshot.profile;
     // The prompt builder drops an unmatched primary and an empty identity set quietly
     // (it must never render an unverified address or a complete-set claim over
     // nothing), so every agent's prompt changes with no signal. Say so here instead.
@@ -1817,7 +1823,7 @@ async function main(): Promise<void> {
   const sendEvidence = new SendEvidenceCollector({
     auditLogRepo,
     // Read per call: principal identities hot-reload in place (#1514).
-    principalBlock: () => formatWhoYouServeBlock(principalIdentities, principalPrimaryEmail.current),
+    principalBlock: () => formatWhoYouServeBlock(principalIdentities, principalPrimaryEmail.current, principalProfile.current),
     logger,
   });
   const bandReview = autonomyGating === 'band'
@@ -2268,6 +2274,26 @@ async function main(): Promise<void> {
   const scoringPass = new AutonomyScoringPass(actionLogRepo, autonomyService, scoringProvider, logger, scoringPassConfig);
   logger.info({ scoringPassConfig }, 'AutonomyScoringPass configured');
 
+  // Console activity feed (#2251). The summarizer writes a one-line activity.summary
+  // when a conversational job with no visible actions completes, on the fast tier so
+  // each chat turn adds one cheap call; the feed reads those rows and never calls a model.
+  const activitySummaryModel = modelRouter.resolve('fast').model;
+  const activitySummarizer = new ActivitySummarizer({
+    bus,
+    llm: new TelemetryLlmProvider(resolveProviderForModel(activitySummaryModel, 'ActivitySummarizer'), bus, logger, 'activity-summarizer', modelRegistry),
+    model: activitySummaryModel,
+    logger,
+  });
+  activitySummarizer.register();
+  const activityService = new ActivityService({
+    auditLogRepo,
+    actionLogRepo,
+    contactService,
+    schedulerService,
+    officeTimezone: config.timezone,
+    logger,
+  });
+
   const llmCallArchiveRetentionDays = llmCallArchiveCfg?.hotRetentionDays ?? 90;
   const dreamEngine = new DreamEngine(
     pool,
@@ -2525,6 +2551,21 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   }
+  // infraLlm asks for no reasoning on every call, but a provider drops that request (at debug)
+  // for a model that can't turn reasoning off, and the call then reasons by default. On the fast
+  // tier that empties 10-token classify calls and burns judge budgets (#2191). Warn, not fatal:
+  // a reasoning fast tier can be deliberate. Standard is skipped; prod's standard model is a
+  // reasoning model by design.
+  {
+    const fastModel = modelRouter.resolve('fast').model;
+    const reasons = modelRegistry.reasoningSupport(fastModel) !== undefined || modelRegistry.thinksByDefault(fastModel);
+    if (reasons && !modelRegistry.honorsReasoningEffort(fastModel, 'none')) {
+      logger.warn(
+        { tier: 'fast', model: fastModel, supported: modelRegistry.reasoningSupport(fastModel)?.efforts ?? [] },
+        `Infra tier 'fast' maps to '${fastModel}', which cannot turn reasoning off — infraLlm classify/extract calls on it will reason and may spend their output budget thinking`,
+      );
+    }
+  }
   const infraLlmRouter = new LLMProviderRouter(modelRegistry, providerRegistry);
   const infraLlmService = new InfraLlmService(infraLlmRouter, modelRouter, bus, logger, modelRegistry);
 
@@ -2720,6 +2761,7 @@ async function main(): Promise<void> {
     // Shared hot-reload array/holder (#1514) — passed by reference.
     principalIdentities,
     principalPrimaryEmail,
+    principalProfile,
     agentContactId: agentIdentityContactId,
     principalContactId: principalContact?.id,
     // Delegated sign-in verifications (#2017): coordinator and ceo-inbox get the live list
@@ -3276,6 +3318,7 @@ async function main(): Promise<void> {
     // Powers GET /api/health with real probes and canary state (#434).
     healthService,
     auditLogRepo,
+    activityFeed: activityService,
     smsWebhookBridge,
     memoryRetention,
     // Console Memory → Documents (#1821, #1822).

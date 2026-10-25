@@ -219,7 +219,12 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
     expect(notePrimaryEmailChanged).not.toHaveBeenCalled();
   });
 
-  it('does not notify a principal PATCH that omits primaryEmail', async () => {
+  it.each([
+    ['pronouns', { pronouns: 'she/her' }],
+    ['preferredName', { preferredName: 'Avy' }],
+    ['title', { title: 'CEO' }],
+    ['displayName', { displayName: 'The Principal' }],
+  ])('notifies after a committed principal %s change, since the prompt profile shows it (#2226)', async (_name, body) => {
     const principal = { ...BASE_CONTACT, systemRole: 'principal' as const };
     const notePrimaryEmailChanged = vi.fn();
     const svc = fakeContactService({
@@ -231,7 +236,40 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
       method: 'PATCH',
       url: `/api/kg/contacts/${BASE_CONTACT.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
-      body: JSON.stringify({ displayName: 'The Principal' }),
+      body: JSON.stringify(body),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(notePrimaryEmailChanged).toHaveBeenCalledTimes(1);
+    expect(notePrimaryEmailChanged).toHaveBeenCalledWith(BASE_CONTACT.id);
+  });
+
+  it('does not notify for a non-principal contact whose pronouns change', async () => {
+    const notePrimaryEmailChanged = vi.fn();
+    const svc = fakeContactService({ notePrimaryEmailChanged });
+    app = await build(svc);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/kg/contacts/${BASE_CONTACT.id}`,
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ pronouns: 'he/him' }),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(notePrimaryEmailChanged).not.toHaveBeenCalled();
+  });
+
+  it('does not notify a principal PATCH that touches no prompt field', async () => {
+    const principal = { ...BASE_CONTACT, systemRole: 'principal' as const };
+    const notePrimaryEmailChanged = vi.fn();
+    const svc = fakeContactService({
+      getContact: vi.fn().mockResolvedValue(principal),
+      notePrimaryEmailChanged,
+    });
+    app = await build(svc);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/kg/contacts/${BASE_CONTACT.id}`,
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ timezone: 'America/Toronto' }),
     });
     expect(res.statusCode).toBe(200);
     expect(notePrimaryEmailChanged).not.toHaveBeenCalled();

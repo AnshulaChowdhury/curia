@@ -76,6 +76,10 @@ export interface TimelinePage {
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 500;
+/** How long after an activity window a delegated task is still read as part of it. */
+const DELEGATION_TAIL_MS = 6 * 60 * 60 * 1000;
+/** Delegation levels read under an activity root before giving up (logged). */
+const MAX_DELEGATION_DEPTH = 10;
 
 /** Columns selected by every read path — keep in sync with {@link mapRow}. */
 const SELECT_COLUMNS = `id, timestamp, event_type, source_layer, source_id,
@@ -252,6 +256,124 @@ export class AuditLogRepo {
     );
 
     return page;
+  }
+
+  /**
+   * Rows for the console activity feed (#2251): the newest root jobs in a
+   * window plus everything under them. Newest first, unlike {@link findTimeline}:
+   * a capped oldest-first read of a busy day returned the day's first jobs.
+   *
+   * A root is an agent.task that no other task delegated. Under it come the
+   * delegated specialist tasks (linked by `metadata.delegationOrigin.taskEventId`,
+   * several levels deep), each task's tool.invoke / agent.response /
+   * activity.summary children, and each invoke's tool.result. All lookups but
+   * the first use idx_audit_log_parent_event_id.
+   *
+   * `limit` caps roots. Rows of a root's job that land after `to` are included,
+   * so a job that straddles the window edge reads complete. `before` is a keyset
+   * cursor: pass the previous page's `nextCursor` to read the next-older roots.
+   * Roots use idx_audit_log_activity_roots and delegated tasks
+   * idx_audit_log_delegation_origin (migration 105).
+   */
+  async findActivityJobs(query: {
+    from: Date;
+    to: Date;
+    limit: number;
+    before?: { timestamp: Date; id: string };
+  }): Promise<{
+    roots: AuditLogRow[];
+    delegated: AuditLogRow[];
+    children: AuditLogRow[];
+    hasMore: boolean;
+    nextCursor?: { timestamp: Date; id: string };
+  }> {
+    const limit = Math.min(Math.max(query.limit, 1), MAX_LIMIT);
+    const params: unknown[] = [query.from, query.to];
+    let cursor = '';
+    if (query.before) {
+      params.push(query.before.timestamp, query.before.id);
+      cursor = `AND (timestamp, id) < ($3, $4::uuid)`;
+    }
+    params.push(limit + 1);
+    // The JSON predicate must match migration 105's index expression exactly.
+    const rootResult = await this.pool.query(
+      `SELECT ${SELECT_COLUMNS}
+       FROM audit_log
+       WHERE event_type = 'agent.task'
+         AND timestamp >= $1
+         AND timestamp < $2
+         AND (payload->'metadata'->'delegationOrigin'->>'taskEventId') IS NULL
+         ${cursor}
+       ORDER BY timestamp DESC, id DESC
+       LIMIT $${params.length}`,
+      params,
+    );
+    const allRoots = rootResult.rows.map(mapRow);
+    const hasMore = allRoots.length > limit;
+    const roots = hasMore ? allRoots.slice(0, limit) : allRoots;
+    const oldest = roots[roots.length - 1];
+    const nextCursor = hasMore && oldest ? { timestamp: oldest.timestamp, id: oldest.id } : undefined;
+    if (roots.length === 0) return { roots, delegated: [], children: [], hasMore, nextCursor };
+
+    // Delegated tasks start after their root, so the oldest root bounds the scan
+    // from below. Above, the window end plus a margin for jobs still running at it.
+    const earliest = roots[roots.length - 1]!.timestamp;
+    const latest = new Date(query.to.getTime() + DELEGATION_TAIL_MS);
+    const delegated: AuditLogRow[] = [];
+    let frontier = roots.map((r) => r.id);
+    // Walk until no task delegated further. The bound only guards against a cycle
+    // or a runaway chain; reaching it is logged, because the deeper work is then
+    // missing from its job.
+    let depth = 0;
+    for (; depth < MAX_DELEGATION_DEPTH && frontier.length > 0; depth++) {
+      const result = await this.pool.query(
+        `SELECT ${SELECT_COLUMNS}
+         FROM audit_log
+         WHERE event_type = 'agent.task'
+           AND timestamp >= $1
+           AND timestamp < $2
+           AND (payload->'metadata'->'delegationOrigin'->>'taskEventId') = ANY($3::text[])`,
+        [earliest, latest, frontier],
+      );
+      const level = result.rows.map(mapRow);
+      delegated.push(...level);
+      frontier = level.map((r) => r.id);
+    }
+    if (frontier.length > 0) {
+      this.logger.warn(
+        { depth, unresolved: frontier.length, maxDepth: MAX_DELEGATION_DEPTH },
+        'audit-log-repo: findActivityJobs hit the delegation depth bound; deeper work is left out of its job',
+      );
+    }
+
+    const taskIds = [...roots, ...delegated].map((r) => r.id);
+    const childResult = await this.pool.query(
+      `SELECT ${SELECT_COLUMNS}
+       FROM audit_log
+       WHERE parent_event_id = ANY($1::text[])
+         AND event_type = ANY(ARRAY['tool.invoke', 'skill.invoke', 'agent.response', 'activity.summary']::text[])`,
+      [taskIds],
+    );
+    const children = childResult.rows.map(mapRow);
+    const invokeIds = children
+      .filter((r) => r.eventType === 'tool.invoke' || r.eventType === 'skill.invoke')
+      .map((r) => r.id);
+    if (invokeIds.length > 0) {
+      const resultRows = await this.pool.query(
+        `SELECT ${SELECT_COLUMNS}
+         FROM audit_log
+         WHERE parent_event_id = ANY($1::text[])
+           AND event_type = ANY(ARRAY['tool.result', 'skill.result']::text[])`,
+        [invokeIds],
+      );
+      children.push(...resultRows.rows.map(mapRow));
+    }
+
+    this.logger.debug(
+      { roots: roots.length, delegated: delegated.length, children: children.length, hasMore },
+      'audit-log-repo: findActivityJobs',
+    );
+    return { roots, delegated, children, hasMore, nextCursor };
   }
 
   /**

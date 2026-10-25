@@ -24,16 +24,38 @@ import { isUuid } from '../../../../src/util/uuid.js';
 // allowlist stays in sync with the KG guard without duplicating it.
 const VALID_FIELD_KEYS = new Set<keyof ContactCanonicalFields>(CANONICAL_ATTRIBUTE_MAP.values());
 
+/** Reserved contact_id that means the principal's own contact. */
+const PRINCIPAL_ALIAS = 'principal';
+
 export class ContactUpdateHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
-    const { contact_id, fields } = ctx.input as {
+    const { contact_id: rawContactId, fields } = ctx.input as {
       contact_id?: string;
       fields?: Record<string, unknown>;
     };
+    let contact_id = rawContactId;
+    const usedPrincipalAlias = rawContactId === PRINCIPAL_ALIAS;
 
     // Validate contact_id
     if (!contact_id || typeof contact_id !== 'string') {
       return { success: false, error: 'Missing required input: contact_id (string)' };
+    }
+
+    // The reserved alias "principal" names the principal's contact, so a model never
+    // needs the UUID to record how the principal wants to be addressed (#2226). Same
+    // alias the send skills accept (ADR-047); resolved here from the system role.
+    if (usedPrincipalAlias) {
+      if (!ctx.contactService) {
+        return {
+          success: false,
+          error: 'contact-update: contactService not available — this is a universal service, check ExecutionLayer configuration.',
+        };
+      }
+      const principal = await ctx.contactService.findContactBySystemRole('principal');
+      if (!principal) {
+        return { success: false, error: 'No principal contact exists yet. Setup has to finish before the principal\'s profile can be saved.' };
+      }
+      contact_id = principal.id;
     }
 
     // Validate UUID format — the DB column rejects non-UUIDs with a cryptic 22P02 error.
@@ -128,7 +150,8 @@ export class ContactUpdateHandler implements ToolHandler {
       return {
         success: true,
         data: {
-          contact_id: updated.id,
+          // The alias is echoed back, not the UUID: the principal's ID stays opt-in (ADR-047).
+          contact_id: usedPrincipalAlias ? PRINCIPAL_ALIAS : updated.id,
           updated_fields: updatedFields,
         },
       };

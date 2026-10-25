@@ -110,7 +110,9 @@ const AGENT_BUDGETS: AgentBudget[] = [
   // archive-extract plus the longer file-parse description (#2208) is +1,831 bytes, the same
   // delta as the coordinator. Measured 45,301 bytes over 45 local tools; the prior total sat
   // under the 44,800 ceiling.
-  { agent: 'ceo-inbox', alwaysOnPromptTokens: 14_100, localToolDefinitionBytes: 45_301, allowMcpPins: false },
+  // contact-update accepts contact_id "principal" (#2226): +38 bytes, 45,339 over 45 local tools.
+  // The budget rises by exactly that delta.
+  { agent: 'ceo-inbox', alwaysOnPromptTokens: 14_100, localToolDefinitionBytes: 45_339, allowMcpPins: false },
   // contacts: YAML 15,595 → 11,423 chars (~4,831 → ~3,788 tokens always-on with its SKILL.md bodies);
   // 35,311 bytes over its local tools.
   { agent: 'contacts', alwaysOnPromptTokens: 3_900, localToolDefinitionBytes: 36_400, allowMcpPins: false },

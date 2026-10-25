@@ -16,6 +16,13 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Added
 
 - **Turn lanes** — per-conversation lock and injection config, default off and inert. (#2018)
+- **Console activity feed** — home page lists what Curia did, one plain-language line per job. (#2251)
+- **`activity.summary` bus event** — **public API:** one fast-tier summary per conversational job, stored for the feed. (#2251)
+- **Ant Farm replay links** — URL can preselect a conversation and time window. (#2251)
+- **Principal profile in prompts** — `## Who you serve` shows the principal's name, preferred name, pronouns and title. (#2226)
+- **`contact-update` principal alias** — `contact_id: "principal"` saves the principal's profile without a UUID. (#2226)
+- **Setup task `principal_profile`** — the wizard asks how to refer to you; done once pronouns are set. (#2226)
+- **Pronouns scenario 41a** — checks emails to third parties never gender a principal without pronouns on file. (#2226)
 - **Memory → Documents** — console page to browse, view, search and download OKF working documents. (#1821)
 - **Documents editing** — edit, create, archive and restore in the console; stale saves conflict, never overwrite. (#1822)
 - **`document.console_action` bus event** — **public API:** audits each console change to a working document. (#1822)
@@ -65,6 +72,9 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **`infraLlm.extract` (public API, additive)** — optional `tier: 'fast' | 'standard'`; defaults to standard. (#2191)
+- **`activity-log`** — uses the shared activity describers; each action gains a readable `summary` line. (#2251)
+- **Unset pronouns** — agents use the name or they/them and never infer pronouns from a name. (#2226)
 - **`ToolContext.outboundContext`** — `register()` takes `recipientContactIds`; entry rows gain `recipientContactIds` and `recipientMessages` (migration 104). (#2261)
 - **Behavior suite usage** — docs make smoke and scenarios a release gate; development runs only targeted cases.
 - **Voice model** — ADR-038 moves voice to Haiku 5.5 with thinking off, keeping its own prompt. (#2245)
@@ -152,6 +162,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 - **Turn injection config** — startup accepts `dispatch.turnInjection` in the config schema. (#2018)
 - **Synthetic notices** — approval, drift-pause and suspension wakes set `syntheticTurn`. (#2018)
+- **KG semantic search** — filters apply before the limit, so closer facts no longer hide entities or create duplicates. (#2248)
+- **Shadow judge** — runs on the fast tier with reasoning off, so sent-observe stops timing out. (#2191)
+- **Recent activity card** — loads for signed-in console users instead of failing with a Bearer token error. (#2285)
+- **Recent activity card** — shows the newest jobs in the window, not the day's oldest rows. (#2251)
 - **Attachment download** — recovers from garbled Nylas IDs via filename or sole-attachment fallback. (#2281)
 - **Email poll** — detaches turns, drops the queue on stop, and shuts mailboxes down together. (#2254)
 - **Email durability** — writes mail ahead, replays it for a day, and skips only a poison row. (#2254)

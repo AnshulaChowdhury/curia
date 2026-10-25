@@ -7,6 +7,8 @@
 // labels. It sits under `## Who you serve`, near the top of the system string
 // (trim plan PR 11). ChannelIdentity satisfies PrincipalContactBlockIdentity.
 
+import type { PrincipalProfile } from '../contacts/types.js';
+
 /** Fields the block reads. */
 export interface PrincipalContactBlockIdentity {
   channel: string;
@@ -119,24 +121,78 @@ export function formatPrincipalContactDetailsBlock(
   return lines.join('\n');
 }
 
+/** A name, title or pronoun entry is a short note. Longer than this, the profile block cuts it. */
+const PROFILE_VALUE_MAX_CHARS = 80;
+
 /**
- * Render `## Who you serve`: who "the principal" is, then their contact details.
- * Null when there are no verified identities. The section has no facts to state
- * without them, and an empty details block would claim a complete set of zero
- * addresses (#1950). It carries no contact ID: spec 09 keeps that handle opt-in.
+ * A profile value made safe to put on one prompt line, or null when it is empty.
+ * Contact fields are writable by agents and the console, so a value is untrusted:
+ * control characters (C0 and C1, newlines included) and line or paragraph
+ * separators become spaces, runs of whitespace collapse, and the length is
+ * capped. It is rendered in quotes, so what is left reads as data.
+ */
+export function cleanedProfileValue(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const cleaned = raw.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, ' ').replace(/\s+/g, ' ').trim();
+  return cleaned ? cleaned.slice(0, PROFILE_VALUE_MAX_CHARS) : null;
+}
+
+function quoteProfileValue(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Render `### Principal Profile`, or null when the profile has no name to show.
+ *
+ * Pronouns are the reason this block exists: with none stored, agents guessed
+ * from the name and misgendered the principal in emails to third parties (#2226).
+ * An unset pronoun line therefore carries the rule instead of staying silent.
+ */
+export function formatPrincipalProfileBlock(profile: PrincipalProfile | null | undefined): string | null {
+  if (!profile) return null;
+  const name = cleanedProfileValue(profile.displayName);
+  if (!name) return null;
+
+  const preferred = cleanedProfileValue(profile.preferredName);
+  const title = cleanedProfileValue(profile.title);
+  const pronouns = cleanedProfileValue(profile.pronouns);
+
+  // The name appears nowhere else in the system prompt (contact details are addresses only).
+  const goesBy = preferred && preferred.toLowerCase() !== name.toLowerCase() ? ` (goes by ${quoteProfileValue(preferred)})` : '';
+  const lines = ['### Principal Profile', `- Name: ${quoteProfileValue(name)}${goesBy}`];
+  if (title) lines.push(`- Title: ${quoteProfileValue(title)}`);
+  lines.push(
+    `- Pronouns: ${pronouns ? quoteProfileValue(pronouns) : 'not set'}`,
+    // One rule for everyone, so it stays when the principal's pronouns are set.
+    'Use the pronouns on file for anyone, the principal included. With none on file, use the name or they/them; never guess from a name.',
+    // The tool documents the "principal" alias; the prompt only says when to save.
+    'When the principal tells you their pronouns, preferred name or title, save it to their contact.',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Render `## Who you serve`: who "the principal" is, their profile, then their
+ * contact details. Null when there is nothing to state. The details need verified
+ * identities: an empty list would claim a complete set of zero addresses (#1950),
+ * so that block is omitted on its own while the profile still renders. It carries
+ * no contact ID: spec 09 keeps that handle opt-in.
  */
 export function formatWhoYouServeBlock(
   identities: readonly PrincipalContactBlockIdentity[],
   primaryEmail: string | null | undefined,
+  profile?: PrincipalProfile | null,
 ): string | null {
+  const profileBlock = formatPrincipalProfileBlock(profile);
   const details = formatPrincipalContactDetailsBlock(identities, primaryEmail);
-  if (!details) return null;
-  return [
+  if (!profileBlock && !details) return null;
+  const parts = [
     '## Who you serve',
     'You work for the principal. In these instructions, in tool descriptions and in messages from other agents, "the principal" means them.',
-    '',
-    details,
-  ].join('\n');
+  ];
+  if (profileBlock) parts.push('', profileBlock);
+  if (details) parts.push('', details);
+  return parts.join('\n');
 }
 
 /**

@@ -23,7 +23,7 @@ import type { EventBus } from '../../bus/bus.js';
 import type { Logger } from '../../logger.js';
 import type { Pool } from 'pg';
 import type { AgentRegistry } from '../../agents/agent-registry.js';
-import { validateBearerToken } from './auth.js';
+import { bypassesBearerAuth, validateBearerToken } from './auth.js';
 import { registerSecurityHeaders } from './security-headers.js';
 import { EventRouter } from './event-router.js';
 import type { SchedulerService } from '../../scheduler/scheduler-service.js';
@@ -33,6 +33,7 @@ import { healthRoutes } from './routes/health.js';
 import { agentRoutes } from './routes/agents.js';
 import { jobRoutes } from './routes/jobs.js';
 import { antfarmRoutes } from './routes/antfarm.js';
+import { activityRoutes } from './routes/activity.js';
 import { antfarmStaticRoutes } from './routes/antfarm-static.js';
 import { antfarmAssetsRoutes } from './routes/antfarm-assets.js';
 import { messageRoutes } from './routes/messages.js';
@@ -152,6 +153,8 @@ export interface HttpAdapterConfig {
   entityMemory?: import('../../memory/entity-memory.js').EntityMemory;
   /** Backs GET /api/antfarm/timeline (replay window queries). */
   auditLogRepo?: AuditLogRepo;
+  /** Backs GET /api/activity, the console home's job-level feed (#2251). */
+  activityFeed?: import('../../activity/activity-service.js').ActivityFeedSource;
   /**
    * Telnyx SMS webhook bridge — HttpAdapter mounts POST /api/webhooks/telnyx/sms
    * and delegates to the handler installed by SmsAdapter.start() (ADR-036).
@@ -266,32 +269,10 @@ export class HttpAdapter implements Channel {
       const requestPath = (request.url ?? '').split('?')[0] ?? '';
       if (!isApiPath(routeUrl) && !isApiPath(requestPath)) return;
 
-      // These API routes use session-cookie auth and bypass bearer token enforcement.
-      // /api/setup/* is included because the onboarding wizard runs in the browser
-      // with the same curia_session cookie / x-web-bootstrap-secret pair as the
-      // identity routes; without this entry, requests get rejected at this hook
-      // before assertSecret ever runs.
-      if (
-        routeUrl === '/api/health' ||
-        routeUrl.startsWith('/api/kg') ||
-        routeUrl.startsWith('/api/voice') ||
-        routeUrl.startsWith('/api/identity') ||
-        routeUrl.startsWith('/api/executive') ||
-        routeUrl.startsWith('/api/jobs') ||
-        routeUrl.startsWith('/api/antfarm') ||
-        routeUrl.startsWith('/api/autonomy') ||
-        routeUrl.startsWith('/api/memory') ||
-        routeUrl.startsWith('/api/documents') ||
-        routeUrl.startsWith('/api/system') ||
-        routeUrl.startsWith('/api/registry') ||
-        routeUrl.startsWith('/api/vault') ||
-        // Secret-capture routes are token-authed (the single-use token in the URL is the
-        // capability), so they bypass bearer auth and self-authorize via the token (#971).
-        routeUrl.startsWith('/api/secret-capture') ||
-        routeUrl.startsWith('/api/setup') ||
-        // Telnyx SMS webhooks authenticate via Ed25519 signature, not bearer token (ADR-036).
-        routeUrl.startsWith('/api/webhooks/telnyx')
-      ) return;
+      // Session-cookie, capability-token and webhook-signature routes authenticate
+      // themselves and bypass bearer token enforcement. A new console route must be
+      // added to the list in auth.ts, or this hook rejects it before assertSecret runs.
+      if (bypassesBearerAuth(routeUrl)) return;
 
       if (!validateBearerToken(request.headers.authorization, apiToken)) {
         // Audit-log the failure: IP, route, and whether a token was even provided.
@@ -397,6 +378,15 @@ export class HttpAdapter implements Channel {
       await this.app.register(antfarmRoutes, {
         auditLogRepo: this.config.auditLogRepo,
         eventRouter: this.eventRouter,
+        webAppBootstrapSecret,
+        sessions,
+        logger,
+      });
+    }
+
+    if (this.config.activityFeed) {
+      await this.app.register(activityRoutes, {
+        activity: this.config.activityFeed,
         webAppBootstrapSecret,
         sessions,
         logger,

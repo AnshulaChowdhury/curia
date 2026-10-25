@@ -29,7 +29,7 @@ import {
 import type { EntityMemory } from '../memory/entity-memory.js';
 import type { ExecutionLayer, InvokeOptions } from '../skills/execution.js';
 import type { CallerContext } from '../skills/types.js';
-import type { ChannelIdentity, PrincipalPrimaryEmailRef } from '../contacts/types.js';
+import type { ChannelIdentity, PrincipalPrimaryEmailRef, PrincipalProfileRef } from '../contacts/types.js';
 import { sanitizeOutput } from '../skills/sanitize.js';
 import { prepareAgentResponseContent } from '../dispatch/no-reply.js';
 import { splitRelayNote } from './principal-note.js';
@@ -267,6 +267,12 @@ export interface AgentConfig {
    * See #1950.
    */
   principalPrimaryEmail?: PrincipalPrimaryEmailRef;
+  /**
+   * The principal's name, preferred name, title and pronouns. Read per turn so a
+   * contact-update in chat shows from the next turn. Omitted renders no profile.
+   * See #2226.
+   */
+  principalProfile?: PrincipalProfileRef;
   /** The specialist roster string (from AgentRegistry.specialistSummary()). When provided,
    *  a "## Available Specialists" block is appended to the system prompt. Passed only for
    *  the coordinator (see src/index.ts). Specialists that use the ${available_specialists}
