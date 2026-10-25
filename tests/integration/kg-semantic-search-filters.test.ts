@@ -101,6 +101,9 @@ describeIf('KG semantic search with filters (#2248)', () => {
     }
 
     for (const p of [pool, indexPool]) {
+      // A fuzzy hit learns `incoming` as an alias, after which the next pass would resolve
+      // by exact match and never reach the fuzzy phase. Forget it so each pass is fuzzy.
+      await pool.query(`UPDATE kg_nodes SET aliases = '{}' WHERE id = $1`, [org]);
       const store = storeOn(p);
       const memory = new EntityMemory(store, new MemoryValidator(store, embedder), embedder, createSilentLogger());
       const result = await memory.resolveOrCreate({ type: 'organization', label: incoming, source: 'integration-test' });
@@ -109,31 +112,33 @@ describeIf('KG semantic search with filters (#2248)', () => {
     }
   });
 
+  // Cosines sit near 1 so organizations left in the shared database by other files cannot
+  // outrank these nodes and push them past the limit.
   it('a type filter returns matching nodes nearest-first past ef_search closer non-matches', async () => {
     const query = await embedder.embed(`type filter probe ${runId}`, 'query');
-    const near = await node('organization', `Type probe near ${runId}`, at(query, 0.9));
-    const far = await node('organization', `Type probe far ${runId}`, at(query, 0.8));
+    const near = await node('organization', `Type probe near ${runId}`, at(query, 0.99));
+    const far = await node('organization', `Type probe far ${runId}`, at(query, 0.98));
     for (let i = 0; i < 60; i++) {
-      await node('fact', `Type probe fact ${i} ${runId}`, at(query, 0.97));
+      await node('fact', `Type probe fact ${i} ${runId}`, at(query, 0.995));
     }
 
-    const results = await storeOn(indexPool).semanticSearch(`type filter probe ${runId}`, { type: 'organization', limit: 5 });
+    const results = await storeOn(indexPool).semanticSearch(`type filter probe ${runId}`, { type: 'organization', limit: 20 });
     const ids = results.map(r => r.node.id);
     expect(ids).toContain(near);
     expect(ids).toContain(far);
     expect(ids.indexOf(near)).toBeLessThan(ids.indexOf(far));
     expect(results.every(r => r.node.type === 'organization')).toBe(true);
-    expect(results[ids.indexOf(near)]!.score).toBeCloseTo(0.9, 3);
+    expect(results[ids.indexOf(near)]!.score).toBeCloseTo(0.99, 3);
   });
 
   it('a sensitivity ceiling returns allowed nodes past ef_search closer restricted ones', async () => {
     const query = await embedder.embed(`sensitivity probe ${runId}`, 'query');
-    const allowed = await node('concept', `Sensitivity probe allowed ${runId}`, at(query, 0.85), 'internal');
+    const allowed = await node('concept', `Sensitivity probe allowed ${runId}`, at(query, 0.98), 'internal');
     for (let i = 0; i < 60; i++) {
-      await node('concept', `Sensitivity probe restricted ${i} ${runId}`, at(query, 0.97), 'restricted');
+      await node('concept', `Sensitivity probe restricted ${i} ${runId}`, at(query, 0.995), 'restricted');
     }
 
-    const results = await storeOn(indexPool).semanticSearch(`sensitivity probe ${runId}`, { maxSensitivity: 'internal', limit: 5 });
+    const results = await storeOn(indexPool).semanticSearch(`sensitivity probe ${runId}`, { maxSensitivity: 'internal', limit: 20 });
     expect(results.map(r => r.node.id)).toContain(allowed);
     expect(results.every(r => r.node.sensitivity === 'internal' || r.node.sensitivity === 'public')).toBe(true);
   });
