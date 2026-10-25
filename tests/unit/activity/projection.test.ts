@@ -154,13 +154,56 @@ describe('projectActivity', () => {
     expect(items.map((i) => i.headline)).toEqual(['provided two essay ideas', 'answered a question']);
   });
 
-  it('drops a job with only plumbing and no reply', () => {
+  it('renders the issue\'s plumbing-only ceo-inbox job, unscheduled, as one item with no tool names', () => {
+    const root = task('t1', { agentId: 'ceo-inbox', channelId: 'internal' });
+    const children = [
+      ...toolCall('t1', 'executive-profile-get', {}, { success: true, data: {} }),
+      ...toolCall('t1', 'config-store', { key: 'a' }, { success: true, data: {} }),
+      ...toolCall('t1', 'config-store', { key: 'b' }, { success: true, data: {} }),
+      ...toolCall('t1', 'ceo-inbox-search', { query: 'x' }, { success: true, data: {} }),
+      ...toolCall('t1', 'ceo-inbox-list', {}, { success: true, data: {} }),
+    ];
+    const items = projectActivity(rows([root], children), ctx());
+    expect(items).toHaveLength(1);
+    expect(items[0]!.headline).toBe('checked the inbox');
+    expect(JSON.stringify(items[0])).not.toMatch(TOOL_NAMES);
+  });
+
+  it('names a lookup-only job by what it read', () => {
+    const cal = task('t1');
+    const other = task('t2');
+    const children = [
+      ...toolCall('t1', 'calendar-list-events', {}, { success: true, data: {} }),
+      ...toolCall('t2', 'config-store', {}, { success: true, data: {} }),
+      response('t2', 'NO_REPLY', { suppressDelivery: true }),
+    ];
+    expect(projectActivity(rows([cal, other], children), ctx()).map((i) => i.headline))
+      .toEqual(['checked the calendar', 'looked into a request']);
+  });
+
+  it('drops a job with no successful tool call and no reply', () => {
     const root = task('t1');
     const children = [
-      ...toolCall('t1', 'config-store', {}, { success: true, data: {} }),
+      ...toolCall('t1', 'config-store', {}, { success: false, error: 'x' }),
       response('t1', 'NO_REPLY', { suppressDelivery: true }),
     ];
     expect(projectActivity(rows([root], children), ctx())).toEqual([]);
+  });
+
+  it('does not count failed web calls as research', () => {
+    const root = task('t1', { channelId: 'http' });
+    const children = [
+      ...toolCall('t1', 'web-search', { query: 'a' }, { success: false, error: 'rate limited' }),
+      ...toolCall('t1', 'web-search', { query: 'b' }, { success: true, data: {} }),
+      response('t1', 'Found it.'),
+    ];
+    expect(projectActivity(rows([root], children), ctx())[0]!.headline).toBe('researched for 1 min (1 search)');
+    const onlyFailed = task('t2', { channelId: 'http' });
+    const failedChildren = [
+      ...toolCall('t2', 'web-search', { query: 'a' }, { success: false, error: 'rate limited' }),
+      response('t2', 'I could not search right now.'),
+    ];
+    expect(projectActivity(rows([onlyFailed], failedChildren), ctx())[0]!.headline).toBe('answered a question');
   });
 
   it('shows a failed consequential action as a failure line', () => {

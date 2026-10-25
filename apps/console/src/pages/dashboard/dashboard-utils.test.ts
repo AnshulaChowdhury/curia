@@ -241,6 +241,12 @@ describe('fetchActivity', () => {
     const data = await fetchActivity();
     expect(data.items.map(i => i.id)).toEqual(['a']);
     expect(data.timezone).toBe('America/Toronto');
+    expect(data.hasMore).toBe(false);
+  });
+
+  it('passes hasMore through', async () => {
+    vi.stubGlobal('fetch', mockFetch(200, { items: [item], hasMore: true, timezone: 'UTC' }));
+    expect((await fetchActivity()).hasMore).toBe(true);
   });
 
   it('asks /api/activity for the last 24h, 20 items', async () => {

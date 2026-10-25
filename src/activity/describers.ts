@@ -174,6 +174,9 @@ const HIDDEN: Describer = { prominence: 'hidden' };
 
 const EMAIL_COUNT_TALLY = (verb: string): Tally => ({ verb, one: 'an email', many: 'emails' });
 
+// The subject in `done` never reaches a feed headline: count-prominence calls
+// render through their tally ("archived 3 emails"). It is for the activity-log
+// skill's per-action `summary`, which reports each call on its own.
 function emailCount(verb: string, attempt: string): Describer {
   return {
     prominence: 'count',

@@ -20,6 +20,7 @@ import type { LLMProvider } from '../agents/llm/provider.js';
 import { NO_REASONING } from '../agents/llm/sampling-options.js';
 import type { Logger } from '../logger.js';
 import { isVisibleTool, researchKind } from './describers.js';
+import { scrubContactDetails } from './scrub.js';
 
 export interface ActivitySummarizerConfig {
   bus: EventBus;
@@ -47,10 +48,6 @@ const MAX_IN_FLIGHT = 3;
 /** Queued summaries beyond this are dropped, logged: the feed falls back to its generic line. */
 const MAX_QUEUED = 100;
 
-// Contact details the model might lift from the text, removed whatever the prompt said.
-const EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
-const URL_RE = /\bhttps?:\/\/\S+|\bwww\.\S+/gi;
-const PHONE_RE = /\+?\d[\d\s().-]{6,}\d/g;
 
 const SYSTEM_PROMPT = [
   'You write one line for an assistant\'s work log.',
@@ -66,16 +63,23 @@ function clip(text: string, max: number): string {
 }
 
 /**
+ * Make untrusted text safe to wrap in the prompt's <request>/<reply> tags: a
+ * literal `</reply>` in a message would otherwise close the envelope and leave
+ * the rest reading as instructions. Escape after clipping so a cut cannot split
+ * an entity.
+ */
+export function escapeForTag(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
  * Normalise the model's phrase: one line, no wrapping quotes or trailing stop,
  * lower-case start, capped. Null when nothing usable is left.
  */
 export function cleanSummary(raw: string): string | null {
   const line = raw.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
-  const stripped = line
-    .replace(EMAIL_RE, '')
-    .replace(URL_RE, '')
-    .replace(PHONE_RE, '')
-    .replace(/\s{2,}/g, ' ')
+  // Contact details the model lifted from the text go, whatever the prompt said.
+  const stripped = scrubContactDetails(line)
     .replace(/^["'“”‘’`*_\s-]+|["'“”‘’`*_\s]+$/g, '')
     .replace(/[.!]+$/, '')
     .trim();
@@ -190,7 +194,7 @@ export class ActivitySummarizer {
           { role: 'system', content: SYSTEM_PROMPT },
           {
             role: 'user',
-            content: `<request>${clip(request, MAX_INPUT_CHARS)}</request>\n<reply>${clip(reply, MAX_REPLY_CHARS)}</reply>`,
+            content: `<request>${escapeForTag(clip(request, MAX_INPUT_CHARS))}</request>\n<reply>${escapeForTag(clip(reply, MAX_REPLY_CHARS))}</reply>`,
           },
         ],
         // A short background call, not an agent turn (ADR-048 §3).

@@ -13,6 +13,7 @@ import type { SchedulerService } from '../scheduler/scheduler-service.js';
 import type { Logger } from '../logger.js';
 import { isUuid } from '../util/uuid.js';
 import { collectActivityRefs, projectActivity, type ActivityRows } from './projection.js';
+import { scrubContactDetails } from './scrub.js';
 import type { ActivityPage } from './types.js';
 
 export interface ActivityServiceDeps {
@@ -31,23 +32,35 @@ export interface ActivityFeedSource {
 }
 
 /**
- * Roots read per requested item. Many jobs project to nothing (plumbing-only
- * turns, inbound mail Curia didn't answer), so read more than asked for.
+ * Roots read per page, per requested item. Some jobs project to nothing
+ * (no reply and no tool work), so each page reads more than asked for, and
+ * list() keeps paging until it has enough items.
  */
 const ROOTS_PER_ITEM = 4;
-const MAX_ROOTS = 200;
+const MIN_ROOTS_PER_PAGE = 50;
+const MAX_ROOTS_PER_PAGE = 200;
+/** Pages read per request before reporting hasMore instead (1,000 roots). */
+const MAX_PAGES = 5;
+/** An approval can land after its job: autonomy rows are read this far past the window. */
+const AUTONOMY_TAIL_MS = 24 * 60 * 60 * 1000;
+/** Autonomy rows read per request; reaching it is logged, since older items then lose their label. */
+const AUTONOMY_ROW_LIMIT = 5000;
 /** Cap on distinct names resolved per request — each is a DB round-trip. */
 const MAX_NAME_LOOKUPS = 100;
 const JOB_LABEL_MAX = 60;
 
-/** A short label for a scheduled job: its task title, else the first sentence of its task. */
+/**
+ * A short label for a scheduled job: its task title, else the first sentence of
+ * its task text. That text is job configuration, so it is scrubbed of emails,
+ * links and phone numbers like the model summaries are.
+ */
 export function jobLabelFrom(job: { taskTitle: string | null; taskPayload: Record<string, unknown> }): string | null {
   const title = job.taskTitle?.trim();
   const raw = title && title.length > 0
     ? title
     : typeof job.taskPayload.task === 'string' ? job.taskPayload.task : '';
   const firstSentence = raw.split(/(?<=[.!?])\s|\n/)[0]?.replace(/\s+/g, ' ').trim() ?? '';
-  const sentence = firstSentence.replace(/[.!?]+$/, '');
+  const sentence = scrubContactDetails(firstSentence).replace(/[.!?]+$/, '').trim();
   if (sentence.length === 0) return null;
   return sentence.length > JOB_LABEL_MAX ? `${sentence.slice(0, JOB_LABEL_MAX - 1)}…` : sentence;
 }
@@ -57,11 +70,7 @@ export class ActivityService implements ActivityFeedSource {
 
   async list(query: { from: Date; to: Date; limit: number }): Promise<ActivityPage> {
     const { deps } = this;
-    const rows: ActivityRows & { hasMore: boolean } = await deps.auditLogRepo.findActivityJobs({
-      from: query.from,
-      to: query.to,
-      limit: Math.min(query.limit * ROOTS_PER_ITEM, MAX_ROOTS),
-    });
+    const { rows, hasMore: rootsRemain } = await this.readRoots(query);
 
     const principal = await this.lookup('principal contact', () => deps.contactService.findContactBySystemRole('principal'));
     const timezone = principal?.timezone ?? deps.officeTimezone;
@@ -70,7 +79,7 @@ export class ActivityService implements ActivityFeedSource {
     const [names, jobLabels, autonomyRows] = await Promise.all([
       this.resolveNames(refs.names, principal?.displayName ?? null),
       this.resolveJobLabels(refs.jobIds),
-      this.loadAutonomyRows(query.from),
+      this.loadAutonomyRows(query.from, query.to),
     ]);
 
     const items = projectActivity(rows, {
@@ -82,9 +91,39 @@ export class ActivityService implements ActivityFeedSource {
 
     return {
       items: items.slice(0, query.limit),
-      hasMore: rows.hasMore || items.length > query.limit,
+      hasMore: items.length > query.limit || rootsRemain,
       timezone,
     };
+  }
+
+  /**
+   * Read roots newest first, a page at a time, until more than `limit` of them
+   * project to an item or the window runs out. Whether a job shows depends only
+   * on its rows, not on names or labels, so each page is counted with a bare
+   * projection before anything is resolved. `hasMore` is true when roots remain
+   * unread: the window was not exhausted.
+   */
+  private async readRoots(query: { from: Date; to: Date; limit: number }): Promise<{ rows: ActivityRows; hasMore: boolean }> {
+    const pageSize = Math.min(Math.max(query.limit * ROOTS_PER_ITEM, MIN_ROOTS_PER_PAGE), MAX_ROOTS_PER_PAGE);
+    const rows: ActivityRows = { roots: [], delegated: [], children: [] };
+    const countCtx = { timezone: 'UTC', name: () => null, jobLabel: () => null, autonomyRows: [] };
+    let visible = 0;
+    let before: { timestamp: Date; id: string } | undefined;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const result = await this.deps.auditLogRepo.findActivityJobs({ from: query.from, to: query.to, limit: pageSize, before });
+      rows.roots.push(...result.roots);
+      rows.delegated.push(...result.delegated);
+      rows.children.push(...result.children);
+      visible += projectActivity(result, countCtx).length;
+      if (!result.hasMore || !result.nextCursor) return { rows, hasMore: false };
+      if (visible > query.limit) return { rows, hasMore: true };
+      before = result.nextCursor;
+    }
+    this.deps.logger.warn(
+      { pages: MAX_PAGES, pageSize, visible, limit: query.limit },
+      'activity: page bound reached before the feed filled; older jobs not read',
+    );
+    return { rows, hasMore: true };
   }
 
   /** Run one lookup; a failure degrades that name to its fallback, logged. */
@@ -132,10 +171,18 @@ export class ActivityService implements ActivityFeedSource {
     return labels;
   }
 
-  private async loadAutonomyRows(from: Date): Promise<ActionLogRow[]> {
-    if (!this.deps.actionLogRepo) return [];
-    // Until now, not the window end: an approval can land after the job's window.
-    const rows = await this.lookup('autonomy action log', () => this.deps.actionLogRepo!.findTerminalBetween(from, new Date()));
+  private async loadAutonomyRows(from: Date, to: Date): Promise<ActionLogRow[]> {
+    const repo = this.deps.actionLogRepo;
+    if (!repo) return [];
+    // Past the window end, so an approval that landed after its job still labels it.
+    const until = new Date(Math.min(Date.now(), to.getTime() + AUTONOMY_TAIL_MS));
+    const rows = await this.lookup('autonomy action log', () => repo.findTerminalBetween(from, until, AUTONOMY_ROW_LIMIT));
+    if (rows && rows.length >= AUTONOMY_ROW_LIMIT) {
+      this.deps.logger.warn(
+        { limit: AUTONOMY_ROW_LIMIT, from, until },
+        'activity: autonomy rows hit the read limit; the oldest items may lose their approved/autonomous label',
+      );
+    }
     return rows ?? [];
   }
 }

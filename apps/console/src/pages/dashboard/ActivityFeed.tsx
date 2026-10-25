@@ -62,12 +62,13 @@ export function ActivityFeed() {
               {group.items.map(item => {
                 const note = autonomyNote(item);
                 return (
-                  <div key={item.id} className={`dash-activity-item ${item.outcome === 'failed' ? 'failed' : ''}`}>
+                  <div key={item.id} className={`dash-activity-item ${item.outcome === 'success' ? '' : item.outcome}`}>
                     <span className="dash-activity-time">{formatActivityTime(item.ts, data.timezone)}</span>
                     <div className="dash-activity-text">
                       <Headline item={item} />
                       <span className="dash-activity-meta">
                         {agentLabel(item.actor)}{note ? ` · ${note}` : ''}
+                        {item.outcome === 'partial' && <span className="dash-activity-partial"> · partly failed</span>}
                       </span>
                       {item.details.length > 0 && (
                         <ul className="dash-activity-details">
@@ -82,6 +83,11 @@ export function ActivityFeed() {
               })}
             </Fragment>
           ))}
+          {data.hasMore && (
+            <div className="dash-card-quiet dash-activity-more">
+              Showing the latest {data.items.length}. <a href="/antfarm/">Replay the full day in the Ant Farm</a>.
+            </div>
+          )}
         </div>
       )}
     </article>

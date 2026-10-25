@@ -295,6 +295,8 @@ export interface ActivityItem {
 
 export interface ActivityFeedData {
   items: ActivityItem[];
+  /** True when the window held more than the card shows. */
+  hasMore: boolean;
   /** IANA timezone the backend wrote dates in — the principal's. Times use it too. */
   timezone: string;
 }
@@ -306,7 +308,7 @@ const ACTIVITY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 export async function fetchActivity(signal?: AbortSignal): Promise<ActivityFeedData> {
   const from = new Date(Date.now() - ACTIVITY_LOOKBACK_MS).toISOString();
   const params = new URLSearchParams({ from, limit: '20' });
-  const data = await fetchJson<{ items?: ActivityItem[]; timezone?: unknown }>(
+  const data = await fetchJson<{ items?: ActivityItem[]; hasMore?: unknown; timezone?: unknown }>(
     `/api/activity?${params.toString()}`,
     signal,
   );
@@ -314,7 +316,7 @@ export async function fetchActivity(signal?: AbortSignal): Promise<ActivityFeedD
   const timezone = typeof data.timezone === 'string' && data.timezone.length > 0
     ? data.timezone
     : Intl.DateTimeFormat().resolvedOptions().timeZone;
-  return { items, timezone };
+  return { items, hasMore: data.hasMore === true, timezone };
 }
 
 // Where a click on an item goes: the job's page, or an Ant Farm replay of the

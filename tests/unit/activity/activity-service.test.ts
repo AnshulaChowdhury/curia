@@ -72,6 +72,68 @@ describe('ActivityService', () => {
     expect(warn).toHaveBeenCalled();
   });
 
+  it('keeps paging when most roots project to nothing, so the feed fills', async () => {
+    // Each page: 49 dropped roots (no tools, no reply) and one archive job.
+    const page = (n: number) => {
+      const roots: AuditLogRow[] = [];
+      const children: AuditLogRow[] = [];
+      for (let i = 0; i < 50; i++) {
+        const id = `p${n}-t${i}`;
+        roots.push(row({ id, eventType: 'agent.task', timestamp: new Date(T0.getTime() - (n * 50 + i) * 60_000), payload: { agentId: 'coordinator', channelId: 'email' } }));
+        if (i === 0) {
+          children.push(
+            row({ id: `${id}-i`, eventType: 'tool.invoke', parentEventId: id, payload: { toolName: 'ceo-inbox-archive', input: {} } }),
+            row({ id: `${id}-r`, eventType: 'tool.result', parentEventId: `${id}-i`, outcome: 'success', payload: { toolName: 'ceo-inbox-archive', result: { success: true, data: {} } } }),
+          );
+        }
+      }
+      const last = roots[roots.length - 1]!;
+      return { roots, delegated: [], children, hasMore: n < 3, nextCursor: n < 3 ? { timestamp: last.timestamp, id: last.id } : undefined };
+    };
+    const findActivityJobs = vi.fn()
+      .mockResolvedValueOnce(page(0)).mockResolvedValueOnce(page(1)).mockResolvedValueOnce(page(2)).mockResolvedValueOnce(page(3));
+    const result = await new ActivityService(deps({ auditLogRepo: { findActivityJobs } })).list({ from: new Date(0), to: T0, limit: 3 });
+    expect(result.items).toHaveLength(3);
+    expect(result.hasMore).toBe(true);
+    // Stopped once it had more than `limit` items: four pages, each continuing from the last.
+    expect(findActivityJobs).toHaveBeenCalledTimes(4);
+    expect(findActivityJobs.mock.calls[1]![0]).toMatchObject({ before: page(0).nextCursor });
+  });
+
+  it('reports no more once the window is exhausted, even when short', async () => {
+    const result = await new ActivityService(deps()).list({ from: new Date(0), to: T0, limit: 20 });
+    expect(result.items).toHaveLength(2);
+    expect(result.hasMore).toBe(false);
+  });
+
+  it('reads autonomy rows for the window plus a day, never past now', async () => {
+    const d = deps();
+    const to = new Date('2026-10-01T00:00:00.000Z');
+    await new ActivityService(d).list({ from: new Date('2026-09-30T00:00:00.000Z'), to, limit: 20 });
+    const [since, until, limit] = vi.mocked(d.actionLogRepo!.findTerminalBetween).mock.calls[0]!;
+    expect(since).toEqual(new Date('2026-09-30T00:00:00.000Z'));
+    expect(until).toEqual(new Date('2026-10-02T00:00:00.000Z'));
+    expect(limit).toBe(5000);
+
+    const recent = deps();
+    const before = Date.now();
+    await new ActivityService(recent).list({ from: new Date(before - 3_600_000), to: new Date(before), limit: 20 });
+    const recentUntil = vi.mocked(recent.actionLogRepo!.findTerminalBetween).mock.calls[0]![1];
+    expect(recentUntil.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('labels an approval that landed after the window', async () => {
+    const d = deps({
+      actionLogRepo: {
+        findTerminalBetween: vi.fn().mockResolvedValue([
+          { taskId: 't1', toolName: 'email-send', outcome: 'approved', conversationId: 'conv-1', createdAt: new Date(T0.getTime() + 3_600_000) },
+        ]),
+      },
+    });
+    const page = await new ActivityService(d).list({ from: new Date(0), to: T0, limit: 20 });
+    expect(page.items[0]!.autonomy).toBe('approved');
+  });
+
   it('trims to the limit and reports more', async () => {
     const page = await new ActivityService(deps()).list({ from: new Date(0), to: T0, limit: 1 });
     expect(page.items).toHaveLength(1);
@@ -85,5 +147,10 @@ describe('jobLabelFrom', () => {
     expect(jobLabelFrom({ taskTitle: null, taskPayload: { task: 'Check the inbox. Then rest.' } })).toBe('Check the inbox');
     expect(jobLabelFrom({ taskTitle: null, taskPayload: {} })).toBeNull();
     expect(jobLabelFrom({ taskTitle: 'x'.repeat(100), taskPayload: {} })!.length).toBe(60);
+  });
+
+  it('scrubs contact details from the task-text fallback', () => {
+    expect(jobLabelFrom({ taskTitle: null, taskPayload: { task: 'Email jane@acme.com the weekly numbers. Then stop.' } }))
+      .toBe('Email the weekly numbers');
   });
 });

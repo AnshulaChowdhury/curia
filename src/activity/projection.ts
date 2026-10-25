@@ -242,6 +242,8 @@ function researchPhrase(job: Job): string | null {
   let searches = 0;
   let pages = 0;
   for (const call of job.calls) {
+    // A search that failed found nothing; it is not research the job did.
+    if (!call.ok) continue;
     const kind = researchKind(call.toolName);
     if (kind === 'search') searches += 1;
     else if (kind === 'page') pages += 1;
@@ -269,6 +271,19 @@ function conversationalFallback(job: Job): string | null {
     return `replied to ${sender.displayName}`;
   }
   return 'answered a question';
+}
+
+/**
+ * Line for a job whose only tool work was lookups: nothing changed and no reply
+ * went out, but Curia did check something. Named by what it read, never by tool.
+ */
+function lookupFallback(job: Job): string | null {
+  const read = job.calls.filter((c) => c.ok).map((c) => c.toolName);
+  if (read.length === 0) return null;
+  if (read.some((t) => t.startsWith('ceo-inbox-') || t.startsWith('email-'))) return 'checked the inbox';
+  if (read.some((t) => t.startsWith('calendar-'))) return 'checked the calendar';
+  if (read.some((t) => t.startsWith('contact-') || t === 'entity-context')) return 'looked up contacts';
+  return 'looked into a request';
 }
 
 function linkFor(job: Job, jobId: string | undefined): ActivityLink | null {
@@ -343,7 +358,7 @@ function projectJob(job: Job, ctx: ProjectionContext): ActivityItem | null {
     headline = 'ran into an error';
     details = [];
   } else {
-    headline = conversationalFallback(job);
+    headline = conversationalFallback(job) ?? lookupFallback(job);
     details = [];
   }
 

@@ -99,6 +99,41 @@ describeIf('activity feed read path', () => {
     expect(ts).toEqual([...ts].sort().reverse());
   });
 
+  it('pages older roots with the keyset cursor', async () => {
+    const day = isolatedDay();
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      ids.push(await seed({ timestamp: new Date(day.getTime() + i * 60_000), eventType: 'agent.task', payload: { agentId: 'coordinator', channelId: 'email' } }));
+    }
+    const window = { from: day, to: new Date(day.getTime() + 86_400_000) };
+    const first = await repo.findActivityJobs({ ...window, limit: 2 });
+    expect(first.roots.map((r) => r.id)).toEqual([ids[4], ids[3]]);
+    expect(first.nextCursor).toBeDefined();
+    const second = await repo.findActivityJobs({ ...window, limit: 2, before: first.nextCursor });
+    expect(second.roots.map((r) => r.id)).toEqual([ids[2], ids[1]]);
+    const third = await repo.findActivityJobs({ ...window, limit: 2, before: second.nextCursor });
+    expect(third.roots.map((r) => r.id)).toEqual([ids[0]]);
+    expect(third.hasMore).toBe(false);
+  });
+
+  it('fills the feed past a page of roots that project to nothing', async () => {
+    const day = isolatedDay();
+    const visible = await seedArchiveJob(day, 'old-but-visible');
+    // 60 newer roots with no tool work and no reply: more than one page at limit=1.
+    for (let i = 1; i <= 60; i++) {
+      await seed({ timestamp: new Date(day.getTime() + i * 60_000), eventType: 'agent.task', payload: { agentId: 'coordinator', channelId: 'email' } });
+    }
+    const service = new ActivityService({
+      auditLogRepo: repo,
+      contactService: { getContact: async () => undefined, findContactBySystemRole: async () => null, resolveByChannelIdentity: async () => null },
+      officeTimezone: 'UTC',
+      logger,
+    });
+    const feed = await service.list({ from: day, to: new Date(day.getTime() + 86_400_000), limit: 1 });
+    expect(feed.items.map((i) => i.id)).toEqual([visible]);
+    expect(feed.hasMore).toBe(false);
+  });
+
   it('reads delegated specialist work and the summary under the root, not as roots', async () => {
     const day = isolatedDay();
     const rootId = await seed({ timestamp: day, eventType: 'agent.task', payload: { agentId: 'coordinator', channelId: 'signal', content: 'x' } });
@@ -119,10 +154,19 @@ describeIf('activity feed read path', () => {
       payload: { toolName: 'contact-create', result: { success: true, data: { display_name: 'Jane Roe' } } },
     });
     await seed({ timestamp: new Date(day.getTime() + 5000), eventType: 'activity.summary', parentEventId: rootId, payload: { summary: 'set up a meeting' } });
+    // Two more levels: past the old three-level cap.
+    const level3 = await seed({
+      timestamp: new Date(day.getTime() + 6000), eventType: 'agent.task', conversationId: 'delegate-3',
+      payload: { agentId: 'research', channelId: 'internal', content: 'a', metadata: { delegationOrigin: { taskEventId: nestedId } } },
+    });
+    const level4 = await seed({
+      timestamp: new Date(day.getTime() + 7000), eventType: 'agent.task', conversationId: 'delegate-4',
+      payload: { agentId: 'research', channelId: 'internal', content: 'b', metadata: { delegationOrigin: { taskEventId: level3 } } },
+    });
 
     const page = await repo.findActivityJobs({ from: day, to: new Date(day.getTime() + 86_400_000), limit: 20 });
     expect(page.roots.map((r) => r.id)).toEqual([rootId]);
-    expect(page.delegated.map((r) => r.id).sort()).toEqual([specialistId, nestedId].sort());
+    expect(page.delegated.map((r) => r.id).sort()).toEqual([specialistId, nestedId, level3, level4].sort());
     expect(page.children.map((r) => r.eventType).sort()).toEqual(['activity.summary', 'tool.invoke', 'tool.result']);
   });
 });
