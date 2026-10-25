@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { MemoryValidator } from '../../../src/memory/validation.js';
 import { KnowledgeGraphStore } from '../../../src/memory/knowledge-graph.js';
 import { EmbeddingService } from '../../../src/memory/embedding.js';
@@ -628,6 +628,391 @@ describe('MemoryValidator', () => {
 
       // Existing is multi-valued with value c2; incoming has no value → values differ → create
       expect(result.action).toBe('create');
+    });
+  });
+
+  describe('exact-key facts (StoreFactOptions.exactKey)', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('creates when no fact shares properties.key', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const existing = await store.createNode({
+        type: 'fact',
+        label: 'foo_1',
+        properties: { key: 'foo_1', value: 'a', namespace: 'ns' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: existing.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'foo_2',
+        properties: { key: 'foo_2', value: 'b', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+
+      expect(result.action).toBe('create');
+    });
+
+    it('updates the matching key and returns newLabel even when cosine would merge', async () => {
+      // Force high cosine so this is not a vacuous pass against the fake embedder.
+      vi.spyOn(EmbeddingService, 'cosineSimilarity').mockReturnValue(0.99);
+
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      // Prose fact without properties.key — semantic merge still applies.
+      const prose = await store.createNode({
+        type: 'fact',
+        label: 'Bob lives in Kitchener',
+        properties: { note: 'prose' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: prose.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+      const semanticProse = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'Bob lives in Kitchener',
+        properties: { note: 'updated' },
+        source: 'test',
+      });
+      expect(semanticProse.action).toBe('update');
+
+      // Config-style fact with a string key — semantic write of a *different* key
+      // must create (isExactKeyProtected), not merge.
+      const existing = await store.createNode({
+        type: 'fact',
+        label: 'processed_event_ids_1',
+        properties: { key: 'processed_event_ids_1', value: '["a"]', namespace: 'ns', exact_key: true },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: existing.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const semanticIntoConfig = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'processed_event_ids_2',
+        properties: { key: 'processed_event_ids_2', value: '["b"]', namespace: 'ns' },
+        source: 'test',
+      });
+      expect(semanticIntoConfig.action).toBe('create');
+
+      // With exactKey, different key → create despite high cosine.
+      const exact = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'processed_event_ids_2',
+        properties: { key: 'processed_event_ids_2', value: '["b"]', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(exact.action).toBe('create');
+
+      // Same key → update with newLabel so label stays aligned.
+      const sameKey = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'processed_event_ids_1',
+        properties: { key: 'processed_event_ids_1', value: '["a","c"]', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(sameKey.action).toBe('update');
+      if (sameKey.action === 'update') {
+        expect(sameKey.existingNodeId).toBe(existing.id);
+        expect(sameKey.newLabel).toBe('processed_event_ids_1');
+        expect(sameKey.mergedProperties.value).toBe('["a","c"]');
+        expect(sameKey.mergedProperties.exact_key).toBe(true);
+      }
+    });
+
+    it('keeps one-character key differences as separate facts under forced high cosine', async () => {
+      vi.spyOn(EmbeddingService, 'cosineSimilarity').mockReturnValue(0.99);
+
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:debrief', properties: {}, source: 'test',
+      });
+      const existing = await store.createNode({
+        type: 'fact',
+        label: 'prompted:j0a3bljsikn3jdv',
+        properties: { key: 'prompted:j0a3bljsikn3jdv', value: '1', namespace: 'debrief' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: existing.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'prompted:j0a3bljsik3njdv',
+        properties: { key: 'prompted:j0a3bljsik3njdv', value: '1', namespace: 'debrief' },
+        source: 'test',
+        exactKey: true,
+      });
+
+      expect(result.action).toBe('create');
+    });
+
+    it('still rate-limits exactKey writes from agent sources', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const agentTaskKey = 'agent:test/task:exact-key-rate';
+      for (let i = 0; i < 50; i++) {
+        validator.recordWrite(agentTaskKey);
+      }
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'k',
+        properties: { key: 'k', value: 'v', namespace: 'ns' },
+        source: agentTaskKey,
+        exactKey: true,
+      });
+      expect(result.action).toBe('rate_limited');
+    });
+
+    it('exempts system:config-store from the rate limit', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      for (let i = 0; i < 50; i++) {
+        validator.recordWrite('system:config-store');
+      }
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'watermark',
+        properties: { key: 'watermark', value: 't51', namespace: 'email' },
+        source: 'system:config-store',
+        exactKey: true,
+      });
+      expect(result.action).toBe('create');
+    });
+
+    it('still rate-limits system:checkpoint sources (not ConfigStore)', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'person', properties: {}, source: 'test',
+      });
+      const checkpointSource = 'system:checkpoint/conversation:c1/agent:coordinator/channel:email';
+      for (let i = 0; i < 50; i++) {
+        validator.recordWrite(checkpointSource);
+      }
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'one more fact',
+        source: checkpointSource,
+      });
+      expect(result.action).toBe('rate_limited');
+    });
+
+    it('adopts a legacy label-only fact on exactKey write (no twin)', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const legacy = await store.createNode({
+        type: 'fact',
+        label: 'writing_guide_url',
+        properties: { value: 'old' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: legacy.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'writing_guide_url',
+        properties: { key: 'writing_guide_url', value: 'new', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(result.action).toBe('update');
+      if (result.action === 'update') {
+        expect(result.existingNodeId).toBe(legacy.id);
+        expect(result.mergedProperties.key).toBe('writing_guide_url');
+        expect(result.mergedProperties.exact_key).toBe(true);
+        expect(result.mergedProperties.value).toBe('new');
+      }
+    });
+
+    it('does not adopt a label-only fact with a conflicting namespace (corrupted meta-index)', async () => {
+      // Old semantic merge left {label: travel_detection, namespace: travel_detection_v2}.
+      // Adopting it on a travel_detection write would overwrite namespace and drop
+      // travel_detection_v2 from list_namespaces.
+      const index = await store.createNode({
+        type: 'concept', label: 'config-store-index', properties: {}, source: 'test',
+      });
+      const corrupted = await store.createNode({
+        type: 'fact',
+        label: 'travel_detection',
+        properties: { namespace: 'travel_detection_v2' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: index.id,
+        targetNodeId: corrupted.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const result = await validator.validate({
+        entityNodeId: index.id,
+        label: 'travel_detection',
+        properties: {
+          key: 'travel_detection',
+          namespace: 'travel_detection',
+        },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(result.action).toBe('create');
+      if (result.action === 'create') {
+        expect(result.validated.properties.namespace).toBe('travel_detection');
+      }
+
+      // Corrupted fact must be untouched.
+      const still = await store.getNode(corrupted.id);
+      expect(still!.properties.namespace).toBe('travel_detection_v2');
+      expect(still!.properties.key).toBeUndefined();
+    });
+
+    it('adopts a legacy label-only fact when namespace already matches', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const legacy = await store.createNode({
+        type: 'fact',
+        label: 'writing_guide_url',
+        properties: { value: 'old', namespace: 'ns' },
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: legacy.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      const result = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'writing_guide_url',
+        properties: { key: 'writing_guide_url', value: 'new', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(result.action).toBe('update');
+      if (result.action === 'update') {
+        expect(result.existingNodeId).toBe(legacy.id);
+      }
+    });
+
+    it('throws when exactKey is set without a string properties.key', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+
+      await expect(
+        validator.validate({
+          entityNodeId: entity.id,
+          label: 'orphan',
+          properties: { value: 'x' },
+          source: 'test',
+          exactKey: true,
+        }),
+      ).rejects.toThrow(/exactKey requires a string properties\.key/);
+    });
+
+    it('looks up only facts that can match the key, not the whole anchor', async () => {
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const byKey = vi.spyOn(store, 'getConnectedFactsByKey');
+      const all = vi.spyOn(store, 'getConnectedFacts');
+
+      await validator.validate({
+        entityNodeId: entity.id,
+        label: 'seen:abc',
+        properties: { key: 'seen:abc', value: '1' },
+        source: 'test',
+        exactKey: true,
+      });
+
+      expect(byKey).toHaveBeenCalledWith(entity.id, 'seen:abc');
+      // The in-memory backend reuses getConnectedFacts internally; the validator
+      // itself must not call the unfiltered store method.
+      expect(all).not.toHaveBeenCalled();
+    });
+
+    it('persists exact_key on create and blocks semantic merge into it', async () => {
+      vi.spyOn(EmbeddingService, 'cosineSimilarity').mockReturnValue(0.99);
+
+      const entity = await store.createNode({
+        type: 'concept', label: 'config:ns', properties: {}, source: 'test',
+      });
+      const created = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'foo_1',
+        properties: { key: 'foo_1', value: 'a', namespace: 'ns' },
+        source: 'test',
+        exactKey: true,
+      });
+      expect(created.action).toBe('create');
+      if (created.action !== 'create') return;
+      expect(created.validated.properties.exact_key).toBe(true);
+
+      const fact = await store.createNode({
+        type: 'fact',
+        label: 'foo_1',
+        properties: created.validated.properties,
+        source: 'test',
+      });
+      await store.createEdge({
+        sourceNodeId: entity.id,
+        targetNodeId: fact.id,
+        type: 'relates_to',
+        properties: {},
+        source: 'test',
+      });
+
+      // Semantic write without exactKey must not merge into the protected fact.
+      const semantic = await validator.validate({
+        entityNodeId: entity.id,
+        label: 'foo_2',
+        properties: { key: 'foo_2', value: 'b', namespace: 'ns' },
+        source: 'test',
+      });
+      expect(semantic.action).toBe('create');
     });
   });
 

@@ -60,6 +60,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`web-browser` `clear_site_data`** — clears one host's cookies and storage, recovering half-finished sign-ins; others stay signed in. (#2244)
 - **`browser.settleCapMs`** — **config:** caps the web-browser redirect wait; default 35s, at most 90s. (#2244)
 - **`voice.session.ended` turn stats** — **public API:** optional `turnStats` counts utterances, turns, barge-in cancels and joined fragments. (#2240)
+- **`pnpm repair:config-store-labels`** — reports and realigns config keys mislabelled by the old merge; dry-run by default. (#2252)
 
 ### Changed
 
@@ -155,6 +156,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`channel.poll`** — **public API:** `processed` is write-ahead; `fetched` is the Nylas count; `deferred` and `already_staged` added. (#2254)
 - **`EventBus.stagePublish`** — **public API:** persists the event, then returns delivery for the caller to start. (#2254)
 - **`EventBus.deliverPersisted`** — **public API:** delivers an already-persisted event without writing it again. (#2254)
+- **`config-store`** — similar keys no longer overwrite each other's values. (#2252)
+- **`ConfigStore`** — infrastructure writes no longer stall after 50 per process. (#2252)
 - **`async-offramp`** — returns after the task is durably queued, without waiting on the coordinator. (#2265)
 - **Voice tool barge-in** — a stalled tool call no longer holds the turn; its late result is discarded. (#2265)
 - **Voice summarization** — runs in the background, so crossing the threshold no longer delays the reply. (#2266)

@@ -30,7 +30,7 @@ function makeSet(over: Partial<SpotCheckSet> = {}): SpotCheckSet {
 }
 
 /** In-memory config store fake: one value per (namespace, key), like report-queue's fake. */
-function makeStore(opts: { stored?: string | null; setResult?: { stored: boolean }; getError?: Error } = {}) {
+function makeStore(opts: { stored?: string | null; setResult?: { stored: boolean; action?: string }; getError?: Error } = {}) {
   const values = new Map<string, string>();
   if (opts.stored !== undefined && opts.stored !== null) {
     values.set(`${SPOT_CHECK_NAMESPACE}/${SPOT_CHECK_KEY}`, opts.stored);
@@ -40,9 +40,9 @@ function makeStore(opts: { stored?: string | null; setResult?: { stored: boolean
     return values.get(`${ns}/${key}`) ?? null;
   });
   const set = vi.fn(async (ns: string, key: string, value: string) => {
-    const result = opts.setResult ?? { stored: true };
+    const result = opts.setResult ?? { stored: true, action: 'created' };
     if (result.stored) values.set(`${ns}/${key}`, value);
-    return result;
+    return { stored: result.stored, action: result.action ?? 'created' };
   });
   const logger = createSilentLogger();
   const warn = vi.spyOn(logger, 'warn');
@@ -220,7 +220,7 @@ describe('SpotCheckStore', () => {
   it('returns rejected from bindDelivery when the config store soft-rejects the write', async () => {
     const { store, set } = makeStore();
     await store.add(makeSet());
-    set.mockResolvedValueOnce({ stored: false });
+    set.mockResolvedValueOnce({ stored: false, action: 'rate_limited' });
 
     await expect(
       store.bindDelivery('conv-1', { channel: 'signal', messageId: 'm1', at: new Date(NOW).toISOString() }, DIGEST),

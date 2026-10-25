@@ -15,6 +15,9 @@ import { createNodeId, createEdgeId, SENSITIVITY_LEVELS } from './types.js';
 import { EmbeddingService } from './embedding.js';
 import { embeddingStamp, type EmbeddingPurpose } from './embedding-profiles.js';
 
+/** Longest withAdvisoryLock() waits for another holder before failing (Postgres interval). */
+const ADVISORY_LOCK_TIMEOUT = '10s';
+
 // -- Public option interfaces --
 
 export interface CreateNodeOptions {
@@ -91,6 +94,23 @@ interface KnowledgeGraphBackend {
   addAlias(nodeId: string, alias: string): Promise<boolean>;
   createEdge(edge: KgEdge): Promise<void>;
   getEdgesForNode(nodeId: string): Promise<KgEdge[]>;
+  /**
+   * Fact nodes connected to `nodeId` by a non-archived edge (either direction).
+   * One round trip on Postgres (JOIN); used by exact-key upsert and getFacts
+   * so large config anchors do not issue N getNode queries (#2252).
+   */
+  getConnectedFacts(nodeId: string): Promise<KgNode[]>;
+  /**
+   * Connected facts that can match an exact-key lookup: `properties.key` equals
+   * `key`, or (legacy) no `properties.key` and `label` equals `key`. Narrows in
+   * the database so unrelated facts and their embeddings are never loaded.
+   */
+  getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]>;
+  /**
+   * Run `fn` while holding a database-wide mutex named `lockKey`, so callers in
+   * other processes serialize on the same name. `fn` may use any connection.
+   */
+  withAdvisoryLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T>;
   deleteEdge(id: string): Promise<void>;
   updateEdge(id: string, updates: { confidence: number; lastConfirmedAt: Date }): Promise<KgEdge>;
   // Atomic upsert: creates if no matching (src, tgt, type) pair exists in either
@@ -255,6 +275,32 @@ export class KnowledgeGraphStore {
   /** Retrieve a node by ID, or undefined if not found */
   async getNode(id: string): Promise<KgNode | undefined> {
     return this.backend.getNode(id);
+  }
+
+  /**
+   * Fact nodes linked to an entity (either edge direction). Single JOIN on
+   * Postgres — prefer this over getEdges + N× getNode for large anchors (#2252).
+   */
+  async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
+    return this.backend.getConnectedFacts(nodeId);
+  }
+
+  /**
+   * Connected facts whose `properties.key` equals `key`, plus legacy facts with
+   * no `properties.key` whose label equals it. Exact-key upserts use this so a
+   * large config anchor does not load every fact (and embedding) per write.
+   */
+  async getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]> {
+    return this.backend.getConnectedFactsByKey(nodeId, key);
+  }
+
+  /**
+   * Run `fn` under a database-wide mutex named `lockKey` (a transaction-scoped
+   * Postgres advisory lock), so a check-then-create in `fn` is safe against the
+   * same call in another process. Locks are never nested; hold one only briefly.
+   */
+  async withAdvisoryLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+    return this.backend.withAdvisoryLock(lockKey, fn);
   }
 
   /**
@@ -664,6 +710,86 @@ class PostgresBackend implements KnowledgeGraphBackend {
       [nodeId],
     );
     return result.rows.map(pgRowToEdge);
+  }
+
+  async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
+    // Dedup via IN (UNION …) so a fact with two edge types is returned once —
+    // matches InMemoryBackend. Each arm uses idx_kg_edges_source / _target.
+    const result = await this.pool.query<PgNodeRow>(
+      `SELECT n.*
+       FROM kg_nodes n
+       WHERE n.type = 'fact'
+         AND n.archived_at IS NULL
+         AND n.id IN (
+           SELECT target_node_id FROM kg_edges
+            WHERE source_node_id = $1 AND archived_at IS NULL
+           UNION
+           SELECT source_node_id FROM kg_edges
+            WHERE target_node_id = $1 AND archived_at IS NULL
+         )`,
+      [nodeId],
+    );
+    return result.rows.map(pgRowToNode);
+  }
+
+  async getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]> {
+    // Same connected-fact set as getConnectedFacts, narrowed to rows that can
+    // match the key. Callers still apply their own exact checks (string type,
+    // namespace) — this only keeps unrelated rows out of the result.
+    const result = await this.pool.query<PgNodeRow>(
+      `SELECT n.*
+       FROM kg_nodes n
+       WHERE n.type = 'fact'
+         AND n.archived_at IS NULL
+         AND (
+           n.properties->>'key' = $2
+           OR (NOT (n.properties ? 'key') AND n.label = $2)
+         )
+         AND n.id IN (
+           SELECT target_node_id FROM kg_edges
+            WHERE source_node_id = $1 AND archived_at IS NULL
+           UNION
+           SELECT source_node_id FROM kg_edges
+            WHERE target_node_id = $1 AND archived_at IS NULL
+         )`,
+      [nodeId, key],
+    );
+    return result.rows.map(pgRowToNode);
+  }
+
+  async withAdvisoryLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+    // The lock lives on its own connection inside a transaction that does no work:
+    // COMMIT (or ROLLBACK, or the connection dropping) releases it. `fn` runs its
+    // queries on other pool connections in autocommit, so its writes are durable
+    // before the lock is released and the next holder sees them.
+    const client = await this.pool.connect();
+    // Set when ROLLBACK fails: the connection may still be in the transaction and
+    // holding the lock, so it must be destroyed, not returned to the pool.
+    let discard: Error | undefined;
+    try {
+      await client.query('BEGIN');
+      // A stuck holder surfaces as a lock_timeout error rather than a silent hang.
+      // set_config(..., true) is SET LOCAL with a bind parameter.
+      await client.query(`SELECT set_config('lock_timeout', $1, true)`, [ADVISORY_LOCK_TIMEOUT]);
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [lockKey]);
+      const result = await fn();
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        discard = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+        this.logger.error(
+          { err: rollbackErr, lockKey },
+          'kg: advisory lock rollback failed — discarding the connection so it cannot keep the lock',
+        );
+      }
+      throw err;
+    } finally {
+      // A truthy argument makes pg destroy the client instead of pooling it.
+      client.release(discard);
+    }
   }
 
   async deleteEdge(id: string): Promise<void> {
@@ -1192,6 +1318,38 @@ class InMemoryBackend implements KnowledgeGraphBackend {
       }
     }
     return results;
+  }
+
+  async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
+    const facts: KgNode[] = [];
+    const seen = new Set<string>();
+    for (const edge of this.edges.values()) {
+      if (this.archivedEdges.has(edge.id)) continue;
+      if (edge.sourceNodeId !== nodeId && edge.targetNodeId !== nodeId) continue;
+      const otherId = edge.sourceNodeId === nodeId ? edge.targetNodeId : edge.sourceNodeId;
+      if (seen.has(otherId) || this.archivedNodes.has(otherId)) continue;
+      seen.add(otherId);
+      const node = this.nodes.get(otherId);
+      if (node?.type === 'fact') facts.push(node);
+    }
+    return facts;
+  }
+
+  async getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]> {
+    // Mirrors the Postgres filter: `->>'key'` yields text for any JSON scalar,
+    // so compare String(value) for keyed rows; legacy rows have no key at all
+    // (undefined counts as absent — JSON storage drops it).
+    const facts = await this.getConnectedFacts(nodeId);
+    return facts.filter((f) => {
+      const props = f.properties as Record<string, unknown>;
+      if (props.key === undefined) return f.label === key;
+      return props.key !== null && String(props.key) === key;
+    });
+  }
+
+  async withAdvisoryLock<T>(_lockKey: string, fn: () => Promise<T>): Promise<T> {
+    // One process owns an in-memory graph, so there is no other holder to exclude.
+    return fn();
   }
 
   async deleteEdge(id: string): Promise<void> {

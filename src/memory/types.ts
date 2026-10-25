@@ -131,6 +131,18 @@ export interface StoreFactOptions {
    * domain-agnostic (#1623).
    */
   multiValued?: boolean;
+  /**
+   * When true, skip embedding-based semantic dedup. Match an existing fact on the
+   * same entity only when `properties.key` equals the incoming `properties.key`
+   * (exact string equality). Used by config-store, where keys are opaque
+   * identifiers — similar stems like `foo_1` / `foo_2` must never merge (#2252).
+   * Callers must set a string `properties.key` (throws if missing). The validator
+   * also persists `properties.exact_key: true` so a later semantic write without
+   * this flag cannot merge into the fact (same pattern as `multi_valued`). Rate
+   * limiting and entity-existence checks still apply. On a key match the
+   * validator returns `newLabel` so the caller's update keeps `label` aligned.
+   */
+  exactKey?: boolean;
 }
 
 // -- Validated data for a new fact node, produced by MemoryValidator --
@@ -157,7 +169,13 @@ export interface ValidatedFactData {
 // -- Validation result --
 export type ValidationResult =
   | { action: 'create'; validated: ValidatedFactData }
-  | { action: 'update'; existingNodeId: string; mergedProperties: Record<string, unknown> }
+  | {
+      action: 'update';
+      existingNodeId: string;
+      mergedProperties: Record<string, unknown>;
+      /** When set (exactKey upserts), persist this as the node's label so label stays aligned with the key. */
+      newLabel?: string;
+    }
   | { action: 'conflict'; existingNodeId: string; reason: string }
   | { action: 'auto_rejected'; existingNodeId: string; reason: string }
   | {

@@ -239,7 +239,7 @@ describe('ReportFallbackDigest with a real ReportQueue', () => {
         action: null, outcome: null, targetType: null, targetId: null, initiatorType: null, initiatorId: null, entryHash: null,
       } as AuditLogRow,
     }));
-    const set = vi.fn().mockResolvedValue({ stored: true });
+    const set = vi.fn().mockResolvedValue({ stored: true, action: 'created' });
     const queue = new ReportQueue({
       auditLogRepo: {
         findByEventTypeAfterSeq: vi.fn(async (_t: string, after: string | null, limit: number) => {

@@ -39,7 +39,7 @@ function makeSet(over: Partial<SpotCheckSet> = {}): SpotCheckSet {
 function storeWith(sets: SpotCheckSet[]): SpotCheckStore {
   const value = JSON.stringify({ sets });
   const get = vi.fn(async () => value);
-  const set = vi.fn(async () => ({ stored: true }));
+  const set = vi.fn(async () => ({ stored: true, action: 'created' }));
   return new SpotCheckStore({ get, set }, createSilentLogger(), () => NOW);
 }
 

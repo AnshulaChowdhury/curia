@@ -124,6 +124,9 @@ const FUZZY_SEARCH_LIMIT = 5;
  * when the caller does not specify one. Without a classifier, nodes default to 'internal'.
  */
 export class EntityMemory {
+  /** Settles when the last queued exact-key write in this process finishes; see storeFact(). */
+  private exactKeyWriteTail: Promise<void> = Promise.resolve();
+
   constructor(
     private store: KnowledgeGraphStore,
     private validator: MemoryValidator,
@@ -556,8 +559,45 @@ export class EntityMemory {
    * deduplication but NOT contradiction detection. Contradiction detection
    * requires callers to invoke validator.validateContradiction() directly when
    * they have attribute metadata and a confidence value to compare against.
+   *
+   * Exact-key writes (#2252) are serialized per (entity, key): the validator's
+   * find-or-create is check-then-act, so two overlapping writes of a missing key
+   * would otherwise both create a fact. The write runs under a database advisory
+   * lock named for the entity and key, which also excludes a second Curia process
+   * — the instance lock (ADR-051) is advisory and does not stop one from starting.
    */
   async storeFact(options: StoreFactOptions): Promise<StoreFactResult> {
+    const exactKey = options.exactKey === true
+      ? (options.properties as Record<string, unknown> | undefined)?.key
+      : undefined;
+    if (typeof exactKey === 'string') {
+      return this.withExactKeyLock(`kg-exact-key:${options.entityNodeId}:${exactKey}`, () =>
+        this.storeFactUnserialized(options),
+      );
+    }
+    return this.storeFactUnserialized(options);
+  }
+
+  /**
+   * Runs `fn` under the database lock `lockKey`. Exact-key writes in this process
+   * also queue behind one another first, so it holds at most one lock connection
+   * at a time and cannot drain the pool while `fn` needs connections of its own.
+   * Config writes are low-volume, so queueing different keys costs little.
+   */
+  private async withExactKeyLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.exactKeyWriteTail;
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.exactKeyWriteTail = previous.then(() => current);
+    await previous;
+    try {
+      return await this.store.withAdvisoryLock(lockKey, fn);
+    } finally {
+      release();
+    }
+  }
+
+  private async storeFactUnserialized(options: StoreFactOptions): Promise<StoreFactResult> {
     // Use contradiction detection when the fact carries `attribute` metadata,
     // since an attribute-based fact can directly contradict an existing one
     // (same entity, same attribute, different value). For facts without attribute
@@ -633,9 +673,12 @@ export class EntityMemory {
       }
 
       case 'update': {
-        // Near-duplicate detected — merge properties into the existing node.
+        // Near-duplicate (or exact-key match) — merge properties into the existing
+        // node. exactKey upserts also pass newLabel so label stays aligned with
+        // properties.key (#2252); semantic merges leave the label alone.
         await this.store.updateNode(result.existingNodeId, {
           properties: result.mergedProperties,
+          ...(result.newLabel !== undefined ? { label: result.newLabel } : {}),
         });
         this.validator.recordWrite(options.source);
 
@@ -757,31 +800,10 @@ export class EntityMemory {
    * returned by query() as relationships instead.
    */
   async getFacts(entityNodeId: string): Promise<KgNode[]> {
-    const edges = await this.store.getEdgesForNode(entityNodeId);
-    const facts: KgNode[] = [];
-
-    for (const edge of edges) {
-      // Edges are bidirectional — find the node on the other side of each edge
-      const otherId = edge.sourceNodeId === entityNodeId
-        ? edge.targetNodeId
-        : edge.sourceNodeId;
-
-      const node = await this.store.getNode(otherId);
-      if (!node) {
-        // Dangling edge — referenced node no longer exists (referential integrity violation).
-        // @TODO: emit a bus event for the audit logger once bus access is available here.
-        this.logger.error(
-          { edgeId: edge.id, nodeId: otherId, entityNodeId },
-          'getFacts: dangling edge detected — referenced node does not exist',
-        );
-        continue;
-      }
-      if (node.type === FACT_TYPE) {
-        facts.push(node);
-      }
-    }
-
-    return facts;
+    // Single JOIN (Postgres) / one walk (in-memory) — avoids N getNode round
+    // trips on large config anchors (#2252). Dangling edges are simply absent
+    // from the join result rather than logged here.
+    return this.store.getConnectedFacts(entityNodeId);
   }
 
   /**
