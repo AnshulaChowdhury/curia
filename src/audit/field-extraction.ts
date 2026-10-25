@@ -110,6 +110,19 @@ const EXTRACTORS: Readonly<Record<string, Extractor>> = {
     initiator_id: str(p, 'initiatedBy', fail),
   }),
 
+  // Same-contact follow-up drained into a live turn (#2018). The host task id
+  // is not a structured column here — `injectedInputAuditColumns` maps it to
+  // `task_id`, and the factory sets `parent_event_id` to the inbound. No
+  // message body is extracted because the payload does not carry one.
+  'agent.task.input_injected': (p, fail) => ({
+    action: 'inject',
+    outcome: 'success',
+    target_type: 'conversation',
+    target_id: str(p, 'conversationId', fail),
+    initiator_type: 'human',
+    initiator_id: str(p, 'senderContactId', fail),
+  }),
+
   'inbound.message': (p, fail) => ({
     action: 'receive',
     outcome: 'success',
@@ -329,6 +342,29 @@ const EXTRACTORS: Readonly<Record<string, Extractor>> = {
     initiator_id: INITIATOR_ID_DISPATCH,
   }),
 };
+
+/**
+ * Identity columns for `agent.task.input_injected` (#2018).
+ *
+ * `task_id` is the host turn (`hostTaskEventId`), not a payload `taskId`.
+ * `parent_event_id` is the drained inbound. `conversation_id` is the payload
+ * conversation. Returns null for every other event so the logger's existing
+ * `taskId` / `agentTaskId` extraction stays the only path for them.
+ */
+export function injectedInputAuditColumns(
+  eventType: string,
+  payload: Record<string, unknown>,
+  parentEventId: string | undefined,
+): { conversationId: string | null; taskId: string | null; parentEventId: string | null } | null {
+  if (eventType !== 'agent.task.input_injected') return null;
+  const conversation = payload['conversationId'];
+  const host = payload['hostTaskEventId'];
+  return {
+    conversationId: typeof conversation === 'string' && conversation.length > 0 ? conversation : null,
+    taskId: typeof host === 'string' && host.length > 0 ? host : null,
+    parentEventId: parentEventId ?? null,
+  };
+}
 
 /**
  * Extract structured audit columns for an event. Never throws — failures become

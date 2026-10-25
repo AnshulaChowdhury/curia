@@ -17,6 +17,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 - **Turn lanes** — per-conversation lock and injection config, default off and inert. (#2018)
 - **Turn lane wiring** — a coordinator conversation has one holder when the flag is on. (#2018)
+- **`agent.task.input_injected`** — **public API:** audit event for a drained same-contact follow-up, not yet emitted. (#2018)
+- **Injected working-memory rows** — host task id is stored, and model history keeps the follow-up group. (#2018)
 - **Console activity feed** — home page lists what Curia did, one plain-language line per job. (#2251)
 - **`activity.summary` bus event** — **public API:** one fast-tier summary per conversational job, stored for the feed. (#2251)
 - **Ant Farm replay links** — URL can preselect a conversation and time window. (#2251)

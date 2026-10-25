@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { buildLlmArchiveResponse } from '../audit/llm-archive-response.js';
 import type { Logger } from '../logger.js';
 import type { WorkingMemory } from '../memory/working-memory.js';
-import { historyForLlm, llmFailureTurnContent, LLM_FAILURE_USER_MESSAGE } from '../memory/llm-failure-turn.js';
+import { historyForLlm, llmFailurePairing, llmFailureTurnContent, LLM_FAILURE_USER_MESSAGE } from '../memory/llm-failure-turn.js';
 import { renderBudgetExhaustedVerificationReply } from './prompts/verification-block.js';
 import {
   CONTACT_RECENT_HISTORY_TIER,
@@ -3869,14 +3869,16 @@ export class AgentRuntime {
     if (!memory) return;
     try {
       // Pairing check against stored content, not the sanitized rewrite (#1775).
+      // A trailing injected follow-up still belongs to this task (#2018).
       const history = await memory.getHistory(conversationId, agentId, { raw: true });
-      const last = history[history.length - 1];
-      if (last?.role !== 'user') return;
-      if (last.content !== expectedUserContent) {
-        logger.warn(
-          { agentId, conversationId },
-          'LLM failure marker skipped — last user turn is not this task\'s message',
-        );
+      const pairing = llmFailurePairing(history, expectedUserContent);
+      if (!pairing.ok) {
+        if (pairing.reason === 'content_mismatch') {
+          logger.warn(
+            { agentId, conversationId },
+            'LLM failure marker skipped — last user turn is not this task\'s message',
+          );
+        }
         return;
       }
       await memory.addTurn(conversationId, agentId, {

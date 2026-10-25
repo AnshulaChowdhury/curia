@@ -1195,6 +1195,42 @@ export interface AgentTaskEvent extends BaseEvent {
   payload: AgentTaskPayload;
 }
 
+/**
+ * Where a same-contact follow-up was drained into the host turn (#2018).
+ * `round:N` is the 0-based tool-loop round. `exit` is the draft that had
+ * not been sent yet.
+ */
+export type InjectionDrainPoint = 'turn_start' | 'exit' | `round:${number}`;
+
+const INJECTION_DRAIN_POINT_RE = /^round:(0|[1-9]\d*)$/;
+
+export function isInjectionDrainPoint(value: string): value is InjectionDrainPoint {
+  return value === 'turn_start' || value === 'exit' || INJECTION_DRAIN_POINT_RE.test(value);
+}
+
+/**
+ * A follow-up was drained into a live turn (#2018).
+ *
+ * No message body. The text stays in working_memory, attributed to
+ * `senderContactId`. This event only records that the drain happened, so
+ * one contact's words cannot ride into another turn's audit row.
+ * `parentEventId` is `inboundEventId`. `hostTaskEventId` is the audit `task_id`.
+ */
+interface AgentTaskInputInjectedPayload {
+  hostTaskEventId: string;
+  inboundEventId: string;
+  conversationId: string;
+  agentId: string;
+  drainPoint: InjectionDrainPoint;
+  senderContactId: string;
+}
+
+export interface AgentTaskInputInjectedEvent extends BaseEvent {
+  type: 'agent.task.input_injected';
+  sourceLayer: 'agent';
+  payload: AgentTaskInputInjectedPayload;
+}
+
 export interface AgentResponseEvent extends BaseEvent {
   type: 'agent.response';
   sourceLayer: 'agent';
@@ -1992,6 +2028,7 @@ export type BusEvent =
   | InboundMessageEvent
   | InboundReactionEvent
   | AgentTaskEvent
+  | AgentTaskInputInjectedEvent
   | AgentResponseEvent
   | OutboundMessageEvent
   | ToolInvokeEvent
@@ -2102,6 +2139,38 @@ export function createAgentTask(
     sourceLayer: 'dispatch',
     payload: rest,
     parentEventId,
+  };
+}
+
+export function createAgentTaskInputInjected(
+  payload: AgentTaskInputInjectedPayload,
+): AgentTaskInputInjectedEvent {
+  if (!isInjectionDrainPoint(payload.drainPoint)) {
+    throw new Error('agent.task.input_injected: invalid drainPoint');
+  }
+  for (const field of ['hostTaskEventId', 'inboundEventId', 'conversationId', 'agentId', 'senderContactId'] as const) {
+    // A non-string with a `.length` (an object carrying message text) must
+    // not be copied onto the audit event.
+    if (typeof payload[field] !== 'string' || payload[field].length === 0) {
+      throw new Error(`agent.task.input_injected: ${field} is required`);
+    }
+  }
+  // Copy field by field. A caller that spreads a wider object (a message,
+  // a task payload) must not be able to put that text on the audit event.
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'agent.task.input_injected',
+    sourceLayer: 'agent',
+    payload: {
+      hostTaskEventId: payload.hostTaskEventId,
+      inboundEventId: payload.inboundEventId,
+      conversationId: payload.conversationId,
+      agentId: payload.agentId,
+      drainPoint: payload.drainPoint,
+      senderContactId: payload.senderContactId,
+    },
+    parentEventId: payload.inboundEventId,
   };
 }
 
