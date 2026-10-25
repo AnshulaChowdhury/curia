@@ -95,6 +95,7 @@ describe('TurnLanes', () => {
       off.confirmDrained('task-a', ['inbound-1']);
       off.release('task-a');
       off.release('task-a');
+      off.cancelReservation('task-a');
       expect(off.inputSignal('task-a').aborted).toBe(false);
       await off.intakeSettled('inbound-1');
     });
@@ -192,6 +193,33 @@ describe('TurnLanes', () => {
       const gate = lanes();
       await gate.acquire(holder('a', { conversationId: '' }));
       await gate.acquire(holder('b', { conversationId: '' }));
+    });
+
+    it('drops a queued reservation without granting it or releasing the holder', async () => {
+      vi.useFakeTimers();
+      const logger = pino({ level: 'silent' });
+      const error = vi.spyOn(logger, 'error');
+      const gate = lanes({ timeoutMs: 60_000, logger });
+      const a = holder('a');
+      await gate.acquire(a);
+      const waiting = gate.reserve(holder('b'));
+      gate.cancelReservation('task-b');
+      gate.cancelReservation('task-b');
+      await expect(waiting).resolves.toEqual({ waitedMs: 0, timedOut: true });
+      expect(error).not.toHaveBeenCalled();
+
+      expect(gate.tryInject('conv-1', input()).kind).toBe('queued');
+      gate.cancelReservation(a.taskEventId);
+      const next = gate.acquire(holder('c'));
+      let nextGranted = false;
+      void next.then(() => { nextGranted = true; });
+      await Promise.resolve();
+      expect(nextGranted).toBe(false);
+      gate.release(a.taskEventId);
+      await expect(next).resolves.toEqual({ waitedMs: 0, timedOut: false });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(error).not.toHaveBeenCalled();
+      gate.release('task-c');
     });
   });
 

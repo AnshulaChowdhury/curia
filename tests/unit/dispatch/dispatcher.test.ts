@@ -3029,4 +3029,66 @@ describe('a failed task publish releases the lane (#2018)', () => {
     ])).resolves.toEqual({ waitedMs: 0, timedOut: false });
     lanes.release('task-next');
   });
+
+  it('cancels a queued reservation when a later publish throws', async () => {
+    const logger = createLogger('error');
+    const taskIds: string[] = [];
+    const bus = new EventBus(logger, async (event) => {
+      if (event.type === 'agent.task') {
+        taskIds.push(event.id);
+        if (taskIds.length === 2) throw new Error('audit write failed');
+      }
+    });
+    const lanes = new TurnLanes({
+      enabled: true,
+      maxInjectionsPerTurn: 5,
+      laneWaitTimeoutMs: 60_000,
+      logger,
+    });
+    const cancel = vi.spyOn(lanes, 'cancelReservation');
+    const dispatcher = new Dispatcher({
+      bus,
+      logger,
+      turnLanes: lanes,
+      contactResolver: makeResolverWithContact({
+        contactConfidence: 1,
+        tier: 'principal',
+        systemRole: 'principal',
+      }),
+    });
+    dispatcher.register();
+
+    const inbound = (content: string) => bus.publish('channel', createInboundMessage({
+      conversationId: 'cli:conv-leak',
+      channelId: 'cli',
+      senderId: 'user',
+      content,
+    }));
+    await inbound('first');
+    await inbound('second');
+
+    expect(taskIds).toHaveLength(2);
+    const holderId = taskIds[0]!;
+    const waiterId = taskIds[1]!;
+    expect(cancel).toHaveBeenCalledWith(waiterId);
+    expect(cancel).not.toHaveBeenCalledWith(holderId);
+
+    lanes.release(holderId);
+    const grant = lanes.acquire({
+      taskEventId: 'task-next',
+      conversationId: 'cli:conv-leak',
+      originatorContactId: null,
+      originatorResolved: false,
+      originatorIsPrincipal: false,
+      liveTurn: false,
+      synthetic: false,
+    });
+    await expect(Promise.race([
+      grant,
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error('next holder was not granted')), 500);
+      }),
+    ])).resolves.toEqual({ waitedMs: 0, timedOut: false });
+    lanes.release('task-next');
+  });
 });

@@ -18,10 +18,10 @@
 // boot (a second Curia continues without it), so it does not extend this lock across
 // processes. A second process would need a Postgres advisory lock; that is out of scope.
 //
-// tryInject, closeIfIdle, takeQueued, confirmDrained, and release are synchronous. No await
-// may be inserted between their check and their state change: handleInbound and the tool
-// loop interleave only at await points, and the reservation has to be visible to the next
-// arrival before this call returns.
+// tryInject, closeIfIdle, takeQueued, confirmDrained, release, and cancelReservation are
+// synchronous. No await may be inserted between their check and their state change:
+// handleInbound and the tool loop interleave only at await points, and the reservation has
+// to be visible to the next arrival before this call returns.
 
 import type { AgentTaskEvent, AgentTaskPayload } from '../bus/events.js';
 import { isDelegatedSpecialistTask, parseTaskOriginator } from '../agents/delegated-task-context.js';
@@ -451,6 +451,31 @@ export class TurnLanes {
   }
 
   /**
+   * Dispatcher: this task's publish failed before the runtime started, so the id
+   * will never acquire or release. Drop a queued waiter without granting it.
+   * The current holder is left alone — release() covers that case. Idempotent.
+   * Resolves the grant as timed out so the floating reserve() promise settles
+   * and a later reader does not treat the cancel as a grant.
+   */
+  cancelReservation(taskEventId: string): void {
+    if (!this.enabled) return;
+    const found = this.findWaiting(taskEventId);
+    if (!found || found.waiter.settled) return;
+    const { conversationId, lane, waiter } = found;
+    const index = lane.waiters.indexOf(waiter);
+    if (index >= 0) lane.waiters.splice(index, 1);
+    globalThis.clearTimeout(waiter.timer);
+    waiter.settled = true;
+    const waitedMs = Date.now() - waiter.enqueuedAt;
+    this.logger.debug(
+      { conversationId, taskEventId: waiter.holder.taskEventId, waitedMs },
+      'turn-lanes: reservation cancelled',
+    );
+    waiter.resolve({ waitedMs, timedOut: true });
+    if (!lane.holder && lane.waiters.length === 0) this.lanes.delete(conversationId);
+  }
+
+  /**
    * Aborts when a follow-up is queued on this holder, and stays aborted.
    * Call after acquire: a signal taken before this task holds the lane never
    * aborts. An unknown task gets a signal that stays open.
@@ -703,10 +728,10 @@ export class TurnLanes {
     return undefined;
   }
 
-  private findWaiting(taskEventId: string): { waiter: Waiter } | undefined {
-    for (const lane of this.lanes.values()) {
-      const waiter = lane.waiters.find((item) => item.holder.taskEventId === taskEventId);
-      if (waiter) return { waiter };
+  private findWaiting(taskEventId: string): { conversationId: string; lane: Lane; waiter: Waiter } | undefined {
+    for (const [conversationId, lane] of this.lanes) {
+      const waiter = lane.waiters.find((item) => item.holder.taskEventId === taskEventId && !item.settled);
+      if (waiter) return { conversationId, lane, waiter };
     }
     return undefined;
   }

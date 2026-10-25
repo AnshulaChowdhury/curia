@@ -1221,13 +1221,18 @@ export class Dispatcher {
       await this.bus.publish('dispatch', taskEvent);
     } catch (err) {
       // writeAhead rejects before any subscriber. Nothing else will release
-      // this reservation, and a leaked hold makes every later message on the
-      // conversation wait out the fail-open and then run without the lane.
-      if (reserved && lanes) lanes.release(taskEvent.id);
+      // this reservation. release() covers a task that already holds the lane.
+      // cancelReservation() covers one still queued behind that holder: release
+      // is a no-op for a waiter, and grantNext would later hand the lane to a
+      // task that never started.
+      if (reserved && lanes) {
+        lanes.release(taskEvent.id);
+        lanes.cancelReservation(taskEvent.id);
+      }
       this.taskRouting.delete(taskEvent.id);
       this.logger.error(
         { err, taskEventId: taskEvent.id, conversationId: payload.conversationId },
-        'Task publish failed — released the turn lane',
+        'Task publish failed — dropped the turn-lane reservation',
       );
       throw err;
     }
