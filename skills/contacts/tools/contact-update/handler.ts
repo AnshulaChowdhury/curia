@@ -34,6 +34,7 @@ export class ContactUpdateHandler implements ToolHandler {
       fields?: Record<string, unknown>;
     };
     let contact_id = rawContactId;
+    const usedPrincipalAlias = rawContactId === PRINCIPAL_ALIAS;
 
     // Validate contact_id
     if (!contact_id || typeof contact_id !== 'string') {
@@ -43,7 +44,7 @@ export class ContactUpdateHandler implements ToolHandler {
     // The reserved alias "principal" names the principal's contact, so a model never
     // needs the UUID to record how the principal wants to be addressed (#2226). Same
     // alias the send skills accept (ADR-047); resolved here from the system role.
-    if (contact_id === PRINCIPAL_ALIAS) {
+    if (usedPrincipalAlias) {
       if (!ctx.contactService) {
         return {
           success: false,
@@ -149,7 +150,8 @@ export class ContactUpdateHandler implements ToolHandler {
       return {
         success: true,
         data: {
-          contact_id: updated.id,
+          // The alias is echoed back, not the UUID: the principal's ID stays opt-in (ADR-047).
+          contact_id: usedPrincipalAlias ? PRINCIPAL_ALIAS : updated.id,
           updated_fields: updatedFields,
         },
       };

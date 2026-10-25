@@ -537,11 +537,14 @@ export async function readPrincipalIdentitySnapshot(
  * check cannot differ between production and the harnesses that render its prompt.
  */
 export function principalIdentitySnapshotGaps(
-  snapshot: { identities: readonly ChannelIdentity[]; primaryEmail: string | null },
+  snapshot: { identities: readonly ChannelIdentity[]; primaryEmail: string | null; profile?: PrincipalProfile | null },
 ): string[] {
   if (snapshot.identities.length === 0) {
+    // The section still renders with a profile (#2226); only the contact details go.
     return [
-      'The principal has no verified, active channel identities: every agent runs without the ## Who you serve section until one is verified.',
+      snapshot.profile
+        ? 'The principal has no verified, active channel identities: every agent runs without the ### Principal Contact Details block until one is verified.'
+        : 'The principal has no verified, active channel identities: every agent runs without the ## Who you serve section until one is verified.',
     ];
   }
   if (snapshot.primaryEmail && !findPrimaryEmailIdentity(snapshot.identities, snapshot.primaryEmail)) {

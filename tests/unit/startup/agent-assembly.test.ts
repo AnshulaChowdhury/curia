@@ -724,6 +724,15 @@ describe('principalIdentitySnapshotGaps', () => {
     updatedAt: new Date(),
   });
 
+  it('says only the contact details go when a profile keeps the section rendering (#2226)', () => {
+    const profile = { displayName: 'Avery Testwell', preferredName: null, title: null, pronouns: null };
+    const [withProfile] = principalIdentitySnapshotGaps({ identities: [], primaryEmail: null, profile });
+    expect(withProfile).toContain('### Principal Contact Details');
+    expect(withProfile).not.toContain('## Who you serve section');
+    const [without] = principalIdentitySnapshotGaps({ identities: [], primaryEmail: null, profile: null });
+    expect(without).toContain('## Who you serve section');
+  });
+
   it('reports nothing when the primary matches a listed identity, or none is set', () => {
     expect(principalIdentitySnapshotGaps({ identities: [email('me@work.ca')], primaryEmail: 'Me@Work.ca' })).toEqual([]);
     expect(principalIdentitySnapshotGaps({ identities: [email('me@work.ca')], primaryEmail: null })).toEqual([]);

@@ -443,7 +443,7 @@ const AUTO_VERIFIED_SOURCES: ReadonlySet<IdentitySource> = new Set([
 export const NAME_NEAR_MISS_THRESHOLD = 0.95;
 
 /** Canonical fields the principal's prompt block reads. A write to one refreshes it. */
-const PRINCIPAL_PROMPT_FIELDS = ['primaryEmail', 'preferredName', 'title', 'pronouns'] as const;
+export const PRINCIPAL_PROMPT_FIELDS = ['primaryEmail', 'preferredName', 'title', 'pronouns'] as const;
 
 /**
  * ContactService manages the lifecycle of contacts and their channel identities.

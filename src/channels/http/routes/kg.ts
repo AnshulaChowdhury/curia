@@ -5,7 +5,7 @@ import type { EventBus } from '../../../bus/bus.js';
 import { createInboundMessage } from '../../../bus/events.js';
 import type { Logger } from '../../../logger.js';
 import type { ContactService } from '../../../contacts/contact-service.js';
-import { ContactValidationError } from '../../../contacts/contact-service.js';
+import { ContactValidationError, PRINCIPAL_PROMPT_FIELDS } from '../../../contacts/contact-service.js';
 import type { ChannelIdentity, Contact, ContactCanonicalFields, ContactKind, ContactTier, IdentityStatus } from '../../../contacts/types.js';
 import {
   IdentityNotFoundError,
@@ -1302,9 +1302,13 @@ export async function knowledgeGraphRoutes(
     if (!updated) {
       return reply.status(404).send({ error: 'Contact not found after update.' });
     }
-    // primary_email is committed above. Identity mutations notify on their own;
-    // this column does not, and the prompt block reads it (#1950).
-    if (updated.systemRole === 'principal' && canonicalFields.primaryEmail !== undefined) {
+    // The columns are committed above. Identity mutations notify on their own; these
+    // do not, and the prompt block reads primary_email (#1950) and the profile fields
+    // (#2226): the canonical ones and the display name.
+    const touchesPromptBlock =
+      PRINCIPAL_PROMPT_FIELDS.some((key) => canonicalFields[key] !== undefined)
+      || (typeof body.displayName === 'string' && body.displayName.trim().length > 0);
+    if (updated.systemRole === 'principal' && touchesPromptBlock) {
       contactService.notePrimaryEmailChanged(updated.id);
     }
     return reply.send({

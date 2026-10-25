@@ -72,7 +72,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Changed
 
 - **`activity-log`** — uses the shared activity describers; each action gains a readable `summary` line. (#2251)
-- **Unset pronouns** — agents use the name or they/them, never infer from the name, for the principal and contacts. (#2226)
+- **Unset pronouns** — agents use the name or they/them and never infer pronouns from a name. (#2226)
 - **`ToolContext.outboundContext`** — `register()` takes `recipientContactIds`; entry rows gain `recipientContactIds` and `recipientMessages` (migration 104). (#2261)
 - **Behavior suite usage** — docs make smoke and scenarios a release gate; development runs only targeted cases.
 - **Voice model** — ADR-038 moves voice to Haiku 5.5 with thinking off, keeping its own prompt. (#2245)

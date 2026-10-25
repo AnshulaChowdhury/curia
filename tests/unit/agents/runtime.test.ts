@@ -1269,14 +1269,14 @@ describe('AgentRuntime', () => {
     const first = await sendTurn(1);
     expect(first).toContain('## Who you serve');
     expect(first).toContain('- Name: "Avery Testwell"');
-    expect(first).toContain('never infer pronouns from the name');
+    expect(first).toContain('Pronouns: not set');
     // No identities: the profile stands alone.
     expect(first).not.toContain('Principal Contact Details');
 
     principalProfile.current = { ...principalProfile.current, pronouns: 'she/her' };
     const second = await sendTurn(2);
     expect(second).toContain('- Pronouns: "she/her"');
-    expect(second).not.toContain('never infer pronouns from the name');
+    expect(second).not.toContain('Pronouns: not set');
   });
 
   it('injects ### Principal Contact Details on scheduler-dispatched tasks', async () => {

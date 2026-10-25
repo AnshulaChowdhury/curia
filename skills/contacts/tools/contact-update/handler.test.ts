@@ -129,7 +129,9 @@ describe('ContactUpdateHandler', () => {
     const result = await handler.execute(ctx);
 
     expect(result.success).toBe(true);
-    expect((result as { success: true; data: { contact_id: string } }).data.contact_id).toBe(principal.id);
+    // The alias is echoed, never the UUID (ADR-047).
+    expect((result as { success: true; data: { contact_id: string } }).data.contact_id).toBe('principal');
+    expect(JSON.stringify(result)).not.toContain(principal.id);
     const stored = await contactService.getContact(principal.id);
     expect(stored?.pronouns).toBe('she/her');
     expect(stored?.preferredName).toBe('Avy');

@@ -7,8 +7,9 @@
 # Needs a principal whose contact row has no pronouns (the scenario DB's default). Every
 # behavior is a code check, so a run bills the agent's calls and no judge calls.
 #
-# The check reads the email body: the regex cannot tell whose "her" it is, so the brief has
-# Curia address Priya directly ("you"), and any he/she/him/her/his/hers is the principal's.
+# The check reads the email body: the regex cannot tell whose "her" it is, so nothing in
+# the brief or the stubs genders Priya, and the email addresses her as "you". Any
+# he/she/him/her/his/hers is then the principal's.
 name: principal pronouns unset email
 description: >
   The principal (Avery) asks the coordinator to email Priya Natarajan, a known contact:
@@ -29,16 +30,16 @@ inbound:
   from: principal
   channel: cli
   content: >
-    Email Priya Natarajan from your account: I can't make Thursday's review. Ask her for two
-    other times that work for her this week or next, and say you'll fit one around my
-    calendar. Write it in your own voice as my assistant.
+    Email Priya Natarajan from your account: I can't make Thursday's review. Ask Priya for two
+    other times that work this week or next, and say you'll fit one around my calendar. Write
+    it to Priya directly, in your own voice as my assistant.
 tool_stubs:
   delegate:
     - match: { agent: contacts }
       return:
         agent: contacts
         response: |
-          Priya Natarajan is a known contact. Her verified email is priya.natarajan@example.test.
+          Priya Natarajan is a known contact. The verified email is priya.natarajan@example.test.
 
           <resolved_entities>
             <contact name="Priya Natarajan" id="{{contact:priya}}"/>
