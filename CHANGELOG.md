@@ -150,6 +150,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Turn injection config** — startup accepts `dispatch.turnInjection` in the config schema. (#2018)
 - **Synthetic notices** — approval, drift-pause and suspension wakes set `syntheticTurn`. (#2018)
 - **Attachment download** — recovers from garbled Nylas IDs via filename or sole-attachment fallback. (#2281)
 - **Email poll** — detaches turns, drops the queue on stop, and shuts mailboxes down together. (#2254)
