@@ -429,7 +429,8 @@ generate a **non-surfaced, non-sent** shadow draft and store it in OKF. High-sen
 threads (board, investors, legal, spouse — KG sensitivity tier) are **included** in shadow
 capture, not excluded. When the sent-mail observer later reconciles against the CEO's
 actual send, it judges `(shadow draft, actual sent reply)` pairs in chunks of 8 (up to 40
-pairs per run, the chunks run concurrently) via `ctx.infraLlm.extract()`, asking whether
+pairs per run, the chunks run concurrently) via `ctx.infraLlm.extract()` on the fast tier
+with reasoning off, asking whether
 the shadow draft reached the same substantive decision/recommendation as the actual send.
 Each chunk is parsed all-or-nothing on its own, so one bad response holds back only its
 own pairs. It then writes a **pre-scored** `autonomy_action_log` row:

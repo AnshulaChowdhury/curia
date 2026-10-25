@@ -2551,6 +2551,21 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   }
+  // infraLlm asks for no reasoning on every call, but a provider drops that request (at debug)
+  // for a model that can't turn reasoning off, and the call then reasons by default. On the fast
+  // tier that empties 10-token classify calls and burns judge budgets (#2191). Warn, not fatal:
+  // a reasoning fast tier can be deliberate. Standard is skipped; prod's standard model is a
+  // reasoning model by design.
+  {
+    const fastModel = modelRouter.resolve('fast').model;
+    const reasons = modelRegistry.reasoningSupport(fastModel) !== undefined || modelRegistry.thinksByDefault(fastModel);
+    if (reasons && !modelRegistry.honorsReasoningEffort(fastModel, 'none')) {
+      logger.warn(
+        { tier: 'fast', model: fastModel, supported: modelRegistry.reasoningSupport(fastModel)?.efforts ?? [] },
+        `Infra tier 'fast' maps to '${fastModel}', which cannot turn reasoning off — infraLlm classify/extract calls on it will reason and may spend their output budget thinking`,
+      );
+    }
+  }
   const infraLlmRouter = new LLMProviderRouter(modelRegistry, providerRegistry);
   const infraLlmService = new InfraLlmService(infraLlmRouter, modelRouter, bus, logger, modelRegistry);
 

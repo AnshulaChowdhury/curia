@@ -1729,8 +1729,8 @@ describe('CeoInboxSentObserveHandler', () => {
       expect(result.success).toBe(true);
 
       expect(extract).toHaveBeenCalledTimes(2);
-      // No maxTokens override: the infraLlm default leaves room for reasoning tokens.
-      for (const call of extract.mock.calls) expect(call[1]).toBeUndefined();
+      // The judge runs on the fast tier (reasoning off) with the default token budget (#2191).
+      for (const call of extract.mock.calls) expect(call[1]).toEqual({ tier: 'fast' });
 
       // The clean chunk landed and is stamped, so the next run retries only the failed two.
       expect(ctx.__actionLog).toHaveLength(8);

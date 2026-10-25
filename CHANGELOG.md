@@ -71,6 +71,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **`infraLlm.extract` (public API, additive)** — optional `tier: 'fast' | 'standard'`; defaults to standard. (#2191)
 - **`activity-log`** — uses the shared activity describers; each action gains a readable `summary` line. (#2251)
 - **Unset pronouns** — agents use the name or they/them and never infer pronouns from a name. (#2226)
 - **`ToolContext.outboundContext`** — `register()` takes `recipientContactIds`; entry rows gain `recipientContactIds` and `recipientMessages` (migration 104). (#2261)
@@ -158,6 +159,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Shadow judge** — runs on the fast tier with reasoning off, so sent-observe stops timing out. (#2191)
 - **Recent activity card** — loads for signed-in console users instead of failing with a Bearer token error. (#2285)
 - **Recent activity card** — shows the newest jobs in the window, not the day's oldest rows. (#2251)
 - **Attachment download** — recovers from garbled Nylas IDs via filename or sole-attachment fallback. (#2281)

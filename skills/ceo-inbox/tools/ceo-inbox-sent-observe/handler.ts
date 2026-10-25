@@ -608,11 +608,13 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
         chunks.push(judgePairs.slice(i, i + JUDGE_CHUNK_SIZE));
       }
 
-      // No maxTokens override: the infraLlm default leaves room for the model's reasoning
-      // tokens, which the old 1500 cap did not (#2191).
+      // Fast tier, so the judge runs with reasoning off. A standard model that can't turn
+      // reasoning off (prod's can't) reasoned through the whole output budget on this task,
+      // 4000 tokens and three retries, and returned no verdict, overrunning the tool timeout (#2191).
+      // The default token budget is ample for a verdict array.
       const verdicts = await Promise.all(
         chunks.map(async (chunk, chunkIndex) => {
-          const res = await infraLlm.extract(buildShadowJudgePrompt(chunk));
+          const res = await infraLlm.extract(buildShadowJudgePrompt(chunk), { tier: 'fast' });
           const judged = res.ok
             ? parseShadowJudgeResult(res.text, chunk.map((p) => p.sourceMessageId))
             : null;
@@ -620,7 +622,9 @@ export class CeoInboxSentObserveHandler implements ToolHandler {
             chunk,
             chunkIndex,
             judged,
-            error: res.ok ? 'malformed-or-incomplete-response' : res.error,
+            // An empty reply usually means the model spent its whole budget reasoning; say so
+            // rather than "malformed", which hid that cause in #2191.
+            error: !res.ok ? res.error : res.text.trim() === '' ? 'empty-response' : 'malformed-or-incomplete-response',
             // Diagnostics for a rejected response without logging its text (the reasons
             // paraphrase email content): a reply that doesn't end in ']' was cut off, one that
             // does dropped or rewrote an id.
