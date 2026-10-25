@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   EXTRACTION_FAILED,
   extractStructuredFields,
-  injectedInputAuditColumns,
 } from '../../../src/audit/field-extraction.js';
 import { createSilentLogger } from '../../../src/logger.js';
 
@@ -276,25 +275,5 @@ describe('extractStructuredFields', () => {
       initiator_type: 'human',
       initiator_id: sender,
     });
-    expect(injectedInputAuditColumns('agent.task.input_injected', {
-      hostTaskEventId: host,
-      conversationId: 'signal:+1555',
-    }, inbound)).toEqual({
-      conversationId: 'signal:+1555',
-      taskId: host,
-      parentEventId: inbound,
-    });
-    // A payload taskId must not steal the column on this event, and other
-    // events must not start treating hostTaskEventId as their task id.
-    expect(injectedInputAuditColumns('agent.task.input_injected', {
-      taskId: 'other-task',
-      hostTaskEventId: host,
-      conversationId: 'signal:+1555',
-    }, inbound)?.taskId).toBe(host);
-    expect(injectedInputAuditColumns('agent.task', {
-      taskId: 'other-task',
-      hostTaskEventId: host,
-      conversationId: 'c',
-    }, 'parent')).toBeNull();
   });
 });

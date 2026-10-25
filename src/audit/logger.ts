@@ -7,7 +7,7 @@ import {
   isDbUnavailableError,
   withDbRetry,
 } from '../db/resilience.js';
-import { extractStructuredFields, injectedInputAuditColumns } from './field-extraction.js';
+import { extractStructuredFields } from './field-extraction.js';
 import {
   GENESIS_HASH,
   computeEntryHash,
@@ -134,27 +134,21 @@ export class AuditLogger {
 
     // Extract conversationId for the dedicated column so it can be indexed separately.
     // Not all event types carry a conversationId (e.g., pure system events).
-    // agent.task.input_injected names the host turn hostTaskEventId (#2018).
-    // That is task_id; the drained inbound is parent_event_id. Other events
-    // keep the taskId / agentTaskId path.
-    const injectedColumns = injectedInputAuditColumns(event.type, payload, event.parentEventId);
-    const conversationId = injectedColumns
-      ? injectedColumns.conversationId
-      : typeof payload.conversationId === 'string' ? payload.conversationId : null;
+    const conversationId =
+      typeof payload.conversationId === 'string' ? payload.conversationId : null;
 
     // Populate task_id when present in payload (additive — no backfill of historical rows).
-    // schedule.fired emits agentTaskId; normalize to the canonical taskId key.
-    const taskId = injectedColumns
-      ? injectedColumns.taskId
-      : typeof payload.taskId === 'string'
-        ? payload.taskId
-        : typeof payload.agentTaskId === 'string'
-          ? payload.agentTaskId
-          : null;
+    // schedule.fired emits agentTaskId; agent.task.input_injected emits
+    // hostTaskEventId (#2018). Normalize both onto the canonical taskId key.
+    // parent_event_id stays event.parentEventId — the injected-input factory
+    // sets that to the drained inbound.
+    const taskId =
+      typeof payload.taskId === 'string' ? payload.taskId
+      : typeof payload.agentTaskId === 'string' ? payload.agentTaskId
+      : typeof payload.hostTaskEventId === 'string' ? payload.hostTaskEventId
+      : null;
 
-    const parentEventId = injectedColumns
-      ? injectedColumns.parentEventId
-      : event.parentEventId ?? null;
+    const parentEventId = event.parentEventId ?? null;
 
     // Structured columns — extraction failures become '[EXTRACTION_FAILED]'.
     const structured = extractStructuredFields(event.type, payload, event.id, this.logger);
