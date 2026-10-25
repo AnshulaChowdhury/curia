@@ -24,7 +24,7 @@ function writeConfig(defaultYaml: string): string {
 }
 
 describe('resolveTurnInjectionConfig (#2018)', () => {
-  it('defaults to off, with the D3 cap and the D7 fail-open', () => {
+  it('defaults to off, with the ADR-053 §3 cap and the §6 fail-open', () => {
     expect(resolveTurnInjectionConfig(undefined)).toEqual({
       enabled: false,
       maxInjectionsPerTurn: 5,

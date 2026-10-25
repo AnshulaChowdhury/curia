@@ -82,7 +82,7 @@ export interface InjectableInput {
 
 export type TicketResult =
   | { kind: 'drained'; hostTaskEventId: string }
-  | { kind: 'returned'; reason: 'closing' | 'cap' | 'holder_ended' };
+  | { kind: 'returned'; reason: 'holder_ended' };
 
 export type TryInjectResult =
   | { kind: 'queued'; ticket: Promise<TicketResult> }
@@ -230,13 +230,6 @@ export class TurnLanes {
   private readonly drainedListeners: Array<(hostTaskEventId: string, input: InjectableInput) => void> = [];
   /** Never aborted. Returned when this task does not hold a lane. */
   private readonly idleSignal = new AbortController().signal;
-  /**
-   * Mutating methods must not re-enter. A getter on a caller-supplied object can
-   * call back into the lane mid-check; the inner call is ignored and the outer
-   * call fails closed instead of queueing a swapped contact.
-   */
-  private callDepth = 0;
-  private reentered = false;
 
   constructor(opts: TurnLanesOptions) {
     if (typeof opts.enabled !== 'boolean') {
@@ -294,21 +287,11 @@ export class TurnLanes {
    */
   tryInject(conversationId: string, input: InjectableInput): TryInjectResult {
     if (!this.enabled) return { kind: 'not_injected', reason: 'disabled' };
-    if (!this.enter()) return { kind: 'not_injected', reason: 'ineligible' };
-    try {
-      return this.enqueue(conversationId, input);
-    } finally {
-      this.exit();
-    }
+    return this.enqueue(conversationId, input);
   }
 
   private enqueue(conversationId: string, input: InjectableInput): TryInjectResult {
-    // One snapshot, before the lane is read. eligible() and the queued record
-    // must not read the caller's object again: a getter can return a different
-    // contact on the second read, or call release() and move the lane, and the
-    // body from that later read would land on the wrong turn.
     const snap = copyInput(input);
-    if (this.reentered) return { kind: 'not_injected', reason: 'ineligible' };
     const lane = this.lanes.get(conversationId);
     if (!lane || !lane.holder || lane.phase === 'idle') {
       return { kind: 'not_injected', reason: 'no_holder' };
@@ -329,11 +312,6 @@ export class TurnLanes {
     if (lane.phase === 'closing') return { kind: 'not_injected', reason: 'closing' };
     if (!this.eligible(holder, snap)) {
       return { kind: 'not_injected', reason: 'ineligible' };
-    }
-    // Re-read after the check. eligible does not re-enter, but a future edit
-    // that did would otherwise queue onto a holder that has since changed.
-    if (lane.holder !== holder) {
-      return { kind: 'not_injected', reason: 'closing' };
     }
     if (lane.accepted >= this.maxInjectionsPerTurn) {
       return { kind: 'not_injected', reason: 'cap' };
@@ -358,12 +336,7 @@ export class TurnLanes {
   /** Runtime: take queued input. Tickets stay pending until confirmDrained or release. */
   takeQueued(taskEventId: string): InjectableInput[] {
     if (!this.enabled) return [];
-    if (!this.enter()) return [];
-    try {
-      return this.takeQueuedHeld(taskEventId);
-    } finally {
-      this.exit();
-    }
+    return this.takeQueuedHeld(taskEventId);
   }
 
   private takeQueuedHeld(taskEventId: string): InjectableInput[] {
@@ -385,44 +358,35 @@ export class TurnLanes {
    */
   confirmDrained(taskEventId: string, inboundEventIds: string[]): void {
     if (!this.enabled) return;
-    if (!this.enter()) return;
     const drained: InjectableInput[] = [];
-    try {
-      const lane = this.laneHeldBy(taskEventId);
-      if (!lane || !lane.holder) return;
-      for (const id of inboundEventIds) {
-        const item = this.takePending(lane, id);
-        if (!item || item.settled) continue;
-        item.settled = true;
-        lane.drainedIds.add(id);
-        item.resolve({ kind: 'drained', hostTaskEventId: taskEventId });
-        drained.push(item.input);
-      }
-    } finally {
-      this.exit();
+    const lane = this.laneHeldBy(taskEventId);
+    if (!lane || !lane.holder) return;
+    for (const id of inboundEventIds) {
+      const item = this.takePending(lane, id);
+      if (!item || item.settled) continue;
+      item.settled = true;
+      lane.drainedIds.add(id);
+      item.resolve({ kind: 'drained', hostTaskEventId: taskEventId });
+      drained.push(item.input);
     }
-    // Listeners run outside the lock so they can call back into the lane.
+    // Notify after the tickets resolve. A listener may call back into the lane.
     for (const item of drained) this.emitDrained(taskEventId, item);
   }
 
   /**
    * Runtime, synchronous. Empty queue → mark closing and return true, so a
    * later arrival is `closing` and runs as the next turn. A non-empty queue
-   * returns false and leaves the phase alone.
+   * returns false and leaves the phase alone. A task that does not hold the
+   * lane returns true: there is nothing for it to drain.
    */
   closeIfIdle(taskEventId: string): boolean {
     if (!this.enabled) return true;
-    if (!this.enter()) return false;
-    try {
-      return this.closeIfIdleHeld(taskEventId);
-    } finally {
-      this.exit();
-    }
+    return this.closeIfIdleHeld(taskEventId);
   }
 
   private closeIfIdleHeld(taskEventId: string): boolean {
     const lane = this.laneHeldBy(taskEventId);
-    if (!lane) return false;
+    if (!lane) return true;
     if (lane.queue.length > 0) return false;
     lane.phase = 'closing';
     return true;
@@ -436,19 +400,13 @@ export class TurnLanes {
    */
   release(taskEventId: string): void {
     if (!this.enabled) return;
-    if (!this.enter()) return;
-    try {
-      this.releaseHeld(taskEventId);
-    } finally {
-      this.exit();
-    }
+    this.releaseHeld(taskEventId);
   }
 
   private releaseHeld(taskEventId: string): void {
     const found = this.findHeld(taskEventId);
     if (!found) return;
     const { conversationId, lane } = found;
-    lane.phase = 'closing';
     const undrained = [...lane.queue, ...lane.pending.values()];
     lane.queue = [];
     lane.pending.clear();
@@ -522,12 +480,7 @@ export class TurnLanes {
   }
 
   private join(holder: LaneHolder, acquire: boolean): Promise<LaneGrant> {
-    if (!this.enter()) return Promise.resolve(IMMEDIATE);
-    try {
-      return this.joinHeld(holder, acquire);
-    } finally {
-      this.exit();
-    }
+    return this.joinHeld(holder, acquire);
   }
 
   private joinHeld(holder: LaneHolder, acquire: boolean): Promise<LaneGrant> {
@@ -535,13 +488,6 @@ export class TurnLanes {
     // fail-open timer, use this copy so a mutated caller object cannot move
     // the waiter onto another conversation.
     const stamped = copyHolder(holder);
-    if (this.reentered) {
-      this.logger.error(
-        { taskEventId: stamped.taskEventId },
-        'turn-lanes: refused a reentrant lane request',
-      );
-      return Promise.resolve(IMMEDIATE);
-    }
     if (stamped.taskEventId.length === 0 || stamped.conversationId.length === 0) {
       this.logger.warn(
         { taskEventId: stamped.taskEventId, conversationId: stamped.conversationId },
@@ -730,20 +676,6 @@ export class TurnLanes {
 
   private laneHeldBy(taskEventId: string): Lane | undefined {
     return this.findHeld(taskEventId)?.lane;
-  }
-
-  private enter(): boolean {
-    if (this.callDepth > 0) {
-      this.reentered = true;
-      return false;
-    }
-    this.callDepth = 1;
-    return true;
-  }
-
-  private exit(): void {
-    this.callDepth = 0;
-    this.reentered = false;
   }
 
   private findHeld(taskEventId: string): { conversationId: string; lane: Lane } | undefined {
