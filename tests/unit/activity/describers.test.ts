@@ -54,6 +54,13 @@ describe('describeToolCall', () => {
     expect(describeToolCall(create, ctx({}, 'Asia/Tokyo'))?.text).toBe('scheduled “Board Meeting” on Nov 1');
   });
 
+  it('keeps an all-day date on its calendar day in any timezone', () => {
+    const allDay = call('calendar-create-event', { title: 'Offsite', start: '2026-10-31' }, null);
+    expect(describeToolCall(allDay, ctx())?.text).toBe('scheduled “Offsite” on Oct 31');
+    expect(describeToolCall(allDay, ctx({}, 'Pacific/Honolulu'))?.text).toBe('scheduled “Offsite” on Oct 31');
+    expect(describeToolCall(allDay, ctx({}, 'Pacific/Kiritimati'))?.text).toBe('scheduled “Offsite” on Oct 31');
+  });
+
   it('describes a failure as a "couldn\'t" line', () => {
     const send = call('email-send', { to: 'c-1', body: 'x' }, null, false);
     expect(describeToolCall(send, ctx({ 'c-1': 'Jane Roe' }))?.text).toBe("couldn't email Jane Roe");

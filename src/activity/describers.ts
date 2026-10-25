@@ -140,6 +140,13 @@ function people(refs: string[], ctx: DescribeContext): string {
 function formatDay(value: unknown, timezone: string): string | null {
   const s = str(value);
   if (!s) return null;
+  // An all-day value ("2026-10-31") is a calendar date, not an instant. Date parses it as
+  // UTC midnight, which a zone west of UTC would show as the day before, so format it in UTC.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const day = new Date(`${s}T00:00:00Z`);
+    if (Number.isNaN(day.getTime())) return null;
+    return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(day);
+  }
   const d = new Date(s);
   if (Number.isNaN(d.getTime())) return null;
   try {

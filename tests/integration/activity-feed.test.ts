@@ -28,10 +28,22 @@ describeIf('activity feed read path', () => {
     await pool.end();
   });
 
-  /** A day in 2019 nobody else writes to, so the shared test DB cannot interfere. */
-  function isolatedDay(): Date {
-    const day = Math.floor(Math.random() * 300);
-    return new Date(Date.UTC(2019, 0, 1) + day * 86_400_000);
+  /**
+   * A day between 1971 and 2019 that holds no audit_log rows yet. audit_log is append-only and
+   * these rows outlive the run, so a random day alone could land on one an earlier run (or an
+   * earlier test here) already filled. The checked span covers the test's one-day window plus
+   * the repo's 6h delegation tail.
+   */
+  async function isolatedDay(): Promise<Date> {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const day = new Date(Date.UTC(1971, 0, 1) + Math.floor(Math.random() * 17_500) * 86_400_000);
+      const { rowCount } = await pool.query(
+        'SELECT 1 FROM audit_log WHERE timestamp >= $1 AND timestamp < $2 LIMIT 1',
+        [day, new Date(day.getTime() + 2 * 86_400_000)],
+      );
+      if (rowCount === 0) return day;
+    }
+    throw new Error('no unused audit_log day found for the activity feed test');
   }
 
   async function seed(opts: {
@@ -65,7 +77,7 @@ describeIf('activity feed read path', () => {
   }
 
   it('returns the newest jobs when the window holds more than the limit', async () => {
-    const day = isolatedDay();
+    const day = await isolatedDay();
     const taskIds: string[] = [];
     for (let i = 0; i < 25; i++) {
       taskIds.push(await seedArchiveJob(new Date(day.getTime() + i * 30 * 60_000), `job-${i}`));
@@ -100,7 +112,7 @@ describeIf('activity feed read path', () => {
   });
 
   it('pages older roots with the keyset cursor', async () => {
-    const day = isolatedDay();
+    const day = await isolatedDay();
     const ids: string[] = [];
     for (let i = 0; i < 5; i++) {
       ids.push(await seed({ timestamp: new Date(day.getTime() + i * 60_000), eventType: 'agent.task', payload: { agentId: 'coordinator', channelId: 'email' } }));
@@ -117,7 +129,7 @@ describeIf('activity feed read path', () => {
   });
 
   it('fills the feed past a page of roots that project to nothing', async () => {
-    const day = isolatedDay();
+    const day = await isolatedDay();
     const visible = await seedArchiveJob(day, 'old-but-visible');
     // 60 newer roots with no tool work and no reply: more than one page at limit=1.
     for (let i = 1; i <= 60; i++) {
@@ -135,7 +147,7 @@ describeIf('activity feed read path', () => {
   });
 
   it('reads delegated specialist work and the summary under the root, not as roots', async () => {
-    const day = isolatedDay();
+    const day = await isolatedDay();
     const rootId = await seed({ timestamp: day, eventType: 'agent.task', payload: { agentId: 'coordinator', channelId: 'signal', content: 'x' } });
     const specialistId = await seed({
       timestamp: new Date(day.getTime() + 1000), eventType: 'agent.task', conversationId: 'delegate-1',
