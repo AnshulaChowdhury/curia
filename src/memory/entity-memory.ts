@@ -402,8 +402,12 @@ export class EntityMemory {
 
     // Phase 2: no exact match — try embedding-based fuzzy resolution.
     // semanticSearch() embeds the query and returns results sorted by score desc.
-    // Does not filter by type — consistent with single-match behavior above (which
+    // Does not filter by entity type — consistent with single-match behavior above (which
     // also returns 'found' across types). Type is only used as a tiebreaker.
+    //
+    // Facts are excluded in the query, not afterwards: facts often name their entity and
+    // can outscore it, so dropping them from the top FUZZY_SEARCH_LIMIT left no candidate
+    // and phase 3 created a duplicate (#2248).
     //
     // The entire phase is wrapped so that embedding API failures or transient DB
     // errors fall through gracefully to Phase 3 (entity creation). This preserves
@@ -412,16 +416,14 @@ export class EntityMemory {
     try {
       const fuzzyResults = await this.store.semanticSearch(options.label, {
         limit: FUZZY_SEARCH_LIMIT,
+        entitiesOnly: true,
         purpose: 'similarity',
       });
       const { fuzzyResolve, fuzzyAmbiguityFloor } = this.embeddingService.profile.thresholds;
 
-      // Filter out fact nodes — we only want entity nodes for disambiguation
-      const entityCandidates = fuzzyResults.filter(r => r.node.type !== FACT_TYPE);
-
       // Partition candidates by threshold
-      const autoResolve = entityCandidates.filter(r => r.score >= fuzzyResolve);
-      const ambiguous = entityCandidates.filter(
+      const autoResolve = fuzzyResults.filter(r => r.score >= fuzzyResolve);
+      const ambiguous = fuzzyResults.filter(
         r => r.score >= fuzzyAmbiguityFloor && r.score < fuzzyResolve,
       );
 

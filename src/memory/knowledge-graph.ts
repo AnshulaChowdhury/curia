@@ -56,6 +56,16 @@ export interface TraversalOptions {
   maxDepth?: number; // defaults to 3 per spec
 }
 
+/** What a backend semantic search may return. Any filter besides `embeddingModel` must be
+ *  applied before the result is limited, never to an already-limited candidate list (#2248). */
+export interface SemanticSearchFilters {
+  embeddingModel: string;
+  type?: NodeType;
+  /** Leave fact nodes out, so the limit counts entities only (fuzzy entity resolution). */
+  entitiesOnly?: boolean;
+  maxSensitivity?: Sensitivity;
+}
+
 /** Returned by listDecayWarnings — one entry per warned node. */
 export interface DecayWarningRow {
   nodeId: string;
@@ -130,7 +140,7 @@ interface KnowledgeGraphBackend {
     limit: number,
     // embeddingModel is required: a vector from another model must never be ranked
     // against this query, even while a re-embed has left the table mixed.
-    filters: { embeddingModel: string; type?: NodeType; maxSensitivity?: Sensitivity },
+    filters: SemanticSearchFilters,
   ): Promise<SearchResult[]>;
   /** List all warned (warned_at IS NOT NULL), non-archived, LABEL-TIER nodes, oldest-first.
    *  Contact-anchored nodes are excluded: they cannot decay, so a "confirm this or lose it"
@@ -458,12 +468,14 @@ export class KnowledgeGraphStore {
    *
    * `purpose` is 'query' for a question against stored labels, and 'similarity' when the
    * text is itself a label being matched against stored labels (fuzzy entity resolution).
+   * `entitiesOnly` leaves fact nodes out before the limit applies.
    */
   async semanticSearch(
     query: string,
     options?: {
       limit?: number;
       type?: NodeType;
+      entitiesOnly?: boolean;
       maxSensitivity?: Sensitivity;
       purpose?: Exclude<EmbeddingPurpose, 'document'>;
     },
@@ -473,6 +485,7 @@ export class KnowledgeGraphStore {
     return this.backend.semanticSearch(queryEmbedding, limit, {
       embeddingModel: embeddingStamp(this.embeddingService.profile),
       type: options?.type,
+      entitiesOnly: options?.entitiesOnly,
       maxSensitivity: options?.maxSensitivity,
     });
   }
@@ -900,7 +913,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
   async semanticSearch(
     queryEmbedding: number[],
     limit: number,
-    filters: { embeddingModel: string; type?: NodeType; maxSensitivity?: Sensitivity },
+    filters: SemanticSearchFilters,
   ): Promise<SearchResult[]> {
     const embeddingStr = `[${queryEmbedding.join(',')}]`;
     const params: unknown[] = [embeddingStr, limit, filters.embeddingModel];
@@ -909,6 +922,10 @@ class PostgresBackend implements KnowledgeGraphBackend {
     if (filters?.type) {
       params.push(filters.type);
       extraClauses.push(`AND type = $${params.length}`);
+    }
+
+    if (filters?.entitiesOnly) {
+      extraClauses.push(`AND type <> 'fact'`);
     }
 
     if (filters?.maxSensitivity !== undefined) {
@@ -927,17 +944,41 @@ class PostgresBackend implements KnowledgeGraphBackend {
       extraClauses.push(`AND sensitivity = ANY($${params.length}::text[])`);
     }
 
-    const result = await this.pool.query<PgNodeRow & { similarity: number }>(
-      `SELECT *, 1 - (embedding <=> $1::vector) AS similarity
-       FROM kg_nodes
-       WHERE embedding IS NOT NULL
-         AND embedding_model = $3
-         AND archived_at IS NULL
-         ${extraClauses.join('\n         ')}
-       ORDER BY embedding <=> $1::vector
-       LIMIT $2`,
-      params,
-    );
+    // Unfiltered: order by the distance operator, so the planner can use the HNSW index
+    // (idx_kg_nodes_embedding). This is the plain memory-query path and must stay fast.
+    //
+    // Filtered: an exact scan. The HNSW index covers every node and hands back only its
+    // hnsw.ef_search (40) nearest before the WHERE clause runs, so when 40 nodes that fail the
+    // filter sit closer (facts that name their entity, mostly), the matching nodes never
+    // arrive (#2248). Ordering by the computed similarity rather than `embedding <=> $1`
+    // keeps the index out, as NodeMergeService.candidates does; the filter then runs before
+    // any distance is computed. Graphs are thousands of nodes, where the scan costs a few
+    // milliseconds (measurements in #2248). hnsw.iterative_scan was rejected: it is still
+    // approximate, and missed matches in the #2238 measurements.
+    const result = extraClauses.length === 0
+      ? await this.pool.query<PgNodeRow & { similarity: number }>(
+        `SELECT *, 1 - (embedding <=> $1::vector) AS similarity
+         FROM kg_nodes
+         WHERE embedding IS NOT NULL
+           AND embedding_model = $3
+           AND archived_at IS NULL
+         ORDER BY embedding <=> $1::vector
+         LIMIT $2`,
+        params,
+      )
+      : await this.pool.query<PgNodeRow & { similarity: number }>(
+        `SELECT * FROM (
+           SELECT *, 1 - (embedding <=> $1::vector) AS similarity
+           FROM kg_nodes
+           WHERE embedding IS NOT NULL
+             AND embedding_model = $3
+             AND archived_at IS NULL
+             ${extraClauses.join('\n             ')}
+         ) scored
+         ORDER BY similarity DESC, id
+         LIMIT $2`,
+        params,
+      );
 
     return result.rows.map((row) => ({
       node: pgRowToNode(row),
@@ -1442,7 +1483,7 @@ class InMemoryBackend implements KnowledgeGraphBackend {
   async semanticSearch(
     queryEmbedding: number[],
     limit: number,
-    filters: { embeddingModel: string; type?: NodeType; maxSensitivity?: Sensitivity },
+    filters: SemanticSearchFilters,
   ): Promise<SearchResult[]> {
     const scored: SearchResult[] = [];
     // Pre-compute sensitivity ceiling rank once outside the loop.
@@ -1463,6 +1504,7 @@ class InMemoryBackend implements KnowledgeGraphBackend {
       if (this.archivedNodes.has(node.id)) continue;
       // Apply type filter
       if (filters?.type && node.type !== filters.type) continue;
+      if (filters?.entitiesOnly && node.type === 'fact') continue;
       // Apply sensitivity ceiling filter.
       // Nodes with unrecognized sensitivity values are treated as fail-closed:
       // indexOf returns -1, which is never <= any valid ceiling rank, so they
