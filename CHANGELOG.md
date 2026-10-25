@@ -158,6 +158,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Recent activity card** — loads for signed-in console users instead of failing with a Bearer token error. (#2285)
 - **Recent activity card** — shows the newest jobs in the window, not the day's oldest rows. (#2251)
 - **Attachment download** — recovers from garbled Nylas IDs via filename or sole-attachment fallback. (#2281)
 - **Email poll** — detaches turns, drops the queue on stop, and shuts mailboxes down together. (#2254)
