@@ -27,7 +27,7 @@
 // captures that specialist's turn the way it captures the coordinator's. A `bullpen` or
 // `scheduler` inbound reaches it the way a thread reply or its own schedule does.
 import { randomUUID } from 'node:crypto';
-import { createAgentDiscuss, createAgentTask, createInboundMessage } from '../../src/bus/events.js';
+import { createAgentDiscuss, createAgentTask, createInboundMessage, type InjectionDrainPoint } from '../../src/bus/events.js';
 import { stampOriginator } from '../../src/contacts/stamp-originator.js';
 import {
   buildInboundEmailIdentifierBlock,
@@ -73,7 +73,7 @@ import {
   type TurnOutcome,
 } from '../shared/turn-capture.js';
 import { internalNamesFor } from './assertions.js';
-import { isTextFinishCall } from './followup-exit.js';
+import { isTextFinishCall, turnStartDrainError } from './followup-exit.js';
 import { createDelegationCapture, inRunOrder, type DelegationCapture, type DelegationTrace } from './delegation-capture.js';
 import { discoverableTools } from './discovery.js';
 import { applyReach } from './reach.js';
@@ -515,6 +515,20 @@ export async function createScenarioHarness(
       capture.fail(event.payload.conversationId, err);
     }
   });
+  // Drain points live on the run result. A turn_start drain means the
+  // correction joined before the model had chosen, so the run fails here
+  // instead of depending on log level to notice it (#2018).
+  const injectionDrains = new Map<string, InjectionDrainPoint[]>();
+  bus.subscribe('agent.task.input_injected', 'system', (event) => {
+    if (event.type !== 'agent.task.input_injected') return;
+    const points = injectionDrains.get(event.payload.conversationId);
+    if (!points) return;
+    points.push(event.payload.drainPoint);
+    const message = turnStartDrainError(event.payload.drainPoint);
+    if (message !== undefined) {
+      capture.fail(event.payload.conversationId, new Error(message));
+    }
+  });
   const coordinator = stack.agent(COORDINATOR);
   const coordinatorTools = new Set(coordinator.toolDefs.map(t => t.name));
   // Production's own activation check, per skill: what skill-activate would hand the
@@ -693,6 +707,9 @@ export async function createScenarioHarness(
     // a failed seed becomes this run's error instead of aborting the suite.
     let seeded: SeededRun | undefined;
     let conversationId: string | undefined;
+    // Follow-up drain points for this attempt. The map entry is removed on
+    // disarm; this array is what the run result keeps.
+    let injectionDrainPoints: InjectionDrainPoint[] | undefined;
     // A follow-up lives only for this attempt. Cleanup disarms it so a late
     // timer cannot publish after the run, and releases a held first tool so
     // the turn can finish (#2018).
@@ -710,6 +727,7 @@ export async function createScenarioHarness(
       if (conversationId !== undefined) {
         injectionQueued.delete(conversationId);
         exitSlots.delete(conversationId);
+        injectionDrains.delete(conversationId);
       }
     };
     let stubbedCalls: StubbedCall[] = [];
@@ -874,6 +892,8 @@ export async function createScenarioHarness(
             throw new Error('channel follow-up has no host inbound id');
           }
           const follow = inbound.followup;
+          injectionDrainPoints = [];
+          injectionDrains.set(runConversationId, injectionDrainPoints);
           const publishFollowup = async (): Promise<void> => {
             if (!followupArmed) return;
             const followSender = await resolveSender({
@@ -927,7 +947,7 @@ export async function createScenarioHarness(
             // it. A text reply never records a tool call. Its llm.call is
             // awaited before the exit hook, and the subscriber publishes
             // there, so closeIfIdle sees the queue and the drain is `exit`
-            // rather than `turn_start`.
+            // rather than `turn_start`. A `turn_start` drain fails the run.
             let claimed = false;
             const claim = (): boolean => {
               if (claimed || !followupArmed) return false;
@@ -1017,6 +1037,7 @@ export async function createScenarioHarness(
         unstubbedCalls: countHoles(merged),
         ...(error ? { error } : {}),
         ...(timeoutKind ? { timeoutKind } : {}),
+        ...(injectionDrainPoints !== undefined ? { injectionDrainPoints: [...injectionDrainPoints] } : {}),
         ...(realDelegation ? { delegations: trace?.delegations ?? [] } : {}),
         usage: state.usage.snapshot(),
         providerRetries: [],
@@ -1032,6 +1053,7 @@ export async function createScenarioHarness(
         durationMs: Date.now() - started,
         unstubbedCalls: stubbedCalls.filter(c => c.disposition === 'refused' || c.disposition === 'canned').length,
         error: describeError(err),
+        ...(injectionDrainPoints !== undefined ? { injectionDrainPoints: [...injectionDrainPoints] } : {}),
         usage: state.usage.snapshot(),
         providerRetries: [],
       };

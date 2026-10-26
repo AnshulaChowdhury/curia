@@ -3,8 +3,9 @@
 # that first call until the follow-up is queued. A text reply never makes that
 # call, so the same follow-up is published at the exit hook, before the turn
 # finishes. Capture matches one conversation to one turn, so a follow-up that is
-# not queued fails the run instead of being scored as a second reply. The shipped
-# config turns the flag on. This case stays out of the release gate until it has
+# not queued fails the run instead of being scored as a second reply. A drain at
+# turn_start fails the run, and the point is recorded on the result. The shipped
+# config leaves the flag off. This case stays out of the release gate until it has
 # been run on the standard-tier model with the official judge. With the flag off
 # the harness errors before publishing. It is not a known_failure: that marker
 # would hide a real miss.

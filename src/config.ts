@@ -594,10 +594,11 @@ export interface YamlConfig {
     conversationCheckpointDebounceMs?: number;
     /**
      * Turn lanes and mid-turn injection (#2018, ADR-053). Absent fields use
-     * {@link DEFAULT_TURN_INJECTION_CONFIG}. The shipped config sets `enabled: true`.
+     * {@link DEFAULT_TURN_INJECTION_CONFIG}. The shipped config leaves `enabled` false
+     * until case 26 is recorded on the release-gate model and judge.
      */
     turnInjection?: {
-      /** Master switch. Absent means false. The shipped config sets true. */
+      /** Master switch. Absent means false. The shipped config leaves it false. */
       enabled?: boolean;
       /** Live same-sender follow-ups drained into one turn before the rest wait. Default: 5. */
       maxInjectionsPerTurn?: number;

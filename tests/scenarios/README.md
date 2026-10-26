@@ -764,6 +764,8 @@ Raise either to `critical` only once a larger sample clears 80% with room.
 turn is still running (#2018). `after: first_tool_call` holds that call and publishes
 while it is in flight, or for five seconds. A reply with no tool call publishes at the
 exit hook instead, before the turn finishes, so the correction drains there.
+A follow-up drained at `turn_start` fails the run, and the drain points are
+recorded on the run result.
 `after: { ms: N }` waits, then publishes, and does not hold the tool. The harness does
 not await either publish: awaiting the host waits for the whole turn, and awaiting the
 follow-up waits until it is drained, which cannot happen while the first tool is held.

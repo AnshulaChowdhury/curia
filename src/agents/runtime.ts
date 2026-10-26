@@ -3412,6 +3412,7 @@ export class AgentRuntime {
       if (call.sliceCostTracker && Number.isFinite(estimatedCostUsd) && estimatedCostUsd > 0) {
         call.sliceCostTracker.usd += estimatedCostUsd;
       }
+      // The scenario follow-up harness relies on this await; see tests/scenarios/followup-exit.ts.
       await bus.publish('agent', event);
     } catch (err) {
       // Telemetry failure must not abort the agent task. Log at error so the gap

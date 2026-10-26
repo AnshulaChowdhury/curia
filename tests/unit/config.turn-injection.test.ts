@@ -1,5 +1,6 @@
 // dispatch.turnInjection (#2018, ADR-053). An absent field stays off. The shipped
-// default.yaml turns the flag on. A bad block fails at boot: laneWaitTimeoutMs
+// default.yaml leaves the flag off until case 26 is recorded. A bad block fails
+// at boot: laneWaitTimeoutMs
 // reaches setTimeout, and a zero cap would reject every follow-up while looking
 // configured.
 
@@ -43,13 +44,13 @@ describe('resolveTurnInjectionConfig (#2018)', () => {
     });
   });
 
-  it('reads the shipped default.yaml with the flag on', () => {
+  it('reads the shipped default.yaml with the flag off', () => {
     const config = loadYamlConfig(path.resolve(import.meta.dirname, '../../config'));
-    expect(resolveTurnInjectionConfig(config.dispatch).enabled).toBe(true);
+    expect(resolveTurnInjectionConfig(config.dispatch).enabled).toBe(false);
     expect(resolveTurnInjectionConfig(config.dispatch).maxInjectionsPerTurn).toBe(5);
   });
 
-  it('lets local.yaml turn the shipped flag off without dropping the other fields', () => {
+  it('lets local.yaml turn an enabled default off without dropping the other fields', () => {
     const dir = writeConfig(`
 dispatch:
   turnInjection:

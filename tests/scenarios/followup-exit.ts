@@ -16,3 +16,12 @@ export function isTextFinishCall(event: BusEvent): boolean {
   if (response === null || typeof response !== 'object' || Array.isArray(response)) return false;
   return (response as { type?: unknown }).type === 'text';
 }
+
+/**
+ * A follow-up drained before the model had chosen. `exit` and `round:N` are
+ * the points the harness aims for, so they are not errors.
+ */
+export function turnStartDrainError(drainPoint: string): string | undefined {
+  if (drainPoint !== 'turn_start') return undefined;
+  return 'follow-up drained at turn_start; the correction joined before the model had chosen';
+}
