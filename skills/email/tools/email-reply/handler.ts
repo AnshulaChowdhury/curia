@@ -316,7 +316,9 @@ export class EmailReplyHandler implements ToolHandler {
         // Lets the dispatcher show this entry when a To or CC recipient replies (#2261).
         recipientContactIds: await replyRecipientContactIds(ctx, [originalFrom, ...(ccAddresses ?? [])]),
         // A task-bound reply leaves a task_outreach row so the answer can find its task (#2312).
-        outreach: { turn: ctx, via: 'email', addresses: [replyTo, ...recipientSet.additionalTo, ...(ccAddresses ?? [])] },
+        outreach: {
+          turn: ctx, via: 'email', addresses: [replyTo, ...recipientSet.additionalTo, ...(ccAddresses ?? [])], subject: replySubject,
+        },
       });
 
       ctx.log.info(

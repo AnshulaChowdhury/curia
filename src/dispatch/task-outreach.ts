@@ -30,7 +30,9 @@ export interface TaskOutreachRow {
   summary: string;
   /**
    * True only for an explicit act (a send or record-outreach) on a principal-originated turn.
-   * A match on an unconfirmed row is a weak link only (Task 3). Merges OR: never downgraded.
+   * A match on an unconfirmed row is a weak link only (Task 3). Confirmed and unconfirmed
+   * writes never share a row, so a confirmed act cannot vouch for addresses a backstop
+   * write guessed, and a backstop write cannot dilute a confirmed row.
    */
   confirmed: boolean;
   createdAt: Date;
@@ -66,7 +68,7 @@ function mapRow(row: Record<string, unknown>): TaskOutreachRow {
     contactIds: (row.contact_ids as string[] | null) ?? [],
     givenContact: (row.given_contact as string | null) ?? null,
     summary: row.summary as string,
-    confirmed: row.confirmed !== false,
+    confirmed: row.confirmed === true,
     createdAt: row.created_at as Date,
     closedAt: (row.closed_at as Date | null) ?? null,
     expiresAt: row.expires_at as Date,
@@ -78,8 +80,10 @@ export class TaskOutreachRepo {
 
   /**
    * Record outreach. Upserts: an open row for the same scope (task_id, or conversation_id
-   * when there is no task), the same `via`, and an overlapping domain or address absorbs
-   * the new values instead of getting a sibling row.
+   * when there is no task), the same `via`, the same `confirmed`, and an overlapping domain
+   * or address absorbs the new values instead of getting a sibling row. A write never merges
+   * across `confirmed`: an unconfirmed write overlapping a confirmed row gets a row of its
+   * own (whose matches stay weak), and a confirmed write never upgrades an unconfirmed row.
    */
   async record(input: TaskOutreachInput): Promise<TaskOutreachRow> {
     const domains = normalizeStrings(input.domains);
@@ -92,12 +96,10 @@ export class TaskOutreachRepo {
               addresses = ARRAY(SELECT DISTINCT a FROM unnest(t.addresses || $5::text[]) AS a ORDER BY a),
               contact_ids = ARRAY(SELECT DISTINCT c FROM unnest(t.contact_ids || $6::uuid[]) AS c ORDER BY c),
               org_name = COALESCE(t.org_name, $7::text),
-              given_contact = COALESCE($8::text, t.given_contact),
-              -- A later confirmed act upgrades a backstop row; an unconfirmed write never downgrades.
-              confirmed = t.confirmed OR $9::boolean
+              given_contact = COALESCE($8::text, t.given_contact)
         WHERE t.id = (
           SELECT id FROM task_outreach
-           WHERE ${OPEN} AND via = $3
+           WHERE ${OPEN} AND via = $3 AND confirmed = $9::boolean
              AND (($1::uuid IS NOT NULL AND task_id = $1::uuid)
                OR ($1::uuid IS NULL AND task_id IS NULL AND $2::text IS NOT NULL AND conversation_id = $2::text))
              AND (domains && $4::text[] OR addresses && $5::text[])

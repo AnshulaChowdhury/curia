@@ -63,8 +63,24 @@ export interface TaskOutreachCapability {
   readonly nonOrgDomains?: ReadonlySet<string>;
 }
 
-/** First characters of the sent message, when there is no task title to summarise with. */
+/** Cap on an email subject used as a send's summary, when there is no task title. */
 export const SEND_SUMMARY_MAX_CHARS = 120;
+
+const CHANNEL_LABELS: Readonly<Record<OutreachVia, string>> = {
+  email: 'Email', web_form: 'Web form', signal: 'Signal', sms: 'SMS', slack: 'Slack', phone: 'Phone', other: 'Other',
+};
+
+/**
+ * A send's summary when the turn has no task title: the email subject, else a label. Never
+ * the message body: a row's summary is shown to the matcher's model and on the link block,
+ * and the body can carry the very details the band judge is guarding (#2312).
+ */
+export function sendSummaryFallback(via: OutreachVia, subject: string | undefined, domains: readonly string[]): string {
+  const trimmed = subject?.trim() ?? '';
+  if (trimmed !== '') return trimmed.slice(0, SEND_SUMMARY_MAX_CHARS);
+  if (via === 'email') return `Email to ${domains[0] ?? 'a contact'}`;
+  return `${CHANNEL_LABELS[via]} message`;
+}
 
 function linkedTaskId(metadata: Record<string, unknown> | undefined): string | null {
   const linked = metadata?.['linkedTask'];
@@ -234,6 +250,8 @@ export interface SendOutreach {
   via: OutreachVia;
   /** The resolved recipient identifiers (email addresses, phone numbers, Slack ids). */
   addresses: readonly string[];
+  /** The email's subject, the summary when the turn has no task title. */
+  subject?: string;
 }
 
 /**
@@ -243,7 +261,7 @@ export interface SendOutreach {
  */
 export async function recordSendOutreach(
   outreach: SendOutreach,
-  sent: { content: string; recipientContactIds?: readonly string[]; log: Logger },
+  sent: { recipientContactIds?: readonly string[]; log: Logger },
 ): Promise<void> {
   const capability = outreach.turn.taskOutreach;
   if (!capability) return;
@@ -253,14 +271,16 @@ export async function recordSendOutreach(
       .filter((a) => a !== '' && capability.ownIdentity(a) === null);
     const contactIds = (sent.recipientContactIds ?? []).filter((id) => !capability.isPrincipalContact(id));
     if (addresses.length === 0 && contactIds.length === 0) return;
+    // The principal's domains are excluded here too, where a full host (mail.corp.example)
+    // is still visible; recordForTurn sees only the reduced org domain.
+    const domains = outreach.via === 'email' ? orgDomainsOf(addresses, capability.nonOrgDomains) : [];
     const row = await capability.recordForTurn(outreach.turn, {
       via: outreach.via,
       addresses,
       contactIds,
-      // The principal's domains are excluded here too, where a full host (mail.corp.example)
-      // is still visible; recordForTurn sees only the reduced org domain.
-      domains: outreach.via === 'email' ? orgDomainsOf(addresses, capability.nonOrgDomains) : [],
-      summary: sent.content.slice(0, SEND_SUMMARY_MAX_CHARS),
+      domains,
+      // The task title when there is one (useTaskTitle); never the message body.
+      summary: sendSummaryFallback(outreach.via, outreach.subject, domains),
       useTaskTitle: true,
     });
     if (row) sent.log.debug({ outreachId: row.id, taskId: row.taskId, via: row.via }, 'task-outreach: recorded send');

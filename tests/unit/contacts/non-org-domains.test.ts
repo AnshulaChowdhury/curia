@@ -16,6 +16,14 @@ describe('isNonOrgDomain', () => {
     expect(isNonOrgDomain(host)).toBe(true);
   });
 
+  it.each([
+    'gmx.de', 'yandex.ru', 'fastmail.fm', 'tuta.io', 'qq.com', 'naver.com',
+    'comcast.net', 'rogers.com', 'shaw.ca', 'videotron.ca', 'btinternet.com', 'orange.fr',
+    't-online.de', 'optusnet.com.au', 'xtra.co.nz', 'mail.ru', 'pm.me',
+  ])('webmail or ISP mail domain %s is non-org', (host) => {
+    expect(isNonOrgDomain(host)).toBe(true);
+  });
+
   it.each(['acme.github.io', 'github.io', 'x.herokuapp.com'])('private-suffix host %s is non-org', (host) => {
     expect(isNonOrgDomain(host)).toBe(true);
   });

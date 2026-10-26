@@ -8,7 +8,7 @@
 import { getDomain } from 'tldts';
 import { registrableDomain } from '../verification/domain.js';
 
-/** Well-known personal webmail domains that should never generate org nodes (#946). */
+/** Well-known personal webmail and ISP mail domains that should never generate org nodes (#946). */
 export const PERSONAL_EMAIL_DOMAINS: ReadonlySet<string> = new Set([
   'gmail.com', 'googlemail.com',
   'yahoo.com', 'ymail.com',
@@ -19,6 +19,20 @@ export const PERSONAL_EMAIL_DOMAINS: ReadonlySet<string> = new Set([
   'aol.com',
   'msn.com',
   'protonmail.com', 'proton.me', 'pm.me',
+  // Other webmail providers.
+  'gmx.com', 'gmx.de', 'gmx.net', 'mail.com', 'inbox.com', 'hushmail.com',
+  'yandex.com', 'yandex.ru', 'mail.ru',
+  'zoho.com', 'zohomail.com', 'fastmail.com', 'fastmail.fm', 'hey.com',
+  'tutanota.com', 'tuta.io',
+  'qq.com', '163.com', '126.com', 'naver.com', 'rediffmail.com',
+  // ISP mailboxes: an address on one names a subscriber, not a business.
+  'comcast.net', 'att.net', 'verizon.net', 'cox.net', 'charter.net', 'earthlink.net',
+  'sbcglobal.net', 'bellsouth.net',
+  'rogers.com', 'shaw.ca', 'sympatico.ca', 'bell.net', 'videotron.ca', 'telus.net',
+  'cogeco.ca', 'eastlink.ca', 'sasktel.net',
+  'btinternet.com', 'sky.com', 'virginmedia.com', 'talktalk.net',
+  'orange.fr', 'free.fr', 'laposte.net', 'web.de', 't-online.de', 'libero.it', 'ziggo.nl',
+  'bigpond.com', 'optusnet.com.au', 'xtra.co.nz',
 ]);
 
 /**

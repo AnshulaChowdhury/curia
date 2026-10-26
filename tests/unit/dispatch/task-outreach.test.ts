@@ -95,15 +95,25 @@ describe('TaskOutreachRepo.record', () => {
     expect(params).toContain('email');
   });
 
-  it('merges confirmed with OR and inserts it as given (#2312)', async () => {
+  it('merges only into a row of the same confirmed value, and inserts it as given (#2312)', async () => {
     const { pool, query } = mockPool([{ rows: [] }, { rows: [dbRow()] }]);
     await new TaskOutreachRepo(pool).record({ ...input, confirmed: false });
     const [updateSql, updateParams] = query.mock.calls[0]! as [string, unknown[]];
-    expect(updateSql).toMatch(/confirmed = t\.confirmed OR \$9::boolean/);
+    // Row selection pins confirmed; the SET list never touches it (no OR-upgrade).
+    expect(updateSql).toMatch(/AND confirmed = \$9::boolean/);
+    expect(updateSql).not.toMatch(/confirmed = t\.confirmed/);
     expect(updateParams[8]).toBe(false);
     const [insertSql, insertParams] = query.mock.calls[1]! as [string, unknown[]];
     expect(insertSql).toMatch(/confirmed\)/);
     expect(insertParams[12]).toBe(false);
+  });
+
+  it('maps confirmed strictly: only a literal true is confirmed (#2312)', async () => {
+    const { pool } = mockPool([{ rows: [dbRow({ confirmed: true })] }, { rows: [dbRow({ confirmed: null })] }, { rows: [dbRow()] }]);
+    const repo = new TaskOutreachRepo(pool);
+    expect((await repo.getById('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))?.confirmed).toBe(true);
+    expect((await repo.getById('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))?.confirmed).toBe(false);
+    expect((await repo.getById('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))?.confirmed).toBe(false);
   });
 
   it('drops non-uuid contact ids', async () => {

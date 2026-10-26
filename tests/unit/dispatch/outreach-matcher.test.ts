@@ -172,6 +172,49 @@ describe('OutreachMatcher — direct matches', () => {
     expect(learnCounterparty).not.toHaveBeenCalled();
   });
 
+  // TaskOutreachRepo.record keeps confirmed and unconfirmed writes in separate rows; this
+  // is that state, with the finders filtering the two rows as Postgres would.
+  describe('a backstop row beside a confirmed row (#2312)', () => {
+    const confirmedRow = row({ id: 'row-confirmed', addresses: ['bob@gmail.com'], domains: [] });
+    // Newer, unconfirmed, and it guessed one more address.
+    const backstopRow = row({
+      id: 'row-backstop', addresses: ['bob@gmail.com', 'mallory@gmail.com'], domains: [], confirmed: false,
+      createdAt: new Date('2026-10-25T12:00:00Z'),
+    });
+    function bothRows() {
+      const repo = makeRepo();
+      const newestFirst = [backstopRow, confirmedRow];
+      repo.findOpenByAddress.mockImplementation(async (a: string) => newestFirst.filter((r) => r.addresses.includes(a)));
+      const matcher = new OutreachMatcher({
+        repo: repo.repo, infraLlm: undefined, logger, nonOrgDomains: NON_ORG, taskStatus: async () => 'in_progress',
+      });
+      return { matcher, ...repo };
+    }
+
+    it('an address only the unconfirmed row holds links weakly and learns nothing', async () => {
+      const { matcher, learnCounterparty } = bothRows();
+      const link = await matcher.match({ ...baseMsg, senderAddress: 'mallory@gmail.com' });
+      expect(link).toMatchObject({ outreachId: 'row-backstop', linkKind: 'address', strength: 'weak' });
+      expect(learnCounterparty).not.toHaveBeenCalled();
+    });
+
+    it('an address the confirmed row holds links strongly to it, though the backstop row is newer', async () => {
+      const { matcher } = bothRows();
+      const link = await matcher.match({ ...baseMsg, senderAddress: 'bob@gmail.com' });
+      expect(link).toMatchObject({ outreachId: 'row-confirmed', linkKind: 'address', strength: 'strong' });
+    });
+  });
+
+  it('a confirmed row whose task is done is skipped; the open unconfirmed row links weakly', async () => {
+    const closed = row({ id: 'row-closed', taskId: '99999999-9999-4999-8999-999999999999' });
+    const open = row({ id: 'row-open', confirmed: false });
+    const { matcher } = makeMatcher({
+      rows: { byAddress: [open, closed] },
+      taskStatus: async (id) => (id === TASK_ID ? 'in_progress' : 'done'),
+    });
+    expect(await matcher.match(baseMsg)).toMatchObject({ outreachId: 'row-open', strength: 'weak' });
+  });
+
   it('an unauthenticated address match is weak', async () => {
     const { matcher, learnCounterparty } = makeMatcher({ rows: { byAddress: [row()] } });
     const link = await matcher.match({ ...baseMsg, senderAuthenticated: false });

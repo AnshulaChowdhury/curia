@@ -118,7 +118,7 @@ describeIf('task_outreach repo', () => {
     expect(new Set([base.id, otherVia.id, otherTask.id, noOverlap.id]).size).toBe(4);
   });
 
-  it('a repeated backstop write merges, and a confirmed act upgrades it but is never downgraded (#2312)', async () => {
+  it('a repeated backstop write merges into its own unconfirmed row (#2312)', async () => {
     const taskId = await seedTask();
     const form = { via: 'web_form' as const, domains: [`${run}-form.test`], addresses: [], confirmed: false };
     const backstop = await repo.record(input(taskId, form));
@@ -128,11 +128,49 @@ describeIf('task_outreach repo', () => {
     expect(again.id).toBe(backstop.id);
     const { rows } = await pool.query(`SELECT count(*)::int AS n FROM task_outreach WHERE task_id = $1`, [taskId]);
     expect(rows[0].n).toBe(1);
-    const explicit = await repo.record(input(taskId, { ...form, confirmed: true }));
-    expect(explicit.id).toBe(backstop.id);
+  });
+
+  it('an unconfirmed write overlapping a confirmed row gets a separate row (#2312)', async () => {
+    const taskId = await seedTask();
+    const confirmedRow = await repo.record(input(taskId));
+    const guessed = await repo.record(input(taskId, {
+      confirmed: false,
+      addresses: [`Bob@${run}-acme.test`, `mallory@${run}-acme.test`],
+    }));
+    expect(guessed.id).not.toBe(confirmedRow.id);
+    expect(guessed.confirmed).toBe(false);
+    const reread = await repo.getById(confirmedRow.id);
+    expect(reread?.confirmed).toBe(true);
+    expect(reread?.addresses).toEqual([`bob@${run}-acme.test`]);
+  });
+
+  it('a confirmed write overlapping an unconfirmed row never upgrades it (#2312)', async () => {
+    const taskId = await seedTask();
+    const guessed = await repo.record(input(taskId, {
+      confirmed: false,
+      addresses: [`Bob@${run}-acme.test`, `mallory@${run}-acme.test`],
+    }));
+    const explicit = await repo.record(input(taskId));
+    expect(explicit.id).not.toBe(guessed.id);
     expect(explicit.confirmed).toBe(true);
-    const later = await repo.record(input(taskId, form));
-    expect(later.confirmed).toBe(true);
+    expect(explicit.addresses).toEqual([`bob@${run}-acme.test`]);
+    const reread = await repo.getById(guessed.id);
+    expect(reread?.confirmed).toBe(false);
+    // A second confirmed act merges into the confirmed row, not the unconfirmed one.
+    const again = await repo.record(input(taskId, { addresses: [`carol@${run}-acme.test`] }));
+    expect(again.id).toBe(explicit.id);
+    expect(again.confirmed).toBe(true);
+    expect((await repo.getById(guessed.id))?.addresses).not.toContain(`carol@${run}-acme.test`);
+  });
+
+  it('a column omitted on insert defaults to unconfirmed (#2312)', async () => {
+    const taskId = await seedTask();
+    const { rows } = await pool.query<{ id: string }>(
+      `INSERT INTO task_outreach (task_id, originator, via, domains, summary)
+       VALUES ($1, $2, 'email', $3, 'default check') RETURNING id`,
+      [taskId, JSON.stringify(originator), [`${run}-acme.test`]],
+    );
+    expect((await repo.getById(rows[0]!.id))?.confirmed).toBe(false);
   });
 
   it('merges by conversation_id when there is no task', async () => {

@@ -280,7 +280,7 @@ export class EmailSendHandler implements ToolHandler {
         // Lets the dispatcher show this entry when a To or CC recipient replies (#2261).
         recipientContactIds: [...resolvedTo.recipientContactIds, ...ccContactIds],
         // A task-bound send leaves a task_outreach row so the reply can find its task (#2312).
-        outreach: { turn: ctx, via: 'email', addresses: [...toAddresses, ...ccAddresses] },
+        outreach: { turn: ctx, via: 'email', addresses: [...toAddresses, ...ccAddresses], subject },
       });
 
       return {

@@ -592,15 +592,16 @@ describe('EmailSendHandler task outreach (#2312)', () => {
     }));
   });
 
-  it('on a live principal turn with no task, records against the conversation', async () => {
+  it('on a live principal turn with no task, records against the conversation, summarised by subject not body', async () => {
     const ctx = makeCtx({ to: ALICE_ID, subject: 'Appointment', body: 'Could we book Tuesday?' }, { taskMetadata: { originator: principal } });
     (ctx as unknown as Record<string, unknown>).liveTurn = true;
     const record = withOutreach(ctx);
 
     await new EmailSendHandler().execute(ctx);
     expect(record).toHaveBeenCalledWith(expect.objectContaining({
-      taskId: null, conversationId: 'conv-1', directingEventId: 'evt-1', summary: 'Could we book Tuesday?',
+      taskId: null, conversationId: 'conv-1', directingEventId: 'evt-1', summary: 'Appointment',
     }));
+    expect(JSON.stringify(record.mock.calls)).not.toContain('Could we book Tuesday?');
   });
 
   it('on an outsider turn with no task, records nothing', async () => {

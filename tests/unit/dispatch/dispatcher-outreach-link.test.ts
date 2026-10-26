@@ -107,6 +107,7 @@ async function sendEmail(
       senderVerified: true,
       curiaRole: 'to',
       otherRecipientCount: 0,
+      primaryRecipientEmails: [],
       // The adapter's header-parsed From, as message-converter publishes it.
       participants: [
         { email: overrides.senderId ?? 'Bookings@Acme.example', name: 'Acme Bookings', role: 'from' },
@@ -236,6 +237,46 @@ describe('Dispatcher outreach link (#2312)', () => {
     expect(h.tasks[0]!.payload.content).toContain('This looks like a reply to outreach Curia did for the principal: "');
     expect(h.tasks[0]!.payload.content).not.toContain('for a task');
     expect(h.updateTask).not.toHaveBeenCalled();
+  });
+
+  it('a weak link stamps linkedTask and the block but never writes into the task', async () => {
+    const h = harness({ match: async () => link({ strength: 'weak', linkKind: 'inferred' }) });
+    await sendEmail(h);
+    expect(h.tasks[0]!.payload.metadata?.['linkedTask']).toMatchObject({ taskId: TASK_ID, strength: 'weak' });
+    expect(h.tasks[0]!.payload.content).toContain('Linked by inferred (weak).');
+    expect(h.updateTask).not.toHaveBeenCalled();
+  });
+
+  it('a strong link writes the progress note', async () => {
+    const h = harness({ match: async () => link({ strength: 'strong', linkKind: 'address' }) });
+    await sendEmail(h);
+    expect(h.updateTask).toHaveBeenCalledOnce();
+    expect(h.updateTask.mock.calls[0]![0]).toBe(TASK_ID);
+  });
+
+  it('passes the Curia mailbox the email was sent to as recipientAddress', async () => {
+    const h = harness();
+    await sendEmail(h, {
+      metadata: {
+        otherRecipientCount: 1,
+        primaryRecipientEmails: ['Dana@Acme.example'],
+        participants: [
+          { email: 'Bookings@Acme.example', name: 'Acme Bookings', role: 'from' },
+          { email: 'Dana@Acme.example', name: 'Dana', role: 'to' },
+          { email: 'Curia+ops@Office.example', name: 'Curia', role: 'to' },
+        ],
+      },
+    });
+    expect(h.match.mock.calls[0]![0].recipientAddress).toBe('curia+ops@office.example');
+  });
+
+  it('omits recipientAddress when Curia was CC\'d or its own address was unknown', async () => {
+    const cc = harness();
+    await sendEmail(cc, { metadata: { curiaRole: 'cc', primaryRecipientEmails: ['dana@acme.example'] } });
+    expect(cc.match.mock.calls[0]![0]).not.toHaveProperty('recipientAddress');
+    const unknownSelf = harness();
+    await sendEmail(unknownSelf, { metadata: { otherRecipientCount: undefined } });
+    expect(unknownSelf.match.mock.calls[0]![0]).not.toHaveProperty('recipientAddress');
   });
 
   it('uses the header-parsed From, not an address a crafted display name carries', async () => {

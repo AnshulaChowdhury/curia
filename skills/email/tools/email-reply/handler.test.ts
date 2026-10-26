@@ -6,6 +6,8 @@ import type { OutboundGateway } from '../../../../src/skills/outbound-gateway.js
 import pino from 'pino';
 import { ContactService } from '../../../../src/contacts/contact-service.js';
 import { resolveRecipientReference } from '../../../../src/skills/_shared/recipient-reference.js';
+import { TaskOutreachService } from '../../../../src/dispatch/task-outreach-capability.js';
+import type { TaskOutreachInput, TaskOutreachRepo, TaskOutreachRow } from '../../../../src/dispatch/task-outreach.js';
 
 function makeLogger() {
   return pino({ level: 'silent' });
@@ -893,5 +895,31 @@ describe('EmailReplyHandler redactions (#2312)', () => {
       expect(result.data).not.toHaveProperty('redaction_note');
     }
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: 'hello' }));
+  });
+});
+
+describe('EmailReplyHandler task outreach (#2312)', () => {
+  it('with no task title, summarises the outreach row by the reply subject, never the body', async () => {
+    const ctx = makeCtx(
+      { reply_to_message_id: 'nylas-msg-1', body: 'My card ends 4242, call me on 416-555-0100.' },
+      { taskMetadata: { originator: { contactId: 'principal-id', systemRole: 'principal', channel: 'email', initiatedAt: '2026-10-26T00:00:00Z' } } },
+    );
+    (ctx.outboundGateway!.getEmailMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      from: [{ email: 'bookings@acme.example' }], to: [], cc: [], subject: 'Appointment', body: '', date: 0,
+    });
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'reply-1' });
+    const record = vi.fn(async (input: TaskOutreachInput) => ({ id: 'outreach-1', ...input } as unknown as TaskOutreachRow));
+    Object.assign(ctx as unknown as Record<string, unknown>, {
+      liveTurn: true,
+      conversationId: 'conv-1',
+      taskEventId: 'evt-1',
+      taskOutreach: new TaskOutreachService({ record } as unknown as TaskOutreachRepo, {
+        principalIdentities: [], selfEmails: ['curia@office.example'], log: makeLogger(),
+      }),
+    });
+
+    expect((await new EmailReplyHandler().execute(ctx)).success).toBe(true);
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({ taskId: null, summary: 'Re: Appointment' }));
+    expect(JSON.stringify(record.mock.calls)).not.toContain('4242');
   });
 });

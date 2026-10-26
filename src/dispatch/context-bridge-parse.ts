@@ -122,7 +122,7 @@ export async function registerOutboundContext(
 
   // Before the early return: a deployment without outbound context still records outreach.
   // recordSendOutreach never throws.
-  if (outreach) await recordSendOutreach(outreach, { content, recipientContactIds, log });
+  if (outreach) await recordSendOutreach(outreach, { recipientContactIds, log });
 
   if (!outboundContext) return;
 

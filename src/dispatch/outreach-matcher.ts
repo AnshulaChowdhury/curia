@@ -116,11 +116,20 @@ export class OutreachMatcher {
     return domain;
   }
 
+  /**
+   * The newest matchable confirmed row, else the newest matchable row. Confirmed and
+   * unconfirmed writes keep separate rows (TaskOutreachRepo.record), so a backstop row that
+   * guessed an address the principal's explicit act also recorded must not shadow it.
+   */
   private async firstMatchable(rows: TaskOutreachRow[]): Promise<TaskOutreachRow | null> {
+    let fallback: TaskOutreachRow | null = null;
     for (const row of rows) {
-      if (await this.isMatchable(row)) return row;
+      if (fallback !== null && !row.confirmed) continue;
+      if (!(await this.isMatchable(row))) continue;
+      if (row.confirmed) return row;
+      fallback = row;
     }
-    return null;
+    return fallback;
   }
 
   private async matchable(rows: TaskOutreachRow[]): Promise<TaskOutreachRow[]> {

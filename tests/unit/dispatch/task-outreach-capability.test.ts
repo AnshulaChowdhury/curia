@@ -9,6 +9,8 @@ import {
   TaskOutreachService,
   outreachScope,
   recordSendOutreach,
+  sendSummaryFallback,
+  SEND_SUMMARY_MAX_CHARS,
 } from '../../../src/dispatch/task-outreach-capability.js';
 import type { TaskOutreachRepo, TaskOutreachInput, TaskOutreachRow } from '../../../src/dispatch/task-outreach.js';
 import type { ChannelIdentity, TaskOriginator } from '../../../src/contacts/types.js';
@@ -154,7 +156,7 @@ describe('TaskOutreachService confirmed (#2312)', () => {
         via: 'email',
         addresses: ['bookings@acme.example'],
       },
-      { content: 'Hello', recipientContactIds: [CONTACT_ID], log },
+      { recipientContactIds: [CONTACT_ID], log },
     );
     expect(record).toHaveBeenCalledWith(expect.objectContaining({ taskId: TASK_ID, confirmed: false }));
   });
@@ -193,7 +195,7 @@ describe('recordSendOutreach', () => {
     const { service, record } = makeService();
     await recordSendOutreach(
       { turn: { ...wake, taskOutreach: service }, via: 'email', addresses: ['Bookings@Acme.example', 'pal@gmail.com'] },
-      { content: 'Hello', recipientContactIds: [CONTACT_ID], log },
+      { recipientContactIds: [CONTACT_ID], log },
     );
     expect(record).toHaveBeenCalledWith(expect.objectContaining({
       taskId: TASK_ID,
@@ -210,28 +212,66 @@ describe('recordSendOutreach', () => {
     const { service, record } = makeService({ nonOrgDomains: new Set(['mail.corp.example']) });
     await recordSendOutreach(
       { turn: { ...wake, taskOutreach: service }, via: 'email', addresses: ['dana@mail.corp.example', 'bookings@acme.example'] },
-      { content: 'Hello', recipientContactIds: [CONTACT_ID], log },
+      { recipientContactIds: [CONTACT_ID], log },
     );
     expect(record).toHaveBeenCalledWith(expect.objectContaining({ domains: ['acme.example'] }));
   });
 
-  it('summarises with the start of the sent message when there is no task', async () => {
+  it('never stores the message body: with no task, an SMS is labelled by channel (#2312)', async () => {
     const { service, record } = makeService();
-    const long = 'x'.repeat(200);
     await recordSendOutreach(
       { turn: { taskMetadata: { originator: principalOriginator }, liveTurn: true, conversationId: 'conv-9', taskEventId: 'evt-9', taskOutreach: service }, via: 'sms', addresses: ['+14165550199'] },
-      { content: long, recipientContactIds: [CONTACT_ID], log },
+      { recipientContactIds: [CONTACT_ID], log },
     );
     expect(record).toHaveBeenCalledWith(expect.objectContaining({
-      taskId: null, conversationId: 'conv-9', directingEventId: 'evt-9', summary: 'x'.repeat(120), domains: [],
+      taskId: null, conversationId: 'conv-9', directingEventId: 'evt-9', summary: 'SMS message', domains: [],
     }));
+  });
+
+  it('with no task title, an email uses its subject, else names the first org domain (#2312)', async () => {
+    const live = { taskMetadata: { originator: principalOriginator }, liveTurn: true, conversationId: 'conv-9', taskEventId: 'evt-9' };
+    const { service, record } = makeService();
+    await recordSendOutreach(
+      { turn: { ...live, taskOutreach: service }, via: 'email', addresses: ['bookings@acme.example'], subject: '  Re: Tuesday appointment ' },
+      { recipientContactIds: [], log },
+    );
+    expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ summary: 'Re: Tuesday appointment' }));
+    await recordSendOutreach(
+      { turn: { ...live, taskOutreach: service }, via: 'email', addresses: ['pal@gmail.com', 'bookings@acme.example'] },
+      { recipientContactIds: [], log },
+    );
+    expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ summary: 'Email to acme.example' }));
+    await recordSendOutreach(
+      { turn: { ...live, taskOutreach: service }, via: 'email', addresses: ['pal@gmail.com'], subject: ' ' },
+      { recipientContactIds: [], log },
+    );
+    expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ summary: 'Email to a contact' }));
+  });
+
+  it('a bound task title still wins over the subject', async () => {
+    const { service, record } = makeService();
+    await recordSendOutreach(
+      { turn: { ...wake, taskOutreach: service }, via: 'email', addresses: ['bookings@acme.example'], subject: 'Hello there' },
+      { recipientContactIds: [], log },
+    );
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({ summary: 'Book physio' }));
+  });
+
+  it.each([
+    ['signal', 'Signal message'], ['slack', 'Slack message'], ['sms', 'SMS message'],
+  ] as const)('labels a %s send with no task title as %j', (via, label) => {
+    expect(sendSummaryFallback(via, undefined, [])).toBe(label);
+  });
+
+  it('caps a long subject', () => {
+    expect(sendSummaryFallback('email', 's'.repeat(300), [])).toBe('s'.repeat(SEND_SUMMARY_MAX_CHARS));
   });
 
   it("leaves out the principal and Curia's own addresses, and writes nothing when no one else is left", async () => {
     const { service, record } = makeService();
     await recordSendOutreach(
       { turn: { ...wake, taskOutreach: service }, via: 'email', addresses: ['joe@example.com'] },
-      { content: 'Update', recipientContactIds: [PRINCIPAL_ID], log },
+      { recipientContactIds: [PRINCIPAL_ID], log },
     );
     expect(record).not.toHaveBeenCalled();
   });
@@ -240,7 +280,7 @@ describe('recordSendOutreach', () => {
     const { service, record } = makeService();
     await recordSendOutreach(
       { turn: { taskMetadata: { originator: outsiderOriginator }, liveTurn: true, conversationId: 'c', taskOutreach: service }, via: 'email', addresses: ['bookings@acme.example'] },
-      { content: 'Hello', recipientContactIds: [CONTACT_ID], log },
+      { recipientContactIds: [CONTACT_ID], log },
     );
     expect(record).not.toHaveBeenCalled();
   });
@@ -250,14 +290,14 @@ describe('recordSendOutreach', () => {
     record.mockRejectedValueOnce(new Error('db down'));
     await expect(recordSendOutreach(
       { turn: { ...wake, taskOutreach: service }, via: 'email', addresses: ['bookings@acme.example'] },
-      { content: 'Hello', recipientContactIds: [CONTACT_ID], log },
+      { recipientContactIds: [CONTACT_ID], log },
     )).resolves.toBeUndefined();
   });
 
   it('is a no-op without the capability', async () => {
     await expect(recordSendOutreach(
       { turn: wake, via: 'email', addresses: ['bookings@acme.example'] },
-      { content: 'Hello', recipientContactIds: [], log },
+      { recipientContactIds: [], log },
     )).resolves.toBeUndefined();
   });
 });
