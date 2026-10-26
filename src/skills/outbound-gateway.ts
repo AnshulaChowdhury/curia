@@ -1515,8 +1515,9 @@ export class OutboundGateway {
           channel: 'email',
           recipientId,
           recipientContactId,
-          // Without the model's sign-off when signEmail dropped it: what was sent.
-          content: toSend.body,
+          // Without the model's sign-off when signEmail dropped it: what was sent. Redacted when
+          // the review sent details raw: the audit event never carries them (#2312).
+          content: rawOnWire ? this.redactedCopy(toSend.body, 'email', recipientId) : toSend.body,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1557,7 +1558,7 @@ export class OutboundGateway {
           channel: 'slack',
           recipientId,
           recipientContactId,
-          content: sendBody,
+          content: redactedBody, // the redacted copy: the audit event never carries raw values (#2312)
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1580,7 +1581,7 @@ export class OutboundGateway {
           channel: 'sms',
           recipientId,
           recipientContactId,
-          content: sendBody,
+          content: redactedBody, // the redacted copy: the audit event never carries raw values (#2312)
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1610,7 +1611,7 @@ export class OutboundGateway {
           channel: 'signal',
           recipientId,
           recipientContactId,
-          content: sendBody,
+          content: redactedBody, // the redacted copy: the audit event never carries raw values (#2312)
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1637,6 +1638,22 @@ export class OutboundGateway {
   ): OutboundSendResult {
     if (!result.success || applied.length === 0) return result;
     return { ...result, redactions: [...applied], sentContent, ...(sentSubject !== undefined ? { sentSubject } : {}) };
+  }
+
+  /**
+   * A redacted copy of sent text for an audit event (#2312): what tier redaction would have
+   * sent, never published as a redaction. Without a redactor the text is returned as is. If
+   * the redactor throws, the best-effort scrubber stands in: the audit must not carry values.
+   */
+  private redactedCopy(text: string, channel: string, recipientId: string): string {
+    if (!this.piiRedactor) return text;
+    try {
+      const ctx = { recipientId };
+      return this.piiRedactor.apply(text, this.piiRedactor.detect(text, channel, ctx), channel, ctx, { audit: false }).content;
+    } catch (err) {
+      this.log.warn({ err, channel }, 'outbound-gateway: PII redactor threw building an audit copy — scrubbing it instead');
+      return scrubPii(text);
+    }
   }
 
   /**
@@ -1851,9 +1868,12 @@ export class OutboundGateway {
         // External send already happened — delete this row before the next dispatch.
         await this.outboundQueue.deleteByIds([row.id]);
 
-        const content = row.payload.channel === 'email'
+        const sent = row.payload.channel === 'email'
           ? row.payload.body
           : row.payload.message;
+        // Under band gating a queued row may hold details the review authorized raw; the
+        // audit event never carries them (#2312). Tier rows were redacted before queueing.
+        const content = this.gating === 'band' ? this.redactedCopy(sent, row.payload.channel, row.recipient) : sent;
         if (row.payload.channel === 'signal' && row.payload.recipient) {
           await this.promoteOrCreateRecipientContact('signal', row.payload.recipient);
         } else if (row.payload.channel === 'sms') {

@@ -111,6 +111,30 @@ describe('ApprovalDelivery.deliver', () => {
     expect(request.message).not.toContain('contact-uuid-1');
   });
 
+  it('lists the personal details of a long message the detail block cuts short (#2312)', async () => {
+    const { delivery, send } = makeDelivery({ row: makeRow({ toolName: 'email-send' }) });
+    delivery.registerDisplay('abcd1234', {
+      preamble: 'Held by the send review.',
+      payload: { to: 'dana@example.com', subject: 'Forms', body: `${'x'.repeat(600)} call (415) 555-1234` },
+    });
+
+    await delivery.deliver('abcd1234', 'signal');
+
+    expect(send.mock.calls[0]![0].message).toContain(
+      'Personal details in this message (sent as written if you approve): phone_us (415) 555-1234',
+    );
+  });
+
+  it('lists them from the stored payload when no display was registered (#2312)', async () => {
+    const { delivery, send } = makeDelivery({
+      row: makeRow({ toolName: 'dispatcher-relay', payload: { to: 'dana@example.com', body: `${'x'.repeat(600)} call (415) 555-1234` } }),
+    });
+
+    await delivery.deliver('abcd1234', 'signal');
+
+    expect(send.mock.calls[0]![0].message).toContain('phone_us (415) 555-1234');
+  });
+
   it('emails with a reply-to-answer call to action and no reaction binding', async () => {
     const { delivery, send, repo } = makeDelivery({ sendResult: { success: true } });
 

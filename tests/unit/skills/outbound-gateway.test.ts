@@ -4337,7 +4337,12 @@ describe('band review (#2159)', () => {
     const phoneBody = `Call me on ${phone} tomorrow.`;
     const phoneReq = { channel: 'email' as const, to: 'joel@example.com', subject: 'Forms', body: phoneBody };
 
-    async function makePiiGateway(opts: { review: ReturnType<typeof vi.fn>; gating?: 'band' | 'tier'; withSignal?: boolean }) {
+    async function makePiiGateway(opts: {
+      review: ReturnType<typeof vi.fn>; gating?: 'band' | 'tier'; withSignal?: boolean;
+      principalIdentities?: ReturnType<typeof makePrincipalIdentity>[];
+      outboundQueue?: OutboundQueueRepo; emailReady?: () => boolean;
+      piiRedactor?: PiiRedactor;
+    }) {
       const { PiiRedactor: RealPiiRedactor } = await import('../../../src/dispatch/pii-redactor.js');
       const signalClient = makeSignalClient();
       const gateway = new OutboundGateway({
@@ -4351,13 +4356,16 @@ describe('band review (#2159)', () => {
         contactService: mocks.contactService,
         contentFilter: mocks.contentFilter,
         bus: mocks.bus,
-        principalIdentities: [makePrincipalIdentity('principal@example.com')],
+        principalIdentities: opts.principalIdentities ?? [makePrincipalIdentity('principal@example.com')],
         logger: mocks.logger,
         autonomyService: makeAutonomyService(84),
         actionLogRepo: makeActionLogRepo(),
         gating: opts.gating ?? 'band',
         bandReview: { review: opts.review as unknown as BandSendReview['review'] },
-        piiRedactor: new RealPiiRedactor({
+        ...(opts.outboundQueue
+          ? { outboundQueue: opts.outboundQueue, outboundQueueReadiness: new Map([['email', opts.emailReady ?? (() => false)]]) }
+          : {}),
+        piiRedactor: opts.piiRedactor ?? new RealPiiRedactor({
           config: { enabled: true, default: 'block', channel_policies: { email: { allow: ['email'] }, signal: { allow: [] } } },
           bus: mocks.bus,
           logger: mocks.logger,
@@ -4382,9 +4390,11 @@ describe('band review (#2159)', () => {
       // Nothing was redacted on the wire.
       expect(result.redactions).toBeUndefined();
       expect(result.sentContent).toBeUndefined();
+      // The audit event carries the redacted copy, never the authorized value.
       const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
       expect(delivered).toHaveLength(1);
-      expect(String(delivered[0]!.payload['content'])).toContain(phone);
+      expect(String(delivered[0]!.payload['content'])).toContain('[REDACTED: PHONE_US]');
+      expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
     });
 
     it('gives the content filter a redacted copy', async () => {
@@ -4467,6 +4477,70 @@ describe('band review (#2159)', () => {
         source: 'agent',
       });
       expect(JSON.stringify(reports[0])).not.toContain('555-1234');
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered).toHaveLength(1);
+      expect(String(delivered[0]!.payload['content'])).toBe('Call me on [REDACTED: PHONE_US] tomorrow.');
+    });
+
+    it('tells the principal instead when there is no verified principal email to copy', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us'] } });
+      const { gateway } = await makePiiGateway({ review, principalIdentities: [makePrincipalIdentity('+15555551111', 'signal')] });
+      const result = await gateway.send(phoneReq, { taskEventId: 't1' });
+
+      expect(result.success).toBe(true);
+      expect(sentEmail().cc).toBeUndefined();
+      const reports = publishedOfType(mocks.bus, 'principal.report');
+      expect(reports).toHaveLength(1);
+      expect(reports[0]!.payload).toMatchObject({
+        summary: 'Sent your phone_us to joel@example.com at your trusted contact\'s request.', urgency: 'now', source: 'agent',
+      });
+    });
+
+    it('keeps the added CC on a queued email, and its flushed audit event redacted', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us'] } });
+      let ready = false;
+      const enqueue = vi.fn().mockResolvedValue({ id: 'q-1' });
+      const outboundQueue = {
+        enqueue,
+        listPending: vi.fn().mockImplementation(async () => [{
+          id: 'q-1', channel: 'email', recipient: 'joel@example.com', payload: enqueue.mock.calls[0]![0],
+          enqueuedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
+        }]),
+        deleteByIds: vi.fn().mockResolvedValue(undefined),
+      } as unknown as OutboundQueueRepo;
+      const { gateway } = await makePiiGateway({ review, outboundQueue, emailReady: () => ready });
+
+      const result = await gateway.send(phoneReq, { taskEventId: 't1' });
+      expect(result.queued).toBe(true);
+      const queued = enqueue.mock.calls[0]![0] as { cc?: string[]; body: string };
+      expect(queued.cc).toEqual(['principal@example.com']);
+      expect(queued.body).toContain(phone);
+
+      ready = true;
+      await gateway.flushChannel('email');
+      expect(sentEmail().cc).toEqual([{ email: 'principal@example.com' }]);
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered).toHaveLength(1);
+      expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
+    });
+
+    it('blocks with pii_redactor_error when detection throws', async () => {
+      const review = vi.fn();
+      const piiRedactor = {
+        detect: vi.fn().mockImplementation(() => { throw new Error('pattern engine crashed'); }),
+        apply: vi.fn(),
+        redact: vi.fn(),
+      } as unknown as PiiRedactor;
+      const { gateway } = await makePiiGateway({ review, piiRedactor });
+      const result = await gateway.send(phoneReq, { taskEventId: 't1' });
+
+      expect(result).toMatchObject({ success: false, blockedReason: expect.stringContaining('pii_redactor_error') });
+      expect(review).not.toHaveBeenCalled();
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+      const blocked = publishedOfType(mocks.bus, 'outbound.blocked');
+      expect(blocked).toHaveLength(1);
+      expect(blocked[0]!.payload['reason']).toBe('pii_redactor_error');
+      expect(String(blocked[0]!.payload['content'])).not.toContain('555-1234');
     });
 
     it('redacts a system notification as tier does', async () => {

@@ -12,6 +12,7 @@ import type { ContactService } from '../contacts/contact-service.js';
 import type { Logger } from '../logger.js';
 import { meetsMinimumTier, type ContactTier } from '../contacts/types.js';
 import { sanitizeOutput } from '../skills/sanitize.js';
+import { detectPii } from '../pii/scrubber.js';
 
 // ---------------------------------------------------------------------------
 // Constants — exported for tests
@@ -64,6 +65,18 @@ const SKILL_DETAIL_FIELDS: Array<{ test: (name: string) => boolean; fields: Deta
       { key: 'draft_id', label: 'Draft' },
       // partialPayload at gate time may omit draft_id; merge live send fields below.
       { key: 'to', label: 'To' },
+      { key: 'subject', label: 'Subject' },
+      { key: 'body', label: 'Body' },
+    ],
+  },
+  {
+    // Before the export rule below, which matched email-send and showed no message at all:
+    // an approved email goes out as written, so the principal is shown it (#2312).
+    test: (n) => n === 'email-send',
+    fields: [
+      { key: 'export_items', label: 'Export items' },
+      { key: 'to', label: 'To' },
+      { key: 'cc', label: 'CC' },
       { key: 'subject', label: 'Subject' },
       { key: 'body', label: 'Body' },
     ],
@@ -313,7 +326,42 @@ export function buildApprovalDetails(
     seenLabels.add(label);
   }
 
+  // Outside the caps: an approved send goes out as written (#2312), so every personal detail
+  // in it is listed even when the field above is cut short.
+  const personal = buildPersonalDetailsLine(toolName, payload);
+  if (personal) lines.push(personal);
+
   return lines.join('\n');
+}
+
+/** Send skills whose approval replays the message as written (#2312). */
+function isSendSkill(toolName: string): boolean {
+  return SEND_SKILLS.has(toolName)
+    || toolName.startsWith('signal-') || toolName.startsWith('sms-') || toolName.startsWith('slack-');
+}
+const SEND_SKILLS = new Set(['email-send', 'email-reply', 'send-draft', 'dispatcher-relay']);
+/** The payload fields a sent message's text lives in, in the order they are scanned. */
+const MESSAGE_FIELD_KEYS = ['subject', 'body', 'message', 'html_quote', 'htmlQuote'] as const;
+/** How many personal details the line names before summarizing the rest. */
+export const MAX_PERSONAL_DETAILS_LISTED = 10;
+
+/**
+ * The line listing the personal details a send skill's approval would send (#2312), or null
+ * when there are none. Scans the full, untruncated message fields with the shared scrubber
+ * core. The approval goes only to the principal, so the values are shown.
+ */
+export function buildPersonalDetailsLine(toolName: string, payload: Record<string, unknown>): string | null {
+  if (!isSendSkill(toolName)) return null;
+  const found: string[] = [];
+  for (const key of MESSAGE_FIELD_KEYS) {
+    const text = payload[key];
+    if (typeof text !== 'string' || text.length === 0) continue;
+    for (const match of detectPii(text)) found.push(`${match.label} ${match.matched}`);
+  }
+  if (found.length === 0) return null;
+  const listed = found.slice(0, MAX_PERSONAL_DETAILS_LISTED).join('; ');
+  const more = found.length > MAX_PERSONAL_DETAILS_LISTED ? `; and ${found.length - MAX_PERSONAL_DETAILS_LISTED} more` : '';
+  return sanitizeOutput(`Personal details in this message (sent as written if you approve): ${listed}${more}`);
 }
 
 export interface BuildApprovalNotificationBodyOpts {
