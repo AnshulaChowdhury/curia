@@ -118,6 +118,8 @@ export function parseStoredOriginator(
     initiatedAt: raw['initiatedAt'],
   };
   if (tier !== undefined) result.tier = tier as ContactTier | null;
+  // Absent stays absent, like tier; present, only an exact true counts (#2312).
+  if (raw['authenticated'] !== undefined) result.authenticated = raw['authenticated'] === true;
   return result;
 }
 

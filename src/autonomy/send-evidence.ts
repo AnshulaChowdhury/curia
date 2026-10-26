@@ -48,8 +48,11 @@ type AuthorityTask = NonNullable<SendAuthority['boundTask']>;
 /** No originator and no live turn: what an unreadable turn is authorized by. */
 const NO_AUTHORITY: SendAuthority = { originator: null, liveTurn: false };
 
-const SYSTEM_ROLES: ReadonlySet<string> = new Set<SystemRole>(['principal', 'agent', 'system']);
-const CONTACT_TIERS: ReadonlySet<string> = new Set<ContactTier>(['blocked', 'unknown', 'known', 'trusted', 'principal']);
+// Keyed by the unions, so a value added to or removed from either fails compilation here.
+const SYSTEM_ROLES: ReadonlySet<string> = new Set(Object.keys({ principal: true, agent: true, system: true } satisfies Record<SystemRole, true>));
+const CONTACT_TIERS: ReadonlySet<string> = new Set(Object.keys({
+  blocked: true, unknown: true, known: true, trusted: true, principal: true,
+} satisfies Record<ContactTier, true>));
 
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;

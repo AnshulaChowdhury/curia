@@ -392,6 +392,12 @@ describe('parseStoredOriginator (#1799)', () => {
     expect('tier' in (parsed ?? {})).toBe(false);
   });
 
+  it('carries authenticated, counting only an exact true, and keeps its absence (#2312)', () => {
+    expect(parseStoredOriginator({ ...valid, authenticated: true })?.authenticated).toBe(true);
+    expect(parseStoredOriginator({ ...valid, authenticated: 'true' })?.authenticated).toBe(false);
+    expect('authenticated' in (parseStoredOriginator(valid) ?? {})).toBe(false);
+  });
+
   it('rejects a bag missing required fields rather than fabricating a lineage', () => {
     // A fabricated lineage would hand the woken turn authority the original never had.
     expect(parseStoredOriginator(null)).toBeUndefined();
