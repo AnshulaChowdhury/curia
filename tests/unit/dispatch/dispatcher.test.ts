@@ -2548,9 +2548,11 @@ describe('Dispatcher content-block relay (#1355)', () => {
       const findings = last
         ? lastFindings
         : [{ rule: 'llm-judge-audience-leak', detail: 'named internal agent' }];
+      // The blocked event carries the redacted audit copy (#2312); the approval must still
+      // replay the relay's own text, not the placeholders.
       await bus.publish('dispatch', createOutboundBlocked({
         blockId: `block_${attempt}`, conversationId: 'signal:+14155551234', channelId: 'signal',
-        content: currentOutbound.payload.content, recipientId: '+14155551234',
+        content: last ? '[REDACTED: audit copy]' : currentOutbound.payload.content, recipientId: '+14155551234',
         reason: findings[0]!.rule, findings, parentEventId: currentOutbound.id,
       }));
       if (!last) {

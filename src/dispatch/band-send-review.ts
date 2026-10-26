@@ -256,12 +256,19 @@ export class BandSendReview {
       const unsupported = new Set<string>();
       const askFirst = new Set<string>();
       const inferredBelow80 = new Set<string>();
+      const taskDirectedBelow80 = new Set<string>();
       for (const item of items) {
         // rulesOnEach() guaranteed one ruling per item.
         const r = byId.get(item.id)!;
         if (r.basis === 'directed' && who === 'principal') continue;
         if (r.basis === 'directed' && who === 'trusted') { copy.add(item.label); continue; }
-        if (r.basis === 'inferred' && who === 'principal') {
+        // The principal set the task, but this turn is not theirs: a directed ruling counts
+        // only as inferred, since the principal did not direct this send themselves.
+        if (r.basis === 'directed' && who === 'principal-task') {
+          if (!isSpotCheckOrAbove(input.score)) taskDirectedBelow80.add(item.label);
+          continue;
+        }
+        if (r.basis === 'inferred' && (who === 'principal' || who === 'principal-task')) {
           if (!isSpotCheckOrAbove(input.score)) inferredBelow80.add(item.label);
           continue;
         }
@@ -278,6 +285,9 @@ export class BandSendReview {
       if (inferredBelow80.size > 0) {
         holds.push({ rule: BAND_RULES.pii, detail: `Held for the principal: it shares personal details (${[...inferredBelow80].join(', ')}) that the principal's request needs but did not name, and this band asks first.` });
       }
+      if (taskDirectedBelow80.size > 0) {
+        holds.push({ rule: BAND_RULES.pii, detail: `Held for the principal: it shares personal details (${[...taskDirectedBelow80].join(', ')}) for a task the principal set, not at their request in this conversation, and this band asks first.` });
+      }
       if (askFirst.size > 0) {
         holds.push({ rule: BAND_RULES.pii, detail: `Held for the principal: the recipient asked for personal details (${[...askFirst].join(', ')}) that nothing authorizes sharing yet.` });
       }
@@ -285,7 +295,7 @@ export class BandSendReview {
       this.deps.logger.info(
         {
           conversationId: input.conversationId, channel: input.channel, items: items.length, authority: who,
-          unsupported: [...unsupported], askFirst: [...askFirst], inferredBelow80: [...inferredBelow80], copyPrincipal: [...copy],
+          unsupported: [...unsupported], askFirst: [...askFirst], inferredBelow80: [...inferredBelow80], taskDirectedBelow80: [...taskDirectedBelow80], copyPrincipal: [...copy],
         },
         'band review: disclosure rulings applied',
       );
@@ -340,14 +350,16 @@ export class BandSendReview {
   }
 
   /**
-   * Who directed the work, from trusted state only. The principal: their own turn, or a task
-   * they created (bound or root). A trusted contact: their stamped tier and their tier now are
-   * both trusted, and their message authenticated them. Anything else, or a failed tier read,
-   * is no authority.
+   * Who directed the work, from trusted state only. The principal: their own turn (a live turn,
+   * or a wake they originated). The principal's task: only the bound or root task is theirs,
+   * not the drafting turn, so a directed ruling counts as inferred. A trusted contact: their
+   * stamped tier and their tier now are both trusted, and their message authenticated them.
+   * Anything else, or a failed tier read, is no authority.
    */
-  private async authorityOf(a: SendAuthority | undefined, rulings: readonly DisclosureRuling[]): Promise<'principal' | 'trusted' | 'none'> {
+  private async authorityOf(a: SendAuthority | undefined, rulings: readonly DisclosureRuling[]): Promise<'principal' | 'principal-task' | 'trusted' | 'none'> {
     if (!a) return 'none';
-    if ([a.originator, a.boundTask?.originator, a.rootTask?.originator].some((o) => o?.systemRole === 'principal')) return 'principal';
+    if (a.originator?.systemRole === 'principal') return 'principal';
+    if ([a.boundTask?.originator, a.rootTask?.originator].some((o) => o?.systemRole === 'principal')) return 'principal-task';
     const o = a.originator;
     // Only a directed ruling uses trusted authority, so skip the lookup otherwise.
     if (!o || o.tier !== 'trusted' || o.authenticated !== true || !rulings.some((r) => r.basis === 'directed')) return 'none';

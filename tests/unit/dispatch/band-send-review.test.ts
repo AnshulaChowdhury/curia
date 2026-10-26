@@ -376,6 +376,36 @@ describe('BandSendReview', () => {
       expect((await svc.review(pii)).kind).toBe('send');
     });
 
+    // Narrow authority (#2312): the principal set the task, but the drafting turn is not theirs,
+    // so a directed ruling counts as inferred: sent at 80+, held below.
+    it('treats a directed ruling as inferred when only the bound or root task is the principal\'s', async () => {
+      const bound: SendAuthority = { originator: curia, liveTurn: false, boundTask: { taskId: 't', title: 'x', description: null, originator: principal } };
+      for (const authority of [bound, standing]) {
+        const at84 = make([withRulings(ruling('directed'))], { evidence: { authority } });
+        expect((await at84.svc.review(pii)).kind).toBe('send');
+        const at74 = make([withRulings(ruling('directed'))], { evidence: { authority } });
+        const d = await at74.svc.review({ ...pii, score: 74 });
+        expect(d.kind).toBe('hold');
+        if (d.kind === 'hold') {
+          expect(d.findings.map((f) => f.rule)).toEqual(['pii-not-authorized']);
+          expect(d.reason).toContain('sin_ca');
+          expect(d.reason).toContain('a task the principal set');
+          expect(d.reason).not.toContain(SIN);
+        }
+      }
+    });
+
+    it('keeps a full directed ruling at 74 for a live principal turn or a wake the principal originated', async () => {
+      const wake: SendAuthority = {
+        originator: principal, liveTurn: false,
+        boundTask: { taskId: 't', title: 'x', description: null, originator: curia },
+      };
+      for (const authority of [live, wake]) {
+        const { svc } = make([withRulings(ruling('directed'))], { evidence: { authority } });
+        expect((await svc.review({ ...pii, score: 74 })).kind).toBe('send');
+      }
+    });
+
     it('bounces an item the judge called directed when an outsider originated the work, naming only the label', async () => {
       const { svc } = make([withRulings(ruling('directed'))], { evidence: { authority: fromOutsider } });
       const d = await svc.review(pii);

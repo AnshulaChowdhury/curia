@@ -16,6 +16,18 @@ describe('content-block-relay', () => {
     expect(summary).toContain('account 4417');
   });
 
+  it('shows the PII and placeholder guidance of a band bounce to the rewriting agent (#2312)', () => {
+    const summary = summarizeBlockFindings([
+      { rule: 'pii-not-authorized', detail: 'This message shares personal details nothing authorizes for this recipient: phone number. Rewrite it without them.' },
+      { rule: 'redaction-token', detail: 'This message contains a redaction placeholder. Rewrite it with the real content or without that part.' },
+      { rule: 'secret-pattern', detail: 'matched sk-live-123' },
+    ]);
+    expect(summary).toContain('pii-not-authorized: This message shares personal details nothing authorizes for this recipient: phone number.');
+    expect(summary).toContain('redaction-token: This message contains a redaction placeholder.');
+    // Other Stage-1 rules still show the rule name only.
+    expect(summary).not.toContain('sk-live-123');
+  });
+
   it('treats content-filter findings as rewriteable', () => {
     expect(isContentFilterRewriteable([{ rule: 'llm-judge-audience-leak', detail: 'named internal agent' }])).toBe(true);
   });

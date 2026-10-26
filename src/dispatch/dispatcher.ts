@@ -2304,7 +2304,9 @@ export class Dispatcher {
         channelId: ctx.channelId,
         accountId: ctx.accountId,
         senderId: ctx.senderId,
-        content: event.payload.content,
+        // The relay's own text, as the rewrite task uses: the blocked event carries the
+        // redacted audit copy, and an approval would replay its placeholders (#2312).
+        content: ctx.content,
         tier: ctx.originator?.tier ?? 'unresolved',
         reason: `Curia's reply on ${ctx.channelId} still ${problems.join(' and ')}, and it has no rewrites left.`,
       });
