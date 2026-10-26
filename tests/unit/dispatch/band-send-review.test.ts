@@ -1065,7 +1065,7 @@ describe('BandSendReview', () => {
 
     it('tells the judge only what holds for every recipient: one recipient\'s answer is partial', async () => {
       const OPS = 'ops@acme.example';
-      const PARTIAL = 'The principal answered about sharing phone number for one of the recipients only, on this thread.';
+      const PARTIAL = 'The principal answered about sharing phone number for some of the recipients only, on this thread.';
       // A yes for one of two recipients is not a yes for the send.
       const partial = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('yes')] } });
       await partial.svc.review({ ...send, recipients: [TO, OPS] });

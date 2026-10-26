@@ -256,15 +256,15 @@ describe('Dispatcher outreach link (#2312)', () => {
 
   it('passes the Curia mailbox the converter published as recipientAddress', async () => {
     const h = harness();
+    // participants disagrees with curiaMailbox on purpose: it is ignored, and so is any
+    // address the participants list would suggest.
     await sendEmail(h, {
       metadata: {
         otherRecipientCount: 1,
-        primaryRecipientEmails: ['Dana@Acme.example'],
         curiaMailbox: 'curia+ops@office.example',
         participants: [
           { email: 'Bookings@Acme.example', name: 'Acme Bookings', role: 'from' },
-          { email: 'Dana@Acme.example', name: 'Dana', role: 'to' },
-          { email: 'Curia+ops@Office.example', name: 'Curia', role: 'to' },
+          { email: 'other-box@office.example', name: 'Curia', role: 'to' },
         ],
       },
     });

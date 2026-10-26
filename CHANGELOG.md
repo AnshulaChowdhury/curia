@@ -83,6 +83,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Linked outreach replies** — an email answering Curia's outreach arrives knowing its task, which gets a note. (#2312)
 - **`taskOutreach` capability** — **public API:** new `ToolContext` field for recording task outreach. (#2312)
 - **PII ask memory** — the principal's yes or no on a personal-data ask applies to that thread. (#2312)
+- **Direct PII ask** — the principal is asked directly when someone requests their data. (#2312)
 - **`disclosureDecisions` capability** — **public API:** new `ToolContext` field recording the principal's answer to an ask. (#2312)
 
 ### Changed
@@ -203,6 +204,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Band judge** — no longer flags Curia's own conduct or what it tells the principal. (#2312)
 - **Send recipients** — Curia's own mailbox no longer counts as a recipient when checking sends. (#2312)
 - **Band judge evidence** — reports to the principal count as support. **Public API:** `outbound.message` gains `reportedToPrincipal`. (#2312)
+- **Sender facts** — contact identity and message authentication are stated separately in sender context. (#2312)
 - **Scenario follow-up** — an unpublished second message fails the run, and its own turn is cleaned up. (#2018)
 - **Scenario follow-up** — scoring waits for the injection decision, and a miss still fails the run. (#2018)
 - **Turn injection config** — startup accepts `dispatch.turnInjection` in the config schema. (#2018)

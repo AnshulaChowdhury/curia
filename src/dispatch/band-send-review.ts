@@ -690,7 +690,7 @@ function describeDecisions(decisions: CollectedEvidence['decisions'], recipients
     const what = describePiiLabels([label]);
     return answer
       ? `The principal already said ${answer} to sharing ${what} with this recipient on this thread.`
-      : `The principal answered about sharing ${what} for one of the recipients only, on this thread.`;
+      : `The principal answered about sharing ${what} for some of the recipients only, on this thread.`;
   });
 }
 

@@ -16,7 +16,7 @@ import {
   type EmailMetadata,
 } from '../../src/dispatch/email-metadata.js';
 import { inboundTurnGuidance } from '../../src/dispatch/turn-guidance-triggers.js';
-import { renderSenderLine } from '../../src/agents/prompts/sender-line.js';
+import { renderSenderFacts, renderSenderLine } from '../../src/agents/prompts/sender-line.js';
 import { renderTurnGuidance } from '../../src/agents/prompts/turn-guidance.js';
 import type { SenderContext } from '../../src/contacts/types.js';
 
@@ -118,9 +118,9 @@ export function buildSenderContextBlock(
     displayName: senderCtx.displayName,
     systemRole: senderCtx.systemRole,
     role: senderCtx.role,
-    verified: senderCtx.verified,
   });
   senderInfo += `\nChannel: ${channelId} | Sender identifier: ${senderId}`;
+  senderInfo += `\n${renderSenderFacts({ identityVerified: senderCtx.verified, messageAuthenticated: undefined })}`;
 
   if (cohort === 'external') {
     senderInfo +=
