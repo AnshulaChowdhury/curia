@@ -315,11 +315,21 @@ describe('sin_ca', () => {
   });
 
   it('does not match inside a UUID, a 10-digit number, or an order id', () => {
-    expect(sinMatches('id 130692ab-1306-4925-8444-130692544000')).toHaveLength(0);
+    // A Luhn-valid formatted SIN whose last group runs straight into a UUID's
+    // first group (\b sits between the space and the UUID). Without UUID
+    // shielding, '130 692 544' would match (next char is 'a', not a digit).
+    expect(sinMatches('130 692 544abcde-1234-4678-9abc-def012345678')).toHaveLength(0);
     expect(sinMatches('1306925440')).toHaveLength(0);
     expect(sinMatches('SIN 1306925440')).toHaveLength(0);
     expect(sinMatches('ORD-130-692-5441')).toHaveLength(0);
   });
+
+  it.each(['416-555-1234', '(416) 555-1234', '+1 416 555 1234', '1-800-130-692-544'])(
+    'does not match phone-like string %s',
+    (phone) => {
+      expect(sinMatches(`call ${phone} today`)).toHaveLength(0);
+    },
+  );
 
   it('scrubs with the [SIN] replacement', () => {
     expect(scrubPii('SIN 130 692 544')).toBe('SIN [SIN]');

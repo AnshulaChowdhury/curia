@@ -102,12 +102,13 @@ function isValidSin(matched: string): boolean {
 
 // Canadian SIN. Hand-written (not from openredaction). First digit 1-7 or 9 (0 is
 // unassigned, 8 is not issued). Two shapes, both Luhn-checked by validate:
-//   1. formatted NNN-NNN-NNN / NNN NNN NNN with one consistent separator;
+//   1. formatted NNN-NNN-NNN / NNN NNN NNN with one consistent separator, not
+//      embedded in a longer separator-joined digit run (e.g. 1-800-130-692-544);
 //   2. bare 9 digits, only when a SIN keyword precedes them within 12 non-digit
 //      characters (lookbehind keeps the keyword out of the matched span).
 const SIN_CA_PATTERN: PiiPattern = {
   name: 'sin_ca',
-  regex: /(?<!\d)[1-79]\d{2}([- ])\d{3}\1\d{3}(?!\d)|(?<=\b(?:SIN|social insurance(?: number| no\.?)?)\b[^\d\n]{0,12})[1-79]\d{8}(?!\d)/gi,
+  regex: /(?<!\d[- ]?)[1-79]\d{2}([- ])\d{3}\1\d{3}(?![- ]?\d)|(?<=\b(?:SIN|social insurance(?: number| no\.?)?)\b[^\d\n]{0,12})[1-79]\d{8}(?!\d)/gi,
   replacement: '[SIN]',
   validate: isValidSin,
 };
