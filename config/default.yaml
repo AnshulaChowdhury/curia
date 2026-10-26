@@ -92,7 +92,7 @@ dispatch:
     max_global: 100         # total messages per window across all senders
 
   # Turn lanes + mid-turn injection (#2018, ADR-053).
-  # Off until case 26 is recorded on the release-gate model and judge.
+  # Off until case 26 passes on the release-gate model and judge.
   # enabled: false, or omitting the key, keeps concurrent turns.
   turnInjection:
     enabled: false

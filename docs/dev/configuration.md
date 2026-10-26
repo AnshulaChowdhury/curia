@@ -109,7 +109,7 @@ Controls the conversation checkpoint pipeline and turn lanes.
 dispatch:
   conversationCheckpointDebounceMs: 600000  # Default: 10 minutes
   turnInjection:
-    enabled: false                # Shipped value, until case 26 is recorded on the release-gate model.
+    enabled: false                # Shipped value, until case 26 passes on the release-gate model.
     maxInjectionsPerTurn: 5       # Same-contact follow-ups drained into one turn.
     extraRoundsPerInjection: 2    # Added to that turn's round budget per drained follow-up.
     laneWaitTimeoutMs: 1200000    # 20 minutes, then the waiter runs anyway.
@@ -117,7 +117,7 @@ dispatch:
 
 `conversationCheckpointDebounceMs` is the quiet period before relationship extraction and other memory tasks run. Lower it to extract sooner. Raise it on slow or cost-sensitive deployments to batch more activity first.
 
-`turnInjection` holds one coordinator turn per human-channel conversation and drains a same-contact follow-up into it ([ADR-053](../adr/053-turn-lanes-and-mid-turn-injection.md), [spec 02](../specs/02-agent-system.md)). The shipped config leaves `enabled` false until case 26 is recorded on `deepseek/deepseek-v4.1-flash` with the `openai/gpt-4o` judge. Omitting `enabled`, or setting it to `false`, keeps concurrent turns and skips injection. The other three fields keep the values above when omitted. A waiter that reaches `laneWaitTimeoutMs` logs an error and runs anyway, without taking the lane.
+`turnInjection` holds one coordinator turn per human-channel conversation and drains a same-contact follow-up into it ([ADR-053](../adr/053-turn-lanes-and-mid-turn-injection.md), [spec 02](../specs/02-agent-system.md)). The shipped config leaves `enabled` false until case 26 passes on `deepseek/deepseek-v4.1-flash` with the `openai/gpt-4o` judge. The 2026-10-26 run of that case drained at `round:1` and failed the gate. Omitting `enabled`, or setting it to `false`, keeps concurrent turns and skips injection. The other three fields keep the values above when omitted. A waiter that reaches `laneWaitTimeoutMs` logs an error and runs anyway, without taking the lane.
 
 ---
 

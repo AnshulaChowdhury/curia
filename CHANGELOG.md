@@ -172,6 +172,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Scenario follow-up** — the harness scans inbound text, so a clean follow-up can join. (#2018)
 - **Scenario follow-up** — sends a correction on the first tool call, or at the exit hook. (#2018)
 - **Scenario follow-up** — a turn-start drain fails the run, and the point is recorded. (#2018)
+- **Scenario case 26** — stubs the task writes and email-button shapes the gate run used. (#2018)
 - **Scenario follow-up** — an unpublished second message fails the run, and its own turn is cleaned up. (#2018)
 - **Scenario follow-up** — scoring waits for the injection decision, and a miss still fails the run. (#2018)
 - **Turn injection config** — startup accepts `dispatch.turnInjection` in the config schema. (#2018)

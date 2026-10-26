@@ -459,7 +459,7 @@
     },
     "mid-turn correction switches the sign-in channel": {
       "unstubbed": null,
-      "reason": "Waiting on a standard-tier run with the official judge before it joins the release gate (#2018)."
+      "reason": "The 2026-10-26 gate run failed (critical checks 67%, two refused calls). A fresh standard-tier official-judge run has to pass before it joins the release gate (#2018)."
     },
     "no google file chat": {
       "unstubbed": 0,

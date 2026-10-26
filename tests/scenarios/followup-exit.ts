@@ -7,7 +7,7 @@
 // at `exit` instead of being missed. A tool_use response is not this signal:
 // that follow-up waits until the first tool call is in flight.
 
-import type { BusEvent } from '../../src/bus/events.js';
+import type { BusEvent, InjectionDrainPoint } from '../../src/bus/events.js';
 
 /** True when this llm.call is a text finish, the step immediately before the exit hook. */
 export function isTextFinishCall(event: BusEvent): boolean {
@@ -21,7 +21,7 @@ export function isTextFinishCall(event: BusEvent): boolean {
  * A follow-up drained before the model had chosen. `exit` and `round:N` are
  * the points the harness aims for, so they are not errors.
  */
-export function turnStartDrainError(drainPoint: string): string | undefined {
+export function turnStartDrainError(drainPoint: InjectionDrainPoint): string | undefined {
   if (drainPoint !== 'turn_start') return undefined;
   return 'follow-up drained at turn_start; the correction joined before the model had chosen';
 }

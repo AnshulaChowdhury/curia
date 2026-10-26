@@ -2,7 +2,7 @@
 
 Date: 2026-10-24
 Status: Accepted
-Amended: 2026-10-26 — the shipped flag stays off until case 26 is recorded on the release-gate model and judge (#2018)
+Amended: 2026-10-26 — the shipped flag stays off; the gate-model case 26 run failed (#2018)
 
 ## Context
 
@@ -40,7 +40,7 @@ Alternatives considered and rejected:
 
 8. **Flag.** `dispatch.turnInjection.enabled` defaults to false. Off means no lane method runs and behaviour is unchanged. It is turned on only after the pieces land and the mid-turn scenario has been run. With the flag on, a second message on Signal, Slack, SMS, HTTP, or CLI waits or is injected instead of running beside the first. That is a behaviour change. Email already waited. A second `POST /api/messages` on the same `conversation_id` while the first turn runs is injected; the first HTTP request still resolves as superseded, and the second request carries the single reply.
 
-*Amended 2026-10-26.* The shipped file stays off. Turning it on rests on a recorded run of case 26, `mid-turn correction switches the sign-in channel`: 3 runs, model `deepseek/deepseek-v4.1-flash`, judge `openai/gpt-4o`. That run is not in this change. An absent `enabled` field still resolves to false, and `enabled: false` does the same. With the flag on, email releases the next same-thread message when the dispatcher decides the inbound, so a same-contact follow-up can join the turn still running.
+*Amended 2026-10-26.* The shipped file stays off. Case 26, `mid-turn correction switches the sign-in channel`, was run on commit `a2bc516a`: 3 runs, model `deepseek/deepseek-v4.1-flash`, judge `openai/gpt-4o`, flag on through a `local.yaml` overlay. Every run drained at `round:1`. Spend was $0.06. The gate failed: `reads_the_code_from_the_inbox` and `clicks_email` passed 2 of 3 runs, and the worst run refused 2 calls. That run does not support turning the flag on. An absent `enabled` field still resolves to false, and `enabled: false` does the same. With the flag on, email releases the next same-thread message when the dispatcher decides the inbound, so a same-contact follow-up can join the turn still running.
 
 9. **Delegate wait.** When late delivery is on, a queued follow-up ends the wait early with `in_progress` rather than a timeout. The specialist keeps running. Its result arrives later as its own late-delegation wake, which waits in the lane. No other in-flight tool call is cancelled.
 

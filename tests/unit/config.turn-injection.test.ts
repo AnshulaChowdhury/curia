@@ -1,8 +1,7 @@
 // dispatch.turnInjection (#2018, ADR-053). An absent field stays off. The shipped
-// default.yaml leaves the flag off until case 26 is recorded. A bad block fails
-// at boot: laneWaitTimeoutMs
-// reaches setTimeout, and a zero cap would reject every follow-up while looking
-// configured.
+// default.yaml leaves the flag off until case 26 passes the gate. A bad block fails
+// at boot: laneWaitTimeoutMs reaches setTimeout, and a zero cap would reject every
+// follow-up while looking configured.
 
 import { describe, it, expect, afterAll } from 'vitest';
 import * as fs from 'node:fs';

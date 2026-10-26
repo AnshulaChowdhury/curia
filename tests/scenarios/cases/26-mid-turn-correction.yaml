@@ -5,8 +5,8 @@
 # finishes. Capture matches one conversation to one turn, so a follow-up that is
 # not queued fails the run instead of being scored as a second reply. A drain at
 # turn_start fails the run, and the point is recorded on the result. The shipped
-# config leaves the flag off. This case stays out of the release gate until it has
-# been run on the standard-tier model with the official judge. With the flag off
+# config leaves the flag off. The 2026-10-26 gate run drained at round:1 and failed,
+# so this case stays out until a fresh recording passes. With the flag off
 # the harness errors before publishing. It is not a known_failure: that marker
 # would hide a real miss.
 #
@@ -95,6 +95,14 @@ tool_stubs:
           [g2f0e2] button "Continue"
         verification_suspected: { page_domain: example-benefits.ca, signals: [one-time-code-input] }
     - match: { action: click, selector: "g1f0e2" }
+      return: *emailed
+    - match: { action: click, selector: "Email me the code" }
+      return: *emailed
+    # One click, sent as a batch of one. The choice-page catch-all would
+    # otherwise answer it.
+    - match:
+        actions:
+          - { action: click, selector: "[g1f0e2]" }
       return: *emailed
     - match: { action: click, selector: "[g1f0e1]" }
       return: &texted
@@ -233,6 +241,27 @@ tool_stubs:
         displayTimezone: "{{timezone}}"
     - match: {}
       error: "Verification not found"
+  # The seeded verification is bound to this task. Updating or completing it is
+  # a reasonable side step, so an unstubbed call must not be scored as a miss.
+  task-update:
+    - match: { task_id: 4b7e1c90-2d3f-4a5b-8c6d-7e8f9012ab34 }
+      return:
+        task_id: 4b7e1c90-2d3f-4a5b-8c6d-7e8f9012ab34
+        title: Sign in to example-benefits.ca
+        status: in_progress
+        owner: curia
+        priority: 2
+        tags: []
+        updated_at: "{{at:now}}"
+        displayTimezone: "{{timezone}}"
+  task-complete:
+    - match: { task_id: 4b7e1c90-2d3f-4a5b-8c6d-7e8f9012ab34 }
+      return:
+        task_id: 4b7e1c90-2d3f-4a5b-8c6d-7e8f9012ab34
+        title: Sign in to example-benefits.ca
+        status: done
+        completed_at: "{{at:now}}"
+        displayTimezone: "{{timezone}}"
   memory-store:
     - match: {}
       return: { stored: true, action: created, node_id: 8c1d2e3f-4a5b-4c6d-9e0f-1a2b3c4d5e6f, sensitivity: internal }
@@ -264,13 +293,19 @@ expected_behaviors:
       with: { agent: ceo-inbox }
   - id: clicks_email
     weight: critical
-    description: Clicks "Email me the code", as [g1f0e2] or the bare ref.
+    description: Clicks "Email me the code", as [g1f0e2], the bare ref, the button label, or a one-click batch.
     check:
       any_of:
         - called: web-browser
           with: { action: click, selector: "[g1f0e2]" }
         - called: web-browser
           with: { action: click, selector: "g1f0e2" }
+        - called: web-browser
+          with: { action: click, selector: "Email me the code" }
+        - called: web-browser
+          with:
+            actions:
+              - { action: click, selector: "[g1f0e2]" }
   - id: does_not_click_text
     weight: critical
     description: Does not click "Text me the code" ([g1f0e1]). That click asks the site to text the code.
