@@ -45,6 +45,7 @@ import { CliAdapter } from './channels/cli/cli-adapter.js';
 import { discoverAgentManifests } from './agents/loader.js';
 import type { AgentYamlConfig, AgentDiscovery } from './agents/loader.js';
 import { ModelRouter } from './agents/llm/model-router.js';
+import { smallCapModelSlots, smallCapThinkingViolations, voiceModelSlot } from './agents/llm/small-cap-models.js';
 import { ModelRegistry } from './agents/llm/model-registry.js';
 import { createEstimateCostUsd } from './agents/llm/pricing.js';
 import type { LLMProvider } from './agents/llm/provider.js';
@@ -527,6 +528,14 @@ async function main(): Promise<void> {
   // for unrecognised models track operator routing rather than hardcoding Sonnet.
   const estimateCostUsd = createEstimateCostUsd(modelRegistry, modelRoutingConfig.tiers.standard.model);
   const modelRouter = new ModelRouter(modelRoutingConfig, modelRegistry, logger);
+  // A model that cannot turn thinking off spends the small output caps of the classifier,
+  // judges and drift detector on thinking (#2224). The voice override is checked where
+  // the voice adapter is built.
+  const smallCapViolations = smallCapThinkingViolations(smallCapModelSlots(yamlConfig), modelRegistry);
+  if (smallCapViolations.length > 0) {
+    logger.fatal({ violations: smallCapViolations }, `Model cannot turn thinking off on a small-cap call site — ${smallCapViolations.join(' ')}`);
+    process.exit(1);
+  }
   const providerRegistry = new Map<string, LLMProvider>();
   if (config.anthropicApiKey) {
     providerRegistry.set('anthropic', new AnthropicProvider(config.anthropicApiKey, logger, modelRegistry));
@@ -2087,6 +2096,16 @@ async function main(): Promise<void> {
     // Capability check runs BEFORE resolveProviderForModel so an unknown voice
     // override warns and disables voice instead of process.exit(1) (#1553 review).
     const voiceModel = config.voiceModel ?? modelRouter.resolve('fast').model;
+    // The override's small-cap check lives here, not with the early one, so it stops boot
+    // only when the voice adapter will actually start (#2224). Without an override, voice
+    // runs on the fast tier, which the early check covers.
+    if (config.voiceModel) {
+      const voiceViolations = smallCapThinkingViolations([voiceModelSlot(config.voiceModel)], modelRegistry);
+      if (voiceViolations.length > 0) {
+        logger.fatal({ violations: voiceViolations }, `Model cannot turn thinking off on a small-cap call site — ${voiceViolations.join(' ')}`);
+        process.exit(1);
+      }
+    }
     const voiceCaps = evaluateVoiceModelCapabilities(
       voiceModel,
       modelRegistry.getModel(voiceModel)?.capabilities,
@@ -2223,8 +2242,9 @@ async function main(): Promise<void> {
   // Build the drift detector if enabled in config. Requires the LLM provider
   // (already created above). If enabled but no provider is available, the config
   // is still valid — drift checks will simply never trigger.
-  // The 'standard' tier is used for drift checks — they're concise JSON judgments
-  // that don't need the full flagship model.
+  // The 'fast' tier is used for drift checks — they're concise JSON judgments at 200
+  // tokens, and boot keeps fast on a model that can turn thinking off (#2224). On the
+  // standard tier a reasoning model returned no verdict, which reads as no drift.
   let driftDetector: DriftDetector | undefined;
   if (yamlConfig.intentDrift?.enabled !== false) {
     // Resolve effective drift config with defaults.
@@ -2232,9 +2252,9 @@ async function main(): Promise<void> {
       enabled: yamlConfig.intentDrift?.enabled ?? true,
       checkEveryNBursts: yamlConfig.intentDrift?.checkEveryNBursts ?? 1,
       minConfidenceToPause: yamlConfig.intentDrift?.minConfidenceToPause ?? 'high',
-      model: modelRouter.resolve('standard').model,
+      model: modelRouter.resolve('fast').model,
     };
-    // Resolve the provider from the registry so remapping 'standard' to an
+    // Resolve the provider from the registry so remapping 'fast' to an
     // OpenRouter model routes drift checks through OpenRouterProvider. (#646)
     const driftProvider = new TelemetryLlmProvider(resolveProviderForModel(driftConfig.model, 'DriftDetector'), bus, logger, 'drift-detector', modelRegistry);
     driftDetector = new DriftDetector(driftProvider, driftConfig, logger);
@@ -2563,21 +2583,6 @@ async function main(): Promise<void> {
         + 'Set the corresponding API key or remap the tier to a model with a registered provider.',
       );
       process.exit(1);
-    }
-  }
-  // infraLlm asks for no reasoning on every call, but a provider drops that request (at debug)
-  // for a model that can't turn reasoning off, and the call then reasons by default. On the fast
-  // tier that empties 10-token classify calls and burns judge budgets (#2191). Warn, not fatal:
-  // a reasoning fast tier can be deliberate. Standard is skipped; prod's standard model is a
-  // reasoning model by design.
-  {
-    const fastModel = modelRouter.resolve('fast').model;
-    const reasons = modelRegistry.reasoningSupport(fastModel) !== undefined || modelRegistry.thinksByDefault(fastModel);
-    if (reasons && !modelRegistry.honorsReasoningEffort(fastModel, 'none')) {
-      logger.warn(
-        { tier: 'fast', model: fastModel, supported: modelRegistry.reasoningSupport(fastModel)?.efforts ?? [] },
-        `Infra tier 'fast' maps to '${fastModel}', which cannot turn reasoning off — infraLlm classify/extract calls on it will reason and may spend their output budget thinking`,
-      );
     }
   }
   const infraLlmRouter = new LLMProviderRouter(modelRegistry, providerRegistry);
