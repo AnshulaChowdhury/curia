@@ -173,4 +173,76 @@ describe('PiiRedactor', () => {
     expect(result.content).toContain('[REDACTED:');
     expect(result.content).not.toContain('user@example.com');
   });
+
+  describe('detect()', () => {
+    const text = 'Mail user@example.com, card 4111 1111 1111 1111.';
+
+    it('returns only non-allowed items with offsets (email allowed on email)', () => {
+      const items = redactor.detect(text, 'email');
+      expect(items).toHaveLength(1);
+      const item = items[0]!;
+      expect(item.label.toLowerCase()).toBe('credit_card');
+      expect(text.slice(item.start, item.end)).toBe(item.matched);
+      expect(item.matched).toContain('4111');
+    });
+
+    it('returns every item on a channel that allows nothing', () => {
+      const items = redactor.detect(text, 'signal');
+      expect(items.map((i) => i.label.toLowerCase())).toEqual(['email', 'credit_card']);
+    });
+
+    it('returns [] when disabled', () => {
+      const disabled = new PiiRedactor({
+        config: { ...defaultConfig, enabled: false },
+        bus,
+        logger,
+        extraPatterns: [],
+      });
+      expect(disabled.detect(text, 'signal')).toEqual([]);
+    });
+
+    it('returns [] when the principal is the sole recipient', () => {
+      expect(redactor.detect(text, 'signal', { principalIsSoleRecipient: true })).toEqual([]);
+    });
+
+    it('does not publish anything', () => {
+      redactor.detect(text, 'signal');
+      expect(mockBusPublish).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('apply()', () => {
+    const text = 'Mail user@example.com, card 4111 1111 1111 1111.';
+
+    it('returns content unchanged and publishes nothing for an empty item list', () => {
+      const result = redactor.apply(text, [], 'signal');
+      expect(result).toEqual({ content: text, redactions: [] });
+      expect(mockBusPublish).not.toHaveBeenCalled();
+    });
+
+    it('redacts only the items passed in', () => {
+      const items = redactor.detect(text, 'signal');
+      const card = items.filter((i) => i.label.toLowerCase() === 'credit_card');
+      const result = redactor.apply(text, card, 'signal');
+      expect(result.content).toContain('user@example.com');
+      expect(result.content).toContain('[REDACTED: CREDIT_CARD]');
+      expect(result.redactions).toHaveLength(1);
+      expect(mockBusPublish).toHaveBeenCalledTimes(1);
+    });
+
+    it('builds the redacted copy without publishing when audit is false', () => {
+      const items = redactor.detect(text, 'signal');
+      const result = redactor.apply(text, items, 'signal', {}, { audit: false });
+      expect(result.content).not.toContain('user@example.com');
+      expect(result.content).not.toContain('4111');
+      expect(result.redactions).toHaveLength(2);
+      expect(mockBusPublish).not.toHaveBeenCalled();
+    });
+
+    it('matches redact() output for detect() items', async () => {
+      const viaRedact = await redactor.redact(text, 'signal');
+      const viaSplit = redactor.apply(text, redactor.detect(text, 'signal'), 'signal');
+      expect(viaSplit).toEqual(viaRedact);
+    });
+  });
 });
