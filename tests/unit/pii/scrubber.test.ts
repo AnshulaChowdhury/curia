@@ -256,3 +256,72 @@ describe('detectPii', () => {
     expect(matches.some(m => m.label === 'extra_0')).toBe(true);
   });
 });
+
+describe('sin_ca', () => {
+  // Luhn check digit for an 8-digit prefix, so fixtures with a chosen leading
+  // digit are valid by construction. Fixed fixtures: 130 692 544 is Luhn-valid
+  // (sum 40); 130 692 545 is not; 046 454 286 is valid but leads with 0.
+  function withLuhnCheckDigit(prefix8: string): string {
+    let sum = 0;
+    for (let i = 0; i < prefix8.length; i++) {
+      let d = Number(prefix8[i]);
+      // Check digit sits in position 9 (odd), so prefix positions 2,4,6,8 double.
+      if (i % 2 === 1) {
+        d *= 2;
+        if (d > 9) d -= 9;
+      }
+      sum += d;
+    }
+    return prefix8 + String((10 - (sum % 10)) % 10);
+  }
+  const sinMatches = (text: string) => detectPii(text).filter((m) => m.label === 'sin_ca');
+
+  it('rejects a Luhn-valid number that starts with 0', () => {
+    expect(sinMatches('My SIN is 046 454 286')).toHaveLength(0);
+  });
+
+  it.each(['130 692 544', '130-692-544'])('matches formatted SIN %s without a keyword', (sin) => {
+    const found = sinMatches(`number ${sin} here`);
+    expect(found).toHaveLength(1);
+    expect(found[0]!.matched).toBe(sin);
+  });
+
+  it.each(['SIN: 130692544', 'social insurance number 130692544', 'Social Insurance No. 130692544'])(
+    'matches bare digits after keyword in %s, excluding the keyword from the span',
+    (text) => {
+      const found = sinMatches(text);
+      expect(found).toHaveLength(1);
+      expect(found[0]!.matched).toBe('130692544');
+    },
+  );
+
+  it('does not match bare 9 digits without a keyword', () => {
+    expect(sinMatches('130692544')).toHaveLength(0);
+  });
+
+  it('rejects a Luhn-invalid number', () => {
+    expect(sinMatches('130 692 545')).toHaveLength(0);
+  });
+
+  it('rejects Luhn-valid numbers starting with 0 or 8', () => {
+    const lead8 = withLuhnCheckDigit('83069254');
+    const lead0 = withLuhnCheckDigit('03069254');
+    expect(sinMatches(`SIN ${lead8}`)).toHaveLength(0);
+    expect(sinMatches(`SIN ${lead0}`)).toHaveLength(0);
+  });
+
+  it('rejects mixed separators', () => {
+    expect(sinMatches('130-692 544')).toHaveLength(0);
+  });
+
+  it('does not match inside a UUID, a 10-digit number, or an order id', () => {
+    expect(sinMatches('id 130692ab-1306-4925-8444-130692544000')).toHaveLength(0);
+    expect(sinMatches('1306925440')).toHaveLength(0);
+    expect(sinMatches('SIN 1306925440')).toHaveLength(0);
+    expect(sinMatches('ORD-130-692-5441')).toHaveLength(0);
+  });
+
+  it('scrubs with the [SIN] replacement', () => {
+    expect(scrubPii('SIN 130 692 544')).toBe('SIN [SIN]');
+  });
+});

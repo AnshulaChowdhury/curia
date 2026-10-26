@@ -22,6 +22,11 @@ export interface PiiPattern {
   regex: RegExp;
   /** Replacement string, e.g. "[EMAIL]". */
   replacement: string;
+  /**
+   * Optional post-match check. detectPii() drops a match when this returns
+   * false (e.g. a checksum failure), so structural regexes can stay loose.
+   */
+  validate?: (matched: string) => boolean;
 }
 
 /** A single PII match found by detectPii(). */
@@ -79,6 +84,34 @@ function extractPattern(typeName: string): RegExp | null {
   }
 }
 
+/** Luhn checksum over the digits of `matched`; requires exactly 9 digits (SIN). */
+function isValidSin(matched: string): boolean {
+  const digits = matched.replace(/\D/g, '');
+  if (digits.length !== 9) return false;
+  let sum = 0;
+  for (let i = 0; i < 9; i++) {
+    let d = Number(digits[i]);
+    if (i % 2 === 1) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+  }
+  return sum % 10 === 0;
+}
+
+// Canadian SIN. Hand-written (not from openredaction). First digit 1-7 or 9 (0 is
+// unassigned, 8 is not issued). Two shapes, both Luhn-checked by validate:
+//   1. formatted NNN-NNN-NNN / NNN NNN NNN with one consistent separator;
+//   2. bare 9 digits, only when a SIN keyword precedes them within 12 non-digit
+//      characters (lookbehind keeps the keyword out of the matched span).
+const SIN_CA_PATTERN: PiiPattern = {
+  name: 'sin_ca',
+  regex: /(?<!\d)[1-79]\d{2}([- ])\d{3}\1\d{3}(?!\d)|(?<=\b(?:SIN|social insurance(?: number| no\.?)?)\b[^\d\n]{0,12})[1-79]\d{8}(?!\d)/gi,
+  replacement: '[SIN]',
+  validate: isValidSin,
+};
+
 /**
  * Built-in PII patterns sourced from openredaction.
  *
@@ -90,8 +123,10 @@ function extractPattern(typeName: string): RegExp | null {
  *   - PHONE_UK: the openredaction v1.1 regex makes the +44/0 prefix optional,
  *     matching arbitrary 9-12 digit sequences (order IDs, reference numbers).
  *     PHONE_UK_MOBILE (requires 7xxx prefix) is specific enough for UK coverage.
- *   - CANADIAN_SIN: `\d{3}[-\s]?\d{3}[-\s]?\d{3}` matches too many 9-digit
- *     sequences in application data (order IDs, reference numbers, etc.)
+ *   - CANADIAN_SIN (the library's): `\d{3}[-\s]?\d{3}[-\s]?\d{3}` matches too many
+ *     9-digit sequences in application data (order IDs, reference numbers, etc.).
+ *     A hand-written `sin_ca` pattern is included instead, guarded by a Luhn
+ *     checksum plus a format/keyword requirement (see SIN_CA_PATTERN).
  *   - ADDRESS_*: high false-positive rate in log strings
  *   - NAME: extremely high false-positive rate
  *
@@ -124,6 +159,7 @@ function buildBuiltInPatterns(): PiiPattern[] {
       missingPatternTypes.push(typeName);
     }
   }
+  result.push(SIN_CA_PATTERN);
   return result;
 }
 
@@ -179,13 +215,14 @@ export function detectPii(text: string, extraPatterns: PiiPattern[] = []): PiiMa
   const overlapsExisting = (start: number, end: number): boolean =>
     matches.some((m) => start < m.end && end > m.start);
 
-  for (const { name, regex } of allPatterns) {
+  for (const { name, regex, validate } of allPatterns) {
     // Reset lastIndex — global regexes retain state across calls if reused.
     regex.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = regex.exec(shielded)) !== null) {
       // Skip any match that covers shielded UUID territory.
       if (m[0].includes('\x00')) continue;
+      if (validate && !validate(m[0])) continue;
       const start = m.index;
       const end = m.index + m[0].length;
       // Skip if this span overlaps an already-accepted match.
