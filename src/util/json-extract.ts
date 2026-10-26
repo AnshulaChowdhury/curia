@@ -1,10 +1,19 @@
 // src/util/json-extract.ts
 //
 // Pulling a JSON object out of a model reply: strip a ```json fence, then take the first
-// balanced object. Shared by the escalation judge, the judge brief and outreach matching.
+// balanced object. Shared by the escalation judge, the judge brief and outreach matching,
+// which with the dispatcher's outreach-link block also shares encodeUntrustedJson.
 //
 // Intentionally not shared with src/dispatch/outbound-judge.ts, which keeps its own copy:
 // that security boundary stays independent so a change here cannot silently weaken it.
+
+/**
+ * JSON-encode untrusted text for a prompt or a context block: quotes and newlines are
+ * escaped, and angle brackets too, so the text cannot close a sentinel tag or add lines.
+ */
+export function encodeUntrustedJson(value: unknown): string {
+  return JSON.stringify(value).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+}
 
 export function stripCodeFence(raw: string): string {
   const trimmed = raw.trim();

@@ -39,13 +39,14 @@ function makeRepo() {
   return { repo: { record } as unknown as TaskOutreachRepo, record };
 }
 
-function makeService(opts: { title?: string | null } = {}) {
+function makeService(opts: { title?: string | null; nonOrgDomains?: ReadonlySet<string> } = {}) {
   const { repo, record } = makeRepo();
   const lookupTask = vi.fn(async (id: string) => (opts.title === null ? null : { title: opts.title ?? 'Book physio', rootTaskId: id === TASK_ID ? ROOT_ID : null }));
   const service = new TaskOutreachService(repo, {
     principalIdentities: [identity('email', 'Joe@Example.com'), identity('sms', '+14165550100')],
     selfEmails: ['curia@office.example'],
     lookupTask,
+    ...(opts.nonOrgDomains ? { nonOrgDomains: opts.nonOrgDomains } : {}),
     log,
   });
   return { service, record, lookupTask };
@@ -102,6 +103,15 @@ describe('TaskOutreachService.recordForTurn', () => {
       { via: 'web_form', summary: 'Web form submitted', useTaskTitle: true },
     );
     expect(record).toHaveBeenCalledWith(expect.objectContaining({ summary: 'Web form submitted', rootTaskId: null }));
+  });
+
+  it("never stores the principal's own org domain on a row", async () => {
+    const { service, record } = makeService({ nonOrgDomains: new Set(['office.example']) });
+    await service.recordForTurn(
+      { taskMetadata: { originator: principalOriginator, boundTask: { taskId: TASK_ID } }, conversationId: 'c' },
+      { via: 'email', summary: 'Asked', domains: ['office.example', 'Acme.example'] },
+    );
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({ domains: ['Acme.example'] }));
   });
 
   it('returns null and writes nothing off-task', async () => {

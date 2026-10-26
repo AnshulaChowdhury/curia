@@ -13,7 +13,7 @@ import type { InfraLlm } from '../skills/infra-llm.js';
 import type { TaskOutreachRepo, TaskOutreachRow } from './task-outreach.js';
 import { isNonOrgDomain } from '../contacts/non-org-domains.js';
 import { registrableDomain } from '../verification/domain.js';
-import { extractFirstJsonObject, stripCodeFence } from '../util/json-extract.js';
+import { encodeUntrustedJson as encode, extractFirstJsonObject, stripCodeFence } from '../util/json-extract.js';
 
 export type OutreachLinkKind = 'address' | 'contact' | 'org-domain' | 'inferred';
 
@@ -57,11 +57,6 @@ const MODEL_BODY_CHARS = 1500;
 
 function errorName(err: unknown): string {
   return err instanceof Error ? err.name : typeof err;
-}
-
-/** JSON-encode untrusted text so embedded angle brackets cannot close its sentinel tag. */
-function encode(value: unknown): string {
-  return JSON.stringify(value).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
 }
 
 export class OutreachMatcher {

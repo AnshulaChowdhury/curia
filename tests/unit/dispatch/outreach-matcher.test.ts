@@ -4,6 +4,7 @@
 // link is (#2312). Strong needs a direct match, an authenticated sender, and a confirmed
 // row; everything else is weak, and only a strong link learns the sender onto the row.
 
+import { principalOrgDomainSet } from '../../../src/contacts/non-org-domains.js';
 import { describe, it, expect, vi } from 'vitest';
 import pino from 'pino';
 import { OutreachMatcher } from '../../../src/dispatch/outreach-matcher.js';
@@ -225,6 +226,14 @@ describe('OutreachMatcher — shared tenant and private-suffix hosts', () => {
   it('a domain only in the injected non-org set is skipped', async () => {
     const { matcher, findOpenByDomain } = makeMatcher({
       rows: { byDomain: { 'acme.example': [row()] } }, nonOrgDomains: new Set(['acme.example']),
+    });
+    expect(await matcher.match(baseMsg)).toBeNull();
+    expect(findOpenByDomain).not.toHaveBeenCalled();
+  });
+
+  it("the principal's own org domain, as configured, never links by domain", async () => {
+    const { matcher, findOpenByDomain } = makeMatcher({
+      rows: { byDomain: { 'acme.example': [row()] } }, nonOrgDomains: principalOrgDomainSet([' Acme.Example. ']),
     });
     expect(await matcher.match(baseMsg)).toBeNull();
     expect(findOpenByDomain).not.toHaveBeenCalled();

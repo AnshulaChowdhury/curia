@@ -146,6 +146,7 @@ import { ActionLogRepo } from './autonomy/action-log-repo.js';
 import { TaskRepo } from './db/task-repo.js';
 import { TaskOutreachRepo } from './dispatch/task-outreach.js';
 import { OutreachMatcher } from './dispatch/outreach-matcher.js';
+import { principalOrgDomainSet } from './contacts/non-org-domains.js';
 import { TaskOutreachService, taskLookupFrom } from './dispatch/task-outreach-capability.js';
 import { WorkingDocsRepo } from './db/working-docs-repo.js';
 import { ApprovalTriggerService } from './autonomy/approval-trigger.js';
@@ -1663,12 +1664,15 @@ async function main(): Promise<void> {
   const workingDocsRepo = new WorkingDocsRepo(pool, logger);
   // Who Curia contacted for a task (#2312): tools write it, and a task's rows close when it ends.
   const taskOutreachRepo = new TaskOutreachRepo(pool);
+  // The principal's own company is never an outreach org domain, on either side (#2312).
+  const outreachNonOrgDomains = principalOrgDomainSet(yamlConfig.security?.principal_org_domains ?? []);
   const taskRepo = new TaskRepo(pool, bus, logger, config.timezone, workingDocsRepo, taskOutreachRepo);
   const taskOutreach = new TaskOutreachService(taskOutreachRepo, {
     principalIdentities,
     selfEmails: resolvedEmailAccounts.map(a => a.selfEmail),
     selfPhones: [config.signalPhoneNumber, config.smsFromNumber].filter((n): n is string => typeof n === 'string' && n !== ''),
     lookupTask: taskLookupFrom(taskRepo),
+    nonOrgDomains: outreachNonOrgDomains,
     log: logger,
   });
 
@@ -3110,13 +3114,13 @@ async function main(): Promise<void> {
     turnLanes,
     // A non-principal email that replies to Curia's outreach arrives linked to its task
     // (#2312). Webmail, form, tenant and private-suffix hosts are excluded by
-    // isNonOrgDomain inside the matcher; this set is for additions, and there are none yet.
+    // isNonOrgDomain inside the matcher; this set adds the principal's own domains.
     outreachMatcher: new OutreachMatcher({
       repo: taskOutreachRepo,
       // One scope for the process: the matcher's model check runs outside any skill call.
       infraLlm: infraLlmService.scoped({ toolName: 'outreach-matcher' }),
       logger,
-      nonOrgDomains: new Set<string>(),
+      nonOrgDomains: outreachNonOrgDomains,
       taskStatus: (id) => taskRepo.getTask(id).then((t) => t?.status ?? null),
     }),
     taskProgress: taskRepo,

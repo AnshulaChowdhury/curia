@@ -59,3 +59,13 @@ export function isNonOrgDomain(domain: string): boolean {
   return [PERSONAL_EMAIL_DOMAINS, FORM_HOST_DOMAINS, SHARED_TENANT_DOMAINS]
     .some((set) => set.has(base) || set.has(host));
 }
+
+/**
+ * `security.principal_org_domains` as a lookup set, normalized as the principal-acquaintance
+ * check normalizes it (trimmed, lowercased, no trailing dot). The principal's own company
+ * is never an outreach org domain: one colleague's address on a row would otherwise link
+ * every unrelated mail from that company to the task (#2312).
+ */
+export function principalOrgDomainSet(domains: readonly string[]): ReadonlySet<string> {
+  return new Set(domains.map((d) => d.trim().toLowerCase().replace(/\.$/, '')).filter((d) => d !== ''));
+}

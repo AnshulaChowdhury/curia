@@ -4,7 +4,7 @@
 // shared form hosts, shared tenant hosts, and anything under a private public suffix.
 
 import { describe, it, expect } from 'vitest';
-import { isNonOrgDomain } from '../../../src/contacts/non-org-domains.js';
+import { isNonOrgDomain, principalOrgDomainSet } from '../../../src/contacts/non-org-domains.js';
 import { orgDomainsOf } from '../../../src/dispatch/task-outreach-capability.js';
 
 describe('isNonOrgDomain', () => {
@@ -30,5 +30,12 @@ describe('orgDomainsOf', () => {
     expect(orgDomainsOf([
       'owner@acme.onmicrosoft.com', 'jo@gmail.com', 'site@acme.github.io', 'bookings@mail.acme.example', '+14165550100',
     ])).toEqual(['acme.example']);
+  });
+
+  it("drops the principal's own domains, by registrable domain or full host", () => {
+    const own = principalOrgDomainSet([' Office.Example. ', 'mail.corp.example', '']);
+    expect([...own]).toEqual(['office.example', 'mail.corp.example']);
+    expect(orgDomainsOf(['a@office.example', 'b@team.office.example', 'c@mail.corp.example', 'd@acme.example'], own))
+      .toEqual(['acme.example']);
   });
 });
