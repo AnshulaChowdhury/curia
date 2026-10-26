@@ -101,7 +101,8 @@ export class ExtractFactsHandler implements ToolHandler {
       }
 
       // -- Step 2: Extraction prompt --
-      // Standard-tier call with the full vocabulary. Returns JSON array of facts.
+      // Fast-tier call with the full vocabulary. Returns JSON array of facts. 1000 tokens
+      // leaves no room for thinking, so it runs where boot guarantees thinking can be off (#2224).
       const extractionResult = await ctx.infraLlm.extract(
         `Extract single-entity attribute facts from the text below. Return a JSON array of fact objects.
 
@@ -126,7 +127,7 @@ Format:
 
 Text:
 ${text}`,
-        { maxTokens: 1000 },
+        { maxTokens: 1000, tier: 'fast' },
       );
 
       if (!extractionResult.ok) {

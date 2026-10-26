@@ -143,7 +143,8 @@ export class ScanGrantRecommendationsHandler implements ToolHandler {
         continue;
       }
 
-      // Ask the LLM judge
+      // Ask the LLM judge. Fast tier, like the ceo-inbox shadow judge: a standard model that
+      // thinks can reason through the whole budget and return no verdict (#2191, #2224).
       let judgeResult: Awaited<ReturnType<typeof ctx.infraLlm.extract>>;
       try {
         judgeResult = await ctx.infraLlm.extract(
@@ -155,6 +156,7 @@ export class ScanGrantRecommendationsHandler implements ToolHandler {
             contact.inboundMessageCount,
             contact.outboundMessageCount,
           )}`,
+          { tier: 'fast' },
         );
       } catch (err) {
         ctx.log.warn({ err, contactId: contact.id }, 'scan-grant-recommendations: judge transport error, skipping contact');

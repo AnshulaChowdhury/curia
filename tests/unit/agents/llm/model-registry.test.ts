@@ -311,6 +311,32 @@ describe('ModelRegistry', () => {
     });
   });
 
+  describe('canTurnThinkingOff (#2224)', () => {
+    it.each([
+      // Lists `none`.
+      ['claude-haiku-5-5', true],
+      ['claude-sonnet-5-5', true],
+      // Thinks by default and lists no `none`.
+      ['claude-opus-5-5', false],
+      ['deepseek/deepseek-v4.1-flash', false],
+      // No `none`, but recorded as not thinking by default.
+      ['google/gemini-3.1-flash-lite', true],
+      ['openai/gpt-4o', true],
+      ['global.anthropic.claude-sonnet-4-6', true],
+      // No sign of reasoning at all.
+      ['claude-haiku-4-5', true],
+      // Reasoning models with no measurement: unset is not safe.
+      ['deepseek/deepseek-v4-pro', false],
+      ['deepseek/deepseek-v4-pro-0813', false],
+      ['z-ai/glm-5.3-flash', false],
+      ['qwen/qwen3.8-flash', false],
+      // Nothing to go on.
+      ['no-such-model', false],
+    ])('%s → %s', (model, expected) => {
+      expect(registry.canTurnThinkingOff(model)).toBe(expected);
+    });
+  });
+
   describe('Embedding models', () => {
     it('text-embedding-3-small is registered with provider openai', () => {
       const meta = registry.getModel('text-embedding-3-small');

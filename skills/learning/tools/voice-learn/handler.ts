@@ -145,8 +145,11 @@ export class VoiceLearnHandler implements ToolHandler {
         return (Number.isFinite(ta) ? ta : -Infinity) - (Number.isFinite(tb) ? tb : -Infinity);
       })
       .slice(0, MAX_PAIRS);
+    // Fast tier: on a model that thinks, 1200 tokens can go to thinking and come back as an
+    // empty guide (#2224).
     const res = await ctx.infraLlm.extract(buildVoiceGuidePrompt(currentGuide, batch), {
       maxTokens: 1200,
+      tier: 'fast',
     });
     if (!res.ok) {
       ctx.log.warn({ error: res.error }, 'voice-learn: LLM failed — no proposal this run');
