@@ -14,7 +14,7 @@ import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skill
 import { RESOLVED_BY } from '../../../../src/autonomy/action-log-types.js';
 import type { NylasMessage } from '../../../../src/channels/email/nylas-client.js';
 import { createHumanDecision } from '../../../../src/bus/events.js';
-import { isPrincipalOriginated } from '../../../../src/contacts/principal.js';
+import { isLivePrincipalTurn, isPrincipalOriginated } from '../../../../src/contacts/principal.js';
 import { isPrincipalDirectedSend } from '../../../../src/skills/_shared/principal-directed.js';
 import { hasTransientErrorSignal } from '../../../../src/skills/outbound-gateway.js';
 import type { TaskOriginator } from '../../../../src/contacts/types.js';
@@ -222,8 +222,17 @@ export class SendDraftHandler implements ToolHandler {
           const updated = await ctx.actionLogRepo.resolveById(row.id, 'approved', RESOLVED_BY.coordinator);
           if (updated && row.disclosureAsk) {
             // A personal-data ask (#2312): sending the draft is the principal's yes, as
-            // approve-action records it. The recorder never throws.
-            if (ctx.disclosureDecisions) {
+            // approve-action records it, but only from a live principal turn whose approval
+            // was delivered (the principal saw its details). A yes authorizes the label on the
+            // whole thread, and principal lineage alone also passes a woken task. Otherwise the
+            // send stands and nothing is remembered. The recorder never throws.
+            const live = isLivePrincipalTurn(ctx.liveTurn, ctx.taskMetadata);
+            if (!live || row.notificationSentAt === null) {
+              ctx.log.info(
+                { rowId: row.id, liveTurn: live, delivered: row.notificationSentAt !== null },
+                'send-draft: not recording the principal\'s yes — not a live principal turn, or the approval was never shown',
+              );
+            } else if (ctx.disclosureDecisions) {
               await ctx.disclosureDecisions.recordForApproval(row, 'yes', 'principal_via_coordinator');
             } else {
               ctx.log.error({ rowId: row.id }, 'send-draft: disclosureDecisions not wired — the principal\'s yes is not remembered for the thread');

@@ -726,14 +726,18 @@ const TASK_TITLE_MAX = 80;
 /**
  * The task an ask is for, named only when the principal's authority comes from it (#2312): a
  * strong link covering the recipients to the principal's task names that task (or its root),
- * otherwise the principal's bound or root task names the bound or root task. Undefined for any
+ * otherwise the bound task names itself when the principal set it, else the root. Undefined for any
  * other ask, or when none has a title. It is quoted in the principal's question, so it is made
  * one line, its double quotes become single ones, and it is cut to 80 characters with an ellipsis.
  */
 function askTaskTitle(a: SendAuthority | undefined, who: Authority, linkCovers: boolean): string | undefined {
   if (who !== 'principal-task') return undefined;
   const viaLink = linkCovers && a?.linkedTask?.strength === 'strong' && linkToPrincipalTask(a);
-  const raw = viaLink ? a?.linkedTask?.title ?? a?.linkedTask?.root?.title : a?.boundTask?.title ?? a?.rootTask?.title;
+  // The task that carries the principal's authority: the bound task when the principal set
+  // it, otherwise the root.
+  const raw = viaLink
+    ? a?.linkedTask?.title ?? a?.linkedTask?.root?.title
+    : a?.boundTask?.originator?.systemRole === 'principal' ? a.boundTask.title : a?.rootTask?.title;
   const title = raw?.replace(/\s+/g, ' ').replace(/"/g, '\'').trim();
   if (!title) return undefined;
   return title.length > TASK_TITLE_MAX ? `${title.slice(0, TASK_TITLE_MAX - 1).trimEnd()}…` : title;

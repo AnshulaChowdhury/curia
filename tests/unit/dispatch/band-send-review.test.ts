@@ -910,9 +910,14 @@ describe('BandSendReview', () => {
           const d = await svc.review({ ...pii, score: 74 });
           expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'], requester: 'joel@example.com', taskTitle: 'Book physio' } });
         }
-        const bound = make([withRulings(ruling('inferred', true))], { evidence: { authority: standing } });
-        const d = await bound.svc.review({ ...pii, score: 74, recipientTier: 'known' });
-        expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'], taskTitle: 'Book the call' } });
+        // The principal set the root, not the bound child: the root carries the authority, so it names the ask.
+        const rooted = make([withRulings(ruling('inferred', true))], { evidence: { authority: standing } });
+        const d = await rooted.svc.review({ ...pii, score: 74, recipientTier: 'known' });
+        expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'], taskTitle: 'Set up the clinic' } });
+        // A bound task the principal set names itself, even under a root they also set.
+        const both: SendAuthority = { ...standing, boundTask: { ...standing.boundTask!, originator: principal } };
+        const bound = make([withRulings(ruling('inferred', true))], { evidence: { authority: both } });
+        expect(await bound.svc.review({ ...pii, score: 74, recipientTier: 'known' })).toMatchObject({ kind: 'hold', ask: { taskTitle: 'Book the call' } });
       });
 
       it('lists each asked label once, across ask reasons', async () => {

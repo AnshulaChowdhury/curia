@@ -34,6 +34,7 @@ function makeCtx(overrides: {
   taskEventId?: string;
   actionLogRepo?: Partial<ActionLogRepo> | null;
   disclosureDecisions?: ToolContext['disclosureDecisions'];
+  liveTurn?: boolean;
 }): ToolContext {
   const gateway = {
     getEmailDraft: vi.fn().mockResolvedValue(DRAFT_STUB),
@@ -76,6 +77,7 @@ function makeCtx(overrides: {
     taskEventId: overrides.taskEventId ?? 'task-event-1',
     actionLogRepo,
     ...(overrides.disclosureDecisions ? { disclosureDecisions: overrides.disclosureDecisions } : {}),
+    ...(overrides.liveTurn !== undefined ? { liveTurn: overrides.liveTurn } : {}),
   } as unknown as ToolContext;
 
   return ctx;
@@ -779,40 +781,53 @@ describe('SendDraftHandler', () => {
     });
 
     // Sending the draft of a personal-data ask is the principal's yes, as approve-action records it (#2312).
+    // Sending the draft of a personal-data ask is the principal's yes, as approve-action records
+    // it (#2312), but only from a live principal turn whose approval was delivered: a yes covers
+    // the whole thread, and principal lineage alone also passes a woken task.
     describe('a row carrying a personal-data ask', () => {
       const disclosureAsk = { conversationId: 'conv-1', counterparties: ['joel@example.com'], labels: ['sin_ca'], requester: 'joel@example.com', outreachId: 'o-1' };
-      const askRow = { id: 55, shortRef: 'ab12cd34', disclosureAsk };
-
-      it('records the yes once the row resolves, as the coordinator acting for the principal', async () => {
+      const delivered = { id: 55, shortRef: 'ab12cd34', disclosureAsk, notificationSentAt: new Date('2026-10-26T10:00:00Z') };
+      const undelivered = { ...delivered, notificationSentAt: null };
+      const run = async (row: Record<string, unknown>, opts: { liveTurn?: boolean; resolved?: boolean; recorder?: boolean } = {}) => {
         const recordForApproval = vi.fn().mockResolvedValue(undefined);
+        const resolveById = vi.fn().mockResolvedValue(opts.resolved ?? true);
         const ctx = makeCtx({
-          actionLogRepo: { findPendingByPayloadField: vi.fn().mockResolvedValue(askRow), resolveById: vi.fn().mockResolvedValue(true) },
-          disclosureDecisions: { recordForApproval },
+          actionLogRepo: { findPendingByPayloadField: vi.fn().mockResolvedValue(row), resolveById },
+          ...(opts.recorder === false ? {} : { disclosureDecisions: { recordForApproval } }),
+          ...(opts.liveTurn !== undefined ? { liveTurn: opts.liveTurn } : {}),
         });
-        expect((await handler.execute(ctx)).success).toBe(true);
-        expect(recordForApproval).toHaveBeenCalledWith(askRow, 'yes', 'principal_via_coordinator');
+        const result = await handler.execute(ctx);
+        return { result, recordForApproval, resolveById };
+      };
+
+      it('records the yes from a live principal turn on a delivered approval', async () => {
+        const { result, recordForApproval } = await run(delivered, { liveTurn: true });
+        expect(result.success).toBe(true);
+        expect(recordForApproval).toHaveBeenCalledWith(delivered, 'yes', 'principal_via_coordinator');
       });
 
-      it('records nothing when the row was resolved concurrently, or carries no ask', async () => {
-        const recordForApproval = vi.fn().mockResolvedValue(undefined);
-        const raced = makeCtx({
-          actionLogRepo: { findPendingByPayloadField: vi.fn().mockResolvedValue(askRow), resolveById: vi.fn().mockResolvedValue(false) },
-          disclosureDecisions: { recordForApproval },
-        });
-        expect((await handler.execute(raced)).success).toBe(true);
-        const plain = makeCtx({
-          actionLogRepo: { findPendingByPayloadField: vi.fn().mockResolvedValue({ id: 56, shortRef: 'x', disclosureAsk: null }), resolveById: vi.fn().mockResolvedValue(true) },
-          disclosureDecisions: { recordForApproval },
-        });
-        expect((await handler.execute(plain)).success).toBe(true);
+      it('records nothing from a woken principal-lineage task, but still sends and resolves the row', async () => {
+        for (const liveTurn of [false, undefined]) {
+          const { result, recordForApproval, resolveById } = await run(delivered, liveTurn === undefined ? {} : { liveTurn });
+          expect(result.success).toBe(true);
+          expect(resolveById).toHaveBeenCalledWith(55, 'approved', 'coordinator');
+          expect(recordForApproval).not.toHaveBeenCalled();
+        }
+      });
+
+      it('records nothing for an approval the principal was never shown', async () => {
+        const { result, recordForApproval } = await run(undelivered, { liveTurn: true });
+        expect(result.success).toBe(true);
         expect(recordForApproval).not.toHaveBeenCalled();
       });
 
+      it('records nothing when the row was resolved concurrently, or carries no ask', async () => {
+        expect((await run(delivered, { liveTurn: true, resolved: false })).recordForApproval).not.toHaveBeenCalled();
+        expect((await run({ ...delivered, disclosureAsk: null }, { liveTurn: true })).recordForApproval).not.toHaveBeenCalled();
+      });
+
       it('still sends when the recorder is not wired', async () => {
-        const ctx = makeCtx({
-          actionLogRepo: { findPendingByPayloadField: vi.fn().mockResolvedValue(askRow), resolveById: vi.fn().mockResolvedValue(true) },
-        });
-        expect((await handler.execute(ctx)).success).toBe(true);
+        expect((await run(delivered, { liveTurn: true, recorder: false })).result.success).toBe(true);
       });
     });
 
