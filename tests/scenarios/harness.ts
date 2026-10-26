@@ -42,6 +42,8 @@ import {
 import { loadConfig } from '../../src/config.js';
 import { BullpenDispatcher } from '../../src/dispatch/bullpen-dispatcher.js';
 import { Dispatcher } from '../../src/dispatch/dispatcher.js';
+import { InboundScanner } from '../../src/dispatch/inbound-scanner.js';
+import { parseExtraInjectionPatterns } from '../../src/dispatch/security-config-loader.js';
 import { PrincipalAcquaintanceCheck } from '../../src/contacts/principal-acquaintance.js';
 
 /**
@@ -432,10 +434,22 @@ export async function createScenarioHarness(
   // Production's Dispatcher, given an outbound-context service so it injects the
   // block — narrowed to the run's own entries — the run's own backlog counts, and the
   // run's own verifications, so a principal's relayed code is tracked as in production.
+  // A missing scan is not a clean scan: without this scanner every follow-up is
+  // refused and case 26 cannot join the live turn (#2018).
+  let extraInjectionPatterns: ReturnType<typeof parseExtraInjectionPatterns> = [];
+  try {
+    extraInjectionPatterns = parseExtraInjectionPatterns(
+      stack.yamlConfig.security?.extra_injection_patterns ?? [],
+      'security.extra_injection_patterns',
+    );
+  } catch (err) {
+    logger.warn({ err }, 'scenario harness: extra injection patterns failed to parse — using built-in defaults');
+  }
   new Dispatcher({
     bus,
     logger,
     contactResolver: stack.contactResolver,
+    injectionScanner: new InboundScanner({ extraPatterns: extraInjectionPatterns }),
     // Production's trust scoring (#2227): the coordinator sees the sender's trust score,
     // and a message counts toward the sender's confidence, as in production.
     channelPolicies: stack.trustScoring.channelPolicies,
@@ -759,6 +773,7 @@ export async function createScenarioHarness(
         }
         const waiter = capture.waitFor(runConversationId, timeoutMs, agent);
         let delivery: Promise<void>;
+        let hostInboundId: string | undefined;
         if (thread) {
           // Posted by the thread's creator (or the case's author), mentioning the case's
           // agent — the event a bullpen reply produces. BullpenDispatcher turns it into
@@ -805,7 +820,7 @@ export async function createScenarioHarness(
             parentEventId: randomUUID(),
           }));
         } else if (sender !== 'bullpen' && 'channelId' in sender) {
-          delivery = bus.publish('channel', createInboundMessage({
+          const hostInbound = createInboundMessage({
             conversationId: runConversationId,
             channelId: sender.channelId,
             senderId: sender.senderId,
@@ -815,7 +830,9 @@ export async function createScenarioHarness(
             // A scenario inbound is a one-to-one message, and the adapters say so (#2261).
             ...(sender.channelId === 'signal' ? { metadata: { isGroup: false } } : {}),
             ...(sender.channelId === 'slack' ? { metadata: { isDm: true } } : {}),
-          }));
+          });
+          hostInboundId = hostInbound.id;
+          delivery = bus.publish('channel', hostInbound);
         } else {
           throw new Error('unreachable: bullpen sender without a thread');
         }
@@ -884,9 +901,11 @@ export async function createScenarioHarness(
           };
           if (follow.after === 'first_tool_call') {
             void (async () => {
-              await controller.whenFirstCall(runConversationId);
-              // The turn can end with no tool call. Disarm runs before endRun
-              // releases this wait, so do not publish into a finished turn.
+              // The lane is reserved once the dispatcher decides the host inbound,
+              // which is before the model call. Waiting for a tool call drops the
+              // correction when the model answers in text, and beforeFinish never
+              // sees it. The first tool stays held until this landing finishes.
+              if (hostInboundId !== undefined) await stack.turnLanes.intakeSettled(hostInboundId);
               if (!followupArmed) return;
               const landing = followupLanded();
               followupLanding = landing;

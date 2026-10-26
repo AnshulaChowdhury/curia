@@ -37,6 +37,20 @@ describe('coordinator scenario cases', () => {
     expect(page({ ...session, action: 'click', selector: 'g1f0e2' })).toContain('Check your email');
     expect(page({ ...session, action: 'click', selector: '[g1f0e1]' })).toContain('Check your phone');
     expect(page({ ...session, action: 'click', selector: 'g1f0e1' })).toContain('Check your phone');
+    expect(page({
+      ...session,
+      actions: [
+        { action: 'type', selector: '[g2f0e1]', text: '518204' },
+        { action: 'click', selector: '[g2f0e2]' },
+      ],
+    })).toContain("You're signed in");
+    expect(page({
+      ...session,
+      actions: [
+        { action: 'type', selector: 'g2f0e1', text: '518204' },
+        { action: 'click', selector: 'g2f0e2' },
+      ],
+    })).toContain("You're signed in");
     const other = page({ ...session, action: 'click', selector: 'button:has-text("Text me the code")' });
     expect(other).toContain('How should we send');
     expect(other).not.toContain('Check your email');
@@ -255,13 +269,12 @@ describe('coordinator scenario cases', () => {
     expect(real.filter(c => c.releaseGate).map(c => path.basename(c.sourceFile).slice(0, 3)).sort())
       .toEqual(['16a', '16d', '16f']);
     // Every other case is in the gate, except 21c (opt-in diagnostics; README, "Cases
-    // that need an opt-in agent"), 26 (mid-turn injection stays off until the paid
-    // eval, #2018), and the specialist cases that reply on a bullpen thread, which
-    // run on demand until #2126 ends the content-less reply loop (README, "Cases for
-    // a specialist"). The style cases run under an identity fixture, which the loader
-    // keeps out of the gate.
+    // that need an opt-in agent") and the specialist cases that reply on a bullpen
+    // thread, which run on demand until #2126 ends the content-less reply loop
+    // (README, "Cases for a specialist"). The style cases run under an identity
+    // fixture, which the loader keeps out of the gate. Case 26 is in the gate (#2018).
     expect(cases.filter(c => c.delegation === 'stubbed' && !c.releaseGate && !c.identity).map(c => path.basename(c.sourceFile).slice(0, 3)))
-      .toEqual(['21c', '26-', '30d', '30e', '30f', '31a', '31b', '31c', '31d', '31h', '32b']);
+      .toEqual(['21c', '30d', '30e', '30f', '31a', '31b', '31c', '31d', '31h', '32b']);
   });
 
   it('principal-scheduling cases split into batches that each share one stack', () => {

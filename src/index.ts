@@ -1937,7 +1937,7 @@ async function main(): Promise<void> {
   }
 
   // Built before the email adapters so a same-thread follow-up can be released
-  // at the dispatcher's decision. The flag still defaults off.
+  // at the dispatcher's decision. The shipped config turns this on; an absent field stays off.
   const turnInjection = resolveTurnInjectionConfig(yamlConfig.dispatch);
   const turnLanes = new TurnLanes({
     enabled: turnInjection.enabled,

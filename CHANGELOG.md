@@ -15,10 +15,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
-- **Turn lanes** — per-conversation lock and injection config, default off and inert. (#2018)
-- **Turn lane wiring** — a coordinator conversation has one holder when the flag is on. (#2018)
+- **Turn lanes** — per-conversation lock and injection config, on in the shipped file. (#2018)
+- **Turn lane wiring** — a coordinator conversation has one holder. (#2018)
 - **`agent.task.input_injected`** — **public API:** audit event for a drained same-contact follow-up. (#2018)
-- **Mid-turn injection** — a same-contact follow-up joins the live turn when the flag is on. (#2018)
+- **Mid-turn injection** — a same-contact follow-up joins the live coordinator turn. (#2018)
 - **Delegate wait** — a queued follow-up ends the wait early and the specialist keeps running. (#2018)
 - **`delegation.timed_out`** — **public API:** optional `cause` distinguishes an interrupted wait from a timeout. (#2018)
 - **Injected working-memory rows** — host task id is stored, and model history keeps the follow-up group. (#2018)
@@ -81,6 +81,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 - **Small-cap model check** — boot refuses fast-tier, judge or voice models that cannot turn thinking off. (#2224)
 - **Small-cap calls on the fast tier** — the drift detector and every `infraLlm.extract` call moved off the standard tier. (#2224)
+- **Turn injection** — the shipped config turns it on; a missing key stays off. (#2018)
 - **`infraLlm.extract` (public API, additive)** — optional `tier: 'fast' | 'standard'`; defaults to standard. (#2191)
 - **`activity-log`** — uses the shared activity describers; each action gains a readable `summary` line. (#2251)
 - **Unset pronouns** — agents use the name or they/them and never infer pronouns from a name. (#2226)
@@ -169,6 +170,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Scenario follow-up** — the harness scans inbound text, so a clean follow-up can join. (#2018)
+- **Scenario follow-up** — a correction is sent once the lane is reserved, not after a tool call. (#2018)
 - **Scenario follow-up** — an unpublished second message fails the run, and its own turn is cleaned up. (#2018)
 - **Scenario follow-up** — scoring waits for the injection decision, and a miss still fails the run. (#2018)
 - **Turn injection config** — startup accepts `dispatch.turnInjection` in the config schema. (#2018)
