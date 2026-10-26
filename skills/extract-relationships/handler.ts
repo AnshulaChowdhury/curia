@@ -81,7 +81,8 @@ export class ExtractRelationshipsHandler implements ToolHandler {
     }
 
     // -- Step 2: Extraction prompt --
-    // Standard-tier call with the full EDGE_TYPES vocabulary. Returns JSON triples.
+    // Fast-tier call with the full EDGE_TYPES vocabulary. Returns JSON triples. 1000 tokens
+    // leaves no room for thinking, so it runs where boot guarantees thinking can be off (#2224).
     const extractionResult = await ctx.infraLlm.extract(
       `Extract entity-to-entity relationships from the text below. Return a JSON array of relationship triples.
 
@@ -100,7 +101,7 @@ Format:
 
 Text:
 ${text}`,
-      { maxTokens: 1000 },
+      { maxTokens: 1000, tier: 'fast' },
     );
 
     if (!extractionResult.ok) {

@@ -71,6 +71,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Small-cap model check** — boot refuses fast-tier, judge or voice models that cannot turn thinking off. (#2224)
+- **Small-cap calls on the fast tier** — drift detector, setup name suggestion, fact, relationship, voice and grant extraction. (#2224)
 - **`infraLlm.extract` (public API, additive)** — optional `tier: 'fast' | 'standard'`; defaults to standard. (#2191)
 - **`activity-log`** — uses the shared activity describers; each action gains a readable `summary` line. (#2251)
 - **Unset pronouns** — agents use the name or they/them and never infer pronouns from a name. (#2226)
