@@ -2,7 +2,7 @@
 
 Date: 2026-10-24
 Status: Accepted
-Amended: 2026-10-26 — the shipped flag is on, resting on the passing case 26 gate run (#2018)
+Amended: 2026-10-26 — the shipped flag is on, resting on the passing case 26 run on the release-gate model and judge (#2018)
 
 ## Context
 

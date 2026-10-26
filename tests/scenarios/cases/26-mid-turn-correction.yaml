@@ -5,10 +5,10 @@
 # finishes. Capture matches one conversation to one turn, so a follow-up that is
 # not queued fails the run instead of being scored as a second reply. A drain at
 # turn_start fails the run, and the point is recorded on the result. The shipped
-# config turns the flag on. The passing gate run drained at round:1, with every
-# critical check at 100%. With the flag off
-# the harness errors before publishing. It is not a known_failure: that marker
-# would hide a real miss.
+# config turns the flag on. The passing run on the release-gate model drained at
+# round:1, with every critical check at 100%. With the flag off the harness
+# errors before publishing. It is not a known_failure: that marker would hide a
+# real miss.
 #
 # The seeded verification is SMS, matching the opening message. The follow-up is
 # what switches the channel to email. A pending email row would already tell the
