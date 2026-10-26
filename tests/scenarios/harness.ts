@@ -141,6 +141,9 @@ const LATE_TURN_GRACE_MS = 60_000;
 /** A declared follow-up that never started publishing. The run must not be scored as one turn. */
 export const FOLLOWUP_UNPUBLISHED_ERROR = 'inbound.followup was never published: the turn ended first';
 
+/** Publish started, and the dispatcher did not queue the message into the live turn. */
+export const FOLLOWUP_NOT_QUEUED_ERROR = 'follow-up was not queued into the live turn';
+
 /**
  * Keep an error the turn already recorded (a timeout, a refused queue). Otherwise
  * fail a follow-up case whose second message never started.
@@ -152,6 +155,52 @@ export function unpublishedFollowupError(
 ): string | undefined {
   if (!hasFollowup || published) return existingError;
   return existingError ?? FOLLOWUP_UNPUBLISHED_ERROR;
+}
+
+/**
+ * A publish that started still has to join the host. `undefined` means the
+ * decision has not arrived: that is a miss, not a pass. An error already on
+ * the turn stays.
+ */
+export function unjoinedFollowupError(
+  hasFollowup: boolean,
+  published: boolean,
+  joinedHost: boolean | undefined,
+  existingError: string | undefined,
+): string | undefined {
+  if (existingError !== undefined) return existingError;
+  if (!hasFollowup || !published || joinedHost === true) return undefined;
+  return FOLLOWUP_NOT_QUEUED_ERROR;
+}
+
+/**
+ * Wait for an in-flight landing before either check. `published` and
+ * `joinedHost` are read after it settles, so a decision still in flight is
+ * not scored as a miss or a pass.
+ */
+export async function followupScoreError(input: {
+  hasFollowup: boolean;
+  published: () => boolean;
+  landing: Promise<void> | undefined;
+  joinedHost: () => boolean | undefined;
+  existingError: string | undefined;
+}): Promise<string | undefined> {
+  if (input.landing !== undefined) {
+    try {
+      await input.landing;
+    } catch (err) {
+      if (input.existingError !== undefined) return input.existingError;
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
+  const unpublished = unpublishedFollowupError(input.hasFollowup, input.published(), input.existingError);
+  if (unpublished !== undefined) return unpublished;
+  return unjoinedFollowupError(
+    input.hasFollowup,
+    input.published(),
+    input.joinedHost(),
+    input.existingError,
+  );
 }
 
 /**
@@ -780,6 +829,11 @@ export async function createScenarioHarness(
         // Set from tryInject's decision. Undefined until then: a publish that
         // settles without it did not join the host turn.
         let joinedHost: boolean | undefined;
+        // The landing already in flight. Scoring awaits this before disarm, so
+        // a decision still inside the dispatcher's contact and scan work is
+        // not dropped. Absent until that landing starts: a timer that has not
+        // fired must not be waited into a finished turn.
+        let followupLanding: Promise<void> | undefined;
         if (inbound.followup && typeof sender === 'object' && 'channelId' in sender) {
           const follow = inbound.followup;
           const publishFollowup = async (): Promise<void> => {
@@ -825,29 +879,41 @@ export async function createScenarioHarness(
               }),
             ]);
             if (!injected && followupArmed) {
-              capture.fail(runConversationId, new Error('follow-up was not queued into the live turn'));
+              capture.fail(runConversationId, new Error(FOLLOWUP_NOT_QUEUED_ERROR));
             }
           };
           if (follow.after === 'first_tool_call') {
             void (async () => {
               await controller.whenFirstCall(runConversationId);
-              await followupLanded();
+              // The turn can end with no tool call. Disarm runs before endRun
+              // releases this wait, so do not publish into a finished turn.
+              if (!followupArmed) return;
+              const landing = followupLanded();
+              followupLanding = landing;
+              await landing;
               releaseFirstCall?.();
             })().catch((err: unknown) => capture.fail(runConversationId, err));
           } else {
             followupTimer = setTimeout(() => {
-              void followupLanded().catch((err: unknown) => capture.fail(runConversationId, err));
+              followupTimer = undefined;
+              const landing = followupLanded();
+              followupLanding = landing;
+              void landing.catch((err: unknown) => capture.fail(runConversationId, err));
             }, follow.after.ms);
             followupTimer.unref();
           }
         }
         trackDelivery(delivery, runConversationId);
         outcome = await waiter;
-        const followupError = unpublishedFollowupError(
-          inbound.followup !== undefined,
-          followupPublished,
-          outcome.error,
-        );
+        // Before disarm drops the injection waiter. Publish returns before
+        // tryInject, so the host can finish while the decision is in flight.
+        const followupError = await followupScoreError({
+          hasFollowup: inbound.followup !== undefined,
+          published: () => followupPublished,
+          landing: followupLanding,
+          joinedHost: () => joinedHost,
+          existingError: outcome.error,
+        });
         if (followupError !== undefined && outcome.error === undefined) {
           outcome = { ...outcome, error: followupError };
         }

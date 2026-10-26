@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  FOLLOWUP_NOT_QUEUED_ERROR,
   FOLLOWUP_UNPUBLISHED_ERROR,
   followupCleansAfterSettle,
+  followupScoreError,
   observeFollowupDelivery,
   unpublishedFollowupError,
 } from '../../scenarios/harness.js';
@@ -21,6 +23,48 @@ describe('unpublished follow-up (#2018)', () => {
 
   it('ignores a case with no follow-up', () => {
     expect(unpublishedFollowupError(false, false, undefined)).toBeUndefined();
+  });
+
+  it('waits for the landing before it treats a publish as joined or missed', async () => {
+    let published = false;
+    let joined: boolean | undefined;
+    let release: () => void = () => {};
+    const landing = new Promise<void>((resolve) => { release = resolve; });
+    const score = followupScoreError({
+      hasFollowup: true,
+      published: () => published,
+      landing,
+      joinedHost: () => joined,
+      existingError: undefined,
+    });
+    let done = false;
+    void score.then(() => { done = true; });
+    await Promise.resolve();
+    expect(done).toBe(false);
+    published = true;
+    joined = true;
+    release();
+    await expect(score).resolves.toBeUndefined();
+  });
+
+  it('fails a published follow-up whose decision never joins the host', async () => {
+    await expect(followupScoreError({
+      hasFollowup: true,
+      published: () => true,
+      landing: Promise.resolve(),
+      joinedHost: () => undefined,
+      existingError: undefined,
+    })).resolves.toBe(FOLLOWUP_NOT_QUEUED_ERROR);
+  });
+
+  it('keeps an existing error when the follow-up does not join', async () => {
+    await expect(followupScoreError({
+      hasFollowup: true,
+      published: () => true,
+      landing: Promise.resolve(),
+      joinedHost: () => false,
+      existingError: 'timed out',
+    })).resolves.toBe('timed out');
   });
 });
 
