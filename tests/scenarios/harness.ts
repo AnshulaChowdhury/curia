@@ -106,6 +106,12 @@ import { COORDINATOR, type CapturedToolCall, type ScenarioCase, type ScenarioRun
  * turn around it. The delegate wait must time out first, so its result is what gets scored.
  */
 const DELEGATION_RUN_MARGIN_MS = 120_000;
+/**
+ * How long the first tool stays held while a follow-up is published (#2018).
+ * Injection queues in well under this. Past it, the tool returns anyway, so a
+ * run with the flag off still finishes instead of waiting out the case timeout.
+ */
+const FOLLOWUP_QUEUE_WAIT_MS = 5_000;
 
 /** Prefix of the application_name every suite process sets on its connections. */
 export const SCENARIO_APPLICATION_PREFIX = 'curia-scenarios';
@@ -131,6 +137,97 @@ export function parseTimeout(raw: string | undefined): number {
 
 /** How long shutdown waits for turns that outlived their run's timeout. */
 const LATE_TURN_GRACE_MS = 60_000;
+
+/** A declared follow-up that never started publishing. The run must not be scored as one turn. */
+export const FOLLOWUP_UNPUBLISHED_ERROR = 'inbound.followup was never published: the turn ended first';
+
+/** Publish started, and the dispatcher did not queue the message into the live turn. */
+export const FOLLOWUP_NOT_QUEUED_ERROR = 'follow-up was not queued into the live turn';
+
+/**
+ * Keep an error the turn already recorded (a timeout, a refused queue). Otherwise
+ * fail a follow-up case whose second message never started.
+ */
+export function unpublishedFollowupError(
+  hasFollowup: boolean,
+  published: boolean,
+  existingError: string | undefined,
+): string | undefined {
+  if (!hasFollowup || published) return existingError;
+  return existingError ?? FOLLOWUP_UNPUBLISHED_ERROR;
+}
+
+/**
+ * A publish that started still has to join the host. `undefined` means the
+ * decision has not arrived: that is a miss, not a pass. An error already on
+ * the turn stays.
+ */
+export function unjoinedFollowupError(
+  hasFollowup: boolean,
+  published: boolean,
+  joinedHost: boolean | undefined,
+  existingError: string | undefined,
+): string | undefined {
+  if (existingError !== undefined) return existingError;
+  if (!hasFollowup || !published || joinedHost === true) return undefined;
+  return FOLLOWUP_NOT_QUEUED_ERROR;
+}
+
+/**
+ * Wait for an in-flight landing before either check. `published` and
+ * `joinedHost` are read after it settles, so a decision still in flight is
+ * not scored as a miss or a pass.
+ */
+export async function followupScoreError(input: {
+  hasFollowup: boolean;
+  published: () => boolean;
+  landing: Promise<void> | undefined;
+  joinedHost: () => boolean | undefined;
+  existingError: string | undefined;
+}): Promise<string | undefined> {
+  if (input.landing !== undefined) {
+    try {
+      await input.landing;
+    } catch (err) {
+      if (input.existingError !== undefined) return input.existingError;
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
+  const unpublished = unpublishedFollowupError(input.hasFollowup, input.published(), input.existingError);
+  if (unpublished !== undefined) return unpublished;
+  return unjoinedFollowupError(
+    input.hasFollowup,
+    input.published(),
+    input.joinedHost(),
+    input.existingError,
+  );
+}
+
+/**
+ * A queued follow-up's publish settles when the host drains it, while that turn
+ * is still running. Only a publish that did not join the host is its own turn,
+ * and only that one owns cleanup.
+ */
+export function followupCleansAfterSettle(joinedHost: boolean | undefined): boolean {
+  return joinedHost !== true;
+}
+
+/**
+ * Stay pending until `delivery` settles, then clean up unless the follow-up
+ * joined the host. Callers put the returned promise in the shutdown wait
+ * immediately, so a separate turn is not still writing when the pool closes.
+ */
+export function observeFollowupDelivery(
+  delivery: Promise<void>,
+  joinedHost: () => boolean | undefined,
+  cleanup: () => Promise<void>,
+): Promise<void> {
+  const finish = async (): Promise<void> => {
+    if (!followupCleansAfterSettle(joinedHost())) return;
+    await cleanup();
+  };
+  return delivery.then(finish, finish);
+}
 
 /**
  * After a run ends and is cancelled, how long to wait for its leftover work to wind down
@@ -347,6 +444,7 @@ export async function createScenarioHarness(
     outboundContextService: scopedOutbound,
     principalBacklog: scopedPrincipalBacklog(currentScope),
     verification: stack.verification,
+    turnLanes: stack.turnLanes,
     selfEmail: SCENARIO_CURIA_EMAIL,
     // Production's check against the run's own seed: the principal's email identities as
     // the stack read them, and a mailbox whose Sent folder is the run's principal_wrote
@@ -364,6 +462,24 @@ export async function createScenarioHarness(
       contacts: stack.contactService,
     },
   }).register();
+  // A follow-up's tryInject has decided. The harness waits for that before it
+  // lets a held tool return, and does not await the follow-up's publish (that
+  // publish resolves only when the follow-up is drained, inside the host turn).
+  // The boolean is whether the decision was `queued`.
+  const injectionQueued = new Map<string, (queued: boolean) => void>();
+  const tryInject = stack.turnLanes.tryInject.bind(stack.turnLanes);
+  stack.turnLanes.tryInject = (conversationId, input) => {
+    const decision = tryInject(conversationId, input);
+    const wake = injectionQueued.get(conversationId);
+    if (wake) {
+      injectionQueued.delete(conversationId);
+      wake(decision.kind === 'queued');
+    }
+    return decision;
+  };
+  const waitForInjection = (conversationId: string): Promise<boolean> => new Promise((resolve) => {
+    injectionQueued.set(conversationId, resolve);
+  });
   // Bullpen mentions reach the coordinator the way they do in production.
   new BullpenDispatcher(bus, logger, stack.bullpenService, stack.agentRegistry).register();
 
@@ -429,6 +545,29 @@ export async function createScenarioHarness(
       .catch((err: unknown) => {
         logger.error({ err, conversationId }, 'scenario harness: late conversation cleanup failed');
         process.stderr.write(`  [WARN] late cleanup failed for ${conversationId}: ${err instanceof Error ? err.message : String(err)}\n`);
+      })
+      .finally(() => { lateTurns.delete(settled); });
+    lateTurns.set(settled, context.current());
+  }
+
+  /**
+   * A follow-up publish joins `lateTurns` as soon as it starts. Cleanup runs
+   * only when `joinedHost` is not true at settlement: a queued follow-up
+   * resolves inside the live host turn, and that host delivery owns cleanup.
+   */
+  function trackFollowupDelivery(
+    delivery: Promise<void>,
+    conversationId: string,
+    joinedHost: () => boolean | undefined,
+  ): void {
+    const settled: Promise<void> = observeFollowupDelivery(
+      delivery,
+      joinedHost,
+      () => cleanupConversation(stack.pool, conversationId),
+    )
+      .catch((err: unknown) => {
+        logger.error({ err, conversationId }, 'scenario harness: follow-up conversation cleanup failed');
+        process.stderr.write(`  [WARN] follow-up cleanup failed for ${conversationId}: ${err instanceof Error ? err.message : String(err)}\n`);
       })
       .finally(() => { lateTurns.delete(settled); });
     lateTurns.set(settled, context.current());
@@ -527,6 +666,22 @@ export async function createScenarioHarness(
     // a failed seed becomes this run's error instead of aborting the suite.
     let seeded: SeededRun | undefined;
     let conversationId: string | undefined;
+    // A follow-up lives only for this attempt. Cleanup disarms it so a late
+    // timer cannot publish after the run, and releases a held first tool so
+    // the turn can finish (#2018).
+    let releaseFirstCall: (() => void) | undefined;
+    let followupArmed = true;
+    let followupTimer: ReturnType<typeof setTimeout> | undefined;
+    const disarmFollowup = (): void => {
+      followupArmed = false;
+      if (followupTimer !== undefined) {
+        clearTimeout(followupTimer);
+        followupTimer = undefined;
+      }
+      releaseFirstCall?.();
+      releaseFirstCall = undefined;
+      if (conversationId !== undefined) injectionQueued.delete(conversationId);
+    };
     let stubbedCalls: StubbedCall[] = [];
     let trace: DelegationTrace | undefined;
     let inboundContent = '';
@@ -580,12 +735,28 @@ export async function createScenarioHarness(
       conversationId = runConversationId;
 
       controller.beginRun(stubTable, runConversationId, { realDelegation });
+      // Armed before the inbound is published. A fast first tool call must
+      // already be held, or the follow-up lands after the model has moved on.
+      if (inbound.followup?.after === 'first_tool_call') {
+        let release: () => void = () => {};
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        controller.holdFirstCall(runConversationId, held);
+        releaseFirstCall = release;
+      }
       openRuns.set(runConversationId, state);
       delegations.begin(runConversationId);
       let outcome: TurnOutcome;
       // Specialists still working when the run's own wait ran out (#2027).
       let stillWorking: string[] = [];
       try {
+        // Capture matches events by conversation id, so a second live turn is
+        // not a second reply: it is mixed in or dropped. A follow-up that was
+        // not queued must fail the run before any of that is scored (#2018).
+        if (inbound.followup && stack.turnLanes.enabled !== true) {
+          throw new Error(
+            'inbound.followup requires dispatch.turnInjection.enabled; the flag is off',
+          );
+        }
         const waiter = capture.waitFor(runConversationId, timeoutMs, agent);
         let delivery: Promise<void>;
         if (thread) {
@@ -651,10 +822,106 @@ export async function createScenarioHarness(
         // A publish that fails outright (no handler, a throwing subscriber) must end the
         // run now, not after the timeout.
         delivery.catch((err: unknown) => capture.fail(runConversationId, err));
+        // Not awaited. Awaiting the host publish waits for the whole turn, and
+        // the follow-up has to be in flight before that turn ends (#2018).
+        // True once publishFollowup gets past its armed check and calls publish.
+        let followupPublished = false;
+        // Set from tryInject's decision. Undefined until then: a publish that
+        // settles without it did not join the host turn.
+        let joinedHost: boolean | undefined;
+        // The landing already in flight. Scoring awaits this before disarm, so
+        // a decision still inside the dispatcher's contact and scan work is
+        // not dropped. Absent until that landing starts: a timer that has not
+        // fired must not be waited into a finished turn.
+        let followupLanding: Promise<void> | undefined;
+        if (inbound.followup && typeof sender === 'object' && 'channelId' in sender) {
+          const follow = inbound.followup;
+          const publishFollowup = async (): Promise<void> => {
+            if (!followupArmed) return;
+            const followSender = await resolveSender({
+              ...scenario,
+              inbound: {
+                ...scenario.inbound,
+                from: follow.from,
+                channel: follow.channel ?? scenario.inbound.channel,
+              },
+            }, stack);
+            if (typeof followSender !== 'object' || !('channelId' in followSender)) {
+              throw new Error(`followup from '${follow.from}' is not a channel sender`);
+            }
+            if (!followupArmed) return;
+            followupPublished = true;
+            const followDelivery = bus.publish('channel', createInboundMessage({
+              conversationId: runConversationId,
+              channelId: followSender.channelId,
+              senderId: followSender.senderId,
+              content: follow.content,
+              ...(followSender.channelId === 'signal' ? { metadata: { isGroup: false } } : {}),
+              ...(followSender.channelId === 'slack' ? { metadata: { isDm: true } } : {}),
+            }));
+            // In lateTurns now, so shutdown waits if this becomes its own turn.
+            // A queued follow-up settles on drain, inside the host turn; cleanup
+            // stays with the host delivery. Not awaited: this promise resolves
+            // only when the follow-up is drained or its own turn ends.
+            trackFollowupDelivery(followDelivery, runConversationId, () => joinedHost);
+            followDelivery.catch((err: unknown) => capture.fail(runConversationId, err));
+          };
+          const followupLanded = async (): Promise<void> => {
+            if (!followupArmed) return;
+            const queued = waitForInjection(runConversationId);
+            void queued.then((wasQueued) => { joinedHost = wasQueued; });
+            void publishFollowup().catch((err: unknown) => capture.fail(runConversationId, err));
+            const injected = await Promise.race([
+              queued,
+              new Promise<boolean>((resolve) => {
+                const timer = setTimeout(() => resolve(false), FOLLOWUP_QUEUE_WAIT_MS);
+                timer.unref();
+              }),
+            ]);
+            if (!injected && followupArmed) {
+              capture.fail(runConversationId, new Error(FOLLOWUP_NOT_QUEUED_ERROR));
+            }
+          };
+          if (follow.after === 'first_tool_call') {
+            void (async () => {
+              await controller.whenFirstCall(runConversationId);
+              // The turn can end with no tool call. Disarm runs before endRun
+              // releases this wait, so do not publish into a finished turn.
+              if (!followupArmed) return;
+              const landing = followupLanded();
+              followupLanding = landing;
+              await landing;
+              releaseFirstCall?.();
+            })().catch((err: unknown) => capture.fail(runConversationId, err));
+          } else {
+            followupTimer = setTimeout(() => {
+              followupTimer = undefined;
+              const landing = followupLanded();
+              followupLanding = landing;
+              void landing.catch((err: unknown) => capture.fail(runConversationId, err));
+            }, follow.after.ms);
+            followupTimer.unref();
+          }
+        }
         trackDelivery(delivery, runConversationId);
         outcome = await waiter;
+        // Before disarm drops the injection waiter. Publish returns before
+        // tryInject, so the host can finish while the decision is in flight.
+        const followupError = await followupScoreError({
+          hasFollowup: inbound.followup !== undefined,
+          published: () => followupPublished,
+          landing: followupLanding,
+          joinedHost: () => joinedHost,
+          existingError: outcome.error,
+        });
+        if (followupError !== undefined && outcome.error === undefined) {
+          outcome = { ...outcome, error: followupError };
+        }
         if (outcome.errorKind === 'timeout') stillWorking = controller.pendingDelegations(runConversationId);
       } finally {
+        // Before endRun resolves a waiting first-call, so the publisher sees
+        // the follow-up is no longer armed.
+        disarmFollowup();
         stubbedCalls = controller.endRun(runConversationId);
         trace = delegations.end(runConversationId);
         openRuns.delete(runConversationId);
@@ -716,6 +983,7 @@ export async function createScenarioHarness(
         providerRetries: [],
       };
     } finally {
+      disarmFollowup();
       if (seeded) {
         // Recorded on the run, not thrown: a throw here would replace the run's result
         // and abort the suite, losing every paid run before it. gateFailures reports it.

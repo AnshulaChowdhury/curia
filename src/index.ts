@@ -20,7 +20,7 @@
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { runner } from 'node-pg-migrate';
-import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveReportFallbackConfig, resolveIdentityGateMode, resolveAutonomyGating, resolveVerificationConfig, resolveRelayBudgetConfig } from './config.js';
+import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveReportFallbackConfig, resolveIdentityGateMode, resolveAutonomyGating, resolveVerificationConfig, resolveRelayBudgetConfig, resolveTurnInjectionConfig } from './config.js';
 import { createVerificationRuntime } from './verification/index.js';
 import { createLogger } from './logger.js';
 import { HttpAdapter } from './channels/http/http-adapter.js';
@@ -39,6 +39,7 @@ import { OpenRouterProvider } from './agents/llm/openrouter.js';
 import { BedrockProvider } from './agents/llm/bedrock.js';
 import { AgentRuntime } from './agents/runtime.js';
 import { Dispatcher } from './dispatch/dispatcher.js';
+import { TurnLanes } from './dispatch/turn-lanes.js';
 import { createPrincipalBacklogSource } from './dispatch/principal-backlog.js';
 import { CliAdapter } from './channels/cli/cli-adapter.js';
 import { discoverAgentManifests } from './agents/loader.js';
@@ -1926,6 +1927,18 @@ async function main(): Promise<void> {
     );
   }
 
+  // Built before the email adapters so a same-thread follow-up can be released
+  // at the dispatcher's decision. The flag still defaults off.
+  const turnInjection = resolveTurnInjectionConfig(yamlConfig.dispatch);
+  const turnLanes = new TurnLanes({
+    enabled: turnInjection.enabled,
+    maxInjectionsPerTurn: turnInjection.maxInjectionsPerTurn,
+    extraRoundsPerInjection: turnInjection.extraRoundsPerInjection,
+    laneWaitTimeoutMs: turnInjection.laneWaitTimeoutMs,
+    logger,
+  });
+  logger.info({ enabled: turnInjection.enabled }, 'Turn lanes initialized');
+
   // Construct one EmailAdapter per resolved account (but don't start any yet —
   // adapters must not poll until the dispatcher is registered, otherwise inbound.message
   // events have no subscriber and are permanently dropped because each adapter advances
@@ -1963,6 +1976,7 @@ async function main(): Promise<void> {
         // Replay this account's unacknowledged inbound.message rows before the
         // first poll, so a deploy cannot leave write-ahead mail behind the watermark.
         unacknowledgedInbound: auditLogger,
+        turnLanes,
       }));
     }
     // Divergence guard (#964): the registry gate marked email enabled + resolvable, yet no
@@ -2772,6 +2786,7 @@ async function main(): Promise<void> {
       : undefined,
     defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs,
     lateDelivery: {
+      enabled: lateDeliveryConfig.enabled,
       ttlMinutes: lateDeliveryConfig.ttlMinutes,
       sweepIntervalMinutes: lateDeliveryConfig.sweepIntervalMinutes,
     },
@@ -2779,6 +2794,7 @@ async function main(): Promise<void> {
     conversationEntities,
     workingDocsRepo,
     taskRepo,
+    turnLanes,
   };
   for (const agentConfig of agentConfigs) {
     let assembled: AssembledAgent;
@@ -3089,6 +3105,7 @@ async function main(): Promise<void> {
       : undefined,
     principalBacklog: createPrincipalBacklogSource(pool),
     verification: verificationRuntime,
+    turnLanes,
   });
   dispatcher.register();
   // Deferred delegations wake in the originating conversation (#1893). The

@@ -55,16 +55,21 @@ even when the coordinator rewords the brief.
 
 A `delegate` wait that times out does not stop the specialist — by design (#1288): cancelling an
 in-flight run risks a half-completed side effect, so the run is left alone and the coordinator's
-turn ends. The specialist then finishes minutes later and publishes an `agent.response` whose
-originating turn no longer exists. Before v0.44 nothing consumed it, and the work was silently
-lost: the weekly travel sweep timed out four weeks running while the calendar agent delivered a
-full result each time, and no trip task was created for a month.
+turn ends. A queued same-contact follow-up ends that wait the same way (#2018): the specialist
+keeps running, and the handle's `cause` is `interrupted` rather than a timeout. The specialist
+then finishes minutes later and publishes an `agent.response` whose originating turn no longer
+exists. Before v0.44 nothing consumed it, and the work was silently lost: the weekly travel sweep
+timed out four weeks running while the calendar agent delivered a full result each time, and no
+trip task was created for a month.
 
 The lifecycle now:
 
-1. On timeout, the runtime publishes `delegation.timed_out` carrying the delegate `agent.task`
-   event id — the value the specialist stamps as `parentEventId` on its eventual response — plus
-   the originating routing and the id of the CEO review task the escalation created.
+1. When the wait ends, the runtime publishes `delegation.timed_out` carrying the delegate
+   `agent.task` event id — the value the specialist stamps as `parentEventId` on its eventual
+   response — plus the originating routing. `cause` is `wait_timeout` when the delegate timer
+   fired, and that payload also carries the id of the CEO review task the escalation created.
+   `cause` is `interrupted` when a same-contact follow-up was queued: no review task is opened
+   and nothing is escalated. Either way the late result still wakes the originating turn.
 2. `LateDelegationSubscriber` (system layer) persists that as a row in `pending_delegations`,
    or promotes the dispatch-time `running` claim for the same `delegate_event_id` in place.
    `UNIQUE (delegate_event_id)` makes the handle idempotent, and `status` is a lease
