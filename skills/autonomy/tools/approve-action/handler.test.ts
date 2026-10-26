@@ -1,7 +1,7 @@
 // handler.test.ts — unit tests for approve-action skill.
 
 import { describe, it, expect, vi } from 'vitest';
-import { ApproveActionHandler } from './handler.js';
+import { ApproveActionHandler, UNSHOWN_PERSONAL_DETAILS_ERROR } from './handler.js';
 import { STALE_SEND_APPROVAL_ERROR } from '../../../../src/skills/_shared/recipient-reference.js';
 import type { ToolContext, ToolResult } from '../../../../src/skills/types.js';
 import type { ActionLogRepo } from '../../../../src/autonomy/action-log-repo.js';
@@ -125,6 +125,40 @@ describe('ApproveActionHandler', () => {
     // Verify return
     expect(result.success).toBe(true);
     expect((result as { data: unknown }).data).toHaveProperty('reExecutionResult');
+  });
+
+  describe('an undelivered approval carrying personal details (#2312)', () => {
+    const smsRow = {
+      ...PENDING_ROW, toolName: 'sms-send', shortRef: 'sms-1',
+      payload: { recipient: 'contact-1', message: 'Her cell is (415) 555-1234.' },
+    };
+
+    async function approve(row: typeof smsRow | typeof PENDING_ROW) {
+      const repo = makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row }) });
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({ actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer }));
+      return { result, repo, execLayer };
+    }
+
+    it('refuses it and leaves the row pending', async () => {
+      const { result, repo, execLayer } = await approve(smsRow);
+      expect(result).toEqual({ success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR });
+      expect(repo.resolveRow).not.toHaveBeenCalled();
+      expect(execLayer.invoke).not.toHaveBeenCalled();
+    });
+
+    it('approves and replays it once delivered', async () => {
+      const { result, repo, execLayer } = await approve({ ...smsRow, notificationSentAt: new Date() } as unknown as typeof smsRow);
+      expect(result.success).toBe(true);
+      expect(repo.resolveRow).toHaveBeenCalledWith(10, 'approved', 'coordinator');
+      expect(execLayer.invoke).toHaveBeenCalledWith('sms-send', smsRow.payload, expect.anything(), expect.objectContaining({ humanApproved: true }));
+    });
+
+    it('approves an undelivered one with no personal details', async () => {
+      const { result, execLayer } = await approve({ ...smsRow, payload: { recipient: 'contact-1', message: 'See you Thursday.' } });
+      expect(result.success).toBe(true);
+      expect(execLayer.invoke).toHaveBeenCalledOnce();
+    });
   });
 
   it('writes failure child row when re-execution fails', async () => {

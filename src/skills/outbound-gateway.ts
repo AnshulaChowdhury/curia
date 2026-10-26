@@ -1480,11 +1480,15 @@ export class OutboundGateway {
     // The dispatch methods read the body/message field from the request object
     // they receive — if we pass the original `request`, the unredacted content
     // reaches Nylas / signal-cli even though redactedBody was computed above.
-    // sendBody is raw only under band review, which authorized every detected item (#2312).
+    // sendBody is raw under band review, which authorized every detected item, and on a band
+    // approved replay, which the principal approved as written (#2312).
     //
     // The spot-check preview is the redacted copy whenever the wire is raw: a sample row is
     // not where a disclosure the review authorized should be repeated (#2312).
     const rawOnWire = detectedItems.length > 0;
+    // The outbound.delivered content never carries raw values: the redacted copy whenever the
+    // wire may be raw (#2312). An intact replay was never detected, so it is redacted here.
+    const auditBody = sendIntact ? this.redactedCopy(sendBody, request.channel, recipientId) : redactedBody;
     if (request.channel === 'email') {
       // Provenance lives on the request so a queued payload keeps it. Only send()
       // options set it; a value already on the request is dropped. dispatchEmail
@@ -1517,7 +1521,7 @@ export class OutboundGateway {
           recipientContactId,
           // Without the model's sign-off when signEmail dropped it: what was sent. Redacted when
           // the review sent details raw: the audit event never carries them (#2312).
-          content: rawOnWire ? this.redactedCopy(toSend.body, 'email', recipientId) : toSend.body,
+          content: rawOnWire || sendIntact ? this.redactedCopy(toSend.body, 'email', recipientId) : toSend.body,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1558,7 +1562,7 @@ export class OutboundGateway {
           channel: 'slack',
           recipientId,
           recipientContactId,
-          content: redactedBody, // the redacted copy: the audit event never carries raw values (#2312)
+          content: auditBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1581,7 +1585,7 @@ export class OutboundGateway {
           channel: 'sms',
           recipientId,
           recipientContactId,
-          content: redactedBody, // the redacted copy: the audit event never carries raw values (#2312)
+          content: auditBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1611,7 +1615,7 @@ export class OutboundGateway {
           channel: 'signal',
           recipientId,
           recipientContactId,
-          content: redactedBody, // the redacted copy: the audit event never carries raw values (#2312)
+          content: auditBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,

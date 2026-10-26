@@ -4563,6 +4563,24 @@ describe('band review (#2159)', () => {
       expect(sentEmail().body).toContain(phone);
       expect(sentEmail().subject).toBe(`Re: ${phone}`);
       expect(publishedOfType(mocks.bus, 'outbound.pii_redacted')).toHaveLength(0);
+      // The audit event still never carries the value.
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered).toHaveLength(1);
+      expect(String(delivered[0]!.payload['content'])).toContain('[REDACTED: PHONE_US]');
+      expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
+    });
+
+    it('sends an approved Signal replay intact, with a redacted audit event', async () => {
+      const review = vi.fn();
+      const { gateway, signalClient } = await makePiiGateway({ review, withSignal: true });
+      const result = await gateway.send({ channel: 'signal', recipient: '+15555552222', message: phoneBody }, { humanApproved: true });
+
+      expect(result.success).toBe(true);
+      expect(review).not.toHaveBeenCalled();
+      expect(JSON.stringify(signalClient.send.mock.calls)).toContain(phone);
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered).toHaveLength(1);
+      expect(String(delivered[0]!.payload['content'])).toBe('Call me on [REDACTED: PHONE_US] tomorrow.');
     });
 
     it('still redacts under tier gating', async () => {

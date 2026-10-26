@@ -15,6 +15,11 @@ import { parseApprovalRefInput } from '../../../_shared/approval-ref.js';
 import { STALE_SEND_APPROVAL_ERROR } from '../../../../src/skills/_shared/recipient-reference.js';
 import { createHumanDecision } from '../../../../src/bus/events.js';
 import type { TaskOriginator } from '../../../../src/contacts/types.js';
+import { hasPersonalDetails } from '../../../../src/autonomy/approval-notification.js';
+
+/** The refusal when an undelivered approval would send personal details (#2312). */
+export const UNSHOWN_PERSONAL_DETAILS_ERROR =
+  'The principal hasn\'t been shown this approval yet, and it contains personal details. Deliver it with deliver-approval first, then ask again.';
 
 export class ApproveActionHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -49,6 +54,18 @@ export class ApproveActionHandler implements ToolHandler {
       if (!row.payload) {
         ctx.log.error({ rowId: row.id }, 'approve-action: row has null payload — cannot re-execute');
         return { success: false, error: `Cannot approve ${approvalLabel(row)}: no stored payload for re-execution` };
+      }
+
+      // An approved send replays as written (#2312). The approval message lists every personal
+      // detail it carries; one never delivered showed the principal none of them (a digest
+      // line or list-pending-actions names only the description). Refused, not resolved: it
+      // stays pending until delivered.
+      if (row.notificationSentAt === null && hasPersonalDetails(row.toolName, row.payload)) {
+        ctx.log.info(
+          { rowId: row.id, shortRef: row.shortRef, toolName: row.toolName },
+          'approve-action: undelivered approval carries personal details — refusing until it is delivered',
+        );
+        return { success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR };
       }
 
       const pins = row.sendResolution;

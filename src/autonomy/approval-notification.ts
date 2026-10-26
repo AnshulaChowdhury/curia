@@ -346,18 +346,35 @@ const MESSAGE_FIELD_KEYS = ['subject', 'body', 'message', 'html_quote', 'htmlQuo
 export const MAX_PERSONAL_DETAILS_LISTED = 10;
 
 /**
- * The line listing the personal details a send skill's approval would send (#2312), or null
- * when there are none. Scans the full, untruncated message fields with the shared scrubber
- * core. The approval goes only to the principal, so the values are shown.
+ * The personal details a send skill's approval would send, as `<label> <value>` (#2312): the
+ * full, untruncated message fields scanned with the shared scrubber core. [] for other skills.
  */
-export function buildPersonalDetailsLine(toolName: string, payload: Record<string, unknown>): string | null {
-  if (!isSendSkill(toolName)) return null;
+function findPersonalDetails(toolName: string, payload: Record<string, unknown>): string[] {
+  if (!isSendSkill(toolName)) return [];
   const found: string[] = [];
   for (const key of MESSAGE_FIELD_KEYS) {
     const text = payload[key];
     if (typeof text !== 'string' || text.length === 0) continue;
     for (const match of detectPii(text)) found.push(`${match.label} ${match.matched}`);
   }
+  return found;
+}
+
+/**
+ * Whether approving this payload would send personal details (#2312): the same scan as the
+ * approval's personal details line. approve-action refuses such an approval until it is shown.
+ */
+export function hasPersonalDetails(toolName: string, payload: Record<string, unknown>): boolean {
+  return findPersonalDetails(toolName, payload).length > 0;
+}
+
+/**
+ * The line listing the personal details a send skill's approval would send (#2312), or null
+ * when there are none. Scans the full, untruncated message fields with the shared scrubber
+ * core. The approval goes only to the principal, so the values are shown.
+ */
+export function buildPersonalDetailsLine(toolName: string, payload: Record<string, unknown>): string | null {
+  const found = findPersonalDetails(toolName, payload);
   if (found.length === 0) return null;
   const listed = found.slice(0, MAX_PERSONAL_DETAILS_LISTED).join('; ');
   const more = found.length > MAX_PERSONAL_DETAILS_LISTED ? `; and ${found.length - MAX_PERSONAL_DETAILS_LISTED} more` : '';
