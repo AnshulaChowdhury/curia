@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import * as yaml from 'js-yaml';
+import ts from 'typescript';
 import type { YamlConfig } from '../../../../src/config.js';
 import { ModelRegistry } from '../../../../src/agents/llm/model-registry.js';
 import { smallCapModelSlots, smallCapThinkingViolations, voiceModelSlot } from '../../../../src/agents/llm/small-cap-models.js';
@@ -118,40 +119,43 @@ function sourceFiles(dir: string): string[] {
     .map((e) => join(e.parentPath, e.name));
 }
 
-// The argument text of each `.extract(` call, with parentheses balanced outside string
-// literals (template `${…}` contents are code, so their parentheses count).
-function extractCalls(source: string): string[] {
-  const calls: string[] = [];
-  let from = 0;
-  for (;;) {
-    const at = source.indexOf('.extract(', from);
-    if (at === -1) return calls;
-    const start = at + '.extract('.length;
-    let depth = 1;
-    let quote: string | null = null;
-    const templateDepth: number[] = [];
-    let i = start;
-    for (; i < source.length && depth > 0; i++) {
-      const c = source[i];
-      if (quote) {
-        if (c === '\\') i++;
-        else if (quote === '`' && c === '$' && source[i + 1] === '{') { templateDepth.push(depth); depth++; quote = null; i++; }
-        else if (c === quote) quote = null;
-        continue;
-      }
-      if (c === "'" || c === '"' || c === '`') quote = c;
-      else if (c === '(' || c === '{') depth++;
-      else if (c === ')' || c === '}') {
-        depth--;
-        if (c === '}' && templateDepth.length > 0 && templateDepth[templateDepth.length - 1] === depth) {
-          templateDepth.pop();
-          quote = '`';
-        }
+interface ExtractCall {
+  line: number;
+  /** An object-literal argument sets `tier: 'fast'`. */
+  fastTier: boolean;
+  /** The literal `maxTokens`, or undefined for the 4,000 default or a computed value. */
+  maxTokens: string | undefined;
+}
+
+// Every `<expr>.extract(…)` call, found on the syntax tree so spacing, line breaks,
+// type arguments and optional chaining (`?.extract`) all count, and comments and
+// strings do not.
+function extractCalls(file: string, source: string): ExtractCall[] {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+  const calls: ExtractCall[] = [];
+  const literalProp = (obj: ts.ObjectLiteralExpression, name: string): ts.Expression | undefined => {
+    for (const p of obj.properties) {
+      if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) && p.name.text === name) {
+        return p.initializer;
       }
     }
-    calls.push(source.slice(start, i - 1));
-    from = i;
-  }
+    return undefined;
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'extract') {
+      const objects = node.arguments.filter(ts.isObjectLiteralExpression);
+      const tiers = objects.map((o) => literalProp(o, 'tier')).filter((e) => e !== undefined);
+      const caps = objects.map((o) => literalProp(o, 'maxTokens')).filter((e) => e !== undefined);
+      calls.push({
+        line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
+        fastTier: tiers.some((e) => ts.isStringLiteralLike(e) && e.text === 'fast'),
+        maxTokens: caps[0] && ts.isNumericLiteral(caps[0]) ? caps[0].text : undefined,
+      });
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return calls;
 }
 
 describe('standard tier serves no small-cap extract (#2224)', () => {
@@ -161,13 +165,12 @@ describe('standard tier serves no small-cap extract (#2224)', () => {
     let checked = 0;
     for (const file of [...sourceFiles(join(REPO, 'src')), ...sourceFiles(join(REPO, 'skills'))]) {
       const path = relative(REPO, file);
-      for (const call of extractCalls(readFileSync(file, 'utf8'))) {
+      for (const call of extractCalls(file, readFileSync(file, 'utf8'))) {
         checked++;
-        if (/tier:\s*'fast'/.test(call)) continue;
+        if (call.fastTier) continue;
         onStandard[path] = (onStandard[path] ?? 0) + 1;
         if (!(path in STANDARD_TIER_EXTRACTS)) {
-          const cap = /maxTokens:\s*(\d[\d_]*)/.exec(call)?.[1] ?? 'default 4000';
-          offenders.push(`${path}: maxTokens ${cap}`);
+          offenders.push(`${path}:${call.line}: maxTokens ${call.maxTokens ?? 'default 4000'}`);
         }
       }
     }
@@ -177,5 +180,23 @@ describe('standard tier serves no small-cap extract (#2224)', () => {
     // A listed file must still have exactly its listed calls on standard, so the list
     // cannot silently cover a new call or outlive the ones it names.
     expect(onStandard).toEqual(STANDARD_TIER_EXTRACTS);
+  });
+});
+
+describe('extractCalls (#2224)', () => {
+  it('finds calls however they are spelled, and skips comments and strings', () => {
+    const source = [
+      "await ctx.infraLlm.extract (prompt, { maxTokens: 1000 });",
+      "await infraLlm",
+      "  .extract(prompt, { tier: 'fast' });",
+      "await ctx.infraLlm?.extract<string>(prompt);",
+      "// ctx.infraLlm.extract(prompt) in a comment",
+      "const s = 'infraLlm.extract(prompt)';",
+    ].join('\n');
+    expect(extractCalls('sample.ts', source)).toEqual([
+      { line: 1, fastTier: false, maxTokens: '1000' },
+      { line: 2, fastTier: true, maxTokens: undefined },
+      { line: 4, fastTier: false, maxTokens: undefined },
+    ]);
   });
 });
