@@ -167,6 +167,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Scenario follow-up** — an unpublished second message fails the run, and its own turn is cleaned up. (#2018)
 - **Turn injection config** — startup accepts `dispatch.turnInjection` in the config schema. (#2018)
 - **Synthetic notices** — approval, drift-pause and suspension wakes set `syntheticTurn`. (#2018)
 - **KG semantic search** — filters apply before the limit, so closer facts no longer hide entities or create duplicates. (#2248)
