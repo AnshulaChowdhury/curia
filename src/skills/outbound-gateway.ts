@@ -759,6 +759,8 @@ export class OutboundGateway {
        * blocked result's advisory.
        */
       postTurn?: boolean;
+      /** The principal note cut from this relayed reply and queued for the principal: judge evidence (#2312). */
+      reportedToPrincipal?: string;
       reExecRecipe?: {
         /** Registered skill name to invoke on approval (e.g. 'send-draft'). */
         toolName: string;
@@ -1964,6 +1966,7 @@ export class OutboundGateway {
       conversationId?: string | null;
       parentEventId?: string;
       postTurn?: boolean;
+      reportedToPrincipal?: string;
       principalDirected?: boolean;
       holdRecipe?: SendRecipe;
       reExecRecipe?: SendRecipe;
@@ -1983,6 +1986,7 @@ export class OutboundGateway {
         ...(options?.taskEventId ? { taskEventId: options.taskEventId } : {}),
         principalDirected: options?.principalDirected === true,
         postTurn: options?.postTurn === true,
+        ...(options?.reportedToPrincipal ? { reportedToPrincipal: options.reportedToPrincipal } : {}),
       });
     } catch (err) {
       // BandSendReview is not meant to throw; if it does, the send was not reviewed. Hold.

@@ -26,10 +26,11 @@ const TASK = row({
   payload: { content: 'Can you confirm Tuesday?', metadata: { boundTask: { taskId: 't', progress: { step: 2 } } } },
 });
 
-function makeRepo(results: AuditLogRow[], task: AuditLogRow | null = TASK) {
+function makeRepo(results: AuditLogRow[], task: AuditLogRow | null = TASK, reports: AuditLogRow[] = []) {
   return {
     findById: vi.fn().mockResolvedValue(task),
     findToolResultsForTasks: vi.fn().mockResolvedValue(results),
+    findPrincipalReportsForTasks: vi.fn().mockResolvedValue(reports),
   };
 }
 
@@ -98,8 +99,43 @@ describe('SendEvidenceCollector', () => {
     expect(ev.toolResults[0]!.result).toContain('+1 555 010 0199');
   });
 
+  it('collects what the turn reported to the principal, newest first, redacted and clipped (#2312)', async () => {
+    const reports = [
+      row({ id: 'p2', eventType: 'principal.report', payload: { summary: `Passed Sam's request on. key sk-ant-abcdefghijklmnopqrstuvwxyz0123 ${'x'.repeat(EVIDENCE_RESULT_MAX_CHARS * 2)}` } }),
+      row({ id: 'p1', eventType: 'principal.report', payload: { summary: 'Sam asked about Tuesday.' } }),
+      row({ id: 'p0', eventType: 'principal.report', payload: {} }),
+    ];
+    const repo = makeRepo([], TASK, reports);
+    const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => null, logger });
+
+    const ev = await collector.collect(['task-1', 'task-2']);
+
+    expect(repo.findPrincipalReportsForTasks).toHaveBeenCalledWith(['task-1', 'task-2'], 10);
+    expect(ev.reportsToPrincipal).toHaveLength(2);
+    expect(ev.reportsToPrincipal![0]).not.toContain('sk-ant-abcdefghijklmnopqrstuvwxyz0123');
+    expect(ev.reportsToPrincipal![0]!.length).toBeLessThanOrEqual(EVIDENCE_RESULT_MAX_CHARS + 1);
+    expect(ev.reportsToPrincipal![1]).toBe('Sam asked about Tuesday.');
+  });
+
+  it('has no reportsToPrincipal when the turn reported nothing', async () => {
+    const collector = new SendEvidenceCollector({ auditLogRepo: makeRepo([]), principalBlock: () => null, logger });
+    const ev = await collector.collect(['task-1']);
+    expect(ev.reportsToPrincipal ?? []).toEqual([]);
+  });
+
+  it('marks the evidence unavailable when the reports lookup fails (#2312)', async () => {
+    const repo = makeRepo([]);
+    repo.findPrincipalReportsForTasks.mockRejectedValue(new Error('db down'));
+    const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => null, logger });
+
+    const ev = await collector.collect(['task-1']);
+
+    expect(ev.unavailable).toBe(true);
+    expect(ev.toolResults).toEqual([]);
+  });
+
   it('marks the evidence unavailable when the audit lookup fails', async () => {
-    const repo = { findById: vi.fn().mockRejectedValue(new Error('db down')), findToolResultsForTasks: vi.fn() };
+    const repo = { findById: vi.fn().mockRejectedValue(new Error('db down')), findToolResultsForTasks: vi.fn(), findPrincipalReportsForTasks: vi.fn() };
     const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => null, logger });
 
     const ev = await collector.collect(['task-1']);

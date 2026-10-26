@@ -227,6 +227,18 @@ describe('BandSendReview', () => {
     expect(collect).toHaveBeenLastCalledWith(['task-1', 'task-2']);
   });
 
+  it('adds what the relay reported to the principal to the evidence (#2312)', async () => {
+    const { svc, review, collect } = make([clean, clean]);
+    collect.mockResolvedValue({ ...OK_EVIDENCE, reportsToPrincipal: ['Earlier note.'] });
+
+    await svc.review({ ...base, reportedToPrincipal: 'Provider asked for your number.' });
+    expect(review.mock.calls[0]![0].evidence.reportsToPrincipal).toEqual(['Earlier note.', 'Provider asked for your number.']);
+
+    // Without a note the collected reports pass through untouched.
+    await svc.review({ ...base, conversationId: 'conv-2' });
+    expect(review.mock.calls[1]![0].evidence.reportsToPrincipal).toEqual(['Earlier note.']);
+  });
+
   it('does not treat a send to someone else on the same conversation as a recheck', async () => {
     const { svc } = make([{ ...clean, unsupportedClaims: [CLAIM] }, { ...clean, unsupportedClaims: [CLAIM] }]);
     await svc.review(base);

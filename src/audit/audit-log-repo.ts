@@ -512,6 +512,27 @@ export class AuditLogRepo {
   }
 
   /**
+   * What the given agent turns reported to the principal, newest first (#2312). The
+   * report-to-principal tool files a principal.report under the drafting turn's agent.task,
+   * so one level, on idx_audit_log_parent_event_id. Evidence for the band brief: a send that
+   * says "I've passed that to <principal>" is supported by one.
+   */
+  async findPrincipalReportsForTasks(taskEventIds: readonly string[], limit: number): Promise<AuditLogRow[]> {
+    if (taskEventIds.length === 0) return [];
+    const clamped = Math.min(Math.max(limit, 1), MAX_LIMIT);
+    const result = await this.pool.query(
+      `SELECT ${SELECT_COLUMNS}
+       FROM audit_log
+       WHERE event_type = 'principal.report'
+         AND parent_event_id = ANY($1::text[])
+       ORDER BY timestamp DESC, id DESC
+       LIMIT $2`,
+      [[...taskEventIds], clamped],
+    );
+    return result.rows.map(mapRow);
+  }
+
+  /**
    * Requester-identity evidence rendered into one delegated specialist task (#1859).
    * `delegateEventId` is that task's `agent.task` id. Matches the structured
    * `target_id` and, if extraction failed, `payload.delegateEventId`.

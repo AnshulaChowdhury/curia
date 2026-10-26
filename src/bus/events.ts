@@ -227,6 +227,12 @@ interface OutboundMessagePayload {
    * humanApproved, so band review does not hold an approved reply a second time.
    */
   principalApproved?: boolean;
+  /**
+   * The principal note the dispatcher cut from this reply and queued for the principal
+   * (#2312). The adapter hands it to the gateway so the send review counts it as evidence
+   * that Curia told the principal; it is never part of the outbound text.
+   */
+  reportedToPrincipal?: string;
 }
 
 // OutboundDeliveredPayload — emitted by OutboundGateway after a successful

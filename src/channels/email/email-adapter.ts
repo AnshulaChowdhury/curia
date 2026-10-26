@@ -1450,6 +1450,8 @@ export class EmailAdapter implements Channel {
         ...(fromName ? { recipientDisplayName: fromName } : {}),
         // The principal approved this text (dispatcher-relay): do not hold it for review again (#2159).
         ...(outbound.payload.principalApproved === true ? { humanApproved: true } : {}),
+        // The note queued for the principal from this reply: evidence for the send review (#2312).
+        ...(outbound.payload.reportedToPrincipal ? { reportedToPrincipal: outbound.payload.reportedToPrincipal } : {}),
       });
     } catch (err) {
       logger.error({ err, threadId }, 'Failed to send email reply');
@@ -1472,6 +1474,7 @@ export class EmailAdapter implements Channel {
       recipientDisplayName?: string;
       /** The principal approved this exact text (#2159). */
       humanApproved?: boolean;
+      reportedToPrincipal?: string;
     },
   ): Promise<void> {
     const { outboundGateway, logger, accountId } = this.config;
@@ -1491,6 +1494,7 @@ export class EmailAdapter implements Channel {
       // A relayed reply: the agent's turn is over, so a held approval wakes the coordinator (#2159).
       postTurn: true,
       ...(context.humanApproved ? { humanApproved: true } : {}),
+      ...(context.reportedToPrincipal ? { reportedToPrincipal: context.reportedToPrincipal } : {}),
       ...(context.recipientSource ? { recipientSource: context.recipientSource } : {}),
       ...(context.recipientDisplayName ? { recipientDisplayName: context.recipientDisplayName } : {}),
       reExecRecipe: {

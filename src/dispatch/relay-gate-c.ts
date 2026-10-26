@@ -176,12 +176,14 @@ export function relaySendOptions(
 ): {
   postTurn: true;
   humanApproved?: true;
+  reportedToPrincipal?: string;
   holdRecipe: { toolName: string; partialPayload: Record<string, unknown>; description: string };
 } {
   const p = outbound.payload;
   return {
     postTurn: true,
     ...(p.principalApproved === true ? { humanApproved: true as const } : {}),
+    ...(p.reportedToPrincipal ? { reportedToPrincipal: p.reportedToPrincipal } : {}),
     holdRecipe: {
       toolName: RELAY_GATE_C_ACTION,
       partialPayload: buildRelayApprovalInput({

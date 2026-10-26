@@ -122,6 +122,17 @@ describe('Dispatcher — note for the principal (prompt trim PR 5)', () => {
     expect(published.indexOf(notification!)).toBeLessThan(published.indexOf(relay!));
   });
 
+  it('hands the note to the relay as what was reported to the principal (#2312)', async () => {
+    const { dispatcher, handlers, published } = harness();
+    seedRouting(dispatcher, 'task-1');
+    await respond(handlers, { taskId: 'task-1', principalNote: 'Provider asked for your number.' });
+    expect(relays(published)[0]!.payload.reportedToPrincipal).toBe('Provider asked for your number.');
+
+    seedRouting(dispatcher, 'task-2');
+    await respond(handlers, { taskId: 'task-2' });
+    expect(relays(published)[1]!.payload).not.toHaveProperty('reportedToPrincipal');
+  });
+
   it('still queues the note when the reply is a decline', async () => {
     const { dispatcher, handlers, published } = harness();
     seedRouting(dispatcher, 'task-1');

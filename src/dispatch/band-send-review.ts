@@ -60,6 +60,8 @@ export interface BandReviewInput {
   principalDirected: boolean;
   /** A dispatcher-relayed reply. Asked the same questions as any send; kept for the logs. */
   postTurn: boolean;
+  /** The note the dispatcher cut from this relayed reply and queued for the principal (#2312); evidence that Curia told them. */
+  reportedToPrincipal?: string;
 }
 
 export type BandReviewReport = { source: 'sent_without_review'; summary: string };
@@ -173,13 +175,18 @@ export class BandSendReview {
     const evidence = await this.deps.evidence.collect(taskIds);
     // Without evidence every claim looks unsupported; that is a review failure, not a bounce.
     if (evidence.unavailable) return { ok: false, failure: 'unreachable' };
+    // The relay's principal note is not under the drafting task in audit_log (its parent is
+    // the agent.response), so it arrives with the send rather than from the collector.
+    const reportsToPrincipal = input.reportedToPrincipal
+      ? [...(evidence.reportsToPrincipal ?? []), input.reportedToPrincipal]
+      : evidence.reportsToPrincipal;
     return this.deps.judge.review({
       questions,
       message,
       recipients: input.recipients,
       ...(input.principalRecipients ? { principalRecipients: input.principalRecipients } : {}),
       band: AutonomyService.bandForScore(input.score),
-      evidence,
+      evidence: { ...evidence, ...(reportsToPrincipal ? { reportsToPrincipal } : {}) },
       conversationId: input.conversationId ?? 'system',
     });
   }

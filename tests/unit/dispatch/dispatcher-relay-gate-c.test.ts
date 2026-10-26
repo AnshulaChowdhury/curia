@@ -259,6 +259,14 @@ describe('relaySendOptions (#2159)', () => {
     });
   });
 
+  it('passes the principal note the reply was cut from as reportedToPrincipal (#2312)', () => {
+    const event = createOutboundMessage({
+      conversationId: 'slack:C1', channelId: 'slack', content: 'x', recipientId: 'U1', parentEventId: 'r',
+      reportedToPrincipal: 'Provider asked for your number.',
+    });
+    expect(relaySendOptions(event, 'U1')).toMatchObject({ reportedToPrincipal: 'Provider asked for your number.' });
+  });
+
   it('carries the principal\'s approval of an approved relay as humanApproved', () => {
     const event = createOutboundMessage({
       conversationId: 'slack:C1', channelId: 'slack', content: 'x', recipientId: 'U1', parentEventId: 'r', principalApproved: true,

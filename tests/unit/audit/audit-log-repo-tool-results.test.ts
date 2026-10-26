@@ -13,6 +13,26 @@ function makeRepo(rows: Record<string, unknown>[]) {
   return { repo: new AuditLogRepo({ query } as unknown as Pool, createSilentLogger()), query };
 }
 
+describe('AuditLogRepo.findPrincipalReportsForTasks (#2312)', () => {
+  it('reads principal.report rows filed under the tasks, newest first, parameterized', async () => {
+    const { repo, query } = makeRepo([]);
+
+    await repo.findPrincipalReportsForTasks(['task-1', 'task-2'], 10);
+
+    const [sql, params] = query.mock.calls[0]!;
+    expect(sql).toMatch(/event_type = 'principal\.report'/);
+    expect(sql).toMatch(/parent_event_id = ANY\(\$1::text\[\]\)/);
+    expect(sql).toMatch(/ORDER BY timestamp DESC, id DESC/);
+    expect(params).toEqual([['task-1', 'task-2'], 10]);
+  });
+
+  it('does not query for no tasks', async () => {
+    const { repo, query } = makeRepo([]);
+    await expect(repo.findPrincipalReportsForTasks([], 10)).resolves.toEqual([]);
+    expect(query).not.toHaveBeenCalled();
+  });
+});
+
 describe('AuditLogRepo.findToolResultsForTasks', () => {
   it('reads results under the tasks\' invokes, newest first, parameterized', async () => {
     const { repo, query } = makeRepo([]);

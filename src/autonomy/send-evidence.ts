@@ -2,7 +2,8 @@
 //
 // Read back from audit_log: the agent.task row (what the turn was answering, and its bound
 // task's progress) and the tool.result rows of its tool calls (task → tool.invoke →
-// tool.result; AuditLogRepo.findToolResultsForTasks). The judge checks claims about the
+// tool.result; AuditLogRepo.findToolResultsForTasks) and the principal.report rows the turn
+// filed (what it told the principal; findPrincipalReportsForTasks, #2312). The judge checks claims about the
 // principal against this; it is passed beside the message and never written into it.
 //
 // Credentials are redacted before the evidence leaves for the judge's model provider, which
@@ -23,6 +24,7 @@ export const EVIDENCE_TOTAL_MAX_CHARS = 12_000;
 // A turn rarely makes more than a few dozen calls; the repo returns the newest first, so a
 // cut keeps the lookups closest to the send.
 const RESULTS_LIMIT = 60;
+const REPORTS_LIMIT = 10;
 
 export interface CollectedEvidence extends BriefEvidence {
   /** True when the audit lookup failed: grounding cannot be judged, so the caller treats it as a judge failure. */
@@ -57,7 +59,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 export class SendEvidenceCollector {
   constructor(private readonly deps: {
-    auditLogRepo: Pick<AuditLogRepo, 'findById' | 'findToolResultsForTasks'>;
+    auditLogRepo: Pick<AuditLogRepo, 'findById' | 'findToolResultsForTasks' | 'findPrincipalReportsForTasks'>;
     /** The injected "## Who you serve" block, read per call so identity hot-reloads (#1514) apply. */
     principalBlock: () => string | null;
     logger: Logger;
@@ -103,8 +105,17 @@ export class SendEvidenceCollector {
         toolResults.push({ toolName, result: text });
       }
 
+      // What the turn told the principal supports "I've passed that on" (#2312). A throw here
+      // lands in the catch below: the same unavailable evidence as a failed tool-result read.
+      const reportRows = await this.deps.auditLogRepo.findPrincipalReportsForTasks(taskEventIds, REPORTS_LIMIT);
+      const reportsToPrincipal = reportRows
+        .map((r) => r.payload['summary'])
+        .filter((s): s is string => typeof s === 'string' && s.length > 0)
+        .map((s) => clip(redactSecrets(s), EVIDENCE_RESULT_MAX_CHARS));
+
       return {
         unavailable: false,
+        ...(reportsToPrincipal.length > 0 ? { reportsToPrincipal } : {}),
         ...(typeof content === 'string' ? { taskContent: clip(redactSecrets(content), EVIDENCE_RESULT_MAX_CHARS) } : {}),
         ...(progress !== undefined ? { taskProgress: clip(redactSecrets(JSON.stringify(progress)), EVIDENCE_RESULT_MAX_CHARS) } : {}),
         toolResults,

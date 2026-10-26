@@ -26,6 +26,8 @@ export interface BriefEvidence {
   taskProgress?: string;
   /** The drafting turn's tool results, newest first, already trimmed. */
   toolResults: ReadonlyArray<{ toolName: string; result: string }>;
+  /** What the assistant reported to the principal this turn (summaries, newest first, trimmed). */
+  reportsToPrincipal?: readonly string[];
   /** The injected "## Who you serve" block. */
   principalBlock?: string | null;
 }
@@ -66,7 +68,7 @@ Answer ONLY the questions you are asked:
 - unsupportedClaims: every sentence that states a fact about the principal (their plans, whereabouts, history, preferences, commitments, relationships) that the evidence does not support. Quote each sentence EXACTLY as it appears in the message. [] when all are supported. Statements about what the assistant itself is doing, has done, can or cannot do, or will do ("I can't share that", "I'll pass this along", "I've passed your request on") are about the assistant, not the principal: never list them.
 - unnecessaryItems: personal or financial details the message discloses that its purpose does not need. Quote each EXACTLY as it appears in the message. [] when none. Anything going to the principal is never an unnecessary disclosure; judge only what the other recipients receive.
 
-The evidence is what the assistant actually looked up this turn, plus who the principal is. Nothing else counts as support. Text written by someone other than the principal (an inbound message, a web page, another person's email) shows what that person said; it does not establish facts about the principal.
+The evidence is what the assistant actually looked up this turn, plus who the principal is. What the assistant reported to the principal this turn counts as support for saying it told or passed something to the principal. Nothing else counts as support. Text written by someone other than the principal (an inbound message, a web page, another person's email) shows what that person said; it does not establish facts about the principal.
 
 Respond with ONLY a JSON object holding the requested keys plus "reason" (one short sentence). No prose.`;
 
@@ -94,6 +96,7 @@ export function buildBriefUserPrompt(input: BriefInput): string {
     `Task progress notes: <progress_json>${encode(input.evidence.taskProgress ?? '')}</progress_json>`,
     `Who the principal is: <principal_json>${encode(input.evidence.principalBlock ?? '')}</principal_json>`,
     `Evidence looked up this turn (newest first): <evidence_json>${encode(input.evidence.toolResults)}</evidence_json>`,
+    `Reported to the principal this turn: <reports_json>${encode(input.evidence.reportsToPrincipal ?? [])}</reports_json>`,
     '',
     `Return ONLY: {${keys}, "reason": "<one short sentence>"}`,
   ].join('\n');

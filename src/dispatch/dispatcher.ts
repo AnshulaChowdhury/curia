@@ -2012,6 +2012,8 @@ export class Dispatcher {
       // this through so the email adapter can pass it to gateway.send() for action_log context.
       taskEventId: event.parentEventId ?? undefined,
       contentBlockSalvage: routing.contentBlockSalvage,
+      // The note queued for the principal above: evidence for the send review (#2312).
+      ...(event.payload.principalNote !== undefined && { reportedToPrincipal: event.payload.principalNote }),
     });
 
     // Track for content-filter block handling (#1355) — cleared on delivery or block.
