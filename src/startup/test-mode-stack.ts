@@ -12,7 +12,11 @@
 //
 //   - No transport clients. The OutboundGateway has no Nylas, Signal, Slack or SMS
 //     client, and TestModeStackOptions has no field to pass one. Every send/draft
-//     fails inside the gateway before it reaches a network call.
+//     fails inside the gateway before it reaches a network call. With `recordSends`
+//     (#2312) a second gateway gets production's review and recording fakes
+//     (test-mode-sends.ts), on a second ExecutionLayer the caller routes chosen calls
+//     to: what passes is handed to the caller's recorder, still with no real client
+//     constructed and no outbound queue. The layer agents call keeps the no-send one.
 //   - No channel adapters. outbound.message events stay on the in-process bus.
 //   - Withheld credentials. Skills that call a provider directly with a declared
 //     secret (e.g. ceo-inbox → Nylas) get a "withheld in test mode" error. Only the
@@ -25,10 +29,12 @@
 //     need them fail with a missing-capability error; scenario tests stub them.
 //     `disabledTools` lists them per agent. Runtimes see pending bullpen threads but
 //     never write read watermarks, which would hide threads from the real agent.
-//     Two of these a caller can opt into when it owns the rows they write (the
-//     scenario suite's real delegation, #2027): `wrapOutboundContext` wires an
-//     outbound-context service the caller narrows, and `delegationClaims` wires
-//     production's pending_delegations claims for `delegate`.
+//     Three of these a caller can opt into when it owns the rows they write (the
+//     scenario suite's real delegation, #2027, and through-gateway sends, #2312):
+//     `wrapOutboundContext` wires an outbound-context service the caller narrows,
+//     `delegationClaims` wires production's pending_delegations claims for `delegate`,
+//     and `recordSends` wires the action log (held sends' approval rows) beside the
+//     recording gateway.
 //   - No shared-setting writes. Smoke turns run with principal standing, so agents get
 //     read-only views of the autonomy score and office identity (a real instance would
 //     send under a changed score), and no working-docs repo (ceo-inbox shadow drafts
@@ -57,7 +63,26 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import * as path from 'node:path';
-import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveLateDeliveryConfig, resolveTasksConfig, resolveTurnInjectionConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
+import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveIdentityGateMode, resolveLateDeliveryConfig, resolveRelayBudgetConfig, resolveTasksConfig, resolveTurnInjectionConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
+import { ActionLogRepo } from '../autonomy/action-log-repo.js';
+import { ApprovalDelivery, type ApprovalDisplay } from '../autonomy/approval-delivery.js';
+import { FailOpenLimiter } from '../autonomy/band-policy.js';
+import { DisclosureDecisionRecorder, DisclosureDecisionsRepo } from '../autonomy/disclosure-decisions.js';
+import type { EscalationJudge } from '../autonomy/escalation-judge.js';
+import { RelayBudget } from '../autonomy/relay-budget.js';
+import { SendEvidenceCollector } from '../autonomy/send-evidence.js';
+import { LLMProviderRouter } from '../agents/llm/provider-router.js';
+import { formatWhoYouServeBlock } from '../agents/principal-contact-block.js';
+import { TRIGGER_GUIDANCE_MARKER_SOURCES } from '../agents/prompts/trigger-guidance-sources.js';
+import { principalOrgDomainSet } from '../contacts/non-org-domains.js';
+import { TaskRepo } from '../db/task-repo.js';
+import { BandSendReview } from '../dispatch/band-send-review.js';
+import { buildEscalationJudge, buildOutboundContentFilter, EscalationJudgeConfigError } from '../dispatch/outbound-filter-wiring.js';
+import { OutboundLlmJudge, type JudgeConfig } from '../dispatch/outbound-judge.js';
+import { PiiRedactor } from '../dispatch/pii-redactor.js';
+import { extractPromptExfiltrationMarkers } from '../dispatch/prompt-exfiltration-markers.js';
+import { parseExtraPiiPatterns } from '../pii/scrubber.js';
+import { createRecordingOutboundGateway, type SendRecorder } from './test-mode-sends.js';
 import { createVerificationRuntime, type VerificationRuntime } from '../verification/index.js';
 import { createLogger, type Logger } from '../logger.js';
 import { createPool, type DbPool } from '../db/connection.js';
@@ -93,10 +118,10 @@ import { ConfidencePipeline } from '../contacts/confidence-pipeline.js';
 import { loadAuthConfig } from '../contacts/config-loader.js';
 import { AuthorizationService } from '../contacts/authorization.js';
 import type { TrustScorerWeights } from '../dispatch/trust-scorer.js';
-import type { ChannelIdentity, ChannelPolicyConfig, PrincipalPrimaryEmailRef, PrincipalProfileRef } from '../contacts/types.js';
+import type { ChannelIdentity, ChannelPolicyConfig, PrincipalEmailRef, PrincipalPrimaryEmailRef, PrincipalProfileRef } from '../contacts/types.js';
 import { OutboundContextService } from '../dispatch/outbound-context.js';
 import { TaskOutreachRepo } from '../dispatch/task-outreach.js';
-import { TaskOutreachService } from '../dispatch/task-outreach-capability.js';
+import { TaskOutreachService, taskLookupFrom } from '../dispatch/task-outreach-capability.js';
 import { OutboundContentFilter } from '../dispatch/outbound-filter.js';
 import { TurnLanes } from '../dispatch/turn-lanes.js';
 import { createInboundScanner } from '../dispatch/security-config-loader.js';
@@ -173,8 +198,12 @@ export const TEST_MODE_PASSTHROUGH_SECRETS: ReadonlySet<string> = new Set([
  *
  * The wrapped layer is what AgentRuntime calls, so tool.invoke / tool.result bus
  * events and the production <task_error> formatting are unchanged.
+ *
+ * `reviewLayer` exists only with `recordSends` (#2312): a second, unwrapped layer whose sends
+ * go through production's review to the recording gateway. The wrapper routes the calls it
+ * chooses there (the scenario suite: a through-gateway case's sends and approvals).
  */
-export type ExecutionLayerWrapper = (layer: ExecutionLayer) => ExecutionLayer;
+export type ExecutionLayerWrapper = (layer: ExecutionLayer, reviewLayer?: ExecutionLayer) => ExecutionLayer;
 
 export interface TestModeStackOptions {
   /** Defaults to loadConfig(). Copied, never mutated — vault values land on the copy. */
@@ -294,6 +323,23 @@ export interface TestModeStackOptions {
    * `autonomy:` cases, per attempt). Held in memory only; see FixtureAutonomyService.
    */
   autonomy?: AutonomyFixture;
+  /**
+   * Run sends through production's gateway review and hand what passes to this recorder
+   * instead of failing them (#2312): the scenario suite's `through_gateway` cases. The stack
+   * then builds the recording gateway (test-mode-sends.ts) wired as src/index.ts wires the
+   * real one — PII redactor, content filter with its judges, band review over the drafting
+   * turn's evidence, the action log — and a second ExecutionLayer over it with the action
+   * log, approval delivery, disclosure decisions and the escalation judge, so a held send can
+   * be delivered to the principal and approved. wrapExecutionLayer receives that layer and
+   * routes to it only the calls it chooses; the layer agents call is unchanged. Still no
+   * transport client and no outbound queue. Absent: no review layer (smoke, the scripts).
+   */
+  recordSends?: SendRecorder;
+  /**
+   * Narrow the action log the gateway and the ExecutionLayer use (recordSends only). The
+   * scenario suite narrows approve-action's "the sole pending approval" to the calling run's.
+   */
+  wrapActionLog?: (repo: ActionLogRepo) => ActionLogRepo;
 }
 
 /** A pinned autonomy score and the gating its prompt block describes. */
@@ -400,7 +446,10 @@ export interface TestModeStack {
   skillRegistry: SkillRegistry;
   /** The layer agents call — the wrapped one when wrapExecutionLayer was given. */
   executionLayer: ExecutionLayer;
-  /** No transport clients: every send fails before any network call. */
+  /**
+   * No transport clients: every send fails before any network call. (With recordSends, the
+   * review layer's sends go through a recording gateway of their own.)
+   */
   outboundGateway: OutboundGateway;
   contactService: ContactService;
   contactResolver: ContactResolver;
@@ -541,6 +590,194 @@ export function createNoSendOutboundGateway(deps: {
     principalIdentities: deps.principalIdentities,
     autonomyService: deps.autonomyService,
   });
+}
+
+/** What buildRecordingSends hands the stack: the gateway, and the ExecutionLayer's extra options. */
+interface RecordingSends {
+  gateway: OutboundGateway;
+  executionOptions: Pick<
+    NonNullable<ConstructorParameters<typeof ExecutionLayer>[2]>,
+    'actionLogRepo' | 'approvalDelivery' | 'disclosureDecisions' | 'escalationJudge' | 'gating' | 'sendEvidence'
+  >;
+  /** Task reads (getTask, project root) for outreach titles and band evidence. Never handed to agents. */
+  taskReads: Pick<TaskRepo, 'getTask' | 'resolveProjectRootTaskId'>;
+}
+
+/**
+ * Production's send review, built for a recording stack (src/index.ts ~1479-1946 and the
+ * approval wiring after it). Differences, each deliberate:
+ *   - Recording transports and no outbound queue (test-mode-sends.ts).
+ *   - No confidence pipeline or export controls on the gateway: both write rows a real
+ *     instance shares (contact confidence, export events) for sends that never left.
+ *   - The fail-open cap only logs when it trips; production also emails the principal.
+ *   - A judge whose config cannot be built is a warning, not a boot failure: the review then
+ *     runs as production's does with that judge off (Gate C escalates ambiguous actions,
+ *     band review holds).
+ */
+function buildRecordingSends(deps: {
+  recorder: SendRecorder;
+  wrapActionLog?: (repo: ActionLogRepo) => ActionLogRepo;
+  pool: DbPool;
+  bus: EventBus;
+  logger: Logger;
+  config: Config;
+  yamlConfig: YamlConfig;
+  configDir: string;
+  modelRegistry: ModelRegistry;
+  providerRegistry: Map<string, LLMProvider>;
+  contactService: ContactService;
+  principalIdentities: ChannelIdentity[];
+  principalPrimaryEmail: PrincipalPrimaryEmailRef;
+  principalProfile: PrincipalProfileRef;
+  officeIdentity: OfficeIdentity;
+  coordinatorPrompt: string | undefined;
+  emailAccounts: ReadonlyArray<{ name: string; selfEmail: string }>;
+  selfEmails: string[];
+  signalPhoneNumber: string | undefined;
+  autonomyService: AutonomyService;
+  conversationEntities: ConversationEntityState;
+  taskOutreachRepo: TaskOutreachRepo;
+  outreachNonOrgDomains: ReadonlySet<string>;
+  warnings: string[];
+}): RecordingSends {
+  const { pool, bus, logger, yamlConfig, modelRegistry, providerRegistry, warnings } = deps;
+  const gating = resolveAutonomyGating(yamlConfig.autonomy);
+
+  let escalationJudge: EscalationJudge | undefined;
+  try {
+    escalationJudge = buildEscalationJudge({ yaml: yamlConfig.escalation?.judge, modelRegistry, providerRegistry, bus, logger });
+  } catch (err) {
+    if (!(err instanceof EscalationJudgeConfigError)) throw err;
+    warnings.push(`Escalation judge off for recorded sends: ${err.message}`);
+  }
+
+  // The content filter's Stage 2 judge, from filter.llmJudge as production reads it.
+  let outboundJudge: OutboundLlmJudge | undefined;
+  const judgeYaml = yamlConfig.filter?.llmJudge;
+  if (judgeYaml?.enabled ?? true) {
+    const judgeConfig: JudgeConfig = {
+      enabled: true,
+      model: judgeYaml?.model ?? 'claude-haiku-5-5',
+      timeoutMs: judgeYaml?.timeout_ms ?? 5000,
+      failMode: judgeYaml?.failMode ?? 'split',
+    };
+    const provider = modelRegistry.isKnownModel(judgeConfig.model) ? modelRegistry.getProvider(judgeConfig.model) : undefined;
+    if (provider && providerRegistry.has(provider)) {
+      outboundJudge = new OutboundLlmJudge(new LLMProviderRouter(modelRegistry, providerRegistry), judgeConfig, bus, logger, modelRegistry);
+    } else {
+      warnings.push(`Content-filter judge off for recorded sends: model '${judgeConfig.model}' has no registered provider`);
+    }
+  }
+
+  // Read per call, as production's mutable ref is: identity binds update it in place.
+  const principalEmail: PrincipalEmailRef = {
+    get current(): string { return deps.principalPrimaryEmail.current ?? ''; },
+  };
+  const contentFilter = buildOutboundContentFilter({
+    systemPromptMarkers: extractPromptExfiltrationMarkers(deps.officeIdentity, deps.coordinatorPrompt, TRIGGER_GUIDANCE_MARKER_SOURCES),
+    ceoEmail: principalEmail,
+    ownEmails: deps.selfEmails,
+    judge: outboundJudge,
+    escalationJudge,
+    logger,
+    gating,
+  });
+
+  // The same redaction config and extra patterns production reads (src/index.ts ~1607).
+  const extraPatterns = (yamlConfig.pii?.extra_patterns ?? []).length > 0
+    ? parseExtraPiiPatterns(yamlConfig.pii?.extra_patterns ?? [], path.join(deps.configDir, 'default.yaml'))
+    : [];
+  const piiRedactor = new PiiRedactor({
+    config: {
+      enabled: yamlConfig.pii?.outbound_redaction?.enabled ?? true,
+      default: (yamlConfig.pii?.outbound_redaction?.default ?? 'block') as 'block' | 'allow',
+      channel_policies: Object.fromEntries(
+        Object.entries(yamlConfig.pii?.outbound_redaction?.channel_policies ?? {}).map(
+          ([ch, policy]) => [ch, { allow: policy.allow ?? [] }],
+        ),
+      ),
+    },
+    bus,
+    logger,
+    extraPatterns,
+  });
+
+  const realActionLog = new ActionLogRepo(pool, logger);
+  const actionLogRepo = deps.wrapActionLog ? deps.wrapActionLog(realActionLog) : realActionLog;
+  // Reads only: the band evidence and outreach titles. Agents never get a task repo here.
+  const taskReads = new TaskRepo(pool, bus, logger, deps.config.timezone, undefined, deps.taskOutreachRepo);
+  const disclosureDecisionsRepo = new DisclosureDecisionsRepo(pool);
+  const disclosureDecisions = new DisclosureDecisionRecorder({
+    repo: disclosureDecisionsRepo, taskOutreachRepo: deps.taskOutreachRepo, logger,
+  });
+  const sendEvidence = new SendEvidenceCollector({
+    auditLogRepo: new AuditLogRepo(pool, logger),
+    taskRepo: taskReads,
+    taskOutreachRepo: deps.taskOutreachRepo,
+    disclosureDecisionsRepo,
+    principalBlock: () => formatWhoYouServeBlock(deps.principalIdentities, deps.principalPrimaryEmail.current, deps.principalProfile.current),
+    logger,
+  });
+  // Built whatever the configured gating: a case pins band per attempt, and the gateway
+  // reads the gating per send (#2312).
+  const bandReview = new BandSendReview({
+    judge: escalationJudge,
+    nonOrgDomains: deps.outreachNonOrgDomains,
+    evidence: sendEvidence,
+    limiter: new FailOpenLimiter(),
+    onLimiterTripped: async () => {
+      logger.error('band review (test mode): fail-open cap tripped — sends are holding for approval');
+    },
+    contactTier: async (contactId) => (await deps.contactService.getContact(contactId))?.tier ?? null,
+    logger,
+  });
+  const persona = deps.officeIdentity.assistant;
+  const gateway = createRecordingOutboundGateway({
+    recorder: deps.recorder,
+    emailAccounts: deps.emailAccounts,
+    ...(deps.signalPhoneNumber ? { signalPhoneNumber: deps.signalPhoneNumber } : {}),
+    contactService: deps.contactService,
+    bus,
+    logger,
+    principalIdentities: deps.principalIdentities,
+    autonomyService: deps.autonomyService,
+    review: {
+      contentFilter,
+      piiRedactor,
+      bandReview,
+      actionLogRepo,
+      conversationEntities: deps.conversationEntities,
+      identityGate: resolveIdentityGateMode(yamlConfig.filter),
+      relayBudget: new RelayBudget({ perHour: resolveRelayBudgetConfig(yamlConfig.autonomy).perHour }),
+      agentPersona: {
+        displayName: persona.name,
+        title: persona.title,
+        ...(persona.emailSignature ? { emailSignature: persona.emailSignature } : {}),
+      },
+      gating,
+    },
+  });
+  const delivery = new ApprovalDelivery({
+    actionLogRepo, outboundGateway: gateway, principalIdentities: deps.principalIdentities, principalEmail, logger,
+  });
+  // Each raise site (the gateway's holds, the ExecutionLayer's gates) registers what the
+  // principal will be shown; the recorder sees it too, so a `held` check can read the
+  // preamble the approval carries. Everything else is the real delivery.
+  const display = deps.recorder.display?.bind(deps.recorder);
+  const approvalDelivery = display
+    ? Object.assign(Object.create(delivery) as ApprovalDelivery, {
+        registerDisplay: (ref: string, shown: ApprovalDisplay): void => {
+          delivery.registerDisplay(ref, shown);
+          display(ref, shown);
+        },
+      })
+    : delivery;
+  gateway.setApprovalDelivery(approvalDelivery);
+  return {
+    gateway,
+    executionOptions: { actionLogRepo, approvalDelivery, disclosureDecisions, escalationJudge, gating, sendEvidence },
+    taskReads,
+  };
 }
 
 /**
@@ -902,9 +1139,11 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     // Own mailboxes for "## Your Contact Details" — production's resolution (enabled
     // + a vault grant) when the vault is available. The grants are read, never used.
     const emailAccountsRepo = new EmailAccountsRepo(pool);
-    const selfEmails = vault
-      ? (await resolveEmailAccounts(emailAccountsRepo, vault, logger)).map(a => a.selfEmail)
-      : (await emailAccountsRepo.list()).filter(a => a.enabled).map(a => a.selfEmail);
+    const emailAccounts: Array<{ name: string; selfEmail: string }> = (vault
+      ? await resolveEmailAccounts(emailAccountsRepo, vault, logger)
+      : (await emailAccountsRepo.list()).filter(a => a.enabled)
+    ).map(a => ({ name: a.name, selfEmail: a.selfEmail }));
+    const selfEmails = emailAccounts.map(a => a.selfEmail);
 
     // What agents get: reads only (see header). The real services stay on the
     // returned stack so tests can seed state through them.
@@ -961,14 +1200,40 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     bus.setAgentOwner((agentId) => agentRegistry.has(agentId));
 
     // ── Execution layer ────────────────────────────────────────────────────
+    // Task outreach (#2312), as src/index.ts wires it, so sends and record-outreach behave as
+    // in production. With no taskRepo here, rows carry no task title and nothing closes them;
+    // a recording stack reads titles through its read-only task repo.
+    const taskOutreachRepo = new TaskOutreachRepo(pool);
+    const outreachNonOrgDomains = principalOrgDomainSet(yamlConfig.security?.principal_org_domains ?? []);
+    const recording = options.recordSends
+      ? buildRecordingSends({
+          recorder: options.recordSends,
+          ...(options.wrapActionLog ? { wrapActionLog: options.wrapActionLog } : {}),
+          pool, bus, logger, config, yamlConfig, configDir,
+          modelRegistry, providerRegistry,
+          contactService, principalIdentities, principalPrimaryEmail, principalProfile,
+          officeIdentity: officeIdentityService.get(),
+          coordinatorPrompt: agentConfigs.find(c => c.name === 'coordinator')?.system_prompt,
+          emailAccounts, selfEmails,
+          signalPhoneNumber,
+          autonomyService: agentAutonomy,
+          conversationEntities,
+          taskOutreachRepo,
+          outreachNonOrgDomains,
+          warnings,
+        })
+      : undefined;
+    // The layer agents call always gets the no-send gateway. A recording stack builds a
+    // second layer for the sends it reviews (below), so everything else runs as before.
     const outboundGateway = createNoSendOutboundGateway({
       contactService, bus, logger, principalIdentities, autonomyService: agentAutonomy,
     });
     const lateDelivery = resolveLateDeliveryConfig(yamlConfig.delegate);
     // Deliberately absent (see header — deferred work a real instance would act on):
-    // schedulerService, taskRepo, actionLogRepo, bullpenService, workingDocsRepo,
-    // approvalTrigger, nylasCalendarClient, browserService; and, unless the caller opts
-    // in, outboundContextService and openDelegationLookup.
+    // schedulerService, taskRepo, bullpenService, workingDocsRepo, approvalTrigger,
+    // nylasCalendarClient, browserService; and, unless the caller opts in,
+    // outboundContextService, openDelegationLookup, and (recordSends) the action log,
+    // approval delivery, disclosure decisions and the escalation judge.
     const outboundContextService = options.wrapOutboundContext
       ? options.wrapOutboundContext(new OutboundContextService(pool, logger))
       : undefined;
@@ -988,16 +1253,15 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       pool, logger, resolveVerificationConfig(yamlConfig.verification), principalIdentities, new Set<string>(),
     );
     const verification = options.wrapVerification ? options.wrapVerification(baseVerification) : baseVerification;
-    // Task outreach (#2312), as src/index.ts wires it, so sends and record-outreach behave as
-    // in production. With no taskRepo here, rows carry no task title and nothing closes them.
-    const taskOutreach = new TaskOutreachService(new TaskOutreachRepo(pool), {
+    const outreachDeps = {
       principalIdentities,
       selfEmails,
       selfPhones: [signalPhoneNumber, smsFromNumber].filter((n): n is string => typeof n === 'string' && n !== ''),
       nonOrgDomains: principalOrgDomainSet(yamlConfig.security?.principal_org_domains ?? []),
       log: logger,
-    });
-    const baseExecutionLayer = new ExecutionLayer(toolRegistry, logger, {
+    };
+    const taskOutreach = new TaskOutreachService(taskOutreachRepo, outreachDeps);
+    const layerOptions: NonNullable<ConstructorParameters<typeof ExecutionLayer>[2]> = {
       bus,
       agentRegistry,
       contactService,
@@ -1026,9 +1290,26 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       taskOutreach,
       ...(outboundContextService ? { outboundContextService } : {}),
       ...(openDelegationLookup ? { openDelegationLookup } : {}),
-    });
+    };
+    const baseExecutionLayer = new ExecutionLayer(toolRegistry, logger, layerOptions);
+    // A recording stack's review layer (#2312): the same layer with what production's gets for
+    // sends and approvals — the recording gateway, the action log, approval delivery,
+    // disclosure decisions, the escalation judge and band evidence — so a held send can be
+    // delivered to the principal and approved on a later live turn. Only calls the wrapper
+    // routes here see any of it; approve-action's replay runs here too (it re-invokes the
+    // layer it was called on).
+    const reviewExecutionLayer = recording
+      ? new ExecutionLayer(toolRegistry, logger, {
+          ...layerOptions,
+          outboundGateway: recording.gateway,
+          taskOutreach: new TaskOutreachService(taskOutreachRepo, {
+            ...outreachDeps, lookupTask: taskLookupFrom(recording.taskReads), nonOrgDomains: outreachNonOrgDomains,
+          }),
+          ...recording.executionOptions,
+        })
+      : undefined;
     const executionLayer = options.wrapExecutionLayer
-      ? options.wrapExecutionLayer(baseExecutionLayer)
+      ? options.wrapExecutionLayer(baseExecutionLayer, reviewExecutionLayer)
       : baseExecutionLayer;
     // Catch a wrapper that forwards only invoke() at boot, not mid-task on a wake path.
     const missingMethods = EXECUTION_LAYER_METHODS.filter(

@@ -374,7 +374,6 @@ export interface OutboundGatewayConfig {
   relayBudget?: RelayBudget;
 }
 
-/** What a band hold replays on approval: the same shape as reExecRecipe (#2159). */
 /** One send's autonomy config read (#2312). `failed`: the read threw (`error`); config is then null. */
 interface AutonomyRead {
   config: AutonomyConfig | null;
@@ -382,6 +381,7 @@ interface AutonomyRead {
   error?: unknown;
 }
 
+/** What a band hold replays on approval: the same shape as reExecRecipe (#2159). */
 interface SendRecipe {
   toolName: string;
   partialPayload?: Record<string, unknown>;

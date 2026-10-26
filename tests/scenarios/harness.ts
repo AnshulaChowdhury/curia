@@ -26,6 +26,12 @@
 // `delegate` inbound publishes the agent.task the delegate handler would, and the run
 // captures that specialist's turn the way it captures the coordinator's. A `bullpen` or
 // `scheduler` inbound reaches it the way a thread reply or its own schedule does.
+//
+// A case with `through_gateway: true` (#2312) runs its sends' real handlers through
+// production's gateway review. The stack's recording transports put what passes in the run's
+// scope (the case context finds it), approvals the review raises land in the action log under
+// the run's conversation, and approve-action on a later live principal turn (a `followup`)
+// acts only on the run's own. readGatewayOutcome reads all of it before cleanup removes it.
 import { randomUUID } from 'node:crypto';
 import { createAgentDiscuss, createAgentTask, createInboundMessage, type InjectionDrainPoint } from '../../src/bus/events.js';
 import { stampOriginator } from '../../src/contacts/stamp-originator.js';
@@ -43,6 +49,10 @@ import { loadConfig } from '../../src/config.js';
 import { BullpenDispatcher } from '../../src/dispatch/bullpen-dispatcher.js';
 import { Dispatcher } from '../../src/dispatch/dispatcher.js';
 import { PrincipalAcquaintanceCheck } from '../../src/contacts/principal-acquaintance.js';
+import type { NylasMessage } from '../../src/channels/email/nylas-client.js';
+import { principalOrgDomainSet } from '../../src/contacts/non-org-domains.js';
+import { OutreachMatcher } from '../../src/dispatch/outreach-matcher.js';
+import { TaskOutreachRepo } from '../../src/dispatch/task-outreach.js';
 
 /**
  * The scenario office's `security.principal_org_domains`: the test principal is
@@ -84,8 +94,11 @@ import {
   createOutboundContextService,
   deletePendingDelegations,
   resolveEnvelope,
+  readGatewayOutcome,
   resolveSender,
   SCENARIO_CURIA_EMAIL,
+  scopedActionLog,
+  scopedOutreachRepo,
   scopedBrowserSessionAlive,
   scopedBullpen,
   scopedOutboundContext,
@@ -404,7 +417,7 @@ export async function createScenarioHarness(
     ...(options.configDir ? { configDir: options.configDir } : {}),
     ...(options.mcpSnapshotDirs ? { mcpSnapshotDirs: options.mcpSnapshotDirs } : {}),
     ...(options.officeIdentity ? { officeIdentity: options.officeIdentity } : {}),
-    wrapExecutionLayer: (layer) => controller.wrap(layer),
+    wrapExecutionLayer: (layer, reviewLayer) => controller.wrap(layer, reviewLayer),
     wrapBullpenService: (bullpen) => scopedBullpen(bullpen, currentScope),
     // Times each model call against its run, and refuses a cancelled run's calls.
     wrapLlmProvider: (provider) => guardProvider(provider, context.current),
@@ -419,6 +432,20 @@ export async function createScenarioHarness(
     wrapVerification: (runtime) => scopedVerification(runtime, currentScope),
     browserSessionAlive: scopedBrowserSessionAlive(currentScope),
     delegationClaims: true,
+    // Through-gateway sends (#2312): production's review, recording transports. What passes
+    // lands in the calling run's scope; a send outside every run fails. Non-opted cases never
+    // reach the gateway (the stub layer answers or refuses their sends), so they are unchanged.
+    recordSends: {
+      record: (send) => {
+        const scope = currentScope();
+        if (!scope) throw new Error('scenario harness: a send outside every scenario run');
+        scope.deliveries.push(send);
+      },
+      message: (messageId) => currentScope()?.inboundMessages.get(messageId),
+      display: (shortRef, shown) => { currentScope()?.approvalDisplays.set(shortRef, shown); },
+    },
+    // approve-action's "the sole pending approval" means the run's own.
+    wrapActionLog: (repo) => scopedActionLog(repo, currentScope),
     observeBus: (bus) => {
       delegationCapture = createDelegationCapture(
         bus,
@@ -469,6 +496,22 @@ export async function createScenarioHarness(
     selfEmail: SCENARIO_CURIA_EMAIL,
     // Relay Gate C follows the case's autonomy fixture, read per relay (#2312).
     autonomyService: stack.autonomyService,
+    // Production's outreach link (#2312) over the run's own rows: the outreach it seeded and
+    // what its sends recorded. With none (every case without seed.outreach or sends) nothing
+    // links, as before. No model step: production's last, weak-only match runs on infraLlm,
+    // which test mode does not build.
+    outreachMatcher: new OutreachMatcher({
+      repo: scopedOutreachRepo(new TaskOutreachRepo(stack.pool), currentScope),
+      infraLlm: undefined,
+      logger,
+      // The stack's own (production's config), as its band review reads them.
+      nonOrgDomains: principalOrgDomainSet(stack.yamlConfig.security?.principal_org_domains ?? []),
+      taskStatus: async (taskId) => {
+        if (!currentScope()?.taskIds.has(taskId)) return null;
+        const { rows } = await stack.pool.query<{ status: string }>(`SELECT status FROM tasks WHERE id = $1`, [taskId]);
+        return rows[0]?.status ?? null;
+      },
+    }),
     // Production's check against the run's own seed: the principal's email identities as
     // the stack read them, and a mailbox whose Sent folder is the run's principal_wrote
     // contacts. A fresh check per lookup, so no answer is cached across runs (#2227).
@@ -800,7 +843,8 @@ export async function createScenarioHarness(
             : `scenario-${randomUUID()}`;
       conversationId = runConversationId;
 
-      controller.beginRun(stubTable, runConversationId, { realDelegation });
+      scope.rootConversation = runConversationId;
+      controller.beginRun(stubTable, runConversationId, { realDelegation, throughGateway: scenario.throughGateway === true });
       // Armed before the inbound is published. A fast first tool call must
       // already be held, or the follow-up lands after the model has moved on.
       if (inbound.followup?.after === 'first_tool_call') {
@@ -872,13 +916,18 @@ export async function createScenarioHarness(
             parentEventId: randomUUID(),
           }));
         } else if (sender !== 'bullpen' && 'channelId' in sender) {
+          const nylasMessageId = inbound.email?.nylasMessageId ?? `scenario-msg-${randomUUID()}`;
+          // What the fake mailbox serves an email-reply to this message (#2312).
+          if (sender.channelId === 'email' && scenario.throughGateway) {
+            scope.inboundMessages.set(nylasMessageId, inboundNylasMessage(nylasMessageId, sender.senderId, inbound, envelope));
+          }
           const hostInbound = createInboundMessage({
             conversationId: runConversationId,
             channelId: sender.channelId,
             senderId: sender.senderId,
             content: inbound.content,
             ...(inbound.email?.account ? { accountId: inbound.email.account } : {}),
-            ...(sender.channelId === 'email' ? { metadata: emailMetadata(sender.senderId, inbound.email, envelope) } : {}),
+            ...(sender.channelId === 'email' ? { metadata: emailMetadata(sender.senderId, inbound.email, envelope, nylasMessageId) } : {}),
             // A scenario inbound is a one-to-one message, and the adapters say so (#2261).
             ...(sender.channelId === 'signal' ? { metadata: { isGroup: false } } : {}),
             ...(sender.channelId === 'slack' ? { metadata: { isDm: true } } : {}),
@@ -1033,6 +1082,8 @@ export async function createScenarioHarness(
       }
 
       const merged = mergeCalls(inRunOrder(outcome.calls, trace, agent), stubbedCalls);
+      // Read after the run's turns settled, before cleanup removes the rows (#2312).
+      const gateway = scenario.throughGateway ? await readGatewayOutcome(stack, scenario, seeded, scope) : undefined;
       // A scoped view failing means the case ran without its premise (no block, no thread).
       const premiseError = scope.errors.length > 0 ? `seeded state was not visible: ${scope.errors.join('; ')}` : undefined;
       // A slow specialist is not a stuck coordinator (#2027): say which it was.
@@ -1057,6 +1108,7 @@ export async function createScenarioHarness(
         ...(timeoutKind ? { timeoutKind } : {}),
         ...(injectionDrainPoints !== undefined ? { injectionDrainPoints: [...injectionDrainPoints] } : {}),
         ...(realDelegation ? { delegations: trace?.delegations ?? [] } : {}),
+        ...(gateway ? { gateway } : {}),
         usage: state.usage.snapshot(),
         providerRetries: [],
       };
@@ -1139,6 +1191,7 @@ function emailMetadata(
   senderEmail: string,
   email: ScenarioCase['inbound']['email'],
   envelope: ResolvedEnvelope | undefined,
+  nylasMessageId: string,
 ): Record<string, unknown> {
   return {
     participants: [
@@ -1160,9 +1213,43 @@ function emailMetadata(
         .filter(a => a !== senderEmail.toLowerCase() && a !== SCENARIO_CURIA_EMAIL.toLowerCase()),
     ).size,
     ...(email?.senderVerified !== undefined ? { senderVerified: email.senderVerified } : {}),
-    nylasMessageId: email?.nylasMessageId ?? `scenario-msg-${randomUUID()}`,
+    nylasMessageId,
     isAutoGenerated: email?.autoGenerated ?? false,
     autoGeneratedSignals: email?.autoGeneratedSignals ?? [],
+  };
+}
+
+/**
+ * The inbound email as the fake mailbox returns it (#2312): what an email-reply's Gate C and
+ * handler fetch. Its Authentication-Results passes only when the case says the sender was
+ * verified, the way the adapter derives `senderVerified` from the same header.
+ */
+export function inboundNylasMessage(
+  id: string,
+  senderEmail: string,
+  inbound: Pick<ScenarioCase['inbound'], 'content' | 'email'>,
+  envelope: ResolvedEnvelope | undefined,
+): NylasMessage {
+  const domain = senderEmail.slice(senderEmail.lastIndexOf('@') + 1);
+  const verdict = inbound.email?.senderVerified === true ? 'pass' : 'fail';
+  return {
+    id,
+    threadId: `scenario-thread-${id}`,
+    subject: '',
+    from: [{ email: senderEmail }],
+    to: (envelope?.to ?? [SCENARIO_CURIA_EMAIL]).map(email => ({ email })),
+    cc: (envelope?.cc ?? []).map(email => ({ email })),
+    bcc: [],
+    body: inbound.content,
+    snippet: inbound.content.slice(0, 120),
+    date: Math.floor(Date.now() / 1000),
+    unread: true,
+    folders: ['INBOX'],
+    headers: [{
+      name: 'Authentication-Results',
+      value: `mx.example.test; spf=${verdict} smtp.mailfrom=${domain}; dkim=${verdict} header.d=${domain}; dmarc=${verdict} header.from=${domain}`,
+    }],
+    attachments: [],
   };
 }
 

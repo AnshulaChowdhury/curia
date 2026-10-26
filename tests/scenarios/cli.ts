@@ -144,7 +144,7 @@ function staticProblems(cases: ScenarioCase[], harness: ScenarioHarness): string
       ? `${agents[0] === COORDINATOR ? 'the coordinator' : `'${agents[0]}'`} is neither offered nor can activate`
       : 'no agent in the run is offered or can activate');
     const mustStubHere = (tool: string): boolean =>
-      mustStub(tool, registry, harness.unavailableTools, harness.inertTools, { realDelegation: real });
+      mustStub(tool, registry, harness.unavailableTools, harness.inertTools, { realDelegation: real, throughGateway: c.throughGateway === true });
     /** Stubs for `tool` that can answer a call by one of `agents`. */
     const stubsFor = (tool: string, agents: string[]) =>
       (c.toolStubs[tool] ?? []).filter(st => st.agent === undefined || agents.includes(st.agent));

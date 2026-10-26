@@ -93,6 +93,28 @@ export type BehaviorCheck =
    */
   | { kind: 'text'; of: TextSource; agent?: CheckAgent; maxWords?: number; excludes?: string[] }
   /**
+   * Over what the recording transports took this run (`through_gateway` cases, #2312): at
+   * least one delivered message (exactly `count` when set) matching every filter. `to` and
+   * `cc_includes` name a seeded contact key, `principal`, or an address; `contains` and
+   * `excludes` are case-insensitive substrings of the delivered text (subject and body). An
+   * email draft is not a delivery; a sent draft is.
+   */
+  | { kind: 'delivered'; channel?: DeliveryChannel; to?: string; ccIncludes?: string; contains?: string[]; excludes?: string[]; count?: number }
+  /** Nothing was delivered this run, or nothing to `to` when it is set. */
+  | { kind: 'not_delivered'; to?: string }
+  /**
+   * An approval was raised this run (a held send or a gated tool): its row in the action log,
+   * and what the principal is shown contains every one of `contains` (case-insensitive).
+   */
+  | { kind: 'held'; contains?: string[] }
+  /**
+   * Outreach was recorded this run (a row the run's sends wrote, or a seeded row they added
+   * to), naming `domain` when set, with that `confirmed` flag when set.
+   */
+  | { kind: 'outreach_recorded'; domain?: string; confirmed?: boolean }
+  /** The principal's answer to a personal-data ask was recorded this run for `label`. */
+  | { kind: 'decision_recorded'; label: string; decision: 'yes' | 'no' }
+  /**
    * Passes when any alternative passes. For a behavior the platform accepts in more
    * than one shape — e.g. delegate links an entry from `outbound_entry_id` or from its
    * id quoted in the brief (#1972).
@@ -101,6 +123,11 @@ export type BehaviorCheck =
 
 /** What a `text` check reads: the reply, or one argument of each call to a tool. */
 export type TextSource = 'reply' | { tool: string; arg: string };
+
+export type DeliveryChannel = 'email' | 'signal' | 'slack' | 'sms';
+
+/** The check kinds that read what a through-gateway run sent (#2312). */
+export const GATEWAY_CHECK_KINDS = ['delivered', 'not_delivered', 'held', 'outreach_recorded', 'decision_recorded'] as const;
 
 export interface ExpectedBehavior {
   id: string;
@@ -114,8 +141,8 @@ export interface ExpectedBehavior {
 export interface SeedContact {
   key: string;
   displayName: string;
-  /** `trusted` is a grant made after creation; createContact refuses it. */
-  tier: 'known' | 'unknown';
+  /** `trusted` is a grant made after creation (createContact refuses it), so seeding sets it then. */
+  tier: 'trusted' | 'known' | 'unknown';
   kind?: 'person' | 'organization' | 'automated';
   role?: string;
   /** Channel identity used when this contact is the sender. */
@@ -126,6 +153,43 @@ export interface SeedContact {
    * Dispatcher makes for an unknown sender answers yes (#2227).
    */
   principalWrote?: boolean;
+}
+
+/**
+ * A standing task (#2312): a `tasks` row with an originator, which band review reads as the
+ * authority a send on it carries. Referenced as `{{task:<key>}}` (the row's id), e.g. as a
+ * task wake's `inbound.task.id`.
+ */
+export interface SeedTask {
+  key: string;
+  title: string;
+  /** The intent anchor. Default: the title. */
+  intent?: string;
+  /** Who started it: `principal` or a seeded contact key. */
+  originator: string;
+  /** The agent that owns it. Default: the coordinator. */
+  agent: string;
+}
+
+/**
+ * A `task_outreach` row (#2312): who Curia already contacted, so a reply from them links to
+ * the task. Referenced as `{{outreach:<key>}}`.
+ */
+export interface SeedOutreach {
+  key: string;
+  /** A seeded task key. Absent: live-turn outreach, keyed by a conversation of its own. */
+  task?: string;
+  via: 'email' | 'web_form' | 'signal' | 'sms' | 'slack' | 'phone' | 'other';
+  orgName?: string;
+  /** Lowercased org domains, under example.test. */
+  domains: string[];
+  /** Addresses contacted, under example.test. */
+  addresses: string[];
+  /** Seeded contact keys contacted. */
+  contacts: string[];
+  summary: string;
+  /** An explicit act on a principal turn (a strong link); false is a backstop guess (weak only). */
+  confirmed: boolean;
 }
 
 /** A row in outbound_context. Referenced as `{{entry:<key>}}`. */
@@ -350,6 +414,10 @@ export interface ScenarioCase {
     bullpen: SeedBullpenThread[];
     verifications: SeedVerification[];
     principalIdentities: SeedPrincipalIdentity[];
+    /** Standing tasks (#2312). */
+    tasks: SeedTask[];
+    /** Outreach rows (#2312). */
+    outreach: SeedOutreach[];
     /**
      * What is waiting on the principal on this run's principal turn (prompt trim PR 7):
      * the counts the Dispatcher's backlog line reports. Absent means nothing is waiting.
@@ -389,6 +457,13 @@ export interface ScenarioCase {
    * different fixtures share a run, and such a case can be in the release gate.
    */
   autonomy?: AutonomyFixture;
+  /**
+   * Send tools run their real handlers through production's gateway review (#2312): PII
+   * detection, the content filter, band review, holds and asks, outreach records. The
+   * transports record instead of sending. THROUGH_GATEWAY_TOOLS skip the stub table, and the
+   * gateway check kinds read what they sent. Each send calls the review's judges.
+   */
+  throughGateway?: true;
   /** File the case came from, for messages. */
   sourceFile: string;
 }
@@ -465,6 +540,8 @@ export interface ScenarioRun {
   injectionDrainPoints?: InjectionDrainPoint[];
   /** Every real specialist run the coordinator started (#2027). Absent for stubbed delegation. */
   delegations?: DelegationRecord[];
+  /** What a through-gateway run sent, held and recorded (#2312). Absent for other cases. */
+  gateway?: GatewayOutcome;
   /** Set when removing the run's rows failed; leftovers may be in the database. */
   cleanupError?: string;
   /**
@@ -477,6 +554,57 @@ export interface ScenarioRun {
    * and run again, one reason each. The run above is the last attempt.
    */
   providerRetries: string[];
+}
+
+/** What a through-gateway run's sends did (#2312), read when the run ends. */
+export interface GatewayOutcome {
+  /** Every message a recording transport took, in order. */
+  deliveries: RecordedDelivery[];
+  /** Approvals raised in the run's conversations, in order. */
+  holds: RecordedHold[];
+  /** Outreach rows the run's sends wrote, or seeded rows they added to. */
+  outreach: RecordedOutreach[];
+  /** The principal's answers to personal-data asks, recorded in the run's conversations. */
+  decisions: RecordedDecision[];
+}
+
+export interface RecordedDelivery {
+  channel: DeliveryChannel;
+  /** `draft`: created, not delivered. */
+  kind: 'send' | 'draft';
+  to: string[];
+  cc: string[];
+  /** The recipients as the case names them: a seeded contact key, `principal`, or the address. */
+  toNames: string[];
+  ccNames: string[];
+  subject?: string;
+  body: string;
+}
+
+export interface RecordedHold {
+  shortRef: string;
+  approvalNumber: number | null;
+  toolName: string;
+  /** The row's outcome now: pending_approval, or how it was resolved during the run. */
+  outcome: string;
+  description: string | null;
+  /** What the principal is shown at the top of the approval (an ask's question), when registered. */
+  preamble?: string;
+  extraLines?: string[];
+}
+
+export interface RecordedOutreach {
+  domains: string[];
+  addresses: string[];
+  confirmed: boolean;
+  via: string;
+  /** A seeded row the run's sends added to. */
+  seeded: boolean;
+}
+
+export interface RecordedDecision {
+  label: string;
+  decision: 'yes' | 'no';
 }
 
 /** One real specialist run inside a scenario run (#2027). */

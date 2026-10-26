@@ -191,6 +191,9 @@ seeded rows, stubs, model calls and spend are found through its own case context
 | Specialists' conversations (real delegation) | | The same rows for each `scenario-delegate-…` conversation. A specialist the run abandoned is cleaned again when it finishes. |
 | Delegation claims (real delegation) | production's `pending_delegations` claims | Rows whose origin is the run's conversation or whose delegate conversation is a specialist's are deleted. |
 | Entries a specialist changes or registers | the run-scoped outbound-context view | Every read or write outside the run's entries finds nothing. A registered entry joins the run's and is deleted with them. |
+| Standing tasks (#2312) | `seed.tasks`: an open `tasks` row with its originator, as `task-create` writes one, but no bus event and no wake job | `created_by` is `scenario-suite (#2312)`; cleanup and the sweep delete only rows carrying it. The Dispatcher's outreach link reads a task's status only for the run's own. |
+| Outreach rows (#2312) | `seed.outreach`: a `task_outreach` row, inserted as it is (not merged into another open row) | The Dispatcher's outreach link (`OutreachMatcher`) sees only the run's seeded rows and the rows its sends wrote (`scopedOutreachRepo`). Deleted after the run, with what its sends recorded. |
+| What through-gateway sends write (#2312) | the gateway's approvals, the principal's answers to asks, outreach records | Approvals, `disclosure_decisions` and `task_outreach` rows in the run's conversations are deleted after the run; approve-action and deny-action see only the run's approvals (`scopedActionLog`). |
 | Prior history | | Withheld. *Contact recent history* (a sender's turns from other conversations) returns nothing during a run (the `wrapWorkingMemory` stack option), so a case never inherits smoke runs' or the real principal's turns from the dev database. |
 
 `audit_log` keeps the runs' events. It is append-only by design.
@@ -200,7 +203,8 @@ nodes `source = 'scenario-test'` (the suite mints each fixture's node itself, so
 never adopts a real node), entries and verifications a `scenario-origin-` conversation id (or, registered
 during a run, the run's or a specialist's), threads a `scenario:` `source_message_id`,
 specialist conversations a `scenario-delegate-` id, and delegation claims those
-conversations. On Ctrl-C/SIGTERM, and at every start-up, the CLI sweeps anything carrying
+conversations. Seeded tasks carry their `created_by` marker; seeded outreach, and what
+through-gateway sends wrote, a run's or a `scenario-origin-` conversation id. On Ctrl-C/SIGTERM, and at every start-up, the CLI sweeps anything carrying
 those markers — and nothing else.
 
 ### Stubs, and why nothing can send
@@ -213,9 +217,9 @@ The stub layer (`stub-layer.ts`) wraps the test-mode ExecutionLayer:
    recorded as stubbed: the model is told what went wrong and can recover, and it is
    not a stub hole.
 2. **No stub, and the tool must be stubbed** — `action_risk` above `none`, `delegate`, or
-   any tool declaring the `executionLayer`, `outboundGateway`, `actionLogRepo` or
-   `secretCapture` capability (some of those say `none` but can re-invoke tools, send or
-   resolve approvals): the call is refused with a `<skill_error>`. It never falls through.
+   any tool declaring the `executionLayer`, `outboundGateway`, `actionLogRepo`,
+   `secretCapture`, `approvalDelivery` or `disclosureDecisions` capability (some of those
+   say `none` but can re-invoke tools, send or resolve approvals): the call is refused with a `<skill_error>`. It never falls through.
    The runtime formats the error as production's `<task_error>`.
 3. **No stub, read-only tool test mode can serve:** the real tool runs (memory reads,
    `date-resolve`, `web-fetch`). `web-search` is one too, but `defaults` stubs it, because each real
@@ -230,6 +234,8 @@ The stub layer (`stub-layer.ts`) wraps the test-mode ExecutionLayer:
    The call is recorded as `canned` and counts as a stub hole, like a refusal, so stub
    every Drive/Docs/Sheets call a case's model makes with realistic data.
 5. **A call from another conversation** (a timed-out earlier turn) is refused.
+6. **A `through_gateway` case's send and approval tools** run for real (#2312): see
+   [Sends through the gateway](#sends-through-the-gateway). Every other case is unchanged.
 
 This sits on top of the test-mode stack's own guarantee: a gateway with no transport
 client (spec 16). So a run cannot send, and `tests/unit/scenarios/stub-layer.test.ts`
@@ -315,11 +321,12 @@ stub_sets: [human-channels]               # optional; `defaults` always applies
 live_search: true                         # optional; web-search runs for real (Tavily credits)
 identity: style-brief-dry                 # optional; run-level office identity, see Style cases
 autonomy: { score: 84, gating: band }     # optional; this case's autonomy, see Per-case fixtures
+through_gateway: true                     # optional; sends run production's review, see Sends through the gateway
 seed:
   contacts:                               # → {{contact:<key>}}
     - key: sam
       display_name: Sam Rivera
-      tier: known                         # known | unknown
+      tier: known                         # trusted | known | unknown
       kind: person                        # person | organization | automated
       channel: email
       identifier: sam@example.test        # always under example.test
@@ -587,9 +594,9 @@ later tone & style PRs compare against, are in
 `autonomy: { score, gating }` runs a case at that autonomy score and gating (`tier`, or
 `band` as production's deployment runs, #2159): the band descriptions in the prompt, the
 ExecutionLayer's gates, the content filter's tier-keyed rules and the Dispatcher's relay
-Gate C all follow it. The OutboundGateway's band review follows it too, but only once sends
-reach the gateway: today every send tool is stubbed, and the recording gateway that lets a
-case send through the real review is PR 6 Task 2 (#2312). The stack lays it
+Gate C all follow it. The OutboundGateway's band review follows it too, for the sends that
+reach it: a `through_gateway` case's (see [Sends through the gateway](#sends-through-the-gateway)).
+Every other case stubs its sends. The stack lays it
 over the database's autonomy config in memory (`FixtureAutonomyService`,
 `src/startup/test-mode-stack.ts`). Nothing is written.
 
@@ -645,6 +652,85 @@ them out: since #2312 those are per case, so `--tags ps-core,ps-ask` can run as 
 Every critical behavior should hold at 8/9 or better. 25a sits near that line on `main`
 as well: `coffee_shaped` was 7/9 in one 9-run measurement. A miss there is worth reading
 before calling it a regression.
+
+## Sends through the gateway
+
+`through_gateway: true` (#2312) runs a case's sends the way production does, up to the
+network. The send tools (`email-send`, `email-reply`, `signal-send`, `sms-send`,
+`slack-send`, `send-draft`) skip the stub table and run their real handlers, through the
+ExecutionLayer's gates and production's `OutboundGateway` review: PII detection and
+redaction, the content filter, band review over the drafting turn's evidence (under the
+case's `autonomy:` fixture), holds and personal-data asks, outreach records. So do
+`deliver-approval`, `approve-action` and `deny-action`, so a held send can reach the
+principal and be approved. Every other tool is stubbed or refused as in any case, and a
+case may not stub a tool that runs for real.
+
+**Nothing can send.** The stack builds this review on a second ExecutionLayer
+(`recordSends`, `src/startup/test-mode-sends.ts`) that only these calls reach. Its gateway
+has recording fakes in place of the Nylas, Signal, Slack and SMS clients (no real client
+class is ever constructed) and no outbound queue, so nothing is deferred to a flush a real
+instance would perform. What passes the review is kept in the run that sent it; a send
+outside every run fails. The layer agents call keeps the no-send gateway, so a case without
+the key runs exactly as before. `tests/unit/startup/test-mode-sends.test.ts` checks it.
+
+An `email-reply` fetches the message it answers: the fake mailbox serves the run's inbound
+email, with an Authentication-Results header that passes only when the case sets
+`inbound.email.sender_verified: true`.
+
+**Approvals.** A held send writes production's approval row under the run's conversation,
+and the view approve-action and deny-action get resolves only the run's: "approve" with no
+number is the run's sole pending approval, and another run's number reads as not found.
+Approving is elevated, so it needs a live principal turn: a `followup` from the principal
+joining a principal-initiated turn. A follow-up from anyone else is not queued into another
+sender's turn, so a hold raised on a third party's turn cannot be approved within that run.
+An approval carrying personal details must be delivered (`deliver-approval`) first, as in
+production.
+
+**Checks** read what the run sent, held and recorded, in code:
+
+```yaml
+check: { delivered: { channel: email, to: pat, cc_includes: principal, contains: [quote], excludes: ["130 692 544"], count: 1 } }
+check: { not_delivered: { to: pat } }      # or not_delivered: true — nothing delivered at all
+check: { held: { contains: [SIN] } }       # or held: true — an approval was raised this run
+check: { outreach_recorded: { domain: vendor.example.test, confirmed: true } }
+check: { decision_recorded: { label: SIN, decision: "yes" } }
+```
+
+`to` and `cc_includes` name a seeded contact key, `principal`, or an address. `contains` and
+`excludes` are case-insensitive substrings of the delivered subject and body (an email's
+HTML reduced to text). An email draft is not a delivery; a sent draft is. `held` matches the
+approval's description and what the principal is shown at its top (an ask's question). These
+checks are allowed only on `through_gateway` cases.
+
+**Seeds** these cases need: `tier: trusted` on a contact (granted after creation),
+`seed.tasks` and `seed.outreach`:
+
+```yaml
+seed:
+  tasks:                                   # → {{task:<key>}}, e.g. a task wake's inbound.task.id
+    - key: onboarding
+      title: Finish the vendor onboarding forms
+      originator: principal                # principal | a seeded contact key
+  outreach:                                # → {{outreach:<key>}}
+    - key: forms
+      task: onboarding                     # optional; a seeded task
+      via: email                           # email | web_form | signal | sms | slack | phone | other
+      org_name: Vendor Co
+      domains: [vendor.example.test]       # under example.test
+      addresses: [pat@vendor.example.test]
+      contacts: [pat]                      # seeded contact keys
+      summary: Sent the onboarding forms
+      confirmed: true                      # an explicit act on a principal turn: a strong link
+```
+
+The Dispatcher links a reply to the run's own outreach as production does, without the
+model step production uses for a last, weak-only match. Every fixture domain under
+`example.test` has the same registrable domain, so an org-domain link cannot tell fixture
+organizations apart: link by address or contact instead.
+
+**Cost.** Each through-gateway send calls the review's judges as production does: the
+escalation judge (Stage 2.5, or band review under band gating) and the content filter's
+Stage 2 judge. Budget a few judge calls per send on top of the agents' own.
 
 ## A deployment's own agents
 
