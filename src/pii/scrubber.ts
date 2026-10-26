@@ -104,11 +104,14 @@ function isValidSin(matched: string): boolean {
 // unassigned, 8 is not issued). Two shapes, both Luhn-checked by validate:
 //   1. formatted NNN-NNN-NNN / NNN NNN NNN with one consistent separator, not
 //      embedded in a longer separator-joined digit run (e.g. 1-800-130-692-544);
-//   2. bare 9 digits, only when a SIN keyword precedes them within 12 non-digit
-//      characters (lookbehind keeps the keyword out of the matched span).
+//   2. formatted (consistent separator) or bare 9 digits, only when a SIN keyword
+//      precedes them within 12 non-digit characters (lookbehind keeps the keyword
+//      out of the matched span). The keyword makes intent clear, so trailing
+//      separator+digit (e.g. a year) is allowed; only a directly adjacent digit
+//      is rejected.
 const SIN_CA_PATTERN: PiiPattern = {
   name: 'sin_ca',
-  regex: /(?<!\d[- ]?)[1-79]\d{2}([- ])\d{3}\1\d{3}(?![- ]?\d)|(?<=\b(?:SIN|social insurance(?: number| no\.?)?)\b[^\d\n]{0,12})[1-79]\d{8}(?!\d)/gi,
+  regex: /(?<!\d[- ]?)[1-79]\d{2}([- ])\d{3}\1\d{3}(?![- ]?\d)|(?<=\b(?:SIN|social insurance(?: number| no\.?)?)\b[^\d\n]{0,12})[1-79]\d{2}(?:([- ])\d{3}\2\d{3}|\d{6})(?!\d)/gi,
   replacement: '[SIN]',
   validate: isValidSin,
 };
@@ -147,7 +150,10 @@ function buildBuiltInPatterns(): PiiPattern[] {
     { typeName: 'SSN',             replacement: '[SSN]'         },
   ];
 
-  const result: PiiPattern[] = [];
+  // sin_ca goes first: pattern order is overlap precedence, and a keyword-led SIN
+  // followed by a year ("SIN 130 692 544 2024") would otherwise lose its last two
+  // groups to phone_us. Its Luhn check and boundaries keep phone-like strings out.
+  const result: PiiPattern[] = [SIN_CA_PATTERN];
   for (const { typeName, replacement } of entries) {
     const regex = extractPattern(typeName);
     if (regex) {
@@ -160,7 +166,6 @@ function buildBuiltInPatterns(): PiiPattern[] {
       missingPatternTypes.push(typeName);
     }
   }
-  result.push(SIN_CA_PATTERN);
   return result;
 }
 

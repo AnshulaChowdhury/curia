@@ -295,6 +295,24 @@ describe('sin_ca', () => {
     },
   );
 
+  it.each([
+    ['SIN 130 692 544 2024', '130 692 544'],
+    ['SIN: 130-692-544.', '130-692-544'],
+    ['social insurance number 130 692 544 5', '130 692 544'],
+  ])('matches keyword-led formatted SIN in %s even when digits follow', (text, expected) => {
+    const found = sinMatches(text);
+    expect(found).toHaveLength(1);
+    expect(found[0]!.matched).toBe(expected);
+  });
+
+  it('does not match a formatted SIN followed by digits without a keyword', () => {
+    expect(sinMatches('ref 130 692 544 2024')).toHaveLength(0);
+  });
+
+  it('does not match a keyword-led 10-digit run split as a formatted SIN', () => {
+    expect(sinMatches('SIN number is 130 692 5441')).toHaveLength(0);
+  });
+
   it('does not match bare 9 digits without a keyword', () => {
     expect(sinMatches('130692544')).toHaveLength(0);
   });
