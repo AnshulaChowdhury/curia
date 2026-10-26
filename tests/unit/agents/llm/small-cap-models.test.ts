@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import * as yaml from 'js-yaml';
 import type { YamlConfig } from '../../../../src/config.js';
 import { ModelRegistry } from '../../../../src/agents/llm/model-registry.js';
@@ -35,7 +35,7 @@ describe('smallCapModelSlots (#2224)', () => {
       { configKey: 'model_routing.tiers.fast.model', model: 'claude-haiku-5-5' },
       { configKey: 'filter.llmJudge.model', model: 'claude-haiku-5-5' },
       { configKey: 'escalation.judge.model', model: 'claude-haiku-5-5' },
-    ]);
+    ].map((s) => expect.objectContaining(s)));
   });
 
   it('leaves out a disabled judge and adds the voice override', () => {
@@ -70,13 +70,18 @@ describe('smallCapThinkingViolations (#2224)', () => {
     );
     expect(violations).toHaveLength(1);
     expect(violations[0]).toContain('filter.llmJudge.model');
+    // Names the judge, not the fast-tier call sites.
+    expect(violations[0]).toContain('outbound leak judge');
+    expect(violations[0]).not.toContain('classifier');
   });
 
   it('skips unknown models, which the per-key registry checks handle', () => {
-    expect(smallCapThinkingViolations([{ configKey: 'channels.voice.model', model: 'no-such-model' }], registry)).toEqual([]);
+    expect(smallCapThinkingViolations([{ configKey: 'channels.voice.model', model: 'no-such-model', callSites: 'voice turns' }], registry)).toEqual([]);
   });
 
-  it('accepts the production model choices (curia-deploy custom/config/local.yaml, 2026-10-25)', () => {
+  // The ids are inlined, so this shows these models pass the predicate, not that the
+  // current curia-deploy config boots: that file lives in another repo.
+  it('passes the model ids curia-deploy production uses for these keys', () => {
     const prod = config({
       fast: 'claude-haiku-5-5',
       standard: 'deepseek/deepseek-v4.1-flash',
@@ -90,5 +95,73 @@ describe('smallCapThinkingViolations (#2224)', () => {
     const defaults = yaml.load(readFileSync(join(import.meta.dirname, '../../../../config/default.yaml'), 'utf8')) as YamlConfig;
     const voice = defaults.channels?.voice?.model?.trim() || undefined;
     expect(smallCapThinkingViolations(smallCapModelSlots(defaults, voice), registry)).toEqual([]);
+  });
+});
+
+// Smallest cap a model that thinks is known to fit: DeepSeek V4.1 Flash used up to 582
+// tokens on a 200-token drift check (2026-10-25). Extracts at or below it run on fast.
+const STANDARD_TIER_MAX_SMALL_CAP = 1200;
+
+const REPO = join(import.meta.dirname, '../../../..');
+
+function sourceFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true, recursive: true })
+    .filter((e) => e.isFile() && e.name.endsWith('.ts') && !e.name.endsWith('.test.ts'))
+    .map((e) => join(e.parentPath, e.name));
+}
+
+// The argument text of each `.extract(` call, with parentheses balanced outside string
+// literals (template `${…}` contents are code, so their parentheses count).
+function extractCalls(source: string): string[] {
+  const calls: string[] = [];
+  let from = 0;
+  for (;;) {
+    const at = source.indexOf('.extract(', from);
+    if (at === -1) return calls;
+    const start = at + '.extract('.length;
+    let depth = 1;
+    let quote: string | null = null;
+    const templateDepth: number[] = [];
+    let i = start;
+    for (; i < source.length && depth > 0; i++) {
+      const c = source[i];
+      if (quote) {
+        if (c === '\\') i++;
+        else if (quote === '`' && c === '$' && source[i + 1] === '{') { templateDepth.push(depth); depth++; quote = null; i++; }
+        else if (c === quote) quote = null;
+        continue;
+      }
+      if (c === "'" || c === '"' || c === '`') quote = c;
+      else if (c === '(' || c === '{') depth++;
+      else if (c === ')' || c === '}') {
+        depth--;
+        if (c === '}' && templateDepth.length > 0 && templateDepth[templateDepth.length - 1] === depth) {
+          templateDepth.pop();
+          quote = '`';
+        }
+      }
+    }
+    calls.push(source.slice(start, i - 1));
+    from = i;
+  }
+}
+
+describe('standard tier serves no small-cap extract (#2224)', () => {
+  it(`every infraLlm.extract with maxTokens <= ${STANDARD_TIER_MAX_SMALL_CAP} sets tier: 'fast'`, () => {
+    const offenders: string[] = [];
+    let checked = 0;
+    for (const file of [...sourceFiles(join(REPO, 'src')), ...sourceFiles(join(REPO, 'skills'))]) {
+      for (const call of extractCalls(readFileSync(file, 'utf8'))) {
+        const cap = /maxTokens:\s*(\d[\d_]*)/.exec(call);
+        if (!cap) continue;
+        checked++;
+        if (Number(cap[1]!.replace(/_/g, '')) <= STANDARD_TIER_MAX_SMALL_CAP && !/tier:\s*'fast'/.test(call)) {
+          offenders.push(`${relative(REPO, file)}: maxTokens ${cap[1]}`);
+        }
+      }
+    }
+    // The scan must find the known calls, or a parsing change would pass vacuously.
+    expect(checked).toBeGreaterThanOrEqual(5);
+    expect(offenders).toEqual([]);
   });
 });

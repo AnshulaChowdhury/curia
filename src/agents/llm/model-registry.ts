@@ -65,9 +65,11 @@ export interface ModelMetadata {
    * The model thinks when a request sends no reasoning setting. A fact about
    * the model, not a request rule: unset reasoning gets the provider default
    * (ADR-048 §3). AnthropicProvider reads it only to size `max_tokens` for a
-   * request that will think. Without `none` in `reasoning`, it also fails
-   * canTurnThinkingOff. On an OpenRouter entry it is set from a measurement at
-   * the small-cap call sites (#2224).
+   * request that will think. Without `none` in `reasoning`, it also decides
+   * canTurnThinkingOff, where unset counts as unknown on a reasoning model.
+   * `false` records that the model was checked and does not think; on an
+   * OpenRouter entry either value comes from a measurement at the small-cap
+   * call sites (#2224).
    */
   thinksByDefault?: boolean;
   /**
@@ -136,6 +138,8 @@ function bedrockClaudeEntries(): Record<string, ModelMetadata> {
       contextWindow: 200_000,
       pricing: { inputPerMToken: 3.00, outputPerMToken: 15.00, cacheCreationPerMToken: 3.75, cacheReadPerMToken: 0.30 },
       capabilities: ['vision', 'reasoning', 'coding', 'large_context', 'tools'],
+      // Sonnet 4.6 thinks only when a request turns thinking on, and bedrock.ts never does.
+      thinksByDefault: false,
     };
     entries[`${prefix}.anthropic.claude-haiku-4-5-20251001-v1:0`] = {
       provider: 'bedrock',
@@ -270,9 +274,10 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
     capabilities: ['vision', 'coding', 'streaming', 'tools'],
     // OpenRouter supported_efforts. No `none`: the judges run Gemini's default
     // `minimal` thinking today, and `none` at a call site must not change that.
-    // Not `thinksByDefault`: at that default it answered 27 of 27 small-cap
-    // calls with no reasoning tokens (2026-10-25, #2224).
     reasoning: { control: 'openrouter-effort', efforts: ['low', 'medium', 'high'] },
+    // At that default it answered every small-cap call with no reasoning
+    // tokens (2026-10-25, #2224; scripts/spikes/thinking-off-small-caps).
+    thinksByDefault: false,
     maxOutputTokens: 8_192,
   },
   // Removed from OpenRouter ~2026-05-31. Entry retained for audit log provenance.
@@ -392,6 +397,8 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
     },
     capabilities: ['vision', 'coding', 'reasoning', 'streaming', 'tools'],
     maxOutputTokens: 16_384,
+    // Not a reasoning model: the capability tag is the loose ADR-014 one.
+    thinksByDefault: false,
   },
 
   ...bedrockClaudeEntries(),
@@ -509,14 +516,18 @@ export class ModelRegistry {
 
   /**
    * True when a `NO_REASONING` request gets an answer without thinking: the
-   * entry lists `none`, or the model does not think by default. False for
-   * unknown models. Boot requires it of every model on a small-cap call site
-   * (#2224).
+   * entry lists `none`, or it records `thinksByDefault: false`. With the flag
+   * unset, only a model with no sign of reasoning passes: no `reasoning` entry
+   * and no `reasoning` capability. A missing flag on a reasoning model is not a
+   * measurement, so it fails. False for unknown models. Boot requires it of
+   * every model on a small-cap call site (#2224).
    */
   canTurnThinkingOff(modelId: string): boolean {
     const entry = this.getModel(modelId);
     if (!entry) return false;
-    return entry.reasoning?.efforts.includes('none') === true || entry.thinksByDefault !== true;
+    if (entry.reasoning?.efforts.includes('none') === true) return true;
+    if (entry.thinksByDefault !== undefined) return !entry.thinksByDefault;
+    return entry.reasoning === undefined && !entry.capabilities.includes('reasoning');
   }
 
   /** How the model takes a reasoning effort, or undefined when Curia sends it none. */

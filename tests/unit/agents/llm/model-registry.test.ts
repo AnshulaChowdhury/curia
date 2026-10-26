@@ -319,11 +319,17 @@ describe('ModelRegistry', () => {
       // Thinks by default and lists no `none`.
       ['claude-opus-5-5', false],
       ['deepseek/deepseek-v4.1-flash', false],
-      // No `none`, but measured not to think at its default.
+      // No `none`, but recorded as not thinking by default.
       ['google/gemini-3.1-flash-lite', true],
-      // Takes no reasoning setting and does not think by default.
-      ['claude-haiku-4-5', true],
       ['openai/gpt-4o', true],
+      ['global.anthropic.claude-sonnet-4-6', true],
+      // No sign of reasoning at all.
+      ['claude-haiku-4-5', true],
+      // Reasoning models with no measurement: unset is not safe.
+      ['deepseek/deepseek-v4-pro', false],
+      ['deepseek/deepseek-v4-pro-0813', false],
+      ['z-ai/glm-5.3-flash', false],
+      ['qwen/qwen3.8-flash', false],
       // Nothing to go on.
       ['no-such-model', false],
     ])('%s → %s', (model, expected) => {

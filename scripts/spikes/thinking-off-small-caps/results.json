@@ -1,5 +1,5 @@
 {
-  "measuredAt": "2026-10-25T21:59:34.870Z",
+  "measuredAt": "2026-10-26T01:45:37.491Z",
   "runs": 3,
   "records": [
     {
@@ -9,11 +9,12 @@
       "cap": 10,
       "run": 1,
       "outputTokens": 30,
-      "reasoningTokens": 30,
+      "reasoningTokens": 35,
       "textChars": 0,
       "error": null,
       "outcome": "(empty)",
-      "ok": false
+      "answered": false,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -22,11 +23,12 @@
       "cap": 10,
       "run": 2,
       "outputTokens": 30,
-      "reasoningTokens": 30,
+      "reasoningTokens": 38,
       "textChars": 0,
       "error": null,
       "outcome": "(empty)",
-      "ok": false
+      "answered": false,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -35,11 +37,12 @@
       "cap": 10,
       "run": 3,
       "outputTokens": 30,
-      "reasoningTokens": 30,
+      "reasoningTokens": 34,
       "textChars": 0,
       "error": null,
       "outcome": "(empty)",
-      "ok": false
+      "answered": false,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -52,7 +55,8 @@
       "textChars": 0,
       "error": null,
       "outcome": "(empty)",
-      "ok": false
+      "answered": false,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -65,7 +69,8 @@
       "textChars": 0,
       "error": null,
       "outcome": "(empty)",
-      "ok": false
+      "answered": false,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -78,7 +83,8 @@
       "textChars": 0,
       "error": null,
       "outcome": "(empty)",
-      "ok": false
+      "answered": false,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -86,12 +92,13 @@
       "input": "leak",
       "cap": 200,
       "run": 1,
-      "outputTokens": 107,
-      "reasoningTokens": 77,
-      "textChars": 121,
+      "outputTokens": 151,
+      "reasoningTokens": 116,
+      "textChars": 145,
       "error": null,
-      "outcome": "llm-judge-audience-leak",
-      "ok": true
+      "outcome": "judged_block",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -99,12 +106,13 @@
       "input": "leak",
       "cap": 200,
       "run": 2,
-      "outputTokens": 117,
-      "reasoningTokens": 85,
-      "textChars": 129,
+      "outputTokens": 342,
+      "reasoningTokens": 315,
+      "textChars": 114,
       "error": null,
-      "outcome": "llm-judge-audience-leak",
-      "ok": true
+      "outcome": "judged_block",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -112,12 +120,13 @@
       "input": "leak",
       "cap": 200,
       "run": 3,
-      "outputTokens": 162,
-      "reasoningTokens": 134,
-      "textChars": 109,
+      "outputTokens": 400,
+      "reasoningTokens": 396,
+      "textChars": 6,
       "error": null,
-      "outcome": "llm-judge-audience-leak",
-      "ok": true
+      "outcome": "judged_block",
+      "answered": true,
+      "matched": false
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -125,12 +134,13 @@
       "input": "clean",
       "cap": 200,
       "run": 1,
-      "outputTokens": 43,
-      "reasoningTokens": 37,
+      "outputTokens": 23,
+      "reasoningTokens": 14,
       "textChars": 29,
       "error": null,
-      "outcome": "(pass)",
-      "ok": true
+      "outcome": "judged_pass",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -138,12 +148,13 @@
       "input": "clean",
       "cap": 200,
       "run": 2,
-      "outputTokens": 31,
-      "reasoningTokens": 24,
+      "outputTokens": 23,
+      "reasoningTokens": 15,
       "textChars": 29,
       "error": null,
-      "outcome": "(pass)",
-      "ok": true
+      "outcome": "judged_pass",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -151,51 +162,55 @@
       "input": "clean",
       "cap": 200,
       "run": 3,
-      "outputTokens": 31,
-      "reasoningTokens": 24,
+      "outputTokens": 23,
+      "reasoningTokens": 14,
       "textChars": 29,
       "error": null,
-      "outcome": "(pass)",
-      "ok": true
+      "outcome": "judged_pass",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
       "site": "disclosure-judge",
-      "input": "calendar-detail",
+      "input": "medical-appointment",
       "cap": 200,
       "run": 1,
-      "outputTokens": 153,
-      "reasoningTokens": 120,
+      "outputTokens": 156,
+      "reasoningTokens": 123,
+      "textChars": 155,
+      "error": null,
+      "outcome": "escalate/third-party",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "site": "disclosure-judge",
+      "input": "medical-appointment",
+      "cap": 200,
+      "run": 2,
+      "outputTokens": 156,
+      "reasoningTokens": 123,
       "textChars": 159,
       "error": null,
       "outcome": "escalate/third-party",
-      "ok": true
+      "answered": true,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
       "site": "disclosure-judge",
-      "input": "calendar-detail",
+      "input": "medical-appointment",
       "cap": 200,
-      "run": 2,
-      "outputTokens": 153,
-      "reasoningTokens": 120,
+      "run": 3,
+      "outputTokens": 156,
+      "reasoningTokens": 123,
       "textChars": 159,
       "error": null,
       "outcome": "escalate/third-party",
-      "ok": true
-    },
-    {
-      "model": "deepseek/deepseek-v4.1-flash",
-      "site": "disclosure-judge",
-      "input": "calendar-detail",
-      "cap": 200,
-      "run": 3,
-      "outputTokens": 160,
-      "reasoningTokens": 127,
-      "textChars": 149,
-      "error": null,
-      "outcome": "escalate/third-party",
-      "ok": true
+      "answered": true,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -205,10 +220,11 @@
       "run": 1,
       "outputTokens": 62,
       "reasoningTokens": 16,
-      "textChars": 190,
+      "textChars": 181,
       "error": null,
       "outcome": "escalate/reversible-external",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -218,10 +234,11 @@
       "run": 2,
       "outputTokens": 60,
       "reasoningTokens": 17,
-      "textChars": 171,
+      "textChars": 165,
       "error": null,
       "outcome": "escalate/reversible-external",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -229,12 +246,55 @@
       "input": "email-third-party",
       "cap": 300,
       "run": 3,
-      "outputTokens": 41,
-      "reasoningTokens": 0,
-      "textChars": 171,
+      "outputTokens": 64,
+      "reasoningTokens": 16,
+      "textChars": 199,
       "error": null,
       "outcome": "escalate/reversible-external",
-      "ok": true
+      "answered": true,
+      "matched": true
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "site": "band-review",
+      "input": "leak-all-questions",
+      "cap": 1200,
+      "run": 1,
+      "outputTokens": 3512,
+      "reasoningTokens": 3414,
+      "textChars": 391,
+      "error": null,
+      "outcome": "purpose=serving unsupported=3",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "site": "band-review",
+      "input": "leak-all-questions",
+      "cap": 1200,
+      "run": 2,
+      "outputTokens": 1200,
+      "reasoningTokens": 1155,
+      "textChars": 163,
+      "error": null,
+      "outcome": "failed: malformed",
+      "answered": false,
+      "matched": null
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "site": "band-review",
+      "input": "leak-all-questions",
+      "cap": 1200,
+      "run": 3,
+      "outputTokens": 868,
+      "reasoningTokens": 773,
+      "textChars": 392,
+      "error": null,
+      "outcome": "purpose=serving unsupported=3",
+      "answered": true,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -242,12 +302,13 @@
       "input": "on-track",
       "cap": 200,
       "run": 1,
-      "outputTokens": 50,
-      "reasoningTokens": 17,
-      "textChars": 174,
+      "outputTokens": 98,
+      "reasoningTokens": 60,
+      "textChars": 152,
       "error": null,
       "outcome": "drifted=false/high",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -255,12 +316,13 @@
       "input": "on-track",
       "cap": 200,
       "run": 2,
-      "outputTokens": 50,
-      "reasoningTokens": 17,
-      "textChars": 174,
+      "outputTokens": 100,
+      "reasoningTokens": 59,
+      "textChars": 161,
       "error": null,
       "outcome": "drifted=false/high",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -268,12 +330,13 @@
       "input": "on-track",
       "cap": 200,
       "run": 3,
-      "outputTokens": 50,
-      "reasoningTokens": 16,
-      "textChars": 174,
+      "outputTokens": 99,
+      "reasoningTokens": 59,
+      "textChars": 157,
       "error": null,
       "outcome": "drifted=false/high",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -281,12 +344,13 @@
       "input": "drifted",
       "cap": 200,
       "run": 1,
-      "outputTokens": 572,
-      "reasoningTokens": 514,
-      "textChars": 294,
+      "outputTokens": 600,
+      "reasoningTokens": 590,
+      "textChars": 27,
       "error": null,
-      "outcome": "drifted=true/high",
-      "ok": true
+      "outcome": "null (read as no drift)",
+      "answered": false,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -294,12 +358,13 @@
       "input": "drifted",
       "cap": 200,
       "run": 2,
-      "outputTokens": 582,
-      "reasoningTokens": 536,
-      "textChars": 214,
+      "outputTokens": 600,
+      "reasoningTokens": 600,
+      "textChars": 0,
       "error": null,
-      "outcome": "drifted=true/high",
-      "ok": true
+      "outcome": "null (read as no drift)",
+      "answered": false,
+      "matched": null
     },
     {
       "model": "deepseek/deepseek-v4.1-flash",
@@ -308,11 +373,96 @@
       "cap": 200,
       "run": 3,
       "outputTokens": 400,
-      "reasoningTokens": 375,
-      "textChars": 109,
+      "reasoningTokens": 359,
+      "textChars": 199,
       "error": null,
       "outcome": "null (read as no drift)",
-      "ok": false
+      "answered": false,
+      "matched": null
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "site": "extract-facts",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 1,
+      "outputTokens": 3000,
+      "reasoningTokens": 3000,
+      "textChars": 0,
+      "error": null,
+      "outcome": "(empty)",
+      "answered": false,
+      "matched": null
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "site": "extract-facts",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 2,
+      "outputTokens": 3000,
+      "reasoningTokens": 3000,
+      "textChars": 0,
+      "error": null,
+      "outcome": "(empty)",
+      "answered": false,
+      "matched": null
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "site": "extract-facts",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 3,
+      "outputTokens": 3000,
+      "reasoningTokens": 3000,
+      "textChars": 0,
+      "error": null,
+      "outcome": "(empty)",
+      "answered": false,
+      "matched": null
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "site": "extract-relationships",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 1,
+      "outputTokens": 810,
+      "reasoningTokens": 600,
+      "textChars": 845,
+      "error": null,
+      "outcome": "json array",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "site": "extract-relationships",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 2,
+      "outputTokens": 886,
+      "reasoningTokens": 600,
+      "textChars": 919,
+      "error": null,
+      "outcome": "json array",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "site": "extract-relationships",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 3,
+      "outputTokens": 844,
+      "reasoningTokens": 600,
+      "textChars": 992,
+      "error": null,
+      "outcome": "json array",
+      "answered": true,
+      "matched": null
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -325,7 +475,8 @@
       "textChars": 3,
       "error": null,
       "outcome": "yes",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -338,7 +489,8 @@
       "textChars": 4,
       "error": null,
       "outcome": "yes.",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -351,7 +503,8 @@
       "textChars": 3,
       "error": null,
       "outcome": "yes",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -359,12 +512,13 @@
       "input": "scheduling",
       "cap": 10,
       "run": 1,
-      "outputTokens": 2,
+      "outputTokens": 1,
       "reasoningTokens": 0,
-      "textChars": 3,
+      "textChars": 2,
       "error": null,
-      "outcome": "no.",
-      "ok": true
+      "outcome": "no",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -372,12 +526,13 @@
       "input": "scheduling",
       "cap": 10,
       "run": 2,
-      "outputTokens": 2,
+      "outputTokens": 1,
       "reasoningTokens": 0,
-      "textChars": 3,
+      "textChars": 2,
       "error": null,
-      "outcome": "no.",
-      "ok": true
+      "outcome": "no",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -385,12 +540,13 @@
       "input": "scheduling",
       "cap": 10,
       "run": 3,
-      "outputTokens": 2,
+      "outputTokens": 1,
       "reasoningTokens": 0,
-      "textChars": 3,
+      "textChars": 2,
       "error": null,
-      "outcome": "no.",
-      "ok": true
+      "outcome": "no",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -398,12 +554,13 @@
       "input": "leak",
       "cap": 200,
       "run": 1,
-      "outputTokens": 32,
+      "outputTokens": 26,
       "reasoningTokens": 0,
-      "textChars": 154,
+      "textChars": 123,
       "error": null,
-      "outcome": "llm-judge-audience-leak",
-      "ok": true
+      "outcome": "judged_block",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -415,8 +572,9 @@
       "reasoningTokens": 0,
       "textChars": 123,
       "error": null,
-      "outcome": "llm-judge-audience-leak",
-      "ok": true
+      "outcome": "judged_block",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -428,8 +586,9 @@
       "reasoningTokens": 0,
       "textChars": 154,
       "error": null,
-      "outcome": "llm-judge-audience-leak",
-      "ok": true
+      "outcome": "judged_block",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -441,8 +600,9 @@
       "reasoningTokens": 0,
       "textChars": 29,
       "error": null,
-      "outcome": "(pass)",
-      "ok": true
+      "outcome": "judged_pass",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -454,8 +614,9 @@
       "reasoningTokens": 0,
       "textChars": 29,
       "error": null,
-      "outcome": "(pass)",
-      "ok": true
+      "outcome": "judged_pass",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -467,39 +628,42 @@
       "reasoningTokens": 0,
       "textChars": 29,
       "error": null,
-      "outcome": "(pass)",
-      "ok": true
+      "outcome": "judged_pass",
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
       "site": "disclosure-judge",
-      "input": "calendar-detail",
+      "input": "medical-appointment",
       "cap": 200,
       "run": 1,
-      "outputTokens": 26,
-      "reasoningTokens": 0,
-      "textChars": 123,
-      "error": null,
-      "outcome": "allow/principal-context",
-      "ok": true
-    },
-    {
-      "model": "google/gemini-3.1-flash-lite",
-      "site": "disclosure-judge",
-      "input": "calendar-detail",
-      "cap": 200,
-      "run": 2,
       "outputTokens": 28,
       "reasoningTokens": 0,
       "textChars": 149,
       "error": null,
       "outcome": "allow/principal-context",
-      "ok": true
+      "answered": true,
+      "matched": null
     },
     {
       "model": "google/gemini-3.1-flash-lite",
       "site": "disclosure-judge",
-      "input": "calendar-detail",
+      "input": "medical-appointment",
+      "cap": 200,
+      "run": 2,
+      "outputTokens": 26,
+      "reasoningTokens": 0,
+      "textChars": 123,
+      "error": null,
+      "outcome": "allow/principal-context",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "google/gemini-3.1-flash-lite",
+      "site": "disclosure-judge",
+      "input": "medical-appointment",
       "cap": 200,
       "run": 3,
       "outputTokens": 26,
@@ -507,7 +671,8 @@
       "textChars": 123,
       "error": null,
       "outcome": "allow/principal-context",
-      "ok": true
+      "answered": true,
+      "matched": null
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -520,7 +685,8 @@
       "textChars": 178,
       "error": null,
       "outcome": "escalate/reversible-external",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -533,7 +699,8 @@
       "textChars": 178,
       "error": null,
       "outcome": "escalate/reversible-external",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -546,7 +713,50 @@
       "textChars": 178,
       "error": null,
       "outcome": "escalate/reversible-external",
-      "ok": true
+      "answered": true,
+      "matched": true
+    },
+    {
+      "model": "google/gemini-3.1-flash-lite",
+      "site": "band-review",
+      "input": "leak-all-questions",
+      "cap": 1200,
+      "run": 1,
+      "outputTokens": 73,
+      "reasoningTokens": 0,
+      "textChars": 307,
+      "error": null,
+      "outcome": "purpose=serving unsupported=1",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "google/gemini-3.1-flash-lite",
+      "site": "band-review",
+      "input": "leak-all-questions",
+      "cap": 1200,
+      "run": 2,
+      "outputTokens": 73,
+      "reasoningTokens": 0,
+      "textChars": 307,
+      "error": null,
+      "outcome": "purpose=serving unsupported=1",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "google/gemini-3.1-flash-lite",
+      "site": "band-review",
+      "input": "leak-all-questions",
+      "cap": 1200,
+      "run": 3,
+      "outputTokens": 73,
+      "reasoningTokens": 0,
+      "textChars": 307,
+      "error": null,
+      "outcome": "purpose=serving unsupported=1",
+      "answered": true,
+      "matched": null
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -559,7 +769,8 @@
       "textChars": 157,
       "error": null,
       "outcome": "drifted=false/high",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -572,7 +783,8 @@
       "textChars": 157,
       "error": null,
       "outcome": "drifted=false/high",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -585,7 +797,8 @@
       "textChars": 157,
       "error": null,
       "outcome": "drifted=false/high",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -598,7 +811,8 @@
       "textChars": 170,
       "error": null,
       "outcome": "drifted=true/high",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -611,7 +825,8 @@
       "textChars": 170,
       "error": null,
       "outcome": "drifted=true/high",
-      "ok": true
+      "answered": true,
+      "matched": true
     },
     {
       "model": "google/gemini-3.1-flash-lite",
@@ -624,7 +839,92 @@
       "textChars": 170,
       "error": null,
       "outcome": "drifted=true/high",
-      "ok": true
+      "answered": true,
+      "matched": true
+    },
+    {
+      "model": "google/gemini-3.1-flash-lite",
+      "site": "extract-facts",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 1,
+      "outputTokens": 116,
+      "reasoningTokens": 0,
+      "textChars": 418,
+      "error": null,
+      "outcome": "json array",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "google/gemini-3.1-flash-lite",
+      "site": "extract-facts",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 2,
+      "outputTokens": 155,
+      "reasoningTokens": 0,
+      "textChars": 572,
+      "error": null,
+      "outcome": "json array",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "google/gemini-3.1-flash-lite",
+      "site": "extract-facts",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 3,
+      "outputTokens": 116,
+      "reasoningTokens": 0,
+      "textChars": 418,
+      "error": null,
+      "outcome": "json array",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "google/gemini-3.1-flash-lite",
+      "site": "extract-relationships",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 1,
+      "outputTokens": 440,
+      "reasoningTokens": 0,
+      "textChars": 1285,
+      "error": null,
+      "outcome": "json array",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "google/gemini-3.1-flash-lite",
+      "site": "extract-relationships",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 2,
+      "outputTokens": 440,
+      "reasoningTokens": 0,
+      "textChars": 1285,
+      "error": null,
+      "outcome": "json array",
+      "answered": true,
+      "matched": null
+    },
+    {
+      "model": "google/gemini-3.1-flash-lite",
+      "site": "extract-relationships",
+      "input": "cfo-paragraph",
+      "cap": 1000,
+      "run": 3,
+      "outputTokens": 441,
+      "reasoningTokens": 0,
+      "textChars": 1289,
+      "error": null,
+      "outcome": "json array",
+      "answered": true,
+      "matched": null
     }
   ]
 }
