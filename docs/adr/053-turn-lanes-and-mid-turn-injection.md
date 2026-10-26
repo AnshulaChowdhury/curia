@@ -2,6 +2,7 @@
 
 Date: 2026-10-24
 Status: Accepted
+Amended: 2026-10-26 — the shipped config turns the flag on (#2018)
 
 ## Context
 
@@ -37,7 +38,9 @@ Alternatives considered and rejected:
 
 7. **One process.** The map is in memory. [ADR-051](051-knowledge-graph-embeddings-from-a-configurable-endpoint.md)'s instance lock is advisory at boot: a second Curia logs and continues without it. That lock does not serialize turns. A multi-process lane would be a Postgres advisory lock, and it is out of scope. One Curia per database remains the supported deployment.
 
-8. **Flag.** `config/default.yaml` sets `dispatch.turnInjection.enabled` to true. That is what a deploy runs. An absent `enabled` field still resolves to false, so dropping the key restores concurrent turns, and setting `enabled: false` does the same: no lane method runs. With the flag on, a second message on Signal, Slack, SMS, HTTP, or CLI waits or is injected instead of running beside the first. Email already waited for the turn to finish; with the flag on, the next same-thread message is released when the dispatcher decides the inbound, so it can join the turn still running. A second `POST /api/messages` on the same `conversation_id` while the first turn runs is injected; the first HTTP request still resolves as superseded, and the second request carries the single reply.
+8. **Flag.** `dispatch.turnInjection.enabled` defaults to false. Off means no lane method runs and behaviour is unchanged. It is turned on only after the pieces land and the mid-turn scenario has been run. With the flag on, a second message on Signal, Slack, SMS, HTTP, or CLI waits or is injected instead of running beside the first. That is a behaviour change. Email already waited. A second `POST /api/messages` on the same `conversation_id` while the first turn runs is injected; the first HTTP request still resolves as superseded, and the second request carries the single reply.
+
+*Amended 2026-10-26.* The shipped `config/default.yaml` sets `enabled` to true. That is what a deploy runs. An absent `enabled` field still resolves to false, so omitting the key restores concurrent turns, and `enabled: false` does the same: no lane method runs. With the flag on, email releases the next same-thread message when the dispatcher decides the inbound, so a same-contact follow-up can join the turn still running.
 
 9. **Delegate wait.** When late delivery is on, a queued follow-up ends the wait early with `in_progress` rather than a timeout. The specialist keeps running. Its result arrives later as its own late-delegation wake, which waits in the lane. No other in-flight tool call is cancelled.
 
@@ -48,4 +51,4 @@ Alternatives considered and rejected:
 - An inbound that was queued but not drained when the process stops stays unacknowledged, so inbound replay delivers it as a fresh turn.
 - History keeps an injected row with the message it followed. The same-role collapse treats that pair as one group, so an injected row cannot erase the original.
 - Voice is unchanged. It does not publish `agent.task` and does not use the exit hook.
-- The shipped config turns the lanes on. `enabled: false`, or omitting the key, restores concurrent turns.
+- Turning the lane on without the injection path would make a live message wait behind a long synthetic turn. Injection is required whenever the lane is on.

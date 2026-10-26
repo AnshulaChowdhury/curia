@@ -95,6 +95,8 @@ import type { ChannelIdentity, ChannelPolicyConfig, PrincipalPrimaryEmailRef, Pr
 import { OutboundContextService } from '../dispatch/outbound-context.js';
 import { OutboundContentFilter } from '../dispatch/outbound-filter.js';
 import { TurnLanes } from '../dispatch/turn-lanes.js';
+import { createInboundScanner } from '../dispatch/security-config-loader.js';
+import type { InboundScanner } from '../dispatch/inbound-scanner.js';
 import {
   acquireRunningDelegation,
   findInFlightPendingDelegation,
@@ -407,6 +409,13 @@ export interface TestModeStack {
    * config. The shipped default.yaml turns it on; an absent field stays off.
    */
   turnLanes: TurnLanes;
+  /**
+   * The inbound scanner production builds for the Dispatcher (#2018). Harnesses
+   * that build their own Dispatcher pass this same instance. A bad
+   * `extra_injection_patterns` entry throws: a suite must not quietly scan with
+   * weaker rules than production.
+   */
+  injectionScanner: InboundScanner;
   /** Every assembled agent, already registered on the bus. */
   agents: AssembledAgent[];
   /**
@@ -986,6 +995,9 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
 
     // ── Agents (same builder as src/index.ts) ──────────────────────────────
     const turnInjection = resolveTurnInjectionConfig(yamlConfig.dispatch);
+    // Throw on a bad pattern. Production warns and continues; a suite that did
+    // the same would score runs against a weaker scanner than the one it ships.
+    const injectionScanner = createInboundScanner(yamlConfig, logger, { onParseError: 'throw' });
     const turnLanes = new TurnLanes({
       enabled: turnInjection.enabled,
       maxInjectionsPerTurn: turnInjection.maxInjectionsPerTurn,
@@ -1097,6 +1109,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       },
       llmProviders: providerRegistry,
       turnLanes,
+      injectionScanner,
       agents,
       disabledTools,
       snapshotMcpTools: snapshotMcp.tools,

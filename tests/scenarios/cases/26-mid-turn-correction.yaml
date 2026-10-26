@@ -1,11 +1,12 @@
 # Case 26 (#2018, ADR-053): a same-contact follow-up arrives while the first tool
 # call is still in flight, and the turn follows the correction. The harness holds
-# that first call until the follow-up is queued. The follow-up is sent once the
-# dispatcher has reserved the lane, so a text reply still receives it. Capture
-# matches one conversation to one turn, so a follow-up that is not queued fails
-# the run instead of being scored as a second reply. The shipped config turns
-# the flag on, and this case is in the release gate. With the flag off the
-# harness errors before publishing. It is not a known_failure: that marker
+# that first call until the follow-up is queued. A text reply never makes that
+# call, so the same follow-up is published at the exit hook, before the turn
+# finishes. Capture matches one conversation to one turn, so a follow-up that is
+# not queued fails the run instead of being scored as a second reply. The shipped
+# config turns the flag on. This case stays out of the release gate until it has
+# been run on the standard-tier model with the official judge. With the flag off
+# the harness errors before publishing. It is not a known_failure: that marker
 # would hide a real miss.
 #
 # The seeded verification is SMS, matching the opening message. The follow-up is
@@ -32,7 +33,7 @@ description: >
   principal changed their mind. Curia clicks "Email me the code", does not
   click "Text me the code", and does not send an SMS.
 tags: [turn-injection, signin, browser]
-release_gate: true
+release_gate: false
 runs: 3
 stub_sets: [human-channels]
 seed:
@@ -138,6 +139,26 @@ tool_stubs:
           - { action: click, selector: "g2f0e1" }
           - { action: type, selector: "g2f0e1", text: "518204" }
           - { action: click, selector: "g2f0e2" }
+      return: *signedin
+    # Two calls instead of one batch: type, then click. The type leaves the
+    # emailed page with the code filled in; the click signs in.
+    - match: { action: type, selector: "[g2f0e1]", text: "518204" }
+      return: &typed
+        session_id: s-26
+        session_reused: true
+        url: https://login.example-benefits.ca/mfa/email
+        content: |
+          Example Benefits — Check your email
+          The code 518204 is in the verification field.
+          --- Interactable elements ---
+          [g2f0e1] textbox "Verification code"
+          [g2f0e2] button "Continue"
+        verification_suspected: { page_domain: example-benefits.ca, signals: [one-time-code-input] }
+    - match: { action: type, selector: "g2f0e1", text: "518204" }
+      return: *typed
+    - match: { action: click, selector: "[g2f0e2]" }
+      return: *signedin
+    - match: { action: click, selector: "g2f0e2" }
       return: *signedin
     # Still the choice page. The emailed page is only the email-button stubs above,
     # so a click in some other selector form is not told that email was chosen.

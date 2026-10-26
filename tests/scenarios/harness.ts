@@ -42,8 +42,6 @@ import {
 import { loadConfig } from '../../src/config.js';
 import { BullpenDispatcher } from '../../src/dispatch/bullpen-dispatcher.js';
 import { Dispatcher } from '../../src/dispatch/dispatcher.js';
-import { InboundScanner } from '../../src/dispatch/inbound-scanner.js';
-import { parseExtraInjectionPatterns } from '../../src/dispatch/security-config-loader.js';
 import { PrincipalAcquaintanceCheck } from '../../src/contacts/principal-acquaintance.js';
 
 /**
@@ -75,6 +73,7 @@ import {
   type TurnOutcome,
 } from '../shared/turn-capture.js';
 import { internalNamesFor } from './assertions.js';
+import { isTextFinishCall } from './followup-exit.js';
 import { createDelegationCapture, inRunOrder, type DelegationCapture, type DelegationTrace } from './delegation-capture.js';
 import { discoverableTools } from './discovery.js';
 import { applyReach } from './reach.js';
@@ -434,22 +433,13 @@ export async function createScenarioHarness(
   // Production's Dispatcher, given an outbound-context service so it injects the
   // block — narrowed to the run's own entries — the run's own backlog counts, and the
   // run's own verifications, so a principal's relayed code is tracked as in production.
-  // A missing scan is not a clean scan: without this scanner every follow-up is
-  // refused and case 26 cannot join the live turn (#2018).
-  let extraInjectionPatterns: ReturnType<typeof parseExtraInjectionPatterns> = [];
-  try {
-    extraInjectionPatterns = parseExtraInjectionPatterns(
-      stack.yamlConfig.security?.extra_injection_patterns ?? [],
-      'security.extra_injection_patterns',
-    );
-  } catch (err) {
-    logger.warn({ err }, 'scenario harness: extra injection patterns failed to parse — using built-in defaults');
-  }
+  // A missing scan is not a clean scan: the stack's scanner is the one production
+  // builds, and a bad extra pattern fails the stack rather than weakening it (#2018).
   new Dispatcher({
     bus,
     logger,
     contactResolver: stack.contactResolver,
-    injectionScanner: new InboundScanner({ extraPatterns: extraInjectionPatterns }),
+    injectionScanner: stack.injectionScanner,
     // Production's trust scoring (#2227): the coordinator sees the sender's trust score,
     // and a message counts toward the sender's confidence, as in production.
     channelPolicies: stack.trustScoring.channelPolicies,
@@ -494,6 +484,14 @@ export async function createScenarioHarness(
   const waitForInjection = (conversationId: string): Promise<boolean> => new Promise((resolve) => {
     injectionQueued.set(conversationId, resolve);
   });
+  // A text llm.call is awaited before the runtime's exit hook. The follow-up
+  // for a reply with no tool call is published from that subscriber, so the
+  // queue is full when closeIfIdle runs and the correction drains at exit.
+  const exitSlots = new Map<string, {
+    agentId: string;
+    claim: () => boolean;
+    publish: () => Promise<void>;
+  }>();
   // Bullpen mentions reach the coordinator the way they do in production.
   new BullpenDispatcher(bus, logger, stack.bullpenService, stack.agentRegistry).register();
 
@@ -502,6 +500,21 @@ export async function createScenarioHarness(
   // Every model call billed to the run it was made in (#1980).
   const unattributed = new UsageLedger();
   meterAgentCalls(bus, context.current, unattributed);
+  // After the meter, so a text finish is billed even though this handler holds
+  // the llm.call delivery until the follow-up is queued. A throw here would be
+  // swallowed by the runtime's telemetry catch, and the exit hook would then
+  // see an empty queue, so the failure is recorded on the run instead.
+  bus.subscribe('llm.call', 'system', async (event) => {
+    if (event.type !== 'llm.call' || !isTextFinishCall(event)) return;
+    const slot = exitSlots.get(event.payload.conversationId);
+    if (!slot || event.payload.agentId !== slot.agentId) return;
+    if (!slot.claim()) return;
+    try {
+      await slot.publish();
+    } catch (err) {
+      capture.fail(event.payload.conversationId, err);
+    }
+  });
   const coordinator = stack.agent(COORDINATOR);
   const coordinatorTools = new Set(coordinator.toolDefs.map(t => t.name));
   // Production's own activation check, per skill: what skill-activate would hand the
@@ -694,7 +707,10 @@ export async function createScenarioHarness(
       }
       releaseFirstCall?.();
       releaseFirstCall = undefined;
-      if (conversationId !== undefined) injectionQueued.delete(conversationId);
+      if (conversationId !== undefined) {
+        injectionQueued.delete(conversationId);
+        exitSlots.delete(conversationId);
+      }
     };
     let stubbedCalls: StubbedCall[] = [];
     let trace: DelegationTrace | undefined;
@@ -852,6 +868,11 @@ export async function createScenarioHarness(
         // fired must not be waited into a finished turn.
         let followupLanding: Promise<void> | undefined;
         if (inbound.followup && typeof sender === 'object' && 'channelId' in sender) {
+          // A follow-up is only valid from a channel sender, and that branch
+          // always sets the id. Publishing without it would skip the wait.
+          if (hostInboundId === undefined) {
+            throw new Error('channel follow-up has no host inbound id');
+          }
           const follow = inbound.followup;
           const publishFollowup = async (): Promise<void> => {
             if (!followupArmed) return;
@@ -900,17 +921,30 @@ export async function createScenarioHarness(
             }
           };
           if (follow.after === 'first_tool_call') {
-            void (async () => {
-              // The lane is reserved once the dispatcher decides the host inbound,
-              // which is before the model call. Waiting for a tool call drops the
-              // correction when the model answers in text, and beforeFinish never
-              // sees it. The first tool stays held until this landing finishes.
-              if (hostInboundId !== undefined) await stack.turnLanes.intakeSettled(hostInboundId);
-              if (!followupArmed) return;
+            // The model has to have chosen before the correction arrives.
+            // whenFirstCall is that moment for a tool round: the call stays
+            // held until the follow-up is queued, and the next round drains
+            // it. A text reply never records a tool call. Its llm.call is
+            // awaited before the exit hook, and the subscriber publishes
+            // there, so closeIfIdle sees the queue and the drain is `exit`
+            // rather than `turn_start`.
+            let claimed = false;
+            const claim = (): boolean => {
+              if (claimed || !followupArmed) return false;
+              claimed = true;
+              return true;
+            };
+            const publish = async (): Promise<void> => {
               const landing = followupLanded();
               followupLanding = landing;
               await landing;
               releaseFirstCall?.();
+            };
+            exitSlots.set(runConversationId, { agentId: agent, claim, publish });
+            void (async () => {
+              await controller.whenFirstCall(runConversationId);
+              if (!claim()) return;
+              await publish();
             })().catch((err: unknown) => capture.fail(runConversationId, err));
           } else {
             followupTimer = setTimeout(() => {

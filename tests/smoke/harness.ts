@@ -228,6 +228,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Curia
     contactResolver,
     channelPolicies: undefined,
     turnLanes: stack.turnLanes,
+    // The lane is on in the shipped config. Without the stack's scanner every
+    // follow-up is refused, because a missing scan is not a clean one (#2018).
+    injectionScanner: stack.injectionScanner,
   });
   dispatcher.register();
 

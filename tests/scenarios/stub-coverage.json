@@ -458,10 +458,8 @@
       "recordedAt": "2026-10-14T16:53:34.402Z"
     },
     "mid-turn correction switches the sign-in channel": {
-      "unstubbed": 0,
-      "runs": 3,
-      "model": "claude-sonnet-4-6",
-      "recordedAt": "2026-10-26T13:13:46.852Z"
+      "unstubbed": null,
+      "reason": "Waiting on a standard-tier run with the official judge before it joins the release gate (#2018)."
     },
     "no google file chat": {
       "unstubbed": 0,
