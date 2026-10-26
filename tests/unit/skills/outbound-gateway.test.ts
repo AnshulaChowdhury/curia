@@ -9,7 +9,7 @@ import type { BusEvent } from '../../../src/bus/events.js';
 import type { AutonomyService, AutonomyConfig } from '../../../src/autonomy/autonomy-service.js';
 import type { PiiRedactor } from '../../../src/dispatch/pii-redactor.js';
 import type { ActionLogRepo } from '../../../src/autonomy/action-log-repo.js';
-import type { BandSendReview } from '../../../src/dispatch/band-send-review.js';
+import { BLOCK_REASON, type BandSendReview } from '../../../src/dispatch/band-send-review.js';
 import type { OutboundQueueRepo } from '../../../src/skills/outbound-queue-repo.js';
 import { readFile, realpath } from 'node:fs/promises';
 
@@ -4076,9 +4076,10 @@ describe('band review (#2159)', () => {
 
   const emailReq = { channel: 'email' as const, to: 'joel@example.com', subject: 'Forms', body: 'Hi Joel. I am out of office until the 13th.' };
 
-  function makeBandGateway(opts: { review: ReturnType<typeof vi.fn>; score: number; gating?: 'band' | 'tier'; actionLogRepo?: ActionLogRepo }) {
+  function makeBandGateway(opts: { review: ReturnType<typeof vi.fn>; score: number; gating?: 'band' | 'tier'; actionLogRepo?: ActionLogRepo; emailAccountAddresses?: Map<string, string> }) {
     return new OutboundGateway({
       nylasClients: new Map([['curia', mocks.nylasClient]]),
+      ...(opts.emailAccountAddresses ? { emailAccountAddresses: opts.emailAccountAddresses } : {}),
       contactService: mocks.contactService,
       contentFilter: mocks.contentFilter,
       bus: mocks.bus,
@@ -4147,11 +4148,11 @@ describe('band review (#2159)', () => {
 
   it('refuses a blocked send with the block reason, publishes no outbound.blocked, and tells the digest', async () => {
     const findings = [{ rule: 'ungrounded-claim', detail: 'not backed: "I am out of office until the 13th."' }];
-    const reason = 'Not sent: after one rewrite it still has the problems below. Rewrite it again without them, or tell the principal.';
+    const reason = BLOCK_REASON;
     const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'block', reason, findings }), score: 84 });
     const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1' });
     expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
-    expect(result.blockedReason).toMatch(new RegExp(`^${reason}`));
+    expect(result.blockedReason!.startsWith(BLOCK_REASON)).toBe(true);
     expect(result.blockedReason).toContain('out of office until the 13th');
     expect(result.gated).toBeUndefined();
     // No outbound.blocked: on a relay it would start the #1355 rewrite loop again.
@@ -4177,6 +4178,47 @@ describe('band review (#2159)', () => {
     expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'send-draft', outcome: 'pending_approval' }));
     expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
     expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+  });
+
+  describe('a block with no drafter waiting holds instead (#2312)', () => {
+    const blockFindings = [{ rule: 'ungrounded-claim', detail: 'not backed: "I am out of office until the 13th."' }];
+    const blockDecision = { kind: 'block', reason: BLOCK_REASON, findings: blockFindings };
+
+    it('holds a relayed reply as gated with an approval, never blocks or publishes outbound.blocked', async () => {
+      const actionLogRepo = makeActionLogRepo();
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(blockDecision), score: 84, actionLogRepo });
+      const result = await gw.send(emailReq, {
+        taskEventId: 't1', postTurn: true,
+        reExecRecipe: { toolName: 'send-draft', partialPayload: { account: 'a' }, description: 'Draft reply to joel@example.com' },
+      });
+      expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+      expect(result.blockedReason).not.toContain('Rewrite it again');
+      expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'send-draft', outcome: 'pending_approval' }));
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the digest for a relayed reply with nothing to replay', async () => {
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(blockDecision), score: 84 });
+      const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', postTurn: true });
+      expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
+      expect(result.blockedReason).toContain('Ask the principal before sending it.');
+      expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(1);
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('holds a saved draft through its holdRecipe', async () => {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const actionLogRepo = makeActionLogRepo();
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(blockDecision), score: 84, actionLogRepo });
+      const result = await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: emailReq.body, subject: 'Forms' }, {
+        taskEventId: 't1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft to joel@example.com' },
+      });
+      expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+      expect((mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft).not.toHaveBeenCalled();
+    });
   });
 
   it('holds a skill send through its holdRecipe', async () => {
@@ -4285,6 +4327,7 @@ describe('band review (#2159)', () => {
       const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, { taskEventId: 't1', conversationId: 'c1' });
       expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
       expect(review).toHaveBeenCalledWith(expect.objectContaining({ content: draftMeta.body, channel: 'email', score: 84 }));
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(1);
     });
 
     it('refuses a blocked draft send, with the digest told and nothing sent', async () => {
@@ -4295,6 +4338,7 @@ describe('band review (#2159)', () => {
       const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, { taskEventId: 't1' });
       expect(result).toMatchObject({ success: false, blockedRules: ['unneeded-disclosure'] });
       expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(1);
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
       expect((mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft).not.toHaveBeenCalled();
     });
 
@@ -4306,7 +4350,19 @@ describe('band review (#2159)', () => {
         taskEventId: 't1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft to joel@example.com' },
       });
       expect(result).toMatchObject({ success: false, gated: true });
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
       expect((mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft).not.toHaveBeenCalled();
+    });
+
+    it('does not review a draft to Curia\'s own address with the principal CC\'d', async () => {
+      withDraftClient();
+      const review = vi.fn();
+      const gw = makeBandGateway({ review, score: 84, emailAccountAddresses: new Map([['curia', 'curia@example.com']]) });
+      const result = await gw.sendEmailDraft('d1', 'curia', {
+        ...draftMeta, recipientEmail: 'curia@example.com', allRecipients: ['curia@example.com', 'principal@example.com'],
+      }, { taskEventId: 't1' });
+      expect(result.success).toBe(true);
+      expect(review).not.toHaveBeenCalled();
     });
 
     it('sends a draft the review passes', async () => {

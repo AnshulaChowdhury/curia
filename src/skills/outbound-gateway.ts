@@ -1971,6 +1971,8 @@ export class OutboundGateway {
       holdRecipe?: SendRecipe;
       reExecRecipe?: SendRecipe;
     } | undefined;
+    /** False for a saved draft: its drafter cannot rewrite it, so a block holds instead. */
+    editable?: boolean;
   }): Promise<{ result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals }> {
     const { request, content, recipients, principalRecipients, options } = args;
     const score = await this.bandScore();
@@ -1993,6 +1995,17 @@ export class OutboundGateway {
       this.log.error({ err, channel: request.channel }, 'outbound-gateway: band review threw — holding the send');
       const reason = 'Held for the principal: the send review failed.';
       decision = { kind: 'hold', reason, findings: [{ rule: BAND_RULES.unreviewed, detail: reason }] };
+    }
+
+    // A block asks the drafter to rewrite, so it needs one waiting. A dispatcher relay's
+    // drafter is gone and a saved draft cannot be rewritten in place: the principal decides.
+    if (decision.kind === 'block' && (options?.postTurn === true || args.editable === false)) {
+      const rules = decision.findings.map((f) => f.rule).join(', ');
+      decision = {
+        kind: 'hold',
+        reason: `Held for the principal: after one rewrite it still has these problems (${rules}).`,
+        findings: decision.findings,
+      };
     }
 
     if (decision.kind === 'send') {
@@ -3461,6 +3474,7 @@ export class OutboundGateway {
         recipients: draftRecipients.length > 0 ? draftRecipients.map((r) => r.email) : draftEnvelope,
         principalRecipients: draftRecipients.filter((r) => r.isPrincipal).map((r) => r.email),
         options,
+        editable: false,
       });
       if (outcome.result) return outcome.result;
       bandReport = outcome.report;

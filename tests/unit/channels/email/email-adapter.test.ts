@@ -942,6 +942,37 @@ describe('EmailAdapter — sendWithGatedDraftFallback gated-fallback', () => {
     await adapter.stop();
   });
 
+  it('forwards the note reported to the principal into the gateway send options (#2312)', async () => {
+    const adapter = makeAdapter(mocks);
+    await adapter.start();
+
+    const humanMessage = makeMockMessage({
+      from: [{ email: CEO_EMAIL }],
+      to: [{ email: SELF_EMAIL }],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([humanMessage]);
+
+    await triggerOutbound(createOutboundMessage({
+      conversationId: 'email:thread-abc',
+      channelId: 'email',
+      content: 'Here is my reply.',
+      parentEventId: 'response-1',
+      taskEventId: 'task-evt-1',
+      reportedToPrincipal: 'Provider asked for your number.',
+    }));
+    expect(mocks.outboundGateway.send).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ reportedToPrincipal: 'Provider asked for your number.' }),
+    );
+
+    // Absent on the event, absent in the options.
+    await triggerOutbound(makeOutboundEventWithTask('email:thread-abc', 'task-evt-2'));
+    const options = vi.mocked(mocks.outboundGateway.send).mock.calls.at(-1)![1] as Record<string, unknown>;
+    expect(options).not.toHaveProperty('reportedToPrincipal');
+
+    await adapter.stop();
+  });
+
   it('creates draft and links action when gateway returns gated', async () => {
     // Gateway returns gated result
     (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mockResolvedValue({

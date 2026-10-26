@@ -96,7 +96,7 @@ export function buildBriefUserPrompt(input: BriefInput): string {
     `Task progress notes: <progress_json>${encode(input.evidence.taskProgress ?? '')}</progress_json>`,
     `Who the principal is: <principal_json>${encode(input.evidence.principalBlock ?? '')}</principal_json>`,
     `Evidence looked up this turn (newest first): <evidence_json>${encode(input.evidence.toolResults)}</evidence_json>`,
-    `Reported to the principal this turn: <reports_json>${encode(input.evidence.reportsToPrincipal ?? [])}</reports_json>`,
+    `Reported to the principal this turn (what the assistant told the principal; not evidence of facts about the principal): <reports_json>${encode(input.evidence.reportsToPrincipal ?? [])}</reports_json>`,
     '',
     `Return ONLY: {${keys}, "reason": "<one short sentence>"}`,
   ].join('\n');

@@ -15,8 +15,10 @@
 //   unsupported claims / unneeded    → bounce to the drafter, ONCE per draft. Curia never
 //     disclosures                       cuts text out of a message: the drafter rewrites it.
 //                                       If the rewrite still has findings, at 80+ the send is
-//                                       blocked (not sent, the drafter told to rewrite again
-//                                       or tell the principal); below 80, held.
+//                                       refused back to the drafter (not sent, told to rewrite
+//                                       again or tell the principal); below 80, held. The
+//                                       gateway holds instead of refusing when no drafter is
+//                                       waiting: a relayed reply or a saved draft.
 //   judge failure                    → 80+: send with a "sent without review" item, capped
 //                                       at 5 an hour (then hold until a judge call succeeds);
 //                                       below 80: hold.
@@ -75,7 +77,7 @@ export type BandReviewSignals = { speaksAsPrincipal?: boolean; bounced?: boolean
 export type BandReviewDecision =
   | { kind: 'send'; report?: BandReviewReport; signals?: BandReviewSignals }
   | { kind: 'bounce'; findings: FilterFinding[] }
-  // Not sent, and not held for the principal: the drafter must rewrite it again (80+ only).
+  // Not sent, and not held for the principal: the drafter must rewrite it again (80+ only). The gateway converts it to a hold for a relayed reply or a saved draft.
   | { kind: 'block'; reason: string; findings: FilterFinding[] }
   | { kind: 'hold'; reason: string; findings: FilterFinding[] };
 
@@ -175,8 +177,9 @@ export class BandSendReview {
     const evidence = await this.deps.evidence.collect(taskIds);
     // Without evidence every claim looks unsupported; that is a review failure, not a bounce.
     if (evidence.unavailable) return { ok: false, failure: 'unreachable' };
-    // Newest first, so the note leads. The relay's principal note is not under the drafting task in audit_log (its parent is
-    // the agent.response), so it arrives with the send rather than from the collector.
+    // Newest first, so the note leads. The relay's principal note is not under the drafting
+    // task in audit_log (its parent is the agent.response), so it arrives with the send
+    // rather than from the collector.
     const reportsToPrincipal = input.reportedToPrincipal
       ? [reportEvidence(input.reportedToPrincipal), ...(evidence.reportsToPrincipal ?? [])]
       : evidence.reportsToPrincipal;
