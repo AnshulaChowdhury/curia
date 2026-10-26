@@ -4324,6 +4324,84 @@ describe('band review (#2159)', () => {
     expect(result.blockedReason).toContain(`ref: ${result.actionRef}`);
   });
 
+  // PR 5 (#2312): a requester's ask reaches the principal as a question, now.
+  describe('a held request for the principal\'s data asks the principal', () => {
+    const askHold = (ask: Record<string, unknown>) => ({
+      kind: 'hold',
+      reason: 'Held for the principal: the recipient asked for personal details (phone_us) that nothing authorizes sharing yet.',
+      findings: [{ rule: 'pii-not-authorized', detail: 'x' }],
+      ask,
+    });
+    const holdRecipe = { toolName: 'email-send', partialPayload: { to: 'contact-1' }, description: 'Email to joel@example.com' };
+
+    it('leads the approval with the question and tells the agent to deliver it now', async () => {
+      const actionLogRepo = makeNumberedActionLogRepo(4);
+      const registerDisplay = vi.fn();
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(askHold({ labels: ['phone_us', 'sin_ca'], requester: 'joel@example.com', taskTitle: 'Book physio' })), score: 84, actionLogRepo });
+      gw.setApprovalDelivery({ registerDisplay } as never);
+      const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+      expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({
+        preamble: 'joel@example.com is asking for your phone number and SIN for "Book physio". Share it? Reply yes to send the message below as written, or no to keep it private.',
+        extraLines: [],
+      }));
+      expect(result.blockedReason!.endsWith(
+        'This is waiting on the principal. Deliver approval 4 to them now with deliver-approval on their urgent channel, then send joel@example.com a short holding reply that doesn\'t include the requested details.',
+      )).toBe(true);
+      // The action row and its digest mention keep the recipe's description.
+      expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ description: 'Email to joel@example.com' }));
+    });
+
+    it('omits the task when none is known, and names the ref when the approval has no number', async () => {
+      const registerDisplay = vi.fn();
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(askHold({ labels: ['phone_us'], requester: 'joel@example.com' })), score: 84 });
+      gw.setApprovalDelivery({ registerDisplay } as never);
+      const result = await gw.send(emailReq, { taskEventId: 't1', holdRecipe });
+      expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({
+        preamble: 'joel@example.com is asking for your phone number. Share it? Reply yes to send the message below as written, or no to keep it private.',
+      }));
+      expect(result.blockedReason).toContain(`Deliver approval ${result.actionRef} to them now with deliver-approval on their urgent channel`);
+    });
+
+    it('keeps the recipe\'s description as the preamble of any other hold', async () => {
+      const registerDisplay = vi.fn();
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84 });
+      gw.setApprovalDelivery({ registerDisplay } as never);
+      const result = await gw.send(emailReq, { taskEventId: 't1', holdRecipe });
+      expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({
+        preamble: 'Email to joel@example.com', extraLines: ['Held by the send review: Held.'],
+      }));
+      expect(result.blockedReason).not.toContain('This is waiting on the principal.');
+    });
+
+    it('bounces a cold stranger\'s request with one digest note and no approval', async () => {
+      const actionLogRepo = makeActionLogRepo();
+      const findings = [{ rule: 'pii-not-authorized', detail: 'This message shares personal details nothing authorizes for this recipient: sin_ca. Rewrite it without them.' }];
+      const gw = makeBandGateway({
+        review: vi.fn().mockResolvedValue({ kind: 'bounce', findings, strangerRequest: { labels: ['sin_ca', 'extra_0'], requester: 'joel@example.com' } }),
+        score: 84, actionLogRepo,
+      });
+      const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(result).toMatchObject({ success: false, blockedRules: ['pii-not-authorized'] });
+      expect(result.gated).toBeUndefined();
+      const reports = publishedOfType(mocks.bus, 'principal.report');
+      expect(reports).toHaveLength(1);
+      expect(reports[0]!.payload).toMatchObject({
+        source: 'blocked_content', urgency: 'digest', conversationId: 'c1',
+        summary: 'joel@example.com asked for your SIN and personal detail. Curia didn\'t share it and replied without it.',
+      });
+      expect(actionLogRepo.insert).not.toHaveBeenCalled();
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('queues no digest note for an ordinary bounce', async () => {
+      const findings = [{ rule: 'ungrounded-claim', detail: 'x' }];
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }), score: 84 });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(0);
+    });
+  });
+
   it('refuses a held send with no recipe, telling the agent to ask', async () => {
     const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84 });
     const result = await gw.send(emailReq, { taskEventId: 't1' });

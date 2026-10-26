@@ -59,7 +59,9 @@ import type { ApprovalDelivery } from '../autonomy/approval-delivery.js';
 import type { AutonomyGating } from '../autonomy/band-policy.js';
 import { budgetedOriginator, type RelayBudget } from '../autonomy/relay-budget.js';
 import { isUuid } from '../util/uuid.js';
-import { BAND_RULES, type BandReviewReport, type BandReviewSignals, type BandSendReview } from '../dispatch/band-send-review.js';
+import {
+  BAND_RULES, describePiiLabels, type BandReviewAsk, type BandReviewReport, type BandReviewSignals, type BandSendReview,
+} from '../dispatch/band-send-review.js';
 import type { OutboundNotificationPayload } from '../bus/events.js';
 import { markdownToHtml } from '../format/markdown-to-html.js';
 import { bodyEndsWithSignature, emailSignatureHtml, emailSignatureText, stripModelSignOff } from '../channels/email/signature.js';
@@ -599,6 +601,12 @@ interface FirstContactProbe {
 function truncatePreview(text: string): string {
   const line = text.split('\n').find((l) => l.trim() !== '')?.trim() ?? '';
   return line.length > 80 ? `${line.slice(0, 77)}...` : line;
+}
+
+/** The question an ask's approval opens with (#2312): who wants which details, for what task. */
+function askPreamble(ask: BandReviewAsk): string {
+  const forTask = ask.taskTitle ? ` for "${ask.taskTitle}"` : '';
+  return `${ask.requester} is asking for your ${describePiiLabels(ask.labels)}${forTask}. Share it? Reply yes to send the message below as written, or no to keep it private.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1997,13 +2005,16 @@ export class OutboundGateway {
    * Nobody is notified here: the agent that tried the send delivers the approval on one
    * channel with deliver-approval. Returns the short ref and approval number (#2159 Phase 3;
    * null when the row has none), or undefined when there is no action log or the row could not
-   * be written (the send stays held either way).
+   * be written (the send stays held either way). `preamble` replaces the recipe's description
+   * at the top of what the principal is shown (an ask's question, #2312); the row and its
+   * digest mention keep the description.
    */
   private async raiseSendApproval(
     request: OutboundSendRequest,
     recipe: SendRecipe,
     ctx: { taskEventId: string; conversationId?: string | null; postTurn?: boolean },
     extraLines: string[],
+    preamble?: string,
   ): Promise<{ shortRef: string; approvalNumber: number | null } | undefined> {
     const actionLogRepo = this.actionLogRepo;
     if (!actionLogRepo) {
@@ -2045,7 +2056,7 @@ export class OutboundGateway {
           : { recipient: request.recipient, message: request.message },
     );
     this.approvalDelivery?.registerDisplay(candidateRef, {
-      preamble: recipe.description,
+      preamble: preamble ?? recipe.description,
       payload: displayPayload,
       extraLines,
       approvalNumber,
@@ -2252,6 +2263,16 @@ export class OutboundGateway {
       } catch (err) {
         this.log.warn({ err, blockId }, 'outbound-gateway: failed to publish outbound.blocked for a band bounce — the send is still bounced');
       }
+      if (decision.strangerRequest) {
+        // A cold stranger asked for the principal's data: nobody can be asked, so the digest
+        // says it was not shared (#2312). Labels only, never the values.
+        const { requester, labels } = decision.strangerRequest;
+        await this.queueBlockReport(
+          `${requester} asked for your ${describePiiLabels(labels)}. Curia didn't share it and replied without it.`,
+          options?.conversationId ?? undefined,
+          options?.taskEventId ?? options?.parentEventId ?? 'system',
+        );
+      }
       return {
         result: {
           success: false,
@@ -2301,20 +2322,26 @@ export class OutboundGateway {
       );
     };
     if (recipe && options?.taskEventId) {
+      // An ask leads with the question; the personal-details line and the draft follow (#2312).
+      const ask = decision.ask;
       const raised = await this.raiseSendApproval(
         request,
         recipe,
         { taskEventId: options.taskEventId, conversationId: options.conversationId, postTurn: options.postTurn },
-        [`Held by the send review: ${decision.reason}`],
+        ask ? [] : [`Held by the send review: ${decision.reason}`],
+        ask ? askPreamble(ask) : undefined,
       );
       if (!raised) await reportUnapprovedHold('the approval row could not be written');
+      const askGuidance = ask && raised
+        ? ` This is waiting on the principal. Deliver approval ${raised.approvalNumber ?? raised.shortRef} to them now with deliver-approval on their urgent channel, then send ${ask.requester} a short holding reply that doesn't include the requested details.`
+        : '';
       return {
         result: {
           success: false,
           gated: true,
           ...(raised ? { actionRef: raised.shortRef } : {}),
           blockedReason: raised
-            ? `${decision.reason} ${approvalAdvisory(raised.shortRef, undefined, raised.approvalNumber)}`
+            ? `${decision.reason} ${approvalAdvisory(raised.shortRef, undefined, raised.approvalNumber)}${askGuidance}`
             : `${decision.reason} No approval request could be recorded — ask the principal before sending it.`,
         },
       };

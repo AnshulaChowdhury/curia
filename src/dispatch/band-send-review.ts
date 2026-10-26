@@ -41,6 +41,12 @@
 //   placeholder in the content bounces the same way. The strictest outcome of all the rules
 //   wins: block > hold > bounce > send.
 //
+// A hold that waits only on the principal's yes to a requester (an askable recipient's request,
+// or a requested item held below 80 under the principal's task) carries `ask`: the gateway
+// shows the principal a question and tells the agent to deliver it now. Any other hold reason
+// beside it drops the ask. A cold stranger's request bounces with `strangerRequest`, so the
+// digest says Curia did not share it. Both name labels and the requester only, never values.
+//
 // The bounce ledger is in memory, keyed by conversation, channel and recipients, so a relay
 // rewrite (a new task on the same conversation) counts as the recheck and sees the first
 // turn's lookups. A restart between a bounce and its recheck gives one more bounce. The two
@@ -117,13 +123,21 @@ export type BandReviewReport = { source: 'sent_without_review'; summary: string 
  */
 export type BandReviewSignals = { speaksAsPrincipal?: boolean; bounced?: boolean };
 
+/**
+ * A requester's ask for the principal's data (#2312): the detected labels, the primary
+ * non-principal recipient, and the title of the task it is for, when the evidence names one.
+ */
+export type BandReviewAsk = { labels: string[]; requester: string; taskTitle?: string };
+
 export type BandReviewDecision =
   // copyPrincipal: a trusted contact directed these items out; the principal is copied (#2312).
   | { kind: 'send'; report?: BandReviewReport; signals?: BandReviewSignals; copyPrincipal?: { labels: string[] } }
-  | { kind: 'bounce'; findings: FilterFinding[] }
+  // strangerRequest: a recipient nobody can ask about requested these items; the digest is told (#2312).
+  | { kind: 'bounce'; findings: FilterFinding[]; strangerRequest?: { labels: string[]; requester: string } }
   // Not sent, and not held for the principal: the drafter must rewrite it again (80+ only). The gateway converts it to a hold for a relayed reply or a saved draft.
   | { kind: 'block'; reason: string; findings: FilterFinding[] }
-  | { kind: 'hold'; reason: string; findings: FilterFinding[] };
+  // ask: the hold waits only on the principal's yes to a requester (#2312).
+  | { kind: 'hold'; reason: string; findings: FilterFinding[]; ask?: BandReviewAsk };
 
 export interface BandSendReviewDeps {
   judge: Pick<EscalationJudge, 'review' | 'isEnabled'> | undefined;
@@ -263,6 +277,10 @@ export class BandSendReview {
     const toRewrite: FilterFinding[] = [];
     const holds: FilterFinding[] = [];
     const copy = new Set<string>();
+    // The held items an ask covers, and whether anything else was held (then no ask).
+    const askLabels = new Set<string>();
+    let heldOtherwise = false;
+    const strangerAsked = new Set<string>();
 
     if (items.length > 0 && rulings === undefined) {
       toRewrite.push({ rule: BAND_RULES.pii, detail: TOO_MANY_DETAIL });
@@ -278,19 +296,31 @@ export class BandSendReview {
         const r = byId.get(item.id)!;
         if (r.basis === 'directed' && who === 'principal') continue;
         if (r.basis === 'directed' && who === 'trusted') { copy.add(item.label); continue; }
+        // Held below 80 for the principal: an ask when it is their task and an askable recipient
+        // requested it. Under the principal's own turn nobody is asking: an ordinary hold.
+        const heldForTask = (set: Set<string>) => {
+          set.add(item.label);
+          if (who === 'principal-task' && r.requested && askable) askLabels.add(item.label);
+          else heldOtherwise = true;
+        };
         // The principal set the task, but this turn is not theirs: a directed ruling counts
         // only as inferred, since the principal did not direct this send themselves.
         if (r.basis === 'directed' && who === 'principal-task') {
-          if (!isSpotCheckOrAbove(input.score)) taskDirectedBelow80.add(item.label);
+          if (!isSpotCheckOrAbove(input.score)) heldForTask(taskDirectedBelow80);
           continue;
         }
         if (r.basis === 'inferred' && (who === 'principal' || who === 'principal-task')) {
-          if (!isSpotCheckOrAbove(input.score)) inferredBelow80.add(item.label);
+          if (!isSpotCheckOrAbove(input.score)) heldForTask(inferredBelow80);
           continue;
         }
         // Every other combination is unsupported.
-        if (r.requested && askable) askFirst.add(item.label);
-        else unsupported.add(item.label);
+        if (r.requested && askable) {
+          askFirst.add(item.label);
+          askLabels.add(item.label);
+        } else {
+          unsupported.add(item.label);
+          if (r.requested) strangerAsked.add(item.label);
+        }
       }
       if (unsupported.size > 0) {
         toRewrite.push({
@@ -319,8 +349,26 @@ export class BandSendReview {
     }
     if (hasToken) toRewrite.push({ rule: BAND_RULES.token, detail: TOKEN_DETAIL });
 
-    if (toRewrite.length > 0) return this.rewriteOutcome(input, toRewrite, hasPrior);
-    if (holds.length > 0) return { kind: 'hold', reason: holds[0]!.detail, findings: holds };
+    if (toRewrite.length > 0) {
+      const outcome = this.rewriteOutcome(input, toRewrite, hasPrior);
+      const requester = primaryRequester(input);
+      // Only the first bounce is noted: a recheck blocks or holds, and says so itself.
+      if (outcome.kind === 'bounce' && strangerAsked.size > 0 && requester !== undefined) {
+        return { ...outcome, strangerRequest: { labels: [...strangerAsked], requester } };
+      }
+      return outcome;
+    }
+    if (holds.length > 0) {
+      const requester = primaryRequester(input);
+      if (askLabels.size > 0 && !heldOtherwise && requester !== undefined) {
+        const taskTitle = askTaskTitle(authority, linkCovers);
+        return {
+          kind: 'hold', reason: holds[0]!.detail, findings: holds,
+          ask: { labels: [...askLabels], requester, ...(taskTitle ? { taskTitle } : {}) },
+        };
+      }
+      return { kind: 'hold', reason: holds[0]!.detail, findings: holds };
+    }
     return { kind: 'send', ...(copy.size > 0 ? { copyPrincipal: { labels: [...copy] } } : {}) };
   }
 
@@ -541,10 +589,48 @@ function combine(a: BandReviewDecision, b: BandReviewDecision): BandReviewDecisi
       ...(labels.length > 0 ? { copyPrincipal: { labels } } : {}),
     };
   }
-  if (a.kind === 'bounce' && b.kind === 'bounce') return { kind: 'bounce', findings: [...a.findings, ...b.findings] };
+  if (a.kind === 'bounce' && b.kind === 'bounce') {
+    const strangerRequest = a.strangerRequest ?? b.strangerRequest;
+    return { kind: 'bounce', findings: [...a.findings, ...b.findings], ...(strangerRequest ? { strangerRequest } : {}) };
+  }
   if (a.kind === 'block' && b.kind === 'block') return { kind: 'block', reason: a.reason, findings: [...a.findings, ...b.findings] };
+  // A merged hold has a reason besides the requester's data, so it is never an ask (#2312).
   if (a.kind === 'hold' && b.kind === 'hold') return { kind: 'hold', reason: a.reason, findings: [...a.findings, ...b.findings] };
   return a;
+}
+
+/** The first recipient who is not the principal: who an ask or a stranger's request names (#2312). */
+function primaryRequester(input: BandReviewInput): string | undefined {
+  const principals = new Set((input.principalRecipients ?? []).map(bareId));
+  return input.recipients.find((r) => !principals.has(bareId(r)));
+}
+
+/**
+ * The task an ask is for, from the review's evidence: a link covering the recipients names
+ * its task (or that task's root), otherwise the bound or root task. Undefined when none has
+ * a title.
+ */
+function askTaskTitle(a: SendAuthority | undefined, linkCovers: boolean): string | undefined {
+  const linked = linkCovers ? a?.linkedTask?.title ?? a?.linkedTask?.root?.title : undefined;
+  const title = linked ?? a?.boundTask?.title ?? a?.rootTask?.title;
+  return title?.trim() ? title.trim() : undefined;
+}
+
+const HUMAN_PII_LABELS: Readonly<Record<string, string>> = {
+  phone_us: 'phone number',
+  phone_uk_mobile: 'mobile number',
+  email: 'email address',
+  credit_card: 'card number',
+  ssn: 'SSN',
+  sin_ca: 'SIN',
+};
+
+/**
+ * Detected labels as the principal reads them (#2312), once each, joined with "and": `phone_us`
+ * is "phone number". A configured pattern (`extra_N`) or any other label is "personal detail".
+ */
+export function describePiiLabels(labels: readonly string[]): string {
+  return [...new Set(labels.map((l) => HUMAN_PII_LABELS[l] ?? 'personal detail'))].join(' and ');
 }
 
 /** The link is to a task the principal directed: its own originator, or its project root's. */

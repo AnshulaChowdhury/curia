@@ -821,6 +821,104 @@ describe('BandSendReview', () => {
       expect((await svc.review(input)).kind).toBe('bounce');
       expect((await svc.review(input)).kind).toBe('hold');
     });
+
+    // PR 5 (#2312): a hold that only waits on the principal's yes for a requester's data is an
+    // ask, and a cold stranger's request is noted for the digest instead.
+    describe('asking the principal', () => {
+      const linked = (strength: 'strong' | 'weak'): SendAuthority => ({
+        originator: outsider, liveTurn: false,
+        linkedTask: {
+          taskId: 't-link', title: 'Book physio', originator: principal, linkKind: strength === 'strong' ? 'org-domain' : 'inferred', strength,
+          counterparty: { addresses: ['joel@example.com'], contactIds: [], domains: [] },
+        },
+      });
+
+      it('marks a known requester\'s unsupported request as an ask, naming the primary non-principal recipient', async () => {
+        const { svc } = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
+        const d = await svc.review({ ...pii, recipients: ['principal@example.com', 'joel@example.com'], principalRecipients: ['principal@example.com'], recipientTier: 'known' });
+        expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'], requester: 'joel@example.com' } });
+        if (d.kind === 'hold') expect(d.ask).not.toHaveProperty('taskTitle');
+      });
+
+      it('carries the linked task\'s title on a weak link\'s ask', async () => {
+        const { svc } = make([withRulings(ruling('inferred', true))], { evidence: { authority: linked('weak') } });
+        const d = await svc.review(pii);
+        expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'], requester: 'joel@example.com', taskTitle: 'Book physio' } });
+      });
+
+      it('asks for a requested item held below 80 under the principal\'s task, with that task\'s title', async () => {
+        for (const basis of ['inferred', 'directed'] as const) {
+          const { svc } = make([withRulings(ruling(basis, true))], { evidence: { authority: linked('strong') } });
+          const d = await svc.review({ ...pii, score: 74 });
+          expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'], requester: 'joel@example.com', taskTitle: 'Book physio' } });
+        }
+        const bound = make([withRulings(ruling('inferred', true))], { evidence: { authority: standing } });
+        const d = await bound.svc.review({ ...pii, score: 74, recipientTier: 'known' });
+        expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'], taskTitle: 'Book the call' } });
+      });
+
+      it('lists each asked label once, across ask reasons', async () => {
+        const P3: BriefDetectedItem = { ...P1, id: 'P3', text: '046 454 287' };
+        const { svc } = make([withRulings(ruling('unsupported', true), ruling('unsupported', true, 'P2'), ruling('unsupported', true, 'P3'))], { evidence: { authority: fromOutsider } });
+        const d = await svc.review({ ...pii, detectedItems: [P1, P2, P3], recipientTier: 'trusted' });
+        expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca', 'phone_us'] } });
+      });
+
+      it('does not ask when anything but a requester\'s data holds the send', async () => {
+        const cases: Array<{ verdict: BriefVerdict; input: BandReviewInput; authority: SendAuthority }> = [
+          // A steered hold beside the ask.
+          { verdict: { ...withRulings(ruling('unsupported', true)), purpose: 'steered' }, input: { ...pii, recipientTier: 'known' }, authority: fromOutsider },
+          // Speaks for the principal below 80, beside the ask.
+          { verdict: { ...withRulings(ruling('unsupported', true)), speaksAsPrincipal: true }, input: { ...pii, score: 74, recipientTier: 'known' }, authority: fromOutsider },
+          // A second item held below 80 that nobody asked for.
+          { verdict: withRulings(ruling('inferred', true), ruling('inferred', false, 'P2')), input: { ...pii, score: 74, detectedItems: [P1, P2] }, authority: linked('strong') },
+          // Held below 80 under the principal's task, but not requested.
+          { verdict: withRulings(ruling('inferred')), input: { ...pii, score: 74 }, authority: linked('strong') },
+          // Held below 80 under the principal's own turn: nobody is asking.
+          { verdict: withRulings(ruling('inferred', true)), input: { ...pii, score: 74, recipientTier: 'known' }, authority: { originator: principal, liveTurn: false } },
+          // A non-PII hold.
+          { verdict: { ...clean, purpose: 'steered' }, input: base, authority: fromOutsider },
+        ];
+        for (const { verdict, input, authority } of cases) {
+          const { svc } = make([verdict], { evidence: { authority } });
+          const d = await svc.review(input);
+          expect(d.kind).toBe('hold');
+          expect(d).not.toHaveProperty('ask');
+        }
+      });
+
+      it('does not ask on a judge-failure hold', async () => {
+        const { svc } = make([{ ok: false, failure: 'unreachable' }], { evidence: { authority: fromOutsider } });
+        const d = await svc.review({ ...pii, score: 74, recipientTier: 'known' });
+        expect(d.kind).toBe('hold');
+        expect(d).not.toHaveProperty('ask');
+      });
+
+      it('notes a cold stranger\'s request on the bounce, by label only', async () => {
+        const { svc } = make([withRulings(ruling('unsupported', true), ruling('unsupported', false, 'P2'))], { evidence: { authority: fromOutsider } });
+        const d = await svc.review({ ...pii, detectedItems: [P1, P2], recipientTier: 'unknown' });
+        expect(d).toMatchObject({ kind: 'bounce', strangerRequest: { labels: ['sin_ca'], requester: 'joel@example.com' } });
+        expect(JSON.stringify(d)).not.toContain(SIN);
+      });
+
+      it('notes nothing for a bounce no stranger asked for, or for the recheck', async () => {
+        const unasked = make([withRulings(ruling('unsupported'))], { evidence: { authority: fromOutsider } });
+        expect(await unasked.svc.review(pii)).not.toHaveProperty('strangerRequest');
+        const asked = make([withRulings(ruling('unsupported', true)), withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
+        expect(await asked.svc.review(pii)).toHaveProperty('strangerRequest');
+        const recheck = await asked.svc.review(pii);
+        expect(recheck.kind).toBe('block');
+        expect(recheck).not.toHaveProperty('strangerRequest');
+      });
+    });
+  });
+
+  describe('describePiiLabels', () => {
+    it('uses human labels, once each, joined with "and"', () => {
+      expect(bandReviewModule.describePiiLabels(['phone_us'])).toBe('phone number');
+      expect(bandReviewModule.describePiiLabels(['phone_us', 'sin_ca'])).toBe('phone number and SIN');
+      expect(bandReviewModule.describePiiLabels(['phone_uk_mobile', 'email', 'credit_card', 'ssn', 'extra_0', 'extra_3'])).toBe('mobile number and email address and card number and SSN and personal detail');
+    });
   });
 
   describe('redaction placeholders', () => {
