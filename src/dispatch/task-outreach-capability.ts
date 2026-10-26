@@ -198,14 +198,19 @@ export function taskLookupFrom(
   };
 }
 
-/** Registrable domains of the email addresses among `addresses`, minus webmail and form hosts. */
+/**
+ * Registrable domains of the email addresses among `addresses`, minus webmail, form hosts,
+ * shared tenant hosts and private-suffix hosts. The full host is checked, since a private
+ * suffix (acme.github.io) is only visible there.
+ */
 export function orgDomainsOf(addresses: readonly string[]): string[] {
   const domains = new Set<string>();
   for (const address of addresses) {
     const at = address.lastIndexOf('@');
     if (at < 0) continue;
-    const domain = registrableDomain(address.slice(at + 1));
-    if (domain && !isNonOrgDomain(domain)) domains.add(domain);
+    const host = address.slice(at + 1);
+    const domain = registrableDomain(host);
+    if (domain && !isNonOrgDomain(host)) domains.add(domain);
   }
   return [...domains];
 }

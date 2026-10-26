@@ -12,13 +12,13 @@
 //
 // Security: every untrusted value is JSON-encoded, has `<`/`>` escaped, and sits inside a
 // sentinel tag the system prompt calls opaque data — the same discipline as
-// escalation-judge-prompt.ts. The parser shares that module's JSON extraction: both are the
-// escalation judge's own boundary.
+// escalation-judge-prompt.ts. The parser uses the same JSON extraction (src/util/json-extract.ts),
+// which the outbound judge deliberately does not share.
 
 import type { ContactTier, SystemRole } from '../contacts/types.js';
 import { isUuid } from '../util/uuid.js';
 import type { AutonomyBand } from './autonomy-service.js';
-import { extractFirstJsonObject, stripCodeFence } from './escalation-judge-prompt.js';
+import { extractFirstJsonObject, stripCodeFence } from '../util/json-extract.js';
 
 export type BriefQuestion = 'purpose' | 'speaks-as-principal' | 'grounding' | 'necessity' | 'disclosure';
 

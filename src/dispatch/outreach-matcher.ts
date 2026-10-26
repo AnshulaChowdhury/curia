@@ -13,7 +13,7 @@ import type { InfraLlm } from '../skills/infra-llm.js';
 import type { TaskOutreachRepo, TaskOutreachRow } from './task-outreach.js';
 import { isNonOrgDomain } from '../contacts/non-org-domains.js';
 import { registrableDomain } from '../verification/domain.js';
-import { extractFirstJsonObject, stripCodeFence } from '../autonomy/escalation-judge-prompt.js';
+import { extractFirstJsonObject, stripCodeFence } from '../util/json-extract.js';
 
 export type OutreachLinkKind = 'address' | 'contact' | 'org-domain' | 'inferred';
 
@@ -54,6 +54,10 @@ export interface OutreachMatcherDeps {
 const TERMINAL_TASK_STATUSES: ReadonlySet<string> = new Set(['done', 'cancelled']);
 const MODEL_ROW_LIMIT = 10;
 const MODEL_BODY_CHARS = 1500;
+
+function errorName(err: unknown): string {
+  return err instanceof Error ? err.name : typeof err;
+}
 
 /** JSON-encode untrusted text so embedded angle brackets cannot close its sentinel tag. */
 function encode(value: unknown): string {
@@ -102,7 +106,10 @@ export class OutreachMatcher {
     return row ? this.link(row, 'inferred', msg) : null;
   }
 
-  /** The sender's registrable domain, unless it is webmail or a shared form host. */
+  /**
+   * The sender's registrable domain, unless it is webmail, a shared form or tenant host, or
+   * under a private suffix (isNonOrgDomain), or listed in the injected non-org set.
+   */
   private orgDomainOf(address: string): string | null {
     const at = address.lastIndexOf('@');
     if (at === -1) return null;
@@ -185,14 +192,16 @@ export class OutreachMatcher {
     try {
       result = await infraLlm.extract(buildPrompt(rows, msg), { tier: 'fast', maxTokens: 200 });
     } catch (err) {
-      this.deps.logger.warn({ err, candidates: ids }, 'outreach-matcher: model check threw; no link');
+      // Provider errors can echo the request, so only the error's class is logged.
+      this.deps.logger.warn({ errName: errorName(err), candidates: ids }, 'outreach-matcher: model check threw; no link');
       return null;
     }
     if (!result.ok) {
-      this.deps.logger.warn({ error: result.error, candidates: ids }, 'outreach-matcher: model check failed; no link');
+      // result.error is the provider's message, which can echo the prompt: not logged.
+      this.deps.logger.warn({ candidates: ids }, 'outreach-matcher: model check failed; no link');
       return null;
     }
-    const id = parseOutreachId(result.text);
+    const id = parseOutreachId(result.text, this.deps.logger);
     if (id === undefined) {
       this.deps.logger.warn({ candidates: ids }, 'outreach-matcher: model output unparseable; no link');
       return null;
@@ -234,13 +243,15 @@ function buildPrompt(rows: TaskOutreachRow[], msg: InboundForMatch): string {
 }
 
 /** The id the model named: a string, null for "none", or undefined when unparseable. */
-function parseOutreachId(raw: string): string | null | undefined {
+function parseOutreachId(raw: string, logger: Logger): string | null | undefined {
   const json = extractFirstJsonObject(stripCodeFence(raw));
   if (json === null) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(json);
-  } catch {
+  } catch (err) {
+    // The caller logs the outcome at warn; this records why, without the model's text.
+    logger.debug({ errName: errorName(err) }, 'outreach-matcher: model JSON did not parse');
     return undefined;
   }
   if (typeof parsed !== 'object' || parsed === null || !('outreach_id' in parsed)) return undefined;

@@ -1,10 +1,11 @@
 // src/contacts/non-org-domains.ts
 //
-// Domains that never identify an organization: personal webmail and shared form /
-// scheduling hosts. A reply from one of them says nothing about which business sent it,
+// Domains that never identify an organization: personal webmail, shared form /
+// scheduling hosts, and hosts shared by many tenants. A reply from one of them says nothing about which business sent it,
 // so outreach linking (#2312) never treats a match on one as an `org-domain` link, and
 // the send path never records one as an outreach domain.
 
+import { getDomain } from 'tldts';
 import { registrableDomain } from '../verification/domain.js';
 
 /** Well-known personal webmail domains that should never generate org nodes (#946). */
@@ -29,13 +30,32 @@ export const FORM_HOST_DOMAINS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * True when `domain` (a host or registrable domain, any case) is personal webmail or a
- * shared form host. Subdomains count: mail.gmail.com and form.typeform.com both match.
+ * Mail and site hosts shared by many unrelated tenants (acme.onmicrosoft.com,
+ * shop.myshopify.com, bounce mail from sendgrid.net). Matching on one would link a reply
+ * from any tenant to outreach made to another.
+ */
+export const SHARED_TENANT_DOMAINS: ReadonlySet<string> = new Set([
+  'onmicrosoft.com', 'myshopify.com', 'janeapp.com', 'wixsite.com', 'squarespace.com',
+  'godaddysites.com', 'mailchimpsites.com', 'sendgrid.net', 'amazonses.com', 'mailgun.org',
+  'zendesk.com', 'freshdesk.com', 'helpscoutapp.com', 'intercom-mail.com', 'salesforce.com',
+  'hubspotemail.net',
+]);
+
+/**
+ * True when `domain` (a host or registrable domain, any case) is personal webmail, a
+ * shared form host, or a shared tenant host. Subdomains count: mail.gmail.com,
+ * form.typeform.com and acme.onmicrosoft.com all match.
+ *
+ * Also true when the Public Suffix List's private section puts the host under a shared
+ * suffix (acme.github.io): the ICANN registrable domain (github.io) then names the
+ * hosting provider, not the organization.
  */
 export function isNonOrgDomain(domain: string): boolean {
   const host = domain.trim().toLowerCase();
   if (host === '') return false;
-  const base = registrableDomain(host) ?? host;
-  return PERSONAL_EMAIL_DOMAINS.has(base) || PERSONAL_EMAIL_DOMAINS.has(host)
-    || FORM_HOST_DOMAINS.has(base) || FORM_HOST_DOMAINS.has(host);
+  const icann = registrableDomain(host);
+  const base = icann ?? host;
+  if (icann !== null && getDomain(host, { allowPrivateDomains: true })?.toLowerCase() !== icann) return true;
+  return [PERSONAL_EMAIL_DOMAINS, FORM_HOST_DOMAINS, SHARED_TENANT_DOMAINS]
+    .some((set) => set.has(base) || set.has(host));
 }

@@ -10,10 +10,20 @@ import { OutreachMatcher } from '../../../src/dispatch/outreach-matcher.js';
 import type { TaskOutreachRepo, TaskOutreachRow } from '../../../src/dispatch/task-outreach.js';
 import type { InfraLlm, InfraLlmResult } from '../../../src/skills/infra-llm.js';
 import type { TaskOriginator } from '../../../src/contacts/types.js';
-import { FORM_HOST_DOMAINS, PERSONAL_EMAIL_DOMAINS } from '../../../src/contacts/non-org-domains.js';
+import {
+  FORM_HOST_DOMAINS, PERSONAL_EMAIL_DOMAINS, SHARED_TENANT_DOMAINS,
+} from '../../../src/contacts/non-org-domains.js';
+import type { Logger } from '../../../src/logger.js';
 
 const logger = pino({ level: 'silent' });
-const NON_ORG: ReadonlySet<string> = new Set([...PERSONAL_EMAIL_DOMAINS, ...FORM_HOST_DOMAINS]);
+const NON_ORG: ReadonlySet<string> = new Set([...PERSONAL_EMAIL_DOMAINS, ...FORM_HOST_DOMAINS, ...SHARED_TENANT_DOMAINS]);
+
+/** A debug-level logger that keeps every line it writes. */
+function capturingLogger(): { log: Logger; lines: string[] } {
+  const lines: string[] = [];
+  const log = pino({ level: 'debug' }, { write: (line: string) => { lines.push(line); } });
+  return { log, lines };
+}
 
 const TASK_ID = '11111111-1111-4111-8111-111111111111';
 const CONTACT_ID = '44444444-4444-4444-8444-444444444444';
@@ -71,15 +81,20 @@ function makeLlm(result: InfraLlmResult | (() => Promise<InfraLlmResult>)) {
   return { infraLlm: { extract, classify } as InfraLlm, extract };
 }
 
-function makeMatcher(opts: {
+interface MatcherOpts {
   rows?: RepoRows;
   llm?: InfraLlm;
   taskStatus?: (taskId: string) => Promise<string | null>;
-} = {}) {
+  nonOrgDomains?: ReadonlySet<string>;
+  logger?: Logger;
+}
+
+function makeMatcher(opts: MatcherOpts = {}) {
   const repo = makeRepo(opts.rows);
   const taskStatus = vi.fn(opts.taskStatus ?? (async () => 'in_progress'));
   const matcher = new OutreachMatcher({
-    repo: repo.repo, infraLlm: opts.llm, logger, nonOrgDomains: NON_ORG, taskStatus,
+    repo: repo.repo, infraLlm: opts.llm, logger: opts.logger ?? logger,
+    nonOrgDomains: opts.nonOrgDomains ?? NON_ORG, taskStatus,
   });
   return { matcher, taskStatus, ...repo };
 }
@@ -181,6 +196,81 @@ describe('OutreachMatcher — non-org senders', () => {
     const link = await matcher.match({ ...baseMsg, senderAddress: 'notifications@form.typeform.com' });
     expect(findOpenByDomain).not.toHaveBeenCalled();
     expect(link).toBeNull();
+  });
+});
+
+describe('OutreachMatcher — shared tenant and private-suffix hosts', () => {
+  it('a tenant on a shared mail domain cannot link strongly to another tenant\'s outreach', async () => {
+    // Curia emailed owner@acme.onmicrosoft.com; an attacker writes, DMARC-aligned, from
+    // another tenant on the same shared domain.
+    const r = row({ id: 'row-ms', domains: ['onmicrosoft.com'], addresses: ['owner@acme.onmicrosoft.com'] });
+    const { infraLlm } = makeLlm({ ok: true, text: '{"outreach_id": "row-ms"}' });
+    const { matcher, findOpenByDomain, learnCounterparty } = makeMatcher({
+      rows: { byDomain: { 'onmicrosoft.com': [r] }, open: [r] }, llm: infraLlm,
+    });
+    const link = await matcher.match({ ...baseMsg, senderAddress: 'x@evil.onmicrosoft.com' });
+    expect(findOpenByDomain).not.toHaveBeenCalled();
+    expect(link).toMatchObject({ linkKind: 'inferred', strength: 'weak' });
+    expect(learnCounterparty).not.toHaveBeenCalled();
+  });
+
+  it('a private-suffix host is never matched by domain, even when the injected set misses it', async () => {
+    const { matcher, findOpenByDomain } = makeMatcher({
+      rows: { byDomain: { 'github.io': [row()] } }, nonOrgDomains: new Set(),
+    });
+    expect(await matcher.match({ ...baseMsg, senderAddress: 'hello@something.github.io' })).toBeNull();
+    expect(findOpenByDomain).not.toHaveBeenCalled();
+  });
+
+  it('a domain only in the injected non-org set is skipped', async () => {
+    const { matcher, findOpenByDomain } = makeMatcher({
+      rows: { byDomain: { 'acme.example': [row()] } }, nonOrgDomains: new Set(['acme.example']),
+    });
+    expect(await matcher.match(baseMsg)).toBeNull();
+    expect(findOpenByDomain).not.toHaveBeenCalled();
+  });
+});
+
+describe('OutreachMatcher — logs carry labels only', () => {
+  const secretMsg = {
+    ...baseMsg,
+    senderAddress: 'secret.sender@acme.example',
+    senderDisplayName: 'Secret Display',
+    subject: 'Secret subject line',
+    bodyStart: 'Secret body text with a health detail',
+  };
+  const secrets = ['secret.sender', 'Secret Display', 'Secret subject', 'Secret body', 'acme.example'];
+
+  async function linesFor(opts: MatcherOpts, msg = secretMsg): Promise<string[]> {
+    const { log, lines } = capturingLogger();
+    const { matcher } = makeMatcher({ ...opts, logger: log });
+    await matcher.match(msg);
+    return lines;
+  }
+
+  it.each<[string, MatcherOpts]>([
+    ['a strong link', { rows: { byDomain: { 'acme.example': [row()] } } }],
+    ['a task-status failure', {
+      rows: { byDomain: { 'acme.example': [row()] } },
+      // The status dep sees only a task id, so its errors are logged as they are.
+      taskStatus: async () => { throw new Error('db down'); },
+    }],
+    ['a model error echoing the prompt', {
+      rows: { open: [row()] }, llm: makeLlm({ ok: false, error: 'bad request: Secret body text' }).infraLlm,
+    }],
+    ['a thrown model call echoing the prompt', {
+      rows: { open: [row()] },
+      llm: makeLlm(async () => { throw new Error('Secret subject line rejected'); }).infraLlm,
+    }],
+    ['an unknown id', { rows: { open: [row()] }, llm: makeLlm({ ok: true, text: '{"outreach_id": "secret.sender"}' }).infraLlm }],
+    ['unparseable output', { rows: { open: [row()] }, llm: makeLlm({ ok: true, text: '{"outreach_id": Secret body}' }).infraLlm }],
+  ])('%s', async (_label, opts) => {
+    // The model cases need the domain step to miss, so the sender is on webmail there.
+    const msg = opts.llm ? { ...secretMsg, senderAddress: 'secret.sender@gmail.com' } : secretMsg;
+    const lines = await linesFor(opts, msg);
+    expect(lines.length).toBeGreaterThan(0);
+    const all = lines.join('\n');
+    for (const s of secrets) expect(all).not.toContain(s);
   });
 });
 
