@@ -38,7 +38,7 @@ model_routing:
 
 Unset means the provider's default, so Haiku 5.5 thinks adaptively at `medium`. On the Anthropic models, an effort turns on adaptive thinking with summarized display. `none` turns thinking off, on the models that accept it. On Sonnet 5.5, `none` turns off thinking before the first response. Anthropic documents short thinking between tool calls, though none appeared in 16 live requests on 2026-10-21. Curia gives a Sonnet 5.5 call with tools at `none` the 16,384-token output cap as a precaution.
 
-Boot refuses a model that cannot turn thinking off as the fast-tier model, either judge's model or `channels.voice.model`, and the error names the key. Opus 5.5, DeepSeek V4.1 Flash and the reasoning models with no measurement (DeepSeek V4 Pro, GLM 5.3 Flash, Qwen 3.8 Flash) are refused there (see `src/agents/llm/small-cap-models.ts`).
+Do not set Opus 5.5 as the fast-tier model, the standard-tier model, or either judge's model. The 10-token classifier runs on the fast-tier model. The drift detector runs on the standard-tier model at 200 tokens, and it reads a failed call as no drift. The judges cap their output at 200 to 1,200 tokens. Opus 5.5 spends those output caps on thinking.
 
 ### `channels`
 
