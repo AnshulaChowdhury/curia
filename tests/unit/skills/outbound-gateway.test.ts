@@ -2285,6 +2285,72 @@ describe('PII redaction pipeline step', () => {
     }));
   });
 
+  describe('reports applied redactions on the send result (#2312)', () => {
+    const phone = { patternLabel: 'phone_us', channelId: 'email', replacedWith: '[REDACTED: PHONE_US]' };
+
+    it('reports the body label and the delivered body', async () => {
+      const piiRedactor = makePiiRedactor(async (content) => (
+        content === piiRequest.body
+          ? { content: 'call [REDACTED: PHONE_US]', redactions: [phone] }
+          : { content, redactions: [] }
+      ));
+      const { gateway } = makeGateway(piiRedactor);
+      const result = await gateway.send(piiRequest);
+
+      expect(result.success).toBe(true);
+      expect(result.redactions).toEqual([{ label: 'phone_us', field: 'body' }]);
+      expect(result.sentContent).toBe('call [REDACTED: PHONE_US]');
+    });
+
+    it('reports body and subject redactions separately', async () => {
+      const piiRedactor = makePiiRedactor(async (content) => ({
+        content: `${content} [REDACTED: PHONE_US]`,
+        redactions: [phone],
+      }));
+      const { gateway } = makeGateway(piiRedactor);
+      const result = await gateway.send(piiRequest);
+
+      expect(result.redactions).toEqual([
+        { label: 'phone_us', field: 'body' },
+        { label: 'phone_us', field: 'subject' },
+      ]);
+    });
+
+    it('leaves both fields undefined when nothing was redacted', async () => {
+      const piiRedactor = makePiiRedactor(async (content) => ({ content, redactions: [] }));
+      const { gateway } = makeGateway(piiRedactor);
+      const result = await gateway.send(piiRequest);
+
+      expect(result.success).toBe(true);
+      expect(result.redactions).toBeUndefined();
+      expect(result.sentContent).toBeUndefined();
+    });
+
+    it('reports redactions on a queued send', async () => {
+      const piiRedactor = makePiiRedactor(async (content) => ({
+        content: 'call [REDACTED: PHONE_US]',
+        redactions: content === piiRequest.body ? [phone] : [],
+      }));
+      const enqueue = vi.fn().mockResolvedValue({ id: 'q-1' });
+      const gateway = new OutboundGateway({
+        nylasClients: new Map([['curia', { sendMessage: vi.fn() } as unknown as NylasClient]]),
+        contactService: { resolveByChannelIdentity: vi.fn().mockResolvedValue(null) } as unknown as ContactService,
+        contentFilter: { check: vi.fn().mockResolvedValue({ passed: true, findings: [] }) } as unknown as OutboundContentFilter,
+        bus: { publish: vi.fn().mockResolvedValue(undefined), subscribe: vi.fn() } as unknown as EventBus,
+        principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+        logger: createLogger('error'),
+        piiRedactor,
+        outboundQueue: { enqueue } as unknown as OutboundQueueRepo,
+        outboundQueueReadiness: new Map([['email', () => false]]),
+      });
+      const result = await gateway.send(piiRequest);
+
+      expect(result.queued).toBe(true);
+      expect(result.redactions).toEqual([{ label: 'phone_us', field: 'body' }]);
+      expect(result.sentContent).toBe('call [REDACTED: PHONE_US]');
+    });
+  });
+
   it('blocks the message when PiiRedactor throws (fail-closed)', async () => {
     // If the redactor throws, the gateway must block the message rather than
     // sending unredacted PII. This is the fail-closed contract.

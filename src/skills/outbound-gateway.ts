@@ -164,6 +164,14 @@ export interface OutboundSendResult {
    * succeeded; `blockedReason` already carries the agent-facing note.
    */
   unmatchedRecipients?: string[];
+  /**
+   * PII redactions that changed what was sent (#2312): the pattern label and which field it hit.
+   * Labels only, never the matched values. Set only on a successful send (dispatched, queued or
+   * held for the digest) where redaction changed something; absent otherwise.
+   */
+  redactions?: Array<{ label: string; field: 'body' | 'subject' }>;
+  /** The body as delivered. Set with `redactions`, so the agent can see what recipients got. */
+  sentContent?: string;
   /** True when the autonomy gate blocked this send */
   gated?: boolean;
   /** Short reference for the action_log row (e.g. 'a3f7c12b'). Present when gated is true. */
@@ -1165,6 +1173,8 @@ export class OutboundGateway {
     // Email subjects can contain PII just as the body can — track a separate
     // variable so we can pass the cleaned subject to dispatchEmail() below.
     let redactedSubject: string | undefined = request.channel === 'email' ? request.subject : undefined;
+    // Labels of what the redactor changed, reported on the send result (#2312).
+    const appliedRedactions: NonNullable<OutboundSendResult['redactions']> = [];
     if (this.piiRedactor) {
       try {
         const redactionResult = await this.piiRedactor.redact(
@@ -1173,6 +1183,9 @@ export class OutboundGateway {
           { recipientId, recipientContactId },
         );
         redactedBody = redactionResult.content;
+        for (const r of redactionResult.redactions) {
+          appliedRedactions.push({ label: r.patternLabel, field: 'body' });
+        }
         // Redact the subject too — same channel policy applies.
         if (request.channel === 'email' && request.subject) {
           const subjectResult = await this.piiRedactor.redact(
@@ -1181,6 +1194,9 @@ export class OutboundGateway {
             { recipientId, recipientContactId },
           );
           redactedSubject = subjectResult.content;
+          for (const r of subjectResult.redactions) {
+            appliedRedactions.push({ label: r.patternLabel, field: 'subject' });
+          }
         }
       } catch (err) {
         this.log.error(
@@ -1361,7 +1377,7 @@ export class OutboundGateway {
         relaySlot = relayOriginator.contactId;
       } else {
         const deferred = await this.deferRelay(request, redactedBody, redactedSubject, relayOriginator, options);
-        if (deferred) return deferred;
+        if (deferred) return this.withRedactions(deferred, appliedRedactions, redactedBody);
         // The digest item could not be recorded: deliver after all. Noise beats a lost message.
       }
     } else if (
@@ -1480,7 +1496,8 @@ export class OutboundGateway {
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return result;
+      // toSend.body, not redactedBody: signEmail may have dropped the model's sign-off.
+      return this.withRedactions(result, appliedRedactions, toSend.body);
     }
 
     if (request.channel === 'slack') {
@@ -1503,7 +1520,7 @@ export class OutboundGateway {
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return result;
+      return this.withRedactions(result, appliedRedactions, redactedBody);
     }
 
     if (request.channel === 'sms') {
@@ -1525,7 +1542,7 @@ export class OutboundGateway {
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return result;
+      return this.withRedactions(result, appliedRedactions, redactedBody);
     }
 
     {
@@ -1554,8 +1571,21 @@ export class OutboundGateway {
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return result;
+      return this.withRedactions(result, appliedRedactions, redactedBody);
     }
+  }
+
+  /**
+   * Attach what redaction changed to a successful send result (#2312). Failures carry nothing:
+   * nothing reached the recipient, so there is no delivered content to report.
+   */
+  private withRedactions(
+    result: OutboundSendResult,
+    applied: NonNullable<OutboundSendResult['redactions']>,
+    sentContent: string,
+  ): OutboundSendResult {
+    if (!result.success || applied.length === 0) return result;
+    return { ...result, redactions: [...applied], sentContent };
   }
 
   /** Whether this channel is registered for durable queueing (#1380). */
