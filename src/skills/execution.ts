@@ -106,6 +106,7 @@ import { formatEmailSummary, isNoOpResult, isSampledTool, sampleEmailFromResult,
 import { TempFileStore } from './temp-file-store.js';
 import type { InfraLlmService } from './infra-llm.js';
 import { OutboundContextService, ScopedOutboundContext } from '../dispatch/outbound-context.js';
+import type { TaskOutreachCapability } from '../dispatch/task-outreach-capability.js';
 import { relayRequesterFor, rosterFromRegistry } from '../dispatch/delegation-hint.js';
 import { buildRateLimitSourceKey } from '../memory/rate-limit-key.js';
 import { DEFAULT_RESUMABLE_CEILINGS, type ResumableCeilingsConfig } from '../config.js';
@@ -315,6 +316,8 @@ export class ExecutionLayer {
   private tempFileStore?: TempFileStore;
   private readonly infraLlmService?: InfraLlmService;
   private outboundContextService?: OutboundContextService;
+  /** Task outreach writer (#2312) — backs the 'taskOutreach' capability. */
+  private taskOutreach?: TaskOutreachCapability;
   /** The agent's own contactId — injected into ctx.agentContactId for entity_enrichment default='agent' */
   private agentContactId?: string;
   /** IANA timezone name used for normalizing offset-less timestamp inputs from the LLM. */
@@ -392,6 +395,8 @@ export class ExecutionLayer {
     tempFileStore?: TempFileStore;
     infraLlmService?: InfraLlmService;
     outboundContextService?: OutboundContextService;
+    /** Task outreach writer (#2312) — backs the 'taskOutreach' capability. */
+    taskOutreach?: TaskOutreachCapability;
     agentContactId?: string;
     timezone?: string;
     selfEmail?: string;
@@ -464,6 +469,7 @@ export class ExecutionLayer {
     this.sensitivityClassifier = options?.sensitivityClassifier;
     this.openDelegationLookup = options?.openDelegationLookup;
     this.verification = options?.verification;
+    this.taskOutreach = options?.taskOutreach;
     if (!this.actionLogRepo) {
       // Once here rather than per call: without the repo no autonomous action reaches the
       // spot-check pool (#2159 Phase 3), and that should not be invisible.
@@ -531,6 +537,8 @@ export class ExecutionLayer {
       sensitivityClassifier: this.sensitivityClassifier,
       // verification (#2017) — plain field injection: the service, code tracker and ask channel.
       verification: this.verification,
+      // taskOutreach (#2312) — plain field injection: record outreach for a task-bound turn.
+      taskOutreach: this.taskOutreach,
     };
   }
 

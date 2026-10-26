@@ -438,6 +438,9 @@ export class WebBrowserHandler implements ToolHandler {
         // is exactly how the agent recovers a tripped session).
         session.recordSuccess();
         completed++;
+        // Typing the principal's or Curia's own email or phone into a form on a task means the
+        // organization may answer there: record it, in case the model does not (#2312).
+        if (stepAction === 'type') await recordFormOutreach(ctx, step, page.url());
         // A screenshot step within a batch requests a capture of the final page state (a batch
         // returns one result, so there is one image — the end state, same as call-level
         // `screenshot: true`). Only honor it if we actually reached the step, not on a batch that
@@ -618,6 +621,34 @@ export class WebBrowserHandler implements ToolHandler {
     }
 
     return { success: true, data: result };
+  }
+}
+
+/**
+ * Browser backstop for task outreach (#2312). When a `type` step's text is one of the
+ * principal's or Curia's own email addresses or phone numbers, record a web-form outreach
+ * for the page's domain; the capability writes only on a task-bound turn. A secret_ref fill
+ * never counts: its value is never seen here. Best-effort: never fails the browser action.
+ */
+async function recordFormOutreach(ctx: ToolContext, step: BrowserActionStep, pageUrl: string): Promise<void> {
+  const outreach = ctx.taskOutreach;
+  if (!outreach || typeof step.text !== 'string' || step.secret_ref) return;
+  const given = outreach.ownIdentity(step.text);
+  if (!given) return;
+  const domain = registrableDomain(pageUrl);
+  try {
+    const row = await outreach.recordForTurn(ctx, {
+      via: 'web_form',
+      domains: domain ? [domain] : [],
+      givenContact: given,
+      orgName: null,
+      summary: 'Web form submitted',
+      useTaskTitle: true,
+    });
+    // Labels only: neither the identity nor the page is logged.
+    if (row) ctx.log.info({ outreachId: row.id, taskId: row.taskId }, 'web-browser: recorded web form outreach');
+  } catch (err) {
+    ctx.log.warn({ err }, 'web-browser: failed to record web form outreach — a reply may not find its task');
   }
 }
 

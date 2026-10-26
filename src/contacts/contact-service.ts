@@ -46,6 +46,7 @@ import type { ContactCalendar, CreateCalendarLinkOptions, ResolvedCalendar } fro
 import { normalizeExclusionPair, type ExclusionPair } from './dedup-exclusions.js';
 import { canonicalPairKey } from './dedup-pair-key.js';
 import { comparableChannels, isNearMiss, sameIdentifier } from './identifier-near-miss.js';
+import { PERSONAL_EMAIL_DOMAINS } from './non-org-domains.js';
 
 /** Outcome of re-pointing a merged-away contact's dedup exclusions onto the survivor. */
 export interface ReattachExclusionsResult {
@@ -181,18 +182,8 @@ const CANONICAL_ATTRIBUTE_KEYS = [
 // Helpers to decide whether an email sender should be stored as a person or
 // routed to an organization KG node. Exported for unit testing.
 
-/** Well-known personal webmail domains that should never generate org nodes. */
-const PERSONAL_EMAIL_DOMAINS = new Set([
-  'gmail.com', 'googlemail.com',
-  'yahoo.com', 'ymail.com',
-  'hotmail.com', 'hotmail.co.uk', 'hotmail.ca',
-  'outlook.com',
-  'live.com', 'live.ca', 'live.co.uk',
-  'icloud.com', 'me.com', 'mac.com',
-  'aol.com',
-  'msn.com',
-  'protonmail.com', 'proton.me', 'pm.me',
-]);
+// The webmail list lives in non-org-domains.ts, shared with outreach linking (#2312).
+export { PERSONAL_EMAIL_DOMAINS };
 
 /**
  * Local-part prefixes that are unambiguously machine-generated: no-reply addresses,

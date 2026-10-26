@@ -4,6 +4,9 @@ import { EmailSendHandler } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { OutboundGateway } from '../../../../src/skills/outbound-gateway.js';
 import pino from 'pino';
+import { TaskOutreachService } from '../../../../src/dispatch/task-outreach-capability.js';
+import type { TaskOutreachInput, TaskOutreachRepo, TaskOutreachRow } from '../../../../src/dispatch/task-outreach.js';
+import type { ChannelIdentity } from '../../../../src/contacts/types.js';
 
 function makeLogger() {
   return pino({ level: 'silent' });
@@ -539,5 +542,73 @@ describe('EmailSendHandler redactions (#2312)', () => {
       expect(result.data).not.toHaveProperty('redaction_note');
     }
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: 'hello' }));
+  });
+});
+
+describe('EmailSendHandler task outreach (#2312)', () => {
+  const TASK_ID = '33333333-3333-4333-8333-333333333333';
+  const PAL_ID = '44444444-4444-4444-8444-444444444444';
+  const principal = { contactId: 'principal-id', systemRole: 'principal', channel: 'email', initiatedAt: '2026-10-26T00:00:00Z', tier: 'principal' };
+  const outsider = { contactId: ALICE_ID, systemRole: null, channel: 'email', initiatedAt: '2026-10-26T00:00:00Z', tier: 'known' };
+
+  function withOutreach(ctx: ToolContext) {
+    const record = vi.fn(async (input: TaskOutreachInput) => ({ id: 'outreach-1', ...input } as unknown as TaskOutreachRow));
+    (ctx as unknown as Record<string, unknown>).taskOutreach = new TaskOutreachService({ record } as unknown as TaskOutreachRepo, {
+      principalIdentities: [{ contactId: 'principal-id', channel: 'email', channelIdentifier: 'ceo@example.com' } as unknown as ChannelIdentity],
+      selfEmails: ['curia@office.example'],
+      lookupTask: async () => ({ title: 'Book physio', rootTaskId: TASK_ID }),
+      log: makeLogger(),
+    });
+    (ctx as unknown as Record<string, unknown>).conversationId = 'conv-1';
+    (ctx as unknown as Record<string, unknown>).taskEventId = 'evt-1';
+    return record;
+  }
+
+  beforeEach(() => {
+    resolveRecipientReference.mockImplementation(async (_channel: string, value: string) => {
+      if (value === 'principal') return { ok: true, kind: 'principal', contactId: 'principal-id', identifier: 'ceo@example.com', displayName: 'Principal' };
+      if (value === ALICE_ID) return { ok: true, kind: 'contact', contactId: ALICE_ID, identifier: 'Bookings@Acme.example', displayName: 'Acme' };
+      if (value === PAL_ID) return { ok: true, kind: 'contact', contactId: PAL_ID, identifier: 'pal@gmail.com', displayName: 'Pal' };
+      return { ok: false, error: 'No contact' };
+    });
+  });
+
+  it('on a task wake, records the task, the recipients and their org domain (gmail excluded)', async () => {
+    const ctx = makeCtx(
+      { to: ALICE_ID, cc: `${PAL_ID},principal`, subject: 'Appointment', body: 'Could we book Tuesday?' },
+      { taskMetadata: { originator: principal, boundTask: { taskId: TASK_ID } } },
+    );
+    const record = withOutreach(ctx);
+
+    expect((await new EmailSendHandler().execute(ctx)).success).toBe(true);
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: TASK_ID,
+      via: 'email',
+      // The principal, copied in, is not a counterparty.
+      addresses: ['bookings@acme.example', 'pal@gmail.com'],
+      contactIds: [ALICE_ID, PAL_ID],
+      domains: ['acme.example'],
+      summary: 'Book physio',
+    }));
+  });
+
+  it('on a live principal turn with no task, records against the conversation', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Appointment', body: 'Could we book Tuesday?' }, { taskMetadata: { originator: principal } });
+    (ctx as unknown as Record<string, unknown>).liveTurn = true;
+    const record = withOutreach(ctx);
+
+    await new EmailSendHandler().execute(ctx);
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: null, conversationId: 'conv-1', directingEventId: 'evt-1', summary: 'Could we book Tuesday?',
+    }));
+  });
+
+  it('on an outsider turn with no task, records nothing', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Re', body: 'Thanks' }, { taskMetadata: { originator: outsider } });
+    (ctx as unknown as Record<string, unknown>).liveTurn = true;
+    const record = withOutreach(ctx);
+
+    expect((await new EmailSendHandler().execute(ctx)).success).toBe(true);
+    expect(record).not.toHaveBeenCalled();
   });
 });

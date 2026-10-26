@@ -571,3 +571,46 @@ describe('documented TTL tiers per channel', () => {
     expect(text).toMatch(/task-wake turn, about 7 days/);
   });
 });
+
+describe('registerOutboundContext task outreach (#2312)', () => {
+  const TASK_ID = '11111111-1111-4111-8111-111111111111';
+  const CONTACT_ID = '44444444-4444-4444-8444-444444444444';
+  const originator = { contactId: 'p', systemRole: 'principal', channel: 'email', initiatedAt: '2026-10-26T00:00:00Z', tier: 'principal' };
+
+  function makeOutreach() {
+    return {
+      recordForTurn: vi.fn().mockResolvedValue({ id: 'row-1', taskId: TASK_ID, via: 'email' }),
+      ownIdentity: vi.fn().mockReturnValue(null),
+      isPrincipalContact: vi.fn().mockReturnValue(false),
+    };
+  }
+
+  it('records the send on a task-bound turn, even with no outbound-context service', async () => {
+    const taskOutreach = makeOutreach();
+    await registerOutboundContext(undefined, undefined, {
+      ...baseOpts,
+      channelId: 'email',
+      recipientContactIds: [CONTACT_ID],
+      outreach: {
+        turn: { taskOutreach, taskMetadata: { originator, boundTask: { taskId: TASK_ID } }, conversationId: 'c' },
+        via: 'email',
+        addresses: ['bookings@acme.example'],
+      },
+    });
+    expect(taskOutreach.recordForTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: 'c' }),
+      expect.objectContaining({ via: 'email', addresses: ['bookings@acme.example'], contactIds: [CONTACT_ID], domains: ['acme.example'] }),
+    );
+  });
+
+  it('still registers the outbound context when the outreach write fails', async () => {
+    const cap = makeCap();
+    const taskOutreach = makeOutreach();
+    taskOutreach.recordForTurn.mockRejectedValueOnce(new Error('db down'));
+    await registerOutboundContext(cap, undefined, {
+      ...baseOpts,
+      outreach: { turn: { taskOutreach, taskMetadata: { originator, boundTask: { taskId: TASK_ID } } }, via: 'signal', addresses: ['+14165550199'] },
+    });
+    expect(cap.register).toHaveBeenCalledOnce();
+  });
+});

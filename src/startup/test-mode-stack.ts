@@ -93,6 +93,8 @@ import { AuthorizationService } from '../contacts/authorization.js';
 import type { TrustScorerWeights } from '../dispatch/trust-scorer.js';
 import type { ChannelIdentity, ChannelPolicyConfig, PrincipalPrimaryEmailRef, PrincipalProfileRef } from '../contacts/types.js';
 import { OutboundContextService } from '../dispatch/outbound-context.js';
+import { TaskOutreachRepo } from '../dispatch/task-outreach.js';
+import { TaskOutreachService } from '../dispatch/task-outreach-capability.js';
 import { OutboundContentFilter } from '../dispatch/outbound-filter.js';
 import { TurnLanes } from '../dispatch/turn-lanes.js';
 import { createInboundScanner } from '../dispatch/security-config-loader.js';
@@ -953,6 +955,14 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       pool, logger, resolveVerificationConfig(yamlConfig.verification), principalIdentities, new Set<string>(),
     );
     const verification = options.wrapVerification ? options.wrapVerification(baseVerification) : baseVerification;
+    // Task outreach (#2312), as src/index.ts wires it, so sends and record-outreach behave as
+    // in production. With no taskRepo here, rows carry no task title and nothing closes them.
+    const taskOutreach = new TaskOutreachService(new TaskOutreachRepo(pool), {
+      principalIdentities,
+      selfEmails,
+      selfPhones: [signalPhoneNumber, smsFromNumber].filter((n): n is string => typeof n === 'string' && n !== ''),
+      log: logger,
+    });
     const baseExecutionLayer = new ExecutionLayer(toolRegistry, logger, {
       bus,
       agentRegistry,
@@ -979,6 +989,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       principalIdentities,
       skillRegistry,
       verification,
+      taskOutreach,
       ...(outboundContextService ? { outboundContextService } : {}),
       ...(openDelegationLookup ? { openDelegationLookup } : {}),
     });

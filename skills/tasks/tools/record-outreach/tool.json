@@ -1,0 +1,25 @@
+{
+  "name": "record-outreach",
+  "description": "Record outreach for a task that no send tool made. Call it after you submit a web form, make a call, or contact an organization outside email for a task, so their reply can find the task. Sends are recorded automatically.",
+  "version": "0.1.0",
+  "sensitivity": "normal",
+  "action_risk": "low",
+  "inputs": {
+    "via": "string ('web_form' | 'phone' | 'other')",
+    "summary": "string (what you asked for)",
+    "org_name": "string?",
+    "website": "string? (the organization's own website or domain)",
+    "form_url": "string? (the form's address, if not on the website)",
+    "contact_given": "string? (the contact detail you left, e.g. \"the principal's email\")"
+  },
+  "outputs": {
+    "recorded": "boolean",
+    "outreach_id": "string"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 30000,
+  "capabilities": [
+    "taskOutreach"
+  ]
+}

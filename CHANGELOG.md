@@ -78,6 +78,9 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`voice.session.ended` turn stats** — **public API:** optional `turnStats` counts utterances, turns, barge-in cancels and joined fragments. (#2240)
 - **`pnpm repair:config-store-labels`** — reports and realigns config keys mislabelled by the old merge; dry-run by default. (#2252)
 - **Canadian SIN detection** — PII redaction now checks the checksum. (#2312)
+- **Task outreach** — sends and web forms on task-bound turns are recorded; rows close when the task ends. (#2312)
+- **`record-outreach`** — records web forms and calls for a task so the organization's reply finds it. (#2312)
+- **`taskOutreach` capability** — **public API:** new `ToolContext` field for recording task outreach. (#2312)
 
 ### Changed
 

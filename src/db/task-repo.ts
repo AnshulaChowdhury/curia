@@ -37,6 +37,7 @@ import {
 } from './active-skills-progress.js';
 import { prepareResumableBlockWithSpill } from './resumable-accumulator-spill.js';
 import type { WorkingDocsRepo } from './working-docs-repo.js';
+import type { TaskOutreachRepo } from '../dispatch/task-outreach.js';
 import { type ResumableCircuitState } from '../agents/resumable-circuit-breaker.js';
 import { isPgUniqueViolation } from '../agents/resumable-continuation.js';
 import type { PlanAdaptiveState } from '../agents/plan-adaptive-replan.js';
@@ -196,7 +197,27 @@ export class TaskRepo {
     private readonly logger: Logger,
     private readonly timezone: string = 'UTC',
     private readonly workingDocsRepo?: WorkingDocsRepo,
+    /**
+     * Closes a finished task's outreach rows (#2312). Injected rather than imported so the
+     * repo stays free of dispatch wiring; absent in tests and tools that build their own repo.
+     */
+    private readonly outreach?: Pick<TaskOutreachRepo, 'closeForTask'>,
   ) {}
+
+  /**
+   * Stop waiting on replies to outreach for tasks that just ended. After the commit and
+   * best-effort: the task is already done, and an open row only expires later (30 days).
+   */
+  private async closeOutreach(taskIds: readonly string[]): Promise<void> {
+    if (!this.outreach) return;
+    for (const taskId of taskIds) {
+      try {
+        await this.outreach.closeForTask(taskId);
+      } catch (err) {
+        this.logger.warn({ err, taskId }, 'task-repo: failed to close task outreach — rows stay open until they expire');
+      }
+    }
+  }
 
   /**
    * Insert a new task row. When `wakeAt` is provided, the insert and the
@@ -812,6 +833,10 @@ export class TaskRepo {
       await this.publishReconcileChildEvents(reconciledChildren, reason, callerAgentId, taskId);
     }
 
+    if (transitioningToTerminal) {
+      await this.closeOutreach([taskId, ...reconciledChildren.map((c) => c.id)]);
+    }
+
     this.logger.info(
       { taskId: updated.id, previousStatus: current.status, newStatus: updated.status },
       'task-repo: updated task',
@@ -945,6 +970,8 @@ export class TaskRepo {
         taskId,
       );
     }
+
+    await this.closeOutreach([taskId, ...reconciledChildren.map((c) => c.id)]);
 
     this.logger.info({ taskId: updated.id }, 'task-repo: completed task');
     return updated;
@@ -1127,6 +1154,7 @@ export class TaskRepo {
   ): Promise<string[]> {
     const rows = await this.runReconcileChildrenQuery(this.pool, taskId, reason);
     await this.publishReconcileChildEvents(rows, reason, callerAgentId, taskId);
+    await this.closeOutreach(rows.map((r) => r.id));
     return rows.map((r) => r.id);
   }
 

@@ -178,6 +178,9 @@ export class SignalSendHandler implements ToolHandler {
           boundTask: boundTaskFromMetadata(ctx.taskMetadata as Record<string, unknown> | undefined),
           // The members a reply in the group can come from (#2261).
           recipientContactIds: trust.trustedContactIds,
+          // A task-bound send leaves a task_outreach row (#2312). The group id is not an
+          // address anyone replies from; the members' contact ids carry the link.
+          outreach: { turn: ctx, via: 'signal', addresses: [] },
         });
 
         return { success: true, data: { delivered_to: groupId, channel: 'signal', ...relayDeferredData(result), ...redactionData(result) } };
@@ -250,6 +253,8 @@ export class SignalSendHandler implements ToolHandler {
         boundTask: boundTaskFromMetadata(ctx.taskMetadata as Record<string, unknown> | undefined),
         // Lets the dispatcher show this entry when the recipient replies (#2261).
         recipientContactIds: [resolved.contactId],
+        // A task-bound send leaves a task_outreach row so the reply can find its task (#2312).
+        outreach: { turn: ctx, via: 'signal', addresses: [destination] },
       });
 
       return {
