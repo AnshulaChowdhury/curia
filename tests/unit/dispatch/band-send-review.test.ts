@@ -582,6 +582,21 @@ describe('BandSendReview', () => {
       expect(contactTier).toHaveBeenCalledWith('c-trusted');
     });
 
+    // Review Focus 5 (#2312): the drafting turn's own trusted originator directed it, so the
+    // principal's root task does not demote the directive to "inferred".
+    it('keeps a trusted contact\'s directive on the copy path inside a principal-rooted task', async () => {
+      const rooted: SendAuthority = { ...fromTrusted, rootTask: { taskId: 't-root', title: 'Set up the clinic', description: null, originator: principal } };
+      const { svc, contactTier } = make([withRulings(ruling('directed'))], { evidence: { authority: rooted }, contactTier: async () => 'trusted' });
+      await expect(svc.review({ ...pii, score: 74 })).resolves.toEqual({ kind: 'send', signals: {}, copyPrincipal: { labels: ['sin_ca'] } });
+      expect(contactTier).toHaveBeenCalledWith('c-trusted');
+      // An inferred item under the same authority still takes the task path: held below 80.
+      const inferred = make([withRulings(ruling('inferred'))], { evidence: { authority: rooted }, contactTier: async () => 'trusted' });
+      expect((await inferred.svc.review({ ...pii, score: 74 })).kind).toBe('hold');
+      // A demoted originator falls back to the task path: the directive counts as inferred.
+      const demoted = make([withRulings(ruling('directed'))], { evidence: { authority: rooted }, contactTier: async () => 'known' });
+      expect((await demoted.svc.review({ ...pii, score: 74 })).kind).toBe('hold');
+    });
+
     it('lists each copied label once', async () => {
       const P3: BriefDetectedItem = { ...P1, id: 'P3', text: '046 454 287' };
       const { svc } = make([withRulings(ruling('directed'), ruling('directed', false, 'P3'))], {
@@ -969,7 +984,7 @@ describe('BandSendReview', () => {
     type OkVerdict = Extract<BriefVerdict, { ok: true }>;
     const withRulings = (...disclosures: DisclosureRuling[]): OkVerdict => ({ ...(clean as OkVerdict), disclosures });
     const said = (decision: 'yes' | 'no', label = 'phone_us', counterparty = TO) => ({ counterparty, label, decision });
-    const DECLINED = 'The principal declined sharing your phone_us with this recipient on this thread. Rewrite without it.';
+    const DECLINED = 'The principal declined sharing your phone number with this recipient on this thread. Rewrite without it.';
 
     it('reads decisions for the send\'s thread and non-principal recipients', async () => {
       const { svc, collect } = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester } });
@@ -1046,6 +1061,24 @@ describe('BandSendReview', () => {
         'The principal already said yes to sharing phone number with this recipient on this thread.',
         'The principal already said yes to sharing SIN with this recipient on this thread.',
       ]);
+    });
+
+    it('tells the judge only what holds for every recipient: one recipient\'s answer is partial', async () => {
+      const OPS = 'ops@acme.example';
+      const PARTIAL = 'The principal answered about sharing phone number for one of the recipients only, on this thread.';
+      // A yes for one of two recipients is not a yes for the send.
+      const partial = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('yes')] } });
+      await partial.svc.review({ ...send, recipients: [TO, OPS] });
+      expect(partial.review.mock.calls[0]![0].evidence.principalDecisions).toEqual([PARTIAL]);
+      // A yes and a no: code bounces on any no, so the judge reads a no, once.
+      const mixed = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('yes'), said('no', 'phone_us', OPS)] } });
+      await mixed.svc.review({ ...send, recipients: [TO, OPS] });
+      expect(mixed.review.mock.calls[0]![0].evidence.principalDecisions).toEqual(['The principal already said no to sharing phone number with this recipient on this thread.']);
+      // A yes from both: a yes, once.
+      const both = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('yes'), said('yes', 'phone_us', OPS)] } });
+      await both.svc.review({ ...send, recipients: [TO, OPS] });
+      expect(both.review.mock.calls[0]![0].evidence.principalDecisions).toEqual(['The principal already said yes to sharing phone number with this recipient on this thread.']);
+      for (const h of [partial, mixed, both]) expect(JSON.stringify(h.review.mock.calls[0]![0].evidence.principalDecisions)).not.toMatch(/acme\.example/);
     });
   });
 

@@ -286,7 +286,7 @@ describe('DenyActionHandler', () => {
         bus: makeMockBus(), disclosureDecisions,
       }));
       expect(result.success).toBe(true);
-      expect(disclosureDecisions.recordForApproval).toHaveBeenCalledExactlyOnceWith(ASK_ROW, 'no');
+      expect(disclosureDecisions.recordForApproval).toHaveBeenCalledExactlyOnceWith(ASK_ROW, 'no', 'principal_via_coordinator');
     });
 
     it('records nothing for a row without an ask, or one resolved concurrently', async () => {

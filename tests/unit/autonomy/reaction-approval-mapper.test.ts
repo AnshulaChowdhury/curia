@@ -521,7 +521,7 @@ describe('ReactionApprovalMapper', () => {
       const row = makeRow({ toolName: 'email-send', payload: { recipient_contact_id: 'c-1', body: 'x' }, disclosureAsk: ASK });
       actionLogRepo.findPendingByDeliveryMessage.mockResolvedValue(row);
       await react('thumbsup');
-      expect(recordForApproval).toHaveBeenCalledExactlyOnceWith(row, 'yes');
+      expect(recordForApproval).toHaveBeenCalledExactlyOnceWith(row, 'yes', 'principal_reaction');
       expect(executionLayer.invoke.mock.calls[0]![1]).toEqual({ recipient_contact_id: 'c-1', body: 'x' });
       expect(recordForApproval.mock.invocationCallOrder[0]!).toBeLessThan(executionLayer.invoke.mock.invocationCallOrder[0]!);
     });
@@ -530,7 +530,7 @@ describe('ReactionApprovalMapper', () => {
       const row = makeRow({ disclosureAsk: ASK });
       actionLogRepo.findPendingByDeliveryMessage.mockResolvedValue(row);
       await react('thumbsdown');
-      expect(recordForApproval).toHaveBeenCalledExactlyOnceWith(row, 'no');
+      expect(recordForApproval).toHaveBeenCalledExactlyOnceWith(row, 'no', 'principal_reaction');
     });
 
     it('records nothing for a row without an ask, a lost race, or a 👍 that failed closed to deny', async () => {

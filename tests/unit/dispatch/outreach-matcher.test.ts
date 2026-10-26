@@ -205,6 +205,40 @@ describe('OutreachMatcher — direct matches', () => {
     });
   });
 
+  // Every direct step runs before an unconfirmed hit is used (#2312): a confirmed row found by
+  // a later step wins over an unconfirmed one an earlier step found.
+  describe('preferring a confirmed row across steps (#2312)', () => {
+    it('an unconfirmed address hit and a confirmed domain match link strongly via the domain', async () => {
+      const guessed = row({ id: 'row-guessed', addresses: ['bookings@acme.example'], confirmed: false });
+      const confirmed = row({ id: 'row-confirmed', domains: ['acme.example'] });
+      const { matcher, learnCounterparty } = makeMatcher({ rows: { byAddress: [guessed], byDomain: { 'acme.example': [confirmed] } } });
+      expect(await matcher.match(baseMsg)).toMatchObject({ outreachId: 'row-confirmed', linkKind: 'org-domain', strength: 'strong' });
+      expect(learnCounterparty).toHaveBeenCalledWith('row-confirmed', { address: 'bookings@acme.example' });
+    });
+
+    it('an unconfirmed address hit and a confirmed contact match link strongly via the contact', async () => {
+      const guessed = row({ id: 'row-guessed', confirmed: false });
+      const confirmed = row({ id: 'row-confirmed', contactIds: [CONTACT_ID] });
+      const { matcher, findOpenByDomain } = makeMatcher({ rows: { byAddress: [guessed], byContact: [confirmed] } });
+      expect(await matcher.match({ ...baseMsg, senderContactId: CONTACT_ID })).toMatchObject({ outreachId: 'row-confirmed', linkKind: 'contact', strength: 'strong' });
+      // The first confirmed hit ends the search.
+      expect(findOpenByDomain).not.toHaveBeenCalled();
+    });
+
+    it('with no confirmed match anywhere, the first unconfirmed hit links weakly, and the model is not asked', async () => {
+      const { infraLlm, extract } = makeLlm({ ok: true, text: '{"outreach_id": "row-open"}' });
+      const first = row({ id: 'row-first', confirmed: false });
+      const later = row({ id: 'row-later', confirmed: false });
+      const { matcher, findOpenByDomain, learnCounterparty } = makeMatcher({
+        rows: { byAddress: [first], byDomain: { 'acme.example': [later] }, open: [row({ id: 'row-open' })] }, llm: infraLlm,
+      });
+      expect(await matcher.match(baseMsg)).toMatchObject({ outreachId: 'row-first', linkKind: 'address', strength: 'weak' });
+      expect(findOpenByDomain).toHaveBeenCalledWith('acme.example');
+      expect(extract).not.toHaveBeenCalled();
+      expect(learnCounterparty).not.toHaveBeenCalled();
+    });
+  });
+
   it('a confirmed row whose task is done is skipped; the open unconfirmed row links weakly', async () => {
     const closed = row({ id: 'row-closed', taskId: '99999999-9999-4999-8999-999999999999' });
     const open = row({ id: 'row-open', confirmed: false });

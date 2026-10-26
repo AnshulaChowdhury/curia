@@ -46,7 +46,7 @@ describeIf('disclosure_decisions', () => {
 
   // Review Focus 1: a yes for phone_us to bookings@ on T authorizes nothing else.
   it('scopes a yes to exactly (thread, counterparty, label)', async () => {
-    await repo.record([{ conversationId: T, counterparty: 'Bookings@Acme.example', label: 'phone_us', decision: 'yes', actionRef: 'ab12cd34' }]);
+    await repo.record([{ conversationId: T, counterparty: 'Bookings@Acme.example', label: 'phone_us', decision: 'yes', decidedBy: 'principal_reaction', actionRef: 'ab12cd34' }]);
 
     expect(await repo.latestFor(T, [BOOKINGS])).toEqual([{ counterparty: BOOKINGS, label: 'phone_us', decision: 'yes' }]);
     // Another counterparty on T, and the same counterparty on thread U, have nothing.
@@ -56,16 +56,17 @@ describeIf('disclosure_decisions', () => {
     expect((await repo.latestFor(T, [BOOKINGS])).map((d) => d.label)).toEqual(['phone_us']);
 
     const { rows } = await pool.query('SELECT decided_by, action_ref FROM disclosure_decisions WHERE conversation_id = $1', [T]);
-    expect(rows).toEqual([{ decided_by: 'principal', action_ref: 'ab12cd34' }]);
+    expect(rows).toEqual([{ decided_by: 'principal_reaction', action_ref: 'ab12cd34' }]);
   });
 
   it('returns the latest decision per counterparty and label', async () => {
     const V = `${run}-thread-V`;
-    await repo.record([{ conversationId: V, counterparty: BOOKINGS, label: 'phone_us', decision: 'yes' }]);
+    const by = { decidedBy: 'principal_via_coordinator' } as const;
+    await repo.record([{ conversationId: V, counterparty: BOOKINGS, label: 'phone_us', decision: 'yes', ...by }]);
     await repo.record([
-      { conversationId: V, counterparty: BOOKINGS, label: 'phone_us', decision: 'no' },
-      { conversationId: V, counterparty: BOOKINGS, label: 'sin_ca', decision: 'yes' },
-      { conversationId: V, counterparty: 'ops@acme.example', label: 'phone_us', decision: 'yes' },
+      { conversationId: V, counterparty: BOOKINGS, label: 'phone_us', decision: 'no', ...by },
+      { conversationId: V, counterparty: BOOKINGS, label: 'sin_ca', decision: 'yes', ...by },
+      { conversationId: V, counterparty: 'ops@acme.example', label: 'phone_us', decision: 'yes', ...by },
     ]);
     const latest = await repo.latestFor(V, [BOOKINGS, 'OPS@acme.example']);
     expect(latest).toHaveLength(3);
@@ -75,13 +76,17 @@ describeIf('disclosure_decisions', () => {
       { counterparty: 'ops@acme.example', label: 'phone_us', decision: 'yes' },
     ]));
     // A later yes overrides the no.
-    await repo.record([{ conversationId: V, counterparty: BOOKINGS, label: 'phone_us', decision: 'yes' }]);
+    await repo.record([{ conversationId: V, counterparty: BOOKINGS, label: 'phone_us', decision: 'yes', ...by }]);
     expect(await repo.latestFor(V, [BOOKINGS])).toEqual(expect.arrayContaining([{ counterparty: BOOKINGS, label: 'phone_us', decision: 'yes' }]));
   });
 
-  it('refuses a decision other than yes or no', async () => {
+  it('refuses a decision other than yes or no, and a resolver other than the principal\'s two', async () => {
     await expect(pool.query(
-      `INSERT INTO disclosure_decisions (conversation_id, counterparty, label, decision, decided_by) VALUES ($1, 'a', 'b', 'maybe', 'principal')`,
+      `INSERT INTO disclosure_decisions (conversation_id, counterparty, label, decision, decided_by) VALUES ($1, 'a', 'b', 'maybe', 'principal_reaction')`,
+      [`${run}-bad`],
+    )).rejects.toMatchObject({ code: '23514' });
+    await expect(pool.query(
+      `INSERT INTO disclosure_decisions (conversation_id, counterparty, label, decision, decided_by) VALUES ($1, 'a', 'b', 'yes', 'principal')`,
       [`${run}-bad`],
     )).rejects.toMatchObject({ code: '23514' });
   });
@@ -103,9 +108,9 @@ describeIf('disclosure_decisions', () => {
     // The replayed input is exactly what was held: no ask inside it.
     expect(row?.payload).toEqual(payload);
 
-    await new DisclosureDecisionRecorder({ repo, logger: createSilentLogger() }).recordForApproval(row!, 'no');
+    await new DisclosureDecisionRecorder({ repo, logger: createSilentLogger() }).recordForApproval(row!, 'no', 'principal_via_coordinator');
     expect(await repo.latestFor(W, [BOOKINGS])).toEqual([{ counterparty: BOOKINGS, label: 'phone_us', decision: 'no' }]);
-    const { rows } = await pool.query('SELECT action_ref FROM disclosure_decisions WHERE conversation_id = $1', [W]);
-    expect(rows).toEqual([{ action_ref: shortRef }]);
+    const { rows } = await pool.query('SELECT decided_by, action_ref FROM disclosure_decisions WHERE conversation_id = $1', [W]);
+    expect(rows).toEqual([{ decided_by: 'principal_via_coordinator', action_ref: shortRef }]);
   });
 });

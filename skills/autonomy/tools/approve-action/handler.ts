@@ -98,7 +98,7 @@ export class ApproveActionHandler implements ToolHandler {
       // on the thread in the meantime already sees it. The recorder never throws.
       if (row.disclosureAsk) {
         if (ctx.disclosureDecisions) {
-          await ctx.disclosureDecisions.recordForApproval(row, 'yes');
+          await ctx.disclosureDecisions.recordForApproval(row, 'yes', 'principal_via_coordinator');
         } else {
           ctx.log.error({ rowId: row.id }, 'approve-action: disclosureDecisions not wired — the principal\'s yes is not remembered for the thread');
         }

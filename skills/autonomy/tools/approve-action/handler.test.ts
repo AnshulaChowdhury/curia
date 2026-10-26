@@ -461,7 +461,7 @@ describe('ApproveActionHandler', () => {
         bus: makeMockBus(), executionLayer: execLayer, disclosureDecisions,
       }));
       expect(result.success).toBe(true);
-      expect(disclosureDecisions.recordForApproval).toHaveBeenCalledExactlyOnceWith(ASK_ROW, 'yes');
+      expect(disclosureDecisions.recordForApproval).toHaveBeenCalledExactlyOnceWith(ASK_ROW, 'yes', 'principal_via_coordinator');
       const invoke = vi.mocked(execLayer.invoke);
       // Exactly the input it was held with: the ask is never part of the replayed payload.
       expect(invoke.mock.calls[0]![1]).toEqual({ recipient_contact_id: 'c-1', subject: 'Booking', body: 'The number is 415-555-0100.' });

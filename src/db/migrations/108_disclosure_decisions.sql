@@ -8,6 +8,9 @@
 -- Band review reads the latest decision per (conversation, counterparty, label): a yes
 -- authorizes exactly that, a no turns a later ask there into a bounce. Labels and recipient
 -- identifiers only, never the shared values. counterparty is the lowercased recipient id.
+-- decided_by is the path the principal's answer came by: 'principal_reaction' (their reaction
+-- on the approval message) or 'principal_via_coordinator' (approve-action / deny-action, the
+-- coordinator acting on their reply). Policy treats both as the principal's decision.
 
 -- Up Migration
 
@@ -17,7 +20,7 @@ CREATE TABLE disclosure_decisions (
   counterparty TEXT NOT NULL,
   label TEXT NOT NULL,
   decision TEXT NOT NULL CHECK (decision IN ('yes', 'no')),
-  decided_by TEXT NOT NULL,
+  decided_by TEXT NOT NULL CHECK (decided_by IN ('principal_reaction', 'principal_via_coordinator')),
   action_ref TEXT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

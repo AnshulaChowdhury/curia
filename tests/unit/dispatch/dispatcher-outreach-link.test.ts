@@ -254,12 +254,13 @@ describe('Dispatcher outreach link (#2312)', () => {
     expect(h.updateTask.mock.calls[0]![0]).toBe(TASK_ID);
   });
 
-  it('passes the Curia mailbox the email was sent to as recipientAddress', async () => {
+  it('passes the Curia mailbox the converter published as recipientAddress', async () => {
     const h = harness();
     await sendEmail(h, {
       metadata: {
         otherRecipientCount: 1,
         primaryRecipientEmails: ['Dana@Acme.example'],
+        curiaMailbox: 'curia+ops@office.example',
         participants: [
           { email: 'Bookings@Acme.example', name: 'Acme Bookings', role: 'from' },
           { email: 'Dana@Acme.example', name: 'Dana', role: 'to' },
@@ -270,13 +271,26 @@ describe('Dispatcher outreach link (#2312)', () => {
     expect(h.match.mock.calls[0]![0].recipientAddress).toBe('curia+ops@office.example');
   });
 
-  it('omits recipientAddress when Curia was CC\'d or its own address was unknown', async () => {
+  it('omits recipientAddress when the converter published no mailbox (CC, BCC, alias, unknown self)', async () => {
     const cc = harness();
     await sendEmail(cc, { metadata: { curiaRole: 'cc', primaryRecipientEmails: ['dana@acme.example'] } });
     expect(cc.match.mock.calls[0]![0]).not.toHaveProperty('recipientAddress');
-    const unknownSelf = harness();
-    await sendEmail(unknownSelf, { metadata: { otherRecipientCount: undefined } });
-    expect(unknownSelf.match.mock.calls[0]![0]).not.toHaveProperty('recipientAddress');
+    // Curia in neither To nor CC: curiaRole falls back to 'to', and the one To address is Dana's.
+    // That is never the mailbox.
+    const bcc = harness();
+    await sendEmail(bcc, {
+      metadata: {
+        otherRecipientCount: 1,
+        participants: [
+          { email: 'Bookings@Acme.example', name: 'Acme Bookings', role: 'from' },
+          { email: 'Dana@Acme.example', name: 'Dana', role: 'to' },
+        ],
+      },
+    });
+    expect(bcc.match.mock.calls[0]![0]).not.toHaveProperty('recipientAddress');
+    const malformed = harness();
+    await sendEmail(malformed, { metadata: { curiaMailbox: 42 } });
+    expect(malformed.match.mock.calls[0]![0]).not.toHaveProperty('recipientAddress');
   });
 
   it('uses the header-parsed From, not an address a crafted display name carries', async () => {

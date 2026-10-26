@@ -57,21 +57,21 @@ describe('readDisclosureAsk', () => {
 });
 
 describe('DisclosureDecisionsRepo', () => {
-  it('records one row per decision, by the principal, with counterparties lowercased', async () => {
+  it('records one row per decision, with its resolver, counterparties lowercased', async () => {
     const { pool, query } = mockPool();
     await new DisclosureDecisionsRepo(pool).record([
-      { conversationId: 'conv-T', counterparty: 'Bookings@Acme.example', label: 'phone_us', decision: 'yes', actionRef: 'ab12cd34' },
-      { conversationId: 'conv-T', counterparty: 'ops@acme.example', label: 'phone_us', decision: 'yes' },
+      { conversationId: 'conv-T', counterparty: 'Bookings@Acme.example', label: 'phone_us', decision: 'yes', decidedBy: 'principal_reaction', actionRef: 'ab12cd34' },
+      { conversationId: 'conv-T', counterparty: 'ops@acme.example', label: 'phone_us', decision: 'yes', decidedBy: 'principal_via_coordinator' },
     ]);
     expect(query).toHaveBeenCalledOnce();
     const [sql, params] = query.mock.calls[0]!;
     expect(sql).toContain('INSERT INTO disclosure_decisions');
-    expect(sql).toContain("'principal'");
     expect(params).toEqual([
       ['conv-T', 'conv-T'],
       ['bookings@acme.example', 'ops@acme.example'],
       ['phone_us', 'phone_us'],
       ['yes', 'yes'],
+      ['principal_reaction', 'principal_via_coordinator'],
       ['ab12cd34', null],
     ]);
   });
@@ -104,7 +104,7 @@ describe('DisclosureDecisionsRepo', () => {
 describe('DisclosureDecisionRecorder', () => {
   function make(opts: { recordFails?: boolean; learnFails?: boolean; noOutreachRepo?: boolean } = {}) {
     const repo = {
-      record: vi.fn(async (_rows: ReadonlyArray<{ decision: string }>): Promise<void> => {
+      record: vi.fn(async (_rows: ReadonlyArray<{ decision: string; decidedBy: string }>): Promise<void> => {
         if (opts.recordFails) throw new Error('db down');
       }),
     };
@@ -120,36 +120,40 @@ describe('DisclosureDecisionRecorder', () => {
   }
   const row = (disclosureAsk: DisclosureAsk | null | undefined) => ({ id: 7, shortRef: 'ab12cd34', disclosureAsk });
 
-  it('records yes for each counterparty and label of the ask, with the approval ref', async () => {
+  it('records yes for each counterparty and label of the ask, with the resolver and the approval ref', async () => {
     const { recorder, repo } = make();
-    await recorder.recordForApproval(row(ASK), 'yes');
+    await recorder.recordForApproval(row(ASK), 'yes', 'principal_via_coordinator');
+    const by = { decidedBy: 'principal_via_coordinator', actionRef: 'ab12cd34' };
     expect(repo.record).toHaveBeenCalledWith([
-      { conversationId: 'conv-T', counterparty: 'bookings@acme.example', label: 'phone_us', decision: 'yes', actionRef: 'ab12cd34' },
-      { conversationId: 'conv-T', counterparty: 'bookings@acme.example', label: 'sin_ca', decision: 'yes', actionRef: 'ab12cd34' },
-      { conversationId: 'conv-T', counterparty: 'ops@acme.example', label: 'phone_us', decision: 'yes', actionRef: 'ab12cd34' },
-      { conversationId: 'conv-T', counterparty: 'ops@acme.example', label: 'sin_ca', decision: 'yes', actionRef: 'ab12cd34' },
+      { conversationId: 'conv-T', counterparty: 'bookings@acme.example', label: 'phone_us', decision: 'yes', ...by },
+      { conversationId: 'conv-T', counterparty: 'bookings@acme.example', label: 'sin_ca', decision: 'yes', ...by },
+      { conversationId: 'conv-T', counterparty: 'ops@acme.example', label: 'phone_us', decision: 'yes', ...by },
+      { conversationId: 'conv-T', counterparty: 'ops@acme.example', label: 'sin_ca', decision: 'yes', ...by },
     ]);
+    const reaction = make();
+    await reaction.recorder.recordForApproval(row(ASK), 'no', 'principal_reaction');
+    expect(reaction.repo.record.mock.calls[0]![0].every((r) => r.decidedBy === 'principal_reaction')).toBe(true);
   });
 
   it('learns the requester onto the linked outreach row on a yes, never on a no', async () => {
     const yes = make();
-    await yes.recorder.recordForApproval(row({ ...ASK, outreachId: 'o-1' }), 'yes');
+    await yes.recorder.recordForApproval(row({ ...ASK, outreachId: 'o-1' }), 'yes', 'principal_via_coordinator');
     expect(yes.taskOutreachRepo.learnCounterparty).toHaveBeenCalledExactlyOnceWith('o-1', { address: 'bookings@acme.example' });
 
     const no = make();
-    await no.recorder.recordForApproval(row({ ...ASK, outreachId: 'o-1' }), 'no');
+    await no.recorder.recordForApproval(row({ ...ASK, outreachId: 'o-1' }), 'no', 'principal_via_coordinator');
     expect(no.repo.record.mock.calls[0]![0].every((r) => r.decision === 'no')).toBe(true);
     expect(no.taskOutreachRepo.learnCounterparty).not.toHaveBeenCalled();
 
     const unlinked = make();
-    await unlinked.recorder.recordForApproval(row(ASK), 'yes');
+    await unlinked.recorder.recordForApproval(row(ASK), 'yes', 'principal_via_coordinator');
     expect(unlinked.taskOutreachRepo.learnCounterparty).not.toHaveBeenCalled();
   });
 
   it('records nothing for a row without an ask', async () => {
     for (const ask of [null, undefined]) {
       const { recorder, repo, taskOutreachRepo } = make();
-      await recorder.recordForApproval(row(ask), 'yes');
+      await recorder.recordForApproval(row(ask), 'yes', 'principal_via_coordinator');
       expect(repo.record).not.toHaveBeenCalled();
       expect(taskOutreachRepo.learnCounterparty).not.toHaveBeenCalled();
     }
@@ -157,12 +161,12 @@ describe('DisclosureDecisionRecorder', () => {
 
   it('never throws: a failed write or learn is logged, by labels and ids only', async () => {
     const failing = make({ recordFails: true, learnFails: true });
-    await expect(failing.recorder.recordForApproval(row({ ...ASK, outreachId: 'o-1' }), 'yes')).resolves.toBeUndefined();
+    await expect(failing.recorder.recordForApproval(row({ ...ASK, outreachId: 'o-1' }), 'yes', 'principal_via_coordinator')).resolves.toBeUndefined();
     expect(failing.error).toHaveBeenCalledTimes(2);
     // The learn still runs when the record failed: they are independent.
     expect(failing.taskOutreachRepo.learnCounterparty).toHaveBeenCalledOnce();
 
     const noRepo = make({ noOutreachRepo: true });
-    await expect(noRepo.recorder.recordForApproval(row({ ...ASK, outreachId: 'o-1' }), 'yes')).resolves.toBeUndefined();
+    await expect(noRepo.recorder.recordForApproval(row({ ...ASK, outreachId: 'o-1' }), 'yes', 'principal_via_coordinator')).resolves.toBeUndefined();
   });
 });

@@ -447,7 +447,7 @@ export class ReactionApprovalMapper {
       this.log.error({ rowId: row.id, decision }, 'reaction-approval: disclosureDecisions not wired — the principal\'s answer is not remembered for the thread');
       return;
     }
-    await this.disclosureDecisions.recordForApproval(row, decision);
+    await this.disclosureDecisions.recordForApproval(row, decision, 'principal_reaction');
   }
 
   private async publishDecision(

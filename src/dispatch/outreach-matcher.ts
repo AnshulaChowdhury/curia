@@ -86,20 +86,22 @@ export class OutreachMatcher {
     const { repo } = this.deps;
     const address = msg.senderAddress.trim().toLowerCase();
 
-    // Steps 1-3: direct matches, first hit wins; each finder returns newest first.
-    if (address !== '') {
-      const row = await this.firstMatchable(await repo.findOpenByAddress(address));
-      if (row) return this.link(row, 'address', msg);
-    }
-    if (msg.senderContactId) {
-      const row = await this.firstMatchable(await repo.findOpenByContact(msg.senderContactId));
-      if (row) return this.link(row, 'contact', msg);
-    }
+    // Steps 1-3: direct matches, each finder newest first. The first confirmed row across the
+    // steps wins; the first unconfirmed hit is used only when no step finds a confirmed one, so a
+    // backstop row an earlier step finds never shadows a confirmed row a later step finds.
+    let fallback: { row: TaskOutreachRow; kind: OutreachLinkKind } | null = null;
+    const steps: Array<[OutreachLinkKind, () => Promise<TaskOutreachRow[]>]> = [];
+    if (address !== '') steps.push(['address', () => repo.findOpenByAddress(address)]);
+    const contactId = msg.senderContactId;
+    if (contactId) steps.push(['contact', () => repo.findOpenByContact(contactId)]);
     const domain = this.orgDomainOf(address);
-    if (domain) {
-      const row = await this.firstMatchable(await repo.findOpenByDomain(domain));
-      if (row) return this.link(row, 'org-domain', msg);
+    if (domain) steps.push(['org-domain', () => repo.findOpenByDomain(domain)]);
+    for (const [kind, find] of steps) {
+      const row = await this.firstMatchable(await find());
+      if (row?.confirmed) return this.link(row, kind, msg);
+      if (row && fallback === null) fallback = { row, kind };
     }
+    if (fallback) return this.link(fallback.row, fallback.kind, msg);
 
     // Step 4: a model check over recent open rows. Always weak.
     if (!this.deps.infraLlm) return null;

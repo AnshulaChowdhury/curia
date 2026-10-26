@@ -300,7 +300,7 @@ export class BandSendReview {
       toRewrite.push({ rule: BAND_RULES.pii, detail: TOO_MANY_DETAIL });
     } else if (items.length > 0) {
       const byId = new Map(rulings!.map((r) => [r.id, r]));
-      const who = await this.authorityOf(authority, rulings!, linkCovers);
+      const { who, trusted } = await this.authorityOf(authority, rulings!, linkCovers);
       const unsupported = new Set<string>();
       const askFirst = new Set<string>();
       const inferredBelow80 = new Set<string>();
@@ -313,7 +313,9 @@ export class BandSendReview {
         const answer = said(item.label);
         if (answer === 'no') { declined.add(item.label); continue; }
         if (answer === 'yes') { saidYes.add(item.label); continue; }
-        if (r.basis === 'directed' && who === 'trusted') { copy.add(item.label); continue; }
+        // The drafting turn's own trusted originator directed it: the copy path, even inside a
+        // task the principal set (that task's authority would only count it as inferred).
+        if (r.basis === 'directed' && trusted) { copy.add(item.label); continue; }
         // Held below 80 for the principal: an ask when it is their task and an askable recipient
         // requested it. Under the principal's own turn nobody is asking: an ordinary hold.
         const heldForTask = (set: Set<string>) => {
@@ -341,7 +343,7 @@ export class BandSendReview {
         }
       }
       for (const label of declined) {
-        toRewrite.push({ rule: BAND_RULES.pii, detail: `The principal declined sharing your ${label} with this recipient on this thread. Rewrite without it.` });
+        toRewrite.push({ rule: BAND_RULES.pii, detail: `The principal declined sharing your ${describePiiLabels([label])} with this recipient on this thread. Rewrite without it.` });
       }
       if (unsupported.size > 0) {
         toRewrite.push({
@@ -361,7 +363,7 @@ export class BandSendReview {
       // Ids, labels and counts only: the judge's reasons and the items' text can echo the data.
       this.deps.logger.info(
         {
-          conversationId: input.conversationId, channel: input.channel, items: items.length, authority: who,
+          conversationId: input.conversationId, channel: input.channel, items: items.length, authority: who, trustedOriginator: trusted,
           ...(authority?.linkedTask ? { linkStrength: authority.linkedTask.strength, linkCovers } : {}),
           unsupported: [...unsupported], askFirst: [...askFirst], inferredBelow80: [...inferredBelow80], taskDirectedBelow80: [...taskDirectedBelow80], copyPrincipal: [...copy],
           principalDeclined: [...declined], principalSaidYes: [...saidYes],
@@ -445,27 +447,37 @@ export class BandSendReview {
    * or a wake they originated). The principal's task: only the bound or root task is theirs,
    * not the drafting turn, so a directed ruling counts as inferred. A strong reply-to-task link
    * to a task (or its root) the principal directed counts the same, when it covers every
-   * recipient (`linkCovers`); a weak one never does. A trusted contact:
-   * their stamped tier and their tier now are both trusted, and their message authenticated them.
-   * Anything else, or a failed tier read, is no authority.
+   * recipient (`linkCovers`); a weak one never does. Anything else is no authority.
+   *
+   * `trusted` is separate, since it is about the drafting turn rather than a task: its
+   * originator's stamped tier and tier now are both trusted, and their message authenticated
+   * them. A directed ruling then takes the copy path even under the principal's task (#2312).
+   * Never for the principal's own turn, which needs no copy. A failed tier read is not trusted.
    */
-  private async authorityOf(a: SendAuthority | undefined, rulings: readonly DisclosureRuling[], linkCovers: boolean): Promise<'principal' | 'principal-task' | 'trusted' | 'none'> {
-    if (!a) return 'none';
+  private async authorityOf(
+    a: SendAuthority | undefined,
+    rulings: readonly DisclosureRuling[],
+    linkCovers: boolean,
+  ): Promise<{ who: 'principal' | 'principal-task' | 'none'; trusted: boolean }> {
+    if (!a) return { who: 'none', trusted: false };
     // `liveTurn` is context for the judge only. Code trusts the stamped role: stampOriginator
     // sets systemRole 'principal' only from the resolved sender, and a wake carries the
     // originator its job was created with.
-    if (a.originator?.systemRole === 'principal') return 'principal';
-    if ([a.boundTask?.originator, a.rootTask?.originator].some((o) => o?.systemRole === 'principal')) return 'principal-task';
+    if (a.originator?.systemRole === 'principal') return { who: 'principal', trusted: false };
     // Only an exact 'strong' counts; the collector already dropped a malformed link.
-    if (linkCovers && a.linkedTask?.strength === 'strong' && linkToPrincipalTask(a)) return 'principal-task';
-    const o = a.originator;
+    const task = [a.boundTask?.originator, a.rootTask?.originator].some((o) => o?.systemRole === 'principal')
+      || (linkCovers && a.linkedTask?.strength === 'strong' && linkToPrincipalTask(a));
+    return { who: task ? 'principal-task' : 'none', trusted: await this.trustedOriginator(a.originator, rulings) };
+  }
+
+  private async trustedOriginator(o: SendAuthority['originator'], rulings: readonly DisclosureRuling[]): Promise<boolean> {
     // Only a directed ruling uses trusted authority, so skip the lookup otherwise.
-    if (!o || o.tier !== 'trusted' || o.authenticated !== true || !rulings.some((r) => r.basis === 'directed')) return 'none';
+    if (!o || o.tier !== 'trusted' || o.authenticated !== true || !rulings.some((r) => r.basis === 'directed')) return false;
     try {
-      return (await this.deps.contactTier(o.contactId)) === 'trusted' ? 'trusted' : 'none';
+      return (await this.deps.contactTier(o.contactId)) === 'trusted';
     } catch (err) {
       this.deps.logger.error({ err, contactId: o.contactId }, 'band review: could not read the originator\'s current tier — no trusted authority');
-      return 'none';
+      return false;
     }
   }
 
@@ -505,7 +517,7 @@ export class BandSendReview {
     if (collected.unavailable) return { verdict: { ok: false, failure: 'unreachable' } };
     // Decisions and the outreach id stay with code: the judge reads the decisions as sentences.
     const { decisions, linkedOutreachId, ...evidence } = collected;
-    const principalDecisions = describeDecisions(decisions);
+    const principalDecisions = describeDecisions(decisions, nonPrincipalRecipients(input));
     // Newest first, so the note leads. The relay's principal note is not under the drafting
     // task in audit_log (its parent is the agent.response), so it arrives with the send
     // rather than from the collector.
@@ -665,10 +677,21 @@ function principalSaid(recipients: readonly string[], decisions: readonly Disclo
   };
 }
 
-/** Decisions as the judge reads them: the label and "this recipient", never the identifier; once each. */
-function describeDecisions(decisions: CollectedEvidence['decisions']): string[] {
-  return [...new Set((decisions ?? []).map((d) =>
-    `The principal already said ${d.decision} to sharing ${describePiiLabels([d.label])} with this recipient on this thread.`))];
+/**
+ * Decisions as the judge reads them: the label and "this recipient", never the identifier; once
+ * per label. A yes or no is stated only when it holds for the send as code applies it
+ * (principalSaid): a yes from every recipient, or a no from any. A yes from some recipients
+ * only is partial, and said to be, since code does not treat it as a yes.
+ */
+function describeDecisions(decisions: CollectedEvidence['decisions'], recipients: readonly string[]): string[] {
+  const said = principalSaid(recipients, decisions ?? []);
+  return [...new Set((decisions ?? []).map((d) => d.label))].map((label) => {
+    const answer = said(label);
+    const what = describePiiLabels([label]);
+    return answer
+      ? `The principal already said ${answer} to sharing ${what} with this recipient on this thread.`
+      : `The principal answered about sharing ${what} for one of the recipients only, on this thread.`;
+  });
 }
 
 const TASK_TITLE_MAX = 80;

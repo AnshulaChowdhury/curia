@@ -50,7 +50,7 @@ export class DenyActionHandler implements ToolHandler {
       // A personal-data ask (#2312): later asks on the thread become bounces. Never throws.
       if (row.disclosureAsk) {
         if (ctx.disclosureDecisions) {
-          await ctx.disclosureDecisions.recordForApproval(row, 'no');
+          await ctx.disclosureDecisions.recordForApproval(row, 'no', 'principal_via_coordinator');
         } else {
           ctx.log.error({ rowId: row.id }, 'deny-action: disclosureDecisions not wired — the principal\'s no is not remembered for the thread');
         }

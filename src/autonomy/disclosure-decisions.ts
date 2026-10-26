@@ -17,6 +17,13 @@ import type { Logger } from '../logger.js';
 export type DisclosureDecision = 'yes' | 'no';
 
 /**
+ * Who resolved the approval: the principal's own reaction on the approval message, or the
+ * coordinator acting on the principal's reply (approve-action / deny-action interpret their
+ * text). Policy treats both as the principal's decision; the column keeps which path it was.
+ */
+export type DisclosureDecider = 'principal_reaction' | 'principal_via_coordinator';
+
+/**
  * The ask a held send carries, stored on its approval row. `counterparties` are the send's
  * non-principal recipients and `requester` the primary one, all normalized. `outreachId` is the
  * outreach row the drafting turn was linked to, when the link covered the recipients: a yes
@@ -73,20 +80,22 @@ export function readDisclosureAsk(raw: unknown): DisclosureAsk | null {
 export class DisclosureDecisionsRepo {
   constructor(private readonly pool: DbPool) {}
 
-  /** Record decisions, one row each. The decider is always the principal. */
+  /** Record decisions, one row each, with the path the principal's answer came by. */
   async record(rows: ReadonlyArray<{
-    conversationId: string; counterparty: string; label: string; decision: DisclosureDecision; actionRef?: string;
+    conversationId: string; counterparty: string; label: string; decision: DisclosureDecision;
+    decidedBy: DisclosureDecider; actionRef?: string;
   }>): Promise<void> {
     if (rows.length === 0) return;
     await this.pool.query(
       `INSERT INTO disclosure_decisions (conversation_id, counterparty, label, decision, decided_by, action_ref)
-       SELECT c, p, l, d, 'principal', r
-         FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) AS t(c, p, l, d, r)`,
+       SELECT c, p, l, d, b, r
+         FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[]) AS t(c, p, l, d, b, r)`,
       [
         rows.map((r) => r.conversationId),
         rows.map((r) => normalizeCounterparty(r.counterparty)),
         rows.map((r) => r.label),
         rows.map((r) => r.decision),
+        rows.map((r) => r.decidedBy),
         rows.map((r) => r.actionRef ?? null),
       ],
     );
@@ -129,17 +138,18 @@ export class DisclosureDecisionRecorder {
   async recordForApproval(
     row: { id: number; shortRef: string | null; disclosureAsk?: DisclosureAsk | null },
     decision: DisclosureDecision,
+    decidedBy: DisclosureDecider,
   ): Promise<void> {
     const ask = row.disclosureAsk;
     if (!ask) return;
     const rows = ask.counterparties.flatMap((counterparty) => ask.labels.map((label) => ({
-      conversationId: ask.conversationId, counterparty, label, decision,
+      conversationId: ask.conversationId, counterparty, label, decision, decidedBy,
       ...(row.shortRef ? { actionRef: row.shortRef } : {}),
     })));
     try {
       await this.deps.repo.record(rows);
       this.deps.logger.info(
-        { rowId: row.id, conversationId: ask.conversationId, labels: ask.labels, counterparties: ask.counterparties.length, decision },
+        { rowId: row.id, conversationId: ask.conversationId, labels: ask.labels, counterparties: ask.counterparties.length, decision, decidedBy },
         'disclosure-decisions: recorded the principal\'s answer to a personal-data ask',
       );
     } catch (err) {
