@@ -983,6 +983,7 @@ describe('EmailAdapter — sendWithGatedDraftFallback gated-fallback', () => {
     (mocks.outboundGateway.createEmailDraft as ReturnType<typeof vi.fn>).mockResolvedValue({
       success: true,
       draftId: 'draft-abc',
+      draft: { subject: 'Re: Hello', body: '<p>Call me at the office</p>' },
     });
 
     const adapter = makeAdapter(mocks);
@@ -1001,12 +1002,12 @@ describe('EmailAdapter — sendWithGatedDraftFallback gated-fallback', () => {
       expect.objectContaining({ to: CEO_EMAIL, channel: 'email' }),
     );
 
-    // linkGatedAction should be called with the actionRef, taskEventId, and just the draft_id.
-    // account is already in the partialPayload stored at gate time — no need to repeat it here.
+    // linkGatedAction links the draft_id and the draft's subject and body as created (#2312),
+    // so an approval replay matches what was shown. account is already in the partialPayload.
     expect(mocks.outboundGateway.linkGatedAction).toHaveBeenCalledWith(
       'email-42',
       'task-evt-2',
-      { draft_id: 'draft-abc' },
+      { draft_id: 'draft-abc', subject: 'Re: Hello', body: '<p>Call me at the office</p>' },
     );
 
     await adapter.stop();

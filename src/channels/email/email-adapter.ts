@@ -1543,10 +1543,13 @@ export class EmailAdapter implements Channel {
           // linkGatedAction is internally guarded (no-throw), so no outer try/catch needed here.
           // Pass context.taskEventId so linkPayload can scope the update to this specific task,
           // preventing short_ref collisions across tasks from smearing draft_id onto the wrong row.
-          // Only draft_id needs linking — account was already stored in reExecRecipe.partialPayload
-          // at gate time, so the merged payload matches send-draft's expected inputs exactly.
+          // account was already stored in reExecRecipe.partialPayload at gate time. The draft's
+          // subject and body, as created, ride along (#2312): send-draft counts a replay as
+          // principal-approved only when the draft still matches them, and the approval and
+          // approve-action's unseen-details check read the text from them.
           await outboundGateway.linkGatedAction(result.actionRef, context.taskEventId, {
             draft_id: draftResult.draftId,
+            ...(draftResult.draft ? { subject: draftResult.draft.subject, body: draftResult.draft.body } : {}),
           });
         } else {
           // actionRef is absent either because taskEventId was not passed, or because

@@ -21,6 +21,8 @@ import type { NylasClient, NylasMessage } from '../../src/channels/email/nylas-c
 import type { ContactService } from '../../src/contacts/contact-service.js';
 import type { OutboundContentFilter, FilterResult } from '../../src/dispatch/outbound-filter.js';
 import type { ActionLogRepo } from '../../src/autonomy/action-log-repo.js';
+import type { ToolContext } from '../../src/skills/types.js';
+import { SendDraftHandler } from '../../skills/email/tools/send-draft/handler.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -215,14 +217,83 @@ describe('Draft Fallback Flow Integration', () => {
       // account is stored in partialPayload at gate time so approve-action has it
       expect((insertedRow.payload as Record<string, unknown>).account).toBe('curia');
 
-      // Assert: linkGatedAction was called with just the draft_id.
-      // account was already stored in partialPayload — no need to link it again.
+      // Assert: linkGatedAction linked the draft_id and the draft's subject and body as
+      // created (#2312). account was already stored in partialPayload — not linked again.
       expect(actionLogRepo._linkedPayloads).toHaveLength(1);
       expect(actionLogRepo._linkedPayloads[0]!.payload).toEqual({
         draft_id: 'draft-001',
+        subject: 'Test Subject',
+        body: 'hello',
       });
 
       await adapter.stop();
+    });
+
+    it('an approval of the linked row replays the draft as principal-approved (#2312)', async () => {
+      const autonomyService = createMockAutonomyService(50);
+      const actionLogRepo = createMockActionLogRepo();
+      (mockNylasClient as unknown as { getDraft: ReturnType<typeof vi.fn> }).getDraft = vi.fn()
+        .mockResolvedValue(stubMessage({ id: 'draft-001', folders: ['DRAFT'] }));
+      const gateway = new OutboundGateway({
+        nylasClients: new Map<string, NylasClient>([['curia', mockNylasClient]]),
+        contactService: mockContactService,
+        contentFilter,
+        bus,
+        logger,
+        autonomyService,
+        actionLogRepo,
+      });
+      const adapter = new EmailAdapter({
+        accountId: 'curia',
+        bus,
+        logger,
+        outboundGateway: gateway,
+        contactService: mockContactService,
+        pollingIntervalMs: 999_999,
+        selfEmail: 'curia@company.com',
+        suppressedSenderEmails: [],
+        ceoEmail: 'ceo@company.com',
+        contactCreationMaxPerMessage: 10,
+        contactCreationMaxPerHour: 100,
+        maxConcurrentTurns: 4,
+        timezone: 'America/Toronto',
+      });
+      await adapter.start();
+      await bus.publish('dispatch', createOutboundMessage({
+        conversationId: 'email:thread-001',
+        channelId: 'email',
+        accountId: 'curia',
+        content: 'Here is my reply.',
+        taskEventId: 'task-evt-001',
+        parentEventId: 'parent-evt-001',
+      }));
+      await adapter.stop();
+
+      // approve-action replays send-draft with the row's payload: the gate-time partial
+      // payload merged with what was linked after the draft was created.
+      const payload = {
+        ...(actionLogRepo._insertedRows[0]!.payload as Record<string, unknown>),
+        ...actionLogRepo._linkedPayloads[0]!.payload,
+      };
+      const sendEmailDraft = vi.spyOn(gateway, 'sendEmailDraft').mockResolvedValue({ success: true, messageId: 'sent-draft-001' });
+      const ctx = {
+        input: payload,
+        secret: () => '',
+        log: logger,
+        outboundGateway: gateway,
+        bus,
+        humanApproved: true,
+        taskMetadata: {
+          originator: { contactId: 'ceo-contact-id', systemRole: 'principal', channel: 'signal', initiatedAt: new Date().toISOString() },
+        },
+        taskEventId: 'task-evt-approve',
+      } as unknown as ToolContext;
+      const result = await new SendDraftHandler().execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(sendEmailDraft).toHaveBeenCalledWith(
+        'draft-001', 'curia', expect.anything(), expect.objectContaining({ principalApproved: true }),
+      );
     });
   });
 

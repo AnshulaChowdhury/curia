@@ -178,7 +178,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Contact-visible outbound context** — contacts see only their own entries, one-to-one, on authenticated channels; their wakes likewise. (#2261)
 - **zod** — override floor set to 4.6.6, clearing a HIGH DoS advisory (CVE-2023-54404).
 - **Principal redaction bypass** — a third party CC'd on a message to the principal no longer bypasses redaction. (#2312)
-- **Saved drafts** — `send-draft` no longer skips PII checks; drafts with unallowed details hold or are refused. (#2312)
+- **Saved drafts** — `send-draft` checks drafts for PII; unallowed details hold, or refuse unless principal-directed. (#2312)
 
 ### Fixed
 

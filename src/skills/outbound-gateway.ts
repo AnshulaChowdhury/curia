@@ -202,6 +202,11 @@ export interface OutboundSendResult {
 export interface OutboundDraftResult extends OutboundSendResult {
   /** Nylas draft ID when success is true. */
   draftId?: string;
+  /**
+   * The draft's subject and body as Nylas stored them, when success is true (#2312). An
+   * approval of the draft stores them so send-draft can match the replay to what was shown.
+   */
+  draft?: { subject: string; body: string };
 }
 
 export interface OutboundGatewayConfig {
@@ -3384,7 +3389,8 @@ export class OutboundGateway {
    *
    * A stored draft is sent as written: it cannot be redacted in place (#2312). Under band
    * gating the review rules on each detected detail, and anything but a send holds the draft.
-   * Under tier gating a draft with details the channel does not allow is refused.
+   * Under tier gating a draft with details the channel does not allow is refused, unless
+   * the send is principal-directed.
    *
    * @param draftId        Nylas draft ID to send
    * @param accountId      Which named account to use. Defaults to the primary account.
@@ -3585,7 +3591,11 @@ export class OutboundGateway {
       }
     }
     const bandReviewRuns = this.gating === 'band' && this.bandReview !== undefined && !draftPrincipalSole;
-    if (detectedItems.length > 0 && !bandReviewRuns) {
+    // Under tier gating a principal-directed draft (a live principal turn, or an approval
+    // replay) is sent as written: the principal is in the loop, as tier has no review to ask.
+    // Band with no review wired still refuses: band means a review decides, and none can.
+    const tierPrincipalDirected = this.gating === 'tier' && options?.principalDirected === true;
+    if (detectedItems.length > 0 && !bandReviewRuns && !tierPrincipalDirected) {
       // Tier gating (or band with no review wired) would redact these, and a stored draft
       // cannot be. Labels only, never the values.
       const labels = [...new Set(detectedItems.map((d) => d.label))].join(', ');
@@ -3777,7 +3787,10 @@ export class OutboundGateway {
         toolName: 'send-draft',
         recipientLabel: draftEnvelope.join(', '),
         // The redacted copy, as in send(): the draft itself when nothing was detected (#2312).
-        preview: redactedSubject || redactedBody,
+        // An approved draft was not scanned above, so its copy is built here.
+        preview: options?.principalApproved === true
+          ? (draftMeta.subject ? this.redactedCopy(draftMeta.subject, 'email', recipientEmail) : '') || this.redactedCopy(body, 'email', recipientEmail)
+          : redactedSubject || redactedBody,
         // A draft's recipient is always an email address, so always a person.
         recipient: { person: true, contactId: recipientContactIdForDraft, lookupFailed: recipientTierUnresolvedForDraft },
         band: { report: bandReport, signals: bandSignals },
@@ -4100,7 +4113,7 @@ export class OutboundGateway {
         'outbound-gateway: draft created successfully',
       );
 
-      return { success: true, draftId: draft.id };
+      return { success: true, draftId: draft.id, draft: { subject: draft.subject, body: draft.body } };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error(
