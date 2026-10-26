@@ -1169,6 +1169,9 @@ export class OutboundGateway {
     //
     // Optional: when piiRedactor is not configured, redactedBody == messageBody
     // and the pipeline behaves identically to the pre-redaction behaviour.
+    // Built once and reused by Step 2: the redactor's principal bypass keys on the same
+    // sole-recipient computation as the content filter (#2312).
+    const { recipients, principalIncluded, principalIsSoleRecipient } = this.buildFilterRecipients(request);
     let redactedBody = messageBody;
     // Email subjects can contain PII just as the body can — track a separate
     // variable so we can pass the cleaned subject to dispatchEmail() below.
@@ -1180,7 +1183,7 @@ export class OutboundGateway {
         const redactionResult = await this.piiRedactor.redact(
           messageBody,
           request.channel,
-          { recipientId, recipientContactId },
+          { recipientId, principalIsSoleRecipient },
         );
         redactedBody = redactionResult.content;
         for (const r of redactionResult.redactions) {
@@ -1191,7 +1194,7 @@ export class OutboundGateway {
           const subjectResult = await this.piiRedactor.redact(
             request.subject,
             request.channel,
-            { recipientId, recipientContactId },
+            { recipientId, principalIsSoleRecipient },
           );
           redactedSubject = subjectResult.content;
           for (const r of subjectResult.redactions) {
@@ -1239,8 +1242,6 @@ export class OutboundGateway {
     // potentially dangerous content through an unchecked pipeline.
     let filterPassed = false;
     let filterFindings: Array<{ rule: string; detail: string }> = [];
-
-    const { recipients, principalIncluded, principalIsSoleRecipient } = this.buildFilterRecipients(request);
 
     try {
       const filterResult = await this.contentFilter.check({

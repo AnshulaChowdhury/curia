@@ -102,72 +102,30 @@ describe('PiiRedactor', () => {
     );
   });
 
-  it('bypasses redaction when recipientContactId matches ceoContactId', async () => {
-    // Simulates the case where startup resolved the principal's UUID and stored it.
-    const ceoUUID = 'b1a2c3d4-e5f6-7890-abcd-ef1234567890';
-    const redactorWithCeoId = new PiiRedactor({
-      config: defaultConfig,
-      bus,
-      logger,
-      extraPatterns: [],
-      ceoContactId: ceoUUID,
-    });
-
-    // Recipient is CEO — should pass through unredacted via structural UUID bypass.
-    const result = await redactorWithCeoId.redact(
+  it('bypasses redaction when the principal is the sole recipient (#2312)', async () => {
+    const result = await redactor.redact(
       'Your card is 4111 1111 1111 1111.',
       'email',
-      { recipientContactId: ceoUUID },
+      { principalIsSoleRecipient: true },
     );
     expect(result.content).toContain('4111 1111 1111 1111');
     expect(result.redactions).toHaveLength(0);
     expect(mockBusPublish).not.toHaveBeenCalled();
   });
 
-  it('does NOT bypass redaction when recipientContactId differs from ceoContactId', async () => {
-    const ceoUUID = 'b1a2c3d4-e5f6-7890-abcd-ef1234567890';
-    const redactorWithCeoId = new PiiRedactor({
-      config: defaultConfig,
-      bus,
-      logger,
-      extraPatterns: [],
-      ceoContactId: ceoUUID,
-    });
-
-    // Recipient is someone else — redaction must apply
-    const result = await redactorWithCeoId.redact(
+  it('redacts when principalIsSoleRecipient is false (a third party shares the send)', async () => {
+    const result = await redactor.redact(
       'Your card is 4111 1111 1111 1111.',
       'email',
-      { recipientContactId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' },
+      { principalIsSoleRecipient: false },
     );
     expect(result.content).toContain('[REDACTED: CREDIT_CARD]');
     expect(result.redactions).toHaveLength(1);
   });
 
-  it('initializing ceoContactId from findContactBySystemRole result bypasses redaction for that recipient (#1049)', async () => {
-    // Mirrors the startup wiring in src/index.ts: the principal contact id comes from
-    // contactService.findContactBySystemRole('principal'), not from CEO_PRIMARY_EMAIL.
-    const principalUUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
-    const findContactBySystemRole = async (systemRole: string) =>
-      systemRole === 'principal' ? { id: principalUUID } : null;
-
-    const principal = await findContactBySystemRole('principal');
-    const redactorFromResolution = new PiiRedactor({
-      config: defaultConfig,
-      bus,
-      logger,
-      extraPatterns: [],
-      ceoContactId: principal?.id,
-    });
-
-    const result = await redactorFromResolution.redact(
-      'Your card is 4111 1111 1111 1111.',
-      'email',
-      { recipientContactId: principalUUID },
-    );
-    expect(result.content).toContain('4111 1111 1111 1111');
-    expect(result.redactions).toHaveLength(0);
-    expect(mockBusPublish).not.toHaveBeenCalled();
+  it('redacts when principalIsSoleRecipient is absent', async () => {
+    const result = await redactor.redact('Your card is 4111 1111 1111 1111.', 'email', {});
+    expect(result.content).toContain('[REDACTED: CREDIT_CARD]');
   });
 
   it('redaction entries do not contain the original PII value', async () => {

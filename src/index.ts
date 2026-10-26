@@ -1637,9 +1637,6 @@ async function main(): Promise<void> {
       bus,
       logger,
       extraPatterns, // same patterns used by the inbound scrubber
-      // Principal bypass: resolved once from findContactBySystemRole('principal') above.
-      // undefined in setup-required mode (no principal yet) — then nothing bypasses redaction.
-      ceoContactId: principalContact?.id,
     });
   } catch (err) {
     logger.fatal({ err }, 'Failed to initialize PiiRedactor — check pii.outbound_redaction config');

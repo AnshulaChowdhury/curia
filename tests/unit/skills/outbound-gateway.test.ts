@@ -2351,6 +2351,80 @@ describe('PII redaction pipeline step', () => {
     });
   });
 
+  describe('principal bypass keys on the sole-recipient set (#2312)', () => {
+    const phoneBody = 'Call me on (415) 555-1234 tomorrow.';
+
+    async function makeRealGateway(identities: ReturnType<typeof makePrincipalIdentity>[]) {
+      const { PiiRedactor: RealPiiRedactor } = await import('../../../src/dispatch/pii-redactor.js');
+      const logger = createLogger('error');
+      const bus = {
+        publish: vi.fn().mockResolvedValue(undefined),
+        subscribe: vi.fn(),
+      } as unknown as EventBus;
+      const nylasClient = {
+        sendMessage: vi.fn().mockResolvedValue({ id: 'msg-pii-2' }),
+      } as unknown as NylasClient;
+      const signalClient = makeSignalClient();
+      const contactService = {
+        resolveByChannelIdentity: vi.fn().mockResolvedValue(null),
+      } as unknown as ContactService;
+      const contentFilter = {
+        check: vi.fn().mockResolvedValue({ passed: true, findings: [] }),
+      } as unknown as OutboundContentFilter;
+      const gateway = new OutboundGateway({
+        nylasClients: new Map([['curia', nylasClient]]),
+        signalClient: signalClient as unknown as import('../../../src/channels/signal/signal-rpc-client.js').SignalRpcClient,
+        signalPhoneNumber: '+15555550000',
+        contactService,
+        contentFilter,
+        bus,
+        principalIdentities: identities,
+        logger,
+        piiRedactor: new RealPiiRedactor({
+          config: {
+            enabled: true,
+            default: 'block',
+            channel_policies: { email: { allow: ['email'] }, signal: { allow: [] } },
+          },
+          bus,
+          logger,
+          extraPatterns: [],
+        }),
+      });
+      return { gateway, nylasClient, signalClient };
+    }
+
+    it('delivers the body intact when the email goes to the principal only', async () => {
+      const { gateway, nylasClient } = await makeRealGateway([makePrincipalIdentity('ceo@example.com')]);
+      const result = await gateway.send({ channel: 'email', to: 'ceo@example.com', subject: 's', body: phoneBody });
+      expect(result.success).toBe(true);
+      const sent = (nylasClient.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { body: string };
+      expect(sent.body).toContain('(415) 555-1234');
+    });
+
+    it('redacts when a third party is CC\'d alongside the principal', async () => {
+      const { gateway, nylasClient } = await makeRealGateway([makePrincipalIdentity('ceo@example.com')]);
+      const result = await gateway.send({
+        channel: 'email',
+        to: 'ceo@example.com',
+        cc: ['third@example.com'],
+        subject: 's',
+        body: phoneBody,
+      });
+      expect(result.success).toBe(true);
+      const sent = (nylasClient.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { body: string };
+      expect(sent.body).toContain('[REDACTED: PHONE_US]');
+      expect(sent.body).not.toContain('555-1234');
+    });
+
+    it('delivers a Signal 1:1 to the principal intact', async () => {
+      const { gateway, signalClient } = await makeRealGateway([makePrincipalIdentity('+15555551111', 'signal')]);
+      const result = await gateway.send({ channel: 'signal', recipient: '+15555551111', message: phoneBody });
+      expect(result.success).toBe(true);
+      expect(JSON.stringify(signalClient.send.mock.calls)).toContain('(415) 555-1234');
+    });
+  });
+
   it('blocks the message when PiiRedactor throws (fail-closed)', async () => {
     // If the redactor throws, the gateway must block the message rather than
     // sending unredacted PII. This is the fail-closed contract.

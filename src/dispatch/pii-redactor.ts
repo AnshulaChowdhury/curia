@@ -3,7 +3,9 @@
 // Sits between the agent response and the channel adapter. For each outbound
 // message it:
 //   1. Checks whether the kill switch is active (enabled: false → pass through)
-//   2. Checks principal contact ID — principal bypass via immutable UUID (silent)
+//   2. Checks principalIsSoleRecipient — the principal is the only human recipient of the
+//      send, computed by the gateway from verified principal identities across every To/CC
+//      recipient (silent bypass). A third party sharing the send disables it (#2312).
 //   3. Detects PII using the shared detectPii() core from src/pii/scrubber.ts
 //   4. Filters matches to those not in the channel's allow list
 //   5. Replaces them end-to-start with labelled tokens (e.g. [REDACTED: CREDIT_CARD])
@@ -60,14 +62,6 @@ export interface PiiRedactorOptions {
   logger: Logger;
   /** Extra patterns from config (loaded once at startup and threaded through). */
   extraPatterns: PiiPattern[];
-  /**
-   * The principal's contact UUID, resolved at startup via findContactBySystemRole('principal') (#1049).
-   * When set, any message destined for this exact contact ID bypasses PII redaction entirely,
-   * regardless of trust_level. This is the primary principal identification mechanism — more stable
-   * than trust_level because it is an immutable UUID resolved once at startup, not a DB field
-   * that could be accidentally updated by contact-management code paths.
-   */
-  ceoContactId?: string;
 }
 
 // -- Optional context for audit event --
@@ -77,10 +71,11 @@ export interface RedactContext {
   recipientId?: string;
   parentEventId?: string;
   /**
-   * The recipient's contact UUID (from the contacts table).
-   * Used to bypass redaction when it matches PiiRedactorOptions.ceoContactId.
+   * True only when the principal is the sole human recipient of the send. The gateway computes
+   * it from the verified principal identities over every To and CC recipient, so a third party
+   * on the same send keeps it false. Redaction is bypassed iff this is exactly `true`.
    */
-  recipientContactId?: string;
+  principalIsSoleRecipient?: boolean;
 }
 
 // -- PiiRedactor class --
@@ -90,14 +85,12 @@ export class PiiRedactor {
   private readonly bus: EventBus;
   private readonly logger: Logger;
   private readonly extraPatterns: PiiPattern[];
-  private readonly ceoContactId: string | undefined;
 
   constructor(opts: PiiRedactorOptions) {
     this.config = opts.config;
     this.bus = opts.bus;
     this.logger = opts.logger;
     this.extraPatterns = opts.extraPatterns;
-    this.ceoContactId = opts.ceoContactId;
   }
 
   /**
@@ -106,7 +99,7 @@ export class PiiRedactor {
    * Returns the (possibly modified) content and a list of applied redactions.
    * Returns the original content unchanged if:
    *   - redaction is disabled (kill switch)
-   *   - the recipient is the principal (principal contact UUID match — structural bypass)
+   *   - the principal is the sole recipient (context.principalIsSoleRecipient === true)
    *   - no PII is detected
    *   - all detected PII is in the channel's allow list
    *
@@ -124,12 +117,10 @@ export class PiiRedactor {
       return { content, redactions: [] };
     }
 
-    // Step 2: principal contact ID bypass — structural principal bypass.
-    // The principal contact UUID is resolved once via findContactBySystemRole('principal')
-    // at startup and stored here (#1049).
-    // A UUID match is tamper-proof: it cannot be accidentally elevated via contact management
-    // code paths (unlike a trust-level field, which has a setTrustLevel() API).
-    if (this.ceoContactId && context.recipientContactId === this.ceoContactId) {
+    // Step 2: principal bypass — the principal is the only human recipient. The gateway derives
+    // this from verified principal identities across every To/CC recipient, so "To: principal,
+    // CC: third party" is NOT a bypass (#2312). Strict `=== true`: absent or false redacts.
+    if (context.principalIsSoleRecipient === true) {
       return { content, redactions: [] };
     }
 
