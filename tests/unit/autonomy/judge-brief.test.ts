@@ -72,6 +72,17 @@ describe('buildBriefUserPrompt', () => {
     expect(BRIEF_SYSTEM_PROMPT).toMatch(/someone other than the principal/);
   });
 
+  it('names the principal among the recipients, encoded like the others', () => {
+    const prompt = buildBriefUserPrompt({ ...input, principalRecipients: ['sam@example.com'] });
+    expect(prompt).toContain('<principal_recipients_json>["sam@example.com"]</principal_recipients_json>');
+    expect(buildBriefUserPrompt(input)).toContain('<principal_recipients_json>[]</principal_recipients_json>');
+  });
+
+  it('keeps Curia\'s own conduct out of the claims and content to the principal out of the disclosures', () => {
+    expect(BRIEF_SYSTEM_PROMPT).toContain('Statements about what the assistant itself is doing, has done, can or cannot do, or will do ("I can\'t share that", "I\'ll pass this along", "I\'ve passed your request on") are about the assistant, not the principal: never list them.');
+    expect(BRIEF_SYSTEM_PROMPT).toContain('Anything going to the principal is never an unnecessary disclosure; judge only what the other recipients receive.');
+  });
+
   it('carries the evidence beside the message, not inside it', () => {
     const prompt = buildBriefUserPrompt(input);
     expect(prompt).toContain('calendar-list');

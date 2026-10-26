@@ -4034,9 +4034,18 @@ describe('band review (#2159)', () => {
     const gw = makeBandGateway({ review, score: 84 });
     await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', principalDirected: true, postTurn: true });
     expect(review).toHaveBeenCalledWith({
-      content: emailReq.body, channel: 'email', recipients: ['joel@example.com'], score: 84,
+      content: emailReq.body, channel: 'email', recipients: ['joel@example.com'], principalRecipients: [], score: 84,
       conversationId: 'c1', taskEventId: 't1', principalDirected: true, postTurn: true,
     });
+  });
+
+  it('tells the review which recipients are the principal', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send({ ...emailReq, to: 'principal@example.com', cc: ['joel@example.com'] }, { taskEventId: 't1', conversationId: 'c1' });
+    const arg = review.mock.calls[0]![0] as { recipients: string[]; principalRecipients: string[] };
+    expect(arg.principalRecipients).toEqual(['principal@example.com']);
+    expect(arg.recipients).toEqual(expect.arrayContaining(['principal@example.com', 'joel@example.com']));
   });
 
   it('bounces with the quoted claims and an outbound.blocked event, but no block report', async () => {

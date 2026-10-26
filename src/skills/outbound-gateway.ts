@@ -1412,6 +1412,7 @@ export class OutboundGateway {
         request,
         content: redactedBody,
         recipients: people.length > 0 ? people : [recipientId],
+        principalRecipients: recipients.filter((r) => r.isPrincipal).map((r) => r.email),
         options,
       });
       if (outcome.result) return outcome.result;
@@ -1954,6 +1955,7 @@ export class OutboundGateway {
     request: OutboundSendRequest;
     content: string;
     recipients: readonly string[];
+    principalRecipients: readonly string[];
     options: {
       taskEventId?: string;
       conversationId?: string | null;
@@ -1964,7 +1966,7 @@ export class OutboundGateway {
       reExecRecipe?: SendRecipe;
     } | undefined;
   }): Promise<{ result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals }> {
-    const { request, content, recipients, options } = args;
+    const { request, content, recipients, principalRecipients, options } = args;
     const score = await this.bandScore();
     let decision: Awaited<ReturnType<BandSendReview['review']>>;
     try {
@@ -1972,6 +1974,7 @@ export class OutboundGateway {
         content,
         channel: request.channel,
         recipients,
+        principalRecipients,
         score,
         ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
         ...(options?.taskEventId ? { taskEventId: options.taskEventId } : {}),
@@ -3445,6 +3448,7 @@ export class OutboundGateway {
         },
         content: body,
         recipients: draftEnvelope,
+        principalRecipients: draftRecipients.filter((r) => r.isPrincipal).map((r) => r.email),
         options,
       });
       if (outcome.result) return outcome.result;

@@ -75,6 +75,12 @@ describe('BandSendReview', () => {
     expect(review.mock.calls[0]![0].questions).toHaveLength(4);
   });
 
+  it('forwards the principal recipients to the judge', async () => {
+    const { svc, review } = make([clean]);
+    await svc.review({ ...base, recipients: ['sam@example.com', 'joel@example.com'], principalRecipients: ['sam@example.com'] });
+    expect(review.mock.calls[0]![0].principalRecipients).toEqual(['sam@example.com']);
+  });
+
   it('asks only grounding for a principal-directed send', async () => {
     const { svc, review } = make([{ ok: true, unsupportedClaims: [], reason: 'ok' }]);
     await svc.review({ ...base, principalDirected: true });

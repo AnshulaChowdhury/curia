@@ -51,6 +51,8 @@ export interface BandReviewInput {
   content: string;
   channel: string;
   recipients: readonly string[];
+  /** The subset of `recipients` that are the principal; the judge never treats content to them as a disclosure. */
+  principalRecipients?: readonly string[];
   score: number;
   conversationId?: string;
   taskEventId?: string;
@@ -175,6 +177,7 @@ export class BandSendReview {
       questions,
       message,
       recipients: input.recipients,
+      ...(input.principalRecipients ? { principalRecipients: input.principalRecipients } : {}),
       band: AutonomyService.bandForScore(input.score),
       evidence,
       conversationId: input.conversationId ?? 'system',
