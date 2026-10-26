@@ -141,6 +141,7 @@ describe('buildBriefUserPrompt', () => {
   it('keeps Curia\'s own conduct out of the claims and content to the principal out of the disclosures', () => {
     expect(BRIEF_SYSTEM_PROMPT).toContain('Statements about what the assistant itself is doing, has done, can or cannot do, or will do ("I can\'t share that", "I\'ll pass this along", "I\'ve passed your request on") are about the assistant, not the principal: never list them.');
     expect(BRIEF_SYSTEM_PROMPT).toContain('Anything going to the principal is never an unnecessary disclosure; judge only what the other recipients receive.');
+    expect(BRIEF_SYSTEM_PROMPT).toContain('Detected personal data listed separately is ruled under disclosures only; do not list it here.');
   });
 
   it('carries the evidence beside the message, not inside it', () => {

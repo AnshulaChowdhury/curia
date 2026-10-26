@@ -62,7 +62,6 @@ const MAX_REVIEWED_ITEMS = 10;
 const REDACTION_TOKEN = /\[REDACTED: [A-Z0-9_]+\]/;
 const TOO_MANY_DETAIL = 'This message contains more personal details than can be reviewed at once. Send fewer, or split the message.';
 const TOKEN_DETAIL = 'This message contains a redaction placeholder. Rewrite it with the real content or without that part.';
-const UNREVIEWED_RECHECK_REASON = 'Held for the principal: it was flagged for unverified statements, and the reviewer was unavailable to recheck it.';
 const UNREVIEWED_BELOW_80_REASON = 'Held for the principal: the reviewer was unavailable, and this band asks first when it is.';
 
 /** What the drafter is told when a send is blocked; the gateway appends the findings. */
@@ -97,6 +96,8 @@ export interface BandReviewInput {
   detectedItems?: readonly BriefDetectedItem[];
   /** The primary recipient's tier: a known or trusted requester can be asked about (#2312). */
   recipientTier?: ContactTier;
+  /** The subject line, when the channel has one: scanned for redaction placeholders like the content. */
+  subject?: string;
 }
 
 export type BandReviewReport = { source: 'sent_without_review'; summary: string };
@@ -128,7 +129,8 @@ export interface BandSendReviewDeps {
 }
 
 export class BandSendReview {
-  private readonly bounced = new Map<string, { taskEventIds: string[]; at: number }>();
+  /** `rules`: what the draft bounced or was blocked for, so a recheck hold can say so. */
+  private readonly bounced = new Map<string, LedgerEntry>();
   private readonly now: () => number;
 
   constructor(private readonly deps: BandSendReviewDeps) {
@@ -144,7 +146,7 @@ export class BandSendReview {
     // Past the cap the judge is not asked about the items at all: they are all unsupported.
     const askedItems = items.length > 0 && items.length <= MAX_REVIEWED_ITEMS ? items : undefined;
     const questions: readonly BriefQuestion[] = askedItems ? [...this.questionsFor(input), 'disclosure'] : this.questionsFor(input);
-    const hasToken = REDACTION_TOKEN.test(input.content);
+    const hasToken = REDACTION_TOKEN.test(input.content) || (input.subject !== undefined && REDACTION_TOKEN.test(input.subject));
 
     const asked = await this.ask(input, questions, taskIds, input.content, askedItems);
     let verdict = asked.verdict;
@@ -161,7 +163,7 @@ export class BandSendReview {
           // This draft already bounced on a finding the drafter has not shown resolved.
           // Failing open now would send exactly what the review flagged, so hold instead.
           this.deps.logger.warn({ conversationId: input.conversationId, failure: verdict.failure }, 'band review: reviewer unavailable on the recheck of a bounced draft — holding');
-          return this.hold(BAND_RULES.unreviewed, UNREVIEWED_RECHECK_REASON);
+          return this.hold(BAND_RULES.unreviewed, recheckReason(prior.rules));
         }
         return this.onJudgeFailure(input, verdict.failure);
       }
@@ -169,9 +171,9 @@ export class BandSendReview {
       // fail-open allowance is not spent on it.
       this.deps.logger.warn({ conversationId: input.conversationId, channel: input.channel, failure: verdict.failure, items: items.length, token: hasToken }, 'band review: reviewer unavailable with personal data or a placeholder in the send — not failing open');
       const other = prior
-        ? this.hold(BAND_RULES.unreviewed, UNREVIEWED_RECHECK_REASON)
+        ? this.hold(BAND_RULES.unreviewed, recheckReason(prior.rules))
         : !isSpotCheckOrAbove(input.score)
-          ? this.hold(BAND_RULES.unreviewed, UNREVIEWED_BELOW_80_REASON)
+          ? this.unreviewedBelow80Hold(items, hasToken)
           : undefined;
       const pii = this.unreviewedPiiOutcome(input, items, hasToken, prior !== undefined);
       // PII first, so its reason leads a merged hold: the bounce may have been for the items.
@@ -179,13 +181,18 @@ export class BandSendReview {
     }
     this.deps.limiter.recordJudgeSuccess();
 
-    const other = this.otherRulesOutcome(input, verdict, prior !== undefined);
+    const other = this.otherRulesOutcome(input, verdict, items, prior !== undefined);
     const pii = await this.piiOutcome(input, items, askedItems ? verdict.disclosures ?? [] : undefined, asked.authority, hasToken, prior !== undefined);
     return this.settle(key, taskIds, input, prior !== undefined, combine(other, pii));
   }
 
   /** The band rules other than disclosure, as before #2312. Writes nothing to the ledger. */
-  private otherRulesOutcome(input: BandReviewInput, verdict: BriefAnswers, hasPrior: boolean): BandReviewDecision {
+  private otherRulesOutcome(
+    input: BandReviewInput,
+    verdict: BriefAnswers,
+    detected: readonly BriefDetectedItem[],
+    hasPrior: boolean,
+  ): BandReviewDecision {
     if (verdict.purpose === 'steered') {
       this.deps.logger.info({ conversationId: input.conversationId, channel: input.channel }, 'band review: held — steered by an outsider');
       return this.hold(BAND_RULES.steered, 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.');
@@ -196,7 +203,9 @@ export class BandSendReview {
     }
 
     const claims = verdict.unsupportedClaims ?? [];
-    const unneeded = verdict.unnecessaryItems ?? [];
+    // Detected items are ruled under disclosure only (#2312): an unneeded-disclosure quote that
+    // overlaps one is dropped, or an authorized item would bounce here anyway.
+    const unneeded = (verdict.unnecessaryItems ?? []).filter((q) => !detected.some((d) => overlaps(q, d.text)));
     if (claims.length === 0 && unneeded.length === 0) {
       return { kind: 'send', signals: { ...(verdict.speaksAsPrincipal === true ? { speaksAsPrincipal: true } : {}), ...(hasPrior ? { bounced: true } : {}) } };
     }
@@ -206,7 +215,7 @@ export class BandSendReview {
         { conversationId: input.conversationId, channel: input.channel, claims: claims.length, items: unneeded.length },
         'band review: bounced to the drafter',
       );
-      return { kind: 'bounce', findings: this.bounceFindings(input.content, claims, unneeded) };
+      return { kind: 'bounce', findings: this.bounceFindings(input.content, claims, unneeded, detected) };
     }
 
     // The one bounce is spent. Below 80 the principal decides; at 80+ the message is not sent.
@@ -217,7 +226,7 @@ export class BandSendReview {
       { conversationId: input.conversationId, channel: input.channel, claims: claims.length, items: unneeded.length, outcome: 'blocked' },
       'band review: blocked — findings survived the rewrite',
     );
-    return { kind: 'block', reason: BLOCK_REASON, findings: this.bounceFindings(input.content, claims, unneeded) };
+    return { kind: 'block', reason: BLOCK_REASON, findings: this.bounceFindings(input.content, claims, unneeded, detected) };
   }
 
   /**
@@ -309,6 +318,16 @@ export class BandSendReview {
     return decisions.reduce(combine);
   }
 
+  /** The reviewer is down below 80: hold, naming (by label) the personal data the send carries. */
+  private unreviewedBelow80Hold(items: readonly BriefDetectedItem[], hasToken: boolean): BandReviewDecision {
+    const findings: FilterFinding[] = [{ rule: BAND_RULES.unreviewed, detail: UNREVIEWED_BELOW_80_REASON }];
+    if (items.length > 0) {
+      findings.push({ rule: BAND_RULES.pii, detail: `It contains personal details the reviewer could not check: ${[...new Set(items.map((i) => i.label))].join(', ')}.` });
+    }
+    if (hasToken) findings.push({ rule: BAND_RULES.token, detail: TOKEN_DETAIL });
+    return { kind: 'hold', reason: UNREVIEWED_BELOW_80_REASON, findings };
+  }
+
   /** Findings the drafter must rewrite away: bounce once, then block at 80+ or hold below. */
   private rewriteOutcome(input: BandReviewInput, findings: FilterFinding[], hasPrior: boolean): BandReviewDecision {
     if (!hasPrior) return { kind: 'bounce', findings };
@@ -345,7 +364,7 @@ export class BandSendReview {
     if (decision.kind === 'bounce' || decision.kind === 'block') {
       // A block keeps the entry and refreshes its time: the drafter's next attempt is still a
       // recheck, and a clean one clears it.
-      this.bounced.set(key, { taskEventIds: taskIds, at: this.now() });
+      this.bounced.set(key, { taskEventIds: taskIds, at: this.now(), rules: decision.findings.map((f) => f.rule) });
       return decision;
     }
     this.bounced.delete(key);
@@ -424,8 +443,11 @@ export class BandSendReview {
    * never carries text the message did not already contain. With no verbatim quote left the
    * finding still stands, in general terms: the judge did flag something.
    */
-  private bounceFindings(content: string, claims: string[], items: string[]): FilterFinding[] {
-    const inMessage = (quotes: string[]) => quotes.map((q) => q.trim()).filter((q) => q.length > 0 && content.includes(q));
+  private bounceFindings(content: string, claims: string[], items: string[], detected: readonly BriefDetectedItem[]): FilterFinding[] {
+    // A quote holding a detected item's value is never shown: findings carry labels, not values.
+    const inMessage = (quotes: string[]) => quotes
+      .map((q) => q.trim())
+      .filter((q) => q.length > 0 && content.includes(q) && !detected.some((d) => containsFolded(q, d.text)));
     const findings: FilterFinding[] = [];
     if (claims.length > 0) {
       const shown = inMessage(claims);
@@ -453,7 +475,7 @@ export class BandSendReview {
     return `${input.conversationId ?? input.taskEventId ?? ''}|${input.channel}|${who}`;
   }
 
-  private priorBounce(key: string): { taskEventIds: string[]; at: number } | undefined {
+  private priorBounce(key: string): LedgerEntry | undefined {
     const entry = this.bounced.get(key);
     if (!entry) return undefined;
     if (this.now() - entry.at > BOUNCE_TTL_MS) {
@@ -494,4 +516,25 @@ function rulesOnEach(rulings: readonly DisclosureRuling[] | undefined, items: re
   if (rulings === undefined || rulings.length !== items.length) return false;
   const ids = new Set(rulings.map((r) => r.id));
   return ids.size === items.length && items.every((i) => ids.has(i.id));
+}
+
+type LedgerEntry = { taskEventIds: string[]; at: number; rules: string[] };
+
+/** The recheck hold's reason, naming what the draft was flagged for. */
+function recheckReason(rules: readonly string[]): string {
+  const flagged: string[] = [];
+  if (rules.includes(BAND_RULES.ungrounded) || rules.includes(BAND_RULES.unneeded)) flagged.push('unverified statements');
+  if (rules.includes(BAND_RULES.pii)) flagged.push('personal details');
+  if (rules.includes(BAND_RULES.token)) flagged.push('a redaction placeholder');
+  return `Held for the principal: it was flagged for ${flagged.length > 0 ? flagged.join(' and ') : 'unverified statements'}, and the reviewer was unavailable to recheck it.`;
+}
+
+function containsFolded(haystack: string, needle: string): boolean {
+  const n = needle.trim().toLowerCase();
+  return n.length > 0 && haystack.toLowerCase().includes(n);
+}
+
+/** Either text contains the other, ignoring case. */
+function overlaps(a: string, b: string): boolean {
+  return containsFolded(a, b) || containsFolded(b, a);
 }

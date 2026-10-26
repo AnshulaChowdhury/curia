@@ -2,7 +2,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import * as bandReviewModule from '../../../src/dispatch/band-send-review.js';
-import { BandSendReview, BLOCK_REASON, type BandReviewInput } from '../../../src/dispatch/band-send-review.js';
+import { BandSendReview, BLOCK_REASON, type BandReviewDecision, type BandReviewInput } from '../../../src/dispatch/band-send-review.js';
 import { FailOpenLimiter } from '../../../src/autonomy/band-policy.js';
 import type { BriefDetectedItem, BriefVerdict, DisclosureRuling, SendAuthority } from '../../../src/autonomy/judge-brief.js';
 import type { ContactTier } from '../../../src/contacts/types.js';
@@ -548,6 +548,101 @@ describe('BandSendReview', () => {
       const { svc } = make([{ ...withRulings(ruling('directed')), speaksAsPrincipal: true }], { evidence: { authority: fromTrusted }, contactTier: async () => 'trusted' });
       await expect(svc.review(pii)).resolves.toEqual({ kind: 'send', signals: { speaksAsPrincipal: true }, copyPrincipal: { labels: ['sin_ca'] } });
     });
+
+    it('counts the bound or root task\'s principal only with a ruling that names it: an outsider\'s turn under a principal root still bounces unsupported', async () => {
+      const outsiderUnderRoot: SendAuthority = {
+        originator: outsider, liveTurn: false,
+        rootTask: { taskId: 't-root', title: 'Set up the clinic', description: null, originator: principal },
+      };
+      const { svc } = make([withRulings(ruling('unsupported'))], { evidence: { authority: outsiderUnderRoot } });
+      expect((await svc.review(pii)).kind).toBe('bounce');
+    });
+
+    it('leaves detected items to the disclosure ruling: a matching unneeded-disclosure quote is dropped', async () => {
+      const PHONE = '415-555-0100';
+      const phone: BriefDetectedItem = { id: 'P1', label: 'phone_us', text: PHONE, field: 'body' };
+      const input = { ...base, content: `Hi Joel. Call Sam on ${PHONE} to book.`, detectedItems: [phone] };
+      for (const quote of [PHONE, `Call Sam on ${PHONE}`, '555-0100']) {
+        const { svc } = make([{ ...withRulings(ruling('inferred')), unnecessaryItems: [quote] }], { evidence: { authority: standing } });
+        await expect(svc.review(input)).resolves.toEqual({ kind: 'send', signals: {} });
+      }
+      // Case-insensitive.
+      const email: BriefDetectedItem = { id: 'P1', label: 'email', text: 'sam@example.com', field: 'body' };
+      const { svc } = make([{ ...withRulings(ruling('inferred')), unnecessaryItems: ['Sam@Example.com'] }], { evidence: { authority: standing } });
+      expect((await svc.review({ ...base, content: 'Hi Joel. Write to Sam@Example.com.', detectedItems: [email] })).kind).toBe('send');
+    });
+
+    it('keeps an unneeded-disclosure finding that does not touch a detected item', async () => {
+      const { svc } = make([{ ...withRulings(ruling('inferred')), unnecessaryItems: ['His salary is 200k.'] }], { evidence: { authority: standing } });
+      const d = await svc.review({ ...pii, content: `${content} His salary is 200k.` });
+      expect(d.kind).toBe('bounce');
+      if (d.kind === 'bounce') expect(d.findings.map((f) => f.rule)).toEqual(['unneeded-disclosure']);
+    });
+
+    it('never quotes a detected item\'s text in any finding or reason', async () => {
+      const text = `${content} His salary is 200k.`;
+      const flagged: BriefVerdict = {
+        ...withRulings(ruling('unsupported')),
+        unsupportedClaims: [`Sam's SIN is ${SIN}.`],
+        unnecessaryItems: ['His salary is 200k.', `SIN is ${SIN}. His salary`],
+      };
+      const decisions: BandReviewDecision[] = [];
+      for (const score of [84, 74]) {
+        const { svc } = make([flagged, flagged], { evidence: { authority: fromOutsider } });
+        decisions.push(await svc.review({ ...pii, content: text, score }));
+        decisions.push(await svc.review({ ...pii, content: text, score }));
+      }
+      for (const score of [84, 74]) {
+        const failing = make([{ ok: false, failure: 'unreachable' }, { ok: false, failure: 'unreachable' }], { evidence: { authority: live } });
+        decisions.push(await failing.svc.review({ ...pii, score }));
+        decisions.push(await failing.svc.review({ ...pii, score }));
+      }
+      const asked = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
+      decisions.push(await asked.svc.review({ ...pii, recipientTier: 'known' }));
+      expect(decisions.map((d) => d.kind)).toEqual(['bounce', 'block', 'bounce', 'hold', 'bounce', 'hold', 'hold', 'hold', 'hold']);
+      for (const d of decisions) expect(JSON.stringify(d)).not.toContain(SIN);
+      // The claim still stands, in general terms.
+      const first = decisions[0]!;
+      if (first.kind === 'bounce') expect(first.findings.map((f) => f.rule)).toEqual(['ungrounded-claim', 'unneeded-disclosure', 'pii-not-authorized']);
+    });
+
+    it('holds a recheck that fails again after a PII-failure bounce, naming personal details', async () => {
+      const { svc } = make([{ ok: false, failure: 'unreachable' }, { ok: false, failure: 'unreachable' }], { evidence: { authority: live } });
+      expect((await svc.review(pii)).kind).toBe('bounce');
+      // The rewrite dropped the item; the reviewer is still down.
+      const d = await svc.review({ ...base, content: 'Hi Joel.' });
+      expect(d.kind).toBe('hold');
+      if (d.kind === 'hold') {
+        expect(d.reason).toContain('personal details');
+        expect(d.reason).not.toContain('unverified statements');
+      }
+    });
+
+    it('keeps the unverified-statements reason for a recheck after a claim bounce', async () => {
+      const { svc } = make([{ ...clean, unsupportedClaims: [CLAIM] }, { ok: false, failure: 'unreachable' }]);
+      await svc.review(base);
+      const d = await svc.review(base);
+      if (d.kind === 'hold') expect(d.reason).toContain('unverified statements');
+      expect(d.kind).toBe('hold');
+    });
+
+    it('names the personal data, by label, on a judge-failure hold below 80', async () => {
+      const { svc } = make([{ ok: false, failure: 'unreachable' }], { evidence: { authority: live } });
+      const d = await svc.review({ ...pii, score: 74 });
+      expect(d.kind).toBe('hold');
+      if (d.kind === 'hold') {
+        const finding = d.findings.find((f) => f.rule === 'pii-not-authorized');
+        expect(finding?.detail).toContain('sin_ca');
+        expect(JSON.stringify(d)).not.toContain(SIN);
+      }
+    });
+
+    it('treats a ruling list of the right length with a wrong id as malformed', async () => {
+      const { svc } = make([withRulings(ruling('directed'), ruling('directed', false, 'P3')), withRulings(ruling('directed'), ruling('directed', false, 'P3'))], { evidence: { authority: live } });
+      const input = { ...pii, detectedItems: [P1, P2] };
+      expect((await svc.review(input)).kind).toBe('bounce');
+      expect((await svc.review(input)).kind).toBe('hold');
+    });
   });
 
   describe('redaction placeholders', () => {
@@ -572,6 +667,12 @@ describe('BandSendReview', () => {
     it('bounces a placeholder even when the judge fails at 84', async () => {
       const { svc } = make([{ ok: false, failure: 'unreachable' }]);
       expect((await svc.review(tokened)).kind).toBe('bounce');
+    });
+
+    it('catches a placeholder in the subject alone', async () => {
+      const { svc } = make([clean]);
+      const d = await svc.review({ ...base, subject: 'Re: [REDACTED: EMAIL]' });
+      expect(d).toEqual({ kind: 'bounce', findings: [{ rule: 'redaction-token', detail: DETAIL }] });
     });
 
     it('ignores bracketed text that is not a placeholder', async () => {
