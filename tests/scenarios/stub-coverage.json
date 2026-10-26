@@ -505,6 +505,22 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
     },
+    "pii forwarded request book it": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
+    "pii principal directive health card": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
+    "pii trusted directive sin at 74": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
+    "pii trusted directive sin at 84": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
     "principal answers dedup task routes to contacts": {
       "unstubbed": 0,
       "runs": 5,

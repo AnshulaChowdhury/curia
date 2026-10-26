@@ -853,3 +853,36 @@ describe('selectRunCases', () => {
     expect(selectRunCases([plain, at84, at74], { caseFilter: 'PII AT' }).cases.map(c => c.name)).toEqual(['pii at 84', 'pii at 74']);
   });
 });
+
+describe('the authority-aware PII cases (#2312)', () => {
+  // The committed cases, as the CLI loads them: the release gate is an unfiltered selection.
+  const committed = loadScenarioCases(path.resolve(import.meta.dirname, '../../scenarios/cases'));
+  const pii = committed.filter(c => c.tags.includes('pii-authority'));
+
+  it('load, each through the gateway under its own band-gating fixture', () => {
+    expect(pii.map(c => path.basename(c.sourceFile).slice(0, 3)).sort()).toEqual(['34a', '34d', '34e', '34f']);
+    for (const c of pii) {
+      expect(c.throughGateway, c.name).toBe(true);
+      expect(c.autonomy?.gating, c.name).toBe('band');
+      expect(c.releaseGate, c.name).toBe(true);
+    }
+    expect(Object.fromEntries(pii.map(c => [path.basename(c.sourceFile).slice(0, 3), c.autonomy?.score])))
+      .toEqual({ '34a': 84, '34d': 84, '34e': 84, '34f': 74 });
+  });
+
+  it('are in the release gate, which still leaves out the on-demand cases', () => {
+    const gate = selectRunCases(committed, {});
+    const gated = new Set(gate.cases.map(c => c.name));
+    for (const c of pii) expect(gated.has(c.name), c.name).toBe(true);
+    const onDemand = committed.filter(c => !c.releaseGate);
+    expect(onDemand.length).toBeGreaterThan(0);
+    for (const c of onDemand) expect(gated.has(c.name), c.name).toBe(false);
+  });
+
+  it('score what reaches the recipient in code: a critical delivered check each', () => {
+    for (const c of pii) {
+      const critical = c.expectedBehaviors.filter(b => b.weight === 'critical').map(b => b.check?.kind);
+      expect(critical, c.name).toContain('delivered');
+    }
+  });
+});
