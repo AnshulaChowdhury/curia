@@ -740,6 +740,31 @@ describe('BandSendReview', () => {
       expect((await svc.review(pii)).kind).toBe('block');
     });
 
+    // A yes to the ask would send the other finding too: the drafter fixes it first (#2312).
+    it('lets a bounce beat an ask hold, whichever rule raised which', async () => {
+      // A claim bounce (other rules) beside an ask (disclosure).
+      const claim = make([{ ...withRulings(ruling('unsupported', true)), unsupportedClaims: [CLAIM] }], { evidence: { authority: fromOutsider } });
+      const d1 = await claim.svc.review({ ...pii, content: `${content} ${CLAIM}`, recipientTier: 'known' });
+      expect(d1.kind).toBe('bounce');
+      if (d1.kind === 'bounce') expect(d1.findings.map((f) => f.rule)).toEqual(['ungrounded-claim']);
+      // Either order: the bounce is returned as it is.
+      const bounce: BandReviewDecision = { kind: 'bounce', findings: [{ rule: 'ungrounded-claim', detail: 'x' }] };
+      const ask: BandReviewDecision = {
+        kind: 'hold', reason: 'Held', findings: [{ rule: 'pii-not-authorized', detail: 'Held' }],
+        ask: { labels: ['sin_ca'], requester: 'joel@example.com', counterparties: ['joel@example.com'] },
+      };
+      expect(bandReviewModule.combine(bounce, ask)).toBe(bounce);
+      expect(bandReviewModule.combine(ask, bounce)).toBe(bounce);
+      // A hold that is not an ask still beats a bounce.
+      const plain: BandReviewDecision = { kind: 'hold', reason: 'Held', findings: [{ rule: 'steered', detail: 'Held' }] };
+      expect(bandReviewModule.combine(bounce, plain)).toBe(plain);
+      expect(bandReviewModule.combine(plain, bounce)).toBe(plain);
+      // The recheck, with the claim gone, asks.
+      const recheck = make([{ ...withRulings(ruling('unsupported', true)), unsupportedClaims: [CLAIM] }, withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
+      await recheck.svc.review({ ...pii, content: `${content} ${CLAIM}`, recipientTier: 'known' });
+      expect(await recheck.svc.review({ ...pii, recipientTier: 'known' })).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'] } });
+    });
+
     it('keeps the other rules\' signals beside the principal copy', async () => {
       const { svc } = make([{ ...withRulings(ruling('directed')), speaksAsPrincipal: true }], { evidence: { authority: fromTrusted }, contactTier: async () => 'trusted' });
       await expect(svc.review(pii)).resolves.toEqual({ kind: 'send', signals: { speaksAsPrincipal: true }, copyPrincipal: { labels: ['sin_ca'] } });
@@ -858,10 +883,25 @@ describe('BandSendReview', () => {
         if (d.kind === 'hold') expect(d.ask).not.toHaveProperty('taskTitle');
       });
 
-      it('carries the linked task\'s title on a weak link\'s ask', async () => {
+      it('does not name the task on a weak link\'s ask: the principal\'s authority is not that task\'s', async () => {
         const { svc } = make([withRulings(ruling('inferred', true))], { evidence: { authority: linked('weak') } });
         const d = await svc.review(pii);
-        expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'], requester: 'joel@example.com', taskTitle: 'Book physio' } });
+        expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'], requester: 'joel@example.com' } });
+        if (d.kind === 'hold') expect(d.ask).not.toHaveProperty('taskTitle');
+      });
+
+      it('names the task only when the principal\'s authority comes from it', async () => {
+        // A known requester's unsupported request under the principal's bound task: the authority
+        // is the task's, so the ask names it.
+        const bound: SendAuthority = { ...fromOutsider, boundTask: { taskId: 't', title: 'Book the call', description: null, originator: principal } };
+        const under = make([withRulings(ruling('unsupported', true))], { evidence: { authority: bound } });
+        expect(await under.svc.review({ ...pii, recipientTier: 'known' })).toMatchObject({ kind: 'hold', ask: { taskTitle: 'Book the call' } });
+        // The same request under a task Curia set: an ask, with no title.
+        const curiaTask: SendAuthority = { ...fromOutsider, boundTask: { taskId: 't', title: 'Book the call', description: null, originator: curia } };
+        const other = make([withRulings(ruling('unsupported', true))], { evidence: { authority: curiaTask } });
+        const d = await other.svc.review({ ...pii, recipientTier: 'known' });
+        expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'] } });
+        if (d.kind === 'hold') expect(d.ask).not.toHaveProperty('taskTitle');
       });
 
       it('asks for a requested item held below 80 under the principal\'s task, with that task\'s title', async () => {
@@ -916,10 +956,28 @@ describe('BandSendReview', () => {
         const { svc } = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
         const d = await svc.review({
           ...pii, recipients: ['principal@example.com', 'Joel <Joel@Example.com>', 'ops@example.com'],
-          principalRecipients: ['principal@example.com'], recipientTier: 'known',
+          principalRecipients: ['principal@example.com'], recipientTiers: { 'joel@example.com': 'known', 'ops@example.com': 'trusted' },
         });
         expect(d).toMatchObject({ kind: 'hold', ask: { counterparties: ['joel@example.com', 'ops@example.com'] } });
         if (d.kind === 'hold') expect(d.ask).not.toHaveProperty('outreachId');
+      });
+
+      // Every non-principal recipient must be askable; anyone else makes it a stranger's request.
+      it('asks only when every non-principal recipient is askable, by tier or a covering link', async () => {
+        const two = { ...pii, recipients: ['joel@example.com', 'ops@other.example'] };
+        // One known, one with no contact: a stranger's request, noted on the bounce.
+        const mixed = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
+        expect(await mixed.svc.review({ ...two, recipientTiers: { 'joel@example.com': 'known' } }))
+          .toMatchObject({ kind: 'bounce', strangerRequest: { labels: ['sin_ca'], requester: 'joel@example.com' } });
+        // The primary's tier alone does not speak for a second recipient.
+        const primaryOnly = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
+        expect((await primaryOnly.svc.review({ ...two, recipientTier: 'known' })).kind).toBe('bounce');
+        // One known by tier, the other covered by a link to the principal's task: an ask.
+        const viaLink = make([withRulings(ruling('inferred', true))], {
+          evidence: { authority: { ...linked('weak'), linkedTask: { ...linked('weak').linkedTask!, counterparty: { addresses: ['ops@other.example'], contactIds: [], domains: [] } } } },
+        });
+        expect(await viaLink.svc.review({ ...two, recipientTiers: { 'joel@example.com': 'known' } }))
+          .toMatchObject({ kind: 'hold', ask: { requester: 'joel@example.com', counterparties: ['joel@example.com', 'ops@other.example'] } });
       });
 
       it('carries the linked outreach row only when the link covers the recipients', async () => {
@@ -936,12 +994,12 @@ describe('BandSendReview', () => {
 
       it('writes the task title on one line, without double quotes, and at most 80 characters', async () => {
         const titled = (title: string): SendAuthority => ({
-          ...linked('weak'), linkedTask: { ...linked('weak').linkedTask!, title },
+          ...linked('strong'), linkedTask: { ...linked('strong').linkedTask!, title },
         });
         const one = make([withRulings(ruling('inferred', true))], { evidence: { authority: titled('Book\n  physio\tfor "Sam"\r\n') } });
-        expect(await one.svc.review(pii)).toMatchObject({ ask: { taskTitle: 'Book physio for \'Sam\'' } });
+        expect(await one.svc.review({ ...pii, score: 74 })).toMatchObject({ ask: { taskTitle: 'Book physio for \'Sam\'' } });
         const long = make([withRulings(ruling('inferred', true))], { evidence: { authority: titled(`Book ${'x'.repeat(200)}`) } });
-        const d = await long.svc.review(pii);
+        const d = await long.svc.review({ ...pii, score: 74 });
         if (d.kind !== 'hold') throw new Error('expected a hold');
         expect(d.ask!.taskTitle!.length).toBe(80);
         expect(d.ask!.taskTitle!.endsWith('…')).toBe(true);
@@ -984,7 +1042,7 @@ describe('BandSendReview', () => {
     type OkVerdict = Extract<BriefVerdict, { ok: true }>;
     const withRulings = (...disclosures: DisclosureRuling[]): OkVerdict => ({ ...(clean as OkVerdict), disclosures });
     const said = (decision: 'yes' | 'no', label = 'phone_us', counterparty = TO) => ({ counterparty, label, decision });
-    const DECLINED = 'The principal declined sharing your phone number with this recipient on this thread. Rewrite without it.';
+    const DECLINED = 'The principal declined sharing the principal\'s phone number with this recipient on this thread. Rewrite without it.';
 
     it('reads decisions for the send\'s thread and non-principal recipients', async () => {
       const { svc, collect } = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester } });
@@ -1014,7 +1072,8 @@ describe('BandSendReview', () => {
       expect(await elsewhere.svc.review(send)).toMatchObject({ kind: 'hold', ask: { labels: ['phone_us'] } });
       // A second recipient without a yes of their own.
       const two = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('yes')] } });
-      expect((await two.svc.review({ ...send, recipients: [TO, 'ops@acme.example'] })).kind).toBe('hold');
+      expect(await two.svc.review({ ...send, recipients: [TO, 'ops@acme.example'], recipientTiers: { [TO]: 'known', 'ops@acme.example': 'known' } }))
+        .toMatchObject({ kind: 'hold', ask: { labels: ['phone_us'] } });
     });
 
     it('bounces a label the principal declined for this recipient, never asking again', async () => {

@@ -32,19 +32,20 @@
 //   trusted   — the originator was stamped trusted, is trusted now, and authenticated
 //   directed  + principal → send          directed + trusted → send, copy the principal
 //   inferred  + principal → send at 80+, hold below
-//   anything else is unsupported: requested by an askable recipient (known or trusted, or
-//   a link, strong or weak, to a task the principal directed) → hold (ask the
-//   principal); otherwise bounce, then block/hold like any finding. More than 10 items, or a
-//   judge failure with items present, is never a fail-open send. A link counts (for authority
-//   or askability) only when every non-principal recipient is a counterparty it links: the
-//   linked sender, or an address, contact or org domain on the outreach row. A `[REDACTED: …]`
+//   anything else is unsupported: requested, with every non-principal recipient askable (known
+//   or trusted, or covered by a link, strong or weak, to a task the principal directed) → hold
+//   (ask the principal); otherwise bounce, then block/hold like any finding. More than 10
+//   items, or a judge failure with items present, is never a fail-open send. A link counts for
+//   authority only when every non-principal recipient is a counterparty it links: the linked
+//   sender, or an address, contact or org domain on the outreach row. A `[REDACTED: …]`
 //   placeholder in the content bounces the same way. The strictest outcome of all the rules
-//   wins: block > hold > bounce > send.
+//   wins: block > hold > bounce > send, except that a bounce beats an ask.
 //
 // A hold that waits only on the principal's yes to a requester (an askable recipient's request,
 // or a requested item held below 80 under the principal's task) carries `ask`: the gateway
-// shows the principal a question and tells the agent to deliver it now. Any other hold reason
-// beside it drops the ask. A cold stranger's request bounces with `strangerRequest`, so the
+// shows the principal a question (naming the task only when the principal's authority is that
+// task's) and tells the agent to deliver it now. Any other hold reason beside it drops the ask;
+// a bounce beside it wins, so the drafter fixes the other finding and the recheck asks. A cold stranger's request bounces with `strangerRequest`, so the
 // digest says Curia did not share it. Both name labels and the requester only, never values.
 //
 // The principal's answer to an ask is remembered per thread (#2312, disclosure_decisions): a
@@ -114,8 +115,14 @@ export interface BandReviewInput {
   reportedToPrincipal?: string;
   /** The personal data detected in the send (#2312); each item needs an authorized ruling to go out. */
   detectedItems?: readonly BriefDetectedItem[];
-  /** The primary recipient's tier: a known or trusted requester can be asked about (#2312). */
+  /** The primary recipient's tier: a known or trusted requester can be asked about (#2312). Used only without `recipientTiers`. */
   recipientTier?: ContactTier;
+  /**
+   * Every person recipient's tier, by normalized id, when the caller resolved them (#2312). An
+   * ask needs every non-principal recipient askable; one missing here is not (no contact, or
+   * the lookup failed).
+   */
+  recipientTiers?: Readonly<Record<string, ContactTier>>;
   /** The subject line, when the channel has one: scanned for redaction placeholders like the content. */
   subject?: string;
   /** Resolved contact ids by lowercased recipient id, for matching a reply-to-task link's counterparties (#2312). */
@@ -279,13 +286,21 @@ export class BandSendReview {
     hasPrior: boolean,
   ): Promise<BandReviewDecision> {
     const { authority } = asked;
-    const said = principalSaid(nonPrincipalRecipients(input), asked.decisions ?? []);
+    const others = nonPrincipalRecipients(input);
+    const said = principalSaid(others, asked.decisions ?? []);
     // A link counts only for a send to the counterparties it links (#2312).
-    const linkCovers = linkCoversRecipients(input, authority, this.deps.nonOrgDomains);
-    // A weak link gives no authority, but a reply about the principal's own task is worth asking
-    // the principal about. The link's originator is the task's (or row's), never the sender's.
-    const askable = input.recipientTier === 'known' || input.recipientTier === 'trusted'
-      || (linkCovers && linkToPrincipalTask(authority));
+    const covered = linkCoverage(input, authority, this.deps.nonOrgDomains);
+    const linkCovers = others.every(covered);
+    // Only when every non-principal recipient can be asked about: a known or trusted contact, or
+    // one a link to the principal's own task covers (a weak link gives no authority, but a reply
+    // about their task is worth asking them about). The link's originator is the task's (or
+    // row's), never the sender's. Anyone else on the send makes it a stranger's request.
+    const tierOf = recipientTierOf(input);
+    const linkAsks = linkToPrincipalTask(authority);
+    const askable = others.length > 0 && others.every((r) => {
+      const tier = tierOf(r);
+      return tier === 'known' || tier === 'trusted' || (linkAsks && covered(r));
+    });
     const toRewrite: FilterFinding[] = [];
     const holds: FilterFinding[] = [];
     const copy = new Set<string>();
@@ -295,12 +310,16 @@ export class BandSendReview {
     const strangerAsked = new Set<string>();
     const declined = new Set<string>();
     const saidYes = new Set<string>();
+    // Who directed the work; an ask names the task only when the principal's authority is that task's.
+    let who: Authority = 'none';
 
     if (items.length > 0 && rulings === undefined) {
       toRewrite.push({ rule: BAND_RULES.pii, detail: TOO_MANY_DETAIL });
     } else if (items.length > 0) {
       const byId = new Map(rulings!.map((r) => [r.id, r]));
-      const { who, trusted } = await this.authorityOf(authority, rulings!, linkCovers);
+      const found = await this.authorityOf(authority, rulings!, linkCovers);
+      who = found.who;
+      const { trusted } = found;
       const unsupported = new Set<string>();
       const askFirst = new Set<string>();
       const inferredBelow80 = new Set<string>();
@@ -343,7 +362,7 @@ export class BandSendReview {
         }
       }
       for (const label of declined) {
-        toRewrite.push({ rule: BAND_RULES.pii, detail: `The principal declined sharing your ${describePiiLabels([label])} with this recipient on this thread. Rewrite without it.` });
+        toRewrite.push({ rule: BAND_RULES.pii, detail: `The principal declined sharing the principal's ${describePiiLabels([label])} with this recipient on this thread. Rewrite without it.` });
       }
       if (unsupported.size > 0) {
         toRewrite.push({
@@ -385,7 +404,7 @@ export class BandSendReview {
     if (holds.length > 0) {
       const requester = primaryRequester(input);
       if (askLabels.size > 0 && !heldOtherwise && requester !== undefined) {
-        const taskTitle = askTaskTitle(authority, linkCovers);
+        const taskTitle = askTaskTitle(authority, who, linkCovers);
         const outreachId = linkCovers ? asked.linkedOutreachId : undefined;
         return {
           kind: 'hold', reason: holds[0]!.detail, findings: holds,
@@ -458,7 +477,7 @@ export class BandSendReview {
     a: SendAuthority | undefined,
     rulings: readonly DisclosureRuling[],
     linkCovers: boolean,
-  ): Promise<{ who: 'principal' | 'principal-task' | 'none'; trusted: boolean }> {
+  ): Promise<{ who: Authority; trusted: boolean }> {
     if (!a) return { who: 'none', trusted: false };
     // `liveTurn` is context for the judge only. Code trusts the stamped role: stampOriginator
     // sets systemRole 'principal' only from the resolved sender, and a wake carries the
@@ -623,11 +642,19 @@ export class BandSendReview {
 
 const STRICTNESS: Record<BandReviewDecision['kind'], number> = { send: 0, bounce: 1, hold: 2, block: 3 };
 
+/** Who directed the work behind a send: the principal's own turn, the principal's task, or nobody. */
+type Authority = 'principal' | 'principal-task' | 'none';
+
 /**
  * The strictest of two outcomes: block > hold > bounce > send. Equal outcomes merge, so the
  * drafter or the principal sees every rule that fired; the first one's reason leads.
+ *
+ * One exception (#2312): a bounce beats an ask. The ask waits only on the principal's yes, and
+ * a yes would send the other finding too; the drafter fixes that first, and the recheck asks.
  */
-function combine(a: BandReviewDecision, b: BandReviewDecision): BandReviewDecision {
+export function combine(a: BandReviewDecision, b: BandReviewDecision): BandReviewDecision {
+  if (a.kind === 'bounce' && b.kind === 'hold' && b.ask) return a;
+  if (b.kind === 'bounce' && a.kind === 'hold' && a.ask) return b;
   if (STRICTNESS[a.kind] !== STRICTNESS[b.kind]) return STRICTNESS[a.kind] > STRICTNESS[b.kind] ? a : b;
   if (a.kind === 'send' && b.kind === 'send') {
     const report = a.report ?? b.report;
@@ -697,14 +724,17 @@ function describeDecisions(decisions: CollectedEvidence['decisions'], recipients
 const TASK_TITLE_MAX = 80;
 
 /**
- * The task an ask is for, from the review's evidence: a link covering the recipients names
- * its task (or that task's root), otherwise the bound or root task. Undefined when none has
- * a title. It is quoted in the principal's question, so it is made one line, its double quotes
- * become single ones, and it is cut to 80 characters with an ellipsis.
+ * The task an ask is for, named only when the principal's authority comes from it (#2312): a
+ * strong link covering the recipients to the principal's task names that task (or its root),
+ * otherwise the principal's bound or root task names the bound or root task. Undefined for any
+ * other ask, or when none has a title. It is quoted in the principal's question, so it is made
+ * one line, its double quotes become single ones, and it is cut to 80 characters with an ellipsis.
  */
-function askTaskTitle(a: SendAuthority | undefined, linkCovers: boolean): string | undefined {
-  const linked = linkCovers ? a?.linkedTask?.title ?? a?.linkedTask?.root?.title : undefined;
-  const title = (linked ?? a?.boundTask?.title ?? a?.rootTask?.title)?.replace(/\s+/g, ' ').replace(/"/g, '\'').trim();
+function askTaskTitle(a: SendAuthority | undefined, who: Authority, linkCovers: boolean): string | undefined {
+  if (who !== 'principal-task') return undefined;
+  const viaLink = linkCovers && a?.linkedTask?.strength === 'strong' && linkToPrincipalTask(a);
+  const raw = viaLink ? a?.linkedTask?.title ?? a?.linkedTask?.root?.title : a?.boundTask?.title ?? a?.rootTask?.title;
+  const title = raw?.replace(/\s+/g, ' ').replace(/"/g, '\'').trim();
   if (!title) return undefined;
   return title.length > TASK_TITLE_MAX ? `${title.slice(0, TASK_TITLE_MAX - 1).trimEnd()}…` : title;
 }
@@ -736,15 +766,28 @@ function linkToPrincipalTask(a: SendAuthority | undefined): boolean {
 const bareId = normalizeCounterparty;
 
 /**
- * Every non-principal recipient is a counterparty the link covers: the linked sender (by
- * address, or by contact when the sender resolved), or an address, contact id or org domain
- * on the outreach row. No link, or no readable row, covers no one (fail closed). A send to the
- * principal alone has no one to cover, so it is covered.
+ * A recipient's tier for an ask (#2312), by normalized id: from `recipientTiers` when the caller
+ * resolved every recipient, otherwise `recipientTier` for the primary requester alone.
  */
-function linkCoversRecipients(input: BandReviewInput, a: SendAuthority | undefined, nonOrgDomains: ReadonlySet<string> | undefined): boolean {
+function recipientTierOf(input: BandReviewInput): (recipient: string) => ContactTier | undefined {
+  if (input.recipientTiers) {
+    const tiers = new Map(Object.entries(input.recipientTiers).map(([k, v]) => [bareId(k), v]));
+    return (r) => tiers.get(r);
+  }
+  const primary = primaryRequester(input);
+  const primaryId = primary !== undefined ? bareId(primary) : undefined;
+  return (r) => (r === primaryId ? input.recipientTier : undefined);
+}
+
+/**
+ * Whether the link covers a recipient (normalized): the linked sender (by contact, when the
+ * sender resolved), or an address, contact id or org domain on the outreach
+ * row. No link, or no readable row, covers no one (fail closed). A send counts as covered when
+ * every non-principal recipient is, so one to the principal alone is.
+ */
+function linkCoverage(input: BandReviewInput, a: SendAuthority | undefined, nonOrgDomains: ReadonlySet<string> | undefined): (recipient: string) => boolean {
   const cp = a?.linkedTask?.counterparty;
-  if (!cp) return false;
-  const principals = new Set((input.principalRecipients ?? []).map(bareId));
+  if (!cp) return () => false;
   // The linked sender is matched by contact id: an originator carries no address.
   const sender = a!.originator ? bareId(a!.originator.contactId) : undefined;
   const senderContact = sender !== undefined && isUuid(sender) ? sender : undefined;
@@ -752,12 +795,12 @@ function linkCoversRecipients(input: BandReviewInput, a: SendAuthority | undefin
   const addresses = new Set(cp.addresses);
   const contacts = new Set(cp.contactIds);
   const domains = new Set(cp.domains);
-  return input.recipients.map(bareId).filter((r) => !principals.has(r)).every((r) => {
+  return (r) => {
     if (addresses.has(r)) return true;
     const contact = contactOf.get(r);
     if (contact !== undefined && (contact === senderContact || contacts.has(contact))) return true;
     return orgDomainsOf([r], nonOrgDomains).some((d) => domains.has(d));
-  });
+  };
 }
 
 /** Exactly one ruling for each asked item. */

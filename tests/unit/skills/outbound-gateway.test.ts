@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { OutboundGateway, UnknownEmailAccountError, hasTransientErrorSignal } from '../../../src/skills/outbound-gateway.js';
+import { OutboundGateway, UnknownEmailAccountError, askPreamble, hasTransientErrorSignal } from '../../../src/skills/outbound-gateway.js';
 import { createLogger } from '../../../src/logger.js';
 import type { NylasClient, NylasMessage } from '../../../src/channels/email/nylas-client.js';
 import type { ContactService } from '../../../src/contacts/contact-service.js';
@@ -4195,8 +4195,20 @@ describe('band review (#2159)', () => {
     expect(review).toHaveBeenCalledWith({
       content: emailReq.body, channel: 'email', recipients: ['joel@example.com'], principalRecipients: [], score: 84,
       conversationId: 'c1', taskEventId: 't1', principalDirected: true, postTurn: true,
-      recipientTier: 'unknown', subject: 'Forms',
+      recipientTier: 'unknown', recipientTiers: {}, subject: 'Forms',
     });
+  });
+
+  it('passes the review every resolved recipient\'s tier, for an ask (#2312)', async () => {
+    const tiers: Record<string, string> = { 'joel@example.com': 'known', 'ops@example.com': 'trusted' };
+    vi.mocked(mocks.contactService.resolveByChannelIdentity).mockImplementation(async (_channel: string, id: string) => (
+      tiers[id.toLowerCase()] ? { contactId: `c-${id}`, displayName: id, role: null, tier: tiers[id.toLowerCase()], kind: 'person', kgNodeId: null, verified: true } : null
+    ) as never);
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send({ ...emailReq, cc: ['Ops@Example.com', 'nobody@example.com'] }, { taskEventId: 't1', conversationId: 'c1' });
+    // Normalized ids; a recipient with no contact is left out, so it is not askable.
+    expect(review.mock.calls[0]![0].recipientTiers).toEqual({ 'joel@example.com': 'known', 'ops@example.com': 'trusted' });
   });
 
   it('forwards the note reported to the principal to the review (#2312)', async () => {
@@ -4393,6 +4405,61 @@ describe('band review (#2159)', () => {
       const gw2 = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84, actionLogRepo: other });
       await gw2.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
       expect(vi.mocked(other.insert).mock.calls[0]![0]).not.toHaveProperty('disclosureAsk');
+    });
+
+    it('names the primary requester and counts the other recipients in the question', () => {
+      const ask = { labels: ['sin_ca'], requester: 'Joel <Joel@Example.com>', counterparties: ['joel@example.com'] };
+      expect(askPreamble(ask)).toBe('Joel <Joel@Example.com> is asking for your SIN. Share it? Reply yes to send the message below as written, or no to keep it private.');
+      expect(askPreamble({ ...ask, counterparties: ['joel@example.com', 'ops@example.com'] }))
+        .toBe('Joel <Joel@Example.com> and 1 other are asking for your SIN. Share it? Reply yes to send the message below as written, or no to keep it private.');
+      expect(askPreamble({ ...ask, counterparties: ['joel@example.com', 'ops@example.com', 'sam@example.com'], taskTitle: 'Book physio' }))
+        .toBe('Joel <Joel@Example.com> and 2 others are asking for your SIN for "Book physio". Share it? Reply yes to send the message below as written, or no to keep it private.');
+    });
+
+    // A relayed reply's agent is gone: the coordinator wake must say this is an ask.
+    describe('on a relayed reply', () => {
+      const relayRecipe = {
+        toolName: 'send-draft', partialPayload: { account: 'curia' },
+        description: 'Draft reply to joel@example.com — "Forms". Use send-draft to approve.',
+        askDescription: 'Draft reply to joel@example.com — "Forms". Approve it with approve-action or send-draft; either records the principal\'s yes.',
+      };
+      const relayReq = { ...emailReq, accountId: 'curia', replyToMessageId: 'msg-7' };
+      const wakeContent = (): string => {
+        const wakes = publishedOfType(mocks.bus, 'agent.task');
+        expect(wakes).toHaveLength(1);
+        return String(wakes[0]!.payload['content']);
+      };
+
+      it('wakes the coordinator with the ask: urgent, one holding reply on the thread, no details', async () => {
+        const actionLogRepo = makeActionLogRepo();
+        const gw = makeBandGateway({
+          review: vi.fn().mockResolvedValue(askHold({ labels: ['sin_ca', 'phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'] })),
+          score: 84, actionLogRepo,
+        });
+        const result = await gw.send(relayReq, { taskEventId: 't1', conversationId: 'c1', postTurn: true, reExecRecipe: relayRecipe });
+        expect(result).toMatchObject({ gated: true, actionRef: expect.any(String) });
+        const content = wakeContent();
+        expect(content).toContain(relayRecipe.askDescription);
+        expect(content).toContain('It is a personal-data request: joel@example.com asked for the principal\'s SIN and phone number');
+        expect(content).toContain('This is urgent. Deliver it now with deliver-approval');
+        expect(content).toContain('Then you may send joel@example.com one short holding reply on the thread (email-reply with reply_to_message_id msg-7, account curia). It must not include the requested details.');
+        expect(content.endsWith('Do not do anything else.')).toBe(true);
+        // Labels only, never raw label ids.
+        expect(content).not.toContain('sin_ca');
+        // The row says either tool approves it.
+        expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ description: relayRecipe.askDescription }));
+      });
+
+      it('keeps the plain wake and description for any other relayed hold', async () => {
+        const actionLogRepo = makeActionLogRepo();
+        const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84, actionLogRepo });
+        await gw.send(relayReq, { taskEventId: 't1', conversationId: 'c1', postTurn: true, reExecRecipe: relayRecipe });
+        const content = wakeContent();
+        expect(content).toContain(relayRecipe.description);
+        expect(content).not.toContain('personal-data');
+        expect(content).not.toContain('holding reply');
+        expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ description: relayRecipe.description }));
+      });
     });
 
     it('keeps the recipe\'s description as the preamble of any other hold', async () => {

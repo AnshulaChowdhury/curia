@@ -53,7 +53,7 @@ import type { ChannelReconnectEvent } from '../bus/events.js';
 import { AutonomyService } from '../autonomy/autonomy-service.js';
 import { markdownToMrkdwn } from '../format/markdown-to-mrkdwn.js';
 import type { ActionLogRepo } from '../autonomy/action-log-repo.js';
-import { approvalAdvisory, buildApprovalDeliveryWake, generateShortRef, readApprovalNumber } from '../autonomy/approval-trigger.js';
+import { approvalAdvisory, buildApprovalDeliveryWake, generateShortRef, readApprovalNumber, type ApprovalWakeAsk } from '../autonomy/approval-trigger.js';
 import { enrichGatewayApprovalPayload } from '../autonomy/approval-notification.js';
 import type { ApprovalDelivery } from '../autonomy/approval-delivery.js';
 import type { AutonomyGating } from '../autonomy/band-policy.js';
@@ -377,6 +377,8 @@ interface SendRecipe {
   toolName: string;
   partialPayload?: Record<string, unknown>;
   description: string;
+  /** Used instead of `description` when the hold is a personal-data ask (#2312). */
+  askDescription?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -604,10 +606,28 @@ function truncatePreview(text: string): string {
   return line.length > 80 ? `${line.slice(0, 77)}...` : line;
 }
 
-/** The question an ask's approval opens with (#2312): who wants which details, for what task. */
-function askPreamble(ask: BandReviewAsk): string {
+/**
+ * The question an ask's approval opens with (#2312): who wants which details, and for what
+ * task when the principal's authority is that task's. The primary requester is named; anyone
+ * else on the send is counted.
+ */
+export function askPreamble(ask: BandReviewAsk): string {
+  const requester = normalizeCounterparty(ask.requester);
+  const others = ask.counterparties.filter((c) => c !== requester).length;
+  const who = others > 0 ? `${ask.requester} and ${others} other${others === 1 ? '' : 's'} are` : `${ask.requester} is`;
   const forTask = ask.taskTitle ? ` for "${ask.taskTitle}"` : '';
-  return `${ask.requester} is asking for your ${describePiiLabels(ask.labels)}${forTask}. Share it? Reply yes to send the message below as written, or no to keep it private.`;
+  return `${who} asking for your ${describePiiLabels(ask.labels)}${forTask}. Share it? Reply yes to send the message below as written, or no to keep it private.`;
+}
+
+/**
+ * A personal-data ask as a relayed reply's coordinator wake states it (#2312): human labels and
+ * the requester, plus the email it answers so the holding reply can thread under it.
+ */
+function wakeAskFor(request: OutboundSendRequest, ask: BandReviewAsk): ApprovalWakeAsk {
+  const replyTo = request.channel === 'email' && request.replyToMessageId
+    ? { messageId: request.replyToMessageId, ...(request.accountId ? { account: request.accountId } : {}) }
+    : undefined;
+  return { details: describePiiLabels(ask.labels), requester: ask.requester, ...(replyTo ? { replyTo } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +813,8 @@ export class OutboundGateway {
          * row (visible via list-pending-actions) and the principal notification body.
          */
         description: string;
+        /** Used instead of `description` when band review holds the send as a personal-data ask (#2312). */
+        askDescription?: string;
       };
       /** Export gate context for attachment bulk-export audit and approval (#201). */
       exportContext?: {
@@ -1044,10 +1066,13 @@ export class OutboundGateway {
 
     // The rest of the envelope (further To, CC): a blocked contact anywhere on
     // it is refused, not only the primary (#2273). Fail-open, as above.
+    // Every resolved person recipient's tier, for the band review's ask (#2312).
+    const recipientTiers: Record<string, ContactTier> = {};
+    if (!recipientTierUnresolved && recipientContactId !== undefined) recipientTiers[normalizeCounterparty(recipientId)] = recipientTier;
     const blockedOther = await this.findBlockedRecipient(
       request.channel,
       this.personRecipients(request).filter((id) => id.toLowerCase() !== recipientId.toLowerCase()),
-      { failClosed: false },
+      { failClosed: false, tiers: recipientTiers },
     );
     if (blockedOther?.kind === 'blocked') {
       this.log.warn(
@@ -1476,6 +1501,7 @@ export class OutboundGateway {
         principalRecipients: recipients.filter((r) => r.isPrincipal).map((r) => r.email),
         detectedItems,
         recipientTier,
+        recipientTiers,
         ...(recipientContactId ? { recipientContactIds: { [recipientId.toLowerCase()]: recipientContactId } } : {}),
         ...(sendSubject !== undefined ? { subject: sendSubject } : {}),
         options,
@@ -2010,6 +2036,7 @@ export class OutboundGateway {
    * at the top of what the principal is shown (an ask's question, #2312); the row and its
    * digest mention keep the description. `disclosureAsk` is stored in its own column, never
    * in the replayed payload, so approving or denying the row records the principal's answer.
+   * `ask` tells a relayed reply's coordinator wake that this is a personal-data request.
    */
   private async raiseSendApproval(
     request: OutboundSendRequest,
@@ -2018,6 +2045,7 @@ export class OutboundGateway {
     extraLines: string[],
     preamble?: string,
     disclosureAsk?: DisclosureAsk,
+    ask?: BandReviewAsk,
   ): Promise<{ shortRef: string; approvalNumber: number | null } | undefined> {
     const actionLogRepo = this.actionLogRepo;
     if (!actionLogRepo) {
@@ -2067,7 +2095,7 @@ export class OutboundGateway {
     });
     await this.queueApprovalMention(candidateRef, recipe.description, ctx.taskEventId, ctx.conversationId ?? undefined);
     if (ctx.postTurn) {
-      await this.wakeCoordinatorToDeliver(candidateRef, recipe.description, ctx.taskEventId);
+      await this.wakeCoordinatorToDeliver(candidateRef, recipe.description, ctx.taskEventId, ask ? wakeAskFor(request, ask) : undefined);
     }
     return { shortRef: candidateRef, approvalNumber };
   }
@@ -2165,6 +2193,8 @@ export class OutboundGateway {
     /** The personal data detected in the send, and the primary recipient's tier (#2312). */
     detectedItems?: readonly BriefDetectedItem[];
     recipientTier?: ContactTier;
+    /** Every resolved person recipient's tier, by normalized id: an ask needs each one askable (#2312). */
+    recipientTiers?: Readonly<Record<string, ContactTier>>;
     /** The primary recipient's resolved contact id, by lowercased id: a link's counterparty check (#2312). */
     recipientContactIds?: Readonly<Record<string, string>>;
     /** The email subject as it will be sent: the review scans it for redaction tokens. */
@@ -2204,6 +2234,7 @@ export class OutboundGateway {
         ...(options?.reportedToPrincipal ? { reportedToPrincipal: options.reportedToPrincipal } : {}),
         ...(args.detectedItems && args.detectedItems.length > 0 ? { detectedItems: args.detectedItems } : {}),
         ...(args.recipientTier ? { recipientTier: args.recipientTier } : {}),
+        ...(args.recipientTiers ? { recipientTiers: args.recipientTiers } : {}),
         ...(args.recipientContactIds ? { recipientContactIds: args.recipientContactIds } : {}),
         ...(args.subject !== undefined ? { subject: args.subject } : {}),
       });
@@ -2310,7 +2341,8 @@ export class OutboundGateway {
     // Hold. Never publish outbound.blocked here: on a relay it would start the #1355
     // rewrite loop, and this message needs the principal, not a rewrite.
     const rule = decision.findings[0]?.rule ?? BAND_RULES.unreviewed;
-    const recipe = options?.holdRecipe ?? options?.reExecRecipe;
+    const baseRecipe = options?.holdRecipe ?? options?.reExecRecipe;
+    const recipe = decision.ask && baseRecipe?.askDescription ? { ...baseRecipe, description: baseRecipe.askDescription } : baseRecipe;
     this.log.info({ channel: request.channel, rule, hasRecipe: recipe !== undefined }, 'outbound-gateway: band review held the send');
     // A hold with no approval behind it reaches nobody unless it is reported: the agent may
     // be gone (a relayed reply), and nothing else records it. The digest gets it then.
@@ -2335,6 +2367,7 @@ export class OutboundGateway {
         ask ? [] : [`Held by the send review: ${decision.reason}`],
         ask ? askPreamble(ask) : undefined,
         ask ? this.disclosureAskFor(ask, options.conversationId) : undefined,
+        ask,
       );
       if (!raised) await reportUnapprovedHold('the approval row could not be written');
       const askGuidance = ask && raised
@@ -2540,9 +2573,9 @@ export class OutboundGateway {
   }
 
   /** Wake the coordinator to deliver an approval nobody is there to deliver (#2159). Never throws. */
-  private async wakeCoordinatorToDeliver(shortRef: string, description: string, taskEventId: string): Promise<void> {
+  private async wakeCoordinatorToDeliver(shortRef: string, description: string, taskEventId: string, ask?: ApprovalWakeAsk): Promise<void> {
     try {
-      await this.bus.publish('dispatch', buildApprovalDeliveryWake(shortRef, description, taskEventId));
+      await this.bus.publish('dispatch', buildApprovalDeliveryWake(shortRef, description, taskEventId, ask));
     } catch (err) {
       this.log.error({ err, shortRef }, 'outbound-gateway: could not wake the coordinator — the expiry sweep will deliver the approval');
     }
@@ -2720,11 +2753,13 @@ export class OutboundGateway {
    * rest of the envelope (further To, CC), so a blocked contact anywhere on it
    * is refused. On a lookup error, `failClosed` returns `lookup-failed`;
    * otherwise that identifier is logged and skipped, as the primary check does.
+   * `opts.tiers`, when given, collects each resolved contact's tier by normalized
+   * identifier, for the band review's ask (#2312).
    */
   private async findBlockedRecipient(
     channel: string,
     identifiers: readonly string[],
-    opts: { failClosed: boolean },
+    opts: { failClosed: boolean; tiers?: Record<string, ContactTier> },
   ): Promise<{ kind: 'blocked'; identifier: string; contactId: string } | { kind: 'lookup-failed'; identifier: string } | null> {
     const seen = new Set<string>();
     for (const identifier of identifiers) {
@@ -2737,6 +2772,7 @@ export class OutboundGateway {
         if (contact !== null && contact.tier === 'blocked') {
           return { kind: 'blocked', identifier, contactId: contact.contactId };
         }
+        if (contact !== null && opts.tiers) opts.tiers[normalizeCounterparty(identifier)] = contact.tier;
       } catch (err) {
         this.log.warn(
           { err, channel, recipientId: redactId(identifier), failClosed: opts.failClosed },
@@ -3596,7 +3632,10 @@ export class OutboundGateway {
     // The rest of the draft's envelope (#2273). Fail-open, as above.
     const draftOthers = (draftMeta.allRecipients ?? [])
       .filter((r) => r.toLowerCase() !== recipientEmail.toLowerCase());
-    const blockedOther = await this.findBlockedRecipient('email', draftOthers, { failClosed: false });
+    // Every resolved person recipient's tier, for the band review's ask (#2312).
+    const draftTiers: Record<string, ContactTier> = {};
+    if (recipientContactIdForDraft !== undefined) draftTiers[normalizeCounterparty(recipientEmail)] = recipientTierForDraft;
+    const blockedOther = await this.findBlockedRecipient('email', draftOthers, { failClosed: false, tiers: draftTiers });
     if (blockedOther?.kind === 'blocked') {
       this.log.warn(
         { draftId, recipientId: redactId(blockedOther.identifier), contactId: blockedOther.contactId },
@@ -3811,6 +3850,7 @@ export class OutboundGateway {
         principalRecipients: draftRecipients.filter((r) => r.isPrincipal).map((r) => r.email),
         detectedItems,
         recipientTier: recipientTierForDraft,
+        recipientTiers: draftTiers,
         ...(recipientContactIdForDraft ? { recipientContactIds: { [recipientEmail.toLowerCase()]: recipientContactIdForDraft } } : {}),
         subject: draftMeta.subject,
         options,

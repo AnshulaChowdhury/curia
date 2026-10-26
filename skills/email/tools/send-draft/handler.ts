@@ -220,6 +220,15 @@ export class SendDraftHandler implements ToolHandler {
           // The coordinator sent the draft on its reading of the conversation; recorded as
           // its decision, not the principal's (#2159).
           const updated = await ctx.actionLogRepo.resolveById(row.id, 'approved', RESOLVED_BY.coordinator);
+          if (updated && row.disclosureAsk) {
+            // A personal-data ask (#2312): sending the draft is the principal's yes, as
+            // approve-action records it. The recorder never throws.
+            if (ctx.disclosureDecisions) {
+              await ctx.disclosureDecisions.recordForApproval(row, 'yes', 'principal_via_coordinator');
+            } else {
+              ctx.log.error({ rowId: row.id }, 'send-draft: disclosureDecisions not wired — the principal\'s yes is not remembered for the thread');
+            }
+          }
           if (!updated) {
             // Row was present during find but couldn't be resolved — likely a concurrent
             // approval (e.g. two principal messages sent in quick succession). Log at warn so

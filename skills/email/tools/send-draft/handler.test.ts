@@ -33,6 +33,7 @@ function makeCtx(overrides: {
   bus?: Partial<EventBus>;
   taskEventId?: string;
   actionLogRepo?: Partial<ActionLogRepo> | null;
+  disclosureDecisions?: ToolContext['disclosureDecisions'];
 }): ToolContext {
   const gateway = {
     getEmailDraft: vi.fn().mockResolvedValue(DRAFT_STUB),
@@ -74,6 +75,7 @@ function makeCtx(overrides: {
         },
     taskEventId: overrides.taskEventId ?? 'task-event-1',
     actionLogRepo,
+    ...(overrides.disclosureDecisions ? { disclosureDecisions: overrides.disclosureDecisions } : {}),
   } as unknown as ToolContext;
 
   return ctx;
@@ -774,6 +776,44 @@ describe('SendDraftHandler', () => {
       const result = await handler.execute(ctx);
 
       expect(result.success).toBe(true);
+    });
+
+    // Sending the draft of a personal-data ask is the principal's yes, as approve-action records it (#2312).
+    describe('a row carrying a personal-data ask', () => {
+      const disclosureAsk = { conversationId: 'conv-1', counterparties: ['joel@example.com'], labels: ['sin_ca'], requester: 'joel@example.com', outreachId: 'o-1' };
+      const askRow = { id: 55, shortRef: 'ab12cd34', disclosureAsk };
+
+      it('records the yes once the row resolves, as the coordinator acting for the principal', async () => {
+        const recordForApproval = vi.fn().mockResolvedValue(undefined);
+        const ctx = makeCtx({
+          actionLogRepo: { findPendingByPayloadField: vi.fn().mockResolvedValue(askRow), resolveById: vi.fn().mockResolvedValue(true) },
+          disclosureDecisions: { recordForApproval },
+        });
+        expect((await handler.execute(ctx)).success).toBe(true);
+        expect(recordForApproval).toHaveBeenCalledWith(askRow, 'yes', 'principal_via_coordinator');
+      });
+
+      it('records nothing when the row was resolved concurrently, or carries no ask', async () => {
+        const recordForApproval = vi.fn().mockResolvedValue(undefined);
+        const raced = makeCtx({
+          actionLogRepo: { findPendingByPayloadField: vi.fn().mockResolvedValue(askRow), resolveById: vi.fn().mockResolvedValue(false) },
+          disclosureDecisions: { recordForApproval },
+        });
+        expect((await handler.execute(raced)).success).toBe(true);
+        const plain = makeCtx({
+          actionLogRepo: { findPendingByPayloadField: vi.fn().mockResolvedValue({ id: 56, shortRef: 'x', disclosureAsk: null }), resolveById: vi.fn().mockResolvedValue(true) },
+          disclosureDecisions: { recordForApproval },
+        });
+        expect((await handler.execute(plain)).success).toBe(true);
+        expect(recordForApproval).not.toHaveBeenCalled();
+      });
+
+      it('still sends when the recorder is not wired', async () => {
+        const ctx = makeCtx({
+          actionLogRepo: { findPendingByPayloadField: vi.fn().mockResolvedValue(askRow), resolveById: vi.fn().mockResolvedValue(true) },
+        });
+        expect((await handler.execute(ctx)).success).toBe(true);
+      });
     });
 
     it('still succeeds when action_log transition throws', async () => {

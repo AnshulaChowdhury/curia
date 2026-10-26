@@ -1485,8 +1485,11 @@ export class EmailAdapter implements Channel {
     //   partialPayload: { account } — the draft's account; draft_id is filled in by
     //                                 linkGatedAction() after the draft is created below
     //   description: human-readable label for the pending_approval row + notification
+    //   askDescription: the same for a personal-data ask (#2312), where either tool records the
+    //                   principal's yes for the thread
     const recipientLabel = [sendRequest.to, ...(sendRequest.additionalTo ?? [])].join(', ');
     const subjectLabel = sendRequest.subject;
+    const draftLabel = `Draft reply to ${recipientLabel}${subjectLabel ? ` — "${subjectLabel}"` : ''}.`;
     const result = await outboundGateway.send(sendRequest, {
       taskEventId: context.taskEventId,
       conversationId: context.conversationId,
@@ -1500,7 +1503,8 @@ export class EmailAdapter implements Channel {
       reExecRecipe: {
         toolName: 'send-draft',
         partialPayload: { account: accountId },
-        description: `Draft reply to ${recipientLabel}${subjectLabel ? ` — "${subjectLabel}"` : ''}. Use send-draft to approve.`,
+        description: `${draftLabel} Use send-draft to approve.`,
+        askDescription: `${draftLabel} Approve it with approve-action or send-draft; either records the principal's yes.`,
       },
     });
 

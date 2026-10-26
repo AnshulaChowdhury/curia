@@ -201,6 +201,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Scenario follow-up** — a turn-start drain fails the run, and the point is recorded. (#2018)
 - **Scenario case 26** — stubs the task writes and email-button shapes the gate run used. (#2018)
 - **Scenario case 26** — bare-ref and label email clicks sent as a one-click batch now succeed. (#2018)
+- **PII asks** — never hide another finding; relayed asks reach the coordinator; `send-draft` records the yes. (#2312)
 - **Band judge** — no longer flags Curia's own conduct or what it tells the principal. (#2312)
 - **Send recipients** — Curia's own mailbox no longer counts as a recipient when checking sends. (#2312)
 - **Band judge evidence** — reports to the principal count as support. **Public API:** `outbound.message` gains `reportedToPrincipal`. (#2312)
