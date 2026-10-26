@@ -1407,11 +1407,14 @@ export class OutboundGateway {
       this.gating === 'band' && this.bandReview
       && !options?.isSystemNotification && !options?.humanApproved && !principalIsSoleRecipient
     ) {
-      const people = this.personRecipients(request);
+      // People in the finalized set (Curia's own addresses dropped; a group or channel id is
+      // still not an audience member), so `recipients` and `principalRecipients` agree.
+      const people = new Set(this.personRecipients(request).map((p) => p.toLowerCase()));
+      const reviewRecipients = recipients.map((r) => r.email).filter((id) => people.has(id.toLowerCase()));
       const outcome = await this.runBandReview({
         request,
         content: redactedBody,
-        recipients: people.length > 0 ? people : [recipientId],
+        recipients: reviewRecipients.length > 0 ? reviewRecipients : [recipientId],
         principalRecipients: recipients.filter((r) => r.isPrincipal).map((r) => r.email),
         options,
       });
@@ -2681,10 +2684,14 @@ export class OutboundGateway {
     principalIncluded: boolean;
     principalIsSoleRecipient: boolean;
   } {
+    // Curia's own mailboxes are not an audience: a status email addressed to Curia with the
+    // principal on CC is a principal-only message, not a send to a third party.
+    const ownAddresses = new Set([...this.emailAccountAddresses.values()].map((a) => a.toLowerCase()));
     const seen = new Set<string>();
     const recipients: FilterRecipient[] = [];
     for (const r of tagged) {
       const key = r.email.toLowerCase();
+      if (ownAddresses.has(key)) continue;
       if (seen.has(key)) continue;
       seen.add(key);
       recipients.push(r);
@@ -3447,7 +3454,7 @@ export class OutboundGateway {
           ...(draftEnvelope.length > 1 ? { cc: draftEnvelope.filter((r) => r !== recipientEmail) } : {}),
         },
         content: body,
-        recipients: draftEnvelope,
+        recipients: draftRecipients.length > 0 ? draftRecipients.map((r) => r.email) : draftEnvelope,
         principalRecipients: draftRecipients.filter((r) => r.isPrincipal).map((r) => r.email),
         options,
       });

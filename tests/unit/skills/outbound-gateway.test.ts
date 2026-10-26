@@ -2444,6 +2444,83 @@ describe('PII redaction pipeline step', () => {
     });
   });
 
+  describe('Curia\'s own addresses are not recipients (#2312)', () => {
+    const phoneBody = 'Call me on (415) 555-1234 tomorrow.';
+
+    async function makeOwnAddressGateway() {
+      const { PiiRedactor: RealPiiRedactor } = await import('../../../src/dispatch/pii-redactor.js');
+      const logger = createLogger('error');
+      const bus = {
+        publish: vi.fn().mockResolvedValue(undefined),
+        subscribe: vi.fn(),
+      } as unknown as EventBus;
+      const nylasClient = {
+        sendMessage: vi.fn().mockResolvedValue({ id: 'msg-own-1' }),
+      } as unknown as NylasClient;
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gateway = new OutboundGateway({
+        nylasClients: new Map([['curia', nylasClient]]),
+        emailAccountAddresses: new Map([['curia', 'curia@example.com']]),
+        contactService: {
+          resolveByChannelIdentity: vi.fn().mockResolvedValue(null),
+        } as unknown as ContactService,
+        contentFilter: {
+          check: vi.fn().mockResolvedValue({ passed: true, findings: [] }),
+        } as unknown as OutboundContentFilter,
+        bus,
+        principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+        logger,
+        autonomyService: makeAutonomyService(84),
+        actionLogRepo: makeActionLogRepo(),
+        gating: 'band',
+        bandReview: { review: review as unknown as BandSendReview['review'] },
+        piiRedactor: new RealPiiRedactor({
+          config: {
+            enabled: true,
+            default: 'block',
+            channel_policies: { email: { allow: ['email'] }, signal: { allow: [] } },
+          },
+          bus,
+          logger,
+          extraPatterns: [],
+        }),
+      });
+      return { gateway, nylasClient, review };
+    }
+
+    it.each(['curia@example.com', 'Curia@Example.com'])(
+      'treats a send to %s with the principal CC\'d as principal-only',
+      async (to) => {
+        const { gateway, nylasClient, review } = await makeOwnAddressGateway();
+        const result = await gateway.send({
+          channel: 'email', to, cc: ['ceo@example.com'], subject: 's', body: phoneBody,
+        });
+        expect(result.success).toBe(true);
+        expect(review).not.toHaveBeenCalled();
+        const sent = (nylasClient.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { body: string };
+        expect(sent.body).toContain('(415) 555-1234');
+      },
+    );
+
+    it('keeps Curia\'s address out of the band review recipients', async () => {
+      const { gateway, review } = await makeOwnAddressGateway();
+      await gateway.send({
+        channel: 'email', to: 'third@example.com', cc: ['curia@example.com'], subject: 's', body: 'Hello there.',
+      });
+      expect(review).toHaveBeenCalledTimes(1);
+      const arg = review.mock.calls[0]![0] as { recipients: string[] };
+      expect(arg.recipients).toEqual(['third@example.com']);
+    });
+
+    it('does not treat a send to Curia alone as principal-only', async () => {
+      const { gateway, review } = await makeOwnAddressGateway();
+      await gateway.send({
+        channel: 'email', to: 'curia@example.com', subject: 's', body: 'Hello there.',
+      });
+      expect(review).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('blocks the message when PiiRedactor throws (fail-closed)', async () => {
     // If the redactor throws, the gateway must block the message rather than
     // sending unredacted PII. This is the fail-closed contract.
