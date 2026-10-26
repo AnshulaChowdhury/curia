@@ -133,8 +133,12 @@ interface ExtractCall {
 function extractCalls(file: string, source: string): ExtractCall[] {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
   const calls: ExtractCall[] = [];
+  // The value the property ends up with: the last assignment wins, and a spread after it
+  // could override it, so that reads as unknown (not fast).
   const literalProp = (obj: ts.ObjectLiteralExpression, name: string): ts.Expression | undefined => {
-    for (const p of obj.properties) {
+    for (let i = obj.properties.length - 1; i >= 0; i--) {
+      const p = obj.properties[i]!;
+      if (ts.isSpreadAssignment(p)) return undefined;
       if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) && p.name.text === name) {
         return p.initializer;
       }
@@ -192,11 +196,20 @@ describe('extractCalls (#2224)', () => {
       "await ctx.infraLlm?.extract<string>(prompt);",
       "// ctx.infraLlm.extract(prompt) in a comment",
       "const s = 'infraLlm.extract(prompt)';",
+      "await infraLlm.extract(prompt, { tier: 'fast', ...override });",
+      "await infraLlm.extract(prompt, { ...defaults, tier: 'fast' });",
+      "await infraLlm.extract(prompt, { tier: 'fast', tier: 'standard' });",
     ].join('\n');
     expect(extractCalls('sample.ts', source)).toEqual([
       { line: 1, fastTier: false, maxTokens: '1000' },
       { line: 2, fastTier: true, maxTokens: undefined },
       { line: 4, fastTier: false, maxTokens: undefined },
+      // A spread after the tier may override it.
+      { line: 7, fastTier: false, maxTokens: undefined },
+      // A tier after the spread wins.
+      { line: 8, fastTier: true, maxTokens: undefined },
+      // The last assignment wins.
+      { line: 9, fastTier: false, maxTokens: undefined },
     ]);
   });
 });
