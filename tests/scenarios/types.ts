@@ -336,6 +336,21 @@ export interface ScenarioInbound {
    * is on, and a second turn on the same conversation fails the run.
    */
   followup?: ScenarioFollowup;
+  /**
+   * The principal's next message, as its own turn once the first has ended (#2312): an
+   * inbound from the principal's verified identity on `channel`, in a second conversation of
+   * the same run. It is a live principal turn, so the elevated gate is production's: this is
+   * how a hold raised on someone else's turn gets approved within the run. Its calls join the
+   * run's; its reply is `then.reply` on the run.
+   */
+  then?: ScenarioPrincipalTurn;
+}
+
+/** A principal turn after the first one (ScenarioInbound.then). */
+export interface ScenarioPrincipalTurn {
+  content: string;
+  /** A channel the principal has a verified identity on (seed one with principal_identities). */
+  channel: string;
 }
 
 /** When the harness publishes `ScenarioInbound.followup`. */
@@ -542,6 +557,8 @@ export interface ScenarioRun {
   delegations?: DelegationRecord[];
   /** What a through-gateway run sent, held and recorded (#2312). Absent for other cases. */
   gateway?: GatewayOutcome;
+  /** The principal's `inbound.then` turn (#2312): the coordinator's reply to it. */
+  then?: { reply: string | null };
   /** Set when removing the run's rows failed; leftovers may be in the database. */
   cleanupError?: string;
   /**
@@ -566,6 +583,11 @@ export interface GatewayOutcome {
   outreach: RecordedOutreach[];
   /** The principal's answers to personal-data asks, recorded in the run's conversations. */
   decisions: RecordedDecision[];
+  /**
+   * The band review's fail-open cap tripped in this run: its judge failed on too many sends,
+   * so later sends held for want of a reviewer. The run is then an error, not a score.
+   */
+  reviewerFailedOpen: boolean;
 }
 
 export interface RecordedDelivery {

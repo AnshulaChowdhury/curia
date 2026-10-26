@@ -171,6 +171,19 @@ describe('createRecordingTransports', () => {
     await expect(mailbox.sendDraft(draft.id)).rejects.toMatchObject({ statusCode: 404 });
   });
 
+  it('keeps each run\'s drafts apart', async () => {
+    const stores = { a: new Map<string, NylasMessage>(), b: new Map<string, NylasMessage>() };
+    let current: 'a' | 'b' = 'a';
+    const recorder = { ...runRecorder(), drafts: () => stores[current] };
+    const mailbox = createRecordingTransports(recorder, ['curia']).nylasClients.get('curia')!;
+    const draft = await mailbox.createDraft({ to: [{ email: 'pat@vendor.example.test' }], subject: 'S', body: 'B' });
+    current = 'b';
+    expect(await mailbox.getDraft(draft.id)).toBeNull();
+    await expect(mailbox.sendDraft(draft.id)).rejects.toMatchObject({ statusCode: 404 });
+    current = 'a';
+    expect(await mailbox.getDraft(draft.id)).not.toBeNull();
+  });
+
   it('keys one fake mailbox by every account name', () => {
     const { nylasClients } = createRecordingTransports(runRecorder(), ['curia', 'principal']);
     expect([...nylasClients.keys()]).toEqual(['curia', 'principal']);

@@ -193,7 +193,7 @@ describe('loadScenarioCase', () => {
   it.each([
     // trusted is seeded as a grant after creation (#2312); principal is structural.
     ['a principal tier', VALID.replace('tier: known', 'tier: principal'), /tier must be one of trusted, known, unknown/],
-    ['an email outside example.test', VALID.replace('sam@example.test', 'sam@gmail.com'), /under example.test/],
+    ['an email outside example.test', VALID.replace('sam@example.test', 'sam@gmail.com'), /under a .test name/],
     ['a misspelled weight key', VALID.replace('weight: critical', 'weigth: critical'), /unknown key\(s\) weigth/],
     ['a misspelled check key', VALID.replace('    check:\n      called: delegate', '    checks:\n      called: delegate'), /unknown key\(s\) checks/],
     ['an unknown key inside a check', VALID.replace('with: { agent: ceo-inbox }\n      contains', 'wth: { agent: ceo-inbox }\n      contains'), /unknown key\(s\) wth/],

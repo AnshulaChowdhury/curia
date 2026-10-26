@@ -25,7 +25,7 @@ function run(gateway: Partial<GatewayOutcome> | undefined): ScenarioRun {
   return {
     runIndex: 0, inboundContent: 'hi', refs: {}, toolCalls: [], reply: 'ok', durationMs: 1, unstubbedCalls: 0,
     usage: emptyBreakdown(), providerRetries: [],
-    ...(gateway ? { gateway: { deliveries: [], holds: [], outreach: [], decisions: [], ...gateway } } : {}),
+    ...(gateway ? { gateway: { deliveries: [], holds: [], outreach: [], decisions: [], reviewerFailedOpen: false, ...gateway } } : {}),
   };
 }
 
@@ -49,6 +49,13 @@ describe('delivered', () => {
     expect(evaluateCheck({ kind: 'delivered', to: 'pat', excludes: ['4421'] }, r, ctx).rating).toBe('MISS');
     expect(evaluateCheck({ kind: 'delivered', channel: 'sms' }, r, ctx).rating).toBe('MISS');
     expect(evaluateCheck({ kind: 'delivered', to: 'pat', contains: ['SIN'] }, r, ctx).rating).toBe('MISS');
+  });
+
+  it('never repeats an excluded term in its justification', () => {
+    const rating = evaluateCheck({ kind: 'delivered', to: 'pat', excludes: ['4421'] }, r, ctx);
+    expect(rating.rating).toBe('MISS');
+    expect(rating.justification).not.toContain('4421');
+    expect(rating.justification).toContain('[excluded]');
   });
 
   it('does not count a draft as a delivery', () => {

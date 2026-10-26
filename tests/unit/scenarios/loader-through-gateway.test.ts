@@ -112,7 +112,24 @@ expected_behaviors:`));
     expect(c.inbound.task?.id).toBe('{{task:onboarding}}');
   });
 
+  it('reads a principal turn after the first (inbound.then), on Signal by default', () => {
+    const c = load(CASE.replace('    sender_verified: true\n', '    sender_verified: true\n  then:\n    content: Yes, approve it\n'));
+    expect(c.inbound.then).toEqual({ content: 'Yes, approve it', channel: 'signal' });
+    const email = load(CASE.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { content: approve 3, channel: email }\n'));
+    expect(email.inbound.then).toEqual({ content: 'approve 3', channel: 'email' });
+  });
+
+  it('accepts third-party fixtures under any .test name', () => {
+    const c = load(CASE.replaceAll('vendor.example.test', 'vendorco.test').replace('[Vendor.example.test]', '[vendorco.test]'));
+    expect(c.seed.contacts[0]!.identifier).toBe('pat@vendorco.test');
+    expect(c.seed.outreach[0]!.domains).toEqual(['vendorco.test']);
+  });
+
   it.each([
+    ['inbound.then on a console channel', (s: string) => s.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { content: approve, channel: cli }\n'), /verified identity/],
+    ['inbound.then without content', (s: string) => s.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { channel: signal }\n'), /'content' must be a non-empty string/],
+    ['an unknown inbound.then key', (s: string) => s.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { content: x, from: pat }\n'), /unknown key/],
+    ['a contact on a real domain', (s: string) => s.replace('pat@vendor.example.test', 'pat@vendor.com'), /under a .test name/],
     ['a gateway check without through_gateway', (s: string) => s.replace('through_gateway: true\n', ''), /'held' check needs through_gateway: true/],
     ['through_gateway: false', (s: string) => s.replace('through_gateway: true', 'through_gateway: false'), /true or absent/],
     ['a stub for a send that runs for real', (s: string) => s.replace('expected_behaviors:', 'tool_stubs:\n  email-reply:\n    - match: {}\n      return: { sent: true }\nexpected_behaviors:'), /runs email-reply for real; remove its stubs/],
@@ -123,7 +140,7 @@ expected_behaviors:`));
     ['a task originator that is not seeded', (s: string) => s.replace('originator: principal', 'originator: lee'), /originator 'lee' is not principal or a seeded contact key/],
     ['outreach for an unseeded task', (s: string) => s.replace('task: onboarding', 'task: other'), /task 'other' is not a seeded task key/],
     ['outreach to an unseeded contact', (s: string) => s.replace('contacts: [pat]', 'contacts: [lee]'), /contact 'lee' is not a seeded contact key/],
-    ['outreach outside example.test', (s: string) => s.replace('[Vendor.example.test]', '[vendor.com]'), /must be under example.test/],
+    ['outreach outside .test', (s: string) => s.replace('[Vendor.example.test]', '[vendor.com]'), /must be a .test name/],
     ['outreach without confirmed', (s: string) => s.replace('      confirmed: true\n', ''), /'confirmed' must be true or false/],
     ['outreach with nothing to match', (s: string) => s.replace('      domains: [Vendor.example.test]\n      contacts: [pat]\n', ''), /at least one of domains, addresses or contacts/],
     ['a bad outreach via', (s: string) => s.replace('via: email', 'via: pigeon'), /via must be one of/],

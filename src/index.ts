@@ -20,7 +20,7 @@
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { runner } from 'node-pg-migrate';
-import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveReportFallbackConfig, resolveIdentityGateMode, resolveAutonomyGating, resolveVerificationConfig, resolveRelayBudgetConfig, resolveTurnInjectionConfig } from './config.js';
+import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveReportFallbackConfig, resolveIdentityGateMode, resolveAutonomyGating, resolveVerificationConfig, resolveRelayBudgetConfig, resolveTurnInjectionConfig, resolveOutboundJudgeConfig, resolveOutboundRedactionConfig, OutboundConfigError, type OutboundJudgeSettings, type OutboundRedactionSettings } from './config.js';
 import { createVerificationRuntime } from './verification/index.js';
 import { createLogger } from './logger.js';
 import { HttpAdapter } from './channels/http/http-adapter.js';
@@ -1541,27 +1541,17 @@ async function main(): Promise<void> {
     // model→provider router so any registered model works. The judge model is validated
     // against the registry here so a typo fails fast at startup.
     let outboundJudge: OutboundLlmJudge | undefined;
-    const judgeYaml = yamlConfig.filter?.llmJudge;
-    const judgeEnabled = judgeYaml?.enabled ?? true;
-    if (judgeEnabled) {
-      const judgeConfig: JudgeConfig = {
-        enabled: true,
-        model: judgeYaml?.model ?? 'claude-haiku-5-5',
-        timeoutMs: judgeYaml?.timeout_ms ?? 5000,
-        failMode: judgeYaml?.failMode ?? 'split',
-      };
-      // Validate timeout_ms. local.yaml overrides are deep-merged but NOT schema-checked
-      // at startup, so a 0/negative/non-integer value could slip through — with the default
-      // 'split' failMode that would make every judge call time out instantly and silently
-      // fail open, disabling Stage 2. Fail fast instead. The 250ms floor rejects values too
-      // low for any real model round-trip (also a likely misconfiguration).
-      if (!Number.isInteger(judgeConfig.timeoutMs) || judgeConfig.timeoutMs < 250) {
-        logger.fatal(
-          { timeoutMs: judgeConfig.timeoutMs },
-          'filter.llmJudge.timeout_ms must be an integer >= 250 (ms) — fix config (default.yaml or local.yaml)',
-        );
-        process.exit(1);
-      }
+    // Defaults and the timeout floor live in resolveOutboundJudgeConfig, shared with test mode.
+    let judgeSettings: OutboundJudgeSettings;
+    try {
+      judgeSettings = resolveOutboundJudgeConfig(yamlConfig.filter);
+    } catch (err) {
+      if (!(err instanceof OutboundConfigError)) throw err;
+      logger.fatal(err.detail, err.message);
+      process.exit(1);
+    }
+    if (judgeSettings.enabled) {
+      const judgeConfig: JudgeConfig = { ...judgeSettings, enabled: true };
       if (!modelRegistry.isKnownModel(judgeConfig.model)) {
         logger.fatal(
           { model: judgeConfig.model },
@@ -1625,19 +1615,11 @@ async function main(): Promise<void> {
   // Config defaults: enabled=true, default='block'.
   //
   // Must be constructed BEFORE OutboundGateway, which receives it as a constructor arg.
-  const outboundRedactionConfig = {
-    enabled: yamlConfig.pii?.outbound_redaction?.enabled ?? true,
-    default: (yamlConfig.pii?.outbound_redaction?.default ?? 'block') as 'block' | 'allow',
-    // Normalize channel_policies: the YAML type allows `allow` to be optional on
-    // each entry, but OutboundRedactionConfig requires it. Default to [] per entry.
-    channel_policies: Object.fromEntries(
-      Object.entries(yamlConfig.pii?.outbound_redaction?.channel_policies ?? {}).map(
-        ([ch, policy]) => [ch, { allow: policy.allow ?? [] }],
-      ),
-    ),
-  };
   let piiRedactor: PiiRedactor;
+  let outboundRedactionConfig: OutboundRedactionSettings;
   try {
+    // Shared with test mode: defaults, and an unknown `default` refused.
+    outboundRedactionConfig = resolveOutboundRedactionConfig(yamlConfig.pii);
     piiRedactor = new PiiRedactor({
       config: outboundRedactionConfig,
       bus,

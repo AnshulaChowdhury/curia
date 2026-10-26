@@ -22,7 +22,7 @@ import type { SmsClient } from '../channels/sms/sms-client.js';
 import type { ApprovalDisplay } from '../autonomy/approval-delivery.js';
 import type { ActionLogRepo } from '../autonomy/action-log-repo.js';
 import type { AutonomyService } from '../autonomy/autonomy-service.js';
-import type { AutonomyGating } from '../autonomy/band-policy.js';
+import { FailOpenLimiter, type AutonomyGating } from '../autonomy/band-policy.js';
 import type { RelayBudget } from '../autonomy/relay-budget.js';
 import type { EventBus } from '../bus/bus.js';
 import type { IdentityGateMode } from '../config.js';
@@ -66,6 +66,40 @@ export interface SendRecorder {
   message(messageId: string): NylasMessage | undefined;
   /** What a held send will show the principal (ApprovalDelivery.registerDisplay). */
   display?(shortRef: string, display: ApprovalDisplay): void;
+  /**
+   * The band review's fail-open cap for the calling run. Production keeps one per process;
+   * on a shared test stack one run's judge failures would hold another run's sends. Absent or
+   * undefined: one cap for the stack.
+   */
+  limiter?(): FailOpenLimiter | undefined;
+  /**
+   * Where the fake mailbox keeps drafts for the calling run, so one run's send-draft never
+   * finds another's. Absent or undefined: one store for the stack.
+   */
+  drafts?(): Map<string, NylasMessage> | undefined;
+}
+
+/**
+ * The fail-open cap band review sees: the calling run's (SendRecorder.limiter), else one for
+ * the whole stack. Each call goes to the cap of the run that made it.
+ */
+export class PerRunFailOpenLimiter extends FailOpenLimiter {
+  private readonly fallback = new FailOpenLimiter();
+  constructor(private readonly current: () => FailOpenLimiter | undefined) {
+    super();
+  }
+  private target(): FailOpenLimiter {
+    return this.current() ?? this.fallback;
+  }
+  override tryAcquire(): { allowed: boolean; justTripped: boolean } {
+    return this.target().tryAcquire();
+  }
+  override recordJudgeSuccess(): void {
+    this.target().recordJudgeSuccess();
+  }
+  override isTripped(): boolean {
+    return this.target().isTripped();
+  }
 }
 
 /** A fake mailbox's failure for an id it does not hold: the 404 Nylas returns. */
@@ -108,10 +142,12 @@ export interface RecordingTransports {
 /**
  * The fakes. Each is a plain object with the methods the gateway calls, cast to the client's
  * type at this one boundary: nothing here can open a socket or make a request. Draft contents
- * live in memory, keyed by a random id, so send-draft replays what createDraft stored.
+ * live in memory (the calling run's store, SendRecorder.drafts), so send-draft replays what
+ * createDraft stored.
  */
 export function createRecordingTransports(recorder: SendRecorder, accountNames: readonly string[]): RecordingTransports {
-  const drafts = new Map<string, NylasMessage>();
+  const sharedDrafts = new Map<string, NylasMessage>();
+  const drafts = (): Map<string, NylasMessage> => recorder.drafts?.() ?? sharedDrafts;
   const asMessage = (id: string, options: SendEmailOptions): NylasMessage => ({
     id,
     threadId: `scenario-thread-${id}`,
@@ -148,14 +184,14 @@ export function createRecordingTransports(recorder: SendRecorder, accountNames: 
     createDraft: async (options: SendEmailOptions): Promise<NylasMessage> => {
       const draft = asMessage(`scenario-draft-${randomUUID()}`, options);
       emailSend('draft', draft);
-      drafts.set(draft.id, draft);
+      drafts().set(draft.id, draft);
       return draft;
     },
-    getDraft: async (draftId: string): Promise<NylasMessage | null> => drafts.get(draftId) ?? null,
+    getDraft: async (draftId: string): Promise<NylasMessage | null> => drafts().get(draftId) ?? null,
     sendDraft: async (draftId: string): Promise<NylasMessage> => {
-      const draft = drafts.get(draftId);
+      const draft = drafts().get(draftId);
       if (!draft) throw new ScenarioMailboxNotFound(`Draft ${draftId}`);
-      drafts.delete(draftId);
+      drafts().delete(draftId);
       const sent = { ...draft, id: `scenario-sent-${randomUUID()}` };
       emailSend('send', sent);
       return sent;

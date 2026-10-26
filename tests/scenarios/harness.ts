@@ -443,6 +443,9 @@ export async function createScenarioHarness(
       },
       message: (messageId) => currentScope()?.inboundMessages.get(messageId),
       display: (shortRef, shown) => { currentScope()?.approvalDisplays.set(shortRef, shown); },
+      // Each run's own fail-open cap (#2312).
+      limiter: () => currentScope()?.failOpen,
+      drafts: () => currentScope()?.drafts,
     },
     // approve-action's "the sole pending approval" means the run's own.
     wrapActionLog: (repo) => scopedActionLog(repo, currentScope),
@@ -723,6 +726,39 @@ export async function createScenarioHarness(
     }));
   }
 
+  /**
+   * The principal's `inbound.then` turn (#2312): an inbound from the principal's verified
+   * identity on its channel, in a conversation of its own filed under the run (its tool calls
+   * get the run's stubs, and its rows are the run's). The Dispatcher stamps it a live principal
+   * turn, so approve-action's elevated gate runs as in production.
+   */
+  async function runPrincipalTurn(
+    scenario: ScenarioCase,
+    turn: NonNullable<ScenarioCase['inbound']['then']>,
+    rootConversationId: string,
+    scope: SeedScope,
+    timeoutMs: number,
+  ): Promise<TurnOutcome> {
+    const sender = await resolveSender({ ...scenario, inbound: { ...scenario.inbound, from: 'principal', channel: turn.channel } }, stack);
+    if (typeof sender !== 'object' || !('channelId' in sender)) throw new Error('unreachable: inbound.then sender is not a channel sender');
+    const conversationId = sender.channelId === 'email' ? `email:scenario-then-${randomUUID()}` : `scenario-then-${randomUUID()}`;
+    scope.followOnConversations.add(conversationId);
+    controller.attach(rootConversationId, conversationId);
+    const waiter = capture.waitFor(conversationId, timeoutMs, COORDINATOR);
+    const delivery = bus.publish('channel', createInboundMessage({
+      conversationId,
+      channelId: sender.channelId,
+      senderId: sender.senderId,
+      content: turn.content,
+      ...(sender.channelId === 'email' ? { metadata: emailMetadata(sender.senderId, undefined, undefined, `scenario-msg-${randomUUID()}`) } : {}),
+      ...(sender.channelId === 'signal' ? { metadata: { isGroup: false } } : {}),
+      ...(sender.channelId === 'slack' ? { metadata: { isDm: true } } : {}),
+    }));
+    delivery.catch((err: unknown) => capture.fail(conversationId, err));
+    trackDelivery(delivery, conversationId);
+    return waiter;
+  }
+
   async function runOnce(
     scenario: ScenarioCase,
     runIndex: number,
@@ -858,6 +894,8 @@ export async function createScenarioHarness(
       let outcome: TurnOutcome;
       // Specialists still working when the run's own wait ran out (#2027).
       let stillWorking: string[] = [];
+      // The principal's `inbound.then` turn (#2312), when the case has one and it ran.
+      let thenOutcome: TurnOutcome | undefined;
       try {
         // Capture matches events by conversation id, so a second live turn is
         // not a second reply: it is mixed in or dropped. A follow-up that was
@@ -1058,6 +1096,12 @@ export async function createScenarioHarness(
           outcome = { ...outcome, error: followupError };
         }
         if (outcome.errorKind === 'timeout') stillWorking = controller.pendingDelegations(runConversationId);
+        if (inbound.then && outcome.error === undefined) {
+          // The first turn has replied; let its publish (and anything it set off) finish, so the
+          // principal's next message is a turn of its own, as it would be in production.
+          await settleWithin(delivery, timeoutMs);
+          thenOutcome = await runPrincipalTurn(scenario, inbound.then, runConversationId, scope, timeoutMs);
+        }
       } finally {
         // Before endRun resolves a waiting first-call, so the publisher sees
         // the follow-up is no longer armed.
@@ -1081,7 +1125,7 @@ export async function createScenarioHarness(
         process.stderr.write(`  [WARN] ${state.label}: a turn was still running ${CANCEL_SETTLE_MS / 1000}s after the run ended; its later spend is counted outside any run\n`);
       }
 
-      const merged = mergeCalls(inRunOrder(outcome.calls, trace, agent), stubbedCalls);
+      const merged = mergeCalls([...inRunOrder(outcome.calls, trace, agent), ...(thenOutcome?.calls ?? [])], stubbedCalls);
       // Read after the run's turns settled, before cleanup removes the rows (#2312).
       const gateway = scenario.throughGateway ? await readGatewayOutcome(stack, scenario, seeded, scope) : undefined;
       // A scoped view failing means the case ran without its premise (no block, no thread).
@@ -1090,9 +1134,13 @@ export async function createScenarioHarness(
       const timeoutKind = outcome.errorKind === 'timeout'
         ? (stillWorking.length > 0 ? 'delegate_wait' as const : 'run' as const)
         : undefined;
+      // Sends held for want of a reviewer test the judge's outage, not the agent (#2312).
+      const reviewerError = gateway?.reviewerFailedOpen
+        ? 'band review\'s fail-open cap tripped: the review judge failed on too many sends, so sends held for want of a reviewer'
+        : undefined;
       const error = timeoutKind === 'delegate_wait'
         ? `${outcome.error} — a specialist was still working (${[...new Set(stillWorking)].join(', ')}): the run's wait ran out before the delegate wait did`
-        : outcome.error ?? premiseError;
+        : outcome.error ?? (thenOutcome?.error ? `inbound.then turn: ${thenOutcome.error}` : undefined) ?? premiseError ?? reviewerError;
       result = {
         runIndex,
         inboundContent,
@@ -1109,6 +1157,7 @@ export async function createScenarioHarness(
         ...(injectionDrainPoints !== undefined ? { injectionDrainPoints: [...injectionDrainPoints] } : {}),
         ...(realDelegation ? { delegations: trace?.delegations ?? [] } : {}),
         ...(gateway ? { gateway } : {}),
+        ...(thenOutcome ? { then: { reply: thenOutcome.reply } } : {}),
         usage: state.usage.snapshot(),
         providerRetries: [],
       };
@@ -1217,6 +1266,16 @@ function emailMetadata(
     isAutoGenerated: email?.autoGenerated ?? false,
     autoGeneratedSignals: email?.autoGeneratedSignals ?? [],
   };
+}
+
+/** Wait for `work` to settle, but no longer than `maxMs`. Its failure is the caller's to report. */
+async function settleWithin(work: Promise<unknown>, maxMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    work.then(() => undefined, () => undefined),
+    new Promise<void>(resolve => { timer = setTimeout(resolve, maxMs); timer.unref(); }),
+  ]);
+  clearTimeout(timer);
 }
 
 /**

@@ -63,10 +63,10 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import * as path from 'node:path';
-import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveIdentityGateMode, resolveLateDeliveryConfig, resolveRelayBudgetConfig, resolveTasksConfig, resolveTurnInjectionConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
+import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveIdentityGateMode, resolveLateDeliveryConfig, resolveOutboundJudgeConfig, resolveOutboundRedactionConfig, resolveRelayBudgetConfig, resolveTasksConfig, resolveTurnInjectionConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
 import { ActionLogRepo } from '../autonomy/action-log-repo.js';
 import { ApprovalDelivery, type ApprovalDisplay } from '../autonomy/approval-delivery.js';
-import { FailOpenLimiter } from '../autonomy/band-policy.js';
+import { ApprovalTriggerService } from '../autonomy/approval-trigger.js';
 import { DisclosureDecisionRecorder, DisclosureDecisionsRepo } from '../autonomy/disclosure-decisions.js';
 import type { EscalationJudge } from '../autonomy/escalation-judge.js';
 import { RelayBudget } from '../autonomy/relay-budget.js';
@@ -82,7 +82,7 @@ import { OutboundLlmJudge, type JudgeConfig } from '../dispatch/outbound-judge.j
 import { PiiRedactor } from '../dispatch/pii-redactor.js';
 import { extractPromptExfiltrationMarkers } from '../dispatch/prompt-exfiltration-markers.js';
 import { parseExtraPiiPatterns } from '../pii/scrubber.js';
-import { createRecordingOutboundGateway, type SendRecorder } from './test-mode-sends.js';
+import { createRecordingOutboundGateway, PerRunFailOpenLimiter, type SendRecorder } from './test-mode-sends.js';
 import { createVerificationRuntime, type VerificationRuntime } from '../verification/index.js';
 import { createLogger, type Logger } from '../logger.js';
 import { createPool, type DbPool } from '../db/connection.js';
@@ -597,7 +597,7 @@ interface RecordingSends {
   gateway: OutboundGateway;
   executionOptions: Pick<
     NonNullable<ConstructorParameters<typeof ExecutionLayer>[2]>,
-    'actionLogRepo' | 'approvalDelivery' | 'disclosureDecisions' | 'escalationJudge' | 'gating' | 'sendEvidence'
+    'actionLogRepo' | 'approvalDelivery' | 'approvalTrigger' | 'disclosureDecisions' | 'escalationJudge' | 'gating' | 'sendEvidence'
   >;
   /** Task reads (getTask, project root) for outreach titles and band evidence. Never handed to agents. */
   taskReads: Pick<TaskRepo, 'getTask' | 'resolveProjectRootTaskId'>;
@@ -609,7 +609,8 @@ interface RecordingSends {
  *   - Recording transports and no outbound queue (test-mode-sends.ts).
  *   - No confidence pipeline or export controls on the gateway: both write rows a real
  *     instance shares (contact confidence, export events) for sends that never left.
- *   - The fail-open cap only logs when it trips; production also emails the principal.
+ *   - The fail-open cap is per run (SendRecorder.limiter), and only logs when it trips;
+ *     production keeps one per process and also emails the principal.
  *   - A judge whose config cannot be built is a warning, not a boot failure: the review then
  *     runs as production's does with that judge off (Gate C escalates ambiguous actions,
  *     band review holds).
@@ -648,24 +649,20 @@ function buildRecordingSends(deps: {
     escalationJudge = buildEscalationJudge({ yaml: yamlConfig.escalation?.judge, modelRegistry, providerRegistry, bus, logger });
   } catch (err) {
     if (!(err instanceof EscalationJudgeConfigError)) throw err;
-    warnings.push(`Escalation judge off for recorded sends: ${err.message}`);
+    warnings.push(`Escalation judge off for recorded sends (through_gateway cases only): ${err.message}`);
   }
 
   // The content filter's Stage 2 judge, from filter.llmJudge as production reads it.
+  // Production's resolution and validation (a bad timeout fails the boot, as in production).
   let outboundJudge: OutboundLlmJudge | undefined;
-  const judgeYaml = yamlConfig.filter?.llmJudge;
-  if (judgeYaml?.enabled ?? true) {
-    const judgeConfig: JudgeConfig = {
-      enabled: true,
-      model: judgeYaml?.model ?? 'claude-haiku-5-5',
-      timeoutMs: judgeYaml?.timeout_ms ?? 5000,
-      failMode: judgeYaml?.failMode ?? 'split',
-    };
+  const judgeSettings = resolveOutboundJudgeConfig(yamlConfig.filter);
+  if (judgeSettings.enabled) {
+    const judgeConfig: JudgeConfig = { ...judgeSettings, enabled: true };
     const provider = modelRegistry.isKnownModel(judgeConfig.model) ? modelRegistry.getProvider(judgeConfig.model) : undefined;
     if (provider && providerRegistry.has(provider)) {
       outboundJudge = new OutboundLlmJudge(new LLMProviderRouter(modelRegistry, providerRegistry), judgeConfig, bus, logger, modelRegistry);
     } else {
-      warnings.push(`Content-filter judge off for recorded sends: model '${judgeConfig.model}' has no registered provider`);
+      warnings.push(`Content-filter judge off for recorded sends (through_gateway cases only): model '${judgeConfig.model}' has no registered provider`);
     }
   }
 
@@ -688,15 +685,7 @@ function buildRecordingSends(deps: {
     ? parseExtraPiiPatterns(yamlConfig.pii?.extra_patterns ?? [], path.join(deps.configDir, 'default.yaml'))
     : [];
   const piiRedactor = new PiiRedactor({
-    config: {
-      enabled: yamlConfig.pii?.outbound_redaction?.enabled ?? true,
-      default: (yamlConfig.pii?.outbound_redaction?.default ?? 'block') as 'block' | 'allow',
-      channel_policies: Object.fromEntries(
-        Object.entries(yamlConfig.pii?.outbound_redaction?.channel_policies ?? {}).map(
-          ([ch, policy]) => [ch, { allow: policy.allow ?? [] }],
-        ),
-      ),
-    },
+    config: resolveOutboundRedactionConfig(yamlConfig.pii),
     bus,
     logger,
     extraPatterns,
@@ -724,7 +713,9 @@ function buildRecordingSends(deps: {
     judge: escalationJudge,
     nonOrgDomains: deps.outreachNonOrgDomains,
     evidence: sendEvidence,
-    limiter: new FailOpenLimiter(),
+    // Per run when the recorder says whose run a send is: one run's judge failures must not
+    // hold another's sends.
+    limiter: new PerRunFailOpenLimiter(() => deps.recorder.limiter?.()),
     onLimiterTripped: async () => {
       logger.error('band review (test mode): fail-open cap tripped — sends are holding for approval');
     },
@@ -775,7 +766,16 @@ function buildRecordingSends(deps: {
   gateway.setApprovalDelivery(approvalDelivery);
   return {
     gateway,
-    executionOptions: { actionLogRepo, approvalDelivery, disclosureDecisions, escalationJudge, gating, sendEvidence },
+    executionOptions: {
+      actionLogRepo,
+      approvalDelivery,
+      // The ExecutionLayer's gates (A, B, C) raise their approvals through it, as in production.
+      approvalTrigger: new ApprovalTriggerService(actionLogRepo, logger, bus, approvalDelivery),
+      disclosureDecisions,
+      escalationJudge,
+      gating,
+      sendEvidence,
+    },
     taskReads,
   };
 }

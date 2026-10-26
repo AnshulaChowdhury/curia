@@ -1,0 +1,205 @@
+// The test-mode stack with recordSends (#2312), against a real database. It boots with the
+// recording review layer the scenario suite's through_gateway cases use, and keeps the
+// promises of tests/integration/test-mode-stack.test.ts for everything else:
+//   1. The layer agents call keeps the no-send gateway.
+//   2. A send on the review layer runs production's handler and gateway and reaches only the
+//      recorder: no real client, no fetch, no outbound_queue row.
+//   3. A gated send writes production's approval row (Gate A through the approval trigger).
+// Judges are off (offline LLM). Rows it writes are removed by their conversation and id.
+// Skips without DATABASE_URL; refuses any database but curia_test.
+
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
+import pg from 'pg';
+import * as path from 'node:path';
+import { loadYamlConfig } from '../../src/config.js';
+import type { ExecutionLayer } from '../../src/skills/execution.js';
+import { createTestModeStack, runWithAutonomyFixture, type TestModeStack } from '../../src/startup/test-mode-stack.js';
+import type { RecordedSend } from '../../src/startup/test-mode-sends.js';
+import { requireCuriaTestDatabase } from './require-test-db.js';
+
+const DATABASE_URL = process.env.DATABASE_URL;
+const describeIf = DATABASE_URL ? describe : describe.skip;
+const { Pool } = pg;
+
+describeIf('test-mode stack with recordSends', () => {
+  let stack: TestModeStack | undefined;
+  let review: ExecutionLayer | undefined;
+  const sends: RecordedSend[] = [];
+  let agentContactWasPresent = true;
+  let agentNodeWasPresent = true;
+  let onTestDb = false;
+  const conversation = `scenario-recording-${randomUUID()}`;
+  const contactIds: string[] = [];
+
+  beforeAll(async () => {
+    const probe = new Pool({ connectionString: DATABASE_URL });
+    try {
+      await requireCuriaTestDatabase(probe);
+      onTestDb = true;
+      const { rows } = await probe.query<{ contact: boolean; node: boolean }>(
+        `SELECT EXISTS (SELECT 1 FROM contacts WHERE system_role = 'agent') AS contact,
+                EXISTS (SELECT 1 FROM kg_nodes WHERE (properties->>'is_agent') = 'true') AS node`,
+      );
+      agentContactWasPresent = rows[0]?.contact === true;
+      agentNodeWasPresent = rows[0]?.node === true;
+    } finally {
+      await probe.end();
+    }
+    // Judges off: offline providers would fail every review call.
+    const yamlConfig = loadYamlConfig(path.resolve(import.meta.dirname, '../../config'));
+    yamlConfig.escalation = { ...yamlConfig.escalation, judge: { ...yamlConfig.escalation?.judge, enabled: false } };
+    yamlConfig.filter = { ...yamlConfig.filter, llmJudge: { ...yamlConfig.filter?.llmJudge, enabled: false } };
+    stack = await createTestModeStack({
+      llm: 'offline',
+      enablement: 'all',
+      yamlConfig,
+      recordSends: { record: (send) => { sends.push(send); }, message: () => undefined },
+      wrapOutboundContext: (service) => service,
+      wrapExecutionLayer: (layer, reviewLayer) => {
+        review = reviewLayer;
+        return layer;
+      },
+    });
+  }, 120_000);
+
+  afterAll(async () => {
+    try {
+      if (onTestDb && stack) {
+        await stack.pool.query('DELETE FROM autonomy_action_log WHERE conversation_id = $1', [conversation]);
+        await stack.pool.query('DELETE FROM task_outreach WHERE conversation_id = $1', [conversation]);
+        for (const id of contactIds) await stack.pool.query('DELETE FROM contacts WHERE id = $1', [id]);
+      }
+      if (onTestDb && (!agentContactWasPresent || !agentNodeWasPresent)) {
+        const pool = new Pool({ connectionString: DATABASE_URL });
+        try {
+          if (!agentContactWasPresent) await pool.query(`DELETE FROM contacts WHERE system_role = 'agent'`);
+          if (!agentNodeWasPresent) {
+            await pool.query(
+              `DELETE FROM kg_nodes WHERE (properties->>'is_agent') = 'true'
+                 AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.kg_node_id = kg_nodes.id)`,
+            );
+          }
+        } finally {
+          await pool.end();
+        }
+      }
+    } finally {
+      await stack?.shutdown();
+    }
+  });
+
+  async function recipient(): Promise<string> {
+    const contact = await stack!.contactService.createContact({ displayName: 'Recording recipient', source: 'ceo_stated' });
+    contactIds.push(contact.id);
+    await stack!.contactService.linkIdentity({
+      contactId: contact.id, channel: 'email', channelIdentifier: `rec-${randomUUID()}@vendorco.test`, source: 'ceo_stated', verified: true,
+    });
+    return contact.id;
+  }
+
+  const queued = async (): Promise<number> =>
+    Number((await stack!.pool.query<{ n: string }>('SELECT count(*)::text AS n FROM outbound_queue')).rows[0]!.n);
+
+  it('hands the wrapper a review layer, and keeps the no-send gateway on the layer agents call', () => {
+    expect(review).toBeDefined();
+    expect(review).not.toBe(stack!.executionLayer);
+    expect(stack!.outboundGateway.listAccountIds()).toEqual([]);
+  });
+
+  it('runs email-send through the review and records it, with no network call and no queued row', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('network call in test mode'));
+    try {
+      const before = await queued();
+      const to = await recipient();
+      const principal = { contactId: stack!.principalContactId ?? randomUUID(), systemRole: 'principal', channel: 'signal', initiatedAt: new Date().toISOString(), tier: 'principal', authenticated: true };
+      const result = await review!.invoke('email-send', { to, subject: 'Forms', body: 'Here are the forms.' }, undefined, {
+        agentId: 'coordinator', channelId: 'signal', conversationId: conversation, taskEventId: randomUUID(), liveTurn: true,
+        taskMetadata: { originator: principal },
+      });
+      expect(result).toMatchObject({ success: true });
+      expect(sends).toEqual([expect.objectContaining({ channel: 'email', kind: 'send', subject: 'Forms' })]);
+      expect(sends[0]!.to[0]).toMatch(/@vendorco\.test$/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(await queued()).toBe(before);
+      // The base layer still has no gateway to send with.
+      const base = await stack!.executionLayer.invoke('email-send', { to, subject: 'Hi', body: 'Hello' }, undefined, {
+        agentId: 'coordinator', channelId: 'cli', conversationId: conversation,
+      });
+      expect(base.success).toBe(false);
+      expect(sends).toHaveLength(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('holds a send a known contact started below the score, writing production\'s approval row', async () => {
+    const to = await recipient();
+    const result = await runWithAutonomyFixture({ score: 50, gating: 'tier' }, () => review!.invoke('email-send', { to, subject: 'Quote', body: 'Our quote.' }, undefined, {
+      agentId: 'coordinator', channelId: 'email', conversationId: conversation, taskEventId: randomUUID(),
+      taskMetadata: { originator: { contactId: to, systemRole: null, channel: 'email', initiatedAt: new Date().toISOString(), tier: 'known' } },
+    }));
+    expect(result.success).toBe(false);
+    const { rows } = await stack!.pool.query<{ outcome: string; tool_name: string; short_ref: string | null }>(
+      'SELECT outcome, skill_name AS tool_name, short_ref FROM autonomy_action_log WHERE conversation_id = $1', [conversation],
+    );
+    expect(rows).toEqual([expect.objectContaining({ outcome: 'pending_approval', tool_name: 'email-send' })]);
+    expect(rows[0]!.short_ref).not.toBeNull();
+    expect(sends.filter(s => s.subject === 'Quote')).toEqual([]);
+  });
+
+  it('seeds a trusted contact, a standing task and outreach, reads the run\'s gateway outcome and removes it all', async () => {
+    const { seedRun, readGatewayOutcome, cleanupRun, SeedScope } = await import('../scenarios/seed.js');
+    const { loadScenarioCase } = await import('../scenarios/loader.js');
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(path.join(tmpdir(), 'recording-'));
+    const tag = randomUUID().slice(0, 8);
+    try {
+      const file = path.join(dir, 'case.yaml');
+      writeFileSync(file, `
+name: recording seeds
+through_gateway: true
+seed:
+  contacts:
+    - { key: pat, display_name: Pat Seed ${tag}, tier: trusted, channel: email, identifier: pat-${tag}@vendorco.test }
+  tasks:
+    - { key: forms, title: Vendor forms ${tag}, originator: principal }
+  outreach:
+    - { key: sent, task: forms, via: email, domains: [vendorco.test], contacts: [pat], summary: Sent forms, confirmed: true }
+inbound: { from: pat, content: hi }
+expected_behaviors:
+  - { id: a, description: x, check: { held: true } }
+`);
+      const scenario = loadScenarioCase(file);
+      if (!stack!.principalContactId) return; // the principal-originated task needs one
+      const scope = new SeedScope();
+      scope.rootConversation = conversation;
+      const seeded = await seedRun(scenario, { stack: stack!, outboundContext: {} as never, scope });
+      let cleaned = false;
+      try {
+        const contact = await stack!.contactService.getContact(seeded.refs.get('contact:pat')!);
+        expect(contact?.tier).toBe('trusted');
+        const outcome = await readGatewayOutcome(stack!, scenario, seeded, scope);
+        // The held send from the test above, in this conversation. The principal's send above
+        // recorded confirmed outreach for it (the real TaskOutreachService); the seeded row,
+        // untouched, is not counted.
+        expect(outcome.holds).toEqual([expect.objectContaining({ toolName: 'email-send', outcome: 'pending_approval' })]);
+        expect(outcome.outreach).toEqual([expect.objectContaining({ domains: ['vendorco.test'], confirmed: true, seeded: false })]);
+        await cleanupRun(stack!, seeded, scope, conversation);
+        cleaned = true;
+        const left = await stack!.pool.query<{ n: string }>(
+          `SELECT ((SELECT count(*) FROM tasks WHERE id = ANY($1::uuid[])) + (SELECT count(*) FROM task_outreach WHERE id = ANY($2::uuid[]))
+                  + (SELECT count(*) FROM autonomy_action_log WHERE conversation_id = $3))::text AS n`,
+          [seeded.taskIds, seeded.outreachIds, conversation],
+        );
+        expect(left.rows[0]!.n).toBe('0');
+      } finally {
+        // A failed assertion above must not leave the seeded rows behind.
+        if (!cleaned) await cleanupRun(stack!, seeded, scope, conversation);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

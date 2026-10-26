@@ -35,6 +35,7 @@ import type { ApprovalDisplay } from '../../src/autonomy/approval-delivery.js';
 import type { NylasMessage } from '../../src/channels/email/nylas-client.js';
 import type { TaskOriginator } from '../../src/contacts/types.js';
 import { buildInitialTaskProgress } from '../../src/db/task-repo.js';
+import { FailOpenLimiter } from '../../src/autonomy/band-policy.js';
 import type { TaskOutreachRepo, TaskOutreachRow } from '../../src/dispatch/task-outreach.js';
 import type { RecordedSend } from '../../src/startup/test-mode-sends.js';
 import type { GatewayOutcome, ScenarioCase, SeedContact, SeedOutreach, SeedPrincipalIdentity, SeedTask } from './types.js';
@@ -69,6 +70,8 @@ export class SeedScope {
   readonly threadIds = new Set<string>();
   /** Conversations real specialists ran in for this run (#2027); cleaned with the run's own. */
   readonly specialistConversations = new Set<string>();
+  /** The run's later principal turns (`inbound.then`, #2312); cleaned with the run's own. */
+  readonly followOnConversations = new Set<string>();
   /** Sign-in verifications the run seeded (#2017), plus any opened during it. */
   readonly verificationIds = new Set<string>();
   /** Browser session ids the run's verification block reads as alive (#2017). */
@@ -94,6 +97,15 @@ export class SeedScope {
   /** Outreach rows the run seeded, with their domains and addresses as seeded (#2312). */
   readonly seededOutreach = new Map<string, { domains: string[]; addresses: string[] }>();
   /**
+   * The band review's fail-open cap for this run (#2312): another run's judge failures never
+   * hold this run's sends. Tripped means the run's sends held for want of a reviewer.
+   */
+  failOpen = new FailOpenLimiter();
+  /** The fake mailbox's drafts for this run (#2312). */
+  readonly drafts = new Map<string, NylasMessage>();
+  /** Action-log row ids the run wrote or read as its own (#2312): the only ids its delivery may claim. */
+  readonly approvalRowIds = new Set<number>();
+  /**
    * Failures inside the scoped views. The Dispatcher and runtime log such a failure
    * and carry on WITHOUT the block — a case would then be scored on a premise it never
    * had — so the harness fails the run when this is non-empty.
@@ -104,6 +116,7 @@ export class SeedScope {
     this.entryIds.clear();
     this.threadIds.clear();
     this.specialistConversations.clear();
+    this.followOnConversations.clear();
     this.verificationIds.clear();
     this.aliveSessions.clear();
     this.principalWroteTo.clear();
@@ -114,6 +127,9 @@ export class SeedScope {
     this.inboundMessages.clear();
     this.taskIds.clear();
     this.seededOutreach.clear();
+    this.failOpen = new FailOpenLimiter();
+    this.approvalRowIds.clear();
+    this.drafts.clear();
     this.errors.length = 0;
   }
 }
@@ -123,25 +139,50 @@ export type CurrentScope = () => SeedScope | undefined;
 
 /** The conversations whose rows are the run's: its own and its specialists' (#2027, #2312). */
 export function runConversations(scope: SeedScope): string[] {
-  return [...(scope.rootConversation ? [scope.rootConversation] : []), ...scope.specialistConversations];
+  return [
+    ...(scope.rootConversation ? [scope.rootConversation] : []),
+    ...scope.specialistConversations,
+    ...scope.followOnConversations,
+  ];
 }
 
 /**
- * The action log narrowed for approve-action and deny-action (#2312). Production resolves a
- * missing reference to "the sole pending approval" across the whole table, and a reference
- * against every row, so one run could act on another's approval (or a real instance's). Here a
- * missing reference means the run's sole pending approval, and a reference that resolves to a
- * row outside the run reads as not found. Everything else, inserts included, is production's.
+ * The action log narrowed for approve-action, deny-action and approval delivery (#2312).
+ * Production resolves a missing reference to "the sole pending approval" across the whole
+ * table, and a reference or number against every row, so one run could act on another's
+ * approval (or a real instance's). Here a missing reference means the run's sole pending
+ * approval; a reference, number or short ref that resolves to a row outside the run reads as
+ * not found; and the delivery writes keyed by row id (claim, release, bind) touch only rows the
+ * run wrote or read as its own. Inserts and everything else are production's.
  */
 export function scopedActionLog(real: ActionLogRepo, currentScope: CurrentScope): ActionLogRepo {
-  const owned = (row: ActionLogRow, scope: SeedScope | undefined): boolean =>
-    scope !== undefined && row.conversationId !== null && runConversations(scope).includes(row.conversationId);
+  const owned = (row: ActionLogRow, scope: SeedScope | undefined): boolean => {
+    const mine = scope !== undefined && row.conversationId !== null && runConversations(scope).includes(row.conversationId);
+    if (mine) scope.approvalRowIds.add(row.id);
+    return mine;
+  };
+  const ownsId = (id: number): boolean => currentScope()?.approvalRowIds.has(id) ?? false;
   const runPending = async (): Promise<ActionLogRow[]> => {
     const scope = currentScope();
     return (await real.findAllPending()).filter(r => owned(r, scope));
   };
+  const ownRow = (row: ActionLogRow | null): ActionLogRow | null => (row && owned(row, currentScope()) ? row : null);
   return Object.assign(Object.create(real) as ActionLogRepo, {
+    insert: async (row: Parameters<ActionLogRepo['insert']>[0]): Promise<number> => {
+      const id = await real.insert(row);
+      const scope = currentScope();
+      if (scope && row.conversationId !== undefined && runConversations(scope).includes(row.conversationId)) scope.approvalRowIds.add(id);
+      return id;
+    },
     findAllPending: runPending,
+    findPendingByShortRef: async (shortRef: string) => ownRow(await real.findPendingByShortRef(shortRef)),
+    findPendingByApprovalNumber: async (n: number) => ownRow(await real.findPendingByApprovalNumber(n)),
+    claimNotification: async (id: number): Promise<boolean> => (ownsId(id) ? real.claimNotification(id) : false),
+    releaseNotification: async (id: number): Promise<void> => {
+      if (ownsId(id)) await real.releaseNotification(id);
+    },
+    bindDeliveryMessage: async (...args: Parameters<ActionLogRepo['bindDeliveryMessage']>): Promise<boolean> =>
+      (ownsId(args[0]) ? real.bindDeliveryMessage(...args) : false),
     resolvePending: async (ref?: string): Promise<ResolveResult> => {
       if (ref === undefined) {
         const pending = await runPending();
@@ -904,7 +945,8 @@ export async function cleanupRun(
   if (conversationId) {
     await attempt(() => cleanupScenarioConversation(stack.pool, conversationId));
   }
-  const specialists = [...scope.specialistConversations];
+  // A later principal turn's conversation is cleaned like a specialist's.
+  const specialists = [...scope.specialistConversations, ...scope.followOnConversations];
   for (const specialist of specialists) {
     await attempt(() => cleanupScenarioConversation(stack.pool, specialist));
   }
@@ -1068,7 +1110,7 @@ export async function readGatewayOutcome(stack: TestModeStack, scenario: Scenari
   const holds = await stack.pool.query<{
     short_ref: string; approval_number: number | null; tool_name: string; outcome: string; description: string | null;
   }>(
-    `SELECT short_ref, approval_number, tool_name, outcome, description FROM autonomy_action_log
+    `SELECT short_ref, approval_number, skill_name AS tool_name, outcome, description FROM autonomy_action_log
       WHERE conversation_id = ANY($1::text[]) AND short_ref IS NOT NULL AND parent_action_id IS NULL
       ORDER BY id`,
     [conversations],
@@ -1115,5 +1157,6 @@ export async function readGatewayOutcome(stack: TestModeStack, scenario: Scenari
       return [{ domains: r.domains, addresses: r.addresses, confirmed: r.confirmed, via: r.via, seeded: seededRow !== undefined }];
     }),
     decisions: decisions.rows.map(r => ({ label: r.label, decision: r.decision })),
+    reviewerFailedOpen: scope.failOpen.isTripped(),
   };
 }

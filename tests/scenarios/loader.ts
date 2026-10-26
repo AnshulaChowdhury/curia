@@ -25,6 +25,7 @@ import {
   type ScenarioCase,
   type ScenarioFollowup,
   type ScenarioInbound,
+  type ScenarioPrincipalTurn,
   type ScenarioWakeTask,
   type SeedBullpenThread,
   type SeedContact,
@@ -87,7 +88,8 @@ const ENTRY_KEYS = ['key', 'channel', 'agent', 'content', 'expected_reply', 'del
 const RESUME_KEYS = ['agent', 'original_task', 'context'] as const;
 const REPLY_KEYS = ['from', 'content'] as const;
 const THREAD_KEYS = ['key', 'topic', 'creator', 'participants', 'content', 'mentions'] as const;
-const INBOUND_KEYS = ['from', 'channel', 'content', 'thread', 'author', 'requester', 'email', 'task', 'followup'] as const;
+const INBOUND_KEYS = ['from', 'channel', 'content', 'thread', 'author', 'requester', 'email', 'task', 'followup', 'then'] as const;
+const THEN_KEYS = ['content', 'channel'] as const;
 const FOLLOWUP_KEYS = ['after', 'from', 'content', 'channel'] as const;
 /** A follow-up held this long still releases the first tool, so a flag-off run can finish. */
 const FOLLOWUP_MAX_DELAY_MS = 120_000;
@@ -98,6 +100,14 @@ const AUTONOMY_GATINGS = ['band', 'tier'] as const;
 const ENVELOPE_TOKENS = ['curia', 'principal'];
 const WAKE_TASK_KEYS = ['id', 'title', 'intent', 'notes', 'tags'] as const;
 const WAKE_NOTE_KEYS = ['at', 'note'] as const;
+/**
+ * A third party's fixture address or domain: under any `.test` name (RFC 6761 reserves the
+ * TLD, so none is real). Distinct names give distinct registrable domains, so an org-domain
+ * outreach link can tell fixture organizations apart (#2312). The principal stays under
+ * example.test.
+ */
+const TEST_DOMAIN = /^([a-z0-9-]+\.)+test$/i;
+const TEST_ADDRESS = /^[^@\s]+@([a-z0-9-]+\.)+test$/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STUB_KEYS = ['match', 'agent', 'return', 'error'] as const;
 const BEHAVIOR_KEYS = ['id', 'weight', 'description', 'check'] as const;
@@ -611,10 +621,10 @@ function parseOutreach(raw: Raw, file: string): SeedOutreach[] {
     };
     // Fixtures never name a real organization or person.
     for (const d of row.domains) {
-      if (!/^([a-z0-9-]+\.)*example\.test$/.test(d)) throw new CaseError(file, `${where}: domain '${d}' must be under example.test`);
+      if (!TEST_DOMAIN.test(d)) throw new CaseError(file, `${where}: domain '${d}' must be a .test name`);
     }
     for (const a of row.addresses) {
-      if (!/^[^@\s]+@([a-z0-9-]+\.)*example\.test$/.test(a)) throw new CaseError(file, `${where}: address '${a}' must be under example.test`);
+      if (!TEST_ADDRESS.test(a)) throw new CaseError(file, `${where}: address '${a}' must be under a .test name`);
     }
     if (row.domains.length === 0 && row.addresses.length === 0 && row.contacts.length === 0) {
       throw new CaseError(file, `${where}: name at least one of domains, addresses or contacts (a reply must have something to match)`);
@@ -704,7 +714,20 @@ function parseInbound(raw: unknown, file: string): ScenarioInbound {
         }
       : {}),
     ...(raw['followup'] !== undefined ? { followup: parseFollowup(raw['followup'], file, from) } : {}),
+    ...(raw['then'] !== undefined ? { then: parseThen(raw['then'], file) } : {}),
   };
+}
+
+/** `inbound.then` (#2312): the principal's next turn, on a channel with a verified identity. */
+function parseThen(raw: unknown, file: string): ScenarioPrincipalTurn {
+  if (!isObject(raw)) throw new CaseError(file, `inbound.then must be a mapping {content, channel}`);
+  onlyKeys(raw, THEN_KEYS, file, 'inbound.then');
+  const channel = optStr(raw, 'channel', file, 'inbound.then') ?? 'signal';
+  // A live principal turn comes from a verified identity; a console channel has none.
+  if (PRINCIPAL_LOCAL_CHANNELS.includes(channel)) {
+    throw new CaseError(file, `inbound.then.channel must be a channel the principal has a verified identity on (not '${channel}')`);
+  }
+  return { content: str(raw, 'content', file, 'inbound.then'), channel };
 }
 
 function parseFollowup(raw: unknown, file: string, inboundFrom: string): ScenarioFollowup {
@@ -1033,7 +1056,7 @@ function parseAutonomy(raw: Raw, file: string): AutonomyFixture | undefined {
 /**
  * An email envelope (inbound.email.to / cc) names Curia exactly once: it received the
  * message, as a To or a CC. Every other entry is the principal, a seeded contact or an
- * address under example.test.
+ * address under a .test name.
  */
 function validateEnvelope(scenario: ScenarioCase, file: string): void {
   const { to, cc } = scenario.inbound.email ?? {};
@@ -1053,8 +1076,8 @@ function validateEnvelope(scenario: ScenarioCase, file: string): void {
   const contactKeys = new Set(scenario.seed.contacts.map(c => c.key));
   for (const token of all) {
     if (ENVELOPE_TOKENS.includes(token) || contactKeys.has(token)) continue;
-    if (!/^[^@\s]+@([a-z0-9-]+\.)*example\.test$/i.test(token)) {
-      throw new CaseError(file, `inbound.email: '${token}' is not curia, principal, a seeded contact key, or an address under example.test`);
+    if (!TEST_ADDRESS.test(token)) {
+      throw new CaseError(file, `inbound.email: '${token}' is not curia, principal, a seeded contact key, or an address under a .test name`);
     }
   }
 }
@@ -1160,8 +1183,8 @@ function validateReferences(scenario: ScenarioCase, file: string): void {
   }
   // Fixture contacts must never collide with a real person's address.
   for (const c of scenario.seed.contacts) {
-    if (c.channel === 'email' && !/@([a-z0-9-]+\.)*example\.test$/i.test(c.identifier)) {
-      throw new CaseError(file, `seed contact '${c.key}': email identifiers must be under example.test`);
+    if (c.channel === 'email' && !TEST_ADDRESS.test(c.identifier)) {
+      throw new CaseError(file, `seed contact '${c.key}': email identifiers must be under a .test name (e.g. example.test)`);
     }
   }
 
@@ -1218,6 +1241,9 @@ function validateReferences(scenario: ScenarioCase, file: string): void {
   }
 
   const follow = scenario.inbound.followup;
+  if (scenario.inbound.then && toSpecialist) {
+    throw new CaseError(file, `inbound.then is a principal turn to the coordinator; a case for '${scenario.agent}' cannot take one`);
+  }
   if (follow && follow.from !== 'principal') {
     const contact = scenario.seed.contacts.find(c => c.key === follow.from);
     if (!contact) throw new CaseError(file, `inbound.followup.from '${follow.from}' is not principal or a seeded contact`);

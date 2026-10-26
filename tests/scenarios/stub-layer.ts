@@ -171,6 +171,11 @@ export interface StubController {
   beginRun(stubs: Record<string, ToolStub[]>, conversationId: string, options?: { realDelegation?: boolean; throughGateway?: boolean }): void;
   /** Close the conversation's run (and its specialists' conversations) and return its calls in order. */
   endRun(conversationId: string): StubbedCall[];
+  /**
+   * File `conversationId` under the open run of `rootConversationId` (#2312): an `inbound.then`
+   * principal turn. Its calls get the run's stubs and are recorded with the run's.
+   */
+  attach(rootConversationId: string, conversationId: string): void;
   /** The conversation of the open run `conversationId` belongs to: itself, or a specialist's run's root. */
   rootOf(conversationId: string): string | undefined;
   /**
@@ -405,6 +410,14 @@ export function createStubController(
         firstCall: deferredVoid(),
         gateOpened: false,
       });
+    },
+    attach(rootConversationId, conversationId) {
+      const run = runs.get(rootConversationId);
+      if (!run) throw new Error(`StubController.attach: no open run for ${rootConversationId}`);
+      if (runFor(conversationId)) throw new Error(`StubController.attach: ${conversationId} already belongs to a run`);
+      delegated.set(conversationId, run);
+      // endRun releases it with the run's specialists.
+      run.specialists.add(conversationId);
     },
     holdFirstCall(conversationId, until) {
       const run = runs.get(conversationId);

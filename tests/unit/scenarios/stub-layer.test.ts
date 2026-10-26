@@ -726,3 +726,18 @@ describe('a through-gateway run on a stack without a review layer', () => {
     controller.endRun('scenario-1');
   });
 });
+
+describe('attach (#2312: inbound.then)', () => {
+  it('files a later conversation under the open run: same stubs, calls recorded with the run, released at endRun', async () => {
+    const { layer, controller } = setup();
+    controller.beginRun({ 'email-send': [{ match: {}, return: { sent: true } }] }, 'scenario-1');
+    controller.attach('scenario-1', 'scenario-then-1');
+    expect(controller.rootOf('scenario-then-1')).toBe('scenario-1');
+    expect(await layer.invoke('email-send', {}, undefined, { agentId: 'coordinator', conversationId: 'scenario-then-1' }))
+      .toEqual({ success: true, data: { sent: true } });
+    expect(() => controller.attach('scenario-1', 'scenario-then-1')).toThrow(/already belongs/);
+    expect(controller.endRun('scenario-1').map(c => c.toolName)).toEqual(['email-send']);
+    expect(controller.rootOf('scenario-then-1')).toBeUndefined();
+    expect(() => controller.attach('scenario-1', 'scenario-then-2')).toThrow(/no open run/);
+  });
+});
