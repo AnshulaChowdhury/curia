@@ -73,7 +73,7 @@ import {
   type TurnOutcome,
 } from '../shared/turn-capture.js';
 import { internalNamesFor } from './assertions.js';
-import { isTextFinishCall, turnStartDrainError } from './followup-exit.js';
+import { publishFollowupOnTextFinish, turnStartDrainError, type TextFinishSlot } from './followup-exit.js';
 import { createDelegationCapture, inRunOrder, type DelegationCapture, type DelegationTrace } from './delegation-capture.js';
 import { discoverableTools } from './discovery.js';
 import { applyReach } from './reach.js';
@@ -487,11 +487,7 @@ export async function createScenarioHarness(
   // A text llm.call is awaited before the runtime's exit hook. The follow-up
   // for a reply with no tool call is published from that subscriber, so the
   // queue is full when closeIfIdle runs and the correction drains at exit.
-  const exitSlots = new Map<string, {
-    agentId: string;
-    claim: () => boolean;
-    publish: () => Promise<void>;
-  }>();
+  const exitSlots = new Map<string, TextFinishSlot>();
   // Bullpen mentions reach the coordinator the way they do in production.
   new BullpenDispatcher(bus, logger, stack.bullpenService, stack.agentRegistry).register();
 
@@ -504,17 +500,10 @@ export async function createScenarioHarness(
   // the llm.call delivery until the follow-up is queued. A throw here would be
   // swallowed by the runtime's telemetry catch, and the exit hook would then
   // see an empty queue, so the failure is recorded on the run instead.
-  bus.subscribe('llm.call', 'system', async (event) => {
-    if (event.type !== 'llm.call' || !isTextFinishCall(event)) return;
-    const slot = exitSlots.get(event.payload.conversationId);
-    if (!slot || event.payload.agentId !== slot.agentId) return;
-    if (!slot.claim()) return;
-    try {
-      await slot.publish();
-    } catch (err) {
-      capture.fail(event.payload.conversationId, err);
-    }
-  });
+  bus.subscribe('llm.call', 'system', (event) =>
+    publishFollowupOnTextFinish(event, exitSlots, (conversationId, err) => {
+      capture.fail(conversationId, err);
+    }));
   // Drain points live on the run result. A turn_start drain means the
   // correction joined before the model had chosen, so the run fails here
   // instead of depending on log level to notice it (#2018).

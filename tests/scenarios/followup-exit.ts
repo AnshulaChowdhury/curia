@@ -9,6 +9,37 @@
 
 import type { BusEvent, InjectionDrainPoint } from '../../src/bus/events.js';
 
+/** The per-conversation follow-up the harness publishes from a text llm.call. */
+export interface TextFinishSlot {
+  agentId: string;
+  /** True once, so a later text finish does not publish a second follow-up. */
+  claim: () => boolean;
+  publish: () => Promise<void>;
+}
+
+/**
+ * The scenario harness's `llm.call` subscriber. A text finish publishes the
+ * follow-up before the runtime's exit hook, so the drain is `exit`. A tool
+ * call is not this signal. A throw is recorded on the run: the runtime
+ * swallows a subscriber error and would otherwise miss the queue.
+ */
+export async function publishFollowupOnTextFinish(
+  event: BusEvent,
+  slots: ReadonlyMap<string, TextFinishSlot>,
+  fail: (conversationId: string, err: unknown) => void,
+): Promise<void> {
+  if (event.type !== 'llm.call' || !isTextFinishCall(event)) return;
+  const conversationId = event.payload.conversationId;
+  const slot = slots.get(conversationId);
+  if (!slot || event.payload.agentId !== slot.agentId) return;
+  if (!slot.claim()) return;
+  try {
+    await slot.publish();
+  } catch (err) {
+    fail(conversationId, err);
+  }
+}
+
 /** True when this llm.call is a text finish, the step immediately before the exit hook. */
 export function isTextFinishCall(event: BusEvent): boolean {
   if (event.type !== 'llm.call') return false;
