@@ -15,7 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
-- **Agenda-and-minutes voice design** — WIP doc for agenda-driven calls and async structuring. 
+- **Agenda-and-minutes voice design** — WIP doc for agenda-driven calls and async structuring.
 - **Ant Farm video-call design** — design doc for replacing the Phaser office with a call view. (#2127)
 - **Turn lanes** — per-conversation lock and injection config, on in the shipped file. (#2018)
 - **Turn lane wiring** — a coordinator conversation has one holder. (#2018)
