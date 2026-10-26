@@ -1,7 +1,8 @@
 // band-send-review.test.ts — the gateway's review of a send under band gating (#2159).
 
 import { describe, expect, it, vi } from 'vitest';
-import { BandSendReview, removeQuoted, type BandReviewInput } from '../../../src/dispatch/band-send-review.js';
+import * as bandReviewModule from '../../../src/dispatch/band-send-review.js';
+import { BandSendReview, BLOCK_REASON, type BandReviewInput } from '../../../src/dispatch/band-send-review.js';
 import { FailOpenLimiter } from '../../../src/autonomy/band-policy.js';
 import type { BriefVerdict } from '../../../src/autonomy/judge-brief.js';
 import { createSilentLogger } from '../../../src/logger.js';
@@ -27,24 +28,10 @@ const base: BandReviewInput = {
 const clean: BriefVerdict = { ok: true, purpose: 'serving', speaksAsPrincipal: false, unsupportedClaims: [], unnecessaryItems: [], reason: 'ok' };
 const CLAIM = 'I am out of office until the 13th.';
 
-describe('removeQuoted', () => {
-  it('removes each quoted sentence and tidies spacing', () => {
-    expect(removeQuoted(base.content, [CLAIM])).toBe('Hi Joel. Adam has the forms.');
-  });
-
-  it('returns null when a quote is not in the message', () => {
-    expect(removeQuoted(base.content, ['I am away until the 13th.'])).toBeNull();
-  });
-
-  it('ignores blank quotes', () => {
-    expect(removeQuoted('Hello.', ['  '])).toBe('Hello.');
-  });
-});
-
 describe('BandSendReview', () => {
   it('sends a clean message at 84 with one judge call and all four questions', async () => {
     const { svc, review } = make([clean]);
-    await expect(svc.review(base)).resolves.toEqual({ kind: 'send', content: base.content, signals: {} });
+    await expect(svc.review(base)).resolves.toEqual({ kind: 'send', signals: {} });
     expect(review).toHaveBeenCalledTimes(1);
     expect(review.mock.calls[0]![0].questions).toEqual(['purpose', 'speaks-as-principal', 'grounding', 'necessity']);
     expect(review.mock.calls[0]![0].band).toBe('spot-check');
@@ -63,7 +50,7 @@ describe('BandSendReview', () => {
   it('reports speaks-as-principal as a signal on a send at 85', async () => {
     const { svc } = make([{ ...clean, speaksAsPrincipal: true }]);
     await expect(svc.review({ ...base, score: 85 })).resolves.toEqual({
-      kind: 'send', content: base.content, signals: { speaksAsPrincipal: true },
+      kind: 'send', signals: { speaksAsPrincipal: true },
     });
   });
 
@@ -73,21 +60,6 @@ describe('BandSendReview', () => {
     const d = await svc.review({ ...base, content: 'Hi Joel. Adam has the forms.' });
     expect(d.kind).toBe('send');
     if (d.kind === 'send') expect(d.signals?.bounced).toBe(true);
-  });
-
-  it('reports bounced alongside the claim_trimmed report on a trimmed send', async () => {
-    const { svc } = make([
-      { ...clean, unsupportedClaims: [CLAIM] },
-      { ...clean, unsupportedClaims: [CLAIM] },
-      { ok: true, unsupportedClaims: [], reason: 'ok' },
-    ]);
-    await svc.review(base);
-    const d = await svc.review(base);
-    expect(d.kind).toBe('send');
-    if (d.kind === 'send') {
-      expect(d.report?.source).toBe('claim_trimmed');
-      expect(d.signals?.bounced).toBe(true);
-    }
   });
 
   it('sends speaks-as-principal at 84 and holds it at 74', async () => {
@@ -109,11 +81,10 @@ describe('BandSendReview', () => {
     expect(review.mock.calls[0]![0].questions).toEqual(['grounding']);
   });
 
-  it('bounces once with the quoted claim, then trims and sends at 84 with a report item', async () => {
+  it('bounces once with the quoted claim, then blocks a second occurrence at 84 with no recheck call', async () => {
     const { svc, review } = make([
-      { ...clean, unsupportedClaims: [CLAIM] },          // first send: bounce
-      { ...clean, unsupportedClaims: [CLAIM] },          // resend: still unsupported
-      { ok: true, unsupportedClaims: [], reason: 'ok' }, // recheck of the trimmed text
+      { ...clean, unsupportedClaims: [CLAIM] }, // first send: bounce
+      { ...clean, unsupportedClaims: [CLAIM] }, // resend: still unsupported
     ]);
     const first = await svc.review(base);
     expect(first.kind).toBe('bounce');
@@ -123,13 +94,90 @@ describe('BandSendReview', () => {
     }
 
     const second = await svc.review(base);
-    expect(second).toEqual({
-      kind: 'send', content: 'Hi Joel. Adam has the forms.',
-      report: { source: 'claim_trimmed', summary: expect.stringContaining('1 unverified statement') },
-      signals: { bounced: true },
+    expect(second.kind).toBe('block');
+    if (second.kind === 'block') {
+      expect(second.findings.map((f) => f.rule)).toEqual(['ungrounded-claim']);
+      expect(second.reason).toBe(BLOCK_REASON);
+    }
+    // Nothing is cut and no grounding-only recheck runs: two judge calls in all.
+    expect(review).toHaveBeenCalledTimes(2);
+  });
+
+  it('blocks a second occurrence of unneeded disclosures at 84 with the unneeded-disclosure rule', async () => {
+    const content = 'Hi Joel. Your account 4417-0099 is fine.';
+    const { svc, review } = make([
+      { ...clean, unnecessaryItems: ['account 4417-0099'] },
+      { ...clean, unnecessaryItems: ['account 4417-0099'] },
+    ]);
+    await svc.review({ ...base, content });
+    const d = await svc.review({ ...base, content });
+    expect(d.kind).toBe('block');
+    if (d.kind === 'block') expect(d.findings.map((f) => f.rule)).toEqual(['unneeded-disclosure']);
+    expect(review).toHaveBeenCalledTimes(2);
+  });
+
+  it('blocks again on a third review that still has findings, and sends a clean fourth', async () => {
+    const { svc } = make([
+      { ...clean, unsupportedClaims: [CLAIM] },
+      { ...clean, unsupportedClaims: [CLAIM] },
+      { ...clean, unsupportedClaims: [CLAIM] },
+      clean,
+    ]);
+    await svc.review(base);
+    expect((await svc.review(base)).kind).toBe('block');
+    expect((await svc.review(base)).kind).toBe('block');
+    expect((await svc.review(base)).kind).toBe('send');
+    // The entry was cleared by the clean send: a new finding bounces afresh.
+  });
+
+  it('clears the ledger entry when a draft after a block is clean', async () => {
+    const { svc } = make([
+      { ...clean, unsupportedClaims: [CLAIM] },
+      { ...clean, unsupportedClaims: [CLAIM] },
+      clean,
+      { ...clean, unsupportedClaims: [CLAIM] },
+    ]);
+    await svc.review(base);
+    await svc.review(base);
+    expect((await svc.review(base)).kind).toBe('send');
+    expect((await svc.review(base)).kind).toBe('bounce');
+  });
+
+  it('refreshes the ledger time on a block, so a third draft inside the window still blocks', async () => {
+    let t = 1_000_000;
+    const review = vi.fn();
+    for (let i = 0; i < 3; i++) review.mockResolvedValueOnce({ ...clean, unsupportedClaims: [CLAIM] });
+    const svc = new BandSendReview({
+      judge: { review, isEnabled: () => true }, evidence: { collect: vi.fn().mockResolvedValue(OK_EVIDENCE) },
+      limiter: new FailOpenLimiter(), onLimiterTripped: vi.fn(), logger: createSilentLogger(), now: () => t,
     });
-    // The recheck asks grounding only, of the trimmed text.
-    expect(review.mock.calls[2]![0]).toMatchObject({ questions: ['grounding'], message: 'Hi Joel. Adam has the forms.' });
+    await svc.review(base);
+    t += 20 * 60_000;
+    expect((await svc.review(base)).kind).toBe('block');
+    t += 20 * 60_000; // 40 minutes after the first bounce, 20 after the block
+    expect((await svc.review(base)).kind).toBe('block');
+  });
+
+  describe('incident drafts: a flagged sentence that survives one rewrite is never sent', () => {
+    const incidents = [
+      { draft: "Thanks for reaching out. I can't share Sam's contact details at this point. If you'd like, I can pass your note along to him.", flagged: "I can't share Sam's contact details at this point." },
+      { draft: "Thanks for following up. I've passed your request along to Sam; he'll reach out directly this week.", flagged: "he'll reach out directly this week." },
+      { draft: 'Email is the best route to Sam: sam@example.com. Send a couple of times that suit you and he will confirm one.', flagged: 'Send a couple of times that suit you and he will confirm one.' },
+    ];
+    for (const { draft, flagged } of incidents) {
+      it(`blocks at 84 and holds at 74: ${flagged}`, async () => {
+        for (const [score, kind] of [[84, 'block'], [74, 'hold']] as const) {
+          const { svc } = make([{ ...clean, unsupportedClaims: [flagged] }, { ...clean, unsupportedClaims: [flagged] }]);
+          const input = { ...base, content: draft, score };
+          expect((await svc.review(input)).kind).toBe('bounce');
+          expect((await svc.review(input)).kind).toBe(kind);
+        }
+      });
+    }
+  });
+
+  it('exports no cut-text helper', () => {
+    expect('removeQuoted' in bandReviewModule).toBe(false);
   });
 
   it('shows the drafter only quotes that are in its message, never other text the judge echoed', async () => {
@@ -152,14 +200,6 @@ describe('BandSendReview', () => {
     }
   });
 
-  it('holds rather than trim a quote too short to cut safely', async () => {
-    // A steered judge quoting "not" would flip a sentence's meaning.
-    const content = 'Hi Joel. The principal will not sign it. Adam has the forms.';
-    const { svc } = make([{ ...clean, unsupportedClaims: ['not'] }, { ...clean, unsupportedClaims: ['not'] }]);
-    await svc.review({ ...base, content });
-    expect((await svc.review({ ...base, content })).kind).toBe('hold');
-  });
-
   it('bounces an unneeded disclosure with its own rule', async () => {
     const { svc } = make([{ ...clean, unnecessaryItems: ['account 4417-0099'] }]);
     const d = await svc.review({ ...base, content: 'Hi Joel. Your account 4417-0099 is fine.' });
@@ -167,29 +207,10 @@ describe('BandSendReview', () => {
     if (d.kind === 'bounce') expect(d.findings.map((f) => f.rule)).toEqual(['unneeded-disclosure']);
   });
 
-  it('holds after one bounce at 74', async () => {
+  it('holds a second occurrence at 74', async () => {
     const { svc } = make([{ ...clean, unsupportedClaims: [CLAIM] }, { ...clean, unsupportedClaims: [CLAIM] }]);
     await svc.review({ ...base, score: 74 });
     expect((await svc.review({ ...base, score: 74 })).kind).toBe('hold');
-  });
-
-  it('holds when the judge paraphrases a claim it cannot find to trim', async () => {
-    const { svc } = make([
-      { ...clean, unsupportedClaims: [CLAIM] },
-      { ...clean, unsupportedClaims: ['The principal is away until the 13th.'] },
-    ]);
-    await svc.review(base);
-    expect((await svc.review(base)).kind).toBe('hold');
-  });
-
-  it('holds when the trimmed text still fails its recheck', async () => {
-    const { svc } = make([
-      { ...clean, unsupportedClaims: [CLAIM] },
-      { ...clean, unsupportedClaims: [CLAIM] },
-      { ok: true, unsupportedClaims: ['Adam has the forms.'], reason: 'still' },
-    ]);
-    await svc.review(base);
-    expect((await svc.review(base)).kind).toBe('hold');
   });
 
   it('treats a relay rewrite on the same conversation as the recheck, with both turns as evidence', async () => {
@@ -210,7 +231,7 @@ describe('BandSendReview', () => {
     const failure: BriefVerdict = { ok: false, failure: 'unreachable' };
     const at84 = make([failure]);
     await expect(at84.svc.review(base)).resolves.toEqual({
-      kind: 'send', content: base.content,
+      kind: 'send',
       report: { source: 'sent_without_review', summary: expect.any(String) },
     });
     const at74 = make([failure]);

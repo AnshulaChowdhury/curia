@@ -12,10 +12,11 @@
 // What each answer does:
 //   purpose = steered                → hold, at every band
 //   speaks as principal, below 80    → hold (the band asks first)
-//   unsupported claims / unneeded    → bounce to the drafter, ONCE per draft. On the
-//     disclosures                       recheck: at 80+ cut the quoted text, recheck the
-//                                       trimmed message for grounding, send with a report
-//                                       item, hold if it still fails; below 80, hold.
+//   unsupported claims / unneeded    → bounce to the drafter, ONCE per draft. Curia never
+//     disclosures                       cuts text out of a message: the drafter rewrites it.
+//                                       If the rewrite still has findings, at 80+ the send is
+//                                       blocked (not sent, the drafter told to rewrite again
+//                                       or tell the principal); below 80, held.
 //   judge failure                    → 80+: send with a "sent without review" item, capped
 //                                       at 5 an hour (then hold until a judge call succeeds);
 //                                       below 80: hold.
@@ -33,10 +34,10 @@ import { AutonomyService } from '../autonomy/autonomy-service.js';
 import type { FilterFinding } from './outbound-filter.js';
 
 const BOUNCE_TTL_MS = 30 * 60_000;
-// The shortest quote trimming will cut. A steered or careless judge quoting a word such as
-// "not" would flip a sentence's meaning; a real unsupported statement is longer than this.
-const MIN_TRIM_QUOTE_CHARS = 12;
 const ALL_QUESTIONS: readonly BriefQuestion[] = ['purpose', 'speaks-as-principal', 'grounding', 'necessity'];
+
+/** What the drafter is told when a send is blocked; the gateway appends the findings. */
+export const BLOCK_REASON = 'Not sent: after one rewrite it still has the problems below. Rewrite it again without them, or tell the principal.';
 
 export const BAND_RULES = {
   ungrounded: 'ungrounded-claim',
@@ -59,7 +60,7 @@ export interface BandReviewInput {
   postTurn: boolean;
 }
 
-export type BandReviewReport = { source: 'sent_without_review' | 'claim_trimmed'; summary: string };
+export type BandReviewReport = { source: 'sent_without_review'; summary: string };
 
 /**
  * What the review learned about a send it let through, for the spot-check pool (#2159
@@ -68,8 +69,10 @@ export type BandReviewReport = { source: 'sent_without_review' | 'claim_trimmed'
 export type BandReviewSignals = { speaksAsPrincipal?: boolean; bounced?: boolean };
 
 export type BandReviewDecision =
-  | { kind: 'send'; content: string; report?: BandReviewReport; signals?: BandReviewSignals }
+  | { kind: 'send'; report?: BandReviewReport; signals?: BandReviewSignals }
   | { kind: 'bounce'; findings: FilterFinding[] }
+  // Not sent, and not held for the principal: the drafter must rewrite it again (80+ only).
+  | { kind: 'block'; reason: string; findings: FilterFinding[] }
   | { kind: 'hold'; reason: string; findings: FilterFinding[] };
 
 export interface BandSendReviewDeps {
@@ -80,27 +83,6 @@ export interface BandSendReviewDeps {
   onLimiterTripped: () => Promise<void>;
   logger: Logger;
   now?: () => number;
-}
-
-/**
- * Cut each quoted passage out of the message. Null when any quote is not found verbatim:
- * the judge must quote exactly, and a paraphrase cannot be cut safely, so the caller holds.
- */
-export function removeQuoted(content: string, quotes: readonly string[]): string | null {
-  let out = content;
-  for (const raw of quotes) {
-    const quote = raw.trim();
-    if (!quote) continue;
-    if (quote.length < MIN_TRIM_QUOTE_CHARS) return null;
-    const at = out.indexOf(quote);
-    if (at === -1) return null;
-    out = out.slice(0, at) + out.slice(at + quote.length);
-  }
-  return out
-    .replace(/[ \t]{2,}/g, ' ')
-    .replace(/ +([.,;:!?])/g, '$1')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
 }
 
 export class BandSendReview {
@@ -148,7 +130,7 @@ export class BandSendReview {
         this.deps.logger.info({ conversationId: input.conversationId, outcome: 'resolved_by_lookup' }, 'band review: bounced send passed on recheck');
       }
       this.bounced.delete(key);
-      return { kind: 'send', content: input.content, signals: { ...(verdict.speaksAsPrincipal === true ? { speaksAsPrincipal: true } : {}), ...(prior ? { bounced: true } : {}) } };
+      return { kind: 'send', signals: { ...(verdict.speaksAsPrincipal === true ? { speaksAsPrincipal: true } : {}), ...(prior ? { bounced: true } : {}) } };
     }
 
     if (!prior) {
@@ -160,31 +142,19 @@ export class BandSendReview {
       return { kind: 'bounce', findings: this.bounceFindings(input.content, claims, items) };
     }
 
-    // The one bounce is spent.
-    this.bounced.delete(key);
+    // The one bounce is spent. Below 80 the principal decides; at 80+ the message is not sent.
     if (!isSpotCheckOrAbove(input.score)) {
+      this.bounced.delete(key);
       return this.hold(BAND_RULES.ungrounded, 'Held for the principal: it still states things about the principal that nothing looked up supports.');
     }
-    const trimmed = removeQuoted(input.content, [...claims, ...items]);
-    if (trimmed === null || trimmed.length === 0) {
-      return this.hold(BAND_RULES.ungrounded, 'Held for the principal: the unverified statements could not be cut cleanly.');
-    }
-    const recheck = await this.ask(input, ['grounding'], taskIds, trimmed);
-    if (!recheck.ok || (recheck.unsupportedClaims ?? []).length > 0) {
-      return this.hold(BAND_RULES.ungrounded, 'Held for the principal: the trimmed message still could not be verified.');
-    }
-    const n = claims.length + items.length;
-    this.deps.logger.info({ conversationId: input.conversationId, outcome: 'claim_dropped', cut: n }, 'band review: trimmed and sent');
-    return {
-      kind: 'send',
-      content: trimmed,
-      report: {
-        source: 'claim_trimmed',
-        summary: `Removed ${n} unverified statement${n === 1 ? '' : 's'} from a ${input.channel} message to ${input.recipients.join(', ')} before sending it.`,
-      },
-      // A trim only follows a bounce, so a trimmed send always bounced first.
-      signals: { bounced: true, ...(verdict.speaksAsPrincipal === true ? { speaksAsPrincipal: true } : {}) },
-    };
+    // Keep the entry and refresh its time: the drafter's next attempt is still a recheck, and
+    // a clean one clears it.
+    this.bounced.set(key, { taskEventIds: taskIds, at: this.now() });
+    this.deps.logger.info(
+      { conversationId: input.conversationId, channel: input.channel, claims: claims.length, items: items.length, outcome: 'blocked' },
+      'band review: blocked — findings survived the rewrite',
+    );
+    return { kind: 'block', reason: BLOCK_REASON, findings: this.bounceFindings(input.content, claims, items) };
   }
 
   private questionsFor(input: BandReviewInput): readonly BriefQuestion[] {
@@ -228,7 +198,6 @@ export class BandSendReview {
     this.deps.logger.warn({ failure, channel: input.channel }, 'band review: reviewer unavailable — sending without review (80+)');
     return {
       kind: 'send',
-      content: input.content,
       report: {
         source: 'sent_without_review',
         summary: `Sent a ${input.channel} message to ${input.recipients.join(', ')} without the usual review: the reviewer was unavailable.`,

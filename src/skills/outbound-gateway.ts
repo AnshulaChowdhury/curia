@@ -1412,11 +1412,9 @@ export class OutboundGateway {
         request,
         content: redactedBody,
         recipients: people.length > 0 ? people : [recipientId],
-        editable: true,
         options,
       });
       if (outcome.result) return outcome.result;
-      redactedBody = outcome.content;
       bandReport = outcome.report;
       bandSignals = outcome.signals;
     }
@@ -1914,11 +1912,10 @@ export class OutboundGateway {
     if (!this.actionLogRepo) return;
     const { band } = args;
     const firstContact = await this.isFirstContact(args.recipient);
-    // One review outcome per row, most telling first: a trim or an unreviewed send says
-    // more than a bounce the drafter then fixed.
-    const review = band?.report?.source === 'claim_trimmed' ? 'trimmed'
-      : band?.report?.source === 'sent_without_review' ? 'unreviewed'
-        : band?.signals?.bounced ? 'bounced' : undefined;
+    // One review outcome per row, most telling first: an unreviewed send says more than a
+    // bounce the drafter then fixed.
+    const review = band?.report?.source === 'sent_without_review' ? 'unreviewed'
+      : band?.signals?.bounced ? 'bounced' : undefined;
     try {
       await this.actionLogRepo.insertSampled({
         taskId: args.options?.taskEventId ?? args.options?.parentEventId ?? 'system',
@@ -1949,16 +1946,14 @@ export class OutboundGateway {
 
   /**
    * Step 2.5 under band gating (#2159): ask the band review, and act on its decision.
-   * Returns `result` when the send must not go out (bounce or hold), otherwise the content
-   * to send — trimmed when the review cut unverified statements — and any report item to
-   * publish once it is delivered. `editable` is false for a stored draft, which cannot be
-   * trimmed: a trimmed decision holds it instead.
+   * Returns `result` when the send must not go out (bounce, block or hold), otherwise any
+   * report item to publish once it is delivered. The message itself is never changed: the
+   * review sends it as written or asks the drafter to rewrite it (#2312).
    */
   private async runBandReview(args: {
     request: OutboundSendRequest;
     content: string;
     recipients: readonly string[];
-    editable: boolean;
     options: {
       taskEventId?: string;
       conversationId?: string | null;
@@ -1968,8 +1963,8 @@ export class OutboundGateway {
       holdRecipe?: SendRecipe;
       reExecRecipe?: SendRecipe;
     } | undefined;
-  }): Promise<{ result?: OutboundSendResult; content: string; report?: BandReviewReport; signals?: BandReviewSignals }> {
-    const { request, content, recipients, editable, options } = args;
+  }): Promise<{ result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals }> {
+    const { request, content, recipients, options } = args;
     const score = await this.bandScore();
     let decision: Awaited<ReturnType<BandSendReview['review']>>;
     try {
@@ -1990,14 +1985,8 @@ export class OutboundGateway {
       decision = { kind: 'hold', reason, findings: [{ rule: BAND_RULES.unreviewed, detail: reason }] };
     }
 
-    if (decision.kind === 'send' && !editable && decision.content !== content) {
-      const reason = 'Held for the principal: the draft states things about the principal that nothing looked up supports, and a saved draft cannot be trimmed.';
-      decision = { kind: 'hold', reason, findings: [{ rule: BAND_RULES.ungrounded, detail: reason }] };
-    }
-
     if (decision.kind === 'send') {
       return {
-        content: decision.content,
         ...(decision.report ? { report: decision.report } : {}),
         ...(decision.signals ? { signals: decision.signals } : {}),
       };
@@ -2022,11 +2011,31 @@ export class OutboundGateway {
         this.log.warn({ err, blockId }, 'outbound-gateway: failed to publish outbound.blocked for a band bounce — the send is still bounced');
       }
       return {
-        content,
         result: {
           success: false,
           blockedReason: buildBlockReasonSummary(decision.findings),
           blockedRules: decision.findings.map((f) => f.rule),
+        },
+      };
+    }
+
+    if (decision.kind === 'block') {
+      // The rewrite did not fix it. Not sent, and no outbound.blocked: on a relay it would
+      // start the #1355 rewrite loop again. The drafter is told in the result; the digest
+      // gets the rule labels (never the quoted sentences) so a relayed reply's block, whose
+      // drafter may be gone, still reaches someone.
+      const rules = decision.findings.map((f) => f.rule);
+      this.log.info({ channel: request.channel, rules }, 'outbound-gateway: band review blocked the send');
+      await this.queueBlockReport(
+        `Outbound ${request.channel} message to ${recipients.join(', ')} was not sent: after one rewrite it still had these problems (${rules.join(', ')}).`,
+        options?.conversationId ?? undefined,
+        options?.taskEventId ?? options?.parentEventId ?? 'system',
+      );
+      return {
+        result: {
+          success: false,
+          blockedReason: `${decision.reason}\n${buildBlockReasonSummary(decision.findings)}`,
+          blockedRules: rules,
         },
       };
     }
@@ -2058,7 +2067,6 @@ export class OutboundGateway {
       );
       if (!raised) await reportUnapprovedHold('the approval row could not be written');
       return {
-        content,
         result: {
           success: false,
           gated: true,
@@ -2071,7 +2079,6 @@ export class OutboundGateway {
     }
     await reportUnapprovedHold(recipe ? 'the send has no task to attach it to' : 'this send has no way to replay it');
     return {
-      content,
       result: { success: false, blockedReason: `${decision.reason} Ask the principal before sending it.`, blockedRules: [rule] },
     };
   }
@@ -3419,8 +3426,7 @@ export class OutboundGateway {
     }
 
     // ------------------------------------------------------------------
-    // Step 2.5: Band review (#2159) — as in send(). A stored draft cannot be trimmed, so a
-    // review that would cut statements holds it instead.
+    // Step 2.5: Band review (#2159) — as in send().
     // ------------------------------------------------------------------
     // Keyed on principalDirected, not humanApproved: send-draft sets humanApproved on every
     // call (its task-origin check is its gate), so it does not mean the principal read this
@@ -3439,7 +3445,6 @@ export class OutboundGateway {
         },
         content: body,
         recipients: draftEnvelope,
-        editable: false,
         options,
       });
       if (outcome.result) return outcome.result;

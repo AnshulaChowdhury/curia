@@ -45,7 +45,7 @@ export interface SampleSignals {
   speaksAsPrincipal?: boolean;
   /** No contact existed for the recipient at send time. */
   firstContact?: boolean;
-  review?: 'bounced' | 'trimmed' | 'unreviewed';
+  review?: 'bounced' | 'unreviewed';
   /** Band Gate C let it through where the tier would have asked. */
   gateProceeded?: boolean;
   triage?: boolean;

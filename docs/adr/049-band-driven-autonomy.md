@@ -47,8 +47,8 @@ Alternatives considered and rejected:
    audit log) and the "Who you serve" block. The evidence is passed beside the message, never
    written into it.
 4. **One bounce.** Unsupported claims or unneeded disclosures go back to the drafter once.
-   After that, at 80+ the quoted statements are cut and the trimmed message is rechecked and
-   sent with a digest item; below 80 it is held.
+   The drafter rewrites it; text is never cut out of a message. If the rewrite still has
+   findings, at 80+ the send is blocked (not sent, with a digest item) and below 80 it is held.
 5. **Below 80, speaking or committing as the principal asks first.** For a send the gateway
    asks, with the whole message and its resolved recipients, and a hold raises the approval;
    for any other action Gate C asks before the skill runs.

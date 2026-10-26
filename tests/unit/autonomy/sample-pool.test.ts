@@ -37,7 +37,7 @@ describe('isSampledTool', () => {
 
 describe('sampleWeight', () => {
   it('weighs speaking for the principal, first contact, a judge intervention, a proceeded gate and triage high', () => {
-    for (const s of [{ speaksAsPrincipal: true }, { firstContact: true }, { review: 'trimmed' as const }, { review: 'bounced' as const }, { review: 'unreviewed' as const }, { gateProceeded: true }, { triage: true }]) {
+    for (const s of [{ speaksAsPrincipal: true }, { firstContact: true }, { review: 'bounced' as const }, { review: 'unreviewed' as const }, { gateProceeded: true }, { triage: true }]) {
       expect(sampleWeight(s)).toBe(3);
     }
   });

@@ -4020,21 +4020,17 @@ describe('band review (#2159)', () => {
       .filter((e) => e.type === type);
   }
 
-  it('sends the reviewed content, and reports a trimmed send', async () => {
-    const review = vi.fn().mockResolvedValue({ kind: 'send', content: 'Hi Joel.', report: { source: 'claim_trimmed', summary: 'Removed 1' } });
+  it('sends the message unchanged when the review passes it', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
     const gw = makeBandGateway({ review, score: 84 });
     const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1' });
     expect(result.success).toBe(true);
     const sent = vi.mocked(mocks.nylasClient.sendMessage).mock.calls[0]![0] as { body: string };
-    expect(sent.body).toContain('Hi Joel.');
-    expect(sent.body).not.toContain('out of office');
-    expect(publishedOfType(mocks.bus, 'principal.report')).toEqual([
-      expect.objectContaining({ payload: expect.objectContaining({ source: 'claim_trimmed', summary: 'Removed 1' }) }),
-    ]);
+    expect(sent.body).toContain('out of office until the 13th');
   });
 
   it('passes the review what it needs', async () => {
-    const review = vi.fn().mockResolvedValue({ kind: 'send', content: emailReq.body });
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
     const gw = makeBandGateway({ review, score: 84 });
     await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', principalDirected: true, postTurn: true });
     expect(review).toHaveBeenCalledWith({
@@ -4052,6 +4048,26 @@ describe('band review (#2159)', () => {
     expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(1);
     expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(0);
     expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('refuses a blocked send with the block reason, publishes no outbound.blocked, and tells the digest', async () => {
+    const findings = [{ rule: 'ungrounded-claim', detail: 'not backed: "I am out of office until the 13th."' }];
+    const reason = 'Not sent: after one rewrite it still has the problems below. Rewrite it again without them, or tell the principal.';
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'block', reason, findings }), score: 84 });
+    const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1' });
+    expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
+    expect(result.blockedReason).toMatch(new RegExp(`^${reason}`));
+    expect(result.blockedReason).toContain('out of office until the 13th');
+    expect(result.gated).toBeUndefined();
+    // No outbound.blocked: on a relay it would start the #1355 rewrite loop again.
+    expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+    expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+    const reports = publishedOfType(mocks.bus, 'principal.report');
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.payload).toMatchObject({ source: 'blocked_content', urgency: 'digest', summary: expect.stringContaining('joel@example.com') });
+    // Labels only: the digest names the rule, never the agent's quoted sentence.
+    expect(String(reports[0]!.payload['summary'])).toContain('ungrounded-claim');
+    expect(String(reports[0]!.payload['summary'])).not.toContain('out of office');
   });
 
   it('holds a relayed reply as gated with an approval, and never publishes outbound.blocked', async () => {
@@ -4149,7 +4165,7 @@ describe('band review (#2159)', () => {
   });
 
   it('emails the principal when a sent-without-review report cannot be recorded', async () => {
-    const review = vi.fn().mockResolvedValue({ kind: 'send', content: emailReq.body, report: { source: 'sent_without_review', summary: 'Sent unreviewed' } });
+    const review = vi.fn().mockResolvedValue({ kind: 'send', report: { source: 'sent_without_review', summary: 'Sent unreviewed' } });
     const gw = makeBandGateway({ review, score: 84 });
     vi.mocked(mocks.bus.publish).mockImplementation(async (_layer, event) => {
       if ((event as { type: string }).type === 'principal.report') throw new Error('audit down');
@@ -4176,10 +4192,21 @@ describe('band review (#2159)', () => {
       expect(review).toHaveBeenCalledWith(expect.objectContaining({ content: draftMeta.body, channel: 'email', score: 84 }));
     });
 
-    it('holds a draft the review would trim: a stored draft cannot be edited', async () => {
+    it('refuses a blocked draft send, with the digest told and nothing sent', async () => {
       withDraftClient();
-      const review = vi.fn().mockResolvedValue({ kind: 'send', content: 'Hi Joel.', report: { source: 'claim_trimmed', summary: 'x' } });
+      const findings = [{ rule: 'unneeded-disclosure', detail: 'shares details: "x"' }];
+      const review = vi.fn().mockResolvedValue({ kind: 'block', reason: 'Not sent: x', findings });
       const gw = makeBandGateway({ review, score: 84 });
+      const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, { taskEventId: 't1' });
+      expect(result).toMatchObject({ success: false, blockedRules: ['unneeded-disclosure'] });
+      expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(1);
+      expect((mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft).not.toHaveBeenCalled();
+    });
+
+    it('holds a draft through its holdRecipe, as before', async () => {
+      withDraftClient();
+      const review = vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'ungrounded-claim', detail: 'x' }] });
+      const gw = makeBandGateway({ review, score: 74 });
       const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, {
         taskEventId: 't1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft to joel@example.com' },
       });
@@ -4189,7 +4216,7 @@ describe('band review (#2159)', () => {
 
     it('sends a draft the review passes', async () => {
       withDraftClient();
-      const review = vi.fn().mockResolvedValue({ kind: 'send', content: draftMeta.body });
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
       const gw = makeBandGateway({ review, score: 84 });
       const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, { taskEventId: 't1' });
       expect(result.success).toBe(true);
@@ -4207,7 +4234,7 @@ describe('band review (#2159)', () => {
       // send-draft passes humanApproved on every call (its own task-origin check is the
       // gate), so humanApproved does not mean the principal read this draft.
       withDraftClient();
-      const review = vi.fn().mockResolvedValue({ kind: 'send', content: draftMeta.body });
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
       const gw = makeBandGateway({ review, score: 84 });
       await gw.sendEmailDraft('d1', 'curia', draftMeta, { humanApproved: true, principalDirected: false, taskEventId: 't1' });
       expect(review).toHaveBeenCalledWith(expect.objectContaining({ principalDirected: false }));
@@ -4373,12 +4400,11 @@ describe('spot-check pool (#2159 Phase 3)', () => {
     expect(queuedRepo.insertSampled).not.toHaveBeenCalled();
   });
 
-  it('records the band review outcome: trimmed, unreviewed, speaks as principal', async () => {
+  it('records the band review outcome: unreviewed, speaks as principal', async () => {
     const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
-      [{ kind: 'send', content: 'Hi Dana.', report: { source: 'claim_trimmed', summary: 'Removed 1' }, signals: { bounced: true } }, { review: 'trimmed' }],
-      [{ kind: 'send', content: danaReq.body, report: { source: 'sent_without_review', summary: 'Sent unreviewed' } }, { review: 'unreviewed' }],
-      [{ kind: 'send', content: danaReq.body, signals: { speaksAsPrincipal: true } }, { speaksAsPrincipal: true }],
-      [{ kind: 'send', content: danaReq.body, signals: { bounced: true } }, { review: 'bounced' }],
+      [{ kind: 'send', report: { source: 'sent_without_review', summary: 'Sent unreviewed' } }, { review: 'unreviewed' }],
+      [{ kind: 'send', signals: { speaksAsPrincipal: true } }, { speaksAsPrincipal: true }],
+      [{ kind: 'send', signals: { bounced: true } }, { review: 'bounced' }],
     ];
     for (const [decision, expected] of cases) {
       const actionLogRepo = makeActionLogRepo();
