@@ -1855,6 +1855,8 @@ async function main(): Promise<void> {
   const bandReview = autonomyGating === 'band'
     ? new BandSendReview({
       judge: escalationJudge,
+      // The principal's own domains never make a recipient a link's counterparty (#2312).
+      nonOrgDomains: outreachNonOrgDomains,
       evidence: sendEvidence,
       limiter: new FailOpenLimiter(),
       // Once, when unreviewed sends pass the hourly cap: sends now hold until the reviewer

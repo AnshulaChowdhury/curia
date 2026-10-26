@@ -60,14 +60,23 @@ export interface SendAuthority {
   /**
    * The task an inbound reply was linked to through Curia's outreach (the dispatcher's
    * `linkedTask`). taskId and title are null for live-turn outreach with no task; the
-   * originator is then the outreach row's. Only a strong link can carry authority.
+   * originator is then the outreach row's. Only a strong link can carry authority, and a
+   * link counts at all only for a send to the counterparties it links.
    */
   linkedTask?: {
     taskId: string | null;
     title: string | null;
     originator: SendAuthority['originator'];
+    /** The linked task's project root, only when it differs from the task. */
+    root?: { taskId: string; title: string; originator: SendAuthority['originator'] };
     linkKind: OutreachLinkKind;
     strength: 'strong' | 'weak';
+    /**
+     * Who the outreach row says Curia contacted (lowercased addresses, contact ids, org
+     * domains). Code only: never rendered for the judge. Absent when the row could not be
+     * read, so no recipient matches the link.
+     */
+    counterparty?: { addresses: readonly string[]; contactIds: readonly string[]; domains: readonly string[] };
   };
 }
 
@@ -154,6 +163,17 @@ function renderOriginator(o: SendAuthority['originator']): RenderedOriginator {
   return { resolved: isUuid(contactId), ...rest };
 }
 
+/** The linked task as the judge sees it: no counterparty addresses or contact ids. */
+function renderLinkedTask(l: NonNullable<SendAuthority['linkedTask']>): unknown {
+  const { counterparty, root, originator, ...rest } = l;
+  void counterparty;
+  return {
+    ...rest,
+    originator: renderOriginator(originator),
+    ...(root ? { root: { ...root, originator: renderOriginator(root.originator) } } : {}),
+  };
+}
+
 function renderAuthority(a: SendAuthority | undefined): unknown {
   if (a === undefined) return null;
   return {
@@ -161,7 +181,7 @@ function renderAuthority(a: SendAuthority | undefined): unknown {
     liveTurn: a.liveTurn,
     ...(a.boundTask ? { boundTask: { ...a.boundTask, originator: renderOriginator(a.boundTask.originator) } } : {}),
     ...(a.rootTask ? { rootTask: { ...a.rootTask, originator: renderOriginator(a.rootTask.originator) } } : {}),
-    ...(a.linkedTask ? { linkedTask: { ...a.linkedTask, originator: renderOriginator(a.linkedTask.originator) } } : {}),
+    ...(a.linkedTask ? { linkedTask: renderLinkedTask(a.linkedTask) } : {}),
   };
 }
 

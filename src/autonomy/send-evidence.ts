@@ -131,6 +131,18 @@ function readLink(raw: unknown): { taskId: string | null; outreachId: string; li
   return { taskId, outreachId, linkKind: linkKind as OutreachLinkKind, strength: strength as AuthorityLink['strength'] };
 }
 
+function lowerStrings(v: unknown): string[] | null {
+  return Array.isArray(v) && v.every((x) => typeof x === 'string') ? v.map((x: string) => x.trim().toLowerCase()) : null;
+}
+
+/** An outreach row's counterparties, lowercased; any ill-typed list drops them all. */
+function readCounterparty(row: { addresses: unknown; contactIds: unknown; domains: unknown }): AuthorityLink['counterparty'] {
+  const addresses = lowerStrings(row.addresses);
+  const contactIds = lowerStrings(row.contactIds);
+  const domains = lowerStrings(row.domains);
+  return addresses && contactIds && domains ? { addresses, contactIds, domains } : undefined;
+}
+
 /** Task text for the judge: credentials redacted, trimmed like other evidence. */
 function taskText(text: string): string {
   return clip(redactSecrets(text), EVIDENCE_RESULT_MAX_CHARS);
@@ -141,7 +153,7 @@ export class SendEvidenceCollector {
     auditLogRepo: Pick<AuditLogRepo, 'findById' | 'findToolResultsForTasks' | 'findPrincipalReportsForTasks'>;
     /** Reads the bound task and its project root for authority (#2312). */
     taskRepo: Pick<TaskRepo, 'getTask' | 'resolveProjectRootTaskId'>;
-    /** Reads a task-less link's outreach row for its originator (#2312). Absent: such a link has none. */
+    /** Reads a link's outreach row: its counterparties, and a task-less link's originator (#2312). Absent: a link has neither. */
     taskOutreachRepo?: Pick<TaskOutreachRepo, 'getById'>;
     /** The injected "## Who you serve" block, read per call so identity hot-reloads (#1514) apply. */
     principalBlock: () => string | null;
@@ -250,29 +262,72 @@ export class SendEvidenceCollector {
   }
 
   /**
-   * The linked task's title and originator: the task's own, or for a task-less link the
-   * outreach row's. A failed or missing read keeps the link with no originator, which gives
-   * it no authority and no askability.
+   * The linked task's title, originator and project root (the task's own, or for a task-less
+   * link the outreach row's originator), and the row's counterparties. A failed or missing read
+   * leaves that part out: no originator gives the link no authority and no askability, and no
+   * counterparties means no recipient matches it.
    */
   private async readLinkedTask(link: NonNullable<ReturnType<typeof readLink>>): Promise<AuthorityLink> {
-    const { taskId, linkKind, strength } = link;
+    const { taskId, outreachId, linkKind, strength } = link;
+    const row = await this.readLinkRow(taskId, outreachId);
     let title: string | null = null;
-    let originator: AuthorityOriginator = null;
-    try {
-      if (taskId !== null) {
-        const task = await this.readTask(taskId);
-        if (task === undefined) this.deps.logger.warn({ taskId }, 'send-evidence: linked task not found — the link carries no originator');
-        title = task?.title ?? null;
-        originator = task?.originator ?? null;
-      } else if (this.deps.taskOutreachRepo) {
-        const row = await this.deps.taskOutreachRepo.getById(link.outreachId);
-        if (row === null) this.deps.logger.warn({ outreachId: link.outreachId }, 'send-evidence: linked outreach row not found — the link carries no originator');
-        originator = readOriginator(row?.originator);
+    let originator: AuthorityOriginator = taskId === null ? row?.originator ?? null : null;
+    let root: AuthorityLink['root'];
+    if (taskId !== null) {
+      let task: AuthorityTask | undefined;
+      try {
+        task = await this.readTask(taskId);
+        if (task === undefined) this.deps.logger.warn({ taskId, outreachId }, 'send-evidence: linked task not found — the link carries no originator');
+      } catch (err) {
+        this.deps.logger.error({ err, taskId, outreachId }, 'send-evidence: linked task lookup failed — the link carries no originator');
       }
-    } catch (err) {
-      this.deps.logger.error({ err, taskId, outreachId: link.outreachId }, 'send-evidence: linked task lookup failed — the link carries no originator');
+      if (task !== undefined) {
+        title = task.title;
+        originator = task.originator;
+        root = await this.readLinkRoot(taskId);
+      }
     }
-    return { taskId, title, originator, linkKind, strength };
+    return {
+      taskId, title, originator,
+      ...(root ? { root } : {}),
+      linkKind, strength,
+      ...(row?.counterparty ? { counterparty: row.counterparty } : {}),
+    };
+  }
+
+  /** The linked task's project root when it differs from the task; a failure leaves it out. */
+  private async readLinkRoot(taskId: string): Promise<AuthorityLink['root']> {
+    try {
+      const rootId = await this.deps.taskRepo.resolveProjectRootTaskId(taskId);
+      if (rootId === null || rootId === taskId) return undefined;
+      const root = await this.readTask(rootId);
+      return root === undefined ? undefined : { taskId: root.taskId, title: root.title, originator: root.originator };
+    } catch (err) {
+      this.deps.logger.error({ err, taskId }, 'send-evidence: linked task root lookup failed — the link leaves the root out');
+      return undefined;
+    }
+  }
+
+  /** The link's outreach row: its originator and counterparties. Undefined when it cannot be read. */
+  private async readLinkRow(
+    taskId: string | null,
+    outreachId: string,
+  ): Promise<{ originator: AuthorityOriginator; counterparty: AuthorityLink['counterparty'] } | undefined> {
+    if (!this.deps.taskOutreachRepo) {
+      this.deps.logger.warn({ outreachId, taskId }, 'send-evidence: outreach repo not wired — the link carries no counterparties');
+      return undefined;
+    }
+    try {
+      const row = await this.deps.taskOutreachRepo.getById(outreachId);
+      if (row === null) {
+        this.deps.logger.warn({ outreachId, taskId }, 'send-evidence: linked outreach row not found — the link carries no counterparties');
+        return undefined;
+      }
+      return { originator: readOriginator(row.originator), counterparty: readCounterparty(row) };
+    } catch (err) {
+      this.deps.logger.error({ err, outreachId, taskId }, 'send-evidence: linked outreach row lookup failed — the link carries no counterparties');
+      return undefined;
+    }
   }
 
   private async readTask(taskId: string): Promise<AuthorityTask | undefined> {

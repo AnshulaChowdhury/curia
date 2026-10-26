@@ -4497,6 +4497,8 @@ describe('band review (#2159)', () => {
       const arg = review.mock.calls[0]![0] as Record<string, unknown>;
       expect(arg['content']).toBe(phoneBody);
       expect(arg['recipientTier']).toBe('trusted');
+      // The resolved contact, keyed by recipient, for a reply-to-task link's counterparty check.
+      expect(arg['recipientContactIds']).toEqual({ [String(phoneReq.to).toLowerCase()]: 'joel-1' });
       expect(arg['subject']).toBe(`Re: ${phone}`);
       expect(arg['detectedItems']).toEqual([
         { id: 'P1', label: 'phone_us', text: phone, field: 'body' },

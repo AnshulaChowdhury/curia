@@ -12,7 +12,11 @@ const OK_EVIDENCE = { unavailable: false, toolResults: [], principalBlock: null 
 
 function make(
   verdicts: BriefVerdict[],
-  opts: { evidence?: { unavailable?: boolean; authority?: SendAuthority }; contactTier?: (id: string) => Promise<ContactTier | null> } = {},
+  opts: {
+    evidence?: { unavailable?: boolean; authority?: SendAuthority };
+    contactTier?: (id: string) => Promise<ContactTier | null>;
+    nonOrgDomains?: ReadonlySet<string>;
+  } = {},
 ) {
   const review = vi.fn();
   for (const v of verdicts) review.mockResolvedValueOnce(v);
@@ -21,7 +25,10 @@ function make(
   const onLimiterTripped = vi.fn().mockResolvedValue(undefined);
   const limiter = new FailOpenLimiter();
   const contactTier = vi.fn(opts.contactTier ?? (async () => null));
-  const svc = new BandSendReview({ judge, evidence: { collect }, limiter, onLimiterTripped, contactTier, logger: createSilentLogger() });
+  const svc = new BandSendReview({
+    judge, evidence: { collect }, limiter, onLimiterTripped, contactTier, logger: createSilentLogger(),
+    ...(opts.nonOrgDomains ? { nonOrgDomains: opts.nonOrgDomains } : {}),
+  });
   return { svc, review, collect, onLimiterTripped, limiter, contactTier };
 }
 
@@ -410,9 +417,18 @@ describe('BandSendReview', () => {
     // which task their message answers. Only a strong link to the principal's task is authority.
     describe('a reply linked to the outreach of a task', () => {
       type Linked = NonNullable<SendAuthority['linkedTask']>;
-      const link = (strength: Linked['strength'], originator: SendAuthority['originator'] = principal): SendAuthority => ({
+      // base sends to joel@example.com: the row lists him, so the link covers this send.
+      const ROW = { addresses: ['joel@example.com'], contactIds: [], domains: [] };
+      const link = (
+        strength: Linked['strength'],
+        originator: SendAuthority['originator'] = principal,
+        over: Partial<Linked> = {},
+      ): SendAuthority => ({
         originator: outsider, liveTurn: false,
-        linkedTask: { taskId: 't-link', title: 'Book physio', originator, linkKind: strength === 'strong' ? 'org-domain' : 'inferred', strength },
+        linkedTask: {
+          taskId: 't-link', title: 'Book physio', originator, linkKind: strength === 'strong' ? 'org-domain' : 'inferred', strength,
+          counterparty: ROW, ...over,
+        },
       });
 
       it('gives a strong link to the principal\'s task principal-task authority: inferred sends at 84, holds at 74', async () => {
@@ -426,9 +442,14 @@ describe('BandSendReview', () => {
         }
       });
 
-      it('gives a task-less strong link the principal directed the same authority', async () => {
-        const authority: SendAuthority = { ...link('strong'), linkedTask: { ...link('strong').linkedTask!, taskId: null, title: null } };
+      it('counts the linked task\'s project root when the principal directed that instead', async () => {
+        const authority = link('strong', curia, { root: { taskId: 't-root', title: 'Set up the clinic', originator: principal } });
         const { svc } = make([withRulings(ruling('inferred'))], { evidence: { authority } });
+        expect((await svc.review(pii)).kind).toBe('send');
+      });
+
+      it('gives a task-less strong link the principal directed the same authority', async () => {
+        const { svc } = make([withRulings(ruling('inferred'))], { evidence: { authority: link('strong', principal, { taskId: null, title: null }) } });
         expect((await svc.review(pii)).kind).toBe('send');
       });
 
@@ -464,6 +485,68 @@ describe('BandSendReview', () => {
             if (d.kind === 'bounce') expect(d.findings[0]!.detail).not.toContain('ask the principal');
           }
         }
+      });
+
+      // The link covers the counterparties Curia contacted for the task, and nobody else.
+      describe('only for a send to the linked counterparties', () => {
+        const offRow: BandReviewInput = { ...pii, recipients: ['dana@other.example'] };
+
+        it('bounces a strong link\'s item sent to someone the row does not list', async () => {
+          const { svc } = make([withRulings(ruling('inferred'))], { evidence: { authority: link('strong') } });
+          expect((await svc.review(offRow)).kind).toBe('bounce');
+        });
+
+        it('bounces a weak link\'s requested item sent off the row, with no offer to ask', async () => {
+          const { svc } = make([withRulings(ruling('inferred', true))], { evidence: { authority: link('weak') } });
+          const d = await svc.review(offRow);
+          expect(d.kind).toBe('bounce');
+          if (d.kind === 'bounce') expect(d.findings[0]!.detail).not.toContain('ask the principal');
+        });
+
+        it('gives no link authority when any non-principal recipient is off the row', async () => {
+          const { svc } = make([withRulings(ruling('inferred'))], { evidence: { authority: link('strong') } });
+          expect((await svc.review({ ...pii, recipients: ['joel@example.com', 'dana@other.example'] })).kind).toBe('bounce');
+        });
+
+        it('ignores the principal among the recipients', async () => {
+          const { svc } = make([withRulings(ruling('inferred'))], { evidence: { authority: link('strong') } });
+          const d = await svc.review({ ...pii, recipients: ['Joel@Example.com', 'joe@principal.example'], principalRecipients: ['JOE@principal.example'] });
+          expect(d.kind).toBe('send');
+        });
+
+        it('covers a recipient at one of the row\'s org domains, unless it is a principal domain', async () => {
+          const atDomain = link('strong', principal, { counterparty: { addresses: [], contactIds: [], domains: ['acme.example'] } });
+          const input = { ...pii, recipients: ['front-desk@mail.acme.example'] };
+          const ok = make([withRulings(ruling('inferred'))], { evidence: { authority: atDomain } });
+          expect((await ok.svc.review(input)).kind).toBe('send');
+          const own = make([withRulings(ruling('inferred'))], { evidence: { authority: atDomain }, nonOrgDomains: new Set(['mail.acme.example']) });
+          expect((await own.svc.review(input)).kind).toBe('bounce');
+        });
+
+        it('covers the linked sender by address, and a recipient whose contact id the row or sender has', async () => {
+          const none = { addresses: [], contactIds: [], domains: [] };
+          const bySender: SendAuthority = { ...link('strong', principal, { counterparty: none }), originator: { ...outsider, contactId: 'Joel@Example.com' } };
+          const a = make([withRulings(ruling('inferred'))], { evidence: { authority: bySender } });
+          expect((await a.svc.review(pii)).kind).toBe('send');
+
+          const byRowContact = link('strong', principal, { counterparty: { ...none, contactIds: ['c-joel'] } });
+          const b = make([withRulings(ruling('inferred'))], { evidence: { authority: byRowContact } });
+          expect((await b.svc.review({ ...pii, recipientContactIds: { 'joel@example.com': 'C-JOEL' } })).kind).toBe('send');
+
+          const joelUuid = '55555555-5555-4555-8555-555555555555';
+          const bySenderContact: SendAuthority = { ...link('strong', principal, { counterparty: none }), originator: { ...outsider, contactId: joelUuid } };
+          const c = make([withRulings(ruling('inferred'))], { evidence: { authority: bySenderContact } });
+          expect((await c.svc.review({ ...pii, recipientContactIds: { 'joel@example.com': joelUuid } })).kind).toBe('send');
+        });
+
+        it('gives no link authority or askability when the row could not be read', async () => {
+          const unread = link('strong', principal, { counterparty: undefined });
+          delete unread.linkedTask!.counterparty;
+          const { svc } = make([withRulings(ruling('inferred', true))], { evidence: { authority: unread } });
+          const d = await svc.review(pii);
+          expect(d.kind).toBe('bounce');
+          if (d.kind === 'bounce') expect(d.findings[0]!.detail).not.toContain('ask the principal');
+        });
       });
     });
 

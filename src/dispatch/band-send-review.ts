@@ -33,9 +33,11 @@
 //   directed  + principal → send          directed + trusted → send, copy the principal
 //   inferred  + principal → send at 80+, hold below
 //   anything else is unsupported: requested by an askable recipient (known or trusted, or
-//   replying on any link, strong or weak, to a task the principal directed) → hold (ask the
+//   a link, strong or weak, to a task the principal directed) → hold (ask the
 //   principal); otherwise bounce, then block/hold like any finding. More than 10 items, or a
-//   judge failure with items present, is never a fail-open send. A `[REDACTED: …]`
+//   judge failure with items present, is never a fail-open send. A link counts (for authority
+//   or askability) only when every non-principal recipient is a counterparty it links: the
+//   linked sender, or an address, contact or org domain on the outreach row. A `[REDACTED: …]`
 //   placeholder in the content bounces the same way. The strictest outcome of all the rules
 //   wins: block > hold > bounce > send.
 //
@@ -56,6 +58,8 @@ import type { ContactTier } from '../contacts/types.js';
 import { isSpotCheckOrAbove, type FailOpenLimiter } from '../autonomy/band-policy.js';
 import { AutonomyService } from '../autonomy/autonomy-service.js';
 import type { FilterFinding } from './outbound-filter.js';
+import { orgDomainsOf } from './task-outreach-capability.js';
+import { isUuid } from '../util/uuid.js';
 
 const BOUNCE_TTL_MS = 30 * 60_000;
 const ALL_QUESTIONS: readonly BriefQuestion[] = ['purpose', 'speaks-as-principal', 'grounding', 'necessity'];
@@ -101,6 +105,8 @@ export interface BandReviewInput {
   recipientTier?: ContactTier;
   /** The subject line, when the channel has one: scanned for redaction placeholders like the content. */
   subject?: string;
+  /** Resolved contact ids by lowercased recipient id, for matching a reply-to-task link's counterparties (#2312). */
+  recipientContactIds?: Readonly<Record<string, string>>;
 }
 
 export type BandReviewReport = { source: 'sent_without_review'; summary: string };
@@ -127,6 +133,8 @@ export interface BandSendReviewDeps {
   onLimiterTripped: () => Promise<void>;
   /** A contact's current tier (#2312). Null, or a throw, is no trusted authority. */
   contactTier: (contactId: string) => Promise<ContactTier | null>;
+  /** The principal's own domains: never a counterparty org domain for a link (#2312). */
+  nonOrgDomains?: ReadonlySet<string>;
   logger: Logger;
   now?: () => number;
 }
@@ -246,10 +254,12 @@ export class BandSendReview {
     hasToken: boolean,
     hasPrior: boolean,
   ): Promise<BandReviewDecision> {
+    // A link counts only for a send to the counterparties it links (#2312).
+    const linkCovers = linkCoversRecipients(input, authority, this.deps.nonOrgDomains);
     // A weak link gives no authority, but a reply about the principal's own task is worth asking
     // the principal about. The link's originator is the task's (or row's), never the sender's.
     const askable = input.recipientTier === 'known' || input.recipientTier === 'trusted'
-      || authority?.linkedTask?.originator?.systemRole === 'principal';
+      || (linkCovers && linkToPrincipalTask(authority));
     const toRewrite: FilterFinding[] = [];
     const holds: FilterFinding[] = [];
     const copy = new Set<string>();
@@ -258,7 +268,7 @@ export class BandSendReview {
       toRewrite.push({ rule: BAND_RULES.pii, detail: TOO_MANY_DETAIL });
     } else if (items.length > 0) {
       const byId = new Map(rulings!.map((r) => [r.id, r]));
-      const who = await this.authorityOf(authority, rulings!);
+      const who = await this.authorityOf(authority, rulings!, linkCovers);
       const unsupported = new Set<string>();
       const askFirst = new Set<string>();
       const inferredBelow80 = new Set<string>();
@@ -301,6 +311,7 @@ export class BandSendReview {
       this.deps.logger.info(
         {
           conversationId: input.conversationId, channel: input.channel, items: items.length, authority: who,
+          ...(authority?.linkedTask ? { linkStrength: authority.linkedTask.strength, linkCovers } : {}),
           unsupported: [...unsupported], askFirst: [...askFirst], inferredBelow80: [...inferredBelow80], taskDirectedBelow80: [...taskDirectedBelow80], copyPrincipal: [...copy],
         },
         'band review: disclosure rulings applied',
@@ -359,11 +370,12 @@ export class BandSendReview {
    * Who directed the work, from trusted state only. The principal: their own turn (a live turn,
    * or a wake they originated). The principal's task: only the bound or root task is theirs,
    * not the drafting turn, so a directed ruling counts as inferred. A strong reply-to-task link
-   * to a task the principal directed counts the same; a weak one never does. A trusted contact:
+   * to a task (or its root) the principal directed counts the same, when it covers every
+   * recipient (`linkCovers`); a weak one never does. A trusted contact:
    * their stamped tier and their tier now are both trusted, and their message authenticated them.
    * Anything else, or a failed tier read, is no authority.
    */
-  private async authorityOf(a: SendAuthority | undefined, rulings: readonly DisclosureRuling[]): Promise<'principal' | 'principal-task' | 'trusted' | 'none'> {
+  private async authorityOf(a: SendAuthority | undefined, rulings: readonly DisclosureRuling[], linkCovers: boolean): Promise<'principal' | 'principal-task' | 'trusted' | 'none'> {
     if (!a) return 'none';
     // `liveTurn` is context for the judge only. Code trusts the stamped role: stampOriginator
     // sets systemRole 'principal' only from the resolved sender, and a wake carries the
@@ -371,7 +383,7 @@ export class BandSendReview {
     if (a.originator?.systemRole === 'principal') return 'principal';
     if ([a.boundTask?.originator, a.rootTask?.originator].some((o) => o?.systemRole === 'principal')) return 'principal-task';
     // Only an exact 'strong' counts; the collector already dropped a malformed link.
-    if (a.linkedTask?.strength === 'strong' && a.linkedTask.originator?.systemRole === 'principal') return 'principal-task';
+    if (linkCovers && a.linkedTask?.strength === 'strong' && linkToPrincipalTask(a)) return 'principal-task';
     const o = a.originator;
     // Only a directed ruling uses trusted authority, so skip the lookup otherwise.
     if (!o || o.tier !== 'trusted' || o.authenticated !== true || !rulings.some((r) => r.basis === 'directed')) return 'none';
@@ -533,6 +545,42 @@ function combine(a: BandReviewDecision, b: BandReviewDecision): BandReviewDecisi
   if (a.kind === 'block' && b.kind === 'block') return { kind: 'block', reason: a.reason, findings: [...a.findings, ...b.findings] };
   if (a.kind === 'hold' && b.kind === 'hold') return { kind: 'hold', reason: a.reason, findings: [...a.findings, ...b.findings] };
   return a;
+}
+
+/** The link is to a task the principal directed: its own originator, or its project root's. */
+function linkToPrincipalTask(a: SendAuthority | undefined): boolean {
+  const l = a?.linkedTask;
+  return l?.originator?.systemRole === 'principal' || l?.root?.originator?.systemRole === 'principal';
+}
+
+/** A channel id as an address: the last `<addr>` when written with a display name, lowercased. */
+function bareId(id: string): string {
+  const angle = /<([^<>]+)>\s*$/.exec(id);
+  return (angle ? angle[1]! : id).trim().toLowerCase();
+}
+
+/**
+ * Every non-principal recipient is a counterparty the link covers: the linked sender (by
+ * address, or by contact when the sender resolved), or an address, contact id or org domain
+ * on the outreach row. No link, or no readable row, covers no one (fail closed). A send to the
+ * principal alone has no one to cover, so it is covered.
+ */
+function linkCoversRecipients(input: BandReviewInput, a: SendAuthority | undefined, nonOrgDomains: ReadonlySet<string> | undefined): boolean {
+  const cp = a?.linkedTask?.counterparty;
+  if (!cp) return false;
+  const principals = new Set((input.principalRecipients ?? []).map(bareId));
+  const sender = a!.originator ? bareId(a!.originator.contactId) : undefined;
+  const senderContact = sender !== undefined && isUuid(sender) ? sender : undefined;
+  const contactOf = new Map(Object.entries(input.recipientContactIds ?? {}).map(([k, v]) => [bareId(k), v.trim().toLowerCase()]));
+  const addresses = new Set(cp.addresses);
+  const contacts = new Set(cp.contactIds);
+  const domains = new Set(cp.domains);
+  return input.recipients.map(bareId).filter((r) => !principals.has(r)).every((r) => {
+    if (r === sender || addresses.has(r)) return true;
+    const contact = contactOf.get(r);
+    if (contact !== undefined && (contact === senderContact || contacts.has(contact))) return true;
+    return orgDomainsOf([r], nonOrgDomains).some((d) => domains.has(d));
+  });
 }
 
 /** Exactly one ruling for each asked item. */

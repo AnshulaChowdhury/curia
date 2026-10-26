@@ -1467,6 +1467,7 @@ export class OutboundGateway {
         principalRecipients: recipients.filter((r) => r.isPrincipal).map((r) => r.email),
         detectedItems,
         recipientTier,
+        ...(recipientContactId ? { recipientContactIds: { [recipientId.toLowerCase()]: recipientContactId } } : {}),
         ...(sendSubject !== undefined ? { subject: sendSubject } : {}),
         options,
       });
@@ -2149,6 +2150,8 @@ export class OutboundGateway {
     /** The personal data detected in the send, and the primary recipient's tier (#2312). */
     detectedItems?: readonly BriefDetectedItem[];
     recipientTier?: ContactTier;
+    /** The primary recipient's resolved contact id, by lowercased id: a link's counterparty check (#2312). */
+    recipientContactIds?: Readonly<Record<string, string>>;
     /** The email subject as it will be sent: the review scans it for redaction tokens. */
     subject?: string;
     options: {
@@ -2186,6 +2189,7 @@ export class OutboundGateway {
         ...(options?.reportedToPrincipal ? { reportedToPrincipal: options.reportedToPrincipal } : {}),
         ...(args.detectedItems && args.detectedItems.length > 0 ? { detectedItems: args.detectedItems } : {}),
         ...(args.recipientTier ? { recipientTier: args.recipientTier } : {}),
+        ...(args.recipientContactIds ? { recipientContactIds: args.recipientContactIds } : {}),
         ...(args.subject !== undefined ? { subject: args.subject } : {}),
       });
     } catch (err) {
@@ -3756,6 +3760,7 @@ export class OutboundGateway {
         principalRecipients: draftRecipients.filter((r) => r.isPrincipal).map((r) => r.email),
         detectedItems,
         recipientTier: recipientTierForDraft,
+        ...(recipientContactIdForDraft ? { recipientContactIds: { [recipientEmail.toLowerCase()]: recipientContactIdForDraft } } : {}),
         subject: draftMeta.subject,
         options,
         editable: false,
