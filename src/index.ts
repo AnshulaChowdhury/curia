@@ -145,6 +145,7 @@ import { AutonomyService } from './autonomy/autonomy-service.js';
 import { ActionLogRepo } from './autonomy/action-log-repo.js';
 import { TaskRepo } from './db/task-repo.js';
 import { TaskOutreachRepo } from './dispatch/task-outreach.js';
+import { OutreachMatcher } from './dispatch/outreach-matcher.js';
 import { TaskOutreachService, taskLookupFrom } from './dispatch/task-outreach-capability.js';
 import { WorkingDocsRepo } from './db/working-docs-repo.js';
 import { ApprovalTriggerService } from './autonomy/approval-trigger.js';
@@ -3107,6 +3108,18 @@ async function main(): Promise<void> {
     principalBacklog: createPrincipalBacklogSource(pool),
     verification: verificationRuntime,
     turnLanes,
+    // A non-principal email that replies to Curia's outreach arrives linked to its task
+    // (#2312). Webmail, form, tenant and private-suffix hosts are excluded by
+    // isNonOrgDomain inside the matcher; this set is for additions, and there are none yet.
+    outreachMatcher: new OutreachMatcher({
+      repo: taskOutreachRepo,
+      // One scope for the process: the matcher's model check runs outside any skill call.
+      infraLlm: infraLlmService.scoped({ toolName: 'outreach-matcher' }),
+      logger,
+      nonOrgDomains: new Set<string>(),
+      taskStatus: (id) => taskRepo.getTask(id).then((t) => t?.status ?? null),
+    }),
+    taskProgress: taskRepo,
   });
   dispatcher.register();
   // Deferred delegations wake in the originating conversation (#1893). The
