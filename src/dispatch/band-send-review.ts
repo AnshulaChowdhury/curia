@@ -23,6 +23,19 @@
 //                                       at 5 an hour (then hold until a judge call succeeds);
 //                                       below 80: hold.
 //
+// Detected personal data (#2312): `disclosure` is added to the questions, and the judge rules
+// each item directed / inferred / unsupported and whether the recipient asked. Code decides
+// who had the authority to direct it, from trusted state (never the judge's word):
+//   principal — the drafting turn's originator, or the bound or root task's, is the principal
+//   trusted   — the originator was stamped trusted, is trusted now, and authenticated
+//   directed  + principal → send          directed + trusted → send, copy the principal
+//   inferred  + principal → send at 80+, hold below
+//   anything else is unsupported: requested by a known/trusted recipient → hold (ask the
+//   principal); otherwise bounce, then block/hold like any finding. More than 10 items, or a
+//   judge failure with items present, is never a fail-open send. A `[REDACTED: …]`
+//   placeholder in the content bounces the same way. The strictest outcome of all the rules
+//   wins: block > hold > bounce > send.
+//
 // The bounce ledger is in memory, keyed by conversation, channel and recipients, so a relay
 // rewrite (a new task on the same conversation) counts as the recheck and sees the first
 // turn's lookups. A restart between a bounce and its recheck gives one more bounce. The two
@@ -33,13 +46,24 @@
 import type { Logger } from '../logger.js';
 import type { EscalationJudge } from '../autonomy/escalation-judge.js';
 import { reportEvidence, type SendEvidenceCollector } from '../autonomy/send-evidence.js';
-import type { BriefQuestion, BriefVerdict } from '../autonomy/judge-brief.js';
+import type {
+  BriefAnswers, BriefDetectedItem, BriefQuestion, BriefVerdict, DisclosureRuling, SendAuthority,
+} from '../autonomy/judge-brief.js';
+import type { ContactTier } from '../contacts/types.js';
 import { isSpotCheckOrAbove, type FailOpenLimiter } from '../autonomy/band-policy.js';
 import { AutonomyService } from '../autonomy/autonomy-service.js';
 import type { FilterFinding } from './outbound-filter.js';
 
 const BOUNCE_TTL_MS = 30 * 60_000;
 const ALL_QUESTIONS: readonly BriefQuestion[] = ['purpose', 'speaks-as-principal', 'grounding', 'necessity'];
+/** The most detected items the judge rules on in one call; past it, none are asked about (#2312). */
+const MAX_REVIEWED_ITEMS = 10;
+/** A placeholder the tier redactor writes. Under band gating it is a defect, never delivered. */
+const REDACTION_TOKEN = /\[REDACTED: [A-Z0-9_]+\]/;
+const TOO_MANY_DETAIL = 'This message contains more personal details than can be reviewed at once. Send fewer, or split the message.';
+const TOKEN_DETAIL = 'This message contains a redaction placeholder. Rewrite it with the real content or without that part.';
+const UNREVIEWED_RECHECK_REASON = 'Held for the principal: it was flagged for unverified statements, and the reviewer was unavailable to recheck it.';
+const UNREVIEWED_BELOW_80_REASON = 'Held for the principal: the reviewer was unavailable, and this band asks first when it is.';
 
 /** What the drafter is told when a send is blocked; the gateway appends the findings. */
 export const BLOCK_REASON = 'Not sent: after one rewrite it still has the problems below. Rewrite it again without them, or tell the principal.';
@@ -50,6 +74,8 @@ export const BAND_RULES = {
   steered: 'steered',
   speaksAsPrincipal: 'speaks-as-principal',
   unreviewed: 'review-unavailable',
+  pii: 'pii-not-authorized',
+  token: 'redaction-token',
 } as const;
 
 export interface BandReviewInput {
@@ -67,6 +93,10 @@ export interface BandReviewInput {
   postTurn: boolean;
   /** The note the dispatcher cut from this relayed reply and queued for the principal (#2312); evidence that Curia told them. */
   reportedToPrincipal?: string;
+  /** The personal data detected in the send (#2312); each item needs an authorized ruling to go out. */
+  detectedItems?: readonly BriefDetectedItem[];
+  /** The primary recipient's tier: a known or trusted requester can be asked about (#2312). */
+  recipientTier?: ContactTier;
 }
 
 export type BandReviewReport = { source: 'sent_without_review'; summary: string };
@@ -78,7 +108,8 @@ export type BandReviewReport = { source: 'sent_without_review'; summary: string 
 export type BandReviewSignals = { speaksAsPrincipal?: boolean; bounced?: boolean };
 
 export type BandReviewDecision =
-  | { kind: 'send'; report?: BandReviewReport; signals?: BandReviewSignals }
+  // copyPrincipal: a trusted contact directed these items out; the principal is copied (#2312).
+  | { kind: 'send'; report?: BandReviewReport; signals?: BandReviewSignals; copyPrincipal?: { labels: string[] } }
   | { kind: 'bounce'; findings: FilterFinding[] }
   // Not sent, and not held for the principal: the drafter must rewrite it again (80+ only). The gateway converts it to a hold for a relayed reply or a saved draft.
   | { kind: 'block'; reason: string; findings: FilterFinding[] }
@@ -90,6 +121,8 @@ export interface BandSendReviewDeps {
   limiter: FailOpenLimiter;
   /** Called once when the fail-open cap trips. Must not throw. */
   onLimiterTripped: () => Promise<void>;
+  /** A contact's current tier (#2312). Null, or a throw, is no trusted authority. */
+  contactTier: (contactId: string) => Promise<ContactTier | null>;
   logger: Logger;
   now?: () => number;
 }
@@ -107,63 +140,220 @@ export class BandSendReview {
     const prior = this.priorBounce(key);
     const taskIds = [...new Set([...(prior?.taskEventIds ?? []), ...(input.taskEventId ? [input.taskEventId] : [])])];
 
-    const verdict = await this.ask(input, this.questionsFor(input), taskIds, input.content);
+    const items = input.detectedItems ?? [];
+    // Past the cap the judge is not asked about the items at all: they are all unsupported.
+    const askedItems = items.length > 0 && items.length <= MAX_REVIEWED_ITEMS ? items : undefined;
+    const questions: readonly BriefQuestion[] = askedItems ? [...this.questionsFor(input), 'disclosure'] : this.questionsFor(input);
+    const hasToken = REDACTION_TOKEN.test(input.content);
+
+    const asked = await this.ask(input, questions, taskIds, input.content, askedItems);
+    let verdict = asked.verdict;
+    if (verdict.ok && askedItems && !rulesOnEach(verdict.disclosures, askedItems)) {
+      // The parser already refuses this; checked again because a gap here would read as a pass.
+      this.deps.logger.error({ conversationId: input.conversationId, items: askedItems.length, rulings: verdict.disclosures?.length ?? 0 }, 'band review: verdict does not rule on every detected item — treating as a reviewer failure');
+      verdict = { ok: false, failure: 'malformed' };
+    }
+
     if (!verdict.ok) {
-      this.bounced.delete(key);
-      if (prior) {
-        // This draft already bounced on a finding the drafter has not shown resolved.
-        // Failing open now would send exactly what the review flagged, so hold instead.
-        this.deps.logger.warn({ conversationId: input.conversationId, failure: verdict.failure }, 'band review: reviewer unavailable on the recheck of a bounced draft — holding');
-        return this.hold(BAND_RULES.unreviewed, 'Held for the principal: it was flagged for unverified statements, and the reviewer was unavailable to recheck it.');
+      if (items.length === 0 && !hasToken) {
+        this.bounced.delete(key);
+        if (prior) {
+          // This draft already bounced on a finding the drafter has not shown resolved.
+          // Failing open now would send exactly what the review flagged, so hold instead.
+          this.deps.logger.warn({ conversationId: input.conversationId, failure: verdict.failure }, 'band review: reviewer unavailable on the recheck of a bounced draft — holding');
+          return this.hold(BAND_RULES.unreviewed, UNREVIEWED_RECHECK_REASON);
+        }
+        return this.onJudgeFailure(input, verdict.failure);
       }
-      return this.onJudgeFailure(input, verdict.failure);
+      // Personal data or a placeholder never goes out unreviewed: no fail-open send, and the
+      // fail-open allowance is not spent on it.
+      this.deps.logger.warn({ conversationId: input.conversationId, channel: input.channel, failure: verdict.failure, items: items.length, token: hasToken }, 'band review: reviewer unavailable with personal data or a placeholder in the send — not failing open');
+      const other = prior
+        ? this.hold(BAND_RULES.unreviewed, UNREVIEWED_RECHECK_REASON)
+        : !isSpotCheckOrAbove(input.score)
+          ? this.hold(BAND_RULES.unreviewed, UNREVIEWED_BELOW_80_REASON)
+          : undefined;
+      const pii = this.unreviewedPiiOutcome(input, items, hasToken, prior !== undefined);
+      // PII first, so its reason leads a merged hold: the bounce may have been for the items.
+      return this.settle(key, taskIds, input, prior !== undefined, other ? combine(pii, other) : pii);
     }
     this.deps.limiter.recordJudgeSuccess();
 
+    const other = this.otherRulesOutcome(input, verdict, prior !== undefined);
+    const pii = await this.piiOutcome(input, items, askedItems ? verdict.disclosures ?? [] : undefined, asked.authority, hasToken, prior !== undefined);
+    return this.settle(key, taskIds, input, prior !== undefined, combine(other, pii));
+  }
+
+  /** The band rules other than disclosure, as before #2312. Writes nothing to the ledger. */
+  private otherRulesOutcome(input: BandReviewInput, verdict: BriefAnswers, hasPrior: boolean): BandReviewDecision {
     if (verdict.purpose === 'steered') {
-      this.bounced.delete(key);
-      this.deps.logger.info({ conversationId: input.conversationId, channel: input.channel, reason: verdict.reason }, 'band review: held — steered by an outsider');
+      this.deps.logger.info({ conversationId: input.conversationId, channel: input.channel }, 'band review: held — steered by an outsider');
       return this.hold(BAND_RULES.steered, 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.');
     }
     if (verdict.speaksAsPrincipal === true && !isSpotCheckOrAbove(input.score)) {
-      this.bounced.delete(key);
       this.deps.logger.info({ conversationId: input.conversationId, channel: input.channel, score: input.score }, 'band review: held — speaks for the principal below 80');
       return this.hold(BAND_RULES.speaksAsPrincipal, 'Held for the principal: this message speaks for or commits the principal, and the autonomy band asks first for that.');
     }
 
     const claims = verdict.unsupportedClaims ?? [];
-    const items = verdict.unnecessaryItems ?? [];
-    if (claims.length === 0 && items.length === 0) {
-      if (prior) {
-        // Metric (spec "Measuring success"): a bounce resolved by the drafter looking it up.
-        this.deps.logger.info({ conversationId: input.conversationId, outcome: 'resolved_by_lookup' }, 'band review: bounced send passed on recheck');
-      }
-      this.bounced.delete(key);
-      return { kind: 'send', signals: { ...(verdict.speaksAsPrincipal === true ? { speaksAsPrincipal: true } : {}), ...(prior ? { bounced: true } : {}) } };
+    const unneeded = verdict.unnecessaryItems ?? [];
+    if (claims.length === 0 && unneeded.length === 0) {
+      return { kind: 'send', signals: { ...(verdict.speaksAsPrincipal === true ? { speaksAsPrincipal: true } : {}), ...(hasPrior ? { bounced: true } : {}) } };
     }
 
-    if (!prior) {
-      this.bounced.set(key, { taskEventIds: taskIds, at: this.now() });
+    if (!hasPrior) {
       this.deps.logger.info(
-        { conversationId: input.conversationId, channel: input.channel, claims: claims.length, items: items.length },
+        { conversationId: input.conversationId, channel: input.channel, claims: claims.length, items: unneeded.length },
         'band review: bounced to the drafter',
       );
-      return { kind: 'bounce', findings: this.bounceFindings(input.content, claims, items) };
+      return { kind: 'bounce', findings: this.bounceFindings(input.content, claims, unneeded) };
     }
 
     // The one bounce is spent. Below 80 the principal decides; at 80+ the message is not sent.
     if (!isSpotCheckOrAbove(input.score)) {
-      this.bounced.delete(key);
       return this.hold(BAND_RULES.ungrounded, 'Held for the principal: it still states things about the principal that nothing looked up supports.');
     }
-    // Keep the entry and refresh its time: the drafter's next attempt is still a recheck, and
-    // a clean one clears it.
-    this.bounced.set(key, { taskEventIds: taskIds, at: this.now() });
     this.deps.logger.info(
-      { conversationId: input.conversationId, channel: input.channel, claims: claims.length, items: items.length, outcome: 'blocked' },
+      { conversationId: input.conversationId, channel: input.channel, claims: claims.length, items: unneeded.length, outcome: 'blocked' },
       'band review: blocked — findings survived the rewrite',
     );
-    return { kind: 'block', reason: BLOCK_REASON, findings: this.bounceFindings(input.content, claims, items) };
+    return { kind: 'block', reason: BLOCK_REASON, findings: this.bounceFindings(input.content, claims, unneeded) };
+  }
+
+  /**
+   * The disclosure policy (#2312). The judge says why each item is there; code decides whether
+   * anyone with the authority to share it directed the work, so a ruling of `directed` counts
+   * only for an authority the evidence shows. `rulings` is undefined when the judge was not
+   * asked (more items than it reviews at once): every item is then unsupported.
+   */
+  private async piiOutcome(
+    input: BandReviewInput,
+    items: readonly BriefDetectedItem[],
+    rulings: readonly DisclosureRuling[] | undefined,
+    authority: SendAuthority | undefined,
+    hasToken: boolean,
+    hasPrior: boolean,
+  ): Promise<BandReviewDecision> {
+    const askable = input.recipientTier === 'known' || input.recipientTier === 'trusted';
+    const toRewrite: FilterFinding[] = [];
+    const holds: FilterFinding[] = [];
+    const copy = new Set<string>();
+
+    if (items.length > 0 && rulings === undefined) {
+      toRewrite.push({ rule: BAND_RULES.pii, detail: TOO_MANY_DETAIL });
+    } else if (items.length > 0) {
+      const byId = new Map(rulings!.map((r) => [r.id, r]));
+      const who = await this.authorityOf(authority, rulings!);
+      const unsupported = new Set<string>();
+      const askFirst = new Set<string>();
+      const inferredBelow80 = new Set<string>();
+      for (const item of items) {
+        // rulesOnEach() guaranteed one ruling per item.
+        const r = byId.get(item.id)!;
+        if (r.basis === 'directed' && who === 'principal') continue;
+        if (r.basis === 'directed' && who === 'trusted') { copy.add(item.label); continue; }
+        if (r.basis === 'inferred' && who === 'principal') {
+          if (!isSpotCheckOrAbove(input.score)) inferredBelow80.add(item.label);
+          continue;
+        }
+        // Every other combination is unsupported.
+        if (r.requested && askable) askFirst.add(item.label);
+        else unsupported.add(item.label);
+      }
+      if (unsupported.size > 0) {
+        toRewrite.push({
+          rule: BAND_RULES.pii,
+          detail: `This message shares personal details nothing authorizes for this recipient: ${[...unsupported].join(', ')}. Rewrite it without them${askable ? ', or ask the principal' : ''}.`,
+        });
+      }
+      if (inferredBelow80.size > 0) {
+        holds.push({ rule: BAND_RULES.pii, detail: `Held for the principal: it shares personal details (${[...inferredBelow80].join(', ')}) that the principal's request needs but did not name, and this band asks first.` });
+      }
+      if (askFirst.size > 0) {
+        holds.push({ rule: BAND_RULES.pii, detail: `Held for the principal: the recipient asked for personal details (${[...askFirst].join(', ')}) that nothing authorizes sharing yet.` });
+      }
+      // Ids, labels and counts only: the judge's reasons and the items' text can echo the data.
+      this.deps.logger.info(
+        {
+          conversationId: input.conversationId, channel: input.channel, items: items.length, authority: who,
+          unsupported: [...unsupported], askFirst: [...askFirst], inferredBelow80: [...inferredBelow80], copyPrincipal: [...copy],
+        },
+        'band review: disclosure rulings applied',
+      );
+    }
+    if (hasToken) toRewrite.push({ rule: BAND_RULES.token, detail: TOKEN_DETAIL });
+
+    if (toRewrite.length > 0) return this.rewriteOutcome(input, toRewrite, hasPrior);
+    if (holds.length > 0) return { kind: 'hold', reason: holds[0]!.detail, findings: holds };
+    return { kind: 'send', ...(copy.size > 0 ? { copyPrincipal: { labels: [...copy] } } : {}) };
+  }
+
+  /** The judge failed with items or a placeholder present: nothing is authorized. */
+  private unreviewedPiiOutcome(input: BandReviewInput, items: readonly BriefDetectedItem[], hasToken: boolean, hasPrior: boolean): BandReviewDecision {
+    const labels = [...new Set(items.map((i) => i.label))].join(', ');
+    const decisions: BandReviewDecision[] = [];
+    if (items.length > 0) {
+      decisions.push(hasPrior
+        ? this.hold(BAND_RULES.pii, `Held for the principal: it shares personal details (${labels}), and the reviewer was unavailable to check them.`)
+        : {
+          kind: 'bounce',
+          findings: [{
+            rule: BAND_RULES.pii,
+            detail: items.length > MAX_REVIEWED_ITEMS
+              ? TOO_MANY_DETAIL
+              : `The reviewer could not check the personal details in this message: ${labels}. Rewrite it without them.`,
+          }],
+        });
+    }
+    if (hasToken) decisions.push(this.rewriteOutcome(input, [{ rule: BAND_RULES.token, detail: TOKEN_DETAIL }], hasPrior));
+    return decisions.reduce(combine);
+  }
+
+  /** Findings the drafter must rewrite away: bounce once, then block at 80+ or hold below. */
+  private rewriteOutcome(input: BandReviewInput, findings: FilterFinding[], hasPrior: boolean): BandReviewDecision {
+    if (!hasPrior) return { kind: 'bounce', findings };
+    if (isSpotCheckOrAbove(input.score)) return { kind: 'block', reason: BLOCK_REASON, findings };
+    return {
+      kind: 'hold',
+      reason: 'Held for the principal: after one rewrite it still has personal details nothing authorizes, or a redaction placeholder.',
+      findings,
+    };
+  }
+
+  /**
+   * Who directed the work, from trusted state only. The principal: their own turn, or a task
+   * they created (bound or root). A trusted contact: their stamped tier and their tier now are
+   * both trusted, and their message authenticated them. Anything else, or a failed tier read,
+   * is no authority.
+   */
+  private async authorityOf(a: SendAuthority | undefined, rulings: readonly DisclosureRuling[]): Promise<'principal' | 'trusted' | 'none'> {
+    if (!a) return 'none';
+    if ([a.originator, a.boundTask?.originator, a.rootTask?.originator].some((o) => o?.systemRole === 'principal')) return 'principal';
+    const o = a.originator;
+    // Only a directed ruling uses trusted authority, so skip the lookup otherwise.
+    if (!o || o.tier !== 'trusted' || o.authenticated !== true || !rulings.some((r) => r.basis === 'directed')) return 'none';
+    try {
+      return (await this.deps.contactTier(o.contactId)) === 'trusted' ? 'trusted' : 'none';
+    } catch (err) {
+      this.deps.logger.error({ err, contactId: o.contactId }, 'band review: could not read the originator\'s current tier — no trusted authority');
+      return 'none';
+    }
+  }
+
+  /** Record the final outcome in the one-bounce ledger and return it. */
+  private settle(key: string, taskIds: string[], input: BandReviewInput, hasPrior: boolean, decision: BandReviewDecision): BandReviewDecision {
+    if (decision.kind === 'bounce' || decision.kind === 'block') {
+      // A block keeps the entry and refreshes its time: the drafter's next attempt is still a
+      // recheck, and a clean one clears it.
+      this.bounced.set(key, { taskEventIds: taskIds, at: this.now() });
+      return decision;
+    }
+    this.bounced.delete(key);
+    if (decision.kind === 'send' && hasPrior) {
+      // Metric (spec "Measuring success"): a bounce resolved by the drafter looking it up.
+      this.deps.logger.info({ conversationId: input.conversationId, outcome: 'resolved_by_lookup' }, 'band review: bounced send passed on recheck');
+    }
+    return decision;
   }
 
   private questionsFor(input: BandReviewInput): readonly BriefQuestion[] {
@@ -175,32 +365,35 @@ export class BandSendReview {
     questions: readonly BriefQuestion[],
     taskIds: string[],
     message: string,
-  ): Promise<BriefVerdict> {
-    if (!this.deps.judge?.isEnabled()) return { ok: false, failure: 'disabled' };
+    detectedItems: readonly BriefDetectedItem[] | undefined,
+  ): Promise<{ verdict: BriefVerdict; authority?: SendAuthority }> {
+    if (!this.deps.judge?.isEnabled()) return { verdict: { ok: false, failure: 'disabled' } };
     const evidence = await this.deps.evidence.collect(taskIds);
     // Without evidence every claim looks unsupported; that is a review failure, not a bounce.
-    if (evidence.unavailable) return { ok: false, failure: 'unreachable' };
+    if (evidence.unavailable) return { verdict: { ok: false, failure: 'unreachable' } };
     // Newest first, so the note leads. The relay's principal note is not under the drafting
     // task in audit_log (its parent is the agent.response), so it arrives with the send
     // rather than from the collector.
     const reportsToPrincipal = input.reportedToPrincipal
       ? [reportEvidence(input.reportedToPrincipal), ...(evidence.reportsToPrincipal ?? [])]
       : evidence.reportsToPrincipal;
-    return this.deps.judge.review({
+    const verdict = await this.deps.judge.review({
       questions,
       message,
       recipients: input.recipients,
       ...(input.principalRecipients ? { principalRecipients: input.principalRecipients } : {}),
+      ...(detectedItems ? { detectedItems } : {}),
       band: AutonomyService.bandForScore(input.score),
       evidence: { ...evidence, ...(reportsToPrincipal ? { reportsToPrincipal } : {}) },
       conversationId: input.conversationId ?? 'system',
     });
+    return { verdict, authority: evidence.authority };
   }
 
   private async onJudgeFailure(input: BandReviewInput, failure: string): Promise<BandReviewDecision> {
     if (!isSpotCheckOrAbove(input.score)) {
       this.deps.logger.warn({ failure, channel: input.channel, score: input.score }, 'band review: reviewer unavailable — holding (below 80)');
-      return this.hold(BAND_RULES.unreviewed, 'Held for the principal: the reviewer was unavailable, and this band asks first when it is.');
+      return this.hold(BAND_RULES.unreviewed, UNREVIEWED_BELOW_80_REASON);
     }
     const { allowed, justTripped } = this.deps.limiter.tryAcquire();
     if (justTripped) {
@@ -269,4 +462,36 @@ export class BandSendReview {
     }
     return entry;
   }
+}
+
+const STRICTNESS: Record<BandReviewDecision['kind'], number> = { send: 0, bounce: 1, hold: 2, block: 3 };
+
+/**
+ * The strictest of two outcomes: block > hold > bounce > send. Equal outcomes merge, so the
+ * drafter or the principal sees every rule that fired; the first one's reason leads.
+ */
+function combine(a: BandReviewDecision, b: BandReviewDecision): BandReviewDecision {
+  if (STRICTNESS[a.kind] !== STRICTNESS[b.kind]) return STRICTNESS[a.kind] > STRICTNESS[b.kind] ? a : b;
+  if (a.kind === 'send' && b.kind === 'send') {
+    const report = a.report ?? b.report;
+    const signals = a.signals || b.signals ? { ...a.signals, ...b.signals } : undefined;
+    const labels = [...new Set([...(a.copyPrincipal?.labels ?? []), ...(b.copyPrincipal?.labels ?? [])])];
+    return {
+      kind: 'send',
+      ...(report ? { report } : {}),
+      ...(signals ? { signals } : {}),
+      ...(labels.length > 0 ? { copyPrincipal: { labels } } : {}),
+    };
+  }
+  if (a.kind === 'bounce' && b.kind === 'bounce') return { kind: 'bounce', findings: [...a.findings, ...b.findings] };
+  if (a.kind === 'block' && b.kind === 'block') return { kind: 'block', reason: a.reason, findings: [...a.findings, ...b.findings] };
+  if (a.kind === 'hold' && b.kind === 'hold') return { kind: 'hold', reason: a.reason, findings: [...a.findings, ...b.findings] };
+  return a;
+}
+
+/** Exactly one ruling for each asked item. */
+function rulesOnEach(rulings: readonly DisclosureRuling[] | undefined, items: readonly BriefDetectedItem[]): boolean {
+  if (rulings === undefined || rulings.length !== items.length) return false;
+  const ids = new Set(rulings.map((r) => r.id));
+  return ids.size === items.length && items.every((i) => ids.has(i.id));
 }

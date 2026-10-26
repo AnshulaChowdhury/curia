@@ -55,7 +55,7 @@ export function smallCapModelSlots(yaml: YamlConfig): SmallCapModelSlot[] {
     slots.push({
       configKey: 'escalation.judge.model',
       model: escalationJudge?.model ?? DEFAULT_JUDGE_MODEL,
-      callSites: 'the escalation judge: disclosure (200 tokens), action (300) and band review (1,200)',
+      callSites: 'the escalation judge: disclosure (200 tokens), action (300) and band review (1,800)',
     });
   }
   return slots;

@@ -1861,6 +1861,9 @@ async function main(): Promise<void> {
           logger.error({ err }, 'band review: could not tell the principal that sends are holding');
         }
       },
+      // Current tier, for a trusted contact's authority to direct a disclosure (#2312). A
+      // missing contact is no authority; a throw is caught by the review and treated the same.
+      contactTier: async (contactId) => (await contactService.getContact(contactId))?.tier ?? null,
       logger,
     })
     : undefined;
