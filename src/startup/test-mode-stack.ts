@@ -406,7 +406,7 @@ export interface TestModeStack {
   /**
    * The process-wide turn lane (#2018), shared with every agent runtime. Harnesses
    * that build their own Dispatcher pass this same instance. The flag comes from
-   * config. The shipped default.yaml leaves it off; an absent field stays off.
+   * config. The shipped default.yaml turns it on; an absent field stays off.
    */
   turnLanes: TurnLanes;
   /**

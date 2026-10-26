@@ -15,10 +15,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
-- **Turn lanes** — per-conversation lock and injection config, default off and inert. (#2018)
-- **Turn lane wiring** — a coordinator conversation has one holder when the flag is on. (#2018)
+- **Turn lanes** — per-conversation lock and injection config, on in the shipped file. (#2018)
+- **Turn lane wiring** — a coordinator conversation has one holder. (#2018)
 - **`agent.task.input_injected`** — **public API:** audit event for a drained same-contact follow-up. (#2018)
-- **Mid-turn injection** — a same-contact follow-up joins the live turn when the flag is on. (#2018)
+- **Mid-turn injection** — a same-contact follow-up joins the live coordinator turn. (#2018)
 - **Delegate wait** — a queued follow-up ends the wait early and the specialist keeps running. (#2018)
 - **`delegation.timed_out`** — **public API:** optional `cause` distinguishes an interrupted wait from a timeout. (#2018)
 - **Injected working-memory rows** — host task id is stored, and model history keeps the follow-up group. (#2018)

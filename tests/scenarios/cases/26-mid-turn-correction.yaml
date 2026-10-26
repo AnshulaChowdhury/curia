@@ -5,8 +5,8 @@
 # finishes. Capture matches one conversation to one turn, so a follow-up that is
 # not queued fails the run instead of being scored as a second reply. A drain at
 # turn_start fails the run, and the point is recorded on the result. The shipped
-# config leaves the flag off. The 2026-10-26 gate run drained at round:1 and failed,
-# so this case stays out until a fresh recording passes. With the flag off
+# config turns the flag on. The passing gate run drained at round:1, with every
+# critical check at 100%. With the flag off
 # the harness errors before publishing. It is not a known_failure: that marker
 # would hide a real miss.
 #
@@ -34,7 +34,7 @@ description: >
   principal changed their mind. Curia clicks "Email me the code", does not
   click "Text me the code", and does not send an SMS.
 tags: [turn-injection, signin, browser]
-release_gate: false
+release_gate: true
 runs: 3
 stub_sets: [human-channels]
 seed:

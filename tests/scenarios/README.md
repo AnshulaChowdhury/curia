@@ -774,9 +774,8 @@ Capture still expects one reply. With injection on, the follow-up joins that tur
 With it off, the harness errors the run before publishing: a second live turn on
 the same conversation is not a second reply, so it must not be scored. If the
 follow-up is published and not queued within five seconds, the run fails the same
-way. `26-mid-turn-correction` stays out of the release gate. The 2026-10-26
-standard-tier run with the official judge drained at `round:1` and failed the
-gate. It is not a `known_failure`:
-that marker would hide a real miss. A follow-up is only valid on a channel inbound
-(`principal` or a seeded contact), and `from` is the same kind of sender. It
-carries no email envelope.
+way. `26-mid-turn-correction` is in the release gate. The passing standard-tier
+run with the official judge drained at `round:1`, and every critical check
+passed. It is not a `known_failure`: that marker would hide a real miss. A
+follow-up is only valid on a channel inbound (`principal` or a seeded contact),
+and `from` is the same kind of sender. It carries no email envelope.
