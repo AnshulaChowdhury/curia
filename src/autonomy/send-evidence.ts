@@ -53,6 +53,11 @@ function renderResult(payload: Record<string, unknown>): string {
   }
 }
 
+/** A report to the principal as the judge sees it: credentials redacted, trimmed like other evidence. */
+export function reportEvidence(text: string): string {
+  return clip(redactSecrets(text), EVIDENCE_RESULT_MAX_CHARS);
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
@@ -111,7 +116,7 @@ export class SendEvidenceCollector {
       const reportsToPrincipal = reportRows
         .map((r) => r.payload['summary'])
         .filter((s): s is string => typeof s === 'string' && s.length > 0)
-        .map((s) => clip(redactSecrets(s), EVIDENCE_RESULT_MAX_CHARS));
+        .map(reportEvidence);
 
       return {
         unavailable: false,

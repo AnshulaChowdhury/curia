@@ -74,10 +74,12 @@ describeIf('audit-log findToolResultsForTasks (#2159)', () => {
   it('returns the principal reports filed under the tasks, newest first, and nothing else', async () => {
     const task = await seed('agent.task', '2026-10-18T11:00:00.000Z', null);
     const other = await seed('agent.task', '2026-10-18T11:00:00.000Z', null);
-    await seed('principal.report', '2026-10-18T11:00:01.000Z', task, { summary: 'first' });
-    await seed('principal.report', '2026-10-18T11:00:02.000Z', task, { summary: 'second' });
-    await seed('principal.report', '2026-10-18T11:00:03.000Z', other, { summary: 'someone else\'s' });
+    await seed('principal.report', '2026-10-18T11:00:01.000Z', task, { source: 'agent', summary: 'first' });
+    await seed('principal.report', '2026-10-18T11:00:02.000Z', task, { source: 'principal_note', summary: 'second' });
+    await seed('principal.report', '2026-10-18T11:00:03.000Z', other, { source: 'agent', summary: 'someone else\'s' });
     await seed('tool.result', '2026-10-18T11:00:04.000Z', task, { toolName: 'not-a-report' });
+    // System-generated reports (a held draft verbatim, etc.) are not something Curia told the principal.
+    await seed('principal.report', '2026-10-18T11:00:05.000Z', task, { source: 'relay_deferred', summary: 'held draft text' });
 
     const rows = await repo.findPrincipalReportsForTasks([task], 10);
 

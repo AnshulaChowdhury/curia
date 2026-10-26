@@ -515,7 +515,9 @@ export class AuditLogRepo {
    * What the given agent turns reported to the principal, newest first (#2312). The
    * report-to-principal tool files a principal.report under the drafting turn's agent.task,
    * so one level, on idx_audit_log_parent_event_id. Evidence for the band brief: a send that
-   * says "I've passed that to <principal>" is supported by one.
+   * says "I've passed that to <principal>" is supported by one. Only reports Curia chose to
+   * make (the agent's tool, the dispatcher's note): system-generated ones such as relay_deferred
+   * embed the held draft verbatim and say nothing the assistant told the principal.
    */
   async findPrincipalReportsForTasks(taskEventIds: readonly string[], limit: number): Promise<AuditLogRow[]> {
     if (taskEventIds.length === 0) return [];
@@ -525,6 +527,7 @@ export class AuditLogRepo {
        FROM audit_log
        WHERE event_type = 'principal.report'
          AND parent_event_id = ANY($1::text[])
+         AND payload->>'source' = ANY(ARRAY['agent', 'principal_note']::text[])
        ORDER BY timestamp DESC, id DESC
        LIMIT $2`,
       [[...taskEventIds], clamped],

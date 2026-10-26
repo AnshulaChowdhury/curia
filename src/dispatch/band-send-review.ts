@@ -27,7 +27,7 @@
 
 import type { Logger } from '../logger.js';
 import type { EscalationJudge } from '../autonomy/escalation-judge.js';
-import type { SendEvidenceCollector } from '../autonomy/send-evidence.js';
+import { reportEvidence, type SendEvidenceCollector } from '../autonomy/send-evidence.js';
 import type { BriefQuestion, BriefVerdict } from '../autonomy/judge-brief.js';
 import { isSpotCheckOrAbove, type FailOpenLimiter } from '../autonomy/band-policy.js';
 import { AutonomyService } from '../autonomy/autonomy-service.js';
@@ -175,10 +175,10 @@ export class BandSendReview {
     const evidence = await this.deps.evidence.collect(taskIds);
     // Without evidence every claim looks unsupported; that is a review failure, not a bounce.
     if (evidence.unavailable) return { ok: false, failure: 'unreachable' };
-    // The relay's principal note is not under the drafting task in audit_log (its parent is
+    // Newest first, so the note leads. The relay's principal note is not under the drafting task in audit_log (its parent is
     // the agent.response), so it arrives with the send rather than from the collector.
     const reportsToPrincipal = input.reportedToPrincipal
-      ? [...(evidence.reportsToPrincipal ?? []), input.reportedToPrincipal]
+      ? [reportEvidence(input.reportedToPrincipal), ...(evidence.reportsToPrincipal ?? [])]
       : evidence.reportsToPrincipal;
     return this.deps.judge.review({
       questions,

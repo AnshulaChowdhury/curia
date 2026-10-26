@@ -228,15 +228,22 @@ describe('BandSendReview', () => {
   });
 
   it('adds what the relay reported to the principal to the evidence (#2312)', async () => {
-    const { svc, review, collect } = make([clean, clean]);
+    const { svc, review, collect } = make([clean, clean, clean, clean]);
     collect.mockResolvedValue({ ...OK_EVIDENCE, reportsToPrincipal: ['Earlier note.'] });
 
     await svc.review({ ...base, reportedToPrincipal: 'Provider asked for your number.' });
-    expect(review.mock.calls[0]![0].evidence.reportsToPrincipal).toEqual(['Earlier note.', 'Provider asked for your number.']);
+    expect(review.mock.calls[0]![0].evidence.reportsToPrincipal).toEqual(['Provider asked for your number.', 'Earlier note.']);
+
+    // Redacted and clipped like the collector's evidence.
+    await svc.review({ ...base, conversationId: 'conv-3', reportedToPrincipal: `key sk-ant-abcdefghijklmnopqrstuvwxyz0123 ${'x'.repeat(5000)}` });
+    const [leading] = review.mock.calls[1]![0].evidence.reportsToPrincipal as string[];
+    expect(leading).not.toContain('sk-ant-abcdefghijklmnopqrstuvwxyz0123');
+    expect(leading).toContain('[REDACTED]');
+    expect(leading!.length).toBeLessThanOrEqual(2_001);
 
     // Without a note the collected reports pass through untouched.
     await svc.review({ ...base, conversationId: 'conv-2' });
-    expect(review.mock.calls[1]![0].evidence.reportsToPrincipal).toEqual(['Earlier note.']);
+    expect(review.mock.calls[2]![0].evidence.reportsToPrincipal).toEqual(['Earlier note.']);
   });
 
   it('does not treat a send to someone else on the same conversation as a recheck', async () => {

@@ -4116,6 +4116,15 @@ describe('band review (#2159)', () => {
     });
   });
 
+  it('forwards the note reported to the principal to the review (#2312)', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', postTurn: true, reportedToPrincipal: 'Provider asked for your number.' });
+    expect(review.mock.calls[0]![0]).toMatchObject({ reportedToPrincipal: 'Provider asked for your number.' });
+    await gw.send(emailReq, { taskEventId: 't2', conversationId: 'c2' });
+    expect(review.mock.calls[1]![0]).not.toHaveProperty('reportedToPrincipal');
+  });
+
   it('tells the review which recipients are the principal', async () => {
     const review = vi.fn().mockResolvedValue({ kind: 'send' });
     const gw = makeBandGateway({ review, score: 84 });

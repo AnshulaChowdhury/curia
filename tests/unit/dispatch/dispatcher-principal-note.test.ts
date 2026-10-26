@@ -133,6 +133,28 @@ describe('Dispatcher — note for the principal (prompt trim PR 5)', () => {
     expect(relays(published)[1]!.payload).not.toHaveProperty('reportedToPrincipal');
   });
 
+  it('does not mark the reply as reported when the note was skipped (a send already reached the principal)', async () => {
+    const { dispatcher, handlers, published } = harness();
+    seedRouting(dispatcher, 'task-1', { principalSendMade: true });
+    await respond(handlers, { taskId: 'task-1', principalNote: NOTE });
+    expect(reports(published)).toHaveLength(0);
+    expect(relays(published)[0]!.payload).not.toHaveProperty('reportedToPrincipal');
+  });
+
+  it('does not mark the reply as reported when queuing the note failed', async () => {
+    const { dispatcher, handlers, published } = harness();
+    seedRouting(dispatcher, 'task-1');
+    const bus = (dispatcher as unknown as { bus: { publish: ReturnType<typeof vi.fn> } }).bus;
+    const publish = bus.publish.getMockImplementation() as (layer: string, event: BusEvent) => Promise<void>;
+    bus.publish.mockImplementation(async (layer: string, event: BusEvent) => {
+      if (event.type === 'principal.report') throw new Error('bus down');
+      return publish(layer, event);
+    });
+    await respond(handlers, { taskId: 'task-1', principalNote: NOTE });
+    expect(relays(published)).toHaveLength(1);
+    expect(relays(published)[0]!.payload).not.toHaveProperty('reportedToPrincipal');
+  });
+
   it('still queues the note when the reply is a decline', async () => {
     const { dispatcher, handlers, published } = harness();
     seedRouting(dispatcher, 'task-1');

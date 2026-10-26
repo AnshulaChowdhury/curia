@@ -1397,7 +1397,7 @@ export class Dispatcher {
   private async deliverPrincipalNote(
     event: AgentResponseEvent,
     routing: { conversationId: string; channelId: string; senderId: string; senderLabel?: string; principalSendMade?: boolean },
-  ): Promise<void> {
+  ): Promise<boolean> {
     const note = event.payload.principalNote!;
     const fields = {
       agentId: event.payload.agentId,
@@ -1408,7 +1408,7 @@ export class Dispatcher {
     };
     if (routing.principalSendMade) {
       this.logger.info(fields, 'Principal note not queued — a send already reached the principal on this turn');
-      return;
+      return false;
     }
     const source = {
       senderLabel: routing.senderLabel ?? routing.senderId,
@@ -1426,8 +1426,10 @@ export class Dispatcher {
         sourceLayer: 'dispatch',
       }));
       this.logger.info(fields, 'Principal note queued for the digest');
+      return true;
     } catch (err) {
       this.logger.error({ err, ...fields }, 'Failed to queue the principal note — the note is only on the agent.response audit record');
+      return false;
     }
   }
 
@@ -1801,8 +1803,9 @@ export class Dispatcher {
     // A note for the principal goes out whatever happens to the relay below: a declined,
     // suppressed or held reply can still carry something the principal needs (prompt trim
     // PR 5). Sent first, so the audit log reads in the order things happened.
+    let noteQueued = false;
     if (event.payload.principalNote !== undefined) {
-      await this.deliverPrincipalNote(event, routing);
+      noteQueued = await this.deliverPrincipalNote(event, routing);
     }
 
     // Reply-lock: a human-facing send already reached this sender (#847, #1860).
@@ -2012,8 +2015,8 @@ export class Dispatcher {
       // this through so the email adapter can pass it to gateway.send() for action_log context.
       taskEventId: event.parentEventId ?? undefined,
       contentBlockSalvage: routing.contentBlockSalvage,
-      // The note queued for the principal above: evidence for the send review (#2312).
-      ...(event.payload.principalNote !== undefined && { reportedToPrincipal: event.payload.principalNote }),
+      // The note queued for the principal above, only if it was: evidence for the send review (#2312).
+      ...(noteQueued && { reportedToPrincipal: event.payload.principalNote }),
     });
 
     // Track for content-filter block handling (#1355) — cleared on delivery or block.
