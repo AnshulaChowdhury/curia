@@ -44,7 +44,8 @@ import {
 import { findPrincipalChannelRules } from '../contacts/principal-channel-registry.js';
 import type { ProjectedRecipient } from '../contacts/principal-channel-rules.js';
 import type { OutboundContentFilter, FilterRecipient } from '../dispatch/outbound-filter.js';
-import type { PiiRedactor } from '../dispatch/pii-redactor.js';
+import type { DetectedPii, PiiRedactor } from '../dispatch/pii-redactor.js';
+import type { BriefDetectedItem } from '../autonomy/judge-brief.js';
 import type { EventBus } from '../bus/bus.js';
 import type { Logger } from '../logger.js';
 import { createOutboundBlocked, createOutboundDelivered, createOutboundNotification, createAutonomySendBlocked, createAutonomyRelayDeferred, createPrincipalReport } from '../bus/events.js';
@@ -1174,14 +1175,58 @@ export class OutboundGateway {
     // and the pipeline behaves identically to the pre-redaction behaviour.
     // Built once and reused by Step 2: the redactor's principal bypass keys on the same
     // sole-recipient computation as the content filter (#2312).
+    //
+    // Under band gating (#2312) the review, not the redactor, decides each disclosure. When
+    // the review will run, the PII is detected, the filter gets a redacted copy, and the
+    // message goes out as written only if the review authorizes every item. An approved
+    // replay (humanApproved) goes out intact: the principal approved this exact message.
+    // Otherwise (a system notice, the principal alone, no review wired) band redacts as tier.
     const { recipients, principalIncluded, principalIsSoleRecipient } = this.buildFilterRecipients(request);
+    const bandReviewRuns = this.gating === 'band' && this.bandReview !== undefined
+      && !options?.isSystemNotification && !options?.humanApproved && !principalIsSoleRecipient;
+    const sendIntact = this.gating === 'band' && options?.humanApproved === true;
+    // The redacted copy: what the content filter and the audit events see. Under tier it is
+    // also what is sent; under band review it never goes on the wire.
     let redactedBody = messageBody;
     // Email subjects can contain PII just as the body can — track a separate
     // variable so we can pass the cleaned subject to dispatchEmail() below.
     let redactedSubject: string | undefined = request.channel === 'email' ? request.subject : undefined;
+    // What goes on the wire. The redacted copy, except under band review, where it stays raw.
+    let sendBody = messageBody;
+    let sendSubject = redactedSubject;
+    // The personal data the band review rules on (#2312), `P1…` in order body, subject, quote.
+    const detectedItems: BriefDetectedItem[] = [];
     // Labels of what the redactor changed, reported on the send result (#2312).
     const appliedRedactions: NonNullable<OutboundSendResult['redactions']> = [];
-    if (this.piiRedactor) {
+    if (this.piiRedactor && sendIntact) {
+      this.log.info(
+        { channel: request.channel },
+        'outbound-gateway: PII detection skipped — an approved send goes out as the principal approved it',
+      );
+    } else if (this.piiRedactor && bandReviewRuns) {
+      const redactor = this.piiRedactor;
+      try {
+        const ctx = { recipientId, principalIsSoleRecipient };
+        const detectIn = (text: string | undefined, field: BriefDetectedItem['field']): DetectedPii[] => {
+          if (!text) return [];
+          const found = redactor.detect(text, request.channel, ctx);
+          for (const item of found) {
+            detectedItems.push({ id: `P${detectedItems.length + 1}`, label: item.label, text: item.matched, field });
+          }
+          return found;
+        };
+        const bodyItems = detectIn(messageBody, 'body');
+        const subjectItems = request.channel === 'email' ? detectIn(request.subject, 'subject') : [];
+        if (request.channel === 'email') detectIn(request.htmlQuote, 'quote');
+        // audit: false — nothing is redacted on the wire, so no outbound.pii_redacted.
+        redactedBody = redactor.apply(messageBody, bodyItems, request.channel, ctx, { audit: false }).content;
+        if (request.channel === 'email' && request.subject) {
+          redactedSubject = redactor.apply(request.subject, subjectItems, request.channel, ctx, { audit: false }).content;
+        }
+      } catch (err) {
+        return this.blockForRedactorError(err, request, messageBody, recipientId, options);
+      }
+    } else if (this.piiRedactor) {
       try {
         const redactionResult = await this.piiRedactor.redact(
           messageBody,
@@ -1205,36 +1250,10 @@ export class OutboundGateway {
           }
         }
       } catch (err) {
-        this.log.error(
-          { err, channel: request.channel, recipientId: redactId(recipientId) },
-          'outbound-gateway: PiiRedactor threw — blocking message (fail-closed)',
-        );
-        const blockId = `block_${randomUUID()}`;
-        try {
-          await this.bus.publish('dispatch', createOutboundBlocked({
-            blockId,
-            conversationId: options?.conversationId ?? '',
-            channelId: request.channel,
-            // scrubPii() as a safety fallback — the redactor itself failed, so we apply
-            // a best-effort scrub before writing anything to the audit log. This ensures
-            // no raw PII leaks into the audit trail even on a redactor failure path.
-            content: scrubPii(messageBody),
-            recipientId,
-            reason: 'pii_redactor_error',
-            findings: [{ rule: 'pii_redactor_error', detail: 'PiiRedactor threw an unexpected error' }],
-            parentEventId: options?.parentEventId ?? '',
-          }));
-        } catch (publishErr) {
-          this.log.warn(
-            { publishErr, blockId },
-            'outbound-gateway: failed to publish outbound.blocked event for PII redactor error',
-          );
-        }
-        return this.withUnmatchedRecipientNote(
-          { success: false, blockedReason: 'pii_redactor_error' },
-          await this.findUnmatchedRecipients(request.channel, this.personRecipients(request)),
-        );
+        return this.blockForRedactorError(err, request, messageBody, recipientId, options);
       }
+      sendBody = redactedBody;
+      sendSubject = redactedSubject;
     }
 
     // ------------------------------------------------------------------
@@ -1405,10 +1424,8 @@ export class OutboundGateway {
     // exact message), and for the principal alone (nobody else reads it).
     let bandReport: BandReviewReport | undefined;
     let bandSignals: BandReviewSignals | undefined;
-    if (
-      this.gating === 'band' && this.bandReview
-      && !options?.isSystemNotification && !options?.humanApproved && !principalIsSoleRecipient
-    ) {
+    let copyPrincipal: { labels: string[] } | undefined;
+    if (bandReviewRuns) {
       // People in the finalized set (Curia's own addresses dropped; a group or channel id is
       // still not an audience member), so `recipients` and `principalRecipients` agree. A group
       // send has no person recipients, so the review names the group id instead. A send that
@@ -1417,14 +1434,20 @@ export class OutboundGateway {
       const reviewRecipients = recipients.map((r) => r.email).filter((id) => people.has(id.toLowerCase()));
       const outcome = await this.runBandReview({
         request,
-        content: redactedBody,
+        // The message as written: the review rules on the raw detected items it contains.
+        content: sendBody,
+        auditContent: redactedBody,
         recipients: reviewRecipients.length > 0 || people.size > 0 ? reviewRecipients : [recipientId],
         principalRecipients: recipients.filter((r) => r.isPrincipal).map((r) => r.email),
+        detectedItems,
+        recipientTier,
+        ...(sendSubject !== undefined ? { subject: sendSubject } : {}),
         options,
       });
       if (outcome.result) return outcome.result;
       bandReport = outcome.report;
       bandSignals = outcome.signals;
+      copyPrincipal = outcome.copyPrincipal;
     }
 
     // Spot-check pool (#2159 Phase 3): a send Curia made on its own. Not a system notice, a
@@ -1453,15 +1476,20 @@ export class OutboundGateway {
     // confirmed (or create one if none exists). The act of sending is the principal's
     // implicit trust confirmation — replies from this person should never be held.
     //
-    // IMPORTANT: pass redactedBody here, not request.body / request.message.
+    // IMPORTANT: pass sendBody here, not request.body / request.message.
     // The dispatch methods read the body/message field from the request object
     // they receive — if we pass the original `request`, the unredacted content
     // reaches Nylas / signal-cli even though redactedBody was computed above.
+    // sendBody is raw only under band review, which authorized every detected item (#2312).
+    //
+    // The spot-check preview is the redacted copy whenever the wire is raw: a sample row is
+    // not where a disclosure the review authorized should be repeated (#2312).
+    const rawOnWire = detectedItems.length > 0;
     if (request.channel === 'email') {
       // Provenance lives on the request so a queued payload keeps it. Only send()
       // options set it; a value already on the request is dropped. dispatchEmail
       // copies named provider fields, so Nylas never sees these (#2071).
-      const toSend: EmailSendRequest = { ...request, body: redactedBody, subject: redactedSubject };
+      const toSend: EmailSendRequest = { ...request, body: sendBody, subject: sendSubject };
       delete toSend.recipientSource;
       delete toSend.recipientDisplayName;
       this.signEmail(toSend, options?.isSystemNotification === true);
@@ -1470,6 +1498,8 @@ export class OutboundGateway {
         const fromName = options.recipientDisplayName?.trim();
         if (fromName) toSend.recipientDisplayName = fromName;
       }
+      // The review let a trusted contact's request send the principal's details: copy them.
+      const principalCopied = copyPrincipal ? this.ccPrincipal(toSend) : false;
       const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchEmail(toSend));
       if (result.success && !result.queued) {
         // A To copied from Curia's own message has not written to us (#2273).
@@ -1502,16 +1532,23 @@ export class OutboundGateway {
             }
             : {}),
         });
-        if (sampled) await this.recordSentAction({ ...sampleArgs, preview: toSend.subject || toSend.body });
+        if (sampled) {
+          await this.recordSentAction({
+            ...sampleArgs,
+            preview: rawOnWire ? (redactedSubject || redactedBody) : (toSend.subject || toSend.body),
+          });
+        }
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      // No verified address to copy: the principal is told instead.
+      if (copyPrincipal && !principalCopied && result.success) await this.reportPrincipalCopy(copyPrincipal, sampleArgs.recipientLabel, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
       // toSend.body, not redactedBody: signEmail may have dropped the model's sign-off.
       return this.withRedactions(result, appliedRedactions, toSend.body, toSend.subject);
     }
 
     if (request.channel === 'slack') {
-      const toSend = { ...request, message: redactedBody };
+      const toSend = { ...request, message: sendBody };
       const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchSlack(toSend));
       // Contact resolution uses slackUserId (U…) when provided; inbound auto-creates
       // contacts from Slack user ids. Skip promoteOrCreate on conversation ids.
@@ -1520,7 +1557,7 @@ export class OutboundGateway {
           channel: 'slack',
           recipientId,
           recipientContactId,
-          content: redactedBody,
+          content: sendBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1529,12 +1566,13 @@ export class OutboundGateway {
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (copyPrincipal && result.success) await this.reportPrincipalCopy(copyPrincipal, sampleArgs.recipientLabel, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return this.withRedactions(result, appliedRedactions, redactedBody);
+      return this.withRedactions(result, appliedRedactions, sendBody);
     }
 
     if (request.channel === 'sms') {
-      const toSend = { ...request, message: redactedBody };
+      const toSend = { ...request, message: sendBody };
       const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchSms(toSend));
       if (result.success && !result.queued) {
         await this.promoteOrCreateRecipientContact('sms', request.recipient);
@@ -1542,7 +1580,7 @@ export class OutboundGateway {
           channel: 'sms',
           recipientId,
           recipientContactId,
-          content: redactedBody,
+          content: sendBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1551,12 +1589,13 @@ export class OutboundGateway {
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (copyPrincipal && result.success) await this.reportPrincipalCopy(copyPrincipal, sampleArgs.recipientLabel, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return this.withRedactions(result, appliedRedactions, redactedBody);
+      return this.withRedactions(result, appliedRedactions, sendBody);
     }
 
     {
-      const toSend: SignalOutboundRequest = { ...request, message: redactedBody };
+      const toSend: SignalOutboundRequest = { ...request, message: sendBody };
       const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchSignal(toSend));
       // Only promote for 1:1 Signal sends — group sends use a groupId, not an individual
       // phone number. Creating a contact for a group token would pollute the contacts table
@@ -1571,7 +1610,7 @@ export class OutboundGateway {
           channel: 'signal',
           recipientId,
           recipientContactId,
-          content: redactedBody,
+          content: sendBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
@@ -1580,8 +1619,9 @@ export class OutboundGateway {
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (copyPrincipal && result.success) await this.reportPrincipalCopy(copyPrincipal, sampleArgs.recipientLabel, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return this.withRedactions(result, appliedRedactions, redactedBody);
+      return this.withRedactions(result, appliedRedactions, sendBody);
     }
   }
 
@@ -1597,6 +1637,87 @@ export class OutboundGateway {
   ): OutboundSendResult {
     if (!result.success || applied.length === 0) return result;
     return { ...result, redactions: [...applied], sentContent, ...(sentSubject !== undefined ? { sentSubject } : {}) };
+  }
+
+  /**
+   * Add the principal's verified email to an email's CC, unless they are already a recipient
+   * (#2312). Returns false when there is no verified address to add.
+   */
+  private ccPrincipal(toSend: EmailSendRequest): boolean {
+    const principal = this.principalIdentities.find((i) => i.channel === 'email' && i.verified && i.status === 'active')?.channelIdentifier;
+    if (!principal) {
+      this.log.warn('outbound-gateway: no verified principal email to copy — telling the principal instead');
+      return false;
+    }
+    const present = [...emailToAddresses(toSend), ...(toSend.cc ?? [])]
+      .some((addr) => addr.toLowerCase() === principal.toLowerCase());
+    if (!present) toSend.cc = [...(toSend.cc ?? []), principal];
+    return true;
+  }
+
+  /**
+   * Tell the principal now that a trusted contact's request sent their details (#2312), on a
+   * send they could not be copied on. Labels only, never the values. Never throws.
+   */
+  private async reportPrincipalCopy(
+    copy: { labels: string[] },
+    recipient: string,
+    options: { taskEventId?: string; parentEventId?: string; conversationId?: string | null } | undefined,
+  ): Promise<void> {
+    try {
+      await this.bus.publish('dispatch', createPrincipalReport({
+        summary: `Sent your ${copy.labels.join(', ')} to ${recipient} at your trusted contact's request.`,
+        urgency: 'now',
+        source: 'agent',
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        parentEventId: options?.taskEventId ?? options?.parentEventId ?? 'system',
+        sourceLayer: 'dispatch',
+      }));
+    } catch (err) {
+      this.log.error({ err, labels: copy.labels }, 'outbound-gateway: could not tell the principal a trusted contact\'s request sent their details');
+    }
+  }
+
+  /**
+   * Step 1.5's fail-closed path: the PII redactor threw, so the message is blocked. Sending
+   * unredacted PII through a broken redactor is worse than dropping the message.
+   */
+  private async blockForRedactorError(
+    err: unknown,
+    request: OutboundSendRequest,
+    messageBody: string,
+    recipientId: string,
+    options: { conversationId?: string; parentEventId?: string } | undefined,
+  ): Promise<OutboundSendResult> {
+    this.log.error(
+      { err, channel: request.channel, recipientId: redactId(recipientId) },
+      'outbound-gateway: PiiRedactor threw — blocking message (fail-closed)',
+    );
+    const blockId = `block_${randomUUID()}`;
+    try {
+      await this.bus.publish('dispatch', createOutboundBlocked({
+        blockId,
+        conversationId: options?.conversationId ?? '',
+        channelId: request.channel,
+        // scrubPii() as a safety fallback — the redactor itself failed, so we apply
+        // a best-effort scrub before writing anything to the audit log. This ensures
+        // no raw PII leaks into the audit trail even on a redactor failure path.
+        content: scrubPii(messageBody),
+        recipientId,
+        reason: 'pii_redactor_error',
+        findings: [{ rule: 'pii_redactor_error', detail: 'PiiRedactor threw an unexpected error' }],
+        parentEventId: options?.parentEventId ?? '',
+      }));
+    } catch (publishErr) {
+      this.log.warn(
+        { publishErr, blockId },
+        'outbound-gateway: failed to publish outbound.blocked event for PII redactor error',
+      );
+    }
+    return this.withUnmatchedRecipientNote(
+      { success: false, blockedReason: 'pii_redactor_error' },
+      await this.findUnmatchedRecipients(request.channel, this.personRecipients(request)),
+    );
   }
 
   /** Whether this channel is registered for durable queueing (#1380). */
@@ -1961,8 +2082,15 @@ export class OutboundGateway {
   private async runBandReview(args: {
     request: OutboundSendRequest;
     content: string;
+    /** What a bounce's outbound.blocked event carries: the redacted copy, never raw values (#2312). Defaults to content. */
+    auditContent?: string;
     recipients: readonly string[];
     principalRecipients: readonly string[];
+    /** The personal data detected in the send, and the primary recipient's tier (#2312). */
+    detectedItems?: readonly BriefDetectedItem[];
+    recipientTier?: ContactTier;
+    /** The email subject as it will be sent: the review scans it for redaction tokens. */
+    subject?: string;
     options: {
       taskEventId?: string;
       conversationId?: string | null;
@@ -1975,7 +2103,9 @@ export class OutboundGateway {
     } | undefined;
     /** False for a saved draft: its drafter cannot rewrite it, so a block holds instead. */
     editable?: boolean;
-  }): Promise<{ result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals }> {
+  }): Promise<{
+    result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals; copyPrincipal?: { labels: string[] };
+  }> {
     const { request, content, recipients, principalRecipients, options } = args;
     const score = await this.bandScore();
     let decision: Awaited<ReturnType<BandSendReview['review']>>;
@@ -1991,6 +2121,9 @@ export class OutboundGateway {
         principalDirected: options?.principalDirected === true,
         postTurn: options?.postTurn === true,
         ...(options?.reportedToPrincipal ? { reportedToPrincipal: options.reportedToPrincipal } : {}),
+        ...(args.detectedItems && args.detectedItems.length > 0 ? { detectedItems: args.detectedItems } : {}),
+        ...(args.recipientTier ? { recipientTier: args.recipientTier } : {}),
+        ...(args.subject !== undefined ? { subject: args.subject } : {}),
       });
     } catch (err) {
       // BandSendReview is not meant to throw; if it does, the send was not reviewed. Hold.
@@ -2014,6 +2147,7 @@ export class OutboundGateway {
       return {
         ...(decision.report ? { report: decision.report } : {}),
         ...(decision.signals ? { signals: decision.signals } : {}),
+        ...(decision.copyPrincipal ? { copyPrincipal: decision.copyPrincipal } : {}),
       };
     }
 
@@ -2026,7 +2160,7 @@ export class OutboundGateway {
           blockId,
           conversationId: options?.conversationId ?? '',
           channelId: request.channel,
-          content,
+          content: args.auditContent ?? content,
           recipientId: recipients[0] ?? '',
           reason: decision.findings.map((f) => `${f.rule}: ${f.detail}`).join('; '),
           findings: decision.findings,

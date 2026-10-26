@@ -4133,6 +4133,7 @@ describe('band review (#2159)', () => {
     expect(review).toHaveBeenCalledWith({
       content: emailReq.body, channel: 'email', recipients: ['joel@example.com'], principalRecipients: [], score: 84,
       conversationId: 'c1', taskEventId: 't1', principalDirected: true, postTurn: true,
+      recipientTier: 'unknown', subject: 'Forms',
     });
   });
 
@@ -4329,6 +4330,177 @@ describe('band review (#2159)', () => {
     await gw.send(emailReq, { taskEventId: 't1' });
     const recipients = vi.mocked(mocks.nylasClient.sendMessage).mock.calls.map((c) => (c[0] as { to: Array<{ email: string }> }).to[0]!.email);
     expect(recipients).toEqual(['joel@example.com', 'principal@example.com']);
+  });
+
+  describe('personal data is sent only when the review authorizes it (#2312)', () => {
+    const phone = '(415) 555-1234';
+    const phoneBody = `Call me on ${phone} tomorrow.`;
+    const phoneReq = { channel: 'email' as const, to: 'joel@example.com', subject: 'Forms', body: phoneBody };
+
+    async function makePiiGateway(opts: { review: ReturnType<typeof vi.fn>; gating?: 'band' | 'tier'; withSignal?: boolean }) {
+      const { PiiRedactor: RealPiiRedactor } = await import('../../../src/dispatch/pii-redactor.js');
+      const signalClient = makeSignalClient();
+      const gateway = new OutboundGateway({
+        nylasClients: new Map([['curia', mocks.nylasClient]]),
+        ...(opts.withSignal
+          ? {
+            signalClient: signalClient as unknown as import('../../../src/channels/signal/signal-rpc-client.js').SignalRpcClient,
+            signalPhoneNumber: '+15555550000',
+          }
+          : {}),
+        contactService: mocks.contactService,
+        contentFilter: mocks.contentFilter,
+        bus: mocks.bus,
+        principalIdentities: [makePrincipalIdentity('principal@example.com')],
+        logger: mocks.logger,
+        autonomyService: makeAutonomyService(84),
+        actionLogRepo: makeActionLogRepo(),
+        gating: opts.gating ?? 'band',
+        bandReview: { review: opts.review as unknown as BandSendReview['review'] },
+        piiRedactor: new RealPiiRedactor({
+          config: { enabled: true, default: 'block', channel_policies: { email: { allow: ['email'] }, signal: { allow: [] } } },
+          bus: mocks.bus,
+          logger: mocks.logger,
+          extraPatterns: [],
+        }),
+      });
+      return { gateway, signalClient };
+    }
+
+    function sentEmail(): { body: string; subject: string; cc?: Array<{ email: string }> } {
+      return vi.mocked(mocks.nylasClient.sendMessage).mock.calls[0]![0] as { body: string; subject: string; cc?: Array<{ email: string }> };
+    }
+
+    it('delivers the raw value when the review sends it, with no redaction audit', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const { gateway } = await makePiiGateway({ review });
+      const result = await gateway.send(phoneReq, { taskEventId: 't1', conversationId: 'c1' });
+
+      expect(result.success).toBe(true);
+      expect(sentEmail().body).toContain(phone);
+      expect(publishedOfType(mocks.bus, 'outbound.pii_redacted')).toHaveLength(0);
+      // Nothing was redacted on the wire.
+      expect(result.redactions).toBeUndefined();
+      expect(result.sentContent).toBeUndefined();
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered).toHaveLength(1);
+      expect(String(delivered[0]!.payload['content'])).toContain(phone);
+    });
+
+    it('gives the content filter a redacted copy', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const { gateway } = await makePiiGateway({ review });
+      await gateway.send(phoneReq, { taskEventId: 't1' });
+
+      expect(mocks.contentFilter.check).toHaveBeenCalledWith(expect.objectContaining({
+        content: 'Call me on [REDACTED: PHONE_US] tomorrow.',
+      }));
+    });
+
+    it('passes the review the detected items, the raw content, the recipient tier and the subject', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      vi.mocked(mocks.contactService.resolveByChannelIdentity).mockResolvedValue({
+        contactId: 'joel-1', displayName: 'Joel', tier: 'trusted', kind: 'person',
+      } as unknown as Awaited<ReturnType<ContactService['resolveByChannelIdentity']>>);
+      const { gateway } = await makePiiGateway({ review });
+      await gateway.send(
+        { ...phoneReq, subject: `Re: ${phone}`, htmlQuote: `<blockquote>Reach me at ${phone}</blockquote>` },
+        { taskEventId: 't1' },
+      );
+
+      const arg = review.mock.calls[0]![0] as Record<string, unknown>;
+      expect(arg['content']).toBe(phoneBody);
+      expect(arg['recipientTier']).toBe('trusted');
+      expect(arg['subject']).toBe(`Re: ${phone}`);
+      expect(arg['detectedItems']).toEqual([
+        { id: 'P1', label: 'phone_us', text: phone, field: 'body' },
+        { id: 'P2', label: 'phone_us', text: phone, field: 'subject' },
+        { id: 'P3', label: 'phone_us', text: phone, field: 'quote' },
+      ]);
+      // The authorized subject goes out as written.
+      expect(sentEmail().subject).toBe(`Re: ${phone}`);
+    });
+
+    it('keeps raw values out of the outbound.blocked event on a bounce', async () => {
+      const findings = [{ rule: 'pii-not-authorized', detail: 'P1 phone_us was not authorized.' }];
+      const { gateway } = await makePiiGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }) });
+      const result = await gateway.send(phoneReq, { taskEventId: 't1' });
+
+      expect(result.success).toBe(false);
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+      const blocked = publishedOfType(mocks.bus, 'outbound.blocked');
+      expect(blocked).toHaveLength(1);
+      expect(String(blocked[0]!.payload['content'])).not.toContain('555-1234');
+      expect(String(blocked[0]!.payload['content'])).toContain('[REDACTED: PHONE_US]');
+    });
+
+    it('copies the principal on an email the review copies them on', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us'] } });
+      const { gateway } = await makePiiGateway({ review });
+      const result = await gateway.send({ ...phoneReq, cc: ['amy@example.com'] }, { taskEventId: 't1' });
+
+      expect(result.success).toBe(true);
+      expect(sentEmail().cc).toEqual([{ email: 'amy@example.com' }, { email: 'principal@example.com' }]);
+      expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(0);
+    });
+
+    it('does not copy the principal twice when they are already a recipient', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us'] } });
+      const { gateway } = await makePiiGateway({ review });
+      await gateway.send({ ...phoneReq, cc: ['Principal@Example.com'] }, { taskEventId: 't1' });
+
+      expect(sentEmail().cc).toEqual([{ email: 'Principal@Example.com' }]);
+    });
+
+    it('tells the principal now, without the value, on a Signal send the review copies them on', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us', 'email'] } });
+      const { gateway, signalClient } = await makePiiGateway({ review, withSignal: true });
+      const result = await gateway.send({ channel: 'signal', recipient: '+15555552222', message: phoneBody }, { taskEventId: 't1' });
+
+      expect(result.success).toBe(true);
+      expect(JSON.stringify(signalClient.send.mock.calls)).toContain(phone);
+      const reports = publishedOfType(mocks.bus, 'principal.report');
+      expect(reports).toHaveLength(1);
+      expect(reports[0]!.payload).toEqual({
+        summary: 'Sent your phone_us, email to +15555552222 at your trusted contact\'s request.',
+        urgency: 'now',
+        source: 'agent',
+      });
+      expect(JSON.stringify(reports[0])).not.toContain('555-1234');
+    });
+
+    it('redacts a system notification as tier does', async () => {
+      const review = vi.fn();
+      const { gateway } = await makePiiGateway({ review });
+      await gateway.send(phoneReq, { isSystemNotification: true });
+
+      expect(review).not.toHaveBeenCalled();
+      expect(sentEmail().body).toContain('[REDACTED: PHONE_US]');
+      expect(sentEmail().body).not.toContain('555-1234');
+    });
+
+    it('sends an approved replay intact, without review', async () => {
+      const review = vi.fn();
+      const { gateway } = await makePiiGateway({ review });
+      const result = await gateway.send({ ...phoneReq, subject: `Re: ${phone}` }, { humanApproved: true });
+
+      expect(result.success).toBe(true);
+      expect(review).not.toHaveBeenCalled();
+      expect(sentEmail().body).toContain(phone);
+      expect(sentEmail().subject).toBe(`Re: ${phone}`);
+      expect(publishedOfType(mocks.bus, 'outbound.pii_redacted')).toHaveLength(0);
+    });
+
+    it('still redacts under tier gating', async () => {
+      const review = vi.fn();
+      const { gateway } = await makePiiGateway({ review, gating: 'tier' });
+      const result = await gateway.send(phoneReq, { taskEventId: 't1' });
+
+      expect(review).not.toHaveBeenCalled();
+      expect(sentEmail().body).toContain('[REDACTED: PHONE_US]');
+      expect(sentEmail().body).not.toContain('555-1234');
+      expect(result.redactions).toEqual([{ label: 'phone_us', field: 'body' }]);
+    });
   });
 
   describe('sendEmailDraft', () => {
