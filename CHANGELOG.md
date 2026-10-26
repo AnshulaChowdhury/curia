@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Ant Farm video-call design** — design doc for replacing the Phaser office with a call view. (#2127)
 - **Turn lanes** — per-conversation lock and injection config, on in the shipped file. (#2018)
 - **Turn lane wiring** — a coordinator conversation has one holder. (#2018)
 - **`agent.task.input_injected`** — **public API:** audit event for a drained same-contact follow-up. (#2018)
