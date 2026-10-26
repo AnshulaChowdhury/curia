@@ -148,6 +148,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Coordinator tool budget** — raised 78,745 → 79,600 for the `verification` tool. (#2017)
 - **`query-relationships` / `delete-relationship`** — no longer require `openai_api_key`; they fail closed without entity memory. (#2023)
 - **Send results** — now report which details were redacted. (#2312)
+- **PII disclosure review** — band review authorizes each personal detail by who directed the work. (#2312)
+- **Trusted-contact directives** — sending the principal's details at a trusted contact's request copies the principal. (#2312)
+- **Approval displays** — approvals for sends list every personal detail they would send. (#2312)
+- **Unseen approvals** — a send approval with personal details can't be approved until it's shown. (#2312)
 
 ### Removed
 
@@ -174,6 +178,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Contact-visible outbound context** — contacts see only their own entries, one-to-one, on authenticated channels; their wakes likewise. (#2261)
 - **zod** — override floor set to 4.6.6, clearing a HIGH DoS advisory (CVE-2023-54404).
 - **Principal redaction bypass** — a third party CC'd on a message to the principal no longer bypasses redaction. (#2312)
+- **Saved drafts** — `send-draft` no longer skips PII checks; drafts with unallowed details hold or are refused. (#2312)
 
 ### Fixed
 

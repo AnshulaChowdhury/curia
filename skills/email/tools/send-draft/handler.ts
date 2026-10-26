@@ -166,6 +166,15 @@ export class SendDraftHandler implements ToolHandler {
       ...(draft.bcc ?? []).map((r) => r.email),
     ];
 
+    // An approval replay sends the draft intact only if it is the draft the principal saw: the
+    // approval's payload carries its subject and body (below), and the draft may have been
+    // edited since, or the approval may predate them (#2312). Otherwise it is scanned again.
+    const principalApproved = ctx.humanApproved === true
+      && input['subject'] === draft.subject && input['body'] === draft.body;
+    if (ctx.humanApproved === true && !principalApproved) {
+      ctx.log.warn({ draftId }, 'send-draft: approved draft differs from what the approval showed — checking it for personal data again');
+    }
+
     const sendResult = await ctx.outboundGateway.sendEmailDraft(
       draftId,
       resolvedAccount,
@@ -175,10 +184,17 @@ export class SendDraftHandler implements ToolHandler {
       {
         humanApproved: true,
         principalDirected: isPrincipalDirectedSend(ctx),
+        principalApproved,
         conversationId: ctx.conversationId,
         taskEventId: ctx.taskEventId,
-        // Used only if band review holds this draft (#2159): approval replays send-draft.
-        holdRecipe: { toolName: 'send-draft', partialPayload: ctx.input, description: `Send draft to ${recipient} — "${draft.subject}"` },
+        // Used only if band review holds this draft (#2159): approval replays send-draft from
+        // draft_id. The subject and body are stored so the approval shows the draft, and its
+        // personal details, even after a restart (#2312).
+        holdRecipe: {
+          toolName: 'send-draft',
+          partialPayload: { ...input, subject: draft.subject, body: draft.body },
+          description: `Send draft to ${recipient} — "${draft.subject}"`,
+        },
       },
     );
 

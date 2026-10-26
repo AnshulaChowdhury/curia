@@ -326,7 +326,12 @@ describe('SendDraftHandler', () => {
         'personal',
         expect.anything(),
         expect.objectContaining({
-          holdRecipe: { toolName: 'send-draft', partialPayload: ctx.input, description: expect.stringMatching(/^Send draft to /) },
+          holdRecipe: {
+            toolName: 'send-draft',
+            // The draft's text rides in the payload, so the approval shows it after a restart (#2312).
+            partialPayload: { ...ctx.input, subject: DRAFT_STUB.subject, body: DRAFT_STUB.body },
+            description: expect.stringMatching(/^Send draft to /),
+          },
         }),
       );
     });
@@ -340,6 +345,47 @@ describe('SendDraftHandler', () => {
         'personal',
         expect.anything(),
         expect.objectContaining({ principalDirected: true }),
+      );
+    });
+  });
+
+  // ─── principalApproved: an approval replay (#2312) ────────────────────────
+
+  describe('principalApproved', () => {
+    const approvedInput = { draft_id: 'draft-abc123', account: 'personal', subject: DRAFT_STUB.subject, body: DRAFT_STUB.body };
+
+    function approvedCtx(input: Record<string, unknown>, humanApproved: boolean): ToolContext {
+      const ctx = makeCtx({ input });
+      (ctx as { humanApproved?: boolean }).humanApproved = humanApproved;
+      return ctx;
+    }
+
+    it('is true on an approval replay of the draft the principal saw', async () => {
+      const ctx = approvedCtx(approvedInput, true);
+      await handler.execute(ctx);
+      expect(ctx.outboundGateway!.sendEmailDraft).toHaveBeenCalledWith(
+        'draft-abc123', 'personal', expect.anything(), expect.objectContaining({ principalApproved: true }),
+      );
+    });
+
+    it('is false without an approval', async () => {
+      const ctx = approvedCtx(approvedInput, false);
+      await handler.execute(ctx);
+      expect(ctx.outboundGateway!.sendEmailDraft).toHaveBeenCalledWith(
+        'draft-abc123', 'personal', expect.anything(), expect.objectContaining({ principalApproved: false }),
+      );
+    });
+
+    it('is false when the draft changed since the approval, or the approval never showed it', async () => {
+      const edited = approvedCtx({ ...approvedInput, body: '<p>Hello Kevin, an older version</p>' }, true);
+      await handler.execute(edited);
+      expect(edited.outboundGateway!.sendEmailDraft).toHaveBeenCalledWith(
+        'draft-abc123', 'personal', expect.anything(), expect.objectContaining({ principalApproved: false }),
+      );
+      const unseen = approvedCtx({ draft_id: 'draft-abc123', account: 'personal' }, true);
+      await handler.execute(unseen);
+      expect(unseen.outboundGateway!.sendEmailDraft).toHaveBeenCalledWith(
+        'draft-abc123', 'personal', expect.anything(), expect.objectContaining({ principalApproved: false }),
       );
     });
   });

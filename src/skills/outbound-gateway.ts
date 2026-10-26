@@ -2125,7 +2125,10 @@ export class OutboundGateway {
       holdRecipe?: SendRecipe;
       reExecRecipe?: SendRecipe;
     } | undefined;
-    /** False for a saved draft: its drafter cannot rewrite it, so a block holds instead. */
+    /**
+     * False for a saved draft: its drafter cannot rewrite it, so a block holds instead, and so
+     * do a bounce and a principal copy when it holds personal data (#2312).
+     */
     editable?: boolean;
   }): Promise<{
     result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals; copyPrincipal?: { labels: string[] };
@@ -2165,6 +2168,22 @@ export class OutboundGateway {
         reason: `Held for the principal: after one rewrite it still has these problems (${rules}).`,
         findings: decision.findings,
       };
+    }
+
+    // A saved draft with personal data in it is sent as written or not at all (#2312). A bounce
+    // asks for a rewrite it cannot get, and copying the principal would change its stored
+    // recipients: the principal decides either way. Rule names and labels only, never values.
+    if (args.editable === false && (args.detectedItems?.length ?? 0) > 0 && decision.kind === 'bounce') {
+      const rules = decision.findings.map((f) => f.rule).join(', ');
+      decision = {
+        kind: 'hold',
+        reason: `Held for the principal: a saved draft can't be rewritten in place, and the review found these problems (${rules}).`,
+        findings: decision.findings,
+      };
+    } else if (args.editable === false && decision.kind === 'send' && decision.copyPrincipal) {
+      const labels = decision.copyPrincipal.labels.join(', ');
+      const reason = `Held for the principal: a trusted contact's request would send their ${labels}, and a saved draft can't be changed to copy them.`;
+      decision = { kind: 'hold', reason, findings: [{ rule: BAND_RULES.pii, detail: reason }] };
     }
 
     if (decision.kind === 'send') {
@@ -3357,13 +3376,15 @@ export class OutboundGateway {
    * Safety pipeline:
    *   0. Autonomy gate — skipped when options.humanApproved is true (principal in the loop)
    *   1. Blocked-contact check on the primary To recipient
-   *   2. Content filter on the draft body
+   *   1.5 PII detection on the body and subject (#2312)
+   *   2. Content filter on the redacted copy of the draft body
+   *   2.5 Band review
    *   3. Nylas drafts.send() dispatch — sends the actual draft, not a reconstructed copy
    *   4. Recipient contact promotion (provisional → confirmed)
    *
-   * Note: PII redaction is not applied here. The draft was created by Curia
-   * (content passed through our pipeline at creation time) or authored directly
-   * by the principal. Sending the stored draft as-is is intentional.
+   * A stored draft is sent as written: it cannot be redacted in place (#2312). Under band
+   * gating the review rules on each detected detail, and anything but a send holds the draft.
+   * Under tier gating a draft with details the channel does not allow is refused.
    *
    * @param draftId        Nylas draft ID to send
    * @param accountId      Which named account to use. Defaults to the primary account.
@@ -3371,6 +3392,8 @@ export class OutboundGateway {
    * @param options        humanApproved: true skips Step 0 only (principal in the loop).
    *                       principalDirected: true lifts the Stage 2.5 disclosure gate only,
    *                       as in send() (#1870).
+   *                       principalApproved: true when the principal approved this draft as
+   *                       written: no PII detection, sent intact (#2312).
    */
   async sendEmailDraft(
     draftId: string,
@@ -3379,6 +3402,8 @@ export class OutboundGateway {
     options?: {
       humanApproved?: boolean;
       principalDirected?: boolean;
+      /** The principal approved this draft as written (an approval replay): sent intact (#2312). */
+      principalApproved?: boolean;
       conversationId?: string;
       taskEventId?: string;
       parentEventId?: string;
@@ -3519,19 +3544,69 @@ export class OutboundGateway {
       );
     }
 
+    const { recipients: draftRecipients, principalIncluded: draftPrincipalIncluded, principalIsSoleRecipient: draftPrincipalSole } = this.buildRecipientSet(draftEnvelope);
+    const draftRequest: EmailSendRequest = {
+      channel: 'email',
+      to: recipientEmail,
+      subject: draftMeta.subject,
+      body,
+      ...(draftEnvelope.length > 1 ? { cc: draftEnvelope.filter((r) => r !== recipientEmail) } : {}),
+    };
+
+    // ------------------------------------------------------------------
+    // Step 1.5: PII detection (#2312)
+    // ------------------------------------------------------------------
+    // A stored draft is sent as written: it cannot be redacted in place. So its personal data
+    // is detected here and either authorized by the band review or the draft is not sent.
+    // Skipped for a draft the principal approved (they saw it as written) and for the
+    // principal alone (the redactor's own bypass). Fail-closed if the redactor throws.
+    const detectedItems: BriefDetectedItem[] = [];
+    // What the content filter and the audit events see: never the raw values.
+    let redactedBody = body;
+    let redactedSubject = draftMeta.subject;
+    if (this.piiRedactor && options?.principalApproved === true) {
+      this.log.info({ draftId }, 'outbound-gateway: PII detection skipped — the principal approved this draft as written');
+    } else if (this.piiRedactor && !draftPrincipalSole) {
+      const redactor = this.piiRedactor;
+      try {
+        const ctx = { recipientId: recipientEmail, principalIsSoleRecipient: draftPrincipalSole };
+        const bodyItems = redactor.detect(body, 'email', ctx);
+        const subjectItems = draftMeta.subject ? redactor.detect(draftMeta.subject, 'email', ctx) : [];
+        for (const [items, field] of [[bodyItems, 'body'], [subjectItems, 'subject']] as const) {
+          for (const item of items) {
+            detectedItems.push({ id: `P${detectedItems.length + 1}`, label: item.label, text: item.matched, field });
+          }
+        }
+        // audit: false — nothing is redacted on the wire, so no outbound.pii_redacted.
+        redactedBody = redactor.apply(body, bodyItems, 'email', ctx, { audit: false }).content;
+        if (draftMeta.subject) redactedSubject = redactor.apply(draftMeta.subject, subjectItems, 'email', ctx, { audit: false }).content;
+      } catch (err) {
+        return this.blockForRedactorError(err, draftRequest, body, recipientEmail, options);
+      }
+    }
+    const bandReviewRuns = this.gating === 'band' && this.bandReview !== undefined && !draftPrincipalSole;
+    if (detectedItems.length > 0 && !bandReviewRuns) {
+      // Tier gating (or band with no review wired) would redact these, and a stored draft
+      // cannot be. Labels only, never the values.
+      const labels = [...new Set(detectedItems.map((d) => d.label))].join(', ');
+      this.log.info({ draftId, labels }, 'outbound-gateway: draft send refused — it contains personal data that cannot be redacted in place');
+      return {
+        success: false,
+        blockedReason: `Not sent: this draft contains ${labels}, which can't be sent to this recipient. Edit the draft to remove them, or ask the principal.`,
+      };
+    }
+
     // ------------------------------------------------------------------
     // Step 2: Content filter
     // ------------------------------------------------------------------
-    // Run on the draft body. The draft is sent as-is by Nylas (PII redaction is not
-    // applied — see method doc), but we still run the content filter to catch any
-    // flagged patterns before committing to sending. Fail-closed on filter crash.
+    // Run on the redacted copy of the draft body: the draft is sent as written, but the filter
+    // never needs the raw values (#2312). Fail-closed on filter crash.
     let filterPassed = false;
     let filterFindings: Array<{ rule: string; detail: string }> = [];
-    const { recipients: draftRecipients, principalIncluded: draftPrincipalIncluded, principalIsSoleRecipient: draftPrincipalSole } = this.buildRecipientSet(draftEnvelope);
 
     try {
       const filterResult = await this.contentFilter.check({
-        content: body,
+        content: redactedBody,
         recipientEmail,
         conversationId: '',
         channelId: 'email',
@@ -3574,7 +3649,7 @@ export class OutboundGateway {
         blockId,
         conversationId: options?.conversationId ?? '',
         channelId: 'email',
-        content: body,
+        content: redactedBody,
         recipientId: recipientEmail,
         reason: fullReason,
         findings: filterFindings,
@@ -3622,20 +3697,21 @@ export class OutboundGateway {
     // call (its task-origin check is its gate), so it does not mean the principal read this
     // draft. A live principal turn or an explicit approval did; a woken task did not. This
     // is also when tier gating skips Stage 2.5.
+    //
+    // A principal-directed draft is still reviewed when it holds personal data (#2312): the
+    // review rules on each item, as it does for send(). Any outcome but send holds it.
     let bandReport: BandReviewReport | undefined;
     let bandSignals: BandReviewSignals | undefined;
-    if (this.gating === 'band' && this.bandReview && !options?.principalDirected && !draftPrincipalSole) {
+    if (bandReviewRuns && options?.principalApproved !== true && (options?.principalDirected !== true || detectedItems.length > 0)) {
       const outcome = await this.runBandReview({
-        request: {
-          channel: 'email',
-          to: recipientEmail,
-          subject: draftMeta.subject,
-          body,
-          ...(draftEnvelope.length > 1 ? { cc: draftEnvelope.filter((r) => r !== recipientEmail) } : {}),
-        },
+        request: draftRequest,
         content: body,
+        auditContent: redactedBody,
         recipients: draftRecipients.map((r) => r.email),
         principalRecipients: draftRecipients.filter((r) => r.isPrincipal).map((r) => r.email),
+        detectedItems,
+        recipientTier: recipientTierForDraft,
+        subject: draftMeta.subject,
         options,
         editable: false,
       });
@@ -3685,7 +3761,9 @@ export class OutboundGateway {
       channel: 'email',
       recipientId: recipientEmail,
       recipientContactId: recipientContactIdForDraft,
-      content: body,
+      // Never the raw values (#2312): the redacted copy when the draft carried any, including
+      // an approved draft, which was not scanned above.
+      content: detectedItems.length > 0 ? redactedBody : options?.principalApproved === true ? this.redactedCopy(body, 'email', recipientEmail) : body,
       messageId: sentMessage.id,
       conversationId: options?.conversationId,
       taskEventId: options?.taskEventId,
@@ -3698,7 +3776,8 @@ export class OutboundGateway {
         channel: 'email',
         toolName: 'send-draft',
         recipientLabel: draftEnvelope.join(', '),
-        preview: draftMeta.subject || body,
+        // The redacted copy, as in send(): the draft itself when nothing was detected (#2312).
+        preview: redactedSubject || redactedBody,
         // A draft's recipient is always an email address, so always a person.
         recipient: { person: true, contactId: recipientContactIdForDraft, lookupFailed: recipientTierUnresolvedForDraft },
         band: { report: bandReport, signals: bandSignals },

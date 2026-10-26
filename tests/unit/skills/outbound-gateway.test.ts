@@ -4593,6 +4593,114 @@ describe('band review (#2159)', () => {
       expect(sentEmail().body).not.toContain('555-1234');
       expect(result.redactions).toEqual([{ label: 'phone_us', field: 'body' }]);
     });
+
+    describe('saved drafts (#2312)', () => {
+      const phoneDraft = { recipientEmail: 'joel@example.com', body: phoneBody, subject: 'Forms' };
+      const holdRecipe = { toolName: 'send-draft', partialPayload: { draft_id: 'd1', subject: 'Forms', body: phoneBody }, description: 'Send draft to joel@example.com' };
+
+      function draftSender(): ReturnType<typeof vi.fn> {
+        const sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+        (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = sendDraft;
+        return sendDraft;
+      }
+
+      it('sends a draft whose details the review authorizes, with a redacted filter copy and audit', async () => {
+        const sendDraft = draftSender();
+        const review = vi.fn().mockResolvedValue({ kind: 'send' });
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.sendEmailDraft('d1', 'curia', { ...phoneDraft, subject: `Re: ${phone}` }, { humanApproved: true, taskEventId: 't1' });
+
+        expect(result.success).toBe(true);
+        expect(sendDraft).toHaveBeenCalledWith('d1');
+        const arg = review.mock.calls[0]![0] as Record<string, unknown>;
+        expect(arg['content']).toBe(phoneBody);
+        expect(arg['subject']).toBe(`Re: ${phone}`);
+        expect(arg['detectedItems']).toEqual([
+          { id: 'P1', label: 'phone_us', text: phone, field: 'body' },
+          { id: 'P2', label: 'phone_us', text: phone, field: 'subject' },
+        ]);
+        expect(mocks.contentFilter.check).toHaveBeenCalledWith(expect.objectContaining({ content: 'Call me on [REDACTED: PHONE_US] tomorrow.' }));
+        const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+        expect(delivered).toHaveLength(1);
+        expect(String(delivered[0]!.payload['content'])).toBe('Call me on [REDACTED: PHONE_US] tomorrow.');
+        expect(publishedOfType(mocks.bus, 'outbound.pii_redacted')).toHaveLength(0);
+      });
+
+      it('holds a draft the review bounces: it cannot be rewritten in place', async () => {
+        const sendDraft = draftSender();
+        const findings = [{ rule: 'pii-not-authorized', detail: 'P1 phone_us was not authorized.' }];
+        const { gateway } = await makePiiGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }) });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1', holdRecipe });
+
+        expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+        expect(result.blockedReason).not.toContain('555-1234');
+        expect(sendDraft).not.toHaveBeenCalled();
+        expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+      });
+
+      it('holds a draft the review would copy the principal on: its recipients cannot change', async () => {
+        const sendDraft = draftSender();
+        const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us'] } });
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1', holdRecipe });
+
+        expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+        expect(result.blockedReason).toContain('phone_us');
+        expect(result.blockedReason).not.toContain('555-1234');
+        expect(sendDraft).not.toHaveBeenCalled();
+      });
+
+      it('reviews a principal-directed draft that holds personal details', async () => {
+        draftSender();
+        const review = vi.fn().mockResolvedValue({ kind: 'send' });
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, principalDirected: true, taskEventId: 't1' });
+
+        expect(result.success).toBe(true);
+        expect(review).toHaveBeenCalledWith(expect.objectContaining({
+          principalDirected: true,
+          detectedItems: [{ id: 'P1', label: 'phone_us', text: phone, field: 'body' }],
+        }));
+      });
+
+      it('sends a draft the principal approved intact, without review, with a redacted audit', async () => {
+        const sendDraft = draftSender();
+        const review = vi.fn();
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, principalApproved: true, taskEventId: 't1' });
+
+        expect(result.success).toBe(true);
+        expect(review).not.toHaveBeenCalled();
+        expect(sendDraft).toHaveBeenCalledWith('d1');
+        const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+        expect(String(delivered[0]!.payload['content'])).toBe('Call me on [REDACTED: PHONE_US] tomorrow.');
+      });
+
+      it('refuses a draft with details under tier gating: it cannot be redacted in place', async () => {
+        const sendDraft = draftSender();
+        const review = vi.fn();
+        const { gateway } = await makePiiGateway({ review, gating: 'tier' });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1' });
+
+        expect(result).toEqual({
+          success: false,
+          blockedReason: 'Not sent: this draft contains phone_us, which can\'t be sent to this recipient. Edit the draft to remove them, or ask the principal.',
+        });
+        expect(sendDraft).not.toHaveBeenCalled();
+        expect(review).not.toHaveBeenCalled();
+      });
+
+      it('sends a tier draft the principal approved, and one to the principal alone', async () => {
+        const sendDraft = draftSender();
+        const { gateway } = await makePiiGateway({ review: vi.fn(), gating: 'tier' });
+        const approved = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, principalApproved: true, taskEventId: 't1' });
+        const toPrincipal = await gateway.sendEmailDraft('d2', 'curia', { ...phoneDraft, recipientEmail: 'principal@example.com' }, { humanApproved: true, taskEventId: 't1' });
+
+        expect(approved.success).toBe(true);
+        expect(toPrincipal.success).toBe(true);
+        expect(sendDraft.mock.calls).toEqual([['d1'], ['d2']]);
+      });
+    });
   });
 
   describe('sendEmailDraft', () => {
