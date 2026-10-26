@@ -45,7 +45,7 @@ import { CliAdapter } from './channels/cli/cli-adapter.js';
 import { discoverAgentManifests } from './agents/loader.js';
 import type { AgentYamlConfig, AgentDiscovery } from './agents/loader.js';
 import { ModelRouter } from './agents/llm/model-router.js';
-import { smallCapModelSlots, smallCapThinkingViolations } from './agents/llm/small-cap-models.js';
+import { smallCapModelSlots, smallCapThinkingViolations, voiceModelSlot } from './agents/llm/small-cap-models.js';
 import { ModelRegistry } from './agents/llm/model-registry.js';
 import { createEstimateCostUsd } from './agents/llm/pricing.js';
 import type { LLMProvider } from './agents/llm/provider.js';
@@ -529,8 +529,9 @@ async function main(): Promise<void> {
   const estimateCostUsd = createEstimateCostUsd(modelRegistry, modelRoutingConfig.tiers.standard.model);
   const modelRouter = new ModelRouter(modelRoutingConfig, modelRegistry, logger);
   // A model that cannot turn thinking off spends the small output caps of the classifier,
-  // judges, drift detector and voice turns on thinking (#2224).
-  const smallCapViolations = smallCapThinkingViolations(smallCapModelSlots(yamlConfig, config.voiceModel), modelRegistry);
+  // judges and drift detector on thinking (#2224). The voice override is checked where
+  // the voice adapter is built.
+  const smallCapViolations = smallCapThinkingViolations(smallCapModelSlots(yamlConfig), modelRegistry);
   if (smallCapViolations.length > 0) {
     logger.fatal({ violations: smallCapViolations }, `Model cannot turn thinking off on a small-cap call site — ${smallCapViolations.join(' ')}`);
     process.exit(1);
@@ -2095,6 +2096,16 @@ async function main(): Promise<void> {
     // Capability check runs BEFORE resolveProviderForModel so an unknown voice
     // override warns and disables voice instead of process.exit(1) (#1553 review).
     const voiceModel = config.voiceModel ?? modelRouter.resolve('fast').model;
+    // The override's small-cap check lives here, not with the early one, so it stops boot
+    // only when the voice adapter will actually start (#2224). Without an override, voice
+    // runs on the fast tier, which the early check covers.
+    if (config.voiceModel) {
+      const voiceViolations = smallCapThinkingViolations([voiceModelSlot(config.voiceModel)], modelRegistry);
+      if (voiceViolations.length > 0) {
+        logger.fatal({ violations: voiceViolations }, `Model cannot turn thinking off on a small-cap call site — ${voiceViolations.join(' ')}`);
+        process.exit(1);
+      }
+    }
     const voiceCaps = evaluateVoiceModelCapabilities(
       voiceModel,
       modelRegistry.getModel(voiceModel)?.capabilities,
