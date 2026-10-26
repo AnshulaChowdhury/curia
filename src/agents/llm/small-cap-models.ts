@@ -11,8 +11,8 @@
 // or disable voice.
 //
 // The standard tier is not a slot: no small-cap call site runs on it.
-// tests/unit/agents/llm/small-cap-models.test.ts fails if an `infraLlm.extract` with a
-// cap of 1,200 or less is left on it.
+// tests/unit/agents/llm/small-cap-models.test.ts fails if an `infraLlm.extract` other
+// than file-parse's is left on it.
 
 import type { YamlConfig } from '../../config.js';
 import type { ModelRegistry } from './model-registry.js';

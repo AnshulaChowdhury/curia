@@ -98,9 +98,15 @@ describe('smallCapThinkingViolations (#2224)', () => {
   });
 });
 
-// Smallest cap a model that thinks is known to fit: DeepSeek V4.1 Flash used up to 582
-// tokens on a 200-token drift check (2026-10-25). Extracts at or below it run on fast.
-const STANDARD_TIER_MAX_SMALL_CAP = 1200;
+// `infraLlm.extract` defaults to the standard tier, which boot does not check. On a
+// model that thinks, no extract cap is safe: on 2026-10-25 DeepSeek V4.1 Flash spent
+// 3,000 tokens reasoning on a 1,000-token extract-facts call and returned no text, and
+// #2191 saw the same at the 4,000 default. So every extract runs on fast, except the
+// calls listed here, which stay on standard on purpose (file path → number of calls).
+const STANDARD_TIER_EXTRACTS: Readonly<Record<string, number>> = {
+  // Document parsing at 4,000 tokens: the content needs the standard model (#2224).
+  'skills/file-parse/handler.ts': 2,
+};
 
 const REPO = join(import.meta.dirname, '../../../..');
 
@@ -147,21 +153,27 @@ function extractCalls(source: string): string[] {
 }
 
 describe('standard tier serves no small-cap extract (#2224)', () => {
-  it(`every infraLlm.extract with maxTokens <= ${STANDARD_TIER_MAX_SMALL_CAP} sets tier: 'fast'`, () => {
+  it("every infraLlm.extract sets tier: 'fast' unless STANDARD_TIER_EXTRACTS lists it", () => {
     const offenders: string[] = [];
+    const onStandard: Record<string, number> = {};
     let checked = 0;
     for (const file of [...sourceFiles(join(REPO, 'src')), ...sourceFiles(join(REPO, 'skills'))]) {
+      const path = relative(REPO, file);
       for (const call of extractCalls(readFileSync(file, 'utf8'))) {
-        const cap = /maxTokens:\s*(\d[\d_]*)/.exec(call);
-        if (!cap) continue;
         checked++;
-        if (Number(cap[1]!.replace(/_/g, '')) <= STANDARD_TIER_MAX_SMALL_CAP && !/tier:\s*'fast'/.test(call)) {
-          offenders.push(`${relative(REPO, file)}: maxTokens ${cap[1]}`);
+        if (/tier:\s*'fast'/.test(call)) continue;
+        onStandard[path] = (onStandard[path] ?? 0) + 1;
+        if (!(path in STANDARD_TIER_EXTRACTS)) {
+          const cap = /maxTokens:\s*(\d[\d_]*)/.exec(call)?.[1] ?? 'default 4000';
+          offenders.push(`${path}: maxTokens ${cap}`);
         }
       }
     }
     // The scan must find the known calls, or a parsing change would pass vacuously.
-    expect(checked).toBeGreaterThanOrEqual(5);
+    expect(checked).toBeGreaterThanOrEqual(8);
     expect(offenders).toEqual([]);
+    // A listed file must still have exactly its listed calls on standard, so the list
+    // cannot silently cover a new call or outlive the ones it names.
+    expect(onStandard).toEqual(STANDARD_TIER_EXTRACTS);
   });
 });

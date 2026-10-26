@@ -52,11 +52,12 @@ if (!apiKey) {
 const logger = createSilentLogger();
 const registry = new ModelRegistry(logger);
 
-// Keeps the last outbound.judge outcome, so a fail-open judge is not read as a pass.
-let lastJudgeOutcome: string | undefined;
+// Keeps the last outbound.judge outcome and reason code, so neither a fail-open judge
+// nor a split-mode parse failure (judged_block / unparseable) is read as a verdict.
+let lastJudge: { outcome?: string; reasonCode?: string } | undefined;
 const bus = {
-  publish: async (_layer: string, ev: { type: string; payload?: { outcome?: string } }) => {
-    if (ev.type === 'outbound.judge') lastJudgeOutcome = ev.payload?.outcome;
+  publish: async (_layer: string, ev: { type: string; payload?: { outcome?: string; reasonCode?: string } }) => {
+    if (ev.type === 'outbound.judge') lastJudge = { outcome: ev.payload?.outcome, reasonCode: ev.payload?.reasonCode };
   },
 } as unknown as EventBus;
 
@@ -201,7 +202,7 @@ async function measureModel(model: string, records: CallRecord[]): Promise<void>
       input,
       cap: 200,
       run: async () => {
-        lastJudgeOutcome = undefined;
+        lastJudge = undefined;
         const findings = await leakJudge.review({
           content,
           recipients: [{ email: 'armin@external.com', isPrincipal: false }],
@@ -211,10 +212,15 @@ async function measureModel(model: string, records: CallRecord[]): Promise<void>
           channelId: 'email',
         });
         // The bus callback sets it during review(); TypeScript cannot see that.
-        const outcome: string = (lastJudgeOutcome as string | undefined) ?? 'no outbound.judge event';
-        // judged_pass / judged_block mean the judge parsed a verdict; failed_open and
-        // failed_closed mean it was unreachable or malformed, whatever the findings say.
-        const answered = outcome === 'judged_pass' || outcome === 'judged_block';
+        const judged = lastJudge as { outcome?: string; reasonCode?: string } | undefined;
+        const outcome = judged?.outcome
+          ? `${judged.outcome}${judged.reasonCode ? `/${judged.reasonCode}` : ''}`
+          : 'no outbound.judge event';
+        // A parsed verdict is judged_pass, or judged_block with reason audience_leak.
+        // Split mode also publishes judged_block for an unparseable reply (reason
+        // unparseable), and failed_open / failed_closed for an unreachable judge.
+        const answered = judged?.outcome === 'judged_pass'
+          || (judged?.outcome === 'judged_block' && judged.reasonCode === 'audience_leak');
         const flagged = findings.some((f) => f.rule === 'llm-judge-audience-leak');
         return { outcome, answered, matched: answered ? flagged === shouldFlag : null };
       },
