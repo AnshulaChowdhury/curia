@@ -67,7 +67,9 @@ describe('coordinator scenario cases', () => {
       expect(page({ ...session, action: 'click', selector })).toContain("You're signed in");
     }
     expect(page({ ...session, action: 'click', selector: 'Email me the code' })).toContain('Check your email');
-    expect(page({ ...session, actions: [{ action: 'click', selector: '[g1f0e2]' }] })).toContain('Check your email');
+    for (const selector of ['[g1f0e2]', 'g1f0e2', 'Email me the code']) {
+      expect(page({ ...session, actions: [{ action: 'click', selector }] })).toContain('Check your email');
+    }
     const taskId = '4b7e1c90-2d3f-4a5b-8c6d-7e8f9012ab34';
     expect(matchToolStub('task-update', { task_id: taskId, progress_note: 'switched to email' }, scenario.toolStubs)?.error).toBeUndefined();
     expect(matchToolStub('task-complete', { task_id: taskId, completion_note: 'signed in' }, scenario.toolStubs)?.return).toMatchObject({ status: 'done' });
@@ -83,6 +85,8 @@ describe('coordinator scenario cases', () => {
           expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { action: 'click', selector: 'g1f0e2' } }),
           expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { action: 'click', selector: 'Email me the code' } }),
           expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { actions: [{ action: 'click', selector: '[g1f0e2]' }] } }),
+          expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { actions: [{ action: 'click', selector: 'g1f0e2' }] } }),
+          expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { actions: [{ action: 'click', selector: 'Email me the code' }] } }),
         ],
       }),
       expect.objectContaining({ kind: 'not_called', tools: ['web-browser'], with: { action: 'click', selector: '[g1f0e1]' } }),

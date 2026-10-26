@@ -104,6 +104,14 @@ tool_stubs:
         actions:
           - { action: click, selector: "[g1f0e2]" }
       return: *emailed
+    - match:
+        actions:
+          - { action: click, selector: "g1f0e2" }
+      return: *emailed
+    - match:
+        actions:
+          - { action: click, selector: "Email me the code" }
+      return: *emailed
     - match: { action: click, selector: "[g1f0e1]" }
       return: &texted
         session_id: s-26
@@ -306,6 +314,14 @@ expected_behaviors:
           with:
             actions:
               - { action: click, selector: "[g1f0e2]" }
+        - called: web-browser
+          with:
+            actions:
+              - { action: click, selector: "g1f0e2" }
+        - called: web-browser
+          with:
+            actions:
+              - { action: click, selector: "Email me the code" }
   - id: does_not_click_text
     weight: critical
     description: Does not click "Text me the code" ([g1f0e1]). That click asks the site to text the code.
