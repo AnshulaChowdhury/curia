@@ -8,7 +8,9 @@ import {
   placeholdersIn,
   resolvePlaceholders,
   resolveRunPlaceholders,
+  selectRunCases,
 } from '../../scenarios/loader.js';
+import type { ScenarioCase } from '../../scenarios/types.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(path.join(tmpdir(), 'scenarios-')); });
@@ -798,8 +800,10 @@ expected_behaviors:
     expect(c.inbound.email?.cc).toEqual(['curia', 'principal', 'ops@northwind.example.test']);
   });
 
-  it('keeps a case with an autonomy fixture out of the release gate', () => {
-    expect(() => loadScenarioCase(write('a.yaml', CC.replace('release_gate: false\n', '')))).toThrow(/'autonomy' fixture runs on demand/);
+  it('lets a case with an autonomy fixture join the release gate (#2312): it is pinned per case', () => {
+    const c = loadScenarioCase(write('a.yaml', CC.replace('release_gate: false\n', '')));
+    expect(c.releaseGate).toBe(true);
+    expect(c.autonomy).toEqual({ score: 84, gating: 'band' });
   });
 
   it.each([
@@ -810,5 +814,41 @@ expected_behaviors:
     ['an unknown key', 'autonomy: { score: 84, gating: band, band: full }', /unknown key\(s\) band/],
   ])('rejects an autonomy fixture with %s', (_label, line, error) => {
     expect(() => loadScenarioCase(write('a.yaml', CC.replace('autonomy: { score: 84, gating: band }', line)))).toThrow(error);
+  });
+});
+
+describe('selectRunCases', () => {
+  // Only the fields selection reads.
+  const scenario = (name: string, extra: Partial<ScenarioCase> = {}): ScenarioCase =>
+    ({ name, tags: ['pii'], releaseGate: true, ...extra }) as ScenarioCase;
+  const plain = scenario('plain');
+  const at84 = scenario('pii at 84', { autonomy: { score: 84, gating: 'band' } });
+  const at74 = scenario('pii at 74', { autonomy: { score: 74, gating: 'band' } });
+  const tier = scenario('pii tier', { autonomy: { score: 84, gating: 'tier' } });
+  const onDemand = scenario('on demand', { releaseGate: false });
+  const styled = scenario('styled', { releaseGate: false, identity: { name: 'formal' } as ScenarioCase['identity'] });
+
+  it('puts cases under different autonomy fixtures, and ordinary ones, in one unfiltered run (#2312)', () => {
+    const picked = selectRunCases([plain, at84, at74, tier, onDemand], {});
+    expect(picked.cases.map(c => c.name)).toEqual(['plain', 'pii at 84', 'pii at 74', 'pii tier']);
+    expect(picked.onDemandSkipped).toEqual(['on demand']);
+    expect(picked.identitySkipped).toEqual([]);
+  });
+
+  it('keeps mixed autonomy fixtures together in a --tags selection', () => {
+    const picked = selectRunCases([plain, at84, at74], { tags: ['pii'] });
+    expect(picked.cases.map(c => c.name)).toEqual(['plain', 'pii at 84', 'pii at 74']);
+  });
+
+  it('still runs identity cases only in a selection of them alone', () => {
+    expect(selectRunCases([plain, styled], { onDemand: true }).identitySkipped).toEqual(['styled']);
+    expect(selectRunCases([plain, styled], { tags: ['pii'] }).identitySkipped).toEqual(['styled']);
+    const alone = selectRunCases([plain, styled], { caseFilter: 'styled' });
+    expect(alone.cases.map(c => c.name)).toEqual(['styled']);
+    expect(alone.identitySkipped).toEqual([]);
+  });
+
+  it('filters by case name, case-insensitively', () => {
+    expect(selectRunCases([plain, at84, at74], { caseFilter: 'PII AT' }).cases.map(c => c.name)).toEqual(['pii at 84', 'pii at 74']);
   });
 });

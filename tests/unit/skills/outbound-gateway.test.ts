@@ -4126,7 +4126,7 @@ describe('band review (#2159)', () => {
 
   const emailReq = { channel: 'email' as const, to: 'joel@example.com', subject: 'Forms', body: 'Hi Joel. I am out of office until the 13th.' };
 
-  function makeBandGateway(opts: { review: ReturnType<typeof vi.fn>; score: number; gating?: 'band' | 'tier'; actionLogRepo?: ActionLogRepo; emailAccountAddresses?: Map<string, string>; signalPhoneNumber?: string }) {
+  function makeBandGateway(opts: { review: ReturnType<typeof vi.fn>; score: number; gating?: 'band' | 'tier'; actionLogRepo?: ActionLogRepo; emailAccountAddresses?: Map<string, string>; signalPhoneNumber?: string; autonomyService?: AutonomyService }) {
     return new OutboundGateway({
       nylasClients: new Map([['curia', mocks.nylasClient]]),
       ...(opts.emailAccountAddresses ? { emailAccountAddresses: opts.emailAccountAddresses } : {}),
@@ -4138,12 +4138,74 @@ describe('band review (#2159)', () => {
       bus: mocks.bus,
       principalIdentities: [makePrincipalIdentity('principal@example.com')],
       logger: mocks.logger,
-      autonomyService: makeAutonomyService(opts.score),
+      autonomyService: opts.autonomyService ?? makeAutonomyService(opts.score),
       actionLogRepo: opts.actionLogRepo ?? makeActionLogRepo(),
       gating: opts.gating ?? 'band',
       bandReview: { review: opts.review as unknown as BandSendReview['review'] },
     });
   }
+
+  /** An autonomy service whose reads carry `current.gating` (undefined: none, as production tier). */
+  function autonomyReading(score: number, gating: 'band' | 'tier' | undefined): { service: AutonomyService; current: { gating: 'band' | 'tier' | undefined } } {
+    const base = makeAutonomyService(score);
+    const current = { gating };
+    const getConfig = vi.fn(async (): Promise<AutonomyConfig | null> => {
+      const read = await (base.getConfig as () => Promise<AutonomyConfig>)();
+      return { ...read, ...(current.gating ? { gating: current.gating } : {}) };
+    });
+    return { service: { getConfig } as unknown as AutonomyService, current };
+  }
+
+  // The scenario suite pins gating per case on one stack (#2312): the gateway reads it per call.
+  describe('reads the gating from the autonomy config on each call', () => {
+    it('reviews a send when the config says band, though the gateway was built tier', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, gating: 'tier', autonomyService: autonomyReading(84, 'band').service });
+      expect((await gw.send(emailReq, { taskEventId: 't1' })).success).toBe(true);
+      expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('skips the review when the config says tier, though the gateway was built band', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, gating: 'band', autonomyService: autonomyReading(84, 'tier').service });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(review).not.toHaveBeenCalled();
+    });
+
+    it('keeps the constructed gating when the config names none', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, gating: 'band', autonomyService: autonomyReading(84, undefined).service });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('keeps the constructed gating when the config read fails', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const failing = { getConfig: vi.fn().mockRejectedValue(new Error('db down')) } as unknown as AutonomyService;
+      const gw = makeBandGateway({ review, score: 84, gating: 'band', autonomyService: failing });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('follows a change between two sends on the same gateway', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const autonomy = autonomyReading(84, 'band');
+      const gw = makeBandGateway({ review, score: 84, gating: 'tier', autonomyService: autonomy.service });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(review).toHaveBeenCalledOnce();
+      autonomy.current.gating = 'tier';
+      await gw.send(emailReq, { taskEventId: 't2' });
+      expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('reviews a draft send when the config says band, though the gateway was built tier', async () => {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, gating: 'tier', autonomyService: autonomyReading(84, 'band').service });
+      await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: 'Hi Joel.', subject: 'Forms' }, { taskEventId: 't1' });
+      expect(review).toHaveBeenCalledOnce();
+    });
+  });
 
   function publishedOfType(bus: EventBus, type: string): Array<{ type: string; payload: Record<string, unknown> }> {
     return vi.mocked(bus.publish).mock.calls

@@ -360,7 +360,9 @@ export interface OutboundGatewayConfig {
   /**
    * Which policy reviews sends (#2159). Under 'band', a send that passes the content
    * filter is reviewed by `bandReview` (the escalation judge's brief) before dispatch.
-   * Default 'tier': no band review, today's behavior.
+   * Default 'tier': no band review, today's behavior. A gating on the autonomy config
+   * overrides it per send (#2312): production stamps this same value there; the scenario
+   * suite pins it per case.
    */
   gating?: AutonomyGating;
   /** The band review (#2159). Used only when gating is 'band'. */
@@ -1220,9 +1222,10 @@ export class OutboundGateway {
     // replay (humanApproved) goes out intact: the principal approved this exact message.
     // Otherwise (a system notice, the principal alone, no review wired) band redacts as tier.
     const { recipients, principalIncluded, principalIsSoleRecipient } = this.buildFilterRecipients(request);
-    const bandReviewRuns = this.gating === 'band' && this.bandReview !== undefined
+    const gating = await this.currentGating();
+    const bandReviewRuns = gating === 'band' && this.bandReview !== undefined
       && !options?.isSystemNotification && !options?.humanApproved && !principalIsSoleRecipient;
-    const sendIntact = this.gating === 'band' && options?.humanApproved === true;
+    const sendIntact = gating === 'band' && options?.humanApproved === true;
     // The redacted copy: what the content filter and the audit events see. Under tier it is
     // also what is sent; under band review it never goes on the wire.
     let redactedBody = messageBody;
@@ -1945,7 +1948,7 @@ export class OutboundGateway {
           : row.payload.message;
         // Under band gating a queued row may hold details the review authorized raw; the
         // audit event never carries them (#2312). Tier rows were redacted before queueing.
-        const content = this.gating === 'band' ? this.redactedCopy(sent, row.payload.channel, row.recipient) : sent;
+        const content = (await this.currentGating()) === 'band' ? this.redactedCopy(sent, row.payload.channel, row.recipient) : sent;
         if (row.payload.channel === 'signal' && row.payload.recipient) {
           await this.promoteOrCreateRecipientContact('signal', row.payload.recipient);
         } else if (row.payload.channel === 'sms') {
@@ -2424,6 +2427,22 @@ export class OutboundGateway {
       ...(ask.outreachId ? { outreachId: ask.outreachId } : {}),
       ...(ask.taskTitle ? { taskTitle: ask.taskTitle } : {}),
     };
+  }
+
+  /**
+   * The gating this send follows (#2312): the autonomy config's, else the constructed value.
+   * Production's AutonomyService stamps the configured gating on every read, so the two agree
+   * there; the scenario suite's fixture service pins it per case on one shared gateway. An
+   * unreadable config keeps the constructed gating, as before this was read per send.
+   */
+  private async currentGating(): Promise<AutonomyGating> {
+    if (!this.autonomyService) return this.gating;
+    try {
+      return (await this.autonomyService.getConfig())?.gating ?? this.gating;
+    } catch (err) {
+      this.log.warn({ err, gating: this.gating }, 'outbound-gateway: autonomy config unreadable for gating — using the configured gating');
+      return this.gating;
+    }
   }
 
   /** The live score for band review. Unreadable counts as 0: below 80, failures hold. */
@@ -3746,11 +3765,12 @@ export class OutboundGateway {
         return this.blockForRedactorError(err, draftRequest, body, recipientEmail, options);
       }
     }
-    const bandReviewRuns = this.gating === 'band' && this.bandReview !== undefined && !draftPrincipalSole;
+    const gating = await this.currentGating();
+    const bandReviewRuns = gating === 'band' && this.bandReview !== undefined && !draftPrincipalSole;
     // Under tier gating a principal-directed draft (a live principal turn, or an approval
     // replay) is sent as written: the principal is in the loop, as tier has no review to ask.
     // Band with no review wired still refuses: band means a review decides, and none can.
-    const tierPrincipalDirected = this.gating === 'tier' && options?.principalDirected === true;
+    const tierPrincipalDirected = gating === 'tier' && options?.principalDirected === true;
     if (detectedItems.length > 0 && !bandReviewRuns && !tierPrincipalDirected) {
       // Tier gating (or band with no review wired) would redact these, and a stored draft
       // cannot be. Labels only, never the values.

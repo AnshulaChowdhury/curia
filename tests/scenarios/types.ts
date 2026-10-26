@@ -384,9 +384,9 @@ export interface ScenarioCase {
    */
   identity?: IdentityFixture;
   /**
-   * The autonomy score and gating the case runs under, laid over the database's. Like
-   * `identity`, it is the run's: every case in a run shares it, and such a case is never
-   * in the release gate.
+   * The autonomy score and gating the case runs under, laid over the database's. Unlike
+   * `identity` it is the case's own (#2312): each attempt enters it, so cases under
+   * different fixtures share a run, and such a case can be in the release gate.
    */
   autonomy?: AutonomyFixture;
   /** File the case came from, for messages. */
@@ -553,8 +553,13 @@ export interface SuiteResult {
   onDemandSkipped?: string[];
   /** The office identity fixture every case ran under (#2143). Absent: the database's own. */
   identity?: string;
-  /** The autonomy every case ran under, read back from the stack, e.g. "84 (band gating)". */
+  /**
+   * The autonomy cases without a fixture ran under, read back from the stack at boot, e.g.
+   * "84 (band gating)" or "none (no autonomy_config row)".
+   */
   autonomy?: string;
+  /** Cases that ran under their own autonomy fixture (#2312), by name, e.g. "74 (band gating)". */
+  caseAutonomy?: Record<string, string>;
   /** Runs each case actually got (a case's `runs` or --runs can differ from the default). */
   runsPerCase: Record<string, number>;
   cases: CaseResult[];

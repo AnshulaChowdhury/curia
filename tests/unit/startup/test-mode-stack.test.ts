@@ -17,8 +17,15 @@ import { ExecutionLayer } from '../../../src/skills/execution.js';
 import { ToolRegistry } from '../../../src/skills/registry.js';
 import type { ToolContext, ToolManifest } from '../../../src/skills/types.js';
 import type { BullpenService } from '../../../src/memory/bullpen.js';
+import { createAgentTask, type AgentTaskEvent } from '../../../src/bus/events.js';
+import type { EscalationJudge } from '../../../src/autonomy/escalation-judge.js';
+import type { OutboundContentFilter } from '../../../src/dispatch/outbound-filter.js';
+import type { BandSendReview } from '../../../src/dispatch/band-send-review.js';
+import type { NylasClient } from '../../../src/channels/email/nylas-client.js';
+import { OutboundGateway } from '../../../src/skills/outbound-gateway.js';
 import {
   createNoSendOutboundGateway,
+  runWithAutonomyFixture,
   createTestModeSecrets,
   autonomyFixtureMismatch,
   FixtureAutonomyService,
@@ -236,16 +243,127 @@ describe('FixtureAutonomyService', () => {
   const pool = { query: vi.fn(async () => ({ rows: [stored] })) } as unknown as ConstructorParameters<typeof AutonomyService>[0];
 
   it('reads the fixture score, its band and its gating, not the database row', async () => {
-    const service = new FixtureAutonomyService(pool, logger, { score: 74, gating: 'band' });
+    const service = new FixtureAutonomyService(pool, logger, { fixture: { score: 74, gating: 'band' } });
     const config = await service.getConfig();
     expect(config).toMatchObject({ score: 74, band: 'approval-required', gating: 'band', updatedBy: 'scenario-fixture' });
     expect(AutonomyService.formatPromptBlock(config!)).toContain('Your current autonomy score is 74');
   });
 
-  it('describes tier gating as the database would', async () => {
-    const config = await new FixtureAutonomyService(pool, logger, { score: 84, gating: 'tier' }).getConfig();
-    expect(config).toMatchObject({ score: 84, band: 'spot-check' });
-    expect(config?.gating).toBeUndefined();
+  it('names tier gating outright, so a stack built band cannot fall back over it', async () => {
+    const config = await new FixtureAutonomyService(pool, logger, { fixture: { score: 84, gating: 'tier' }, gating: 'band' }).getConfig();
+    expect(config).toMatchObject({ score: 84, band: 'spot-check', gating: 'tier' });
+    expect(AutonomyService.formatPromptBlock(config!)).toContain('Your current autonomy score is 84');
+  });
+
+  it('reads the database row, with the configured gating, when no fixture is in force', async () => {
+    const config = await new FixtureAutonomyService(pool, logger, { gating: 'band' }).getConfig();
+    expect(config).toMatchObject({ score: 95, band: 'full', gating: 'band', updatedBy: 'ceo' });
+    expect((await new FixtureAutonomyService(pool, logger).getConfig())?.gating).toBeUndefined();
+  });
+
+  it('reads the fixture entered for the work in hand over the default', async () => {
+    const service = new FixtureAutonomyService(pool, logger, { fixture: { score: 84, gating: 'band' } });
+    const inCase = await runWithAutonomyFixture({ score: 74, gating: 'band' }, () => service.getConfig());
+    expect(inCase).toMatchObject({ score: 74, gating: 'band' });
+    // Entered with no fixture: the default, as a case without `autonomy:` reads.
+    const plain = await runWithAutonomyFixture(undefined, () => service.getConfig());
+    expect(plain).toMatchObject({ score: 84, gating: 'band' });
+    expect(await service.getConfig()).toMatchObject({ score: 84 });
+  });
+});
+
+// Review Focus 1 (#2312): one stack, cases at once, each under its own autonomy.
+describe('per-case autonomy fixtures on one stack', () => {
+  const stored = { score: 95, band: 'full', updated_at: new Date('2026-10-01T00:00:00Z'), updated_by: 'ceo' };
+  const pool = { query: vi.fn(async () => ({ rows: [stored] })) } as unknown as ConstructorParameters<typeof AutonomyService>[0];
+  const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+  it('gives concurrent attempts their own score and gating through the bus and the execution layer', async () => {
+    const service = new FixtureAutonomyService(pool, logger);
+    const bus = new EventBus(logger);
+    const registry = new ToolRegistry();
+    registry.register(
+      { ...manifest('calendar-respond', []), action_risk: 'medium' },
+      { execute: async () => ({ success: true, data: 'responded' }) },
+    );
+    // Band Gate C asks the judge; which questions it asks depends on the score's band, and
+    // the call names the conversation, so each review is traceable to its attempt.
+    const reviews = new Map<string, string[]>();
+    const review = vi.fn(async (args: { questions: string[]; conversationId: string }) => {
+      reviews.set(args.conversationId, args.questions);
+      return { ok: true as const, purpose: 'serving' as const, reason: 'x' };
+    });
+    const layer = new ExecutionLayer(registry, logger, {
+      autonomyService: service,
+      bus,
+      escalationJudge: { isEnabled: () => true, review, classifyAction: vi.fn() } as unknown as EscalationJudge,
+      sendEvidence: { collect: vi.fn().mockResolvedValue({ unavailable: false, toolResults: [] }) },
+    });
+
+    const seen = new Map<string, Array<string | undefined>>();
+    bus.subscribe('agent.task', 'agent', async (event) => {
+      const { conversationId } = (event as AgentTaskEvent).payload;
+      const reads: Array<string | undefined> = [];
+      // Interleave: each attempt reads, yields to the others, and reads again.
+      const before = await service.getConfig();
+      reads.push(`${before?.score} ${before?.gating ?? 'tier'}`);
+      await delay(conversationId === 'conv-a' ? 15 : 5);
+      const after = await service.getConfig();
+      reads.push(`${after?.score} ${after?.gating ?? 'tier'}`);
+      seen.set(conversationId, reads);
+      await layer.invoke('calendar-respond', {}, undefined, {
+        conversationId,
+        taskEventId: event.id,
+        taskMetadata: {
+          originator: { contactId: 'contact-abc', systemRole: null, channel: 'email', initiatedAt: new Date().toISOString(), tier: 'unknown' },
+        },
+      });
+    });
+
+    const publish = (conversationId: string) => bus.publish('dispatch', createAgentTask({
+      agentId: 'coordinator', conversationId, channelId: 'email', senderId: 'someone@example.com', content: 'hi', parentEventId: 'p',
+    }));
+    await Promise.all([
+      runWithAutonomyFixture({ score: 84, gating: 'band' }, () => publish('conv-a')),
+      runWithAutonomyFixture({ score: 74, gating: 'band' }, () => publish('conv-b')),
+      runWithAutonomyFixture({ score: 84, gating: 'tier' }, () => publish('conv-c')),
+      // A case without `autonomy:` runs on the database's.
+      runWithAutonomyFixture(undefined, () => publish('conv-d')),
+    ]);
+
+    expect(seen.get('conv-a')).toEqual(['84 band', '84 band']);
+    expect(seen.get('conv-b')).toEqual(['74 band', '74 band']);
+    expect(seen.get('conv-c')).toEqual(['84 tier', '84 tier']);
+    expect(seen.get('conv-d')).toEqual(['95 tier', '95 tier']);
+    // Band gating at 84 asks only purpose of an outsider; below 80 it also asks whether the
+    // action speaks for the principal. Tier gating never asks the judge.
+    expect(reviews.get('conv-a')).toEqual(['purpose']);
+    expect(reviews.get('conv-b')).toEqual(['purpose', 'speaks-as-principal']);
+    expect(reviews.has('conv-c')).toBe(false);
+    expect(reviews.has('conv-d')).toBe(false);
+  });
+
+  it('gives concurrent sends their own gating in the outbound gateway', async () => {
+    const service = new FixtureAutonomyService(pool, logger);
+    const review = vi.fn(async () => ({ kind: 'send' as const }));
+    const nylas = { sendMessage: vi.fn().mockResolvedValue({ id: 'msg-1' }) } as unknown as NylasClient;
+    const gw = new OutboundGateway({
+      nylasClients: new Map([['curia', nylas]]),
+      contactService: { resolveByChannelIdentity: vi.fn().mockResolvedValue(null) } as unknown as ContactService,
+      contentFilter: { check: vi.fn().mockResolvedValue({ passed: true, findings: [] }) } as unknown as OutboundContentFilter,
+      bus: { publish: vi.fn().mockResolvedValue(undefined), subscribe: vi.fn() } as unknown as EventBus,
+      logger,
+      autonomyService: service,
+      bandReview: { review: review as unknown as BandSendReview['review'] },
+    });
+    const send = (to: string) => gw.send({ channel: 'email', to, subject: 'Hi', body: 'Hello' }, { taskEventId: `t-${to}` });
+    await Promise.all([
+      runWithAutonomyFixture({ score: 84, gating: 'band' }, () => send('band@example.com')),
+      runWithAutonomyFixture({ score: 84, gating: 'tier' }, () => send('tier@example.com')),
+    ]);
+    expect(review).toHaveBeenCalledOnce();
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({ score: 84 }));
+    expect(JSON.stringify(review.mock.calls[0])).toContain('band@example.com');
   });
 });
 

@@ -55,6 +55,7 @@
 //   - Your Contact Details shows the Signal and SMS numbers whenever they resolve;
 //     production also drops a number whose channel is disabled in the registry.
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import * as path from 'node:path';
 import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveLateDeliveryConfig, resolveTasksConfig, resolveTurnInjectionConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
 import { createVerificationRuntime, type VerificationRuntime } from '../verification/index.js';
@@ -288,8 +289,9 @@ export interface TestModeStackOptions {
    */
   officeIdentity?: OfficeIdentityFixture;
   /**
-   * Lay this autonomy score (and gating) over the database's for the whole stack: the
-   * scenario suite's `autonomy:` cases. Held in memory only; see FixtureAutonomyService.
+   * Lay this autonomy score (and gating) over the database's for the whole stack, unless
+   * the work in hand entered its own with runWithAutonomyFixture (the scenario suite's
+   * `autonomy:` cases, per attempt). Held in memory only; see FixtureAutonomyService.
    */
   autonomy?: AutonomyFixture;
 }
@@ -302,8 +304,8 @@ export interface AutonomyFixture {
 
 /**
  * Why the stack's autonomy config does not match a pinned fixture, or null when it does.
- * The scenario CLI reads the config back after boot, so a fixture that never reached the
- * stack stops the run instead of being reported as in force.
+ * The scenario harness reads the config back inside each attempt, so a fixture that never
+ * reached the stack fails the run instead of being reported as in force.
  */
 export function autonomyFixtureMismatch(fixture: AutonomyFixture, config: AutonomyConfig | null): string | null {
   if (!config) return `the stack has no autonomy config; the fixture asked for ${fixture.score} (${fixture.gating} gating)`;
@@ -313,23 +315,51 @@ export function autonomyFixtureMismatch(fixture: AutonomyFixture, config: Autono
 }
 
 /**
- * The autonomy config with a fixture's score and gating in place of the database's. Only
- * getConfig() changes, so the prompt block still comes from the real formatPromptBlock()
- * and nothing is written: autonomy_config and its history stay as they were.
+ * The autonomy fixture the work in hand runs under (#2312). The scenario harness enters one
+ * per attempt, around everything the attempt does: the bus delivers an event by awaiting
+ * every subscriber in the publisher's call chain, so the dispatcher, the agents' turns and
+ * their tool calls all run inside it (tests/shared/case-scope.ts). Cases running at once
+ * on one stack each read their own.
+ */
+const autonomyFixtureStorage = new AsyncLocalStorage<AutonomyFixture | undefined>();
+
+/**
+ * Run `fn` under `fixture`: every getConfig() it causes on a FixtureAutonomyService, however
+ * indirectly, reads it. `undefined` runs `fn` under the service's default, so work entered
+ * without a fixture never inherits one from an enclosing context.
+ */
+export function runWithAutonomyFixture<T>(fixture: AutonomyFixture | undefined, fn: () => Promise<T>): Promise<T> {
+  return autonomyFixtureStorage.run(fixture, fn);
+}
+
+/**
+ * The autonomy config with a fixture's score and gating in place of the database's: the
+ * fixture entered with runWithAutonomyFixture, else the stack's default fixture, else the
+ * database's row under the configured gating. Only getConfig() changes, so the prompt block
+ * still comes from the real formatPromptBlock(), and the OutboundGateway and ExecutionLayer
+ * read the gating from it on each call. Nothing is written: autonomy_config and its history
+ * stay as they were.
  */
 export class FixtureAutonomyService extends AutonomyService {
-  constructor(pool: DbPool, logger: Logger, private readonly fixture: AutonomyFixture) {
-    super(pool, logger, { gating: fixture.gating });
+  private readonly defaultFixture?: AutonomyFixture;
+
+  constructor(pool: DbPool, logger: Logger, opts: { fixture?: AutonomyFixture; gating?: AutonomyGating } = {}) {
+    super(pool, logger, { gating: opts.gating ?? 'tier' });
+    this.defaultFixture = opts.fixture;
   }
 
   override async getConfig(): Promise<AutonomyConfig | null> {
     const stored = await super.getConfig();
+    const fixture = autonomyFixtureStorage.getStore() ?? this.defaultFixture;
+    if (!fixture) return stored;
     return {
-      score: this.fixture.score,
-      band: AutonomyService.bandForScore(this.fixture.score),
+      score: fixture.score,
+      band: AutonomyService.bandForScore(fixture.score),
       updatedAt: stored?.updatedAt ?? new Date(0),
       updatedBy: 'scenario-fixture',
-      ...(this.fixture.gating === 'band' ? { gating: 'band' as const } : {}),
+      // Named even for tier: the gateway and execution layer fall back to their constructed
+      // gating only when the config names none, and a tier case must stay tier.
+      gating: fixture.gating,
     };
   }
 }
@@ -758,10 +788,12 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     }
 
     // Gating as production resolves it, so a deployment overlay's `gating: band` reaches the
-    // prompt block. Only the block: this stack's ExecutionLayer keeps tier gating.
-    const autonomyService = options.autonomy
-      ? new FixtureAutonomyService(pool, logger, options.autonomy)
-      : new AutonomyService(pool, logger, { gating: resolveAutonomyGating(yamlConfig.autonomy) });
+    // prompt block, and the gateway and ExecutionLayer, which read it per call (#2312). A
+    // fixture service even with no default fixture: a case can enter its own per attempt.
+    const autonomyService = new FixtureAutonomyService(pool, logger, {
+      gating: resolveAutonomyGating(yamlConfig.autonomy),
+      ...(options.autonomy ? { fixture: options.autonomy } : {}),
+    });
     officeIdentityService = options.officeIdentity
       ? new FixtureOfficeIdentityService(pool, logger, bus, options.officeIdentity)
       : new OfficeIdentityService(pool, logger, bus);

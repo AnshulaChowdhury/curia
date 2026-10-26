@@ -314,7 +314,7 @@ known_failure: { issue: "#1234", reason: … }   # optional; reported, not gated
 stub_sets: [human-channels]               # optional; `defaults` always applies
 live_search: true                         # optional; web-search runs for real (Tavily credits)
 identity: style-brief-dry                 # optional; run-level office identity, see Style cases
-autonomy: { score: 84, gating: band }     # optional; run-level autonomy, see Run-level fixtures
+autonomy: { score: 84, gating: band }     # optional; this case's autonomy, see Per-case fixtures
 seed:
   contacts:                               # → {{contact:<key>}}
     - key: sam
@@ -582,32 +582,42 @@ with a Signal identity in the database the run uses. The design, and the baselin
 later tone & style PRs compare against, are in
 [docs/wip/2026-10-15-tone-and-style-design.md](../../docs/wip/2026-10-15-tone-and-style-design.md#measurement).
 
-## Run-level fixtures: autonomy
+## Per-case fixtures: autonomy
 
-`autonomy: { score, gating }` runs a case at that autonomy score, with that gating's band
-descriptions in the prompt (`tier`, or `band` as production's deployment runs, #2159).
-The stack lays it over the database's autonomy config in memory (`FixtureAutonomyService`,
-`src/startup/test-mode-stack.ts`). Nothing is written. Like `identity:`, it is the run's:
+`autonomy: { score, gating }` runs a case at that autonomy score and gating (`tier`, or
+`band` as production's deployment runs, #2159): the band descriptions in the prompt, the
+ExecutionLayer's gates and the OutboundGateway's review all follow it. The stack lays it
+over the database's autonomy config in memory (`FixtureAutonomyService`,
+`src/startup/test-mode-stack.ts`). Nothing is written.
 
-- a case with one is never in the release gate (`release_gate: false`);
-- every case in a selection must agree on it;
-- a wider selection leaves fixture cases out and says so.
+Unlike `identity:`, it is the case's own (#2312). Each attempt enters its case's fixture
+(`runWithAutonomyFixture`, an `AsyncLocalStorage`) around everything it does: the bus
+delivers an event by awaiting every subscriber in the publisher's call chain, so the
+dispatcher, the turns and their tool calls all read it. The gateway and the ExecutionLayer
+read the gating from the autonomy config on each call, not at construction. So:
 
-After boot the CLI reads the autonomy config back from the stack. It prints it ("Autonomy
-in force") and records it in the results, with or without a fixture. If a fixture is not
-in force, the run stops before any case.
+- cases under different fixtures, and cases without one, run in the same suite run, at
+  `--concurrency` beside each other;
+- a case with one can be in the release gate.
 
-Without a fixture, the stack reads the database's score and takes gating from
-`autonomy.gating` (so a curia-deploy `--overlay` gets band descriptions). The fixture
-reaches the prompt and the ExecutionLayer's score reads. Stubbed tools still answer before
-Gate A, so a case scores what the model chooses at that score, not production's refusal.
+Inside each attempt the harness reads the autonomy config back before seeding. If the
+case's fixture is not what the stack reads, the run fails with "autonomy fixture not in
+force" (an errored run fails the gate). The header counts the fixture cases by fixture, the
+summary marks each one ("autonomy 74 (band gating)"), and the results record them under
+`caseAutonomy`.
+
+Without a fixture, a case reads the database's score and takes gating from
+`autonomy.gating` (so a curia-deploy `--overlay` gets band descriptions and band gates).
+The CLI reads that back after boot and prints it ("Autonomy in force"). Stubbed tools still
+answer before Gate A, so a case scores what the model chooses at that score, not
+production's refusal.
 
 ### Principal-involved scheduling (25a–25n)
 
 The principal CCs or forwards Curia on scheduling, a counterpart sends a booking link, or
 someone the principal knows asks Curia for time. The design and the behaviors are in
 [docs/wip/2026-10-21-principal-scheduling-scenarios-design.md](../../docs/wip/2026-10-21-principal-scheduling-scenarios-design.md).
-All run real delegation, on demand. They form three batches, one stack each:
+All run real delegation, on demand. They form three batches:
 
 ```bash
 pnpm scenarios --tags ps-core  --model …   # autonomy 84 (band): 25a, 25b, 25d, 25e, 25j–25n
@@ -615,12 +625,11 @@ pnpm scenarios --tags ps-ask   --model …   # autonomy 74 (band): 25c
 pnpm scenarios --tags ps-prefs --model …   # autonomy 84 + identity scheduling-prefs: 25f–25i
 ```
 
-**Why they stay out of the release gate (#2227).** Each batch needs a run-level fixture:
-autonomy for all three, plus the office identity for ps-prefs. A fixture applies to a whole
-run, so the loader requires `release_gate: false` on any case that sets one. The gate runs
-every case in one stack, at the database's own autonomy. They are also the suite's most
-expensive cases: real delegation, and about $0.05–0.10 a run. All 14 at five runs adds
-roughly $4 and 45 minutes to a gate.
+**Why they stay out of the release gate (#2227).** They are the suite's most expensive
+cases: real delegation, and about $0.05–0.10 a run. All 14 at five runs adds roughly $4 and
+45 minutes to a gate. ps-prefs also needs an office identity, which applies to a whole run,
+so the loader requires `release_gate: false` on it. (Their autonomy fixtures no longer keep
+them out: since #2312 those are per case, so `--tags ps-core,ps-ask` can run as one batch.)
 
 **When to run them instead.** Run all three batches, 9 runs each, before merging a change to:
 - the coordinator's or the calendar specialist's prompts;

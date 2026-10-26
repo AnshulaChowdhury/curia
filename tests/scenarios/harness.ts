@@ -53,7 +53,7 @@ const SCENARIO_ORG_DOMAINS = ['example.test'];
 import { recordedReplyViews } from '../../src/dispatch/outbound-context.js';
 import { inboundSenderAuthenticated } from '../../src/dispatch/outbound-entry-access.js';
 import { formatTaskWakeContent } from '../../src/scheduler/wake-disposition.js';
-import { createTestModeStack, type AutonomyFixture, type OfficeIdentityFixture, type TestModeStack, type TierReasoningOverride } from '../../src/startup/test-mode-stack.js';
+import { autonomyFixtureMismatch, createTestModeStack, runWithAutonomyFixture, type AutonomyFixture, type OfficeIdentityFixture, type TestModeStack, type TierReasoningOverride } from '../../src/startup/test-mode-stack.js';
 import {
   closeAttempt,
   createCaseContext,
@@ -102,6 +102,7 @@ import {
 } from './seed.js';
 import { createStubController, type StubController, type StubbedCall } from './stub-layer.js';
 import { COORDINATOR, type CapturedToolCall, type ScenarioCase, type ScenarioRun } from './types.js';
+import type { AutonomyService } from '../../src/autonomy/autonomy-service.js';
 
 /**
  * What a real-delegation run waits beyond the longest delegate wait: the coordinator's own
@@ -348,11 +349,27 @@ export interface StackSources {
 }
 
 /**
+ * Why a case's autonomy fixture is not what the stack reads in the calling context, or
+ * undefined when it is (or the case has none). Called inside the attempt (#2312): the
+ * fixture is entered per attempt, so this is where a fixture that never arrived shows.
+ */
+export async function caseAutonomyError(
+  fixture: AutonomyFixture | undefined,
+  autonomy: Pick<AutonomyService, 'getConfig'>,
+): Promise<string | undefined> {
+  if (!fixture) return undefined;
+  const mismatch = autonomyFixtureMismatch(fixture, await autonomy.getConfig());
+  return mismatch ? `autonomy fixture not in force: ${mismatch}` : undefined;
+}
+
+/**
  * `officeIdentity`: the run's identity fixture (#2143). One stack serves every case in a
- * run, so the identity is the run's, never a case's.
+ * run, so the identity is the run's, never a case's. A case's `autonomy:` fixture is its
+ * own (#2312): each attempt enters it (see attempt()), so cases with different scores and
+ * gatings share the stack and run at once.
  */
 export async function createScenarioHarness(
-  options: { model?: string; reasoning?: TierReasoningOverride; officeIdentity?: OfficeIdentityFixture; autonomy?: AutonomyFixture } & StackSources = {},
+  options: { model?: string; reasoning?: TierReasoningOverride; officeIdentity?: OfficeIdentityFixture } & StackSources = {},
 ): Promise<ScenarioHarness> {
   const context = createCaseContext<ScenarioRunState>();
   const currentScope = (): SeedScope | undefined => context.current()?.scope;
@@ -387,7 +404,6 @@ export async function createScenarioHarness(
     ...(options.configDir ? { configDir: options.configDir } : {}),
     ...(options.mcpSnapshotDirs ? { mcpSnapshotDirs: options.mcpSnapshotDirs } : {}),
     ...(options.officeIdentity ? { officeIdentity: options.officeIdentity } : {}),
-    ...(options.autonomy ? { autonomy: options.autonomy } : {}),
     wrapExecutionLayer: (layer) => controller.wrap(layer),
     wrapBullpenService: (bullpen) => scopedBullpen(bullpen, currentScope),
     // Times each model call against its run, and refuses a cancelled run's calls.
@@ -681,10 +697,14 @@ export async function createScenarioHarness(
     }
   }
 
-  /** One attempt at a run, in a fresh case context with its own seeded rows. */
+  /**
+   * One attempt at a run, in a fresh case context with its own seeded rows, under the case's
+   * autonomy fixture (#2312) or, without one, the database's. Both contexts wrap everything
+   * the attempt starts: the inbound's publish, the turns, their tool calls and follow-ups.
+   */
   async function attempt(scenario: ScenarioCase, runIndex: number): Promise<{ run: ScenarioRun; providerReason?: string }> {
     const state: ScenarioRunState = { ...newAttempt(`${scenario.name} run ${runIndex + 1}`), scope: new SeedScope() };
-    return context.run(state, () => attemptInContext(scenario, runIndex, state));
+    return context.run(state, () => runWithAutonomyFixture(scenario.autonomy, () => attemptInContext(scenario, runIndex, state)));
   }
 
   async function attemptInContext(
@@ -740,6 +760,10 @@ export async function createScenarioHarness(
       toolStubs: resolveDates(scenario.toolStubs),
     };
     try {
+      // What the agents will read, read back inside the attempt: a fixture that never reached
+      // the stack must fail the run, not be scored as in force.
+      const autonomyError = await caseAutonomyError(scenario.autonomy, stack.autonomyService);
+      if (autonomyError) throw new Error(autonomyError);
       seeded = await seedRun(dated, { stack, outboundContext, scope });
       const stubTable = resolvePlaceholders(dated.toolStubs, seeded.refs);
       const inbound = resolvePlaceholders(dated.inbound, seeded.refs);

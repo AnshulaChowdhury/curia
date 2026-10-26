@@ -819,12 +819,10 @@ export function loadScenarioCase(file: string, options: LoadOptions = {}): Scena
     : loadIdentityFixture(identityName, file, options.identitiesDir ?? DEFAULT_IDENTITIES_DIR);
   const autonomy = parseAutonomy(raw, file);
   const releaseGate = optBool(raw, 'release_gate', file, 'case') ?? true;
-  // The release gate is one unfiltered run on the database's identity and autonomy.
+  // The release gate is one unfiltered run on the database's identity. An autonomy fixture
+  // is pinned per case (#2312), so a case with one can join it.
   if (identity && releaseGate) {
     throw new CaseError(file, `a case with an 'identity' fixture runs on demand; set release_gate: false`);
-  }
-  if (autonomy && releaseGate) {
-    throw new CaseError(file, `a case with an 'autonomy' fixture runs on demand; set release_gate: false`);
   }
   const scenario: ScenarioCase = {
     name: str(raw, 'name', file, 'case'),
@@ -1061,4 +1059,40 @@ export function loadScenarioCases(dir: string, options: LoadOptions = {}): Scena
     seen.add(key);
   }
   return cases;
+}
+
+/** The cases a `pnpm scenarios` run gets, and the ones it leaves out and why. */
+export interface RunSelection {
+  cases: ScenarioCase[];
+  /** release_gate: false cases an unfiltered run leaves out (#2027). */
+  onDemandSkipped: string[];
+  /** Identity-fixture cases left out because the selection holds other cases too (#2143). */
+  identitySkipped: string[];
+}
+
+/**
+ * Pick a run's cases from `all`. An unfiltered run is the release gate: on-demand cases join
+ * it only with `onDemand` (#2027); a `caseFilter` or `tags` selection runs whatever it names.
+ * A case with an identity fixture (#2143) needs the whole stack on that identity, and a run
+ * has one stack, so it runs only in a selection of fixture cases alone (--tags style): never
+ * in an unfiltered run, `onDemand` included, nor beside ordinary cases a wider selection also
+ * picks. An autonomy fixture is the case's own (#2312), so those cases run beside any others.
+ */
+export function selectRunCases(
+  all: readonly ScenarioCase[],
+  args: { caseFilter?: string; tags?: readonly string[]; onDemand?: boolean },
+): RunSelection {
+  let cases = [...all];
+  if (args.caseFilter !== undefined) {
+    const needle = args.caseFilter.toLowerCase();
+    cases = cases.filter(c => c.name.toLowerCase().includes(needle));
+  }
+  if (args.tags !== undefined) cases = cases.filter(c => c.tags.some(t => args.tags!.includes(t)));
+  const selected = args.caseFilter !== undefined || args.tags !== undefined;
+  const onDemandSkipped = selected || args.onDemand ? [] : cases.filter(c => !c.releaseGate).map(c => c.name);
+  cases = cases.filter(c => !onDemandSkipped.includes(c.name));
+  const hasIdentity = (c: ScenarioCase): boolean => c.identity !== undefined;
+  const identitySkipped = selected && cases.every(hasIdentity) ? [] : cases.filter(hasIdentity).map(c => c.name);
+  cases = cases.filter(c => !identitySkipped.includes(c.name));
+  return { cases, onDemandSkipped, identitySkipped };
 }
