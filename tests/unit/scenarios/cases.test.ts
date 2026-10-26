@@ -37,6 +37,42 @@ describe('coordinator scenario cases', () => {
     expect(page({ ...session, action: 'click', selector: 'g1f0e2' })).toContain('Check your email');
     expect(page({ ...session, action: 'click', selector: '[g1f0e1]' })).toContain('Check your phone');
     expect(page({ ...session, action: 'click', selector: 'g1f0e1' })).toContain('Check your phone');
+    const signedInBatches = [
+      [
+        { action: 'type', selector: '[g2f0e1]', text: '518204' },
+        { action: 'click', selector: '[g2f0e2]' },
+      ],
+      [
+        { action: 'type', selector: 'g2f0e1', text: '518204' },
+        { action: 'click', selector: 'g2f0e2' },
+      ],
+      [
+        { action: 'click', selector: '[g2f0e1]' },
+        { action: 'type', selector: '[g2f0e1]', text: '518204' },
+        { action: 'click', selector: '[g2f0e2]' },
+      ],
+      [
+        { action: 'click', selector: 'g2f0e1' },
+        { action: 'type', selector: 'g2f0e1', text: '518204' },
+        { action: 'click', selector: 'g2f0e2' },
+      ],
+    ];
+    for (const actions of signedInBatches) {
+      expect(page({ ...session, actions })).toContain("You're signed in");
+    }
+    for (const selector of ['[g2f0e1]', 'g2f0e1']) {
+      expect(page({ ...session, action: 'type', selector, text: '518204' })).toContain('518204');
+    }
+    for (const selector of ['[g2f0e2]', 'g2f0e2']) {
+      expect(page({ ...session, action: 'click', selector })).toContain("You're signed in");
+    }
+    expect(page({ ...session, action: 'click', selector: 'Email me the code' })).toContain('Check your email');
+    for (const selector of ['[g1f0e2]', 'g1f0e2', 'Email me the code']) {
+      expect(page({ ...session, actions: [{ action: 'click', selector }] })).toContain('Check your email');
+    }
+    const taskId = '4b7e1c90-2d3f-4a5b-8c6d-7e8f9012ab34';
+    expect(matchToolStub('task-update', { task_id: taskId, progress_note: 'switched to email' }, scenario.toolStubs)?.error).toBeUndefined();
+    expect(matchToolStub('task-complete', { task_id: taskId, completion_note: 'signed in' }, scenario.toolStubs)?.return).toMatchObject({ status: 'done' });
     const other = page({ ...session, action: 'click', selector: 'button:has-text("Text me the code")' });
     expect(other).toContain('How should we send');
     expect(other).not.toContain('Check your email');
@@ -47,6 +83,10 @@ describe('coordinator scenario cases', () => {
         checks: [
           expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { action: 'click', selector: '[g1f0e2]' } }),
           expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { action: 'click', selector: 'g1f0e2' } }),
+          expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { action: 'click', selector: 'Email me the code' } }),
+          expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { actions: [{ action: 'click', selector: '[g1f0e2]' }] } }),
+          expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { actions: [{ action: 'click', selector: 'g1f0e2' }] } }),
+          expect.objectContaining({ kind: 'called', tool: 'web-browser', with: { actions: [{ action: 'click', selector: 'Email me the code' }] } }),
         ],
       }),
       expect.objectContaining({ kind: 'not_called', tools: ['web-browser'], with: { action: 'click', selector: '[g1f0e1]' } }),
@@ -255,13 +295,12 @@ describe('coordinator scenario cases', () => {
     expect(real.filter(c => c.releaseGate).map(c => path.basename(c.sourceFile).slice(0, 3)).sort())
       .toEqual(['16a', '16d', '16f']);
     // Every other case is in the gate, except 21c (opt-in diagnostics; README, "Cases
-    // that need an opt-in agent"), 26 (mid-turn injection stays off until the paid
-    // eval, #2018), and the specialist cases that reply on a bullpen thread, which
-    // run on demand until #2126 ends the content-less reply loop (README, "Cases for
-    // a specialist"). The style cases run under an identity fixture, which the loader
-    // keeps out of the gate.
+    // that need an opt-in agent") and the specialist cases that reply on a bullpen
+    // thread, which run on demand until #2126 ends the content-less reply loop
+    // (README, "Cases for a specialist"). The style cases run under an identity
+    // fixture, which the loader keeps out of the gate.
     expect(cases.filter(c => c.delegation === 'stubbed' && !c.releaseGate && !c.identity).map(c => path.basename(c.sourceFile).slice(0, 3)))
-      .toEqual(['21c', '26-', '30d', '30e', '30f', '31a', '31b', '31c', '31d', '31h', '32b']);
+      .toEqual(['21c', '30d', '30e', '30f', '31a', '31b', '31c', '31d', '31h', '32b']);
   });
 
   it('principal-scheduling cases split into batches that each share one stack', () => {

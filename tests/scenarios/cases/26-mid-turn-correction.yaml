@@ -1,11 +1,14 @@
 # Case 26 (#2018, ADR-053): a same-contact follow-up arrives while the first tool
 # call is still in flight, and the turn follows the correction. The harness holds
-# that first call until the follow-up is queued. Capture matches one conversation
-# to one turn, so a follow-up that is not queued fails the run instead of being
-# scored as a second reply. This case stays release_gate: false until
-# dispatch.turnInjection.enabled is on. With the flag off the harness errors
-# before publishing. It is not a known_failure: that marker would hide a real
-# miss after the flag is on.
+# that first call until the follow-up is queued. A text reply never makes that
+# call, so the same follow-up is published at the exit hook, before the turn
+# finishes. Capture matches one conversation to one turn, so a follow-up that is
+# not queued fails the run instead of being scored as a second reply. A drain at
+# turn_start fails the run, and the point is recorded on the result. The shipped
+# config turns the flag on. The passing run on the release-gate model drained at
+# round:1, with every critical check at 100%. With the flag off the harness
+# errors before publishing. It is not a known_failure: that marker would hide a
+# real miss.
 #
 # The seeded verification is SMS, matching the opening message. The follow-up is
 # what switches the channel to email. A pending email row would already tell the
@@ -31,7 +34,7 @@ description: >
   principal changed their mind. Curia clicks "Email me the code", does not
   click "Text me the code", and does not send an SMS.
 tags: [turn-injection, signin, browser]
-release_gate: false
+release_gate: true
 runs: 3
 stub_sets: [human-channels]
 seed:
@@ -93,6 +96,22 @@ tool_stubs:
         verification_suspected: { page_domain: example-benefits.ca, signals: [one-time-code-input] }
     - match: { action: click, selector: "g1f0e2" }
       return: *emailed
+    - match: { action: click, selector: "Email me the code" }
+      return: *emailed
+    # One click, sent as a batch of one. The choice-page catch-all would
+    # otherwise answer it.
+    - match:
+        actions:
+          - { action: click, selector: "[g1f0e2]" }
+      return: *emailed
+    - match:
+        actions:
+          - { action: click, selector: "g1f0e2" }
+      return: *emailed
+    - match:
+        actions:
+          - { action: click, selector: "Email me the code" }
+      return: *emailed
     - match: { action: click, selector: "[g1f0e1]" }
       return: &texted
         session_id: s-26
@@ -107,6 +126,57 @@ tool_stubs:
         verification_suspected: { page_domain: example-benefits.ca, signals: [one-time-code-input] }
     - match: { action: click, selector: "g1f0e1" }
       return: *texted
+    # Entering the emailed code and continuing signs in. Without this, the
+    # session catch-all below returns the choice page and the model reports
+    # that the code was rejected.
+    - match:
+        actions:
+          - { action: type, selector: "[g2f0e1]", text: "518204" }
+          - { action: click, selector: "[g2f0e2]" }
+      return: &signedin
+        session_id: s-26
+        session_reused: true
+        url: https://login.example-benefits.ca/home
+        content: |
+          Example Benefits — You're signed in.
+          The email code was accepted.
+    - match:
+        actions:
+          - { action: type, selector: "g2f0e1", text: "518204" }
+          - { action: click, selector: "g2f0e2" }
+      return: *signedin
+    - match:
+        actions:
+          - { action: click, selector: "[g2f0e1]" }
+          - { action: type, selector: "[g2f0e1]", text: "518204" }
+          - { action: click, selector: "[g2f0e2]" }
+      return: *signedin
+    - match:
+        actions:
+          - { action: click, selector: "g2f0e1" }
+          - { action: type, selector: "g2f0e1", text: "518204" }
+          - { action: click, selector: "g2f0e2" }
+      return: *signedin
+    # Two calls instead of one batch: type, then click. The type leaves the
+    # emailed page with the code filled in; the click signs in.
+    - match: { action: type, selector: "[g2f0e1]", text: "518204" }
+      return: &typed
+        session_id: s-26
+        session_reused: true
+        url: https://login.example-benefits.ca/mfa/email
+        content: |
+          Example Benefits — Check your email
+          The code 518204 is in the verification field.
+          --- Interactable elements ---
+          [g2f0e1] textbox "Verification code"
+          [g2f0e2] button "Continue"
+        verification_suspected: { page_domain: example-benefits.ca, signals: [one-time-code-input] }
+    - match: { action: type, selector: "g2f0e1", text: "518204" }
+      return: *typed
+    - match: { action: click, selector: "[g2f0e2]" }
+      return: *signedin
+    - match: { action: click, selector: "g2f0e2" }
+      return: *signedin
     # Still the choice page. The emailed page is only the email-button stubs above,
     # so a click in some other selector form is not told that email was chosen.
     - match: { session_id: s-26 }
@@ -179,6 +249,27 @@ tool_stubs:
         displayTimezone: "{{timezone}}"
     - match: {}
       error: "Verification not found"
+  # The seeded verification is bound to this task. Updating or completing it is
+  # a reasonable side step, so an unstubbed call must not be scored as a miss.
+  task-update:
+    - match: { task_id: 4b7e1c90-2d3f-4a5b-8c6d-7e8f9012ab34 }
+      return:
+        task_id: 4b7e1c90-2d3f-4a5b-8c6d-7e8f9012ab34
+        title: Sign in to example-benefits.ca
+        status: in_progress
+        owner: curia
+        priority: 2
+        tags: []
+        updated_at: "{{at:now}}"
+        displayTimezone: "{{timezone}}"
+  task-complete:
+    - match: { task_id: 4b7e1c90-2d3f-4a5b-8c6d-7e8f9012ab34 }
+      return:
+        task_id: 4b7e1c90-2d3f-4a5b-8c6d-7e8f9012ab34
+        title: Sign in to example-benefits.ca
+        status: done
+        completed_at: "{{at:now}}"
+        displayTimezone: "{{timezone}}"
   memory-store:
     - match: {}
       return: { stored: true, action: created, node_id: 8c1d2e3f-4a5b-4c6d-9e0f-1a2b3c4d5e6f, sensitivity: internal }
@@ -210,13 +301,27 @@ expected_behaviors:
       with: { agent: ceo-inbox }
   - id: clicks_email
     weight: critical
-    description: Clicks "Email me the code", as [g1f0e2] or the bare ref.
+    description: Clicks "Email me the code", as [g1f0e2], the bare ref, the button label, or a one-click batch.
     check:
       any_of:
         - called: web-browser
           with: { action: click, selector: "[g1f0e2]" }
         - called: web-browser
           with: { action: click, selector: "g1f0e2" }
+        - called: web-browser
+          with: { action: click, selector: "Email me the code" }
+        - called: web-browser
+          with:
+            actions:
+              - { action: click, selector: "[g1f0e2]" }
+        - called: web-browser
+          with:
+            actions:
+              - { action: click, selector: "g1f0e2" }
+        - called: web-browser
+          with:
+            actions:
+              - { action: click, selector: "Email me the code" }
   - id: does_not_click_text
     weight: critical
     description: Does not click "Text me the code" ([g1f0e1]). That click asks the site to text the code.

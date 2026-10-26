@@ -3,6 +3,7 @@
 // A scenario is one inbound message to the coordinator, or one task fired at a specialist
 // (#2025), with seeded state and stubbed tools, run N times on the production prompt.
 // Behaviors are scored per run, either in code (`check`) or by the LLM judge (no `check`).
+import type { InjectionDrainPoint } from '../../src/bus/events.js';
 import type { PrincipalBacklogCounts } from '../../src/agents/prompts/backlog-line.js';
 import type { AutonomyFixture, OfficeIdentityFixture } from '../../src/startup/test-mode-stack.js';
 import type { VerificationDelivery, VerificationStatus } from '../../src/verification/types.js';
@@ -456,6 +457,12 @@ export interface ScenarioRun {
    * otherwise (#2027).
    */
   timeoutKind?: 'run' | 'delegate_wait';
+  /**
+   * Drain points of follow-ups joined into this run (#2018). A `turn_start`
+   * point fails the run: the correction arrived before the model had chosen.
+   * Absent when the case publishes no follow-up.
+   */
+  injectionDrainPoints?: InjectionDrainPoint[];
   /** Every real specialist run the coordinator started (#2027). Absent for stubbed delegation. */
   delegations?: DelegationRecord[];
   /** Set when removing the run's rows failed; leftovers may be in the database. */

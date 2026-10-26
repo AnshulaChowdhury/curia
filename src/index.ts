@@ -124,9 +124,8 @@ import { formatWhoYouServeBlock } from './agents/principal-contact-block.js';
 import { OutboundGateway } from './skills/outbound-gateway.js';
 import { OutboundQueueRepo } from './skills/outbound-queue-repo.js';
 import { ExportControlService, resolveExportControls } from './security/export-controls.js';
-import { InboundScanner } from './dispatch/inbound-scanner.js';
+import { createInboundScanner } from './dispatch/security-config-loader.js';
 import { RateLimiter } from './dispatch/rate-limiter.js';
-import { parseExtraInjectionPatterns, type ExtraInjectionPattern } from './dispatch/security-config-loader.js';
 import { parseExtraPiiPatterns, getMissingBuiltInPatterns, getBuiltInPatternCount } from './pii/scrubber.js';
 import type { PiiPattern } from './pii/scrubber.js';
 import { PiiRedactor } from './dispatch/pii-redactor.js';
@@ -1937,7 +1936,7 @@ async function main(): Promise<void> {
   }
 
   // Built before the email adapters so a same-thread follow-up can be released
-  // at the dispatcher's decision. The flag still defaults off.
+  // at the dispatcher's decision. The shipped config turns this on; an absent field stays off.
   const turnInjection = resolveTurnInjectionConfig(yamlConfig.dispatch);
   const turnLanes = new TurnLanes({
     enabled: turnInjection.enabled,
@@ -3017,28 +3016,12 @@ async function main(): Promise<void> {
     'PII scrubber active',
   );
 
-  // Layer 1 inbound injection scanner — parses extra patterns from the already-merged
+  // Layer 1 inbound injection scanner — extra patterns come from the already-merged
   // config (default.yaml + local.yaml, see loadYamlConfig()) so operator overrides in
-  // local.yaml actually take effect (#1397). Non-fatal on parse error: a broken custom
-  // pattern entry should warn loudly but not prevent startup (built-in defaults still protect).
-  // Narrow the try block to parseExtraInjectionPatterns() only — the constructor and
-  // logger.info are not config-parsing concerns and should not be silenced by this catch.
-  let extraInjectionPatterns: ExtraInjectionPattern[] = [];
-  try {
-    extraInjectionPatterns = parseExtraInjectionPatterns(
-      yamlConfig.security?.extra_injection_patterns ?? [],
-      'security.extra_injection_patterns (config/default.yaml merged with config/local.yaml)',
-    );
-  } catch (err) {
-    // Warn and fall back to zero extra patterns — built-in defaults still protect.
-    // A misconfigured extra pattern entry should not block startup entirely.
-    logger.warn({ err }, 'Failed to parse extra injection patterns from config — using built-in defaults only');
-  }
-  const injectionScanner = new InboundScanner({ extraPatterns: extraInjectionPatterns });
-  logger.info(
-    { builtInPatterns: InboundScanner.DEFAULT_PATTERN_COUNT, extraPatterns: extraInjectionPatterns.length },
-    'Inbound injection scanner initialized',
-  );
+  // local.yaml actually take effect (#1397). A broken custom pattern warns and the
+  // built-in defaults still protect. createInboundScanner keeps that try around the
+  // parse only.
+  const injectionScanner = createInboundScanner(yamlConfig, logger);
 
   // Parse trust scorer weights from config (security.trust_score section in default.yaml).
   // Falls back to DEFAULT_TRUST_WEIGHTS (0.4/0.4/0.2) if the section is absent.

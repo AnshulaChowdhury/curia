@@ -103,14 +103,21 @@ You generally don't need to change this unless you're testing a different coordi
 
 ### `dispatch`
 
-Controls the conversation checkpoint pipeline — the debounced background process that runs relationship extraction and other memory tasks after conversations go quiet.
+Controls the conversation checkpoint pipeline and turn lanes.
 
 ```yaml
 dispatch:
   conversationCheckpointDebounceMs: 600000  # Default: 10 minutes
+  turnInjection:
+    enabled: true                 # Shipped value. false, or omitting the key, keeps concurrent turns.
+    maxInjectionsPerTurn: 5       # Same-contact follow-ups drained into one turn.
+    extraRoundsPerInjection: 2    # Added to that turn's round budget per drained follow-up.
+    laneWaitTimeoutMs: 1200000    # 20 minutes, then the waiter runs anyway.
 ```
 
-Lower this to run memory extraction sooner after conversations end. Raise it on slow or cost-sensitive deployments to batch more activity before triggering extraction.
+`conversationCheckpointDebounceMs` is the quiet period before relationship extraction and other memory tasks run. Lower it to extract sooner. Raise it on slow or cost-sensitive deployments to batch more activity first.
+
+`turnInjection` holds one coordinator turn per human-channel conversation and drains a same-contact follow-up into it ([ADR-053](../adr/053-turn-lanes-and-mid-turn-injection.md), [spec 02](../specs/02-agent-system.md)). The shipped config sets `enabled` true. That rests on the passing case 26 run: `deepseek/deepseek-v4.1-flash`, judge `openai/gpt-4o`, every drain at `round:1`, critical checks at 100%. Omitting `enabled`, or setting it to `false`, keeps concurrent turns and skips injection. The other three fields keep the values above when omitted. A waiter that reaches `laneWaitTimeoutMs` logs an error and runs anyway, without taking the lane.
 
 ---
 

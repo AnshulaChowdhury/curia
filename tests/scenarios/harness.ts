@@ -27,7 +27,7 @@
 // captures that specialist's turn the way it captures the coordinator's. A `bullpen` or
 // `scheduler` inbound reaches it the way a thread reply or its own schedule does.
 import { randomUUID } from 'node:crypto';
-import { createAgentDiscuss, createAgentTask, createInboundMessage } from '../../src/bus/events.js';
+import { createAgentDiscuss, createAgentTask, createInboundMessage, type InjectionDrainPoint } from '../../src/bus/events.js';
 import { stampOriginator } from '../../src/contacts/stamp-originator.js';
 import {
   buildInboundEmailIdentifierBlock,
@@ -73,6 +73,7 @@ import {
   type TurnOutcome,
 } from '../shared/turn-capture.js';
 import { internalNamesFor } from './assertions.js';
+import { publishFollowupOnTextFinish, turnStartDrainError, type TextFinishSlot } from './followup-exit.js';
 import { createDelegationCapture, inRunOrder, type DelegationCapture, type DelegationTrace } from './delegation-capture.js';
 import { discoverableTools } from './discovery.js';
 import { applyReach } from './reach.js';
@@ -432,10 +433,13 @@ export async function createScenarioHarness(
   // Production's Dispatcher, given an outbound-context service so it injects the
   // block — narrowed to the run's own entries — the run's own backlog counts, and the
   // run's own verifications, so a principal's relayed code is tracked as in production.
+  // A missing scan is not a clean scan: the stack's scanner is the one production
+  // builds, and a bad extra pattern fails the stack rather than weakening it (#2018).
   new Dispatcher({
     bus,
     logger,
     contactResolver: stack.contactResolver,
+    injectionScanner: stack.injectionScanner,
     // Production's trust scoring (#2227): the coordinator sees the sender's trust score,
     // and a message counts toward the sender's confidence, as in production.
     channelPolicies: stack.trustScoring.channelPolicies,
@@ -480,6 +484,10 @@ export async function createScenarioHarness(
   const waitForInjection = (conversationId: string): Promise<boolean> => new Promise((resolve) => {
     injectionQueued.set(conversationId, resolve);
   });
+  // A text llm.call is awaited before the runtime's exit hook. The follow-up
+  // for a reply with no tool call is published from that subscriber, so the
+  // queue is full when closeIfIdle runs and the correction drains at exit.
+  const exitSlots = new Map<string, TextFinishSlot>();
   // Bullpen mentions reach the coordinator the way they do in production.
   new BullpenDispatcher(bus, logger, stack.bullpenService, stack.agentRegistry).register();
 
@@ -488,6 +496,28 @@ export async function createScenarioHarness(
   // Every model call billed to the run it was made in (#1980).
   const unattributed = new UsageLedger();
   meterAgentCalls(bus, context.current, unattributed);
+  // After the meter, so a text finish is billed even though this handler holds
+  // the llm.call delivery until the follow-up is queued. A throw here would be
+  // swallowed by the runtime's telemetry catch, and the exit hook would then
+  // see an empty queue, so the failure is recorded on the run instead.
+  bus.subscribe('llm.call', 'system', (event) =>
+    publishFollowupOnTextFinish(event, exitSlots, (conversationId, err) => {
+      capture.fail(conversationId, err);
+    }));
+  // Drain points live on the run result. A turn_start drain means the
+  // correction joined before the model had chosen, so the run fails here
+  // instead of depending on log level to notice it (#2018).
+  const injectionDrains = new Map<string, InjectionDrainPoint[]>();
+  bus.subscribe('agent.task.input_injected', 'system', (event) => {
+    if (event.type !== 'agent.task.input_injected') return;
+    const points = injectionDrains.get(event.payload.conversationId);
+    if (!points) return;
+    points.push(event.payload.drainPoint);
+    const message = turnStartDrainError(event.payload.drainPoint);
+    if (message !== undefined) {
+      capture.fail(event.payload.conversationId, new Error(message));
+    }
+  });
   const coordinator = stack.agent(COORDINATOR);
   const coordinatorTools = new Set(coordinator.toolDefs.map(t => t.name));
   // Production's own activation check, per skill: what skill-activate would hand the
@@ -666,6 +696,9 @@ export async function createScenarioHarness(
     // a failed seed becomes this run's error instead of aborting the suite.
     let seeded: SeededRun | undefined;
     let conversationId: string | undefined;
+    // Follow-up drain points for this attempt. The map entry is removed on
+    // disarm; this array is what the run result keeps.
+    let injectionDrainPoints: InjectionDrainPoint[] | undefined;
     // A follow-up lives only for this attempt. Cleanup disarms it so a late
     // timer cannot publish after the run, and releases a held first tool so
     // the turn can finish (#2018).
@@ -680,7 +713,11 @@ export async function createScenarioHarness(
       }
       releaseFirstCall?.();
       releaseFirstCall = undefined;
-      if (conversationId !== undefined) injectionQueued.delete(conversationId);
+      if (conversationId !== undefined) {
+        injectionQueued.delete(conversationId);
+        exitSlots.delete(conversationId);
+        injectionDrains.delete(conversationId);
+      }
     };
     let stubbedCalls: StubbedCall[] = [];
     let trace: DelegationTrace | undefined;
@@ -759,6 +796,7 @@ export async function createScenarioHarness(
         }
         const waiter = capture.waitFor(runConversationId, timeoutMs, agent);
         let delivery: Promise<void>;
+        let hostInboundId: string | undefined;
         if (thread) {
           // Posted by the thread's creator (or the case's author), mentioning the case's
           // agent — the event a bullpen reply produces. BullpenDispatcher turns it into
@@ -805,7 +843,7 @@ export async function createScenarioHarness(
             parentEventId: randomUUID(),
           }));
         } else if (sender !== 'bullpen' && 'channelId' in sender) {
-          delivery = bus.publish('channel', createInboundMessage({
+          const hostInbound = createInboundMessage({
             conversationId: runConversationId,
             channelId: sender.channelId,
             senderId: sender.senderId,
@@ -815,7 +853,9 @@ export async function createScenarioHarness(
             // A scenario inbound is a one-to-one message, and the adapters say so (#2261).
             ...(sender.channelId === 'signal' ? { metadata: { isGroup: false } } : {}),
             ...(sender.channelId === 'slack' ? { metadata: { isDm: true } } : {}),
-          }));
+          });
+          hostInboundId = hostInbound.id;
+          delivery = bus.publish('channel', hostInbound);
         } else {
           throw new Error('unreachable: bullpen sender without a thread');
         }
@@ -835,7 +875,14 @@ export async function createScenarioHarness(
         // fired must not be waited into a finished turn.
         let followupLanding: Promise<void> | undefined;
         if (inbound.followup && typeof sender === 'object' && 'channelId' in sender) {
+          // A follow-up is only valid from a channel sender, and that branch
+          // always sets the id. Publishing without it would skip the wait.
+          if (hostInboundId === undefined) {
+            throw new Error('channel follow-up has no host inbound id');
+          }
           const follow = inbound.followup;
+          injectionDrainPoints = [];
+          injectionDrains.set(runConversationId, injectionDrainPoints);
           const publishFollowup = async (): Promise<void> => {
             if (!followupArmed) return;
             const followSender = await resolveSender({
@@ -883,15 +930,30 @@ export async function createScenarioHarness(
             }
           };
           if (follow.after === 'first_tool_call') {
-            void (async () => {
-              await controller.whenFirstCall(runConversationId);
-              // The turn can end with no tool call. Disarm runs before endRun
-              // releases this wait, so do not publish into a finished turn.
-              if (!followupArmed) return;
+            // The model has to have chosen before the correction arrives.
+            // whenFirstCall is that moment for a tool round: the call stays
+            // held until the follow-up is queued, and the next round drains
+            // it. A text reply never records a tool call. Its llm.call is
+            // awaited before the exit hook, and the subscriber publishes
+            // there, so closeIfIdle sees the queue and the drain is `exit`
+            // rather than `turn_start`. A `turn_start` drain fails the run.
+            let claimed = false;
+            const claim = (): boolean => {
+              if (claimed || !followupArmed) return false;
+              claimed = true;
+              return true;
+            };
+            const publish = async (): Promise<void> => {
               const landing = followupLanded();
               followupLanding = landing;
               await landing;
               releaseFirstCall?.();
+            };
+            exitSlots.set(runConversationId, { agentId: agent, claim, publish });
+            void (async () => {
+              await controller.whenFirstCall(runConversationId);
+              if (!claim()) return;
+              await publish();
             })().catch((err: unknown) => capture.fail(runConversationId, err));
           } else {
             followupTimer = setTimeout(() => {
@@ -964,6 +1026,7 @@ export async function createScenarioHarness(
         unstubbedCalls: countHoles(merged),
         ...(error ? { error } : {}),
         ...(timeoutKind ? { timeoutKind } : {}),
+        ...(injectionDrainPoints !== undefined ? { injectionDrainPoints: [...injectionDrainPoints] } : {}),
         ...(realDelegation ? { delegations: trace?.delegations ?? [] } : {}),
         usage: state.usage.snapshot(),
         providerRetries: [],
@@ -979,6 +1042,7 @@ export async function createScenarioHarness(
         durationMs: Date.now() - started,
         unstubbedCalls: stubbedCalls.filter(c => c.disposition === 'refused' || c.disposition === 'canned').length,
         error: describeError(err),
+        ...(injectionDrainPoints !== undefined ? { injectionDrainPoints: [...injectionDrainPoints] } : {}),
         usage: state.usage.snapshot(),
         providerRetries: [],
       };

@@ -1,6 +1,7 @@
-// dispatch.turnInjection (#2018, ADR-053). The flag defaults off. A bad block fails
-// at boot: laneWaitTimeoutMs reaches setTimeout, and a zero cap would reject every
-// follow-up while looking configured.
+// dispatch.turnInjection (#2018, ADR-053). An absent field stays off. The shipped
+// default.yaml turns the flag on. A bad block fails at boot: laneWaitTimeoutMs
+// reaches setTimeout, and a zero cap would reject every follow-up while looking
+// configured.
 
 import { describe, it, expect, afterAll } from 'vitest';
 import * as fs from 'node:fs';
@@ -24,7 +25,7 @@ function writeConfig(defaultYaml: string): string {
 }
 
 describe('resolveTurnInjectionConfig (#2018)', () => {
-  it('defaults to off, with the ADR-053 §3 cap and the §6 fail-open', () => {
+  it('stays off when the field is absent, with the ADR-053 §3 cap and the §6 fail-open', () => {
     expect(resolveTurnInjectionConfig(undefined)).toEqual({
       enabled: false,
       maxInjectionsPerTurn: 5,
@@ -42,10 +43,32 @@ describe('resolveTurnInjectionConfig (#2018)', () => {
     });
   });
 
-  it('reads the shipped default.yaml with the flag off', () => {
+  it('reads the shipped default.yaml with the flag on', () => {
     const config = loadYamlConfig(path.resolve(import.meta.dirname, '../../config'));
-    expect(resolveTurnInjectionConfig(config.dispatch).enabled).toBe(false);
+    expect(resolveTurnInjectionConfig(config.dispatch).enabled).toBe(true);
     expect(resolveTurnInjectionConfig(config.dispatch).maxInjectionsPerTurn).toBe(5);
+  });
+
+  it('lets local.yaml turn an enabled default off without dropping the other fields', () => {
+    const dir = writeConfig(`
+dispatch:
+  turnInjection:
+    enabled: true
+    maxInjectionsPerTurn: 5
+    extraRoundsPerInjection: 2
+    laneWaitTimeoutMs: 1200000
+`);
+    fs.writeFileSync(path.join(dir, 'local.yaml'), `
+dispatch:
+  turnInjection:
+    enabled: false
+`);
+    expect(resolveTurnInjectionConfig(loadYamlConfig(dir).dispatch)).toEqual({
+      enabled: false,
+      maxInjectionsPerTurn: 5,
+      extraRoundsPerInjection: 2,
+      laneWaitTimeoutMs: 1_200_000,
+    });
   });
 });
 

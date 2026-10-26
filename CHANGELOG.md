@@ -16,10 +16,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Added
 
 - **Ant Farm video-call design** — design doc for replacing the Phaser office with a call view. (#2127)
-- **Turn lanes** — per-conversation lock and injection config, default off and inert. (#2018)
-- **Turn lane wiring** — a coordinator conversation has one holder when the flag is on. (#2018)
+- **Turn lanes** — per-conversation lock and injection config, on in the shipped file. (#2018)
+- **Turn lane wiring** — a coordinator conversation has one holder. (#2018)
 - **`agent.task.input_injected`** — **public API:** audit event for a drained same-contact follow-up. (#2018)
-- **Mid-turn injection** — a same-contact follow-up joins the live turn when the flag is on. (#2018)
+- **Mid-turn injection** — a same-contact follow-up joins the live coordinator turn. (#2018)
 - **Delegate wait** — a queued follow-up ends the wait early and the specialist keeps running. (#2018)
 - **`delegation.timed_out`** — **public API:** optional `cause` distinguishes an interrupted wait from a timeout. (#2018)
 - **Injected working-memory rows** — host task id is stored, and model history keeps the follow-up group. (#2018)
@@ -170,6 +170,11 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Scenario follow-up** — the harness scans inbound text, so a clean follow-up can join. (#2018)
+- **Scenario follow-up** — sends a correction on the first tool call, or at the exit hook. (#2018)
+- **Scenario follow-up** — a turn-start drain fails the run, and the point is recorded. (#2018)
+- **Scenario case 26** — stubs the task writes and email-button shapes the gate run used. (#2018)
+- **Scenario case 26** — bare-ref and label email clicks sent as a one-click batch now succeed. (#2018)
 - **Scenario follow-up** — an unpublished second message fails the run, and its own turn is cleaned up. (#2018)
 - **Scenario follow-up** — scoring waits for the injection decision, and a miss still fails the run. (#2018)
 - **Turn injection config** — startup accepts `dispatch.turnInjection` in the config schema. (#2018)

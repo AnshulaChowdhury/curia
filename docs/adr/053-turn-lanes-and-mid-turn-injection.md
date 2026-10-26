@@ -2,6 +2,7 @@
 
 Date: 2026-10-24
 Status: Accepted
+Amended: 2026-10-26 — the shipped flag is on, resting on the passing case 26 run on the release-gate model and judge (#2018)
 
 ## Context
 
@@ -39,6 +40,8 @@ Alternatives considered and rejected:
 
 8. **Flag.** `dispatch.turnInjection.enabled` defaults to false. Off means no lane method runs and behaviour is unchanged. It is turned on only after the pieces land and the mid-turn scenario has been run. With the flag on, a second message on Signal, Slack, SMS, HTTP, or CLI waits or is injected instead of running beside the first. That is a behaviour change. Email already waited. A second `POST /api/messages` on the same `conversation_id` while the first turn runs is injected; the first HTTP request still resolves as superseded, and the second request carries the single reply.
 
+*Amended 2026-10-26.* The shipped file sets `enabled` true. That rests on case 26, `mid-turn correction switches the sign-in channel`, commit `1db43195`: 3 runs, model `deepseek/deepseek-v4.1-flash`, judge `openai/gpt-4o`, critical checks 100%, every drain at `round:1`. An earlier run the same day, commit `a2bc516a`, failed because InferenceNet drops tool arguments after an `action` key. InferenceNet is excluded at the account level for that reason. An absent `enabled` field still resolves to false, and `enabled: false` does the same. With the flag on, email releases the next same-thread message when the dispatcher decides the inbound, so a same-contact follow-up can join the turn still running.
+
 9. **Delegate wait.** When late delivery is on, a queued follow-up ends the wait early with `in_progress` rather than a timeout. The specialist keeps running. Its result arrives later as its own late-delegation wake, which waits in the lane. No other in-flight tool call is cancelled.
 
 ## Consequences
@@ -48,4 +51,4 @@ Alternatives considered and rejected:
 - An inbound that was queued but not drained when the process stops stays unacknowledged, so inbound replay delivers it as a fresh turn.
 - History keeps an injected row with the message it followed. The same-role collapse treats that pair as one group, so an injected row cannot erase the original.
 - Voice is unchanged. It does not publish `agent.task` and does not use the exit hook.
-- Turning the flag on without the injection path would make a live message wait behind a long synthetic turn. The flag stays off until both are in place.
+- Turning the lane on without the injection path would make a live message wait behind a long synthetic turn. Injection is required whenever the lane is on.

@@ -1,7 +1,7 @@
 // Turn lanes (#2018, ADR-053). One in-process owner of "who is running on conversation X".
 //
 // The class has no database and no bus. With `enabled: false` every method is a no-op and
-// nothing is retained, so today's concurrent turns are unchanged. With the flag on, a
+// nothing is retained, so turns stay concurrent, as they did before #2018. With the flag on, a
 // coordinator turn on a human channel holds the conversation until it releases. A live
 // follow-up may join that turn only when tryInject's checks all pass; everything else waits
 // its own turn.
