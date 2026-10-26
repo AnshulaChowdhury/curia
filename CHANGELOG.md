@@ -82,6 +82,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`record-outreach`** — records web forms and calls for a task so the organization's reply finds it. (#2312)
 - **Linked outreach replies** — an email answering Curia's outreach arrives knowing its task, which gets a note. (#2312)
 - **`taskOutreach` capability** — **public API:** new `ToolContext` field for recording task outreach. (#2312)
+- **PII ask memory** — the principal's yes or no on a personal-data ask applies to that thread. (#2312)
+- **`disclosureDecisions` capability** — **public API:** new `ToolContext` field recording the principal's answer to an ask. (#2312)
 
 ### Changed
 

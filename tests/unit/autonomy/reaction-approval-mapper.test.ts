@@ -9,6 +9,7 @@ import type { ActionLogRepo } from '../../../src/autonomy/action-log-repo.js';
 import type { ActionLogRow } from '../../../src/autonomy/action-log-types.js';
 import type { ContactService } from '../../../src/contacts/contact-service.js';
 import type { ExecutionLayer } from '../../../src/skills/execution.js';
+import type { DisclosureDecisionRecorder } from '../../../src/autonomy/disclosure-decisions.js';
 import type { EventBus } from '../../../src/bus/bus.js';
 import type { ChannelIdentity } from '../../../src/contacts/types.js';
 import { createSilentLogger } from '../../../src/logger.js';
@@ -494,6 +495,58 @@ describe('ReactionApprovalMapper', () => {
 
   // Review fix (#2159 Phase 3): only a real approval notification binds. A principal 👍 on an
   // ordinary message that merely mentions an approval must not approve anything.
+  // PR 5 (#2312): a reaction answering a personal-data ask is the principal's yes or no.
+  describe('a row carrying a personal-data ask', () => {
+    const ASK = { conversationId: 'slack:D123', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com' };
+    let recordForApproval: ReturnType<typeof vi.fn>;
+    let asking: ReactionApprovalMapper;
+    const react = (emoji: string) => asking.handleReaction(createInboundReaction({
+      conversationId: 'slack:D123', channelId: 'slack', senderId: 'U_CEO', emoji, targetMessageId: '1710000000.000100',
+    }));
+
+    beforeEach(() => {
+      recordForApproval = vi.fn().mockResolvedValue(undefined);
+      asking = new ReactionApprovalMapper({
+        bus: bus as unknown as EventBus,
+        logger: createSilentLogger(),
+        actionLogRepo: actionLogRepo as unknown as ActionLogRepo,
+        contactService: contactService as unknown as ContactService,
+        executionLayer: executionLayer as unknown as ExecutionLayer,
+        principalIdentities: [makePrincipal('slack', 'U_CEO')],
+        disclosureDecisions: { recordForApproval: recordForApproval as unknown as DisclosureDecisionRecorder['recordForApproval'] },
+      });
+    });
+
+    it('records yes on 👍 before the replay, which gets the payload intact', async () => {
+      const row = makeRow({ toolName: 'email-send', payload: { recipient_contact_id: 'c-1', body: 'x' }, disclosureAsk: ASK });
+      actionLogRepo.findPendingByDeliveryMessage.mockResolvedValue(row);
+      await react('thumbsup');
+      expect(recordForApproval).toHaveBeenCalledExactlyOnceWith(row, 'yes');
+      expect(executionLayer.invoke.mock.calls[0]![1]).toEqual({ recipient_contact_id: 'c-1', body: 'x' });
+      expect(recordForApproval.mock.invocationCallOrder[0]!).toBeLessThan(executionLayer.invoke.mock.invocationCallOrder[0]!);
+    });
+
+    it('records no on 👎', async () => {
+      const row = makeRow({ disclosureAsk: ASK });
+      actionLogRepo.findPendingByDeliveryMessage.mockResolvedValue(row);
+      await react('thumbsdown');
+      expect(recordForApproval).toHaveBeenCalledExactlyOnceWith(row, 'no');
+    });
+
+    it('records nothing for a row without an ask, a lost race, or a 👍 that failed closed to deny', async () => {
+      actionLogRepo.findPendingByDeliveryMessage.mockResolvedValue(makeRow());
+      await react('thumbsup');
+      await react('thumbsdown');
+      actionLogRepo.findPendingByDeliveryMessage.mockResolvedValue(makeRow({ disclosureAsk: ASK, payload: null }));
+      await react('thumbsup');
+      actionLogRepo.resolveRow.mockResolvedValue(false);
+      actionLogRepo.findPendingByDeliveryMessage.mockResolvedValue(makeRow({ disclosureAsk: ASK }));
+      await react('thumbsup');
+      await react('thumbsdown');
+      expect(recordForApproval).not.toHaveBeenCalled();
+    });
+  });
+
   describe('binds only the notification fingerprint', () => {
     const probes = [
       'Sent you approval 3 for the Dana email.',

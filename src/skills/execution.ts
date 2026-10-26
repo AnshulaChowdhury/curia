@@ -107,6 +107,7 @@ import { TempFileStore } from './temp-file-store.js';
 import type { InfraLlmService } from './infra-llm.js';
 import { OutboundContextService, ScopedOutboundContext } from '../dispatch/outbound-context.js';
 import type { TaskOutreachCapability } from '../dispatch/task-outreach-capability.js';
+import type { DisclosureDecisionRecorder } from '../autonomy/disclosure-decisions.js';
 import { relayRequesterFor, rosterFromRegistry } from '../dispatch/delegation-hint.js';
 import { buildRateLimitSourceKey } from '../memory/rate-limit-key.js';
 import { DEFAULT_RESUMABLE_CEILINGS, type ResumableCeilingsConfig } from '../config.js';
@@ -318,6 +319,8 @@ export class ExecutionLayer {
   private outboundContextService?: OutboundContextService;
   /** Task outreach writer (#2312) — backs the 'taskOutreach' capability. */
   private taskOutreach?: TaskOutreachCapability;
+  /** The principal's answer to a personal-data ask (#2312) — backs the 'disclosureDecisions' capability. */
+  private disclosureDecisions?: Pick<DisclosureDecisionRecorder, 'recordForApproval'>;
   /** The agent's own contactId — injected into ctx.agentContactId for entity_enrichment default='agent' */
   private agentContactId?: string;
   /** IANA timezone name used for normalizing offset-less timestamp inputs from the LLM. */
@@ -397,6 +400,8 @@ export class ExecutionLayer {
     outboundContextService?: OutboundContextService;
     /** Task outreach writer (#2312) — backs the 'taskOutreach' capability. */
     taskOutreach?: TaskOutreachCapability;
+    /** The principal's answer to a personal-data ask (#2312) — backs the 'disclosureDecisions' capability. */
+    disclosureDecisions?: Pick<DisclosureDecisionRecorder, 'recordForApproval'>;
     agentContactId?: string;
     timezone?: string;
     selfEmail?: string;
@@ -470,6 +475,7 @@ export class ExecutionLayer {
     this.openDelegationLookup = options?.openDelegationLookup;
     this.verification = options?.verification;
     this.taskOutreach = options?.taskOutreach;
+    this.disclosureDecisions = options?.disclosureDecisions;
     if (!this.actionLogRepo) {
       // Once here rather than per call: without the repo no autonomous action reaches the
       // spot-check pool (#2159 Phase 3), and that should not be invisible.
@@ -539,6 +545,8 @@ export class ExecutionLayer {
       verification: this.verification,
       // taskOutreach (#2312) — plain field injection: record outreach for a task-bound turn.
       taskOutreach: this.taskOutreach,
+      // disclosureDecisions (#2312) — plain field injection: approve/deny record the principal's answer to an ask.
+      disclosureDecisions: this.disclosureDecisions,
     };
   }
 

@@ -93,6 +93,11 @@ export interface BriefEvidence {
   principalBlock?: string | null;
   /** Who directed the work (#2312), rendered for the judge. */
   authority?: SendAuthority;
+  /**
+   * The principal's earlier yes or no on this thread (#2312), as sentences that name the label
+   * and "this recipient" only, never a recipient identifier. Rendered only when there are some.
+   */
+  principalDecisions?: readonly string[];
 }
 
 export interface BriefInput {
@@ -205,6 +210,10 @@ export function buildBriefUserPrompt(input: BriefInput): string {
     `Who the principal is: <principal_json>${encode(input.evidence.principalBlock ?? '')}</principal_json>`,
     `Evidence looked up this turn (newest first): <evidence_json>${encode(input.evidence.toolResults)}</evidence_json>`,
     `Reported to the principal this turn (what the assistant told the principal; not evidence of facts about the principal): <reports_json>${encode(input.evidence.reportsToPrincipal ?? [])}</reports_json>`,
+    // Only when present, so a send on a thread with no decisions sees the brief unchanged.
+    ...((input.evidence.principalDecisions?.length ?? 0) > 0
+      ? [`The principal's earlier answers on this thread (system-recorded): <decisions_json>${encode(input.evidence.principalDecisions)}</decisions_json>`]
+      : []),
     '',
     `Return ONLY: {${keys}, "reason": "<one short sentence>"}`,
   ].join('\n');

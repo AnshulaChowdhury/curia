@@ -13,7 +13,10 @@ const OK_EVIDENCE = { unavailable: false, toolResults: [], principalBlock: null 
 function make(
   verdicts: BriefVerdict[],
   opts: {
-    evidence?: { unavailable?: boolean; authority?: SendAuthority };
+    evidence?: {
+      unavailable?: boolean; authority?: SendAuthority;
+      decisions?: Array<{ counterparty: string; label: string; decision: 'yes' | 'no' }>; linkedOutreachId?: string;
+    };
     contactTier?: (id: string) => Promise<ContactTier | null>;
     nonOrgDomains?: ReadonlySet<string>;
   } = {},
@@ -236,7 +239,7 @@ describe('BandSendReview', () => {
     await svc.review({ ...base, postTurn: true, taskEventId: 'task-1' });
     const second = await svc.review({ ...base, postTurn: true, taskEventId: 'task-2', content: 'Hi Joel. Adam has the forms.' });
     expect(second.kind).toBe('send');
-    expect(collect).toHaveBeenLastCalledWith(['task-1', 'task-2']);
+    expect(collect).toHaveBeenLastCalledWith(['task-1', 'task-2'], { conversationId: 'conv-1', counterparties: ['joel@example.com'] });
   });
 
   it('adds what the relay reported to the principal to the evidence (#2312)', async () => {
@@ -894,6 +897,41 @@ describe('BandSendReview', () => {
         expect(d).not.toHaveProperty('ask');
       });
 
+      it('names every non-principal recipient, normalized, as the ask\'s counterparties', async () => {
+        const { svc } = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
+        const d = await svc.review({
+          ...pii, recipients: ['principal@example.com', 'Joel <Joel@Example.com>', 'ops@example.com'],
+          principalRecipients: ['principal@example.com'], recipientTier: 'known',
+        });
+        expect(d).toMatchObject({ kind: 'hold', ask: { counterparties: ['joel@example.com', 'ops@example.com'] } });
+        if (d.kind === 'hold') expect(d.ask).not.toHaveProperty('outreachId');
+      });
+
+      it('carries the linked outreach row only when the link covers the recipients', async () => {
+        const covered = make([withRulings(ruling('inferred', true))], { evidence: { authority: linked('weak'), linkedOutreachId: 'o-1' } });
+        expect(await covered.svc.review(pii)).toMatchObject({ kind: 'hold', ask: { outreachId: 'o-1' } });
+        const elsewhere = make([withRulings(ruling('unsupported', true))], { evidence: { authority: linked('weak'), linkedOutreachId: 'o-1' } });
+        const d = await elsewhere.svc.review({ ...pii, recipients: ['sam@other.example'], recipientTier: 'known' });
+        expect(d.kind).toBe('hold');
+        if (d.kind === 'hold') {
+          expect(d.ask).toBeDefined();
+          expect(d.ask).not.toHaveProperty('outreachId');
+        }
+      });
+
+      it('writes the task title on one line, without double quotes, and at most 80 characters', async () => {
+        const titled = (title: string): SendAuthority => ({
+          ...linked('weak'), linkedTask: { ...linked('weak').linkedTask!, title },
+        });
+        const one = make([withRulings(ruling('inferred', true))], { evidence: { authority: titled('Book\n  physio\tfor "Sam"\r\n') } });
+        expect(await one.svc.review(pii)).toMatchObject({ ask: { taskTitle: 'Book physio for \'Sam\'' } });
+        const long = make([withRulings(ruling('inferred', true))], { evidence: { authority: titled(`Book ${'x'.repeat(200)}`) } });
+        const d = await long.svc.review(pii);
+        if (d.kind !== 'hold') throw new Error('expected a hold');
+        expect(d.ask!.taskTitle!.length).toBe(80);
+        expect(d.ask!.taskTitle!.endsWith('…')).toBe(true);
+      });
+
       it('notes a cold stranger\'s request on the bounce, by label only', async () => {
         const { svc } = make([withRulings(ruling('unsupported', true), ruling('unsupported', false, 'P2'))], { evidence: { authority: fromOutsider } });
         const d = await svc.review({ ...pii, detectedItems: [P1, P2], recipientTier: 'unknown' });
@@ -910,6 +948,104 @@ describe('BandSendReview', () => {
         expect(recheck.kind).toBe('block');
         expect(recheck).not.toHaveProperty('strangerRequest');
       });
+    });
+  });
+
+  // PR 5 (#2312): the principal's recorded yes or no on this thread decides, for exactly that
+  // label and recipient. Review Focus 1 and 2.
+  describe('the principal\'s earlier answer on this thread', () => {
+    const PHONE = '415-555-0100';
+    const SIN = '046 454 286';
+    const P_PHONE: BriefDetectedItem = { id: 'P1', label: 'phone_us', text: PHONE, field: 'body' };
+    const P_SIN: BriefDetectedItem = { id: 'P2', label: 'sin_ca', text: SIN, field: 'body' };
+    const TO = 'bookings@acme.example';
+    const send: BandReviewInput = {
+      ...base, conversationId: 'conv-T', recipients: [TO], recipientTier: 'known',
+      content: `Hi. The number is ${PHONE}.`, detectedItems: [P_PHONE],
+    };
+    const outsider: NonNullable<SendAuthority['originator']> = { contactId: TO, systemRole: null, tier: 'known', channel: 'email', authenticated: true };
+    const fromRequester: SendAuthority = { originator: outsider, liveTurn: false };
+    const ruling = (basis: DisclosureRuling['basis'], requested: boolean, id = 'P1'): DisclosureRuling => ({ id, basis, requested, reason: 'x' });
+    type OkVerdict = Extract<BriefVerdict, { ok: true }>;
+    const withRulings = (...disclosures: DisclosureRuling[]): OkVerdict => ({ ...(clean as OkVerdict), disclosures });
+    const said = (decision: 'yes' | 'no', label = 'phone_us', counterparty = TO) => ({ counterparty, label, decision });
+    const DECLINED = 'The principal declined sharing your phone_us with this recipient on this thread. Rewrite without it.';
+
+    it('reads decisions for the send\'s thread and non-principal recipients', async () => {
+      const { svc, collect } = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester } });
+      await svc.review({ ...send, recipients: ['principal@example.com', TO], principalRecipients: ['principal@example.com'] });
+      expect(collect).toHaveBeenCalledWith(['task-1'], { conversationId: 'conv-T', counterparties: [TO] });
+    });
+
+    it('sends a label the principal said yes to for this recipient, whatever the judge\'s basis', async () => {
+      for (const r of [ruling('unsupported', true), ruling('unsupported', false), ruling('inferred', false)]) {
+        for (const score of [84, 74]) {
+          const { svc } = make([withRulings(r)], { evidence: { authority: fromRequester, decisions: [said('yes')] } });
+          expect((await svc.review({ ...send, score })).kind).toBe('send');
+        }
+      }
+    });
+
+    it('does not let a yes for one label, or one recipient, authorize another', async () => {
+      // Another label: sin_ca was never answered, so it is asked about as before.
+      const other = make([withRulings(ruling('unsupported', true, 'P2'))], { evidence: { authority: fromRequester, decisions: [said('yes')] } });
+      const d1 = await other.svc.review({ ...send, content: `SIN ${SIN}`, detectedItems: [P_SIN] });
+      expect(d1).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'] } });
+      // Both labels: the yes covers phone_us only, so the send still waits on sin_ca.
+      const both = make([withRulings(ruling('unsupported', true), ruling('unsupported', true, 'P2'))], { evidence: { authority: fromRequester, decisions: [said('yes')] } });
+      expect(await both.svc.review({ ...send, detectedItems: [P_PHONE, P_SIN] })).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'] } });
+      // Another counterparty: a yes recorded for someone else is not this recipient's.
+      const elsewhere = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('yes', 'phone_us', 'other@acme.example')] } });
+      expect(await elsewhere.svc.review(send)).toMatchObject({ kind: 'hold', ask: { labels: ['phone_us'] } });
+      // A second recipient without a yes of their own.
+      const two = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('yes')] } });
+      expect((await two.svc.review({ ...send, recipients: [TO, 'ops@acme.example'] })).kind).toBe('hold');
+    });
+
+    it('bounces a label the principal declined for this recipient, never asking again', async () => {
+      const { svc, review } = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('no')] } });
+      const d = await svc.review(send);
+      expect(d).toEqual({ kind: 'bounce', findings: [{ rule: 'pii-not-authorized', detail: DECLINED }] });
+      // The judge is told, without the recipient's identifier.
+      const evidence = review.mock.calls[0]![0].evidence;
+      expect(evidence.principalDecisions).toEqual(['The principal already said no to sharing phone number with this recipient on this thread.']);
+      expect(evidence).not.toHaveProperty('decisions');
+      expect(JSON.stringify(evidence.principalDecisions)).not.toContain(TO);
+    });
+
+    it('bounces on a no for any recipient, even with a yes for another, and still asks about a different label', async () => {
+      const mixed = make([withRulings(ruling('unsupported', true))], {
+        evidence: { authority: fromRequester, decisions: [said('yes'), said('no', 'phone_us', 'ops@acme.example')] },
+      });
+      expect(await mixed.svc.review({ ...send, recipients: [TO, 'ops@acme.example'] })).toMatchObject({ kind: 'bounce', findings: [{ detail: DECLINED }] });
+      const otherLabel = make([withRulings(ruling('unsupported', true, 'P2'))], { evidence: { authority: fromRequester, decisions: [said('no')] } });
+      expect(await otherLabel.svc.review({ ...send, content: `SIN ${SIN}`, detectedItems: [P_SIN] })).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'] } });
+    });
+
+    it('after a declined label\'s one rewrite, blocks at 84 and holds at 74 without an ask', async () => {
+      const at84 = make([withRulings(ruling('unsupported', true)), withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('no')] } });
+      await at84.svc.review(send);
+      expect((await at84.svc.review(send)).kind).toBe('block');
+      const at74 = make([withRulings(ruling('unsupported', true)), withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('no')] } });
+      await at74.svc.review({ ...send, score: 74 });
+      const d = await at74.svc.review({ ...send, score: 74 });
+      expect(d.kind).toBe('hold');
+      expect(d).not.toHaveProperty('ask');
+    });
+
+    it('lets the principal\'s own live directive send a label they declined earlier', async () => {
+      const principal: NonNullable<SendAuthority['originator']> = { contactId: 'c-p', systemRole: 'principal', tier: 'principal', channel: 'signal', authenticated: true };
+      const { svc } = make([withRulings(ruling('directed', false))], { evidence: { authority: { originator: principal, liveTurn: true }, decisions: [said('no')] } });
+      expect((await svc.review(send)).kind).toBe('send');
+    });
+
+    it('tells the judge about a yes, too, as a sentence', async () => {
+      const { svc, review } = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromRequester, decisions: [said('yes'), said('yes', 'sin_ca')] } });
+      await svc.review(send);
+      expect(review.mock.calls[0]![0].evidence.principalDecisions).toEqual([
+        'The principal already said yes to sharing phone number with this recipient on this thread.',
+        'The principal already said yes to sharing SIN with this recipient on this thread.',
+      ]);
     });
   });
 

@@ -3,7 +3,8 @@
 // Approves a pending approval request: transitions the row to 'approved',
 // re-executes the originally blocked skill with humanApproved: true,
 // writes a child autonomy_action_log row for the re-execution result,
-// and publishes a human.decision audit event.
+// and publishes a human.decision audit event. A row carrying a personal-data ask (#2312)
+// first records the principal's yes for that thread (disclosure_decisions).
 //
 // SECURITY: sensitivity: "elevated" — authorization is enforced solely by the execution-layer
 // live-principal gate (#1126). No handler-level re-check: the gate already guarantees this skill
@@ -92,6 +93,16 @@ export class ApproveActionHandler implements ToolHandler {
         return { success: false, error: `${approvalLabel(row)} was already resolved by another action — approval aborted` };
       }
       ctx.log.info({ rowId: row.id, shortRef: row.shortRef }, 'approve-action: row transitioned to approved');
+
+      // A personal-data ask (#2312): the yes is recorded before the replay, so a reply drafted
+      // on the thread in the meantime already sees it. The recorder never throws.
+      if (row.disclosureAsk) {
+        if (ctx.disclosureDecisions) {
+          await ctx.disclosureDecisions.recordForApproval(row, 'yes');
+        } else {
+          ctx.log.error({ rowId: row.id }, 'approve-action: disclosureDecisions not wired — the principal\'s yes is not remembered for the thread');
+        }
+      }
 
       // Step 2: Re-execute the original skill with humanApproved bypass.
       // humanApproved skips the autonomy + caller gates (ADR-018). taskMetadata is forwarded so

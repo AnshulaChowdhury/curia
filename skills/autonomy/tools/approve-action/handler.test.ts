@@ -442,4 +442,65 @@ describe('ApproveActionHandler', () => {
       }
     });
   });
+
+  // PR 5 (#2312): approving a personal-data ask records the principal's yes for the thread.
+  describe('a row carrying a personal-data ask', () => {
+    const ASK = { conversationId: 'conv-1', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com' };
+    const ASK_ROW = {
+      ...PENDING_ROW, toolName: 'email-send', shortRef: 'ab12cd34', notificationSentAt: new Date(),
+      payload: { recipient_contact_id: 'c-1', subject: 'Booking', body: 'The number is 415-555-0100.' },
+      disclosureAsk: ASK,
+    };
+    const recorder = () => ({ recordForApproval: vi.fn().mockResolvedValue(undefined) });
+
+    it('records the yes, then replays the stored payload intact (Review Focus 3)', async () => {
+      const disclosureDecisions = recorder();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }) }),
+        bus: makeMockBus(), executionLayer: execLayer, disclosureDecisions,
+      }));
+      expect(result.success).toBe(true);
+      expect(disclosureDecisions.recordForApproval).toHaveBeenCalledExactlyOnceWith(ASK_ROW, 'yes');
+      const invoke = vi.mocked(execLayer.invoke);
+      // Exactly the input it was held with: the ask is never part of the replayed payload.
+      expect(invoke.mock.calls[0]![1]).toEqual({ recipient_contact_id: 'c-1', subject: 'Booking', body: 'The number is 415-555-0100.' });
+      expect(invoke.mock.calls[0]![3]).toMatchObject({ humanApproved: true });
+      expect(disclosureDecisions.recordForApproval.mock.invocationCallOrder[0]!).toBeLessThan(invoke.mock.invocationCallOrder[0]!);
+    });
+
+    it('records nothing for a row without an ask', async () => {
+      const disclosureDecisions = recorder();
+      await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo(), bus: makeMockBus(), executionLayer: makeMockExecutionLayer(), disclosureDecisions,
+      }));
+      expect(disclosureDecisions.recordForApproval).not.toHaveBeenCalled();
+    });
+
+    it('records nothing when the row was resolved concurrently or never shown', async () => {
+      const raced = recorder();
+      await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }), resolveRow: vi.fn().mockResolvedValue(false) }),
+        bus: makeMockBus(), executionLayer: makeMockExecutionLayer(), disclosureDecisions: raced,
+      }));
+      expect(raced.recordForApproval).not.toHaveBeenCalled();
+      const unshown = recorder();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: { ...ASK_ROW, notificationSentAt: null } }) }),
+        bus: makeMockBus(), executionLayer: makeMockExecutionLayer(), disclosureDecisions: unshown,
+      }));
+      expect(result).toEqual({ success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR });
+      expect(unshown.recordForApproval).not.toHaveBeenCalled();
+    });
+
+    it('still replays the approved send when the recorder is not wired', async () => {
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }) }),
+        bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(true);
+      expect(execLayer.invoke).toHaveBeenCalledOnce();
+    });
+  });
 });

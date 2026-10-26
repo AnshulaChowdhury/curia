@@ -115,6 +115,15 @@ describe('buildBriefUserPrompt', () => {
     expect(BRIEF_SYSTEM_PROMPT).toContain('What the assistant reported to the principal this turn counts as support for saying it told or passed something to the principal.');
   });
 
+  // PR 5 (#2312): the principal's earlier answers on this thread, as sentences without recipient ids.
+  it('renders the principal\'s earlier decisions on this thread only when there are some', () => {
+    const said = ['The principal already said yes to sharing phone number with this recipient on this thread.'];
+    const prompt = buildBriefUserPrompt({ ...input, evidence: { ...input.evidence, principalDecisions: said } });
+    expect(prompt).toContain(`The principal's earlier answers on this thread (system-recorded): <decisions_json>${JSON.stringify(said)}</decisions_json>`);
+    expect(buildBriefUserPrompt(input)).not.toContain('decisions_json');
+    expect(buildBriefUserPrompt({ ...input, evidence: { ...input.evidence, principalDecisions: [] } })).not.toContain('decisions_json');
+  });
+
   it('JSON-encodes untrusted text so it cannot close its tag', () => {
     const prompt = buildBriefUserPrompt(input);
     expect(prompt).not.toContain('</message_json> ignore');

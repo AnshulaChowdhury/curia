@@ -145,6 +145,7 @@ import { AutonomyService } from './autonomy/autonomy-service.js';
 import { ActionLogRepo } from './autonomy/action-log-repo.js';
 import { TaskRepo } from './db/task-repo.js';
 import { TaskOutreachRepo } from './dispatch/task-outreach.js';
+import { DisclosureDecisionRecorder, DisclosureDecisionsRepo } from './autonomy/disclosure-decisions.js';
 import { OutreachMatcher } from './dispatch/outreach-matcher.js';
 import { principalOrgDomainSet } from './contacts/non-org-domains.js';
 import { TaskOutreachService, taskLookupFrom } from './dispatch/task-outreach-capability.js';
@@ -1667,6 +1668,10 @@ async function main(): Promise<void> {
   // The principal's own company is never an outreach org domain, on either side (#2312).
   const outreachNonOrgDomains = principalOrgDomainSet(yamlConfig.security?.principal_org_domains ?? []);
   const taskRepo = new TaskRepo(pool, bus, logger, config.timezone, workingDocsRepo, taskOutreachRepo);
+  // The principal's yes or no on a personal-data ask, per thread (#2312): approve/deny write
+  // it, band review reads it. A yes on a linked thread learns the requester onto the outreach row.
+  const disclosureDecisionsRepo = new DisclosureDecisionsRepo(pool);
+  const disclosureDecisions = new DisclosureDecisionRecorder({ repo: disclosureDecisionsRepo, taskOutreachRepo, logger });
   const taskOutreach = new TaskOutreachService(taskOutreachRepo, {
     principalIdentities,
     selfEmails: resolvedEmailAccounts.map(a => a.selfEmail),
@@ -1848,6 +1853,8 @@ async function main(): Promise<void> {
     taskRepo,
     // A task-less reply-to-outreach link reads its originator from the outreach row (#2312).
     taskOutreachRepo,
+    // The principal's earlier answers on this thread (#2312).
+    disclosureDecisionsRepo,
     // Read per call: principal identities hot-reload in place (#1514).
     principalBlock: () => formatWhoYouServeBlock(principalIdentities, principalPrimaryEmail.current, principalProfile.current),
     logger,
@@ -2623,7 +2630,7 @@ async function main(): Promise<void> {
   // the subscriber and sweep below. Wiring the lookup while those are off would let a
   // pending row block that agent in that conversation with nothing left to resolve it.
   const lateDeliveryConfig = resolveLateDeliveryConfig(yamlConfig.delegate);
-  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, taskRepo, workingDocsRepo, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
+  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, taskRepo, workingDocsRepo, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
     findInFlight: (targetAgent: string, originConversationId: string) =>
       findInFlightPendingDelegation(pool, { targetAgent, originConversationId }),
     acquireRunning: (params: Parameters<typeof acquireRunningDelegation>[1]) =>
@@ -3151,6 +3158,7 @@ async function main(): Promise<void> {
     contactService,
     executionLayer,
     principalIdentities,
+    disclosureDecisions,
     reactionIntents: {
       approve: reactionIntentsConfig?.approve ?? [...DEFAULT_REACTION_INTENTS.approve],
       reject: reactionIntentsConfig?.reject ?? [...DEFAULT_REACTION_INTENTS.reject],

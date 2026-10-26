@@ -480,11 +480,56 @@ describe('SendEvidenceCollector', () => {
       });
     });
 
+    // PR 5 (#2312): the outreach row a linked turn points at, for learning the requester on a yes.
+    it('carries the linked outreach id beside the authority, never inside it', async () => {
+      const turn = row({
+        id: 'task-1', eventType: 'agent.task', parentEventId: null,
+        payload: { content: 'x', metadata: { linkedTask: { taskId: null, outreachId: 'o-9', linkKind: 'address', strength: 'strong' } } },
+      });
+      const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([], turn), principalBlock: () => null, logger });
+      const ev = await collector.collect(['task-1']);
+      expect(ev.linkedOutreachId).toBe('o-9');
+      expect(JSON.stringify(ev.authority)).not.toContain('o-9');
+      expect((await new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([]), principalBlock: () => null, logger }).collect(['task-1'])))
+        .not.toHaveProperty('linkedOutreachId');
+    });
+
     it('carries no authority when the evidence is unavailable', async () => {
       const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([], null), principalBlock: () => null, logger });
       const ev = await collector.collect(['task-1']);
       expect(ev.unavailable).toBe(true);
       expect(ev.authority).toEqual({ originator: null, liveTurn: false });
+    });
+  });
+
+  describe('the principal\'s earlier decisions on this thread (#2312)', () => {
+    const DECISIONS = [{ counterparty: 'bookings@acme.example', label: 'phone_us', decision: 'yes' as const }];
+
+    it('reads the latest decisions for the send\'s conversation and recipients', async () => {
+      const latestFor = vi.fn().mockResolvedValue(DECISIONS);
+      const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([]), disclosureDecisionsRepo: { latestFor }, principalBlock: () => null, logger });
+      const ev = await collector.collect(['task-1'], { conversationId: 'conv-T', counterparties: ['bookings@acme.example'] });
+      expect(latestFor).toHaveBeenCalledWith('conv-T', ['bookings@acme.example']);
+      expect(ev.decisions).toEqual(DECISIONS);
+    });
+
+    it('reads none without a conversation, recipients or the repo', async () => {
+      const latestFor = vi.fn().mockResolvedValue(DECISIONS);
+      const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([]), disclosureDecisionsRepo: { latestFor }, principalBlock: () => null, logger });
+      expect(await collector.collect(['task-1'])).not.toHaveProperty('decisions');
+      expect(await collector.collect(['task-1'], { counterparties: ['a@b.example'] })).not.toHaveProperty('decisions');
+      expect(await collector.collect(['task-1'], { conversationId: 'conv-T', counterparties: [] })).not.toHaveProperty('decisions');
+      expect(latestFor).not.toHaveBeenCalled();
+      const unwired = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([]), principalBlock: () => null, logger });
+      expect(await unwired.collect(['task-1'], { conversationId: 'conv-T', counterparties: ['a@b.example'] })).not.toHaveProperty('decisions');
+    });
+
+    it('leaves decisions out, and the evidence available, when the read fails', async () => {
+      const latestFor = vi.fn().mockRejectedValue(new Error('db down'));
+      const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([]), disclosureDecisionsRepo: { latestFor }, principalBlock: () => null, logger });
+      const ev = await collector.collect(['task-1'], { conversationId: 'conv-T', counterparties: ['a@b.example'] });
+      expect(ev.unavailable).toBe(false);
+      expect(ev).not.toHaveProperty('decisions');
     });
   });
 });

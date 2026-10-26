@@ -4337,7 +4337,7 @@ describe('band review (#2159)', () => {
     it('leads the approval with the question and tells the agent to deliver it now', async () => {
       const actionLogRepo = makeNumberedActionLogRepo(4);
       const registerDisplay = vi.fn();
-      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(askHold({ labels: ['phone_us', 'sin_ca'], requester: 'joel@example.com', taskTitle: 'Book physio' })), score: 84, actionLogRepo });
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(askHold({ labels: ['phone_us', 'sin_ca'], requester: 'joel@example.com', counterparties: ['joel@example.com'], taskTitle: 'Book physio' })), score: 84, actionLogRepo });
       gw.setApprovalDelivery({ registerDisplay } as never);
       const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
       expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
@@ -4354,13 +4354,45 @@ describe('band review (#2159)', () => {
 
     it('omits the task when none is known, and names the ref when the approval has no number', async () => {
       const registerDisplay = vi.fn();
-      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(askHold({ labels: ['phone_us'], requester: 'joel@example.com' })), score: 84 });
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(askHold({ labels: ['phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'] })), score: 84 });
       gw.setApprovalDelivery({ registerDisplay } as never);
       const result = await gw.send(emailReq, { taskEventId: 't1', holdRecipe });
       expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({
         preamble: 'joel@example.com is asking for your phone number. Share it? Reply yes to send the message below as written, or no to keep it private.',
       }));
       expect(result.blockedReason).toContain(`Deliver approval ${result.actionRef} to them now with deliver-approval on their urgent channel`);
+    });
+
+    // Task 2: the ask is stored beside the payload, so approve and deny can record the answer
+    // while the replay re-invokes the skill with exactly the input it was held with.
+    it('stores the ask on the approval row beside the payload, keyed by the thread', async () => {
+      const actionLogRepo = makeActionLogRepo();
+      const gw = makeBandGateway({
+        review: vi.fn().mockResolvedValue(askHold({
+          labels: ['phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'], outreachId: 'o-1',
+        })),
+        score: 84, actionLogRepo,
+      });
+      await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({
+        payload: { to: 'contact-1' },
+        disclosureAsk: { conversationId: 'c1', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com', outreachId: 'o-1' },
+      }));
+    });
+
+    it('stores no ask without a conversation to key it, or on any other hold', async () => {
+      const noThread = makeActionLogRepo();
+      const gw1 = makeBandGateway({
+        review: vi.fn().mockResolvedValue(askHold({ labels: ['phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'] })),
+        score: 84, actionLogRepo: noThread,
+      });
+      const r1 = await gw1.send(emailReq, { taskEventId: 't1', holdRecipe });
+      expect(r1).toMatchObject({ gated: true });
+      expect(vi.mocked(noThread.insert).mock.calls[0]![0]).not.toHaveProperty('disclosureAsk');
+      const other = makeActionLogRepo();
+      const gw2 = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84, actionLogRepo: other });
+      await gw2.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(vi.mocked(other.insert).mock.calls[0]![0]).not.toHaveProperty('disclosureAsk');
     });
 
     it('keeps the recipe\'s description as the preamble of any other hold', async () => {

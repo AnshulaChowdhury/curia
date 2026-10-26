@@ -47,6 +47,12 @@
 // beside it drops the ask. A cold stranger's request bounces with `strangerRequest`, so the
 // digest says Curia did not share it. Both name labels and the requester only, never values.
 //
+// The principal's answer to an ask is remembered per thread (#2312, disclosure_decisions): a
+// latest yes for a label from every non-principal recipient sends that item whatever the judge's
+// basis; a latest no from any of them bounces it (then blocks or holds on the recheck like any
+// finding) and is never asked again. Only the principal's own live directive overrides a no.
+// The judge sees these as sentences about "this recipient", never the recipient's identifier.
+//
 // The bounce ledger is in memory, keyed by conversation, channel and recipients, so a relay
 // rewrite (a new task on the same conversation) counts as the recheck and sees the first
 // turn's lookups. A restart between a bounce and its recheck gives one more bounce. The two
@@ -56,7 +62,8 @@
 
 import type { Logger } from '../logger.js';
 import type { EscalationJudge } from '../autonomy/escalation-judge.js';
-import { reportEvidence, type SendEvidenceCollector } from '../autonomy/send-evidence.js';
+import { reportEvidence, type CollectedEvidence, type SendEvidenceCollector } from '../autonomy/send-evidence.js';
+import { normalizeCounterparty, type DisclosureDecisionRow } from '../autonomy/disclosure-decisions.js';
 import type {
   BriefAnswers, BriefDetectedItem, BriefQuestion, BriefVerdict, DisclosureRuling, SendAuthority,
 } from '../autonomy/judge-brief.js';
@@ -125,9 +132,12 @@ export type BandReviewSignals = { speaksAsPrincipal?: boolean; bounced?: boolean
 
 /**
  * A requester's ask for the principal's data (#2312): the detected labels, the primary
- * non-principal recipient, and the title of the task it is for, when the evidence names one.
+ * non-principal recipient, and the title of the task it is for, when the evidence names one
+ * (on one line, at most 80 characters). `counterparties` are every non-principal recipient,
+ * normalized: the principal's answer is recorded for each. `outreachId` is the outreach row a
+ * covering link points at, so a yes can learn the requester onto it.
  */
-export type BandReviewAsk = { labels: string[]; requester: string; taskTitle?: string };
+export type BandReviewAsk = { labels: string[]; requester: string; counterparties: string[]; taskTitle?: string; outreachId?: string };
 
 export type BandReviewDecision =
   // copyPrincipal: a trusted contact directed these items out; the principal is copied (#2312).
@@ -207,7 +217,7 @@ export class BandSendReview {
     this.deps.limiter.recordJudgeSuccess();
 
     const other = this.otherRulesOutcome(input, verdict, items, prior !== undefined);
-    const pii = await this.piiOutcome(input, items, askedItems ? verdict.disclosures ?? [] : undefined, asked.authority, hasToken, prior !== undefined);
+    const pii = await this.piiOutcome(input, items, askedItems ? verdict.disclosures ?? [] : undefined, asked, hasToken, prior !== undefined);
     return this.settle(key, taskIds, input, prior !== undefined, combine(other, pii));
   }
 
@@ -264,10 +274,12 @@ export class BandSendReview {
     input: BandReviewInput,
     items: readonly BriefDetectedItem[],
     rulings: readonly DisclosureRuling[] | undefined,
-    authority: SendAuthority | undefined,
+    asked: { authority?: SendAuthority; decisions?: readonly DisclosureDecisionRow[]; linkedOutreachId?: string },
     hasToken: boolean,
     hasPrior: boolean,
   ): Promise<BandReviewDecision> {
+    const { authority } = asked;
+    const said = principalSaid(nonPrincipalRecipients(input), asked.decisions ?? []);
     // A link counts only for a send to the counterparties it links (#2312).
     const linkCovers = linkCoversRecipients(input, authority, this.deps.nonOrgDomains);
     // A weak link gives no authority, but a reply about the principal's own task is worth asking
@@ -281,6 +293,8 @@ export class BandSendReview {
     const askLabels = new Set<string>();
     let heldOtherwise = false;
     const strangerAsked = new Set<string>();
+    const declined = new Set<string>();
+    const saidYes = new Set<string>();
 
     if (items.length > 0 && rulings === undefined) {
       toRewrite.push({ rule: BAND_RULES.pii, detail: TOO_MANY_DETAIL });
@@ -295,6 +309,10 @@ export class BandSendReview {
         // rulesOnEach() guaranteed one ruling per item.
         const r = byId.get(item.id)!;
         if (r.basis === 'directed' && who === 'principal') continue;
+        // The principal already answered for this label and these recipients on this thread.
+        const answer = said(item.label);
+        if (answer === 'no') { declined.add(item.label); continue; }
+        if (answer === 'yes') { saidYes.add(item.label); continue; }
         if (r.basis === 'directed' && who === 'trusted') { copy.add(item.label); continue; }
         // Held below 80 for the principal: an ask when it is their task and an askable recipient
         // requested it. Under the principal's own turn nobody is asking: an ordinary hold.
@@ -322,6 +340,9 @@ export class BandSendReview {
           if (r.requested) strangerAsked.add(item.label);
         }
       }
+      for (const label of declined) {
+        toRewrite.push({ rule: BAND_RULES.pii, detail: `The principal declined sharing your ${label} with this recipient on this thread. Rewrite without it.` });
+      }
       if (unsupported.size > 0) {
         toRewrite.push({
           rule: BAND_RULES.pii,
@@ -343,6 +364,7 @@ export class BandSendReview {
           conversationId: input.conversationId, channel: input.channel, items: items.length, authority: who,
           ...(authority?.linkedTask ? { linkStrength: authority.linkedTask.strength, linkCovers } : {}),
           unsupported: [...unsupported], askFirst: [...askFirst], inferredBelow80: [...inferredBelow80], taskDirectedBelow80: [...taskDirectedBelow80], copyPrincipal: [...copy],
+          principalDeclined: [...declined], principalSaidYes: [...saidYes],
         },
         'band review: disclosure rulings applied',
       );
@@ -362,9 +384,13 @@ export class BandSendReview {
       const requester = primaryRequester(input);
       if (askLabels.size > 0 && !heldOtherwise && requester !== undefined) {
         const taskTitle = askTaskTitle(authority, linkCovers);
+        const outreachId = linkCovers ? asked.linkedOutreachId : undefined;
         return {
           kind: 'hold', reason: holds[0]!.detail, findings: holds,
-          ask: { labels: [...askLabels], requester, ...(taskTitle ? { taskTitle } : {}) },
+          ask: {
+            labels: [...askLabels], requester, counterparties: nonPrincipalRecipients(input),
+            ...(taskTitle ? { taskTitle } : {}), ...(outreachId ? { outreachId } : {}),
+          },
         };
       }
       return { kind: 'hold', reason: holds[0]!.detail, findings: holds };
@@ -469,11 +495,17 @@ export class BandSendReview {
     taskIds: string[],
     message: string,
     detectedItems: readonly BriefDetectedItem[] | undefined,
-  ): Promise<{ verdict: BriefVerdict; authority?: SendAuthority }> {
+  ): Promise<{ verdict: BriefVerdict; authority?: SendAuthority; decisions?: DisclosureDecisionRow[]; linkedOutreachId?: string }> {
     if (!this.deps.judge?.isEnabled()) return { verdict: { ok: false, failure: 'disabled' } };
-    const evidence = await this.deps.evidence.collect(taskIds);
+    const collected = await this.deps.evidence.collect(taskIds, {
+      ...(input.conversationId ? { conversationId: input.conversationId } : {}),
+      counterparties: nonPrincipalRecipients(input),
+    });
     // Without evidence every claim looks unsupported; that is a review failure, not a bounce.
-    if (evidence.unavailable) return { verdict: { ok: false, failure: 'unreachable' } };
+    if (collected.unavailable) return { verdict: { ok: false, failure: 'unreachable' } };
+    // Decisions and the outreach id stay with code: the judge reads the decisions as sentences.
+    const { decisions, linkedOutreachId, ...evidence } = collected;
+    const principalDecisions = describeDecisions(decisions);
     // Newest first, so the note leads. The relay's principal note is not under the drafting
     // task in audit_log (its parent is the agent.response), so it arrives with the send
     // rather than from the collector.
@@ -487,10 +519,17 @@ export class BandSendReview {
       ...(input.principalRecipients ? { principalRecipients: input.principalRecipients } : {}),
       ...(detectedItems ? { detectedItems } : {}),
       band: AutonomyService.bandForScore(input.score),
-      evidence: { ...evidence, ...(reportsToPrincipal ? { reportsToPrincipal } : {}) },
+      evidence: {
+        ...evidence,
+        ...(reportsToPrincipal ? { reportsToPrincipal } : {}),
+        ...(principalDecisions.length > 0 ? { principalDecisions } : {}),
+      },
       conversationId: input.conversationId ?? 'system',
     });
-    return { verdict, authority: evidence.authority };
+    return {
+      verdict, authority: evidence.authority,
+      ...(decisions ? { decisions } : {}), ...(linkedOutreachId ? { linkedOutreachId } : {}),
+    };
   }
 
   private async onJudgeFailure(input: BandReviewInput, failure: string): Promise<BandReviewDecision> {
@@ -605,15 +644,46 @@ function primaryRequester(input: BandReviewInput): string | undefined {
   return input.recipients.find((r) => !principals.has(bareId(r)));
 }
 
+/** Every recipient who is not the principal, normalized and once each: who a decision is for (#2312). */
+function nonPrincipalRecipients(input: BandReviewInput): string[] {
+  const principals = new Set((input.principalRecipients ?? []).map(bareId));
+  return [...new Set(input.recipients.map(bareId).filter((r) => !principals.has(r)))];
+}
+
+/**
+ * The principal's standing answer for a label on this thread (#2312): 'no' when any recipient's
+ * latest decision is no, 'yes' when every recipient's is yes, otherwise none. A send to the
+ * principal alone has no recipient to answer for.
+ */
+function principalSaid(recipients: readonly string[], decisions: readonly DisclosureDecisionRow[]): (label: string) => 'yes' | 'no' | undefined {
+  const latest = new Map(decisions.map((d) => [`${normalizeCounterparty(d.counterparty)}\u0000${d.label}`, d.decision]));
+  return (label) => {
+    if (recipients.length === 0) return undefined;
+    const answers = recipients.map((r) => latest.get(`${r}\u0000${label}`));
+    if (answers.includes('no')) return 'no';
+    return answers.every((a) => a === 'yes') ? 'yes' : undefined;
+  };
+}
+
+/** Decisions as the judge reads them: the label and "this recipient", never the identifier; once each. */
+function describeDecisions(decisions: CollectedEvidence['decisions']): string[] {
+  return [...new Set((decisions ?? []).map((d) =>
+    `The principal already said ${d.decision} to sharing ${describePiiLabels([d.label])} with this recipient on this thread.`))];
+}
+
+const TASK_TITLE_MAX = 80;
+
 /**
  * The task an ask is for, from the review's evidence: a link covering the recipients names
  * its task (or that task's root), otherwise the bound or root task. Undefined when none has
- * a title.
+ * a title. It is quoted in the principal's question, so it is made one line, its double quotes
+ * become single ones, and it is cut to 80 characters with an ellipsis.
  */
 function askTaskTitle(a: SendAuthority | undefined, linkCovers: boolean): string | undefined {
   const linked = linkCovers ? a?.linkedTask?.title ?? a?.linkedTask?.root?.title : undefined;
-  const title = linked ?? a?.boundTask?.title ?? a?.rootTask?.title;
-  return title?.trim() ? title.trim() : undefined;
+  const title = (linked ?? a?.boundTask?.title ?? a?.rootTask?.title)?.replace(/\s+/g, ' ').replace(/"/g, '\'').trim();
+  if (!title) return undefined;
+  return title.length > TASK_TITLE_MAX ? `${title.slice(0, TASK_TITLE_MAX - 1).trimEnd()}…` : title;
 }
 
 const HUMAN_PII_LABELS: Readonly<Record<string, string>> = {
@@ -640,10 +710,7 @@ function linkToPrincipalTask(a: SendAuthority | undefined): boolean {
 }
 
 /** A channel id as an address: the last `<addr>` when written with a display name, lowercased. */
-function bareId(id: string): string {
-  const angle = /<([^<>]+)>\s*$/.exec(id);
-  return (angle ? angle[1]! : id).trim().toLowerCase();
-}
+const bareId = normalizeCounterparty;
 
 /**
  * Every non-principal recipient is a counterparty the link covers: the linked sender (by

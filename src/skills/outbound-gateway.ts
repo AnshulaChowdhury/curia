@@ -63,6 +63,7 @@ import {
   BAND_RULES, describePiiLabels, type BandReviewAsk, type BandReviewReport, type BandReviewSignals, type BandSendReview,
 } from '../dispatch/band-send-review.js';
 import type { OutboundNotificationPayload } from '../bus/events.js';
+import { normalizeCounterparty, type DisclosureAsk } from '../autonomy/disclosure-decisions.js';
 import { markdownToHtml } from '../format/markdown-to-html.js';
 import { bodyEndsWithSignature, emailSignatureHtml, emailSignatureText, stripModelSignOff } from '../channels/email/signature.js';
 import type { AgentPersona } from './types.js';
@@ -2007,7 +2008,8 @@ export class OutboundGateway {
    * null when the row has none), or undefined when there is no action log or the row could not
    * be written (the send stays held either way). `preamble` replaces the recipe's description
    * at the top of what the principal is shown (an ask's question, #2312); the row and its
-   * digest mention keep the description.
+   * digest mention keep the description. `disclosureAsk` is stored in its own column, never
+   * in the replayed payload, so approving or denying the row records the principal's answer.
    */
   private async raiseSendApproval(
     request: OutboundSendRequest,
@@ -2015,6 +2017,7 @@ export class OutboundGateway {
     ctx: { taskEventId: string; conversationId?: string | null; postTurn?: boolean },
     extraLines: string[],
     preamble?: string,
+    disclosureAsk?: DisclosureAsk,
   ): Promise<{ shortRef: string; approvalNumber: number | null } | undefined> {
     const actionLogRepo = this.actionLogRepo;
     if (!actionLogRepo) {
@@ -2034,6 +2037,7 @@ export class OutboundGateway {
         shortRef: candidateRef,
         description: recipe.description,
         payload: recipe.partialPayload ?? {},
+        ...(disclosureAsk ? { disclosureAsk } : {}),
         expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
       });
     } catch (err) {
@@ -2330,6 +2334,7 @@ export class OutboundGateway {
         { taskEventId: options.taskEventId, conversationId: options.conversationId, postTurn: options.postTurn },
         ask ? [] : [`Held by the send review: ${decision.reason}`],
         ask ? askPreamble(ask) : undefined,
+        ask ? this.disclosureAskFor(ask, options.conversationId) : undefined,
       );
       if (!raised) await reportUnapprovedHold('the approval row could not be written');
       const askGuidance = ask && raised
@@ -2349,6 +2354,25 @@ export class OutboundGateway {
     await reportUnapprovedHold(recipe ? 'the send has no task to attach it to' : 'this send has no way to replay it');
     return {
       result: { success: false, blockedReason: `${decision.reason} Ask the principal before sending it.`, blockedRules: [rule] },
+    };
+  }
+
+  /**
+   * The ask as its approval row stores it (#2312), keyed by the thread the principal's answer
+   * applies to. Without a conversation there is no thread to remember it for: the question is
+   * still asked, but the answer decides this one send only.
+   */
+  private disclosureAskFor(ask: BandReviewAsk, conversationId: string | null | undefined): DisclosureAsk | undefined {
+    if (!conversationId || ask.counterparties.length === 0) {
+      this.log.warn({ labels: ask.labels, hasConversation: Boolean(conversationId) }, 'outbound-gateway: a personal-data ask has no thread or recipient to remember the answer for');
+      return undefined;
+    }
+    return {
+      conversationId,
+      counterparties: ask.counterparties,
+      labels: ask.labels,
+      requester: normalizeCounterparty(ask.requester),
+      ...(ask.outreachId ? { outreachId: ask.outreachId } : {}),
     };
   }
 

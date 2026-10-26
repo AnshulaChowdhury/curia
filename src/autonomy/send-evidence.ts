@@ -13,6 +13,10 @@
 // Curia's outreach also carries the linked task (the dispatcher's `linkedTask`), with its
 // task's originator, or for a task-less link the outreach row's.
 //
+// Decisions (#2312): the principal's latest yes or no on a personal-data ask, for the send's
+// conversation and non-principal recipients (disclosure_decisions). Code only, like the link's
+// outreach id: band review renders them for the judge without the recipient identifiers.
+//
 // Credentials are redacted before the evidence leaves for the judge's model provider, which
 // may differ from the agents'. Contact data is not: grounding checks claims such as "Dana's
 // number is …" against exactly that.
@@ -29,6 +33,7 @@ import type { TaskOutreachRepo } from '../dispatch/task-outreach.js';
 import type { Logger } from '../logger.js';
 import { createSecretPatterns } from '../security/secret-patterns.js';
 import type { BriefEvidence, SendAuthority } from './judge-brief.js';
+import type { DisclosureDecisionRow, DisclosureDecisionsRepo } from './disclosure-decisions.js';
 
 export type { SendAuthority } from './judge-brief.js';
 
@@ -44,6 +49,17 @@ export interface CollectedEvidence extends BriefEvidence {
   unavailable: boolean;
   /** Who directed the work. Always present; no authority at all when the evidence is unavailable. */
   authority: SendAuthority;
+  /** The principal's latest yes or no per (recipient, label) on this conversation (#2312). Code only. */
+  decisions?: DisclosureDecisionRow[];
+  /** The outreach row the drafting turn was linked to (#2312): a yes learns the requester onto it. Code only. */
+  linkedOutreachId?: string;
+}
+
+/** Which thread and recipients a send's decisions are read for (#2312). */
+export interface DecisionScope {
+  conversationId?: string;
+  /** The send's non-principal recipients. */
+  counterparties?: readonly string[];
 }
 
 type AuthorityOriginator = SendAuthority['originator'];
@@ -155,13 +171,18 @@ export class SendEvidenceCollector {
     taskRepo: Pick<TaskRepo, 'getTask' | 'resolveProjectRootTaskId'>;
     /** Reads a link's outreach row: its counterparties, and a task-less link's originator (#2312). Absent: a link has neither. */
     taskOutreachRepo?: Pick<TaskOutreachRepo, 'getById'>;
+    /** Reads the principal's earlier yes or no on this thread (#2312). Absent: no decisions. */
+    disclosureDecisionsRepo?: Pick<DisclosureDecisionsRepo, 'latestFor'>;
     /** The injected "## Who you serve" block, read per call so identity hot-reloads (#1514) apply. */
     principalBlock: () => string | null;
     logger: Logger;
   }) {}
 
-  /** Evidence from one or more drafting turns, newest tool result first. */
-  async collect(taskEventIds: readonly string[]): Promise<CollectedEvidence> {
+  /**
+   * Evidence from one or more drafting turns, newest tool result first. `scope` names the
+   * send's conversation and non-principal recipients, for the principal's decisions there.
+   */
+  async collect(taskEventIds: readonly string[], scope: DecisionScope = {}): Promise<CollectedEvidence> {
     const principalBlock = this.deps.principalBlock();
     if (taskEventIds.length === 0) {
       // A send with no drafting turn to read (no taskEventId). The caller treats this as a
@@ -218,9 +239,13 @@ export class SendEvidenceCollector {
         ...(link !== null ? { linkedTask: await this.readLinkedTask(link) } : {}),
       };
 
+      const decisions = await this.readDecisions(scope);
+
       return {
         unavailable: false,
         authority,
+        ...(link !== null ? { linkedOutreachId: link.outreachId } : {}),
+        ...(decisions ? { decisions } : {}),
         ...(reportsToPrincipal.length > 0 ? { reportsToPrincipal } : {}),
         ...(typeof content === 'string' ? { taskContent: clip(redactSecrets(content), EVIDENCE_RESULT_MAX_CHARS) } : {}),
         ...(progress !== undefined ? { taskProgress: clip(redactSecrets(JSON.stringify(progress)), EVIDENCE_RESULT_MAX_CHARS) } : {}),
@@ -230,6 +255,23 @@ export class SendEvidenceCollector {
     } catch (err) {
       this.deps.logger.error({ err, taskEventIds }, 'send-evidence: audit lookup failed — grounding cannot be judged');
       return { unavailable: true, toolResults: [], principalBlock, authority: NO_AUTHORITY };
+    }
+  }
+
+  /**
+   * The principal's latest decisions for this thread's recipients. A failed read is logged and
+   * leaves them out rather than marking the evidence unavailable: without a yes the send is
+   * reviewed as if never asked, and without a no the principal may be asked again. Neither
+   * shares anything.
+   */
+  private async readDecisions(scope: DecisionScope): Promise<DisclosureDecisionRow[] | undefined> {
+    const { conversationId, counterparties } = scope;
+    if (!this.deps.disclosureDecisionsRepo || !conversationId || !counterparties || counterparties.length === 0) return undefined;
+    try {
+      return await this.deps.disclosureDecisionsRepo.latestFor(conversationId, counterparties);
+    } catch (err) {
+      this.deps.logger.error({ err, conversationId }, 'send-evidence: could not read the principal\'s disclosure decisions — reviewing without them');
+      return undefined;
     }
   }
 

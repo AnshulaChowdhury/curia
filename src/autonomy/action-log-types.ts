@@ -1,5 +1,6 @@
 // action-log-types.ts — TypeScript types for the autonomy_action_log table.
 import type { SendRecipientPin } from '../skills/_shared/recipient-reference.js';
+import type { DisclosureAsk } from './disclosure-decisions.js';
 //
 // These mirror the Postgres schema from migration 031. The scoring engine,
 // approval lifecycle skills (#427/#428), and the DreamEngine scoring pass
@@ -68,6 +69,11 @@ export interface ActionLogRow {
    * approvals that did not use a label hint. Not skill input (#2047).
    */
   sendResolution?: SendRecipientPin[] | null;
+  /**
+   * The personal-data ask a held send carries (#2312): approving the row records the
+   * principal's yes, denying it their no. Null on every other row. Not skill input.
+   */
+  disclosureAsk?: DisclosureAsk | null;
 
   createdAt: Date;
 }
@@ -101,6 +107,8 @@ export interface ActionLogInsert {
   parentActionId?: number;
   /** Hinted-recipient pin. Stored beside the skill payload, never inside it. */
   sendResolution?: SendRecipientPin[] | null;
+  /** A held send's personal-data ask (#2312). Stored beside the skill payload, never inside it. */
+  disclosureAsk?: DisclosureAsk;
 
   /**
    * Pre-scored flags (shadow-reconciler / #1426). When scoredBy is set, findUnscoredTerminal

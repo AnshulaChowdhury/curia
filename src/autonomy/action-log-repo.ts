@@ -14,6 +14,7 @@ import type {
 } from './action-log-types.js';
 import { NO_REF_RETRY_GUIDANCE, TERMINAL_OUTCOMES } from './action-log-types.js';
 import { SAMPLE_POOL_SCORED_BY } from './sample-pool.js';
+import { readDisclosureAsk } from './disclosure-decisions.js';
 import type { SampledActionInsert } from './sample-pool.js';
 
 export class ActionLogRepo {
@@ -26,7 +27,8 @@ export class ActionLogRepo {
    *  Kept in one place so the two insert paths cannot drift.
    *
    *  `approvalNumber` is allocated by insert() for pending approvals only (#2159 Phase 3) and is
-   *  NULL everywhere else. It is the LAST column ($17) so every other param keeps its position. */
+   *  NULL everywhere else. It is $17 so every earlier param keeps its position; `disclosure_ask`
+   *  (#2312) was added after it as $18. */
   private insertColumnsAndParams(
     row: ActionLogInsert,
     approvalNumber: number | null = null,
@@ -35,8 +37,8 @@ export class ActionLogRepo {
       columns:
         '(task_id, conversation_id, skill_name, action_risk, outcome, task_summary, ' +
         'payload, expires_at, short_ref, description, parent_action_id, ' +
-        'competence_flag, commitment_flag, compatibility, scored_by, send_resolution, approval_number)',
-      values: 'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)',
+        'competence_flag, commitment_flag, compatibility, scored_by, send_resolution, approval_number, disclosure_ask)',
+      values: 'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)',
       params: [
         row.taskId,
         row.conversationId ?? null,
@@ -57,6 +59,7 @@ export class ActionLogRepo {
         row.scoredBy ?? null,
         row.sendResolution && row.sendResolution.length > 0 ? JSON.stringify(row.sendResolution) : null,
         approvalNumber,
+        row.disclosureAsk ? JSON.stringify(row.disclosureAsk) : null,
       ],
     };
   }
@@ -1005,6 +1008,7 @@ function mapRow(row: Record<string, unknown>): ActionLogRow {
     approvalNumber: row.approval_number == null ? null : Number(row.approval_number),
     description: row.description as string | null,
     sendResolution: readSendResolution(row.send_resolution),
+    disclosureAsk: readDisclosureAsk(row.disclosure_ask),
     createdAt: new Date(row.created_at as string),
   };
 }

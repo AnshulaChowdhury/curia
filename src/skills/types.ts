@@ -58,7 +58,7 @@ export interface ToolManifest {
    *  schedulerService, entityMemory, nylasCalendarClient, autonomyService,
    *  executiveProfileService, officeIdentityService, browserService, bullpenService, toolSearch,
    *  actionLogRepo, auditLogRepo, executionLayer, confidencePipeline, tempFileStore, infraLlm, outboundContext,
-   *  taskRepo, workingDocs, secretCapture, secretResolver, userSecretIndex, taskOutreach.
+   *  taskRepo, workingDocs, secretCapture, secretResolver, userSecretIndex, taskOutreach, disclosureDecisions.
    *
    *  Services NOT listed here (contactService, entityContextAssembler, agentPersona)
    *  are universal — available to every skill without declaration. */
@@ -312,6 +312,9 @@ export interface ToolContext {
   /** Task outreach (#2312) — available to skills declaring 'taskOutreach'. Records who Curia
    *  contacted for a task so their reply can find it; writes only on a task-bound turn. */
   taskOutreach?: import('../dispatch/task-outreach-capability.js').TaskOutreachCapability;
+  /** Disclosure decisions (#2312) — available to skills declaring 'disclosureDecisions'. Records
+   *  the principal's yes or no when an approval carrying a personal-data ask is resolved. */
+  disclosureDecisions?: Pick<import('../autonomy/disclosure-decisions.js').DisclosureDecisionRecorder, 'recordForApproval'>;
   /** Configurable fallback timeout for specialist delegations when the runtime injects no
    *  valid timeout_ms (the model cannot supply one since #1797; the runtime derives it from
    *  expected durations). Sourced from config.delegate.defaultTimeoutMs. Relevant to the

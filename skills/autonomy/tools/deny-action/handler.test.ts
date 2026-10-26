@@ -272,4 +272,40 @@ describe('DenyActionHandler', () => {
       }
     });
   });
+
+  // PR 5 (#2312): denying a personal-data ask records the principal's no for the thread.
+  describe('a row carrying a personal-data ask', () => {
+    const ASK = { conversationId: 'conv-1', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com' };
+    const ASK_ROW = { ...PENDING_ROW, toolName: 'email-send', disclosureAsk: ASK };
+    const recorder = () => ({ recordForApproval: vi.fn().mockResolvedValue(undefined) });
+
+    it('records the no once the row is denied', async () => {
+      const disclosureDecisions = recorder();
+      const result = await new DenyActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }) }),
+        bus: makeMockBus(), disclosureDecisions,
+      }));
+      expect(result.success).toBe(true);
+      expect(disclosureDecisions.recordForApproval).toHaveBeenCalledExactlyOnceWith(ASK_ROW, 'no');
+    });
+
+    it('records nothing for a row without an ask, or one resolved concurrently', async () => {
+      const plain = recorder();
+      await new DenyActionHandler().execute(makeCtx({ actionLogRepo: makeMockRepo(), bus: makeMockBus(), disclosureDecisions: plain }));
+      expect(plain.recordForApproval).not.toHaveBeenCalled();
+      const raced = recorder();
+      await new DenyActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }), resolveRow: vi.fn().mockResolvedValue(false) }),
+        bus: makeMockBus(), disclosureDecisions: raced,
+      }));
+      expect(raced.recordForApproval).not.toHaveBeenCalled();
+    });
+
+    it('still denies when the recorder is not wired', async () => {
+      const result = await new DenyActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }) }), bus: makeMockBus(),
+      }));
+      expect(result.success).toBe(true);
+    });
+  });
 });

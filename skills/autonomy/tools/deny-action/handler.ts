@@ -2,7 +2,8 @@
 //
 // Denies a pending approval request: transitions the autonomy_action_log row
 // to outcome = 'denied' and publishes a human.decision audit event.
-// No re-execution — the originally blocked skill stays blocked.
+// No re-execution — the originally blocked skill stays blocked. A row carrying a personal-data
+// ask (#2312) records the principal's no for that thread (disclosure_decisions).
 //
 // SECURITY: sensitivity: "elevated" — authorization is enforced solely by the execution-layer
 // live-principal gate (#1126). No handler-level re-check.
@@ -44,6 +45,15 @@ export class DenyActionHandler implements ToolHandler {
       if (!transitioned) {
         ctx.log.warn({ rowId: row.id, shortRef: row.shortRef }, 'deny-action: row was already resolved concurrently');
         return { success: false, error: `${approvalLabel(row)} was already resolved by another action` };
+      }
+
+      // A personal-data ask (#2312): later asks on the thread become bounces. Never throws.
+      if (row.disclosureAsk) {
+        if (ctx.disclosureDecisions) {
+          await ctx.disclosureDecisions.recordForApproval(row, 'no');
+        } else {
+          ctx.log.error({ rowId: row.id }, 'deny-action: disclosureDecisions not wired — the principal\'s no is not remembered for the thread');
+        }
       }
 
       // Publish human.decision audit event (best-effort).
