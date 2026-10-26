@@ -153,6 +153,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`query-relationships` / `delete-relationship`** — no longer require `openai_api_key`; they fail closed without entity memory. (#2023)
 - **Send results** — now report which details were redacted. (#2312)
 - **PII disclosure review** — band review authorizes each personal detail by who directed the work. (#2312)
+- **Linked-reply authority** — band review trusts a strong link to the principal's task; weak links only ask. (#2312)
 - **Trusted-contact directives** — sending the principal's details at a trusted contact's request copies the principal. (#2312)
 - **Approval displays** — approvals for sends list every personal detail they would send. (#2312)
 - **Unseen approvals** — a send approval with personal details can't be approved until it's shown. (#2312)

@@ -26,11 +26,14 @@
 // Detected personal data (#2312): `disclosure` is added to the questions, and the judge rules
 // each item directed / inferred / unsupported and whether the recipient asked. Code decides
 // who had the authority to direct it, from trusted state (never the judge's word):
-//   principal — the drafting turn's originator, or the bound or root task's, is the principal
+//   principal — the drafting turn's originator, or the bound or root task's, is the principal;
+//               so is a strong reply-to-task link to a task the principal directed. Through
+//               a task or a link only, a directed ruling counts as inferred.
 //   trusted   — the originator was stamped trusted, is trusted now, and authenticated
 //   directed  + principal → send          directed + trusted → send, copy the principal
 //   inferred  + principal → send at 80+, hold below
-//   anything else is unsupported: requested by a known/trusted recipient → hold (ask the
+//   anything else is unsupported: requested by an askable recipient (known or trusted, or
+//   replying on any link, strong or weak, to a task the principal directed) → hold (ask the
 //   principal); otherwise bounce, then block/hold like any finding. More than 10 items, or a
 //   judge failure with items present, is never a fail-open send. A `[REDACTED: …]`
 //   placeholder in the content bounces the same way. The strictest outcome of all the rules
@@ -243,7 +246,10 @@ export class BandSendReview {
     hasToken: boolean,
     hasPrior: boolean,
   ): Promise<BandReviewDecision> {
-    const askable = input.recipientTier === 'known' || input.recipientTier === 'trusted';
+    // A weak link gives no authority, but a reply about the principal's own task is worth asking
+    // the principal about. The link's originator is the task's (or row's), never the sender's.
+    const askable = input.recipientTier === 'known' || input.recipientTier === 'trusted'
+      || authority?.linkedTask?.originator?.systemRole === 'principal';
     const toRewrite: FilterFinding[] = [];
     const holds: FilterFinding[] = [];
     const copy = new Set<string>();
@@ -352,8 +358,9 @@ export class BandSendReview {
   /**
    * Who directed the work, from trusted state only. The principal: their own turn (a live turn,
    * or a wake they originated). The principal's task: only the bound or root task is theirs,
-   * not the drafting turn, so a directed ruling counts as inferred. A trusted contact: their
-   * stamped tier and their tier now are both trusted, and their message authenticated them.
+   * not the drafting turn, so a directed ruling counts as inferred. A strong reply-to-task link
+   * to a task the principal directed counts the same; a weak one never does. A trusted contact:
+   * their stamped tier and their tier now are both trusted, and their message authenticated them.
    * Anything else, or a failed tier read, is no authority.
    */
   private async authorityOf(a: SendAuthority | undefined, rulings: readonly DisclosureRuling[]): Promise<'principal' | 'principal-task' | 'trusted' | 'none'> {
@@ -363,6 +370,8 @@ export class BandSendReview {
     // originator its job was created with.
     if (a.originator?.systemRole === 'principal') return 'principal';
     if ([a.boundTask?.originator, a.rootTask?.originator].some((o) => o?.systemRole === 'principal')) return 'principal-task';
+    // Only an exact 'strong' counts; the collector already dropped a malformed link.
+    if (a.linkedTask?.strength === 'strong' && a.linkedTask.originator?.systemRole === 'principal') return 'principal-task';
     const o = a.originator;
     // Only a directed ruling uses trusted authority, so skip the lookup otherwise.
     if (!o || o.tier !== 'trusted' || o.authenticated !== true || !rulings.some((r) => r.basis === 'directed')) return 'none';

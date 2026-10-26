@@ -357,6 +357,104 @@ describe('SendEvidenceCollector', () => {
       expect(ev.authority.rootTask).toBeUndefined();
     });
 
+    describe('a reply linked to outreach (linkedTask, #2312)', () => {
+      const LINK = { taskId: 't-link', rootTaskId: null, outreachId: 'o-1', linkKind: 'org-domain', strength: 'strong' };
+      const OUTSIDER: TaskOriginator = { contactId: 'bookings@acme.example', systemRole: null, channel: 'email', initiatedAt: AT, tier: 'unknown', authenticated: true };
+      const linkedTurn = (linkedTask: unknown) => row({
+        id: 'task-1', eventType: 'agent.task', parentEventId: null,
+        payload: { content: 'We have a slot Tuesday — what is the patient\'s number?', metadata: { originator: OUTSIDER, linkedTask } },
+      });
+      const outreachRepo = (originator: unknown = PRINCIPAL_SIGNAL) => ({
+        getById: vi.fn().mockResolvedValue({ id: 'o-1', taskId: null, originator }),
+      });
+
+      it('reads a task link: the task\'s title and originator, the link kind and strength', async () => {
+        const taskRepo = {
+          getTask: vi.fn().mockResolvedValue(taskRow({ id: 't-link', title: 'Book physio sk-ant-abcdefghijklmnopqrstuvwxyz0123', originator: PRINCIPAL_SIGNAL })),
+          resolveProjectRootTaskId: vi.fn(),
+        };
+        const taskOutreachRepo = outreachRepo();
+        const collector = new SendEvidenceCollector({ taskRepo, taskOutreachRepo, auditLogRepo: makeRepo([], linkedTurn(LINK)), principalBlock: () => null, logger });
+
+        const ev = await collector.collect(['task-1']);
+
+        expect(ev.authority.linkedTask).toEqual({
+          taskId: 't-link', title: 'Book physio [REDACTED]',
+          originator: { contactId: 'principal-1', systemRole: 'principal', tier: 'principal', channel: 'signal', authenticated: true },
+          linkKind: 'org-domain', strength: 'strong',
+        });
+        expect(taskRepo.getTask).toHaveBeenCalledWith('t-link');
+        // The task's originator decides; the outreach row is read only for a task-less link.
+        expect(taskOutreachRepo.getById).not.toHaveBeenCalled();
+        // The sender is still the turn's originator: a link never changes who is speaking.
+        expect(ev.authority.originator?.systemRole).toBeNull();
+      });
+
+      it('reads a task-less link (live-turn outreach) from the outreach row\'s originator', async () => {
+        const taskRepo = noTasks();
+        const taskOutreachRepo = outreachRepo();
+        const collector = new SendEvidenceCollector({
+          taskRepo, taskOutreachRepo, auditLogRepo: makeRepo([], linkedTurn({ ...LINK, taskId: null, linkKind: 'inferred', strength: 'weak' })), principalBlock: () => null, logger,
+        });
+
+        const ev = await collector.collect(['task-1']);
+
+        expect(ev.authority.linkedTask).toEqual({
+          taskId: null, title: null,
+          originator: { contactId: 'principal-1', systemRole: 'principal', tier: 'principal', channel: 'signal', authenticated: true },
+          linkKind: 'inferred', strength: 'weak',
+        });
+        expect(taskOutreachRepo.getById).toHaveBeenCalledWith('o-1');
+        expect(taskRepo.getTask).not.toHaveBeenCalled();
+      });
+
+      it('keeps the link with no originator when its task or row is missing, unreadable, or not wired', async () => {
+        const error = vi.spyOn(logger, 'error');
+        const cases = [
+          { taskRepo: noTasks(), taskOutreachRepo: outreachRepo(), link: LINK },
+          { taskRepo: { getTask: vi.fn().mockRejectedValue(new Error('db down')), resolveProjectRootTaskId: vi.fn() }, taskOutreachRepo: outreachRepo(), link: LINK },
+          { taskRepo: noTasks(), taskOutreachRepo: { getById: vi.fn().mockResolvedValue(null) }, link: { ...LINK, taskId: null } },
+          { taskRepo: noTasks(), taskOutreachRepo: { getById: vi.fn().mockRejectedValue(new Error('db down')) }, link: { ...LINK, taskId: null } },
+          { taskRepo: noTasks(), taskOutreachRepo: outreachRepo({ contactId: 7 }), link: { ...LINK, taskId: null } },
+          { taskRepo: noTasks(), taskOutreachRepo: undefined, link: { ...LINK, taskId: null } },
+        ];
+        for (const c of cases) {
+          const collector = new SendEvidenceCollector({
+            taskRepo: c.taskRepo, ...(c.taskOutreachRepo ? { taskOutreachRepo: c.taskOutreachRepo } : {}),
+            auditLogRepo: makeRepo([], linkedTurn(c.link)), principalBlock: () => null, logger,
+          });
+          const ev = await collector.collect(['task-1']);
+          expect(ev.unavailable).toBe(false);
+          expect(ev.authority.linkedTask).toEqual({ taskId: c.link.taskId, title: null, originator: null, linkKind: 'org-domain', strength: 'strong' });
+        }
+        expect(error).toHaveBeenCalledTimes(2);
+        error.mockRestore();
+      });
+
+      it.each([
+        ['an array', [LINK]],
+        ['a string', 'strong'],
+        ['an unknown strength', { ...LINK, strength: 'STRONG' }],
+        ['a boolean strength', { ...LINK, strength: true }],
+        ['a missing strength', { ...LINK, strength: undefined }],
+        ['an unknown linkKind', { ...LINK, linkKind: 'principal' }],
+        ['a non-string taskId', { ...LINK, taskId: 42 }],
+        ['an empty taskId', { ...LINK, taskId: '' }],
+        ['a missing outreachId', { ...LINK, outreachId: undefined }],
+      ])('ignores a malformed linkedTask entirely (%s), with no lookups', async (_label, linkedTask) => {
+        const taskRepo = noTasks();
+        const taskOutreachRepo = outreachRepo();
+        const collector = new SendEvidenceCollector({ taskRepo, taskOutreachRepo, auditLogRepo: makeRepo([], linkedTurn(linkedTask)), principalBlock: () => null, logger });
+
+        const ev = await collector.collect(['task-1']);
+
+        expect(ev.unavailable).toBe(false);
+        expect(ev.authority).not.toHaveProperty('linkedTask');
+        expect(taskRepo.getTask).not.toHaveBeenCalled();
+        expect(taskOutreachRepo.getById).not.toHaveBeenCalled();
+      });
+    });
+
     it('carries no authority when the evidence is unavailable', async () => {
       const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([], null), principalBlock: () => null, logger });
       const ev = await collector.collect(['task-1']);

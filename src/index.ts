@@ -1846,6 +1846,8 @@ async function main(): Promise<void> {
   const sendEvidence = new SendEvidenceCollector({
     auditLogRepo,
     taskRepo,
+    // A task-less reply-to-outreach link reads its originator from the outreach row (#2312).
+    taskOutreachRepo,
     // Read per call: principal identities hot-reload in place (#1514).
     principalBlock: () => formatWhoYouServeBlock(principalIdentities, principalPrimaryEmail.current, principalProfile.current),
     logger,

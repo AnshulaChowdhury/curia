@@ -114,6 +114,15 @@ describe('TaskOutreachService.recordForTurn', () => {
     expect(record).toHaveBeenCalledWith(expect.objectContaining({ domains: ['Acme.example'] }));
   });
 
+  it("never stores the principal's own org domain written with a trailing dot", async () => {
+    const { service, record } = makeService({ nonOrgDomains: new Set(['office.example']) });
+    await service.recordForTurn(
+      { taskMetadata: { originator: principalOriginator, boundTask: { taskId: TASK_ID } }, conversationId: 'c' },
+      { via: 'email', summary: 'Asked', domains: [' Office.Example. ', 'acme.example'] },
+    );
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({ domains: ['acme.example'] }));
+  });
+
   it('returns null and writes nothing off-task', async () => {
     const { service, record } = makeService();
     const row = await service.recordForTurn({ taskMetadata: { originator: outsiderOriginator } }, { via: 'other', summary: 'x' });
@@ -195,6 +204,15 @@ describe('recordSendOutreach', () => {
       summary: 'Book physio',
       originator: principalOriginator,
     }));
+  });
+
+  it("leaves out a principal domain configured as a full host before reducing to the org domain", async () => {
+    const { service, record } = makeService({ nonOrgDomains: new Set(['mail.corp.example']) });
+    await recordSendOutreach(
+      { turn: { ...wake, taskOutreach: service }, via: 'email', addresses: ['dana@mail.corp.example', 'bookings@acme.example'] },
+      { content: 'Hello', recipientContactIds: [CONTACT_ID], log },
+    );
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({ domains: ['acme.example'] }));
   });
 
   it('summarises with the start of the sent message when there is no task', async () => {

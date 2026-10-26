@@ -128,6 +128,14 @@ export class TaskOutreachRepo {
     return mapRow(inserted.rows[0]!);
   }
 
+  /** One row by id, open or not; null when missing or the id is not a UUID (#2312: a link's originator). */
+  async getById(id: string): Promise<TaskOutreachRow | null> {
+    if (!isUuid(id)) return null;
+    const result = await this.pool.query(`SELECT * FROM task_outreach WHERE id = $1`, [id.toLowerCase()]);
+    const row = result.rows[0];
+    return row ? mapRow(row) : null;
+  }
+
   /** Open rows, newest first. */
   async findOpen(limit: number): Promise<TaskOutreachRow[]> {
     const result = await this.pool.query(

@@ -9,7 +9,9 @@
 // Authority (#2312): who directed the work — the turn's stamped originator, its live-turn
 // signal, and the task it was bound to with that task's project root, read from the tasks
 // table. Later code decides what that authority covers; here each piece is validated and a
-// malformed or missing one reads as null/absent, never as more authority.
+// malformed or missing one reads as null/absent, never as more authority. A reply linked to
+// Curia's outreach also carries the linked task (the dispatcher's `linkedTask`), with its
+// task's originator, or for a task-less link the outreach row's.
 //
 // Credentials are redacted before the evidence leaves for the judge's model provider, which
 // may differ from the agents'. Contact data is not: grounding checks claims such as "Dana's
@@ -22,6 +24,8 @@
 import type { AuditLogRepo } from '../audit/audit-log-repo.js';
 import type { ContactTier, SystemRole } from '../contacts/types.js';
 import type { TaskRepo } from '../db/task-repo.js';
+import type { OutreachLinkKind } from '../dispatch/outreach-matcher.js';
+import type { TaskOutreachRepo } from '../dispatch/task-outreach.js';
 import type { Logger } from '../logger.js';
 import { createSecretPatterns } from '../security/secret-patterns.js';
 import type { BriefEvidence, SendAuthority } from './judge-brief.js';
@@ -44,6 +48,7 @@ export interface CollectedEvidence extends BriefEvidence {
 
 type AuthorityOriginator = SendAuthority['originator'];
 type AuthorityTask = NonNullable<SendAuthority['boundTask']>;
+type AuthorityLink = NonNullable<SendAuthority['linkedTask']>;
 
 /** No originator and no live turn: what an unreadable turn is authorized by. */
 const NO_AUTHORITY: SendAuthority = { originator: null, liveTurn: false };
@@ -53,6 +58,10 @@ const SYSTEM_ROLES: ReadonlySet<string> = new Set(Object.keys({ principal: true,
 const CONTACT_TIERS: ReadonlySet<string> = new Set(Object.keys({
   blocked: true, unknown: true, known: true, trusted: true, principal: true,
 } satisfies Record<ContactTier, true>));
+const LINK_KINDS: ReadonlySet<string> = new Set(Object.keys({
+  address: true, contact: true, 'org-domain': true, inferred: true,
+} satisfies Record<OutreachLinkKind, true>));
+const LINK_STRENGTHS: ReadonlySet<string> = new Set(Object.keys({ strong: true, weak: true } satisfies Record<AuthorityLink['strength'], true>));
 
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -106,6 +115,22 @@ function readOriginator(raw: unknown): AuthorityOriginator {
   };
 }
 
+/**
+ * The dispatcher's `linkedTask` stamp, checked like an originator: a missing or empty
+ * outreachId, a taskId that is neither a non-empty string nor null, or a linkKind or strength
+ * outside its set makes the whole link absent. Never a weaker reading of a malformed one.
+ */
+function readLink(raw: unknown): { taskId: string | null; outreachId: string; linkKind: OutreachLinkKind; strength: AuthorityLink['strength'] } | null {
+  if (!isRecord(raw)) return null;
+  const { taskId, outreachId, linkKind, strength } = raw;
+  if (typeof outreachId !== 'string' || outreachId === '') return null;
+  if (taskId !== null && !(typeof taskId === 'string' && taskId !== '')) return null;
+  if (typeof linkKind !== 'string' || !LINK_KINDS.has(linkKind)) return null;
+  if (typeof strength !== 'string' || !LINK_STRENGTHS.has(strength)) return null;
+  // Checked against the sets above.
+  return { taskId, outreachId, linkKind: linkKind as OutreachLinkKind, strength: strength as AuthorityLink['strength'] };
+}
+
 /** Task text for the judge: credentials redacted, trimmed like other evidence. */
 function taskText(text: string): string {
   return clip(redactSecrets(text), EVIDENCE_RESULT_MAX_CHARS);
@@ -116,6 +141,8 @@ export class SendEvidenceCollector {
     auditLogRepo: Pick<AuditLogRepo, 'findById' | 'findToolResultsForTasks' | 'findPrincipalReportsForTasks'>;
     /** Reads the bound task and its project root for authority (#2312). */
     taskRepo: Pick<TaskRepo, 'getTask' | 'resolveProjectRootTaskId'>;
+    /** Reads a task-less link's outreach row for its originator (#2312). Absent: such a link has none. */
+    taskOutreachRepo?: Pick<TaskOutreachRepo, 'getById'>;
     /** The injected "## Who you serve" block, read per call so identity hot-reloads (#1514) apply. */
     principalBlock: () => string | null;
     logger: Logger;
@@ -145,6 +172,7 @@ export class SendEvidenceCollector {
       const boundTask = isRecord(metadata) ? metadata['boundTask'] : undefined;
       const progress = isRecord(boundTask) ? boundTask['progress'] : undefined;
       const boundTaskId = isRecord(boundTask) && typeof boundTask['taskId'] === 'string' ? boundTask['taskId'] : undefined;
+      const link = readLink(isRecord(metadata) ? metadata['linkedTask'] : undefined);
 
       const results = await this.deps.auditLogRepo.findToolResultsForTasks(taskEventIds, RESULTS_LIMIT);
       if (results.length === RESULTS_LIMIT) {
@@ -175,6 +203,7 @@ export class SendEvidenceCollector {
         // The dispatcher's distinct top-level signal (#1126); only an exact true counts.
         liveTurn: task.payload['liveTurn'] === true,
         ...(boundTaskId !== undefined ? await this.readTasks(boundTaskId) : {}),
+        ...(link !== null ? { linkedTask: await this.readLinkedTask(link) } : {}),
       };
 
       return {
@@ -218,6 +247,32 @@ export class SendEvidenceCollector {
       this.deps.logger.error({ err, taskId: boundTaskId }, 'send-evidence: root task lookup failed — authority leaves the root out');
       return { boundTask: bound };
     }
+  }
+
+  /**
+   * The linked task's title and originator: the task's own, or for a task-less link the
+   * outreach row's. A failed or missing read keeps the link with no originator, which gives
+   * it no authority and no askability.
+   */
+  private async readLinkedTask(link: NonNullable<ReturnType<typeof readLink>>): Promise<AuthorityLink> {
+    const { taskId, linkKind, strength } = link;
+    let title: string | null = null;
+    let originator: AuthorityOriginator = null;
+    try {
+      if (taskId !== null) {
+        const task = await this.readTask(taskId);
+        if (task === undefined) this.deps.logger.warn({ taskId }, 'send-evidence: linked task not found — the link carries no originator');
+        title = task?.title ?? null;
+        originator = task?.originator ?? null;
+      } else if (this.deps.taskOutreachRepo) {
+        const row = await this.deps.taskOutreachRepo.getById(link.outreachId);
+        if (row === null) this.deps.logger.warn({ outreachId: link.outreachId }, 'send-evidence: linked outreach row not found — the link carries no originator');
+        originator = readOriginator(row?.originator);
+      }
+    } catch (err) {
+      this.deps.logger.error({ err, taskId, outreachId: link.outreachId }, 'send-evidence: linked task lookup failed — the link carries no originator');
+    }
+    return { taskId, title, originator, linkKind, strength };
   }
 
   private async readTask(taskId: string): Promise<AuthorityTask | undefined> {

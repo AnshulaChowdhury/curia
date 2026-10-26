@@ -150,6 +150,27 @@ describe('TaskOutreachRepo finders', () => {
     await new TaskOutreachRepo(pool).findOpenByContact(CONTACT_ID.toUpperCase());
     expect(query.mock.calls[0]![1]).toEqual([CONTACT_ID]);
   });
+
+  // The band review reads a link's row by id, open or not (#2312 Task 5).
+  it('getById reads one row by id, whatever its state, parameterized', async () => {
+    const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const { pool, query } = mockPool([{ rows: [dbRow({ closed_at: new Date(0) })] }]);
+    const row = await new TaskOutreachRepo(pool).getById(id.toUpperCase());
+    expect(row?.id).toBe(id);
+    expect(row?.originator).toEqual(originator);
+    const [sql, params] = query.mock.calls[0]! as [string, unknown[]];
+    expect(sql).toMatch(/WHERE id = \$1/);
+    expect(sql).not.toMatch(/closed_at IS NULL/);
+    expect(params).toEqual([id]);
+  });
+
+  it('getById returns null for a missing row, and for a non-uuid without querying', async () => {
+    const { pool, query } = mockPool([{ rows: [] }]);
+    const repo = new TaskOutreachRepo(pool);
+    expect(await repo.getById('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')).toBeNull();
+    expect(await repo.getById('nope')).toBeNull();
+    expect(query).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('TaskOutreachRepo.learnCounterparty and closeForTask', () => {

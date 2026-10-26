@@ -406,6 +406,67 @@ describe('BandSendReview', () => {
       }
     });
 
+    // A reply linked to outreach (#2312): the sender is the outsider who replied; the link says
+    // which task their message answers. Only a strong link to the principal's task is authority.
+    describe('a reply linked to the outreach of a task', () => {
+      type Linked = NonNullable<SendAuthority['linkedTask']>;
+      const link = (strength: Linked['strength'], originator: SendAuthority['originator'] = principal): SendAuthority => ({
+        originator: outsider, liveTurn: false,
+        linkedTask: { taskId: 't-link', title: 'Book physio', originator, linkKind: strength === 'strong' ? 'org-domain' : 'inferred', strength },
+      });
+
+      it('gives a strong link to the principal\'s task principal-task authority: inferred sends at 84, holds at 74', async () => {
+        for (const basis of ['inferred', 'directed'] as const) {
+          const at84 = make([withRulings(ruling(basis, true))], { evidence: { authority: link('strong') } });
+          expect((await at84.svc.review(pii)).kind).toBe('send');
+          const at74 = make([withRulings(ruling(basis, true))], { evidence: { authority: link('strong') } });
+          const d = await at74.svc.review({ ...pii, score: 74 });
+          expect(d.kind).toBe('hold');
+          if (d.kind === 'hold') expect(d.findings.map((f) => f.rule)).toEqual(['pii-not-authorized']);
+        }
+      });
+
+      it('gives a task-less strong link the principal directed the same authority', async () => {
+        const authority: SendAuthority = { ...link('strong'), linkedTask: { ...link('strong').linkedTask!, taskId: null, title: null } };
+        const { svc } = make([withRulings(ruling('inferred'))], { evidence: { authority } });
+        expect((await svc.review(pii)).kind).toBe('send');
+      });
+
+      it('gives a weak link no authority, but makes a requesting recipient askable: held at 84 and 74', async () => {
+        for (const score of [84, 74]) {
+          const { svc } = make([withRulings(ruling('inferred', true))], { evidence: { authority: link('weak') } });
+          const d = await svc.review({ ...pii, score });
+          expect(d.kind).toBe('hold');
+          if (d.kind === 'hold') {
+            expect(d.findings.map((f) => f.rule)).toEqual(['pii-not-authorized']);
+            expect(d.reason).toContain('the recipient asked');
+            expect(d.reason).not.toContain(SIN);
+          }
+        }
+      });
+
+      it('bounces a weak link\'s item the recipient did not ask for, offering to ask the principal', async () => {
+        const { svc } = make([withRulings(ruling('inferred'))], { evidence: { authority: link('weak') } });
+        const d = await svc.review(pii);
+        expect(d.kind).toBe('bounce');
+        if (d.kind === 'bounce') {
+          expect(d.findings.map((f) => f.rule)).toEqual(['pii-not-authorized']);
+          expect(d.findings[0]!.detail).toContain('ask the principal');
+        }
+      });
+
+      it('gives a link to a task the principal did not direct no authority and no askability', async () => {
+        for (const originator of [curia, outsider, null]) {
+          for (const strength of ['strong', 'weak'] as const) {
+            const { svc } = make([withRulings(ruling('inferred', true))], { evidence: { authority: link(strength, originator) } });
+            const d = await svc.review(pii);
+            expect(d.kind).toBe('bounce');
+            if (d.kind === 'bounce') expect(d.findings[0]!.detail).not.toContain('ask the principal');
+          }
+        }
+      });
+    });
+
     it('bounces an item the judge called directed when an outsider originated the work, naming only the label', async () => {
       const { svc } = make([withRulings(ruling('directed'))], { evidence: { authority: fromOutsider } });
       const d = await svc.review(pii);

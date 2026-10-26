@@ -59,6 +59,8 @@ export interface TaskOutreachCapability {
   ownIdentity(text: string): string | null;
   /** True for the principal's contact id. */
   isPrincipalContact(contactId: string): boolean;
+  /** The principal's own domains (TaskOutreachServiceDeps.nonOrgDomains), for orgDomainsOf. */
+  readonly nonOrgDomains?: ReadonlySet<string>;
 }
 
 /** First characters of the sent message, when there is no task title to summarise with. */
@@ -155,7 +157,8 @@ export class TaskOutreachService implements TaskOutreachCapability {
       originator: scope.originator,
       via: entry.via,
       orgName: entry.orgName ?? null,
-      domains: (entry.domains ?? []).filter((d) => !this.deps.nonOrgDomains?.has(d.trim().toLowerCase())),
+      // Compared as principalOrgDomainSet normalizes: trimmed, lowercased, no trailing dot.
+      domains: (entry.domains ?? []).filter((d) => !this.deps.nonOrgDomains?.has(d.trim().toLowerCase().replace(/\.$/, ''))),
       addresses: [...(entry.addresses ?? [])],
       contactIds: [...(entry.contactIds ?? [])],
       givenContact: entry.givenContact ?? null,
@@ -189,6 +192,10 @@ export class TaskOutreachService implements TaskOutreachCapability {
 
   isPrincipalContact(contactId: string): boolean {
     return this.deps.principalIdentities.some((i) => i.contactId === contactId);
+  }
+
+  get nonOrgDomains(): ReadonlySet<string> | undefined {
+    return this.deps.nonOrgDomains;
   }
 }
 
@@ -250,7 +257,9 @@ export async function recordSendOutreach(
       via: outreach.via,
       addresses,
       contactIds,
-      domains: outreach.via === 'email' ? orgDomainsOf(addresses) : [],
+      // The principal's domains are excluded here too, where a full host (mail.corp.example)
+      // is still visible; recordForTurn sees only the reduced org domain.
+      domains: outreach.via === 'email' ? orgDomainsOf(addresses, capability.nonOrgDomains) : [],
       summary: sent.content.slice(0, SEND_SUMMARY_MAX_CHARS),
       useTaskTitle: true,
     });
