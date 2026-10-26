@@ -33,5 +33,7 @@
     "outboundGateway",
     "outboundContext"
   ],
-  "optional_capabilities": ["taskOutreach"]
+  "optional_capabilities": [
+    "taskOutreach"
+  ]
 }

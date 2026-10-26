@@ -28,6 +28,11 @@ export interface TaskOutreachRow {
   contactIds: string[];
   givenContact: string | null;
   summary: string;
+  /**
+   * True only for an explicit act (a send or record-outreach) on a principal-originated turn.
+   * A match on an unconfirmed row is a weak link only (Task 3). Merges OR: never downgraded.
+   */
+  confirmed: boolean;
   createdAt: Date;
   closedAt: Date | null;
   expiresAt: Date;
@@ -61,6 +66,7 @@ function mapRow(row: Record<string, unknown>): TaskOutreachRow {
     contactIds: (row.contact_ids as string[] | null) ?? [],
     givenContact: (row.given_contact as string | null) ?? null,
     summary: row.summary as string,
+    confirmed: row.confirmed !== false,
     createdAt: row.created_at as Date,
     closedAt: (row.closed_at as Date | null) ?? null,
     expiresAt: row.expires_at as Date,
@@ -86,7 +92,9 @@ export class TaskOutreachRepo {
               addresses = ARRAY(SELECT DISTINCT a FROM unnest(t.addresses || $5::text[]) AS a ORDER BY a),
               contact_ids = ARRAY(SELECT DISTINCT c FROM unnest(t.contact_ids || $6::uuid[]) AS c ORDER BY c),
               org_name = COALESCE(t.org_name, $7::text),
-              given_contact = COALESCE($8::text, t.given_contact)
+              given_contact = COALESCE($8::text, t.given_contact),
+              -- A later confirmed act upgrades a backstop row; an unconfirmed write never downgrades.
+              confirmed = t.confirmed OR $9::boolean
         WHERE t.id = (
           SELECT id FROM task_outreach
            WHERE ${OPEN} AND via = $3
@@ -99,7 +107,7 @@ export class TaskOutreachRepo {
         RETURNING t.*`,
       [
         input.taskId, input.conversationId, input.via, domains, addresses, contactIds,
-        input.orgName, input.givenContact,
+        input.orgName, input.givenContact, input.confirmed,
       ],
     );
     const mergedRow = merged.rows[0];
@@ -108,13 +116,13 @@ export class TaskOutreachRepo {
     const inserted = await this.pool.query(
       `INSERT INTO task_outreach
          (task_id, root_task_id, conversation_id, directing_event_id, originator, via,
-          org_name, domains, addresses, contact_ids, given_contact, summary)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+          org_name, domains, addresses, contact_ids, given_contact, summary, confirmed)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING *`,
       [
         input.taskId, input.rootTaskId, input.conversationId, input.directingEventId,
         JSON.stringify(input.originator), input.via, input.orgName, domains, addresses,
-        contactIds, input.givenContact, input.summary,
+        contactIds, input.givenContact, input.summary, input.confirmed,
       ],
     );
     return mapRow(inserted.rows[0]!);

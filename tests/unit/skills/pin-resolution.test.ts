@@ -33,7 +33,6 @@ const TASK_TOOLS = [
   'task-complete',
   'plan',
   'checkpoint',
-  'record-outreach',
 ] as const;
 const DOC_TOOLS = ['doc-read', 'doc-list', 'doc-write', 'doc-search', 'doc-place'] as const;
 

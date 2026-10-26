@@ -57,6 +57,7 @@ const input: TaskOutreachInput = {
   contactIds: [CONTACT_ID.toUpperCase()],
   givenContact: null,
   summary: 'asked about invoice',
+  confirmed: true,
 };
 
 describe('TaskOutreachRepo.record', () => {
@@ -92,6 +93,17 @@ describe('TaskOutreachRepo.record', () => {
     expect(params).toContainEqual(['acme.com']);
     expect(params).toContainEqual(['a@acme.com']);
     expect(params).toContain('email');
+  });
+
+  it('merges confirmed with OR and inserts it as given (#2312)', async () => {
+    const { pool, query } = mockPool([{ rows: [] }, { rows: [dbRow()] }]);
+    await new TaskOutreachRepo(pool).record({ ...input, confirmed: false });
+    const [updateSql, updateParams] = query.mock.calls[0]! as [string, unknown[]];
+    expect(updateSql).toMatch(/confirmed = t\.confirmed OR \$9::boolean/);
+    expect(updateParams[8]).toBe(false);
+    const [insertSql, insertParams] = query.mock.calls[1]! as [string, unknown[]];
+    expect(insertSql).toMatch(/confirmed\)/);
+    expect(insertParams[12]).toBe(false);
   });
 
   it('drops non-uuid contact ids', async () => {

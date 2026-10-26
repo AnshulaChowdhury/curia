@@ -60,6 +60,8 @@ tools:
   - request-clarification
   # Delegated sign-in verification (#2017): coordinator-only code-screen tracking.
   - verification
+  # Task outreach (#2312): coordinator-only record of web forms and calls made for a task.
+  - record-outreach
   - drive-download-file
   - image-generate
   # Personal vault (agent-captured user.* secrets)

@@ -103,7 +103,7 @@ interface AgentBudget {
 // #2328 optional task ids say to omit a placeholder: task-create's three id inputs and
 // task-update's blocker input (+132 bytes). The coordinator had 109 bytes of slack, so its
 // budget rises by 23 to 81,885. ceo-inbox was exact, so its budget rises by 132 to 45,471.
-// record-outreach joins the pinned tasks bundle (#2312): web forms and calls leave a task_outreach
+// record-outreach pinned as a standalone tool (#2312): web forms and calls leave a task_outreach
 // row so the organization's reply can find its task (sends record theirs in code): +677 bytes,
 // 82,671 over 74 local tools. The budget rises by exactly that delta.
 const AGENT_BUDGETS: AgentBudget[] = [
@@ -120,12 +120,10 @@ const AGENT_BUDGETS: AgentBudget[] = [
   // The budget rises by exactly that delta.
   // #2328 optional id hints (+132 bytes, the same delta as the coordinator's schema growth):
   // 45,471 over 45 local tools.
-  // record-outreach in the pinned tasks bundle (#2312): 46,257 over 46 local tools.
-  { agent: 'ceo-inbox', alwaysOnPromptTokens: 14_100, localToolDefinitionBytes: 46_257, allowMcpPins: false },
+  { agent: 'ceo-inbox', alwaysOnPromptTokens: 14_100, localToolDefinitionBytes: 45_471, allowMcpPins: false },
   // contacts: YAML 15,595 → 11,423 chars (~4,831 → ~3,788 tokens always-on with its SKILL.md bodies);
   // 35,311 bytes over its local tools.
-  // record-outreach in the pinned tasks bundle (#2312): measured 36,829 bytes over 40 local tools (with #2328's id hints).
-  { agent: 'contacts', alwaysOnPromptTokens: 3_900, localToolDefinitionBytes: 36_829, allowMcpPins: false },
+  { agent: 'contacts', alwaysOnPromptTokens: 3_900, localToolDefinitionBytes: 36_400, allowMcpPins: false },
   // meeting-debrief: YAML 18,627 → 14,682 chars (~4,670 → ~3,681 tokens always-on); 22,685 bytes over 17 local tools.
   { agent: 'meeting-debrief', alwaysOnPromptTokens: 3_800, localToolDefinitionBytes: 23_200, allowMcpPins: false },
 ];

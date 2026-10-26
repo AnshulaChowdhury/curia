@@ -1,9 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import pino from 'pino';
 import { RecordOutreachHandler } from './handler.js';
-import type { ToolContext } from '../../../../src/skills/types.js';
-import { TaskOutreachService } from '../../../../src/dispatch/task-outreach-capability.js';
-import type { TaskOutreachInput, TaskOutreachRepo, TaskOutreachRow } from '../../../../src/dispatch/task-outreach.js';
+import type { ToolContext } from '../../src/skills/types.js';
+import { TaskOutreachService } from '../../src/dispatch/task-outreach-capability.js';
+import type { TaskOutreachInput, TaskOutreachRepo, TaskOutreachRow } from '../../src/dispatch/task-outreach.js';
 
 const log = pino({ level: 'silent' });
 const TASK_ID = '11111111-1111-4111-8111-111111111111';
@@ -52,6 +52,8 @@ describe('record-outreach', () => {
       domains: ['acme.example', 'typeform.com'],
       givenContact: "the principal's email",
       summary: 'Asked Acme Physio for a Tuesday appointment',
+      // An explicit act on a principal-originated turn (#2312).
+      confirmed: true,
     }));
   });
 

@@ -112,6 +112,35 @@ describe('TaskOutreachService.recordForTurn', () => {
   });
 });
 
+describe('TaskOutreachService confirmed (#2312)', () => {
+  const principalTask = { taskMetadata: { originator: principalOriginator, boundTask: { taskId: TASK_ID } }, conversationId: 'c' };
+
+  it('an explicit act on a principal-originated turn is confirmed', async () => {
+    const { service, record } = makeService();
+    await service.recordForTurn(principalTask, { via: 'phone', summary: 'Called' });
+    expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ confirmed: true }));
+  });
+
+  it('a backstop row is never confirmed, even on a principal turn', async () => {
+    const { service, record } = makeService();
+    await service.recordForTurn(principalTask, { via: 'web_form', summary: 'Web form submitted', backstop: true });
+    expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ confirmed: false }));
+  });
+
+  it('a send on an outsider turn bound only by a linked task is not confirmed', async () => {
+    const { service, record } = makeService();
+    await recordSendOutreach(
+      {
+        turn: { taskMetadata: { originator: outsiderOriginator, linkedTask: { taskId: TASK_ID } }, conversationId: 'c', taskOutreach: service },
+        via: 'email',
+        addresses: ['bookings@acme.example'],
+      },
+      { content: 'Hello', recipientContactIds: [CONTACT_ID], log },
+    );
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({ taskId: TASK_ID, confirmed: false }));
+  });
+});
+
 describe('TaskOutreachService.ownIdentity', () => {
   it('matches the principal email case-insensitively and trimmed', () => {
     const { service } = makeService();

@@ -635,15 +635,19 @@ async function recordFormOutreach(ctx: ToolContext, step: BrowserActionStep, pag
   if (!outreach || typeof step.text !== 'string' || step.secret_ref) return;
   const given = outreach.ownIdentity(step.text);
   if (!given) return;
+  // No registrable domain (an IP, about:blank): nothing a reply could be matched on.
   const domain = registrableDomain(pageUrl);
+  if (!domain) return;
   try {
+    // A second matching field on the same page merges into this row (same task, via, domain).
     const row = await outreach.recordForTurn(ctx, {
       via: 'web_form',
-      domains: domain ? [domain] : [],
+      domains: [domain],
       givenContact: given,
       orgName: null,
       summary: 'Web form submitted',
       useTaskTitle: true,
+      backstop: true,
     });
     // Labels only: neither the identity nor the page is logged.
     if (row) ctx.log.info({ outreachId: row.id, taskId: row.taskId }, 'web-browser: recorded web form outreach');

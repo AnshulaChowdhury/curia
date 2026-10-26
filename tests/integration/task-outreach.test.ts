@@ -52,6 +52,7 @@ describeIf('task_outreach repo', () => {
       contactIds: [],
       givenContact: null,
       summary: 'asked about an invoice',
+      confirmed: true,
       ...overrides,
     };
   }
@@ -115,6 +116,23 @@ describeIf('task_outreach repo', () => {
     const otherTask = await repo.record(input(await seedTask()));
     const noOverlap = await repo.record(input(taskId, { domains: [`${run}-other.test`], addresses: [] }));
     expect(new Set([base.id, otherVia.id, otherTask.id, noOverlap.id]).size).toBe(4);
+  });
+
+  it('a repeated backstop write merges, and a confirmed act upgrades it but is never downgraded (#2312)', async () => {
+    const taskId = await seedTask();
+    const form = { via: 'web_form' as const, domains: [`${run}-form.test`], addresses: [], confirmed: false };
+    const backstop = await repo.record(input(taskId, form));
+    expect(backstop.confirmed).toBe(false);
+    // A second matching type step on the same page: same task, via and domain.
+    const again = await repo.record(input(taskId, form));
+    expect(again.id).toBe(backstop.id);
+    const { rows } = await pool.query(`SELECT count(*)::int AS n FROM task_outreach WHERE task_id = $1`, [taskId]);
+    expect(rows[0].n).toBe(1);
+    const explicit = await repo.record(input(taskId, { ...form, confirmed: true }));
+    expect(explicit.id).toBe(backstop.id);
+    expect(explicit.confirmed).toBe(true);
+    const later = await repo.record(input(taskId, form));
+    expect(later.confirmed).toBe(true);
   });
 
   it('merges by conversation_id when there is no task', async () => {

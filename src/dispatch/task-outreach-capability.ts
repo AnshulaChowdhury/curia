@@ -45,6 +45,8 @@ export interface OutreachEntry {
   summary: string;
   /** Prefer the bound task's title over `summary` (sends and the browser backstop). */
   useTaskTitle?: boolean;
+  /** Inferred by the browser backstop rather than an explicit act: always unconfirmed. */
+  backstop?: boolean;
 }
 
 export interface TaskOutreachCapability {
@@ -153,6 +155,9 @@ export class TaskOutreachService implements TaskOutreachCapability {
       contactIds: [...(entry.contactIds ?? [])],
       givenContact: entry.givenContact ?? null,
       summary,
+      // Confirmed only for an explicit act the principal directed (#2312). Task 3 links an
+      // unconfirmed row weakly, so a backstop guess or an outsider-steered turn adds no authority.
+      confirmed: entry.backstop !== true && scope.originator.systemRole === 'principal',
     });
   }
 

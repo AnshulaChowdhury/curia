@@ -23,6 +23,9 @@ CREATE TABLE task_outreach (
   contact_ids UUID[] NOT NULL DEFAULT '{}',
   given_contact TEXT NULL,
   summary TEXT NOT NULL,
+  -- True only for an explicit act (a send or record-outreach) on a principal-originated turn.
+  -- Browser-backstop rows and rows from other turns are false; their matches link weakly only.
+  confirmed BOOLEAN NOT NULL DEFAULT true,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   closed_at TIMESTAMPTZ NULL,
   expires_at TIMESTAMPTZ NOT NULL DEFAULT now() + interval '30 days'

@@ -84,6 +84,8 @@ function redactSenderId(value: string): string {
  * forged through metadata. The `livePrincipal: undefined` strip is belt-and-suspenders: it scrubs
  * any stray channel-supplied bag key so no downstream code can ever mistake it for the signal.
  * `syntheticTurn` gets the same scrub (#1892): the real signal is the distinct payload field.)
+ * `boundTask` and `linkedTask` are stripped too (#2312): either makes a turn task-bound, so its
+ * sends record outreach, and neither may come from a channel.
  */
 function mergeTaskMetadata(
   channelMetadata: Record<string, unknown> | undefined,
@@ -106,6 +108,8 @@ function mergeTaskMetadata(
     inboundNylasMessageId: undefined, // strip channel-forged id; dispatcher stamps the sanitized value (#1909)
     inboundEmailAccount: undefined,   // strip channel-forged mailbox; dispatcher stamps the receiving account (#1909)
     spotCheckVerdicts: undefined,     // strip forged verdicts; dispatcher stamps the pairs the principal typed (#2159)
+    boundTask: undefined,             // strip forged task binding; only the scheduler's wake stamps it (#2312)
+    linkedTask: undefined,            // strip forged outreach link; only the dispatcher's linker stamps it (#2312)
     ...(trustedMeta ?? {}),           // trusted stamp wins last
   };
 }

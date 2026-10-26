@@ -48,6 +48,8 @@
     "secretResolver"
   ],
   "optional_capabilities": [
-    "verification", "taskOutreach"],
+    "verification",
+    "taskOutreach"
+  ],
   "allowed_callers": ["coordinator"]
 }

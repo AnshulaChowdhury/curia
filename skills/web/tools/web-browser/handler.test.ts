@@ -2473,6 +2473,8 @@ describe('web-browser task outreach backstop (#2312)', () => {
       orgName: null,
       summary: 'Web form submitted',
       useTaskTitle: true,
+      // Inferred, not an explicit act: always unconfirmed (#2312).
+      backstop: true,
     });
   });
 
@@ -2485,6 +2487,29 @@ describe('web-browser task outreach backstop (#2312)', () => {
     });
     await new WebBrowserHandler().execute(ctx);
     expect(recordForTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a second matching field on the same page records the same task, via and domain, so it merges', async () => {
+    const { ctx, recordForTurn } = withOutreach({
+      actions: [
+        { action: 'type', selector: '#email', text: PRINCIPAL_EMAIL },
+        { action: 'type', selector: '#email2', text: PRINCIPAL_EMAIL },
+      ],
+    });
+    await new WebBrowserHandler().execute(ctx);
+    // record() merges on task + via + overlapping domain (covered against Postgres in
+    // tests/integration/task-outreach.test.ts), so both calls land on one row.
+    expect(recordForTurn).toHaveBeenCalledTimes(2);
+    expect(recordForTurn.mock.calls[0]![1]).toEqual(recordForTurn.mock.calls[1]![1]);
+  });
+
+  it('skips a page with no registrable domain', async () => {
+    const { ctx, recordForTurn } = withOutreach({ action: 'type', selector: '#email', text: PRINCIPAL_EMAIL });
+    const page = (await (ctx.browserService as unknown as { getOrCreateSession: () => Promise<{ session: { page: { url: ReturnType<typeof vi.fn> } } }> })
+      .getOrCreateSession()).session.page;
+    page.url.mockReturnValue('http://192.168.1.10/form');
+    await new WebBrowserHandler().execute(ctx);
+    expect(recordForTurn).not.toHaveBeenCalled();
   });
 
   it('does not record other text', async () => {

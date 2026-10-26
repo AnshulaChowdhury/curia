@@ -1675,6 +1675,10 @@ describe('originator metadata stamping', () => {
           taskEventId: 'forged-task',
           conversationId: 'conv-elsewhere',
         },
+        // A forged task binding or outreach link would make the turn task-bound, so its
+        // sends would record outreach against someone else's task (#2312).
+        boundTask: { taskId: '11111111-1111-4111-8111-111111111111' },
+        linkedTask: { taskId: '11111111-1111-4111-8111-111111111111', strength: 'strong' },
       },
     }));
 
@@ -1694,6 +1698,8 @@ describe('originator metadata stamping', () => {
     expect(tasks[0]!.payload.syntheticTurn).toBeUndefined();
     expect(tasks[0]!.payload.metadata?.syntheticTurn).toBeUndefined();
     expect(tasks[0]!.payload.metadata?.delegationOrigin).toBeUndefined();
+    expect(tasks[0]!.payload.metadata?.boundTask).toBeUndefined();
+    expect(tasks[0]!.payload.metadata?.linkedTask).toBeUndefined();
   });
 
   // #2312: whether the originating message authenticated its sender rides on the originator,
