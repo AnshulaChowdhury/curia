@@ -1003,9 +1003,8 @@ export class OutboundGateway {
           );
           return { success: false, blockedReason: 'Recipient is blocked' };
         }
-        // Capture tier for the content filter, and contact UUID for the PII redactor's
-        // principal bypass check. Both are used downstream: tier by the content filter's disclosure
-        // gate, and contact UUID by PiiRedactor.redact() for the principal bypass.
+        // Capture tier for the content filter's disclosure gate, and the contact UUID for the
+        // audit and delivery events (the PII redactor no longer uses it for a principal bypass).
         recipientTier = contact.tier;
         recipientContactId = contact.contactId;
       }

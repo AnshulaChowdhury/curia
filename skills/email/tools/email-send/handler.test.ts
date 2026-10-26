@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { REDACTION_NOTE } from '../../../../src/skills/_shared/principal-directed.js';
 import { EmailSendHandler } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { OutboundGateway } from '../../../../src/skills/outbound-gateway.js';
@@ -490,5 +491,42 @@ describe('email-send relay budget (#1320)', () => {
     // Nothing reached the principal, so no reply should bind to it.
     expect(outboundContext.register).not.toHaveBeenCalled();
     if (result.success) expect(result.data).toMatchObject({ deferred_to_digest: true, note: expect.stringMatching(/digest/) });
+  });
+});
+
+// #2312: the agent is told what was removed, and the entry records what was delivered.
+describe('EmailSendHandler redactions (#2312)', () => {
+  const RED = [{ label: 'phone_us', field: 'body' as const }];
+  const SENT = 'x [REDACTED: PHONE_US]';
+
+  function withContext(ctx: ToolContext) {
+    const register = vi.fn().mockResolvedValue('entry-1');
+    (ctx as unknown as Record<string, unknown>).outboundContext = {
+      register, release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6,
+    };
+    return register;
+  }
+
+  it('reports the redactions and records the delivered content', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'S', body: 'x 519-555-0100' });
+    const register = withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'm', redactions: RED, sentContent: SENT });
+    const result = await new EmailSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toMatchObject({ redactions: RED, redaction_note: REDACTION_NOTE });
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: SENT }));
+  });
+
+  it('adds no redactions key when nothing was removed', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'S', body: 'hello' });
+    const register = withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'm' });
+    const result = await new EmailSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).not.toHaveProperty('redactions');
+      expect(result.data).not.toHaveProperty('redaction_note');
+    }
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: 'hello' }));
   });
 });

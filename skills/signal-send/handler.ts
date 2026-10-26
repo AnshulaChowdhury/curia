@@ -19,7 +19,7 @@ import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/type
 import { checkGroupMemberTrust } from '../../src/channels/signal/group-trust.js';
 import { registerOutboundContext } from '../../src/dispatch/context-bridge-parse.js';
 import { boundTaskFromMetadata } from '../../src/agents/resumable-task.js';
-import { isPrincipalDirectedSend, originatorOption, relayDeferredData } from '../../src/skills/_shared/principal-directed.js';
+import { isPrincipalDirectedSend, originatorOption, relayDeferredData, redactionData } from '../../src/skills/_shared/principal-directed.js';
 import { hasPresentValue } from '../../src/contacts/principal-carveout-parse.js';
 import {
   RECIPIENT_REFERENCE_SKILLS,
@@ -171,7 +171,8 @@ export class SignalSendHandler implements ToolHandler {
         // A relay held for the digest never reached the principal: nothing for a reply to bind to (#1320).
         if (!result.deferredToDigest) await registerOutboundContext(ctx.outboundContext, contextBridgeRaw, {
           channelId: 'signal',
-          content: message,
+          // What was delivered, with any redactions applied; not the draft (#2312).
+          content: result.sentContent ?? message,
           agentId: ctx.agentId ?? 'coordinator',
           log: ctx.log,
           boundTask: boundTaskFromMetadata(ctx.taskMetadata as Record<string, unknown> | undefined),
@@ -179,7 +180,7 @@ export class SignalSendHandler implements ToolHandler {
           recipientContactIds: trust.trustedContactIds,
         });
 
-        return { success: true, data: { delivered_to: groupId, channel: 'signal', ...relayDeferredData(result) } };
+        return { success: true, data: { delivered_to: groupId, channel: 'signal', ...relayDeferredData(result), ...redactionData(result) } };
       } catch (err) {
         const errMessage = err instanceof Error ? err.message : String(err);
         ctx.log.error({ err, destinationType: 'group' }, 'signal-send: gateway threw unexpectedly');
@@ -242,7 +243,8 @@ export class SignalSendHandler implements ToolHandler {
       // A relay held for the digest never reached the principal: nothing for a reply to bind to (#1320).
       if (!result.deferredToDigest) await registerOutboundContext(ctx.outboundContext, contextBridgeRaw, {
         channelId: 'signal',
-        content: message,
+        // What was delivered, with any redactions applied; not the draft (#2312).
+        content: result.sentContent ?? message,
         agentId: ctx.agentId ?? 'coordinator',
         log: ctx.log,
         boundTask: boundTaskFromMetadata(ctx.taskMetadata as Record<string, unknown> | undefined),
@@ -260,6 +262,8 @@ export class SignalSendHandler implements ToolHandler {
           channel: 'signal',
           // Held by the relay budget for the principal's digest (#1320).
           ...relayDeferredData(result),
+          // Details the gateway removed before sending (#2312).
+          ...redactionData(result),
         },
       };
     } catch (err) {

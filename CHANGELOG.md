@@ -77,6 +77,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`browser.settleCapMs`** — **config:** caps the web-browser redirect wait; default 35s, at most 90s. (#2244)
 - **`voice.session.ended` turn stats** — **public API:** optional `turnStats` counts utterances, turns, barge-in cancels and joined fragments. (#2240)
 - **`pnpm repair:config-store-labels`** — reports and realigns config keys mislabelled by the old merge; dry-run by default. (#2252)
+- **Canadian SIN detection** — PII redaction now checks the checksum. (#2312)
 
 ### Changed
 
@@ -145,6 +146,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Task reply binding** — skipped while a sign-in verification is pending for that task. (#2017)
 - **Coordinator tool budget** — raised 78,745 → 79,600 for the `verification` tool. (#2017)
 - **`query-relationships` / `delete-relationship`** — no longer require `openai_api_key`; they fail closed without entity memory. (#2023)
+- **Send results** — now report which details were redacted. (#2312)
 
 ### Removed
 
@@ -170,6 +172,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Judgment elevation** — email senders become known only on SPF/DKIM/DMARC-verified mail. (#2227)
 - **Contact-visible outbound context** — contacts see only their own entries, one-to-one, on authenticated channels; their wakes likewise. (#2261)
 - **zod** — override floor set to 4.6.6, clearing a HIGH DoS advisory (CVE-2023-54404).
+- **Principal redaction bypass** — a third party CC'd on a message to the principal no longer bypasses redaction. (#2312)
 
 ### Fixed
 

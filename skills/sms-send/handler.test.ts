@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { REDACTION_NOTE } from '../../src/skills/_shared/principal-directed.js';
 import { SmsSendHandler } from './handler.js';
 import type { ToolContext } from '../../src/skills/types.js';
 import pino from 'pino';
@@ -161,5 +162,43 @@ describe('sms-send outbound-context recipients (#2261)', () => {
     }));
     expect(result.success).toBe(true);
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ recipientContactIds: ['principal-id'] }));
+  });
+});
+
+// #2312: the agent is told what was removed, and the entry records what was delivered.
+describe('sms-send redactions (#2312)', () => {
+  const RED = [{ label: 'phone_us', field: 'body' as const }];
+  const SENT = 'x [REDACTED: PHONE_US]';
+  const OC = () => { const register = vi.fn().mockResolvedValue('entry-1'); return { register, ctx: { register, release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6 } as never }; };
+
+  it('reports the redactions and records the delivered content', async () => {
+    const send = vi.fn().mockResolvedValue({ success: true, messageId: 'm', redactions: RED, sentContent: SENT });
+    const oc = OC();
+    const result = await new SmsSendHandler().execute(makeCtx({
+      input: { recipient: 'principal', message: 'x 519-555-0100' },
+      outboundGateway: { send, resolveRecipientReference } as never,
+      outboundContext: oc.ctx,
+    }));
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).toMatchObject({ redactions: RED, redaction_note: REDACTION_NOTE });
+    }
+    expect(oc.register).toHaveBeenCalledWith(expect.objectContaining({ content: SENT }));
+  });
+
+  it('adds no redactions key when nothing was removed', async () => {
+    const send = vi.fn().mockResolvedValue({ success: true, messageId: 'm' });
+    const oc = OC();
+    const result = await new SmsSendHandler().execute(makeCtx({
+      input: { recipient: 'principal', message: 'hello' },
+      outboundGateway: { send, resolveRecipientReference } as never,
+      outboundContext: oc.ctx,
+    }));
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).not.toHaveProperty('redactions');
+      expect(result.data).not.toHaveProperty('redaction_note');
+    }
+    expect(oc.register).toHaveBeenCalledWith(expect.objectContaining({ content: 'hello' }));
   });
 });

@@ -15,7 +15,7 @@
 import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
 import { registerOutboundContext } from '../../src/dispatch/context-bridge-parse.js';
 import { boundTaskFromMetadata } from '../../src/agents/resumable-task.js';
-import { isPrincipalDirectedSend, originatorOption, relayDeferredData } from '../../src/skills/_shared/principal-directed.js';
+import { isPrincipalDirectedSend, originatorOption, relayDeferredData, redactionData } from '../../src/skills/_shared/principal-directed.js';
 import {
   RECIPIENT_REFERENCE_SKILLS,
   findRetiredRecipientField,
@@ -129,7 +129,8 @@ export class SlackSendHandler implements ToolHandler {
 
       if (!result.deferredToDigest) await registerOutboundContext(ctx.outboundContext, contextBridgeRaw, {
         channelId: 'slack',
-        content: message,
+        // What was delivered, with any redactions applied; not the draft (#2312).
+        content: result.sentContent ?? message,
         agentId: ctx.agentId ?? 'coordinator',
         log: ctx.log,
         boundTask: boundTaskFromMetadata(ctx.taskMetadata as Record<string, unknown> | undefined),
@@ -147,6 +148,8 @@ export class SlackSendHandler implements ToolHandler {
           channel: 'slack',
           // Held by the relay budget for the principal's digest (#1320).
           ...relayDeferredData(result),
+          // Details the gateway removed before sending (#2312).
+          ...redactionData(result),
         },
       };
     } catch (err) {
