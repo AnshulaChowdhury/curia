@@ -47,7 +47,10 @@ function toCallerContext(
   channel: string,
   senderId: string,
 ): VoiceCallerContext {
-  const { originator, liveTurn } = stampOriginator({ senderContext, channel, senderId });
+  // Voice never authenticates its sender (#2312): caller ids are spoofable (ADR-036), a Signal
+  // call's number is not a Signal message envelope, and the console's bootstrap secret proves
+  // the session, not the message. liveTurn still carries console principal standing.
+  const { originator, liveTurn } = stampOriginator({ senderContext, channel, senderId, authenticated: false });
   if (senderContext.resolved) {
     return {
       contactId: senderContext.contactId,

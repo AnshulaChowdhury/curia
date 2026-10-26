@@ -6,6 +6,11 @@
 // filed (what it told the principal; findPrincipalReportsForTasks, #2312). The judge checks claims about the
 // principal against this; it is passed beside the message and never written into it.
 //
+// Authority (#2312): who directed the work — the turn's stamped originator, its live-turn
+// signal, and the task it was bound to with that task's project root, read from the tasks
+// table. Later code decides what that authority covers; here each piece is validated and a
+// malformed or missing one reads as null/absent, never as more authority.
+//
 // Credentials are redacted before the evidence leaves for the judge's model provider, which
 // may differ from the agents'. Contact data is not: grounding checks claims such as "Dana's
 // number is …" against exactly that.
@@ -15,9 +20,13 @@
 // audit_log when the gateway asks.
 
 import type { AuditLogRepo } from '../audit/audit-log-repo.js';
+import type { ContactTier, SystemRole } from '../contacts/types.js';
+import type { TaskRepo } from '../db/task-repo.js';
 import type { Logger } from '../logger.js';
 import { createSecretPatterns } from '../security/secret-patterns.js';
-import type { BriefEvidence } from './judge-brief.js';
+import type { BriefEvidence, SendAuthority } from './judge-brief.js';
+
+export type { SendAuthority } from './judge-brief.js';
 
 export const EVIDENCE_RESULT_MAX_CHARS = 2_000;
 export const EVIDENCE_TOTAL_MAX_CHARS = 12_000;
@@ -29,7 +38,18 @@ const REPORTS_LIMIT = 10;
 export interface CollectedEvidence extends BriefEvidence {
   /** True when the audit lookup failed: grounding cannot be judged, so the caller treats it as a judge failure. */
   unavailable: boolean;
+  /** Who directed the work. Always present; no authority at all when the evidence is unavailable. */
+  authority: SendAuthority;
 }
+
+type AuthorityOriginator = SendAuthority['originator'];
+type AuthorityTask = NonNullable<SendAuthority['boundTask']>;
+
+/** No originator and no live turn: what an unreadable turn is authorized by. */
+const NO_AUTHORITY: SendAuthority = { originator: null, liveTurn: false };
+
+const SYSTEM_ROLES: ReadonlySet<string> = new Set<SystemRole>(['principal', 'agent', 'system']);
+const CONTACT_TIERS: ReadonlySet<string> = new Set<ContactTier>(['blocked', 'unknown', 'known', 'trusted', 'principal']);
 
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -62,9 +82,37 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
+/**
+ * An originator as authority evidence. Originators reach here as JSONB (audit_log metadata,
+ * tasks.originator), so the shape is checked rather than trusted: anything malformed is null.
+ * A missing tier (stamped before #950) is null; `authenticated` counts only when exactly true.
+ */
+function readOriginator(raw: unknown): AuthorityOriginator {
+  if (!isRecord(raw)) return null;
+  const { contactId, systemRole, tier, channel, authenticated } = raw;
+  if (typeof contactId !== 'string' || typeof channel !== 'string') return null;
+  if (systemRole !== null && !(typeof systemRole === 'string' && SYSTEM_ROLES.has(systemRole))) return null;
+  if (tier !== undefined && tier !== null && !(typeof tier === 'string' && CONTACT_TIERS.has(tier))) return null;
+  return {
+    contactId,
+    // Checked against the sets above.
+    systemRole: systemRole as SystemRole | null,
+    tier: (tier ?? null) as ContactTier | null,
+    channel,
+    authenticated: authenticated === true,
+  };
+}
+
+/** Task text for the judge: credentials redacted, trimmed like other evidence. */
+function taskText(text: string): string {
+  return clip(redactSecrets(text), EVIDENCE_RESULT_MAX_CHARS);
+}
+
 export class SendEvidenceCollector {
   constructor(private readonly deps: {
     auditLogRepo: Pick<AuditLogRepo, 'findById' | 'findToolResultsForTasks' | 'findPrincipalReportsForTasks'>;
+    /** Reads the bound task and its project root for authority (#2312). */
+    taskRepo: Pick<TaskRepo, 'getTask' | 'resolveProjectRootTaskId'>;
     /** The injected "## Who you serve" block, read per call so identity hot-reloads (#1514) apply. */
     principalBlock: () => string | null;
     logger: Logger;
@@ -77,7 +125,7 @@ export class SendEvidenceCollector {
       // A send with no drafting turn to read (no taskEventId). The caller treats this as a
       // judge failure; the warning says why, since nothing else will.
       this.deps.logger.warn('send-evidence: no drafting turn to read — grounding cannot be judged');
-      return { unavailable: true, toolResults: [], principalBlock };
+      return { unavailable: true, toolResults: [], principalBlock, authority: NO_AUTHORITY };
     }
     try {
       // The latest turn's task row describes what the message answers.
@@ -87,12 +135,13 @@ export class SendEvidenceCollector {
         // Without it the purpose question has nothing to go on but the outbound message,
         // which leans toward "serving" — so this is a failure, not thin evidence.
         this.deps.logger.warn({ taskEventIds }, 'send-evidence: drafting turn not found in audit_log — grounding cannot be judged');
-        return { unavailable: true, toolResults: [], principalBlock };
+        return { unavailable: true, toolResults: [], principalBlock, authority: NO_AUTHORITY };
       }
       const content = task.payload['content'];
       const metadata = task.payload['metadata'];
       const boundTask = isRecord(metadata) ? metadata['boundTask'] : undefined;
       const progress = isRecord(boundTask) ? boundTask['progress'] : undefined;
+      const boundTaskId = isRecord(boundTask) && typeof boundTask['taskId'] === 'string' ? boundTask['taskId'] : undefined;
 
       const results = await this.deps.auditLogRepo.findToolResultsForTasks(taskEventIds, RESULTS_LIMIT);
       if (results.length === RESULTS_LIMIT) {
@@ -118,8 +167,16 @@ export class SendEvidenceCollector {
         .filter((s): s is string => typeof s === 'string' && s.length > 0)
         .map(reportEvidence);
 
+      const authority: SendAuthority = {
+        originator: readOriginator(isRecord(metadata) ? metadata['originator'] : undefined),
+        // The dispatcher's distinct top-level signal (#1126); only an exact true counts.
+        liveTurn: task.payload['liveTurn'] === true,
+        ...(boundTaskId !== undefined ? await this.readTasks(boundTaskId) : {}),
+      };
+
       return {
         unavailable: false,
+        authority,
         ...(reportsToPrincipal.length > 0 ? { reportsToPrincipal } : {}),
         ...(typeof content === 'string' ? { taskContent: clip(redactSecrets(content), EVIDENCE_RESULT_MAX_CHARS) } : {}),
         ...(progress !== undefined ? { taskProgress: clip(redactSecrets(JSON.stringify(progress)), EVIDENCE_RESULT_MAX_CHARS) } : {}),
@@ -128,7 +185,46 @@ export class SendEvidenceCollector {
       };
     } catch (err) {
       this.deps.logger.error({ err, taskEventIds }, 'send-evidence: audit lookup failed — grounding cannot be judged');
-      return { unavailable: true, toolResults: [], principalBlock };
+      return { unavailable: true, toolResults: [], principalBlock, authority: NO_AUTHORITY };
     }
+  }
+
+  /**
+   * The bound task and, when different, its project root. A task-repo failure is logged and
+   * leaves the failed part out rather than marking the evidence unavailable: authority then
+   * rests on the originator alone, which only narrows what can be authorized.
+   */
+  private async readTasks(boundTaskId: string): Promise<Pick<SendAuthority, 'boundTask' | 'rootTask'>> {
+    let bound: AuthorityTask | undefined;
+    try {
+      bound = await this.readTask(boundTaskId);
+    } catch (err) {
+      this.deps.logger.error({ err, taskId: boundTaskId }, 'send-evidence: bound task lookup failed — authority rests on the originator alone');
+      return {};
+    }
+    if (bound === undefined) {
+      this.deps.logger.warn({ taskId: boundTaskId }, 'send-evidence: bound task not found — authority rests on the originator alone');
+      return {};
+    }
+    try {
+      const rootId = await this.deps.taskRepo.resolveProjectRootTaskId(boundTaskId);
+      if (rootId === null || rootId === boundTaskId) return { boundTask: bound };
+      const root = await this.readTask(rootId);
+      return root === undefined ? { boundTask: bound } : { boundTask: bound, rootTask: root };
+    } catch (err) {
+      this.deps.logger.error({ err, taskId: boundTaskId }, 'send-evidence: root task lookup failed — authority leaves the root out');
+      return { boundTask: bound };
+    }
+  }
+
+  private async readTask(taskId: string): Promise<AuthorityTask | undefined> {
+    const row = await this.deps.taskRepo.getTask(taskId);
+    if (row === null) return undefined;
+    return {
+      taskId: row.id,
+      title: taskText(row.title),
+      description: row.description === null ? null : taskText(row.description),
+      originator: readOriginator(row.originator),
+    };
   }
 }

@@ -11,6 +11,8 @@ import {
   EVIDENCE_TOTAL_MAX_CHARS,
 } from '../../../src/autonomy/send-evidence.js';
 import type { AuditLogRow } from '../../../src/audit/audit-log-repo.js';
+import type { TaskRow } from '../../../src/db/queries/tasks.js';
+import type { TaskOriginator } from '../../../src/contacts/types.js';
 import { createSilentLogger } from '../../../src/logger.js';
 
 function row(over: Partial<AuditLogRow>): AuditLogRow {
@@ -36,13 +38,35 @@ function makeRepo(results: AuditLogRow[], task: AuditLogRow | null = TASK, repor
 
 const logger = createSilentLogger();
 
+function noTasks() {
+  return { getTask: vi.fn().mockResolvedValue(null), resolveProjectRootTaskId: vi.fn().mockResolvedValue(null) };
+}
+
+function taskRow(over: Partial<TaskRow>): TaskRow {
+  return {
+    id: 'task', agentId: 'coordinator', intentAnchor: '', status: 'open', progress: {}, errorBudget: {},
+    conversationId: null, createdAt: '', updatedAt: '', title: 'A task', description: null, owner: 'coordinator',
+    waitingOnContactId: null, waitingOnText: null, parentTaskId: null, blockedByTaskId: null, priority: 0,
+    dueAt: null, source: 'agent', sourceAgentId: null, createdBy: 'coordinator', tags: [], originator: null, ...over,
+  };
+}
+
+const AT = '2026-10-26T12:00:00.000Z';
+const PRINCIPAL_SIGNAL: TaskOriginator = {
+  contactId: 'principal-1', systemRole: 'principal', channel: 'signal', initiatedAt: AT, tier: 'principal', authenticated: true,
+};
+const PRINCIPAL_EMAIL_UNVERIFIED: TaskOriginator = {
+  contactId: 'principal-1', systemRole: 'principal', channel: 'email', initiatedAt: AT, tier: 'principal',
+};
+const SYSTEM_ORIGINATOR: TaskOriginator = { contactId: 'system', systemRole: 'system', channel: 'scheduler', initiatedAt: AT, tier: null };
+
 describe('SendEvidenceCollector', () => {
   it('collects the task content, progress and tool results, newest first', async () => {
     const repo = makeRepo([
       row({ id: 'c', timestamp: new Date(3), payload: { toolName: 'contact-lookup', result: { success: true, data: { name: 'Dana' } } } }),
       row({ id: 'a', timestamp: new Date(1), payload: { toolName: 'calendar-list', result: { success: true, data: { free: true } } } }),
     ]);
-    const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => '## Who you serve', logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: repo, principalBlock: () => '## Who you serve', logger });
 
     const ev = await collector.collect(['task-1']);
 
@@ -58,7 +82,7 @@ describe('SendEvidenceCollector', () => {
     const big = 'x'.repeat(EVIDENCE_RESULT_MAX_CHARS * 3);
     const results = Array.from({ length: 20 }, (_, i) =>
       row({ id: `r${19 - i}`, timestamp: new Date(19 - i), payload: { toolName: `t${19 - i}`, result: { success: true, data: big } } }));
-    const collector = new SendEvidenceCollector({ auditLogRepo: makeRepo(results), principalBlock: () => null, logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo(results), principalBlock: () => null, logger });
 
     const ev = await collector.collect(['task-1']);
 
@@ -70,7 +94,7 @@ describe('SendEvidenceCollector', () => {
 
   it('reads several turns in one query, describing the latest (a relay rewrite and the turn it rewrote)', async () => {
     const repo = makeRepo([]);
-    const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => null, logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: repo, principalBlock: () => null, logger });
 
     await collector.collect(['task-1', 'task-2']);
 
@@ -80,7 +104,7 @@ describe('SendEvidenceCollector', () => {
 
   it('reads pre-ADR-031 skill.result rows too', async () => {
     const repo = makeRepo([row({ eventType: 'skill.result', payload: { skillName: 'legacy', result: { success: true, data: 1 } } })]);
-    const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => null, logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: repo, principalBlock: () => null, logger });
     expect((await collector.collect(['task-1'])).toolResults.map((r) => r.toolName)).toEqual(['legacy']);
   });
 
@@ -89,7 +113,7 @@ describe('SendEvidenceCollector', () => {
       toolName: 'web-fetch',
       result: { success: true, data: { key: 'sk-ant-abcdefghijklmnopqrstuvwxyz0123', phone: '+1 555 010 0199' } },
     } })]);
-    const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => null, logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: repo, principalBlock: () => null, logger });
 
     const ev = await collector.collect(['task-1']);
 
@@ -106,7 +130,7 @@ describe('SendEvidenceCollector', () => {
       row({ id: 'p0', eventType: 'principal.report', payload: {} }),
     ];
     const repo = makeRepo([], TASK, reports);
-    const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => null, logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: repo, principalBlock: () => null, logger });
 
     const ev = await collector.collect(['task-1', 'task-2']);
 
@@ -118,7 +142,7 @@ describe('SendEvidenceCollector', () => {
   });
 
   it('has no reportsToPrincipal when the turn reported nothing', async () => {
-    const collector = new SendEvidenceCollector({ auditLogRepo: makeRepo([]), principalBlock: () => null, logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([]), principalBlock: () => null, logger });
     const ev = await collector.collect(['task-1']);
     expect(ev.reportsToPrincipal ?? []).toEqual([]);
   });
@@ -126,7 +150,7 @@ describe('SendEvidenceCollector', () => {
   it('marks the evidence unavailable when the reports lookup fails (#2312)', async () => {
     const repo = makeRepo([]);
     repo.findPrincipalReportsForTasks.mockRejectedValue(new Error('db down'));
-    const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => null, logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: repo, principalBlock: () => null, logger });
 
     const ev = await collector.collect(['task-1']);
 
@@ -136,7 +160,7 @@ describe('SendEvidenceCollector', () => {
 
   it('marks the evidence unavailable when the audit lookup fails', async () => {
     const repo = { findById: vi.fn().mockRejectedValue(new Error('db down')), findToolResultsForTasks: vi.fn(), findPrincipalReportsForTasks: vi.fn() };
-    const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => null, logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: repo, principalBlock: () => null, logger });
 
     const ev = await collector.collect(['task-1']);
 
@@ -146,7 +170,7 @@ describe('SendEvidenceCollector', () => {
 
   it('marks the evidence unavailable when the drafting turn\'s task row is missing', async () => {
     const warn = vi.spyOn(logger, 'warn');
-    const collector = new SendEvidenceCollector({ auditLogRepo: makeRepo([], null), principalBlock: () => null, logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([], null), principalBlock: () => null, logger });
 
     const ev = await collector.collect(['task-1']);
 
@@ -158,11 +182,186 @@ describe('SendEvidenceCollector', () => {
   it('is unavailable, with a warning, when there is no task to read', async () => {
     const warn = vi.spyOn(logger, 'warn');
     const repo = makeRepo([]);
-    const collector = new SendEvidenceCollector({ auditLogRepo: repo, principalBlock: () => null, logger });
+    const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: repo, principalBlock: () => null, logger });
 
     expect((await collector.collect([])).unavailable).toBe(true);
     expect(repo.findById).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
+  });
+
+  describe('authority: who directed the work (#2312)', () => {
+    it('reads a live principal turn: originator from metadata, liveTurn from the payload', async () => {
+      const task = row({
+        id: 'task-1', eventType: 'agent.task', parentEventId: null,
+        payload: { content: 'Send Sam my number', liveTurn: true, metadata: { originator: PRINCIPAL_SIGNAL } },
+      });
+      const taskRepo = noTasks();
+      const collector = new SendEvidenceCollector({ taskRepo, auditLogRepo: makeRepo([], task), principalBlock: () => null, logger });
+
+      const ev = await collector.collect(['task-1']);
+
+      expect(ev.authority).toEqual({
+        originator: { contactId: 'principal-1', systemRole: 'principal', tier: 'principal', channel: 'signal', authenticated: true },
+        liveTurn: true,
+      });
+      // No bound task on the turn, so nothing to look up.
+      expect(taskRepo.getTask).not.toHaveBeenCalled();
+    });
+
+    it('reads a standing-task wake: the bound task and its root, each with its originator, clipped and redacted', async () => {
+      const task = row({
+        id: 'task-1', eventType: 'agent.task', parentEventId: null,
+        payload: {
+          content: 'Wake: follow up with Sam',
+          metadata: { originator: PRINCIPAL_EMAIL_UNVERIFIED, boundTask: { taskId: 'child', progress: {} } },
+        },
+      });
+      const taskRepo = {
+        getTask: vi.fn(async (id: string) => (id === 'child'
+          ? taskRow({ id: 'child', parentTaskId: 'root', title: 'Follow up with Sam', description: `key sk-ant-abcdefghijklmnopqrstuvwxyz0123 ${'x'.repeat(EVIDENCE_RESULT_MAX_CHARS * 2)}`, originator: PRINCIPAL_EMAIL_UNVERIFIED })
+          : id === 'root'
+            ? taskRow({ id: 'root', title: 'Close the Sam deal', description: 'Get Sam to sign.', originator: PRINCIPAL_SIGNAL })
+            : null)),
+        resolveProjectRootTaskId: vi.fn().mockResolvedValue('root'),
+      };
+      const collector = new SendEvidenceCollector({ taskRepo, auditLogRepo: makeRepo([], task), principalBlock: () => null, logger });
+
+      const ev = await collector.collect(['task-1']);
+
+      expect(ev.unavailable).toBe(false);
+      expect(ev.authority.liveTurn).toBe(false);
+      expect(ev.authority.originator).toEqual({ contactId: 'principal-1', systemRole: 'principal', tier: 'principal', channel: 'email', authenticated: false });
+      expect(ev.authority.boundTask).toMatchObject({
+        taskId: 'child', title: 'Follow up with Sam',
+        originator: { contactId: 'principal-1', systemRole: 'principal', tier: 'principal', channel: 'email', authenticated: false },
+      });
+      expect(ev.authority.boundTask!.description).not.toContain('sk-ant-abcdefghijklmnopqrstuvwxyz0123');
+      expect(ev.authority.boundTask!.description).toContain('[REDACTED]');
+      expect(ev.authority.boundTask!.description!.length).toBeLessThanOrEqual(EVIDENCE_RESULT_MAX_CHARS + 1);
+      expect(ev.authority.rootTask).toEqual({
+        taskId: 'root', title: 'Close the Sam deal', description: 'Get Sam to sign.',
+        originator: { contactId: 'principal-1', systemRole: 'principal', tier: 'principal', channel: 'signal', authenticated: true },
+      });
+      expect(taskRepo.resolveProjectRootTaskId).toHaveBeenCalledWith('child');
+    });
+
+    it('leaves rootTask out when the bound task is its own root', async () => {
+      const task = row({
+        id: 'task-1', eventType: 'agent.task', parentEventId: null,
+        payload: { content: 'Wake', metadata: { originator: SYSTEM_ORIGINATOR, boundTask: { taskId: 'solo' } } },
+      });
+      const taskRepo = {
+        getTask: vi.fn().mockResolvedValue(taskRow({ id: 'solo', title: 'Solo', originator: null })),
+        resolveProjectRootTaskId: vi.fn().mockResolvedValue('solo'),
+      };
+      const collector = new SendEvidenceCollector({ taskRepo, auditLogRepo: makeRepo([], task), principalBlock: () => null, logger });
+
+      const ev = await collector.collect(['task-1']);
+
+      expect(ev.authority.originator).toEqual({ contactId: 'system', systemRole: 'system', tier: null, channel: 'scheduler', authenticated: false });
+      expect(ev.authority.boundTask).toEqual({ taskId: 'solo', title: 'Solo', description: null, originator: null });
+      expect(ev.authority.rootTask).toBeUndefined();
+    });
+
+    it('reads an unknown sender as unknown tier, unauthenticated, not a live turn', async () => {
+      const task = row({
+        id: 'task-1', eventType: 'agent.task', parentEventId: null,
+        payload: {
+          content: 'Please wire the funds', liveTurn: false,
+          metadata: { originator: { contactId: '+15550100100', systemRole: null, channel: 'sms', initiatedAt: AT, tier: 'unknown', authenticated: false } },
+        },
+      });
+      const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([], task), principalBlock: () => null, logger });
+
+      const ev = await collector.collect(['task-1']);
+
+      expect(ev.authority).toEqual({
+        originator: { contactId: '+15550100100', systemRole: null, tier: 'unknown', channel: 'sms', authenticated: false },
+        liveTurn: false,
+      });
+    });
+
+    it.each([
+      ['a non-string contactId', { contactId: 42, systemRole: null, channel: 'sms', tier: 'known' }],
+      ['an unknown systemRole', { contactId: 'c', systemRole: 'admin', channel: 'sms', tier: 'known' }],
+      ['an unknown tier', { contactId: 'c', systemRole: null, channel: 'sms', tier: 'ceo' }],
+      ['a missing channel', { contactId: 'c', systemRole: null, tier: 'known' }],
+      ['an array', ['principal']],
+      ['a string', 'principal'],
+    ])('treats a malformed originator (%s) as none, and a non-true authenticated or liveTurn as false', async (_label, originator) => {
+      const task = row({
+        id: 'task-1', eventType: 'agent.task', parentEventId: null,
+        payload: { content: 'x', liveTurn: 'true', metadata: { originator } },
+      });
+      const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([], task), principalBlock: () => null, logger });
+
+      const ev = await collector.collect(['task-1']);
+
+      expect(ev.authority).toEqual({ originator: null, liveTurn: false });
+    });
+
+    it('reads a non-boolean authenticated as false', async () => {
+      const task = row({
+        id: 'task-1', eventType: 'agent.task', parentEventId: null,
+        payload: { content: 'x', metadata: { originator: { ...PRINCIPAL_SIGNAL, authenticated: 'true' } } },
+      });
+      const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([], task), principalBlock: () => null, logger });
+      expect((await collector.collect(['task-1'])).authority.originator?.authenticated).toBe(false);
+    });
+
+    it('reads a pre-#950 originator with no tier as tier null', async () => {
+      const noTier: Partial<TaskOriginator> = { ...PRINCIPAL_EMAIL_UNVERIFIED };
+      delete noTier.tier;
+      const task = row({ id: 'task-1', eventType: 'agent.task', parentEventId: null, payload: { content: 'x', metadata: { originator: noTier } } });
+      const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([], task), principalBlock: () => null, logger });
+      expect((await collector.collect(['task-1'])).authority.originator?.tier).toBeNull();
+    });
+
+    it('logs a task-repo failure and keeps the evidence, without the tasks', async () => {
+      const error = vi.spyOn(logger, 'error');
+      const task = row({
+        id: 'task-1', eventType: 'agent.task', parentEventId: null,
+        payload: { content: 'Wake', metadata: { originator: PRINCIPAL_SIGNAL, boundTask: { taskId: 'child' } } },
+      });
+      const taskRepo = { getTask: vi.fn().mockRejectedValue(new Error('db down')), resolveProjectRootTaskId: vi.fn() };
+      const collector = new SendEvidenceCollector({ taskRepo, auditLogRepo: makeRepo([], task), principalBlock: () => null, logger });
+
+      const ev = await collector.collect(['task-1']);
+
+      expect(ev.unavailable).toBe(false);
+      expect(ev.taskContent).toBe('Wake');
+      expect(ev.authority).toEqual({
+        originator: { contactId: 'principal-1', systemRole: 'principal', tier: 'principal', channel: 'signal', authenticated: true },
+        liveTurn: false,
+      });
+      expect(error).toHaveBeenCalled();
+      error.mockRestore();
+    });
+
+    it('logs a root-resolution failure and keeps the bound task', async () => {
+      const task = row({
+        id: 'task-1', eventType: 'agent.task', parentEventId: null,
+        payload: { content: 'Wake', metadata: { boundTask: { taskId: 'child' } } },
+      });
+      const taskRepo = {
+        getTask: vi.fn().mockResolvedValue(taskRow({ id: 'child', title: 'Child', parentTaskId: 'root' })),
+        resolveProjectRootTaskId: vi.fn().mockRejectedValue(new Error('db down')),
+      };
+      const collector = new SendEvidenceCollector({ taskRepo, auditLogRepo: makeRepo([], task), principalBlock: () => null, logger });
+
+      const ev = await collector.collect(['task-1']);
+
+      expect(ev.authority.originator).toBeNull();
+      expect(ev.authority.boundTask?.taskId).toBe('child');
+      expect(ev.authority.rootTask).toBeUndefined();
+    });
+
+    it('carries no authority when the evidence is unavailable', async () => {
+      const collector = new SendEvidenceCollector({ taskRepo: noTasks(), auditLogRepo: makeRepo([], null), principalBlock: () => null, logger });
+      const ev = await collector.collect(['task-1']);
+      expect(ev.unavailable).toBe(true);
+      expect(ev.authority).toEqual({ originator: null, liveTurn: false });
+    });
   });
 });

@@ -928,6 +928,8 @@ export class Dispatcher {
       senderContext,
       channel: payload.channelId,
       senderId: payload.senderId,
+      // #2312: computed from the adapter's own metadata, never from an inbound originator.
+      authenticated: inboundSenderAuthenticated(payload.channelId, payload.metadata),
     });
     const originatorMeta: Record<string, unknown> = { originator };
     if (!senderContext?.resolved) {

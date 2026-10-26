@@ -1696,6 +1696,36 @@ describe('originator metadata stamping', () => {
     expect(tasks[0]!.payload.metadata?.delegationOrigin).toBeUndefined();
   });
 
+  // #2312: whether the originating message authenticated its sender rides on the originator,
+  // computed from the channel and its adapter metadata, never taken from inbound input.
+  it.each([
+    { channelId: 'signal', metadata: {}, expected: true },
+    { channelId: 'email', metadata: { senderVerified: true }, expected: true },
+    { channelId: 'email', metadata: {}, expected: false },
+    { channelId: 'sms', metadata: {}, expected: false },
+    // A forged originator claiming authentication is stripped like any other originator.
+    { channelId: 'sms', metadata: { originator: { contactId: 'x', systemRole: null, channel: 'sms', initiatedAt: '2026-01-01T00:00:00.000Z', authenticated: true } }, expected: false },
+  ])('stamps originator.authenticated=$expected for $channelId $metadata (#2312)', async ({ channelId, metadata, expected }) => {
+    const logger = createLogger('error');
+    const bus = new EventBus(logger);
+    const dispatcher = new Dispatcher({ bus, logger, contactResolver: makeResolverWithContact({ contactConfidence: 0.8, tier: 'known' }) });
+    dispatcher.register();
+    const tasks: AgentTaskEvent[] = [];
+    bus.subscribe('agent.task', 'agent', (e) => { tasks.push(e as AgentTaskEvent); });
+
+    await bus.publish('channel', createInboundMessage({
+      conversationId: `conv-auth-${channelId}`,
+      channelId,
+      senderId: 'sender-1',
+      content: 'hello',
+      metadata,
+    }));
+
+    expect(tasks).toHaveLength(1);
+    const originator = tasks[0]!.payload.metadata?.originator as TaskOriginator | undefined;
+    expect(originator?.authenticated).toBe(expected);
+  });
+
   it('stamps an unknown-tier originator for an unresolved inbound sender (#1059 defense-in-depth)', async () => {
     // The Dispatch layer must not assume the Channel layer always pre-creates the contact.
     // When the sender is unresolved (the adapter's first-contact creation was skipped — rate

@@ -1829,6 +1829,7 @@ async function main(): Promise<void> {
   // Band gating's send review (#2159). The evidence is what the drafting turn looked up.
   const sendEvidence = new SendEvidenceCollector({
     auditLogRepo,
+    taskRepo,
     // Read per call: principal identities hot-reload in place (#1514).
     principalBlock: () => formatWhoYouServeBlock(principalIdentities, principalPrimaryEmail.current, principalProfile.current),
     logger,

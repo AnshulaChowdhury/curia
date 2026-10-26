@@ -47,6 +47,7 @@ describe('stampOriginator', () => {
       channel: 'voice',
       senderId: 'ceo-web-user',
       initiatedAt: FIXED_AT,
+      authenticated: false,
     });
 
     expect(liveTurn).toBe(true);
@@ -56,6 +57,7 @@ describe('stampOriginator', () => {
       channel: 'voice',
       initiatedAt: FIXED_AT,
       tier: 'principal',
+      authenticated: false,
     });
   });
 
@@ -65,6 +67,7 @@ describe('stampOriginator', () => {
       channel: 'voice',
       senderId: '+15551234567',
       initiatedAt: FIXED_AT,
+      authenticated: false,
     });
 
     expect(liveTurn).toBe(false);
@@ -74,6 +77,7 @@ describe('stampOriginator', () => {
       channel: 'voice',
       initiatedAt: FIXED_AT,
       tier: 'known',
+      authenticated: false,
     });
   });
 
@@ -88,6 +92,7 @@ describe('stampOriginator', () => {
       channel: 'voice',
       senderId: 'unknown-token',
       initiatedAt: FIXED_AT,
+      authenticated: false,
     });
 
     expect(liveTurn).toBe(false);
@@ -97,6 +102,7 @@ describe('stampOriginator', () => {
       channel: 'voice',
       initiatedAt: FIXED_AT,
       tier: 'unknown',
+      authenticated: false,
     });
   });
 
@@ -106,6 +112,7 @@ describe('stampOriginator', () => {
       channel: 'email',
       senderId: 'stranger@example.com',
       initiatedAt: FIXED_AT,
+      authenticated: false,
     });
 
     expect(liveTurn).toBe(false);
@@ -119,13 +126,36 @@ describe('stampOriginator', () => {
       senderContext: knownSender({ systemRole: 'agent', tier: 'trusted' }),
       channel: 'voice',
       senderId: 'agent-1',
+      authenticated: false,
     });
     const { liveTurn: systemTurn } = stampOriginator({
       senderContext: knownSender({ systemRole: 'system', tier: 'trusted' }),
       channel: 'voice',
       senderId: 'system',
+      authenticated: false,
     });
     expect(agentTurn).toBe(false);
     expect(systemTurn).toBe(false);
+  });
+
+  it('carries whether the originating message authenticated its sender (#2312)', () => {
+    const { originator } = stampOriginator({
+      senderContext: principalSender(),
+      channel: 'signal',
+      senderId: '+15550100199',
+      initiatedAt: FIXED_AT,
+      authenticated: true,
+    });
+    expect(originator.authenticated).toBe(true);
+
+    // An unresolved sender keeps the flag too: authentication is about the message, not the contact.
+    const { originator: stranger } = stampOriginator({
+      senderContext: undefined,
+      channel: 'signal',
+      senderId: '+15550100100',
+      authenticated: true,
+    });
+    expect(stranger.authenticated).toBe(true);
+    expect(stranger.tier).toBe('unknown');
   });
 });

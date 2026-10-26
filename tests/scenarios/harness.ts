@@ -51,6 +51,7 @@ import { PrincipalAcquaintanceCheck } from '../../src/contacts/principal-acquain
  */
 const SCENARIO_ORG_DOMAINS = ['example.test'];
 import { recordedReplyViews } from '../../src/dispatch/outbound-context.js';
+import { inboundSenderAuthenticated } from '../../src/dispatch/outbound-entry-access.js';
 import { formatTaskWakeContent } from '../../src/scheduler/wake-disposition.js';
 import { createTestModeStack, type AutonomyFixture, type OfficeIdentityFixture, type TestModeStack, type TierReasoningOverride } from '../../src/startup/test-mode-stack.js';
 import {
@@ -632,7 +633,9 @@ export async function createScenarioHarness(
     inbound: ScenarioCase['inbound'],
   ): Promise<void> {
     const senderContext = await stack.contactResolver.resolve(requester.channelId, requester.senderId);
-    const { originator, liveTurn } = stampOriginator({ senderContext, channel: requester.channelId, senderId: requester.senderId });
+    // The dispatcher's derivation (#2312): the same channel test over the metadata emailMetadata() would set.
+    const authenticated = inboundSenderAuthenticated(requester.channelId, { senderVerified: inbound.email?.senderVerified });
+    const { originator, liveTurn } = stampOriginator({ senderContext, channel: requester.channelId, senderId: requester.senderId, authenticated });
     const messageId = inbound.email ? sanitizeNylasMessageId(inbound.email.nylasMessageId ?? `scenario-msg-${randomUUID()}`) : undefined;
     const account = inbound.email ? preambleAccountLabel(inbound.email.account) : undefined;
     const identifiers = inbound.email ? buildInboundEmailIdentifierBlock(messageId?.ok ? messageId.value : undefined, account) : null;
