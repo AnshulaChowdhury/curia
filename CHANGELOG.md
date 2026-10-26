@@ -85,6 +85,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **PII ask memory** — the principal's yes or no on a personal-data ask applies to that thread. (#2312)
 - **Direct PII ask** — the principal is asked directly when someone requests their data. (#2312)
 - **`disclosureDecisions` capability** — **public API:** new `ToolContext` field recording the principal's answer to an ask. (#2312)
+- **Per-case autonomy fixtures** — scenario cases pin their own score and gating, so mixed fixtures share one run. (#2312)
 
 ### Changed
 

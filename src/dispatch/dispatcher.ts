@@ -56,6 +56,7 @@ import {
 import { buildApprovalDeliveryWake, type ApprovalTriggerService } from '../autonomy/approval-trigger.js';
 import type { EscalationJudge } from '../autonomy/escalation-judge.js';
 import type { AutonomyGating } from '../autonomy/band-policy.js';
+import type { AutonomyService } from '../autonomy/autonomy-service.js';
 import type { BullpenService } from '../memory/bullpen.js';
 import {
   REPLY_LOCK_SKILLS,
@@ -171,9 +172,16 @@ export interface DispatcherConfig {
   /**
    * Which policy gates the relay (#2159). Under 'band', a relayed reply skips the tier
    * Gate C (except #1059's missing-tier fail-closed); the gateway's band review asks all
-   * four questions instead. Default 'tier'.
+   * four questions instead. Default 'tier'. A gating on `autonomyService`'s config
+   * overrides it per relay (#2312).
    */
   gating?: AutonomyGating;
+  /**
+   * Read per relay for its gating (#2312): the scenario suite pins it per case on one
+   * dispatcher. Absent (production), or a config naming none, keeps `gating`. Production
+   * stamps the same configured gating on its config, so wiring it there changes nothing.
+   */
+  autonomyService?: Pick<AutonomyService, 'getConfig'>;
   /**
    * When a reply-lock suppresses the coordinator's relay (#1860), the text is
    * filed here instead of on the principal's channel. Absent in tests that
@@ -382,6 +390,7 @@ export class Dispatcher {
   private approvalTrigger?: ApprovalTriggerService;
   private escalationJudge?: EscalationJudge;
   private gating: AutonomyGating;
+  private autonomyService?: Pick<AutonomyService, 'getConfig'>;
   private bullpenService?: BullpenService;
   private principalIdentities?: readonly ChannelIdentity[];
   private principalAcquaintance?: PrincipalAcquaintanceConfig;
@@ -409,6 +418,7 @@ export class Dispatcher {
     this.approvalTrigger = config.approvalTrigger;
     this.escalationJudge = config.escalationJudge;
     this.gating = config.gating ?? 'tier';
+    this.autonomyService = config.autonomyService;
     this.bullpenService = config.bullpenService;
     this.principalIdentities = config.principalIdentities;
     this.principalAcquaintance = config.principalAcquaintance;
@@ -2130,7 +2140,7 @@ export class Dispatcher {
       conversationId: routing.conversationId,
       channelId: routing.channelId,
       escalationJudge: this.escalationJudge,
-      gating: this.gating,
+      gating: await this.currentGating(),
     });
     if (gateOutcome.kind === 'decide') {
       const audited = await this.publishRelayGateCDecision({
@@ -2244,6 +2254,20 @@ export class Dispatcher {
     // Schedule a checkpoint for this conversation — resets the debounce timer if
     // already running, so only fires after a full window of inactivity.
     this.scheduleCheckpoint(routing.conversationId, event.payload.agentId, routing.channelId);
+  }
+
+  /**
+   * The gating this relay follows (#2312): the autonomy config's, else the constructed value.
+   * An unreadable config keeps the constructed gating, as before this was read per relay.
+   */
+  private async currentGating(): Promise<AutonomyGating> {
+    if (!this.autonomyService) return this.gating;
+    try {
+      return (await this.autonomyService.getConfig())?.gating ?? this.gating;
+    } catch (err) {
+      this.logger.warn({ err, gating: this.gating }, 'Dispatcher: autonomy config unreadable for relay gating — using the configured gating');
+      return this.gating;
+    }
   }
 
   /**

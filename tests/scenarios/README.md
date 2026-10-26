@@ -586,15 +586,19 @@ later tone & style PRs compare against, are in
 
 `autonomy: { score, gating }` runs a case at that autonomy score and gating (`tier`, or
 `band` as production's deployment runs, #2159): the band descriptions in the prompt, the
-ExecutionLayer's gates and the OutboundGateway's review all follow it. The stack lays it
+ExecutionLayer's gates, the content filter's tier-keyed rules and the Dispatcher's relay
+Gate C all follow it. The OutboundGateway's band review follows it too, but only once sends
+reach the gateway: today every send tool is stubbed, and the recording gateway that lets a
+case send through the real review is PR 6 Task 2 (#2312). The stack lays it
 over the database's autonomy config in memory (`FixtureAutonomyService`,
 `src/startup/test-mode-stack.ts`). Nothing is written.
 
 Unlike `identity:`, it is the case's own (#2312). Each attempt enters its case's fixture
 (`runWithAutonomyFixture`, an `AsyncLocalStorage`) around everything it does: the bus
 delivers an event by awaiting every subscriber in the publisher's call chain, so the
-dispatcher, the turns and their tool calls all read it. The gateway and the ExecutionLayer
-read the gating from the autonomy config on each call, not at construction. So:
+dispatcher, the turns and their tool calls all read it. The gateway, the content filter
+(through the gateway), the Dispatcher and the ExecutionLayer read the gating from the
+autonomy config on each call, not at construction. So:
 
 - cases under different fixtures, and cases without one, run in the same suite run, at
   `--concurrency` beside each other;

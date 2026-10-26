@@ -50,7 +50,7 @@ import type { EventBus } from '../bus/bus.js';
 import type { Logger } from '../logger.js';
 import { createOutboundBlocked, createOutboundDelivered, createOutboundNotification, createAutonomySendBlocked, createAutonomyRelayDeferred, createPrincipalReport } from '../bus/events.js';
 import type { ChannelReconnectEvent } from '../bus/events.js';
-import { AutonomyService } from '../autonomy/autonomy-service.js';
+import { AutonomyService, type AutonomyConfig } from '../autonomy/autonomy-service.js';
 import { markdownToMrkdwn } from '../format/markdown-to-mrkdwn.js';
 import type { ActionLogRepo } from '../autonomy/action-log-repo.js';
 import { approvalAdvisory, buildApprovalDeliveryWake, generateShortRef, readApprovalNumber, type ApprovalWakeAsk } from '../autonomy/approval-trigger.js';
@@ -375,6 +375,13 @@ export interface OutboundGatewayConfig {
 }
 
 /** What a band hold replays on approval: the same shape as reExecRecipe (#2159). */
+/** One send's autonomy config read (#2312). `failed`: the read threw (`error`); config is then null. */
+interface AutonomyRead {
+  config: AutonomyConfig | null;
+  failed: boolean;
+  error?: unknown;
+}
+
 interface SendRecipe {
   toolName: string;
   partialPayload?: Record<string, unknown>;
@@ -851,6 +858,8 @@ export class OutboundGateway {
     // allowed the skill, the gateway independently blocks the actual send
     // when the score is too low. Fail-open if the service is not wired
     // or the config table is missing.
+    // One read per send (#2312): this gate, the gating and the band review's score share it.
+    const autonomy = await this.readAutonomy();
     if (this.autonomyService && options?.humanApproved) {
       // principal is explicitly in the loop — autonomy gate does not apply. Log the bypass
       // so operators can trace every humanApproved send in the log stream. See ADR-017.
@@ -880,13 +889,11 @@ export class OutboundGateway {
       // Fail-open on config read only — getConfig() failure must not block sends.
       // The action_log DB write is kept outside this try/catch so a DB error there
       // does NOT cause fail-open; the send stays blocked even if we can't write the row.
-      let autonomyConfig: Awaited<ReturnType<typeof this.autonomyService.getConfig>> | null = null;
-      try {
-        autonomyConfig = await this.autonomyService.getConfig();
-      } catch (err) {
+      const autonomyConfig = autonomy.config;
+      if (autonomy.failed) {
         // DB error — fail-open. Log at warn so anomalies are visible in alerting.
         this.log.warn(
-          { err, channel: request.channel },
+          { err: autonomy.error, channel: request.channel },
           'outbound-gateway: autonomy gate failed to read config — proceeding without gate (fail-open)',
         );
       }
@@ -1222,7 +1229,7 @@ export class OutboundGateway {
     // replay (humanApproved) goes out intact: the principal approved this exact message.
     // Otherwise (a system notice, the principal alone, no review wired) band redacts as tier.
     const { recipients, principalIncluded, principalIsSoleRecipient } = this.buildFilterRecipients(request);
-    const gating = await this.currentGating();
+    const gating = this.currentGating(autonomy);
     const bandReviewRuns = gating === 'band' && this.bandReview !== undefined
       && !options?.isSystemNotification && !options?.humanApproved && !principalIsSoleRecipient;
     const sendIntact = gating === 'band' && options?.humanApproved === true;
@@ -1341,6 +1348,8 @@ export class OutboundGateway {
         recipients,
         principalIncluded,
         principalIsSoleRecipient,
+        // The send's gating (#2312): the filter's tier-keyed rules follow it, not its constructed value.
+        gating,
       });
       filterPassed = filterResult.passed;
       filterFindings = filterResult.findings;
@@ -1493,6 +1502,7 @@ export class OutboundGateway {
       const reviewRecipients = recipients.map((r) => r.email).filter((id) => people.has(id.toLowerCase()));
       const outcome = await this.runBandReview({
         request,
+        autonomy,
         // The message as written: the review rules on the raw detected items it contains.
         content: sendBody,
         auditContent: redactedBody,
@@ -1948,7 +1958,7 @@ export class OutboundGateway {
           : row.payload.message;
         // Under band gating a queued row may hold details the review authorized raw; the
         // audit event never carries them (#2312). Tier rows were redacted before queueing.
-        const content = (await this.currentGating()) === 'band' ? this.redactedCopy(sent, row.payload.channel, row.recipient) : sent;
+        const content = this.currentGating(await this.readAutonomy()) === 'band' ? this.redactedCopy(sent, row.payload.channel, row.recipient) : sent;
         if (row.payload.channel === 'signal' && row.payload.recipient) {
           await this.promoteOrCreateRecipientContact('signal', row.payload.recipient);
         } else if (row.payload.channel === 'sms') {
@@ -2185,6 +2195,8 @@ export class OutboundGateway {
   private async runBandReview(args: {
     request: OutboundSendRequest;
     content: string;
+    /** The send's one autonomy read (#2312): the review's score comes from it. */
+    autonomy: AutonomyRead;
     /** What a bounce's outbound.blocked event carries: the redacted copy, never raw values (#2312). Defaults to content. */
     auditContent?: string;
     recipients: readonly string[];
@@ -2217,7 +2229,7 @@ export class OutboundGateway {
     result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals; copyPrincipal?: { labels: string[] };
   }> {
     const { request, content, recipients, principalRecipients, options } = args;
-    const score = await this.bandScore();
+    const score = this.bandScore(args.autonomy);
     let decision: Awaited<ReturnType<BandSendReview['review']>>;
     try {
       decision = await this.bandReview!.review({
@@ -2430,35 +2442,41 @@ export class OutboundGateway {
   }
 
   /**
+   * The autonomy config, read once per send (#2312) and shared by the autonomy gate, the
+   * gating and the band review's score. Never throws: a failed read is reported in the result
+   * and each user fails open or closed as it always has.
+   */
+  private async readAutonomy(): Promise<AutonomyRead> {
+    if (!this.autonomyService) return { config: null, failed: false };
+    try {
+      return { config: await this.autonomyService.getConfig(), failed: false };
+    } catch (err) {
+      return { config: null, failed: true, error: err };
+    }
+  }
+
+  /**
    * The gating this send follows (#2312): the autonomy config's, else the constructed value.
    * Production's AutonomyService stamps the configured gating on every read, so the two agree
    * there; the scenario suite's fixture service pins it per case on one shared gateway. An
    * unreadable config keeps the constructed gating, as before this was read per send.
    */
-  private async currentGating(): Promise<AutonomyGating> {
-    if (!this.autonomyService) return this.gating;
-    try {
-      return (await this.autonomyService.getConfig())?.gating ?? this.gating;
-    } catch (err) {
-      this.log.warn({ err, gating: this.gating }, 'outbound-gateway: autonomy config unreadable for gating — using the configured gating');
-      return this.gating;
-    }
+  private currentGating(autonomy: AutonomyRead): AutonomyGating {
+    return autonomy.config?.gating ?? this.gating;
   }
 
-  /** The live score for band review. Unreadable counts as 0: below 80, failures hold. */
-  private async bandScore(): Promise<number> {
+  /** The live score for band review, from the send's read. Unreadable counts as 0: below 80, failures hold. */
+  private bandScore(autonomy: AutonomyRead): number {
     if (!this.autonomyService) return 0;
-    try {
-      const config = await this.autonomyService.getConfig();
-      if (config === null) {
-        this.log.warn('outbound-gateway: no autonomy score for band review — reviewing as score 0');
-        return 0;
-      }
-      return config.score;
-    } catch (err) {
-      this.log.warn({ err }, 'outbound-gateway: autonomy score unreadable for band review — reviewing as score 0');
+    if (autonomy.failed) {
+      this.log.warn({ err: autonomy.error }, 'outbound-gateway: autonomy score unreadable for band review — reviewing as score 0');
       return 0;
     }
+    if (autonomy.config === null) {
+      this.log.warn('outbound-gateway: no autonomy score for band review — reviewing as score 0');
+      return 0;
+    }
+    return autonomy.config.score;
   }
 
   /**
@@ -3583,6 +3601,8 @@ export class OutboundGateway {
     // ------------------------------------------------------------------
     // Step 0: Autonomy gate
     // ------------------------------------------------------------------
+    // One read per draft send (#2312): this gate, the gating and the band review's score share it.
+    const autonomy = await this.readAutonomy();
     if (this.autonomyService && options?.humanApproved) {
       this.log.info(
         { draftId },
@@ -3604,36 +3624,35 @@ export class OutboundGateway {
         'outbound-gateway: autonomy gate skipped — draft recipient is principal (agent-to-principal communication)',
       );
     } else if (this.autonomyService) {
-      try {
-        const autonomyConfig = await this.autonomyService.getConfig();
-        const sendThreshold = AutonomyService.minScoreForActionRisk('medium');
-        if (autonomyConfig !== null && autonomyConfig.score < sendThreshold) {
-          this.log.info(
-            { draftId, currentScore: autonomyConfig.score, sendThreshold },
-            `outbound-gateway: draft send blocked by autonomy gate — score < ${sendThreshold}`,
-          );
-          this.bus.publish('dispatch', createAutonomySendBlocked({
-            channel: 'email',
-            currentScore: autonomyConfig.score,
-            requiredScore: sendThreshold,
-          }, options?.parentEventId)).catch((err) => {
-            this.log.warn(
-              { err, draftId },
-              'outbound-gateway: failed to publish autonomy.send_blocked event',
-            );
-          });
-          return {
-            success: false,
-            blockedReason:
-              `Autonomy score is ${autonomyConfig.score} — direct sends require a score of at least ${sendThreshold}. ` +
-              `Use createEmailDraft() for drafts, or ask the principal to raise the score with set-autonomy.`,
-          };
-        }
-      } catch (err) {
+      if (autonomy.failed) {
         this.log.warn(
-          { err, draftId },
+          { err: autonomy.error, draftId },
           'outbound-gateway: autonomy gate failed to read config — proceeding without gate (fail-open)',
         );
+      }
+      const autonomyConfig = autonomy.config;
+      const sendThreshold = AutonomyService.minScoreForActionRisk('medium');
+      if (autonomyConfig !== null && autonomyConfig.score < sendThreshold) {
+        this.log.info(
+          { draftId, currentScore: autonomyConfig.score, sendThreshold },
+          `outbound-gateway: draft send blocked by autonomy gate — score < ${sendThreshold}`,
+        );
+        this.bus.publish('dispatch', createAutonomySendBlocked({
+          channel: 'email',
+          currentScore: autonomyConfig.score,
+          requiredScore: sendThreshold,
+        }, options?.parentEventId)).catch((err) => {
+          this.log.warn(
+            { err, draftId },
+            'outbound-gateway: failed to publish autonomy.send_blocked event',
+          );
+        });
+        return {
+          success: false,
+          blockedReason:
+            `Autonomy score is ${autonomyConfig.score} — direct sends require a score of at least ${sendThreshold}. ` +
+            `Use createEmailDraft() for drafts, or ask the principal to raise the score with set-autonomy.`,
+        };
       }
     }
 
@@ -3765,7 +3784,7 @@ export class OutboundGateway {
         return this.blockForRedactorError(err, draftRequest, body, recipientEmail, options);
       }
     }
-    const gating = await this.currentGating();
+    const gating = this.currentGating(autonomy);
     const bandReviewRuns = gating === 'band' && this.bandReview !== undefined && !draftPrincipalSole;
     // Under tier gating a principal-directed draft (a live principal turn, or an approval
     // replay) is sent as written: the principal is in the loop, as tier has no review to ask.
@@ -3802,6 +3821,7 @@ export class OutboundGateway {
         recipients: draftRecipients,
         principalIncluded: draftPrincipalIncluded,
         principalIsSoleRecipient: draftPrincipalSole,
+        gating,
       });
       filterPassed = filterResult.passed;
       filterFindings = filterResult.findings;
@@ -3891,6 +3911,7 @@ export class OutboundGateway {
     if (bandReviewRuns && options?.principalApproved !== true && (options?.principalDirected !== true || detectedItems.length > 0)) {
       const outcome = await this.runBandReview({
         request: draftRequest,
+        autonomy,
         content: body,
         auditContent: redactedBody,
         recipients: draftRecipients.map((r) => r.email),

@@ -467,6 +467,8 @@ export async function createScenarioHarness(
     verification: stack.verification,
     turnLanes: stack.turnLanes,
     selfEmail: SCENARIO_CURIA_EMAIL,
+    // Relay Gate C follows the case's autonomy fixture, read per relay (#2312).
+    autonomyService: stack.autonomyService,
     // Production's check against the run's own seed: the principal's email identities as
     // the stack read them, and a mailbox whose Sent folder is the run's principal_wrote
     // contacts. A fresh check per lookup, so no answer is cached across runs (#2227).

@@ -987,6 +987,7 @@ describe('OutboundGateway', () => {
         recipients: [{ email: baseRequest.to, isPrincipal: false }],
         principalIncluded: false,
         principalIsSoleRecipient: false,
+        gating: 'tier',
       });
     });
 
@@ -1071,6 +1072,7 @@ describe('OutboundGateway', () => {
         recipients: [{ email: baseRequest.to, isPrincipal: false }],
         principalIncluded: false,
         principalIsSoleRecipient: false,
+        gating: 'tier',
       });
     });
   });
@@ -4196,6 +4198,36 @@ describe('band review (#2159)', () => {
       autonomy.current.gating = 'tier';
       await gw.send(emailReq, { taskEventId: 't2' });
       expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('passes the config\'s gating to the content filter, on sends and draft sends', async () => {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, gating: 'tier', autonomyService: autonomyReading(84, 'band').service });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: 'Hi Joel.', subject: 'Forms' }, { taskEventId: 't1' });
+      const gatings = vi.mocked(mocks.contentFilter.check).mock.calls.map(([input]) => input.gating);
+      expect(gatings).toEqual(['band', 'band']);
+    });
+
+    it('reads the autonomy config once per send, for the gate, the gating and the band score', async () => {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const autonomy = autonomyReading(84, 'band');
+      const gw = makeBandGateway({ review, score: 84, gating: 'tier', autonomyService: autonomy.service });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(autonomy.service.getConfig).toHaveBeenCalledOnce();
+      expect(review).toHaveBeenCalledWith(expect.objectContaining({ score: 84 }));
+      await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: 'Hi Joel.', subject: 'Forms' }, { taskEventId: 't1' });
+      expect(autonomy.service.getConfig).toHaveBeenCalledTimes(2);
+    });
+
+    it('reviews at score 0 when the send\'s one read fails', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const failing = { getConfig: vi.fn().mockRejectedValue(new Error('db down')) } as unknown as AutonomyService;
+      const gw = makeBandGateway({ review, score: 84, gating: 'band', autonomyService: failing });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(review).toHaveBeenCalledWith(expect.objectContaining({ score: 0 }));
     });
 
     it('reviews a draft send when the config says band, though the gateway was built tier', async () => {

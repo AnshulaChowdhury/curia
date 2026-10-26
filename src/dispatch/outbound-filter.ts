@@ -90,6 +90,12 @@ export interface FilterCheckInput {
   recipients?: FilterRecipient[];
   principalIncluded?: boolean;
   principalIsSoleRecipient?: boolean;
+  /**
+   * The gating this send follows (#2312), as the gateway read it from the autonomy config
+   * for this call. Overrides the constructed `gating`: the scenario suite pins it per case
+   * on one shared filter. Absent: the constructed value, as before.
+   */
+  gating?: AutonomyGating;
 }
 
 export interface FilterFinding {
@@ -274,6 +280,7 @@ export class OutboundContentFilter {
     const normalizedContent = normalizeForMatching(input.content);
 
     const principalIsSoleRecipient = input.principalIsSoleRecipient ?? false;
+    const gating = input.gating ?? this.config.gating ?? 'tier';
 
     // Stage 1: deterministic rules
     const findings: FilterFinding[] = [
@@ -281,7 +288,7 @@ export class OutboundContentFilter {
       ...this.checkInternalStructure(normalizedContent, principalIsSoleRecipient),
       ...this.checkSecretPatterns(normalizedContent),
       // Tier-keyed: off under band gating (#2159).
-      ...(this.config.gating === 'band'
+      ...(gating === 'band'
         ? []
         : this.checkContactDataLeak(normalizedContent, input.recipientEmail, input.recipientTier)),
       ...this.checkPrincipalNoteMarkup(normalizedContent, principalIsSoleRecipient),
@@ -314,7 +321,7 @@ export class OutboundContentFilter {
     // No-op pass when no escalation judge is configured.
     let escalationFindings: FilterFinding[] = [];
     try {
-      escalationFindings = await this.runEscalationJudge({ ...input, content: normalizedContent });
+      escalationFindings = await this.runEscalationJudge({ ...input, content: normalizedContent, gating });
     } catch (err) {
       // Fail-closed: disclosure gate error blocks the message.
       const message = err instanceof Error ? err.message : String(err);
@@ -622,8 +629,8 @@ export class OutboundContentFilter {
    * error). The outer try/catch in check() handles any truly unexpected throws.
    */
   private async runEscalationJudge(input: FilterCheckInput): Promise<FilterFinding[]> {
-    // Replaced by the gateway's BandSendReview under band gating (#2159).
-    if (this.config.gating === 'band') return [];
+    // Replaced by the gateway's BandSendReview under band gating (#2159); check() resolves gating.
+    if ((input.gating ?? this.config.gating) === 'band') return [];
     // Treat a disabled judge the same as an absent one — both are a no-op pass.
     // A disabled judge is an operator kill switch; we don't want it hard-blocking
     // every message (which is what classifyDisclosure returns when enabled=false).
