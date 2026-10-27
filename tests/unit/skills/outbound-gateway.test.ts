@@ -4521,7 +4521,7 @@ describe('band review (#2159)', () => {
       expect(reports).toHaveLength(1);
       expect(reports[0]!.payload).toMatchObject({
         source: 'blocked_content', urgency: 'digest', conversationId: 'c1',
-        summary: 'joel@example.com asked for your SIN and personal detail. Curia didn\'t share it and replied without it.',
+        summary: 'joel@example.com asked for your SIN and personal detail. Curia didn\'t share it.',
       });
       expect(actionLogRepo.insert).not.toHaveBeenCalled();
       expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();

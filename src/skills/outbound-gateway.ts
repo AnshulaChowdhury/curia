@@ -2315,10 +2315,11 @@ export class OutboundGateway {
       }
       if (decision.strangerRequest) {
         // A cold stranger asked for the principal's data: nobody can be asked, so the digest
-        // says it was not shared (#2312). Labels only, never the values.
+        // says it was not shared (#2312), not that a reply went: the drafter may not rewrite.
+        // Labels only, never the values.
         const { requester, labels } = decision.strangerRequest;
         await this.queueBlockReport(
-          `${normalizeCounterparty(requester)} asked for your ${describePiiLabels(labels)}. Curia didn't share it and replied without it.`,
+          `${normalizeCounterparty(requester)} asked for your ${describePiiLabels(labels)}. Curia didn't share it.`,
           options?.conversationId ?? undefined,
           options?.taskEventId ?? options?.parentEventId ?? 'system',
         );
