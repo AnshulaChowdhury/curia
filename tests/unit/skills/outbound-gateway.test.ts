@@ -4856,6 +4856,16 @@ describe('band review (#2159)', () => {
         expect(sentEmail().body).toContain(QUOTED);
       });
 
+      it('stays on an approved replay when every recipient was on the quoted message, and goes otherwise', async () => {
+        const { gateway } = await makePiiGateway({ review: vi.fn() });
+        await gateway.send({ ...reply, quoteParticipants: ['joel@example.com'] }, { humanApproved: true });
+        expect(sentEmail().body).toContain(QUOTED);
+
+        vi.mocked(mocks.nylasClient.sendMessage).mockClear();
+        await gateway.send({ ...reply, cc: ['newcomer@example.com'], quoteParticipants: ['joel@example.com'] }, { humanApproved: true });
+        expect(sentEmail().body).not.toContain(QUOTED);
+      });
+
       it('is reviewed when a recipient was not on it, or nobody recorded who was', async () => {
         for (const req of [
           { ...reply, cc: ['newcomer@example.com'], quoteParticipants: ['joel@example.com'] },

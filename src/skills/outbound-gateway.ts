@@ -1258,7 +1258,8 @@ export class OutboundGateway {
       if (request.channel === 'email' && request.subject) redactedSubject = this.redactedCopy(request.subject, 'email', recipientId);
       // The approval showed the body and subject. A reply's quote is rebuilt at send time and was
       // never shown, so personal details in it go out only after a review: here, without it.
-      if (request.channel === 'email' && request.htmlQuote) {
+      // Unless everyone it reaches was on the quoted message, as for a reviewed send.
+      if (request.channel === 'email' && request.htmlQuote && !this.quoteIsRecipients(request, recipients)) {
         try {
           dropIntactQuote = this.piiRedactor.detect(request.htmlQuote, 'email', { recipientId, principalIsSoleRecipient }).length > 0;
         } catch (err) {
@@ -1574,17 +1575,18 @@ export class OutboundGateway {
     // wire may be raw (#2312), an intact replay's included.
     const auditBody = redactedBody;
     // What the review let go out raw, by label: the audit's record of the disclosure.
-    const disclosed = rawOnWire ? { disclosed: detectedItems.map(({ label, field }) => ({ label, field })) } : {};
+    const disclosed = rawOnWire
+      ? { disclosed: detectedItems.filter((i) => !(dropQuote && i.field === 'quote')).map(({ label, field }) => ({ label, field })) }
+      : {};
     if (request.channel === 'email') {
       // Provenance lives on the request so a queued payload keeps it. Only send()
       // options set it; a value already on the request is dropped. dispatchEmail
       // copies named provider fields, so Nylas never sees these (#2071).
       const toSend: EmailSendRequest = { ...request, body: sendBody, subject: sendSubject };
-      if (dropIntactQuote) delete toSend.htmlQuote;
       delete toSend.recipientSource;
       delete toSend.recipientDisplayName;
       // Quoted history, not the agent's text: dropping it is not a cut (#2312).
-      if (dropQuote) {
+      if (dropQuote || dropIntactQuote) {
         delete toSend.htmlQuote;
         delete toSend.quoteParticipants;
       }
