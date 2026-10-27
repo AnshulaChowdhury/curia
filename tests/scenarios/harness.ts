@@ -950,7 +950,7 @@ export async function createScenarioHarness(
       // A through-gateway Signal reply's conversation is named by the fixture's number, so it is
       // reused across runs and attempts: start it clean, or the last run's turns are this run's
       // history.
-      if (runConversationId.startsWith('signal:')) await cleanupConversation(stack.pool, runConversationId);
+      if (runConversationId.startsWith('signal:')) await cleanupScenarioConversation(stack.pool, runConversationId);
 
       scope.rootConversation = runConversationId;
       scope.throughGateway = scenario.throughGateway === true;

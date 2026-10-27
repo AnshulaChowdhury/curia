@@ -963,6 +963,9 @@ export const SCENARIO_CONVERSATION_PREFIXES = ['scenario-', 'email:scenario-', '
 export async function cleanupScenarioConversation(pool: DbPool, conversationId: string): Promise<void> {
   await cleanupConversation(pool, conversationId);
   await pool.query(`DELETE FROM task_outreach WHERE conversation_id = $1`, [conversationId]);
+  // What a through-gateway send there wrote: approvals and the principal's answers.
+  await pool.query(`DELETE FROM autonomy_action_log WHERE conversation_id = $1`, [conversationId]);
+  await pool.query(`DELETE FROM disclosure_decisions WHERE conversation_id = $1`, [conversationId]);
 }
 
 export async function cleanupRun(
