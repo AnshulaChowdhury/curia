@@ -26,8 +26,8 @@ export type DisclosureDecider = 'principal_reaction' | 'principal_via_coordinato
 /**
  * The ask a held send carries, stored on its approval row. `counterparties` are the send's
  * non-principal recipients and `requester` the primary one, all normalized. `outreachId` is the
- * outreach row the drafting turn was linked to, when the link covered the recipients: a yes
- * learns the requester onto it.
+ * outreach row the drafting turn was strongly linked to, when the link covered the recipients:
+ * a yes learns the requester onto it.
  */
 export interface DisclosureAsk {
   conversationId: string;

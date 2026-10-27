@@ -120,9 +120,11 @@ export function buildSenderContextBlock(
     role: senderCtx.role,
   });
   senderInfo += `\nChannel: ${channelId} | Sender identifier: ${senderId}`;
-  // An external email carries no passing authentication here; the CLI has none to check.
+  // An external email carries no passing authentication here; the CLI has none to check, so
+  // it renders as production renders a message without Authentication-Results.
   const messageAuthenticated = cohort === 'external' ? false : undefined;
-  senderInfo += `\n${renderSenderFacts({ identityVerified: senderCtx.verified, messageAuthenticated })}`;
+  const messageAuthentication = cohort === 'external' ? 'not confirmed' : undefined;
+  senderInfo += `\n${renderSenderFacts({ identityVerified: senderCtx.verified, messageAuthenticated, messageAuthentication })}`;
 
   if (cohort === 'external') {
     senderInfo +=

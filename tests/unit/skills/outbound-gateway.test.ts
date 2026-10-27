@@ -4209,6 +4209,18 @@ describe('band review (#2159)', () => {
     await gw.send({ ...emailReq, cc: ['Ops@Example.com', 'nobody@example.com'] }, { taskEventId: 't1', conversationId: 'c1' });
     // Normalized ids; a recipient with no contact is left out, so it is not askable.
     expect(review.mock.calls[0]![0].recipientTiers).toEqual({ 'joel@example.com': 'known', 'ops@example.com': 'trusted' });
+    // Each resolved contact id too, so a link can cover a cc'd contact by id.
+    expect(review.mock.calls[0]![0].recipientContactIds).toEqual({ 'joel@example.com': 'c-joel@example.com', 'ops@example.com': 'c-Ops@Example.com' });
+  });
+
+  it('passes the review a cc\'d contact\'s id even when their tier is unknown (#2312)', async () => {
+    vi.mocked(mocks.contactService.resolveByChannelIdentity).mockImplementation(async (_channel: string, id: string) => (
+      { contactId: `c-${id.toLowerCase()}`, displayName: id, role: null, tier: id.toLowerCase() === 'joel@example.com' ? 'known' : 'unknown', kind: 'person', kgNodeId: null, verified: false }
+    ) as never);
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send({ ...emailReq, cc: ['ops@other.example'] }, { taskEventId: 't1', conversationId: 'c1' });
+    expect(review.mock.calls[0]![0].recipientContactIds).toEqual({ 'joel@example.com': 'c-joel@example.com', 'ops@other.example': 'c-ops@other.example' });
   });
 
   it('forwards the note reported to the principal to the review (#2312)', async () => {

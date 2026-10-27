@@ -1669,7 +1669,7 @@ async function main(): Promise<void> {
   const outreachNonOrgDomains = principalOrgDomainSet(yamlConfig.security?.principal_org_domains ?? []);
   const taskRepo = new TaskRepo(pool, bus, logger, config.timezone, workingDocsRepo, taskOutreachRepo);
   // The principal's yes or no on a personal-data ask, per thread (#2312): approve/deny write
-  // it, band review reads it. A yes on a linked thread learns the requester onto the outreach row.
+  // it, band review reads it. A yes on a strongly linked thread learns the requester onto the outreach row.
   const disclosureDecisionsRepo = new DisclosureDecisionsRepo(pool);
   const disclosureDecisions = new DisclosureDecisionRecorder({ repo: disclosureDecisionsRepo, taskOutreachRepo, logger });
   const taskOutreach = new TaskOutreachService(taskOutreachRepo, {

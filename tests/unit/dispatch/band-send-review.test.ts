@@ -985,9 +985,17 @@ describe('BandSendReview', () => {
           .toMatchObject({ kind: 'hold', ask: { requester: 'joel@example.com', counterparties: ['joel@example.com', 'ops@other.example'] } });
       });
 
-      it('carries the linked outreach row only when the link covers the recipients', async () => {
-        const covered = make([withRulings(ruling('inferred', true))], { evidence: { authority: linked('weak'), linkedOutreachId: 'o-1' } });
-        expect(await covered.svc.review(pii)).toMatchObject({ kind: 'hold', ask: { outreachId: 'o-1' } });
+      it('carries the linked outreach row only when a strong link covers the recipients', async () => {
+        const covered = make([withRulings(ruling('inferred', true))], { evidence: { authority: linked('strong'), linkedOutreachId: 'o-1' } });
+        expect(await covered.svc.review({ ...pii, score: 74 })).toMatchObject({ kind: 'hold', ask: { outreachId: 'o-1' } });
+        // A weak link still asks, but the principal is shown no task, so a yes learns no row.
+        const weak = make([withRulings(ruling('inferred', true))], { evidence: { authority: linked('weak'), linkedOutreachId: 'o-1' } });
+        const w = await weak.svc.review(pii);
+        expect(w.kind).toBe('hold');
+        if (w.kind === 'hold') {
+          expect(w.ask).toBeDefined();
+          expect(w.ask).not.toHaveProperty('outreachId');
+        }
         const elsewhere = make([withRulings(ruling('unsupported', true))], { evidence: { authority: linked('weak'), linkedOutreachId: 'o-1' } });
         const d = await elsewhere.svc.review({ ...pii, recipients: ['sam@other.example'], recipientTier: 'known' });
         expect(d.kind).toBe('hold');

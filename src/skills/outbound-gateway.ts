@@ -1058,11 +1058,13 @@ export class OutboundGateway {
     // it is refused, not only the primary (#2273). Fail-open, as above.
     // Every resolved person recipient's tier, for the band review's ask (#2312).
     const recipientTiers: Record<string, ContactTier> = {};
+    const recipientContactIds: Record<string, string> = {};
+    if (recipientContactId !== undefined) recipientContactIds[normalizeCounterparty(recipientId)] = recipientContactId;
     if (!recipientTierUnresolved && recipientContactId !== undefined) recipientTiers[normalizeCounterparty(recipientId)] = recipientTier;
     const blockedOther = await this.findBlockedRecipient(
       request.channel,
       this.personRecipients(request).filter((id) => id.toLowerCase() !== recipientId.toLowerCase()),
-      { failClosed: false, tiers: recipientTiers },
+      { failClosed: false, tiers: recipientTiers, contactIds: recipientContactIds },
     );
     if (blockedOther?.kind === 'blocked') {
       this.log.warn(
@@ -1492,7 +1494,7 @@ export class OutboundGateway {
         detectedItems,
         recipientTier,
         recipientTiers,
-        ...(recipientContactId ? { recipientContactIds: { [recipientId.toLowerCase()]: recipientContactId } } : {}),
+        ...(Object.keys(recipientContactIds).length > 0 ? { recipientContactIds } : {}),
         ...(sendSubject !== undefined ? { subject: sendSubject } : {}),
         options,
       });
@@ -2764,12 +2766,13 @@ export class OutboundGateway {
    * is refused. On a lookup error, `failClosed` returns `lookup-failed`;
    * otherwise that identifier is logged and skipped, as the primary check does.
    * `opts.tiers`, when given, collects each resolved contact's tier by normalized
-   * identifier, for the band review's ask (#2312).
+   * identifier, for the band review's ask (#2312), and `opts.contactIds` its contact id, for
+   * matching a linked outreach row.
    */
   private async findBlockedRecipient(
     channel: string,
     identifiers: readonly string[],
-    opts: { failClosed: boolean; tiers?: Record<string, ContactTier> },
+    opts: { failClosed: boolean; tiers?: Record<string, ContactTier>; contactIds?: Record<string, string> },
   ): Promise<{ kind: 'blocked'; identifier: string; contactId: string } | { kind: 'lookup-failed'; identifier: string } | null> {
     const seen = new Set<string>();
     for (const identifier of identifiers) {
@@ -2782,7 +2785,10 @@ export class OutboundGateway {
         if (contact !== null && contact.tier === 'blocked') {
           return { kind: 'blocked', identifier, contactId: contact.contactId };
         }
-        if (contact !== null && opts.tiers) opts.tiers[normalizeCounterparty(identifier)] = contact.tier;
+        if (contact !== null) {
+          if (opts.tiers) opts.tiers[normalizeCounterparty(identifier)] = contact.tier;
+          if (opts.contactIds) opts.contactIds[normalizeCounterparty(identifier)] = contact.contactId;
+        }
       } catch (err) {
         this.log.warn(
           { err, channel, recipientId: redactId(identifier), failClosed: opts.failClosed },
@@ -3644,8 +3650,12 @@ export class OutboundGateway {
       .filter((r) => r.toLowerCase() !== recipientEmail.toLowerCase());
     // Every resolved person recipient's tier, for the band review's ask (#2312).
     const draftTiers: Record<string, ContactTier> = {};
-    if (recipientContactIdForDraft !== undefined) draftTiers[normalizeCounterparty(recipientEmail)] = recipientTierForDraft;
-    const blockedOther = await this.findBlockedRecipient('email', draftOthers, { failClosed: false, tiers: draftTiers });
+    const draftContactIds: Record<string, string> = {};
+    if (recipientContactIdForDraft !== undefined) {
+      draftTiers[normalizeCounterparty(recipientEmail)] = recipientTierForDraft;
+      draftContactIds[normalizeCounterparty(recipientEmail)] = recipientContactIdForDraft;
+    }
+    const blockedOther = await this.findBlockedRecipient('email', draftOthers, { failClosed: false, tiers: draftTiers, contactIds: draftContactIds });
     if (blockedOther?.kind === 'blocked') {
       this.log.warn(
         { draftId, recipientId: redactId(blockedOther.identifier), contactId: blockedOther.contactId },
@@ -3861,7 +3871,7 @@ export class OutboundGateway {
         detectedItems,
         recipientTier: recipientTierForDraft,
         recipientTiers: draftTiers,
-        ...(recipientContactIdForDraft ? { recipientContactIds: { [recipientEmail.toLowerCase()]: recipientContactIdForDraft } } : {}),
+        ...(Object.keys(draftContactIds).length > 0 ? { recipientContactIds: draftContactIds } : {}),
         subject: draftMeta.subject,
         options,
         editable: false,

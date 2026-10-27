@@ -142,7 +142,7 @@ export type BandReviewSignals = { speaksAsPrincipal?: boolean; bounced?: boolean
  * non-principal recipient, and the title of the task it is for, when the evidence names one
  * (on one line, at most 80 characters). `counterparties` are every non-principal recipient,
  * normalized: the principal's answer is recorded for each. `outreachId` is the outreach row a
- * covering link points at, so a yes can learn the requester onto it.
+ * covering strong link points at, so a yes can learn the requester onto it.
  */
 export type BandReviewAsk = { labels: string[]; requester: string; counterparties: string[]; taskTitle?: string; outreachId?: string };
 
@@ -405,7 +405,9 @@ export class BandSendReview {
       const requester = primaryRequester(input);
       if (askLabels.size > 0 && !heldOtherwise && requester !== undefined) {
         const taskTitle = askTaskTitle(authority, who, linkCovers);
-        const outreachId = linkCovers ? asked.linkedOutreachId : undefined;
+        // Only a strong link names its row: the ask shows no task for a weak one, so a yes
+        // can't confirm which row the requester belongs on.
+        const outreachId = linkCovers && authority?.linkedTask?.strength === 'strong' ? asked.linkedOutreachId : undefined;
         return {
           kind: 'hold', reason: holds[0]!.detail, findings: holds,
           ask: {
