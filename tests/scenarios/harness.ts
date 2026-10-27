@@ -67,7 +67,6 @@ import {
 } from '../shared/case-scope.js';
 import { sumBreakdowns, UsageLedger, type UsageBreakdown } from '../shared/usage.js';
 import {
-  cleanupConversation,
   createTurnCapture,
   withoutRecentHistory,
   type ObservedToolCall,
@@ -93,6 +92,7 @@ import {
   scopedPrincipalBacklog,
   scopedVerification,
   SeedScope,
+  cleanupScenarioConversation,
   describeError,
   seedRun,
   sweepLeftovers,
@@ -413,7 +413,7 @@ export async function createScenarioHarness(
           if (!booted) return;
           const { pool, logger } = booted;
           void Promise.all([
-            cleanupConversation(pool, conversationId),
+            cleanupScenarioConversation(pool, conversationId),
             deletePendingDelegations(booted, [], [conversationId]),
           ]).catch((err: unknown) => {
             logger.error({ err, conversationId }, 'scenario harness: late specialist cleanup failed');
@@ -572,7 +572,7 @@ export async function createScenarioHarness(
         // records that the late turn ended in an error.
         logger.error({ err, conversationId }, 'scenario harness: a coordinator turn failed');
       })
-      .then(() => cleanupConversation(stack.pool, conversationId))
+      .then(() => cleanupScenarioConversation(stack.pool, conversationId))
       .catch((err: unknown) => {
         logger.error({ err, conversationId }, 'scenario harness: late conversation cleanup failed');
         process.stderr.write(`  [WARN] late cleanup failed for ${conversationId}: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -594,7 +594,7 @@ export async function createScenarioHarness(
     const settled: Promise<void> = observeFollowupDelivery(
       delivery,
       joinedHost,
-      () => cleanupConversation(stack.pool, conversationId),
+      () => cleanupScenarioConversation(stack.pool, conversationId),
     )
       .catch((err: unknown) => {
         logger.error({ err, conversationId }, 'scenario harness: follow-up conversation cleanup failed');

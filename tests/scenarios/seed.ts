@@ -674,7 +674,17 @@ export function seedConflictKeys(scenario: ScenarioCase): string[] {
 }
 
 /** Conversation ids a run uses (harness.ts); the sweep finds leftovers by them. */
-export const SCENARIO_CONVERSATION_PREFIXES = ['scenario-', 'email:scenario-'] as const;
+export const SCENARIO_CONVERSATION_PREFIXES = ['scenario-', 'email:scenario-', 'scheduler:scenario-'] as const;
+
+/**
+ * A run conversation's rows (cleanupConversation), plus the outreach its sends recorded
+ * (#2312). Late turns (an abandoned specialist, a timed-out coordinator turn, a follow-up)
+ * clean up with this too, so a send that finishes after the run's cleanup leaves nothing.
+ */
+export async function cleanupScenarioConversation(pool: DbPool, conversationId: string): Promise<void> {
+  await cleanupConversation(pool, conversationId);
+  await pool.query(`DELETE FROM task_outreach WHERE conversation_id = $1`, [conversationId]);
+}
 
 export async function cleanupRun(
   stack: TestModeStack,
@@ -706,17 +716,13 @@ export async function cleanupRun(
     // Messages and read watermarks cascade.
     await attempt(() => stack.pool.query(`DELETE FROM bullpen_threads WHERE id = ANY($1::uuid[])`, [threadIds]));
   }
+  // Conversation rows and the outreach the run's sends recorded (#2312), taskless rows included.
   if (conversationId) {
-    await attempt(() => cleanupConversation(stack.pool, conversationId));
+    await attempt(() => cleanupScenarioConversation(stack.pool, conversationId));
   }
   const specialists = [...scope.specialistConversations];
   for (const specialist of specialists) {
-    await attempt(() => cleanupConversation(stack.pool, specialist));
-  }
-  // Outreach the run's sends recorded (#2312), taskless rows included.
-  const runConversations = [...(conversationId ? [conversationId] : []), ...specialists];
-  if (runConversations.length > 0) {
-    await attempt(() => stack.pool.query(`DELETE FROM task_outreach WHERE conversation_id = ANY($1::text[])`, [runConversations]));
+    await attempt(() => cleanupScenarioConversation(stack.pool, specialist));
   }
   if (conversationId || specialists.length > 0) {
     // A dispatch claim a timed-out delegation kept (#1893): nothing in test mode promotes
