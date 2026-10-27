@@ -5022,6 +5022,30 @@ describe('band review (#2159)', () => {
       expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
     });
 
+    it('redacts the flushed audit event of a band-queued row even after a switch to tier gating', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const enqueue = vi.fn().mockResolvedValue({ id: 'q-1' });
+      const outboundQueue = {
+        enqueue,
+        listPending: vi.fn().mockImplementation(async () => [{
+          id: 'q-1', channel: 'email', recipient: 'joel@example.com', payload: enqueue.mock.calls[0]![0],
+          enqueuedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
+        }]),
+        deleteByIds: vi.fn().mockResolvedValue(undefined),
+      } as unknown as OutboundQueueRepo;
+      const { gateway: band } = await makePiiGateway({ review, outboundQueue });
+      expect((await band.send(phoneReq, { taskEventId: 't1' })).queued).toBe(true);
+      expect((enqueue.mock.calls[0]![0] as { body: string }).body).toContain(phone);
+
+      // Restarted with tier gating while the raw row is still queued.
+      const { gateway: tier } = await makePiiGateway({ review, outboundQueue, gating: 'tier', emailReady: () => true });
+      await tier.flushChannel('email');
+      expect(sentEmail().body).toContain(phone);
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered).toHaveLength(1);
+      expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
+    });
+
     it('blocks with pii_redactor_error when detection throws', async () => {
       const review = vi.fn();
       const piiRedactor = {

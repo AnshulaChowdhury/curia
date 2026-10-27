@@ -1976,9 +1976,10 @@ export class OutboundGateway {
         const sent = row.payload.channel === 'email'
           ? row.payload.body
           : row.payload.message;
-        // Under band gating a queued row may hold details the review authorized raw; the
-        // audit event never carries them (#2312). Tier rows were redacted before queueing.
-        const content = this.currentGating(await this.readAutonomy()) === 'band' ? this.redactedCopy(sent, row.payload.channel, row.recipient) : sent;
+        // A row queued under band gating may hold details the review authorized raw, and the
+        // gating may have changed since it was queued: the audit event always gets a redacted
+        // copy (#2312), so it never carries them.
+        const content = this.redactedCopy(sent, row.payload.channel, row.recipient);
         if (row.payload.channel === 'signal' && row.payload.recipient) {
           await this.promoteOrCreateRecipientContact('signal', row.payload.recipient);
         } else if (row.payload.channel === 'sms') {
