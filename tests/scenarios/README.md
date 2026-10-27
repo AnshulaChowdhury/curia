@@ -731,7 +731,7 @@ check: { not_delivered: { to: pat } }      # or not_delivered: true — nothing 
 check: { held: { contains: [SIN] } }       # or held: true — an approval was raised this run
 check: { not_held: true }                  # or not_held: { contains: [SIN] } — no such approval
 check: { outreach_recorded: { domain: vendor.example.test, confirmed: true } }
-check: { decision_recorded: { label: SIN, decision: "yes" } }
+check: { decision_recorded: { label: sin_ca, decision: "yes" } }
 check: { reviewed: { label: phone_us } }   # or { label: phone_us, outcome: bounce } — the review ruled on it
 check: { delivered: { to: pat, contains: ["692"], count: 0, own_text: true } }   # Curia's own words only
 ```
@@ -750,6 +750,15 @@ A reply quotes the message it answers, and the sender's own details in that quot
 disclosure to them (the gateway exempts a quote everyone on the send was on). `own_text: true`
 matches only the reply's own words: the subject and the body above the quote. So "Curia did not
 send Pat the SIN Pat wrote to it" is `delivered: { to: pat, contains: [SIN], count: 0, own_text: true }`.
+
+`own_text` falls back to the whole body when the delivery has no separate own text (no quote
+to split off), so it fails closed only for `count: 0` checks: a quoted term then counts against
+the case. For a positive check (`count` of 1 or more) it can match quoted text, so don't rely
+on it to prove the reply itself said something.
+
+The `label` of `reviewed` and `decision_recorded` must be a detection label: a built-in
+pattern name (`phone_us`, `sin_ca`, `email`, ...) or `extra_N` for the operator's Nth extra
+pattern. The loader rejects any other, so a typo can't make a check pass or fail silently.
 
 `reviewed: { label }` passes when band review ruled on a detected item with that label in a
 send's own text (body or subject; a quote's items do not count), with that `outcome`

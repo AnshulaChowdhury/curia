@@ -97,8 +97,11 @@ export class ApproveActionHandler implements ToolHandler {
       ctx.log.info({ rowId: row.id, shortRef: row.shortRef }, 'approve-action: row transitioned to approved');
 
       // A personal-data ask (#2312): the yes is recorded before the replay, so a reply drafted
-      // on the thread in the meantime already sees it. The recorder never throws.
-      if (row.disclosureAsk) {
+      // on the thread in the meantime already sees it. The recorder never throws. Only a delivered
+      // approval records one: a yes to a message the principal never received is no consent
+      // (the refusal above already stops every undelivered ask; this is the belt to those
+      // braces).
+      if (row.disclosureAsk && row.notificationSentAt !== null) {
         if (ctx.disclosureDecisions) {
           await ctx.disclosureDecisions.recordForApproval(row, 'yes', 'principal_via_coordinator');
         } else {

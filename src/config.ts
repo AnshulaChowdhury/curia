@@ -442,14 +442,16 @@ export interface OutboundRedactionSettings {
  */
 export function resolveOutboundRedactionConfig(yaml: YamlConfig['pii'], warn: ConfigWarn = () => {}): OutboundRedactionSettings {
   const redaction = yaml?.outbound_redaction;
-  let fallback: string = redaction?.default ?? 'block';
-  if (fallback !== 'block' && fallback !== 'allow') {
-    warn({ default: fallback }, "pii.outbound_redaction.default must be 'block' or 'allow' — using 'block'");
-    fallback = 'block';
+  const configured: string = redaction?.default ?? 'block';
+  let fallback: OutboundRedactionSettings['default'] = 'block';
+  if (configured === 'block' || configured === 'allow') {
+    fallback = configured;
+  } else {
+    warn({ default: configured }, "pii.outbound_redaction.default must be 'block' or 'allow' — using 'block'");
   }
   return {
     enabled: redaction?.enabled ?? true,
-    default: fallback as 'block' | 'allow',
+    default: fallback,
     channel_policies: Object.fromEntries(
       Object.entries(redaction?.channel_policies ?? {}).map(([ch, policy]) => [ch, { allow: policy.allow ?? [] }]),
     ),

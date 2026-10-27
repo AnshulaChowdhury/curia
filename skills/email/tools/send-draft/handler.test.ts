@@ -780,7 +780,6 @@ describe('SendDraftHandler', () => {
       expect(result.success).toBe(true);
     });
 
-    // Sending the draft of a personal-data ask is the principal's yes, as approve-action records it (#2312).
     // Sending the draft of a personal-data ask is the principal's yes, as approve-action records
     // it (#2312), but only from a live principal turn whose approval was delivered: a yes covers
     // the whole thread, and principal lineage alone also passes a woken task.

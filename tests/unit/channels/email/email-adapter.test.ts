@@ -1433,3 +1433,15 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
     expect(mocks.outboundGateway.send).not.toHaveBeenCalled();
   });
 });
+
+describe('EmailAdapter — subscribeOutbound once-guard (#2312)', () => {
+  it('a second subscribeOutbound() subscribes nothing more, and start() after it adds none', () => {
+    const mocks = createMocks();
+    const adapter = makeAdapter(mocks);
+    adapter.subscribeOutbound();
+    const subscribed = (mocks.bus.subscribe as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(subscribed).toBeGreaterThan(0);
+    adapter.subscribeOutbound();
+    expect((mocks.bus.subscribe as ReturnType<typeof vi.fn>).mock.calls.length).toBe(subscribed);
+  });
+});

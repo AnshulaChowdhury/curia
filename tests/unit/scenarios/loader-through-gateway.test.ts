@@ -66,7 +66,7 @@ expected_behaviors:
   - id: decision
     description: records the yes
     check:
-      decision_recorded: { label: SIN, decision: "yes" }
+      decision_recorded: { label: sin_ca, decision: "yes" }
   - id: any-hold
     description: any hold
     check:
@@ -93,7 +93,7 @@ describe('through_gateway cases', () => {
       { kind: 'not_delivered', to: 'pat' },
       { kind: 'delivered', channel: 'signal', to: 'principal', ccIncludes: 'lee@vendor.example.test', contains: ['approval'], excludes: ['130 692 544'], count: 1 },
       { kind: 'outreach_recorded', domain: 'vendor.example.test', confirmed: true },
-      { kind: 'decision_recorded', label: 'SIN', decision: 'yes' },
+      { kind: 'decision_recorded', label: 'sin_ca', decision: 'yes' },
       { kind: 'held' },
       { kind: 'not_held', contains: ['passport'] },
     ]);
@@ -174,6 +174,7 @@ expected_behaviors:`));
     ['outreach without confirmed', (s: string) => s.replace('      confirmed: true\n', ''), /'confirmed' must be true or false/],
     ['outreach with nothing to match', (s: string) => s.replace('      domains: [Vendor.example.test]\n      contacts: [pat]\n', ''), /at least one of domains, addresses or contacts/],
     ['a bad outreach via', (s: string) => s.replace('via: email', 'via: pigeon'), /via must be one of/],
+    ['a misspelled PII label on reviewed', (s: string) => s.replace('held: true', 'reviewed: { label: sin }'), /'label' sin is not a PII label/],
     ['a duplicate task key', (s: string) => s.replace('  outreach:', '    - key: onboarding\n      title: Again\n      originator: principal\n  outreach:'), /duplicate task key 'onboarding'/],
   ])('rejects %s', (_label, edit, error) => {
     expect(() => load(edit(CASE))).toThrow(error);

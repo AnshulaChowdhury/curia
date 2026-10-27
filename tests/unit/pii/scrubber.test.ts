@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { scrubPii, parseExtraPiiPatterns, detectPii } from '../../../src/pii/scrubber.js';
+import { scrubPii, parseExtraPiiPatterns, detectPii, isKnownPiiLabel } from '../../../src/pii/scrubber.js';
 
 describe('scrubPii — built-in patterns', () => {
   // ── Email ──────────────────────────────────────────────────────────────────
@@ -368,5 +368,18 @@ describe('sin_ca', () => {
 
   it('scrubs with the [SIN] replacement', () => {
     expect(scrubPii('SIN 130 692 544')).toBe('SIN [SIN]');
+  });
+});
+
+describe('isKnownPiiLabel', () => {
+  it('knows built-in pattern names and extra_N, nothing else', () => {
+    expect(isKnownPiiLabel('phone_us')).toBe(true);
+    expect(isKnownPiiLabel('sin_ca')).toBe(true);
+    expect(isKnownPiiLabel('email')).toBe(true);
+    expect(isKnownPiiLabel('extra_0')).toBe(true);
+    expect(isKnownPiiLabel('extra_12')).toBe(true);
+    expect(isKnownPiiLabel('sin')).toBe(false);
+    expect(isKnownPiiLabel('extra_')).toBe(false);
+    expect(isKnownPiiLabel('PHONE_US')).toBe(false);
   });
 });

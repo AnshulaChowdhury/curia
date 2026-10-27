@@ -71,6 +71,8 @@ export class SignalAdapter implements Channel {
   // Bound handler so we can remove it in stop() without losing the reference.
   // Arrow function captures `this` correctly even after .off() removes it.
   private readonly boundHandleInbound: (envelope: SignalEnvelope) => void;
+  /** subscribeOutbound() ran: the bus has no unsubscribe, so a second call would double every send. */
+  private outboundSubscribed = false;
 
   constructor(config: SignalAdapterConfig) {
     this.config = config;
@@ -95,9 +97,12 @@ export class SignalAdapter implements Channel {
    * Subscribe the outbound side: replies the dispatcher relays (outbound.message) go back to
    * the sender through the OutboundGateway. start() calls it before connecting. The test-mode
    * recording stack (#2312) calls it alone, against a recording client, so a scenario's
-   * relayed reply takes this exact path with no socket. Call once per adapter.
+   * relayed reply takes this exact path with no socket. Safe to call twice: the second call
+   * is a no-op, so a reply is never sent twice.
    */
   subscribeOutbound(): void {
+    if (this.outboundSubscribed) return;
+    this.outboundSubscribed = true;
     // When the coordinator responds to a Signal-triggered conversation, the
     // dispatcher creates an outbound.message with channelId 'signal'. The adapter
     // routes this back to the sender via the OutboundGateway.

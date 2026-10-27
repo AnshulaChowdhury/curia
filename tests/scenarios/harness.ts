@@ -921,6 +921,11 @@ export async function createScenarioHarness(
               : `scenario-${randomUUID()}`;
       conversationId = runConversationId;
 
+      // A through-gateway Signal reply's conversation is named by the fixture's number, so it is
+      // reused across runs and attempts: start it clean, or the last run's turns are this run's
+      // history.
+      if (runConversationId.startsWith('signal:')) await cleanupConversation(stack.pool, runConversationId);
+
       scope.rootConversation = runConversationId;
       scope.throughGateway = scenario.throughGateway === true;
       controller.beginRun(stubTable, runConversationId, { realDelegation, throughGateway: scenario.throughGateway === true });
@@ -1155,7 +1160,10 @@ export async function createScenarioHarness(
           thenOutcome = then.outcome;
           await settleWithin(then.delivery, timeoutMs);
         }
-        const wakes = await Promise.all(scope.wakeTurns);
+        // A wake turn can itself hold a send that starts another wake: await until the list stops
+        // growing, not just the snapshot taken here.
+        let wakes = await Promise.all(scope.wakeTurns);
+        while (wakes.length < scope.wakeTurns.length) wakes = await Promise.all(scope.wakeTurns);
         wakeCalls = wakes.flatMap(w => w.calls);
         wakeError = wakes.find(w => w.error)?.error;
       } finally {

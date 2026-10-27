@@ -229,6 +229,8 @@ export class EmailAdapter implements Channel {
   private readonly slotWaiters = new Set<string>();
   /** True between start() and stop() — outbound-queue readiness (#1380). */
   private running = false;
+  /** subscribeOutbound() ran: the bus has no unsubscribe, so a second call would double every send. */
+  private outboundSubscribed = false;
 
   // ── Watchdog state ─────────────────────────────────────────────────────────
   // Tracks the last successful poll completion time for stall detection.
@@ -398,9 +400,11 @@ export class EmailAdapter implements Channel {
    * and system notifications (outbound.notification). start() calls it before polling. The
    * test-mode recording stack (#2312) calls it alone, against recording clients, so a
    * scenario's relayed reply takes this exact path without an inbox, a poll or a real client.
-   * Call once per adapter.
+   * Safe to call twice: the second call is a no-op, so a reply is never sent twice.
    */
   subscribeOutbound(): void {
+    if (this.outboundSubscribed) return;
+    this.outboundSubscribed = true;
     const { bus, logger } = this.config;
 
     // Subscribe to outbound messages for this specific email account.

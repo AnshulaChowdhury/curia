@@ -7,6 +7,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import * as path from 'node:path';
 import * as yaml from 'js-yaml';
 import { hasBacklog, type PrincipalBacklogCounts } from '../../src/agents/prompts/backlog-line.js';
+import { isKnownPiiLabel } from '../../src/pii/scrubber.js';
 import { registrableDomain } from '../../src/verification/domain.js';
 import { hasDatePlaceholders, resolveDatePlaceholders } from '../shared/date-placeholders.js';
 import { LIVE_SEARCH_TOOL } from '../shared/live-search.js';
@@ -254,16 +255,25 @@ function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, f
     case 'decision_recorded': {
       const decision = body['decision'];
       if (decision !== 'yes' && decision !== 'no') throw new CaseError(file, `${at}: 'decision' must be yes or no`);
-      return { kind, label: str(body, 'label', file, at), decision };
+      return { kind, label: piiLabel(body, file, at), decision };
     }
     case 'reviewed': {
       const outcome = optStr(body, 'outcome', file, at);
       if (outcome !== undefined && !(REVIEW_OUTCOMES as readonly string[]).includes(outcome)) {
         throw new CaseError(file, `${at}: 'outcome' must be one of ${REVIEW_OUTCOMES.join(', ')}`);
       }
-      return { kind, label: str(body, 'label', file, at), ...(outcome !== undefined ? { outcome: outcome as ReviewOutcome } : {}) };
+      return { kind, label: piiLabel(body, file, at), ...(outcome !== undefined ? { outcome: outcome as ReviewOutcome } : {}) };
     }
   }
+}
+
+/** A `label` that must name a PII pattern (built-in or extra_N): a typo would pass a `reviewed` check never or a count:0 check always. */
+function piiLabel(body: Raw, file: string, at: string): string {
+  const label = str(body, 'label', file, at);
+  if (!isKnownPiiLabel(label)) {
+    throw new CaseError(file, `${at}: 'label' ${label} is not a PII label (a built-in pattern name such as phone_us or sin_ca, or extra_N)`);
+  }
+  return label;
 }
 
 function parseCheck(raw: unknown, file: string, where: string): BehaviorCheck {

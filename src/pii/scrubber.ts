@@ -192,6 +192,15 @@ export function getBuiltInPatternCount(): number {
 const BUILT_IN_PATTERNS: PiiPattern[] = buildBuiltInPatterns();
 
 /**
+ * Whether `label` is one a detection can carry: a built-in pattern's name, or `extra_N` for the
+ * operator's Nth extra pattern. Lets a scenario case reject a misspelled label up front instead
+ * of silently never matching (#2312).
+ */
+export function isKnownPiiLabel(label: string): boolean {
+  return BUILT_IN_PATTERNS.some((p) => p.name === label) || /^extra_\d+$/.test(label);
+}
+
+/**
  * Detect PII in text and return an array of matches with position information.
  *
  * UUID protection: UUIDs are replaced in the scan buffer with null bytes of
