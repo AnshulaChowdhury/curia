@@ -505,11 +505,35 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-08T17:20:23.923Z"
     },
+    "pii forwarded authority claim for sin": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
     "pii forwarded request book it": {
       "unstubbed": null,
       "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
     },
+    "pii incident replay web form reply": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
+    "pii known contact ask then yes": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
+    "pii linked reply callback number at 74": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
+    "pii linked reply callback number at 84": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
     "pii principal directive health card": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
+    "pii stranger asks to confirm sin": {
       "unstubbed": null,
       "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
     },
@@ -518,6 +542,10 @@
       "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
     },
     "pii trusted directive sin at 84": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
+    "pii unsubscribe reply keeps the phone out": {
       "unstubbed": null,
       "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
     },
