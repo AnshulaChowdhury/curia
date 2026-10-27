@@ -51,13 +51,32 @@ message must pass through it regardless of origin.
 
 **Pipeline (in order):**
 1. **Blocked contact check** — reject immediately if the recipient is blocked
-2. **Content filter** — run the two-stage filter pipeline (see below)
+2. **PII step** — tier gating redacts detected personal details to `[REDACTED: …]` tokens and reports the labels in the send result (`redactions`, labels only). Band gating only *detects*; the band review rules on each item (see [Personal details](#personal-details-outreach-links-and-asks))
+2a. **Content filter** — run the two-stage filter pipeline (see below); its Stage 2 judge sees the redacted copy, and a Stage 2 block wins over any disclosure ruling
 3. **Relay budget** — a send to the principal alone that an outside contact caused counts against that contact's hourly budget; over it, the message goes to the principal's digest instead (#1320, spec 14)
 4. **Channel dispatch** — route to the appropriate channel client (`email` → Nylas, etc.)
 5. **Audit emission** — on successful wire-level delivery, emit `outbound.delivered`
 
 The gateway fails closed: if the content filter crashes, the message is blocked. A channel
 client failure returns a structured error; it does not silently drop the message.
+
+### Personal details, outreach links and asks
+
+Authority-aware PII disclosure, [ADR-054](../adr/054-authority-aware-pii-disclosure.md) (#2312). The full policy table and judge contract are in [spec 14](14-autonomy-engine.md#personal-details-under-band-gating-2312); this is the gateway's side.
+
+**Band flow: detect → judge per item → policy table → act.** `PiiRedactor.detect(content, channel, ctx)` returns the items that would have been redacted (`id`, `label`, span, matched text) from the subject, the body and, for email replies, the quoted thread. `apply` is the old redaction, kept for tier gating and fallbacks. The recipient set for the principal-only bypass is the filter's own, with Curia's mailboxes excluded, so "To: principal, cc: third party" is no longer exempt (both modes). Under band, nothing is cut, no token is delivered, and a stray `[REDACTED: …]` in a body or subject is itself a defect (bounce, then block). The agent's error or success note names the labels, never the values; `outbound_context.content_preview` and `outbound.delivered` store what was delivered, with labels only for what was withheld. If the judge fails, every item is treated as unsupported and the draft bounces (fail closed).
+
+**Authority.** The judge's `directed`/`inferred` rulings count only for an authority code confirms from the stamped originator (tier, system role, channel, `authenticated`), the live turn, the task and root task, and the reply link. Authenticated means Signal, Slack, or email with `senderVerified`; SMS and voice never count. A trusted contact's explicit directive sends and copies the principal (email `cc`, or an urgent report item elsewhere).
+
+**Outreach links.** `task_outreach` rows (migration 107) record whom Curia contacted for a task: domains, addresses, contact ids, the contact given on a form, a one-line summary, `confirmed`, a 30-day expiry, closed with the task. Writers are task-bound email/other sends, the coordinator-only `record-outreach` tool (forms, calls), and a `web-browser` backstop that records an unconfirmed skeleton row when a task-bound turn types the principal's or Curia's address or number into a page. Only explicit acts on principal-originated turns set `confirmed`. For a non-principal email the dispatcher matches, in order, address, known contact, and the organization domain (a deny list of freemail, shared-tenant and private-suffix hosts excluded on both sides), preferring the newest confirmed row; a fast-tier model check over up to ten open rows is the weak fallback. Auto-generated mail is skipped, and channel-supplied `linkedTask`/`boundTask` are stripped. The link is **strong** only for a direct match, an authenticated sender and a confirmed row; everything else is **weak**. The reply turn answers; the task gets a progress note and is not woken. The link carries the task as context and judge evidence, never a tier change, and the sender's address is learned onto the row only after a strong link or the principal's yes. Link authority applies only when every non-principal recipient is a linked counterparty.
+
+**Asks and decisions.** A requested, askable `unsupported` item (or an `inferred` one below 80 with no strong link) holds the original send as an approval whose display opens with "<requester> wants your <label> to <summary>. Share it?" and lists every personal detail with its value. The ask rides on the action row (`disclosure_ask`), never in the replayed payload; the agent is told to deliver the approval and send a holding reply without the data. `approve-action` refuses an approval carrying personal details that was never delivered. A yes or no is stored in `disclosure_decisions` (migration 108: conversation, counterparty, label, decision, `decided_by`); a yes authorizes that label to that counterparty on that thread only, a no stops asks there, and the principal's newest live word wins. Relayed replies hold rather than block.
+
+**Quoted thread.** Details only in quoted text are exempt when every non-principal recipient was on the quoted message; otherwise the quote is dropped.
+
+**Saved drafts.** `send-draft` detects and reviews like a send. A draft cannot bounce, so any outcome but "send" holds. Under tier gating, a draft with detected details is refused unless principal-directed. The draft passes as approved only if it still matches the approved subject and body.
+
+**Under `gating: tier`** only the reporting applies (the redacted labels in send results). The quoted thread is not scanned.
 
 ### `outbound.delivered` — the canonical wire-level audit event
 

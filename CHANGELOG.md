@@ -82,11 +82,13 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`record-outreach`** — records web forms and calls for a task so the organization's reply finds it. (#2312)
 - **Linked outreach replies** — an email answering Curia's outreach arrives knowing its task, which gets a note. (#2312)
 - **`taskOutreach` capability** — **public API:** new `ToolContext` field for recording task outreach. (#2312)
-- **PII ask memory** — the principal's yes or no on a personal-data ask applies to that thread. (#2312)
-- **Direct PII ask** — the principal is asked directly when someone requests their data. (#2312)
+- **PII ask and memory** — the principal is asked when someone requests their data; the answer sticks per thread. (#2312)
 - **`disclosureDecisions` capability** — **public API:** new `ToolContext` field recording the principal's answer to an ask. (#2312)
 - **Per-case autonomy fixtures** — scenario cases pin their own score and gating, so mixed fixtures share one run. (#2312)
 - **Through-gateway scenario sends** — opted-in cases send through production's review into recording transports, checked deterministically. (#2312, #2192)
+- **Scenario gateway checks** — cases assert delivered, held, not-held, reviewed, outreach and decision outcomes. (#2312)
+- **Scenario `inbound.then`** — a case sends the principal a second message after the first turn replies. (#2312)
+- **ADR-054** — authority-aware PII disclosure: the judge rules per item; code decides who authorized. (#2312)
 
 ### Changed
 

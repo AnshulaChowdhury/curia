@@ -317,6 +317,7 @@ Under `band` the outbound filter's `contact-data-leak` rule and Stage 2.5 are of
 |---|---|
 | Principal-directed (a live principal turn) | grounding |
 | Everything else, at every band | purpose, speaks as principal, grounding, necessity |
+| Any send with detected personal details | plus **disclosure**, principal-directed sends included |
 
 `send-draft` is the exception: a principal-directed draft send (a live turn or an approval) is not reviewed at all, because `send-draft` marks every call `humanApproved` and a stored draft cannot be edited; an autonomous one (a woken task) gets all four questions.
 
@@ -328,6 +329,31 @@ Under `band` the outbound filter's `contact-data-leak` rule and Stage 2.5 are of
 | judge failure | 80+: send with a `sent_without_review` item, at most five an hour, then hold until a judge call succeeds and email the principal once; below 80: hold. A failure on the recheck of a bounced draft holds. |
 
 A bounce publishes `outbound.blocked`, so a relayed reply goes through the dispatcher's rewrite, and shows the drafter only text quoted verbatim from its message. A hold raises an approval through the send's `holdRecipe` (each send skill replays itself; relayed replies replay through `dispatcher-relay`) and never publishes `outbound.blocked`; a hold with no approval behind it queues a digest item. Sends the principal approved (`humanApproved`), system notifications and sends to the principal alone are not reviewed; sends to the principal alone are capped by the relay budget instead (below). A block never publishes `outbound.blocked` either (it would restart the relay rewrite loop); the bounce ledger entry survives a block with its time refreshed, so each further draft is still a recheck until one is clean.
+
+### Personal details under band gating (#2312)
+
+See [ADR-054](../adr/054-authority-aware-pii-disclosure.md). Under `band` the gateway never redacts, cuts or tokenizes. The flow is **detect → judge per item → policy table → act**, and no `[REDACTED: …]` token is ever delivered. `PiiRedactor.detect` finds the items in the subject, the body and the quoted thread (the principal-only bypass uses the full recipient set, Curia's own mailboxes excluded); the brief's `disclosure` question rules on each (at most ten, more is treated as unsupported) as `directed`, `inferred` or `unsupported`, and whether the recipient asked. Detected items are ruled on under `disclosure` only; `necessity` findings that overlap them are dropped, and a report whose only recipient is the principal is never a disclosure.
+
+**Authority evidence** is computed by code, never taken from the judge (`SendEvidenceCollector`): the originator's tier, system role and channel; whether the originating message authenticated its sender (`TaskOriginator.authenticated`, stamped with the originator and carried to wakes and child tasks, absent means false); the live turn; the bound task and its root task; the reply's task link and its strength; the principal's recorded yes/no for the thread; and the `principal.report` items the turn filed. Text inside forwarded or quoted content is labelled so and grants nothing.
+
+| Ruling | Who directed (code-confirmed) | At 80+ | Below 80 |
+|---|---|---|---|
+| `directed` | the principal: live turn, the send's task or its root task, or a recorded yes | send | send |
+| `directed` | a trusted contact on an authenticated channel (stamped and current tier both `trusted`; checked before a principal-rooted task) | send, principal copied | send, principal copied |
+| `inferred` | a principal-directed task, or a strong link to one | send | hold, ask if askable |
+| `inferred` | only a weak link | hold, ask if askable | hold, ask if askable |
+| `unsupported`, requested, requester askable | n/a | hold, ask | hold, ask |
+| `unsupported` or any other `directed`/`inferred` | n/a | bounce | bounce |
+
+A bounce goes to the drafter once. A second unapproved item is a block at 80+ and a hold below 80; a relayed reply or a saved draft, with no drafter, is held. A principal-rooted task reached by an outsider's turn downgrades `directed` to `inferred`. An ask is raised only when the requester was asked for the data and is **askable**: every non-principal recipient is a linked counterparty of a principal-directed task or a `known`/`trusted` contact. A cold stranger gets a bounce, a polite decline and a digest note. If the judge fails or times out, every item is unsupported and not askable (fail closed). When review is not running (a system notification), the tier redaction fallback applies.
+
+**Quoted-thread exemption.** A detail only in the quoted thread is not a disclosure when every non-principal recipient was on the quoted message; otherwise the unauthorized quote is dropped, not bounced.
+
+**Reply links** (`task_outreach`, [spec 15](15-outbound-safety.md#personal-details-outreach-links-and-asks)). A link is *strong* only for a direct match (address, known contact, or the organization's own domain) from an authenticated sender to a `confirmed` row (an explicit outreach act on a principal-originated turn); anything else, including a model-inferred match, is *weak*. A weak link never unlocks an `inferred` disclosure; it only makes the requester askable. A link never raises the sender's tier.
+
+**Asks and decisions.** A `hold → ask` keeps the original send as the held action, and its approval leads with the question. `approve-action`, `deny-action` and reactions record the answer in `disclosure_decisions` (`decided_by`: `principal_reaction` or `principal_via_coordinator`): a yes authorizes that label to that counterparty on that thread, a no turns later asks there into bounces, and a live principal directive overrides an earlier no. `send-draft` records a yes only on a live principal turn with a delivered approval. Approved replays send intact; the approval display lists every personal detail (label and value), and `approve-action` refuses an approval carrying personal details that was never delivered.
+
+**Saved drafts.** `send-draft` runs the same detection and review (it cannot bounce, so anything but "send" holds); a principal-directed draft gets a disclosure-only review. A draft passes as approved only when its stored subject and body match what was approved.
 
 Relayed replies skip the dispatcher's tier Gate C (except #1059's missing-tier escalate) and get all four questions at the gateway.
 
