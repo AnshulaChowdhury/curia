@@ -640,6 +640,11 @@ export async function sweepLeftovers(stack: TestModeStack): Promise<Record<strin
   await count('verifications',
     `DELETE FROM verifications WHERE conversation_id LIKE ANY($1::text[])`,
     [[`${SCENARIO_VERIFICATION_ORIGIN}%`, ...SCENARIO_CONVERSATION_PREFIXES.map(p => `${p}%`)]]);
+  // Outreach a run's sends recorded (#2312), task-bound or not: a taskless row is scoped to
+  // the run's conversation, and nothing cascades it away.
+  await count('task_outreach',
+    `DELETE FROM task_outreach WHERE conversation_id LIKE ANY($1::text[])`,
+    [SCENARIO_CONVERSATION_PREFIXES.map(p => `${p}%`)]);
   const conversations = await sweepConversations(stack.pool, SCENARIO_CONVERSATION_PREFIXES);
   for (const [table, rows] of Object.entries(conversations)) {
     if (rows > 0) removed[table] = rows;
@@ -707,6 +712,11 @@ export async function cleanupRun(
   const specialists = [...scope.specialistConversations];
   for (const specialist of specialists) {
     await attempt(() => cleanupConversation(stack.pool, specialist));
+  }
+  // Outreach the run's sends recorded (#2312), taskless rows included.
+  const runConversations = [...(conversationId ? [conversationId] : []), ...specialists];
+  if (runConversations.length > 0) {
+    await attempt(() => stack.pool.query(`DELETE FROM task_outreach WHERE conversation_id = ANY($1::text[])`, [runConversations]));
   }
   if (conversationId || specialists.length > 0) {
     // A dispatch claim a timed-out delegation kept (#1893): nothing in test mode promotes
