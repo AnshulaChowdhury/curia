@@ -152,6 +152,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Trusted-contact directives** — sending the principal's details at a trusted contact's request copies the principal. (#2312)
 - **Approval displays** — approvals for sends list every personal detail they would send. (#2312)
 - **Unseen approvals** — a send approval with personal details can't be approved until it's shown. (#2312)
+- **Disclosure audit** — **Public API:** `outbound.delivered` gains `disclosed`, labels of details sent as written. (#2312)
+- **Draft sends** — a draft edited after its checks is not sent. (#2312)
 
 ### Removed
 

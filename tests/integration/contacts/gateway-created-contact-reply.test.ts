@@ -89,13 +89,13 @@ describeIf('Reply from a gateway-created contact (#2040)', () => {
       name: 'send-draft',
       source: 'outbound_recipient' as const,
       verified: false,
-      send: (gateway: OutboundGateway, address: string) =>
-        gateway.sendEmailDraft(
-          `draft-${runId}`,
-          'curia',
-          { recipientEmail: address, body: 'Confirming the venue for the 14th.', subject: 'Venue' },
-          { humanApproved: true },
-        ),
+      send: (gateway: OutboundGateway, address: string) => {
+        const meta = { recipientEmail: address, body: 'Confirming the venue for the 14th.', subject: 'Venue' };
+        // The gateway re-reads the draft before sending it (#2312): unchanged since the check.
+        const client = (gateway as unknown as { getNylasClient(a: string): Record<string, unknown> }).getNylasClient('curia');
+        client['getDraft'] = vi.fn().mockResolvedValue({ to: [{ email: address }], cc: [], bcc: [], body: meta.body, subject: meta.subject });
+        return gateway.sendEmailDraft(`draft-${runId}`, 'curia', meta, { humanApproved: true });
+      },
     },
     {
       name: 'email-reply',

@@ -2518,6 +2518,18 @@ describe('Dispatcher content-block relay (#1355)', () => {
       says: ['nothing it looked up supports', 'its purpose does not need'],
       doesNotSay: [],
     },
+    {
+      label: 'unauthorized personal details (#2312)',
+      lastFindings: [{ rule: 'pii-not-authorized', detail: 'phone number (P1): nobody asked for it.' }],
+      says: ['personal details nobody authorized'],
+      doesNotSay: ['nothing it looked up supports'],
+    },
+    {
+      label: 'a placeholder (#2312)',
+      lastFindings: [{ rule: 'redaction-token', detail: 'The message has a placeholder.' }],
+      says: ['a placeholder where a detail was removed'],
+      doesNotSay: ['personal details nobody authorized'],
+    },
   ])('asks the principal, naming $label, when a band bounce comes after the last retry (#2159)', async ({ lastFindings, says, doesNotSay }) => {
     const logger = createLogger('error');
     const bus = new EventBus(logger);

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { OutboundGateway, UnknownEmailAccountError, hasTransientErrorSignal } from '../../../src/skills/outbound-gateway.js';
 import { createLogger } from '../../../src/logger.js';
-import type { NylasClient } from '../../../src/channels/email/nylas-client.js';
+import type { NylasClient, NylasMessage } from '../../../src/channels/email/nylas-client.js';
 import type { ContactService } from '../../../src/contacts/contact-service.js';
 import type { OutboundContentFilter } from '../../../src/dispatch/outbound-filter.js';
 import type { EventBus } from '../../../src/bus/bus.js';
@@ -28,6 +28,28 @@ function reasonBeforeRecipientNote(reason: string | undefined): string | undefin
 
 const mockReadFile = readFile as ReturnType<typeof vi.fn>;
 const mockRealpath = realpath as ReturnType<typeof vi.fn>;
+
+type DraftMeta = Parameters<OutboundGateway['sendEmailDraft']>[2];
+/** The stored draft a send checked, as Nylas returns it. */
+function storedDraft(meta: DraftMeta): NylasMessage {
+  const to = (meta.allRecipients && meta.allRecipients.length > 0 ? meta.allRecipients : [meta.recipientEmail]).map((email) => ({ email }));
+  return { id: 'd', threadId: 't', subject: meta.subject, from: [], to, cc: [], bcc: [], body: meta.body, snippet: '', date: 0, unread: false, folders: [], attachments: [] };
+}
+
+// sendEmailDraft re-reads the draft just before sending and refuses one that changed (#2312).
+// Unless a test stubs getDraft itself, the re-read serves back the draft that call checked.
+const echoedGetDrafts = new WeakSet<object>();
+const realSendEmailDraft = OutboundGateway.prototype.sendEmailDraft;
+OutboundGateway.prototype.sendEmailDraft = function (this: OutboundGateway, draftId, accountId, meta, options) {
+  const client = (this as unknown as { getNylasClient(a?: string): Record<string, unknown> | undefined }).getNylasClient(accountId);
+  const own = client?.['getDraft'];
+  if (client && (own === undefined || echoedGetDrafts.has(own as object))) {
+    const echo = vi.fn().mockResolvedValue(storedDraft(meta));
+    echoedGetDrafts.add(echo);
+    client['getDraft'] = echo;
+  }
+  return realSendEmailDraft.call(this, draftId, accountId, meta, options);
+};
 
 /**
  * Build fresh vi.fn() mocks for each test. Using beforeEach + createMocks()
@@ -2833,6 +2855,34 @@ describe('OutboundGateway.sendEmailDraft', () => {
     expect(arg.recipients).toEqual([{ email: 'ceo@example.com', isPrincipal: true }]);
   });
 
+  it('does not send a draft edited after it was checked (#2312)', async () => {
+    const getDraft = vi.fn().mockResolvedValue(storedDraft({ ...DRAFT_META, body: '<p>Hello, my SIN is 130 692 544</p>' }));
+    const { gateway, nylasClient } = makeGateway({ nylasClient: { getDraft } });
+    const result = await gateway.sendEmailDraft(DRAFT_ID, 'joseph', DRAFT_META);
+    expect(result).toMatchObject({ success: false, blockedReason: expect.stringContaining('The draft changed while it was being checked') });
+    expect(getDraft).toHaveBeenCalledWith(DRAFT_ID);
+    expect(nylasClient.sendDraft).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a new recipient', { allRecipients: ['partner@example.com', 'other@example.com'] }],
+    ['a draft that is gone', null],
+  ])('does not send a draft with %s since it was checked (#2312)', async (_label, change) => {
+    const getDraft = vi.fn().mockResolvedValue(change === null ? null : storedDraft({ ...DRAFT_META, ...change }));
+    const { gateway, nylasClient } = makeGateway({ nylasClient: { getDraft } });
+    const result = await gateway.sendEmailDraft(DRAFT_ID, 'joseph', DRAFT_META);
+    expect(result.success).toBe(false);
+    expect(nylasClient.sendDraft).not.toHaveBeenCalled();
+  });
+
+  it('does not send a draft when the re-read fails (fail-closed, #2312)', async () => {
+    const getDraft = vi.fn().mockRejectedValue(new Error('Nylas down'));
+    const { gateway, nylasClient } = makeGateway({ nylasClient: { getDraft } });
+    const result = await gateway.sendEmailDraft(DRAFT_ID, 'joseph', DRAFT_META);
+    expect(result.success).toBe(false);
+    expect(nylasClient.sendDraft).not.toHaveBeenCalled();
+  });
+
   it('returns failure when nylasClient.sendDraft throws', async () => {
     const { gateway } = makeGateway({
       nylasClient: {
@@ -4398,6 +4448,17 @@ describe('band review (#2159)', () => {
       expect(delivered).toHaveLength(1);
       expect(String(delivered[0]!.payload['content'])).toContain('[REDACTED: PHONE_US]');
       expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
+      expect(delivered[0]!.payload['disclosed']).toEqual([{ label: 'phone_us', field: 'body' }]);
+    });
+
+    it('records a quoted detail the review let out, which the audit body cannot show', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const { gateway } = await makePiiGateway({ review });
+      await gateway.send({ ...phoneReq, body: 'See below.', htmlQuote: '<blockquote>SIN 130 692 544</blockquote>' }, { taskEventId: 't1' });
+
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered[0]!.payload['disclosed']).toEqual([{ label: 'sin_ca', field: 'quote' }]);
+      expect(JSON.stringify(delivered[0]!.payload)).not.toContain('130 692 544');
     });
 
     it('gives the content filter a redacted copy', async () => {
@@ -4573,6 +4634,33 @@ describe('band review (#2159)', () => {
       expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
     });
 
+    it('gives the content filter and its block event a redacted copy of an approved replay', async () => {
+      const { gateway } = await makePiiGateway({ review: vi.fn() });
+      vi.mocked(mocks.contentFilter.check).mockResolvedValueOnce({ passed: false, findings: [{ rule: 'llm-judge-audience-leak', detail: 'x' }] });
+      const result = await gateway.send(phoneReq, { humanApproved: true });
+
+      expect(result.success).toBe(false);
+      expect(mocks.contentFilter.check).toHaveBeenCalledWith(expect.objectContaining({ content: 'Call me on [REDACTED: PHONE_US] tomorrow.' }));
+      const blocked = publishedOfType(mocks.bus, 'outbound.blocked');
+      expect(blocked).toHaveLength(1);
+      expect(String(blocked[0]!.payload['content'])).not.toContain('555-1234');
+    });
+
+    it('sends an approved reply without its quote when the quote has details the approval did not show', async () => {
+      const { gateway } = await makePiiGateway({ review: vi.fn() });
+      const result = await gateway.send({ ...phoneReq, body: 'See below.', htmlQuote: '<blockquote>My SIN is 130 692 544</blockquote>' }, { humanApproved: true });
+
+      expect(result.success).toBe(true);
+      expect(sentEmail().body).not.toContain('130 692 544');
+      expect(sentEmail().body).not.toContain('blockquote');
+    });
+
+    it('keeps an approved reply\'s quote when it has no personal details', async () => {
+      const { gateway } = await makePiiGateway({ review: vi.fn() });
+      await gateway.send({ ...phoneReq, body: 'See below.', htmlQuote: '<blockquote>Thanks for the update.</blockquote>' }, { humanApproved: true });
+      expect(sentEmail().body).toContain('Thanks for the update.');
+    });
+
     it('sends an approved Signal replay intact, with a redacted audit event', async () => {
       const review = vi.fn();
       const { gateway, signalClient } = await makePiiGateway({ review, withSignal: true });
@@ -4677,6 +4765,19 @@ describe('band review (#2159)', () => {
         expect(sendDraft).toHaveBeenCalledWith('d1');
         const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
         expect(String(delivered[0]!.payload['content'])).toBe('Call me on [REDACTED: PHONE_US] tomorrow.');
+      });
+
+      it('gives the content filter and its block event a redacted copy of an approved draft', async () => {
+        const sendDraft = draftSender();
+        const { gateway } = await makePiiGateway({ review: vi.fn() });
+        vi.mocked(mocks.contentFilter.check).mockResolvedValueOnce({ passed: false, findings: [{ rule: 'llm-judge-audience-leak', detail: 'x' }] });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, principalApproved: true, taskEventId: 't1' });
+
+        expect(result.success).toBe(false);
+        expect(sendDraft).not.toHaveBeenCalled();
+        expect(mocks.contentFilter.check).toHaveBeenCalledWith(expect.objectContaining({ content: 'Call me on [REDACTED: PHONE_US] tomorrow.' }));
+        const blocked = publishedOfType(mocks.bus, 'outbound.blocked');
+        expect(String(blocked[0]!.payload['content'])).not.toContain('555-1234');
       });
 
       it('refuses a draft with details under tier gating: it cannot be redacted in place', async () => {

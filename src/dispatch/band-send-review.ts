@@ -358,6 +358,9 @@ export class BandSendReview {
    */
   private async authorityOf(a: SendAuthority | undefined, rulings: readonly DisclosureRuling[]): Promise<'principal' | 'principal-task' | 'trusted' | 'none'> {
     if (!a) return 'none';
+    // `liveTurn` is context for the judge only. Code trusts the stamped role: stampOriginator
+    // sets systemRole 'principal' only from the resolved sender, and a wake carries the
+    // originator its job was created with.
     if (a.originator?.systemRole === 'principal') return 'principal';
     if ([a.boundTask?.originator, a.rootTask?.originator].some((o) => o?.systemRole === 'principal')) return 'principal-task';
     const o = a.originator;

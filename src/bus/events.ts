@@ -271,6 +271,10 @@ interface OutboundDeliveredPayload {
     toolName?: string;
     agentId?: string;
   };
+  /** Personal details that went out as written (authorized by the band review, or a draft
+   *  the principal directed), by label and field, never the values (#2312). `content` is the
+   *  redacted body and cannot show a quote's, so this does. */
+  disclosed?: Array<{ label: string; field: 'body' | 'subject' | 'quote' }>;
 }
 
 // ExportDeliveredPayload — emitted by ExecutionLayer after a successful MCP

@@ -1203,11 +1203,27 @@ export class OutboundGateway {
     const detectedItems: BriefDetectedItem[] = [];
     // Labels of what the redactor changed, reported on the send result (#2312).
     const appliedRedactions: NonNullable<OutboundSendResult['redactions']> = [];
+    // An approved replay's quoted thread holds details the principal was not shown (#2312).
+    let dropIntactQuote = false;
     if (this.piiRedactor && sendIntact) {
       this.log.info(
         { channel: request.channel },
         'outbound-gateway: PII detection skipped — an approved send goes out as the principal approved it',
       );
+      // Sent as written, but the content filter and the audit events still get redacted copies.
+      redactedBody = this.redactedCopy(messageBody, request.channel, recipientId);
+      if (request.channel === 'email' && request.subject) redactedSubject = this.redactedCopy(request.subject, 'email', recipientId);
+      // The approval showed the body and subject. A reply's quote is rebuilt at send time and was
+      // never shown, so personal details in it go out only after a review: here, without it.
+      if (request.channel === 'email' && request.htmlQuote) {
+        try {
+          dropIntactQuote = this.piiRedactor.detect(request.htmlQuote, 'email', { recipientId, principalIsSoleRecipient }).length > 0;
+        } catch (err) {
+          this.log.warn({ err }, 'outbound-gateway: PII redactor threw scanning an approved reply\'s quote — sending without it');
+          dropIntactQuote = true;
+        }
+        if (dropIntactQuote) this.log.info('outbound-gateway: approved reply sent without its quoted message — the quote has details the approval did not show');
+      }
     } else if (this.piiRedactor && bandReviewRuns) {
       const redactor = this.piiRedactor;
       try {
@@ -1232,6 +1248,8 @@ export class OutboundGateway {
         return this.blockForRedactorError(err, request, messageBody, recipientId, options);
       }
     } else if (this.piiRedactor) {
+      // Tier redaction (and band with no review). An email's quoted thread is not scanned or
+      // redacted here: that is the pre-#2312 behavior, unchanged. Band review covers quotes above.
       try {
         const redactionResult = await this.piiRedactor.redact(
           messageBody,
@@ -1490,15 +1508,20 @@ export class OutboundGateway {
     //
     // The spot-check preview is the redacted copy whenever the wire is raw: a sample row is
     // not where a disclosure the review authorized should be repeated (#2312).
-    const rawOnWire = detectedItems.length > 0;
+    // Only the review fills detectedItems; naming it here keeps a future path that detects
+    // without reviewing from sending raw behind a redacted audit copy.
+    const rawOnWire = bandReviewRuns && detectedItems.length > 0;
     // The outbound.delivered content never carries raw values: the redacted copy whenever the
-    // wire may be raw (#2312). An intact replay was never detected, so it is redacted here.
-    const auditBody = sendIntact ? this.redactedCopy(sendBody, request.channel, recipientId) : redactedBody;
+    // wire may be raw (#2312), an intact replay's included.
+    const auditBody = redactedBody;
+    // What the review let go out raw, by label: the audit's record of the disclosure.
+    const disclosed = rawOnWire ? { disclosed: detectedItems.map(({ label, field }) => ({ label, field })) } : {};
     if (request.channel === 'email') {
       // Provenance lives on the request so a queued payload keeps it. Only send()
       // options set it; a value already on the request is dropped. dispatchEmail
       // copies named provider fields, so Nylas never sees these (#2071).
       const toSend: EmailSendRequest = { ...request, body: sendBody, subject: sendSubject };
+      if (dropIntactQuote) delete toSend.htmlQuote;
       delete toSend.recipientSource;
       delete toSend.recipientDisplayName;
       this.signEmail(toSend, options?.isSystemNotification === true);
@@ -1531,6 +1554,7 @@ export class OutboundGateway {
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
+          ...disclosed,
           ...(exportAuditItems && exportAuditItems.length > 0
             ? {
               exportAudit: {
@@ -1545,7 +1569,7 @@ export class OutboundGateway {
         if (sampled) {
           await this.recordSentAction({
             ...sampleArgs,
-            preview: rawOnWire ? (redactedSubject || redactedBody) : (toSend.subject || toSend.body),
+            preview: rawOnWire || sendIntact ? (redactedSubject || redactedBody) : (toSend.subject || toSend.body),
           });
         }
       }
@@ -1572,6 +1596,7 @@ export class OutboundGateway {
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
+          ...disclosed,
         });
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
@@ -1595,6 +1620,7 @@ export class OutboundGateway {
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
+          ...disclosed,
         });
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
@@ -1625,6 +1651,7 @@ export class OutboundGateway {
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
+          ...disclosed,
         });
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
@@ -1651,11 +1678,11 @@ export class OutboundGateway {
 
   /**
    * A redacted copy of sent text for an audit event (#2312): what tier redaction would have
-   * sent, never published as a redaction. Without a redactor the text is returned as is. If
-   * the redactor throws, the best-effort scrubber stands in: the audit must not carry values.
+   * sent, never published as a redaction. Without a redactor, or if it throws, the best-effort
+   * scrubber stands in: the audit must not carry values.
    */
   private redactedCopy(text: string, channel: string, recipientId: string): string {
-    if (!this.piiRedactor) return text;
+    if (!this.piiRedactor) return scrubPii(text);
     try {
       const ctx = { recipientId };
       return this.piiRedactor.apply(text, this.piiRedactor.detect(text, channel, ctx), channel, ctx, { audit: false }).content;
@@ -1667,7 +1694,8 @@ export class OutboundGateway {
 
   /**
    * Add the principal's verified email to an email's CC, unless they are already a recipient
-   * (#2312). Returns false when there is no verified address to add.
+   * (#2312). Returns false when there is no verified address to add. Any verified mailbox meets
+   * the obligation (a copy reaches the principal), so the first one is used.
    */
   private ccPrincipal(toSend: EmailSendRequest): boolean {
     const principal = this.principalIdentities.find((i) => i.channel === 'email' && i.verified && i.status === 'active')?.channelIdentifier;
@@ -2523,6 +2551,7 @@ export class OutboundGateway {
       toolName?: string;
       agentId?: string;
     };
+    disclosed?: Array<{ label: string; field: 'body' | 'subject' | 'quote' }>;
   }): Promise<void> {
     try {
       const { exportAudit, ...rest } = payload;
@@ -3572,6 +3601,9 @@ export class OutboundGateway {
     let redactedSubject = draftMeta.subject;
     if (this.piiRedactor && options?.principalApproved === true) {
       this.log.info({ draftId }, 'outbound-gateway: PII detection skipped — the principal approved this draft as written');
+      // Sent as written, but the content filter and the audit events still get redacted copies.
+      redactedBody = this.redactedCopy(body, 'email', recipientEmail);
+      if (draftMeta.subject) redactedSubject = this.redactedCopy(draftMeta.subject, 'email', recipientEmail);
     } else if (this.piiRedactor && !draftPrincipalSole) {
       const redactor = this.piiRedactor;
       try {
@@ -3741,6 +3773,16 @@ export class OutboundGateway {
       };
     }
 
+    // The checks above read the draft as fetched, and the send is by id after a review that can
+    // take seconds. Send only if the draft is still what was checked (#2312): an edit in the
+    // meantime gets checked again on the next send, not sent unchecked.
+    if (await this.draftChangedSinceFetch(nylasClient, draftId, draftMeta)) {
+      return {
+        success: false,
+        blockedReason: 'The draft changed while it was being checked, so it was not sent. Send it again to check the current version.',
+      };
+    }
+
     let sentMessage: NylasMessage;
     try {
       sentMessage = await nylasClient.sendDraft(draftId);
@@ -3771,13 +3813,13 @@ export class OutboundGateway {
       channel: 'email',
       recipientId: recipientEmail,
       recipientContactId: recipientContactIdForDraft,
-      // Never the raw values (#2312): the redacted copy when the draft carried any, including
-      // an approved draft, which was not scanned above.
-      content: detectedItems.length > 0 ? redactedBody : options?.principalApproved === true ? this.redactedCopy(body, 'email', recipientEmail) : body,
+      // Never the raw values (#2312): the redacted copy, an approved draft's included.
+      content: redactedBody,
       messageId: sentMessage.id,
       conversationId: options?.conversationId,
       taskEventId: options?.taskEventId,
       parentEventId: options?.parentEventId,
+      ...(detectedItems.length > 0 ? { disclosed: detectedItems.map(({ label, field }) => ({ label, field })) } : {}),
     });
     // Spot-check pool (#2159 Phase 3). Keyed on principalDirected, not humanApproved, for
     // the reason given at the band review above: send-draft sets humanApproved on every call.
@@ -3787,10 +3829,7 @@ export class OutboundGateway {
         toolName: 'send-draft',
         recipientLabel: draftEnvelope.join(', '),
         // The redacted copy, as in send(): the draft itself when nothing was detected (#2312).
-        // An approved draft was not scanned above, so its copy is built here.
-        preview: options?.principalApproved === true
-          ? (draftMeta.subject ? this.redactedCopy(draftMeta.subject, 'email', recipientEmail) : '') || this.redactedCopy(body, 'email', recipientEmail)
-          : redactedSubject || redactedBody,
+        preview: redactedSubject || redactedBody,
         // A draft's recipient is always an email address, so always a person.
         recipient: { person: true, contactId: recipientContactIdForDraft, lookupFailed: recipientTierUnresolvedForDraft },
         band: { report: bandReport, signals: bandSignals },
@@ -3800,6 +3839,32 @@ export class OutboundGateway {
     if (bandReport) await this.publishBandReport(bandReport, options);
 
     return { success: true, messageId: sentMessage.id };
+  }
+
+  /**
+   * Whether the stored draft differs from what sendEmailDraft checked (#2312): body, subject or
+   * envelope. A draft that is gone, or a lookup that fails, counts as changed (fail closed).
+   */
+  private async draftChangedSinceFetch(
+    nylasClient: NylasClient,
+    draftId: string,
+    draftMeta: { recipientEmail: string; body: string; subject: string; allRecipients?: string[] },
+  ): Promise<boolean> {
+    let current: NylasMessage | null;
+    try {
+      current = await nylasClient.getDraft(draftId);
+    } catch (err) {
+      this.log.warn({ err, draftId }, 'outbound-gateway: draft re-read before send failed — not sending it (fail-closed)');
+      return true;
+    }
+    const envelope = (addrs: readonly string[]) => [...new Set(addrs.map((a) => a.toLowerCase()))].sort().join(',');
+    const checked = draftMeta.allRecipients && draftMeta.allRecipients.length > 0 ? draftMeta.allRecipients : [draftMeta.recipientEmail];
+    const changed = current === null
+      || current.body !== draftMeta.body
+      || current.subject !== draftMeta.subject
+      || envelope([...current.to, ...(current.cc ?? []), ...(current.bcc ?? [])].map((r) => r.email)) !== envelope(checked);
+    if (changed) this.log.warn({ draftId, gone: current === null }, 'outbound-gateway: draft changed between its checks and the send — not sending it');
+    return changed;
   }
 
   /**

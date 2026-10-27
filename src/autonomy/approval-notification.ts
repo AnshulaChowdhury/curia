@@ -342,22 +342,21 @@ function isSendSkill(toolName: string): boolean {
 const SEND_SKILLS = new Set(['email-send', 'email-reply', 'send-draft', 'dispatcher-relay']);
 /** The payload fields a sent message's text lives in, in the order they are scanned. */
 const MESSAGE_FIELD_KEYS = ['subject', 'body', 'message', 'html_quote', 'htmlQuote'] as const;
-/** How many personal details the line names before summarizing the rest. */
-export const MAX_PERSONAL_DETAILS_LISTED = 10;
-
 /**
- * The personal details a send skill's approval would send, as `<label> <value>` (#2312): the
- * full, untruncated message fields scanned with the shared scrubber core. [] for other skills.
+ * The personal details a send skill's approval would send, as `<label> <value>`, each once
+ * (#2312): the full, untruncated message fields scanned with the shared scrubber core. [] for
+ * other skills. Deliberately broader than what a channel would redact: an approved send goes
+ * out as written, so the principal sees every detail that leaves, allow-listed ones included.
  */
 function findPersonalDetails(toolName: string, payload: Record<string, unknown>): string[] {
   if (!isSendSkill(toolName)) return [];
-  const found: string[] = [];
+  const found = new Set<string>();
   for (const key of MESSAGE_FIELD_KEYS) {
     const text = payload[key];
     if (typeof text !== 'string' || text.length === 0) continue;
-    for (const match of detectPii(text)) found.push(`${match.label} ${match.matched}`);
+    for (const match of detectPii(text)) found.add(`${match.label} ${match.matched}`);
   }
-  return found;
+  return [...found];
 }
 
 /**
@@ -371,14 +370,13 @@ export function hasPersonalDetails(toolName: string, payload: Record<string, unk
 /**
  * The line listing the personal details a send skill's approval would send (#2312), or null
  * when there are none. Scans the full, untruncated message fields with the shared scrubber
- * core. The approval goes only to the principal, so the values are shown.
+ * core. The approval goes only to the principal, so the values are shown, every one of them:
+ * approving sends them all, so none may be summarized away.
  */
 export function buildPersonalDetailsLine(toolName: string, payload: Record<string, unknown>): string | null {
   const found = findPersonalDetails(toolName, payload);
   if (found.length === 0) return null;
-  const listed = found.slice(0, MAX_PERSONAL_DETAILS_LISTED).join('; ');
-  const more = found.length > MAX_PERSONAL_DETAILS_LISTED ? `; and ${found.length - MAX_PERSONAL_DETAILS_LISTED} more` : '';
-  return sanitizeOutput(`Personal details in this message (sent as written if you approve): ${listed}${more}`);
+  return sanitizeOutput(`Personal details in this message (sent as written if you approve): ${found.join('; ')}`);
 }
 
 export interface BuildApprovalNotificationBodyOpts {

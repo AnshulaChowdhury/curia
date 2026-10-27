@@ -7,7 +7,6 @@ import {
   SKILL_DETAIL_FIXTURES,
   MAX_DETAIL_FIELD_LENGTH,
   MAX_DETAIL_TOTAL_LENGTH,
-  MAX_PERSONAL_DETAILS_LISTED,
 } from '../../../src/autonomy/approval-notification.js';
 import type { ContactService } from '../../../src/contacts/contact-service.js';
 import { createSilentLogger } from '../../../src/logger.js';
@@ -147,14 +146,18 @@ describe('buildApprovalDetails', () => {
       expect(details).toContain('email dana.home@example.org');
     });
 
-    it('names at most the cap, then how many more', () => {
-      const phones = Array.from({ length: MAX_PERSONAL_DETAILS_LISTED + 2 }, (_, i) => `(415) 555-${String(1000 + i)}`);
+    it('names every detail, however many: approving sends them all', () => {
+      const phones = Array.from({ length: 14 }, (_, i) => `(415) 555-${String(1000 + i)}`);
       const line = buildApprovalDetails('sms-send', { recipient: '+15550142', message: phones.join(' and ') })
         .split('\n').find((l) => l.startsWith(PREFIX))!;
-      expect(line.split('; phone_us').length).toBe(MAX_PERSONAL_DETAILS_LISTED);
-      expect(line).toContain('(415) 555-1009');
-      expect(line).not.toContain('(415) 555-1010');
-      expect(line.endsWith('; and 2 more')).toBe(true);
+      for (const phone of phones) expect(line).toContain(`phone_us ${phone}`);
+      expect(line).not.toContain('more');
+    });
+
+    it('names a repeated detail once', () => {
+      const line = buildApprovalDetails('sms-send', { recipient: '+15550142', message: 'Call (415) 555-1234, again (415) 555-1234.' })
+        .split('\n').find((l) => l.startsWith(PREFIX))!;
+      expect(line.split('phone_us').length).toBe(2);
     });
 
     it('is absent when the message has none, and for skills that send nothing', () => {
