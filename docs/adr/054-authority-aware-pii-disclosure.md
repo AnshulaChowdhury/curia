@@ -34,7 +34,9 @@ redactor behaves as before and the gateway only reports what it removed.
 
 1. **Detect, then decide, then act.** The gateway detects PII items (body, subject and the
    quoted thread) without removing anything. The band brief gets a `disclosure` question: for
-   each item (at most ten; more is treated as unsupported) the judge answers `directed`,
+   each item (at most ten; past that the judge rules on the message's own items alone, and
+   quote-only items go unruled, so the quote is dropped; more than ten of the message's own
+   is treated as unsupported) the judge answers `directed`,
    `inferred` or `unsupported`, and whether the recipient asked for it. Detected items are
    ruled on under `disclosure` only, never `necessity`.
 2. **The judge's ruling is advisory; code owns authority.** A deterministic policy table
@@ -119,7 +121,8 @@ redactor behaves as before and the gateway only reports what it removed.
 - More holds below 80 and an extra deliver step for approvals with personal details; approval
   messages are longer. Principals see asks for linked or known requesters only.
 - A judge failure bounces a draft carrying personal details (holds it below 80), and more than
-  ten items always bounce: larger messages must be split. A quote-only judge failure sends
+  ten of the message's own items always bounce: larger messages must be split. A long quote
+  that alone passes the cap goes without the quote. A quote-only judge failure sends
   without the quote.
 - The outreach tables and `disclosure_decisions` (migrations 107 and 108) add state to keep
   correct; weak links and unconfirmed rows cost an ask where a strong link would have shared.
