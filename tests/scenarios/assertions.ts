@@ -10,6 +10,7 @@
 // case agent's (the coordinator's unless the case targets a specialist, #2025) unless it
 // names an `agent` (or `any`).
 import { isDeepStrictEqual } from 'node:util';
+import { detectPii } from '../../src/pii/scrubber.js';
 import { argsMatch } from './stub-matcher.js';
 import {
   ANY_AGENT, COORDINATOR, type BehaviorCheck, type CapturedToolCall, type CheckAgent, type GATEWAY_CHECK_KINDS,
@@ -233,20 +234,38 @@ function maskTerms(text: string, terms: readonly string[]): string {
   return masked;
 }
 
+/**
+ * `text` with every detected personal detail replaced by its label ([sin_ca]). A delivery can
+ * carry values no check names (the phone number in a quote, a card number the drafter wrote),
+ * and a justification must carry labels only. Built-in patterns: the operator's extra patterns
+ * live in config the checks never read. Runs before maskTerms, so a term inside a detected value
+ * leaves no partial digits behind.
+ */
+function maskPii(text: string): string {
+  const matches = detectPii(text);
+  let masked = text;
+  // End to start, so earlier offsets stay valid.
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const m = matches[i]!;
+    masked = `${masked.slice(0, m.start)}[${m.label}]${masked.slice(m.end)}`;
+  }
+  return masked;
+}
+
 /** The terms of a check, for a justification: how many, never what. */
 function termCount(terms: readonly string[] | undefined): string | undefined {
   return terms && terms.length > 0 ? `${terms.length} term(s)` : undefined;
 }
 
-/** One delivery for a justification, with `mask` masked. */
+/** One delivery for a justification, with detected personal details and `mask` masked. */
 function describeDelivery(d: RecordedDelivery, mask: readonly string[] = []): string {
-  const text = maskTerms((d.subject ? `${d.subject} — ` : '') + d.body, mask);
+  const text = maskTerms(maskPii((d.subject ? `${d.subject} — ` : '') + d.body), mask);
   return `${d.channel} to ${d.toNames.join(', ') || '(nobody)'}${d.ccNames.length > 0 ? ` cc ${d.ccNames.join(', ')}` : ''}: ${text.slice(0, 120)}`;
 }
 
-/** What one approval shows, for a justification, with `mask` masked. */
+/** What one approval shows, for a justification, with detected personal details and `mask` masked. */
 function describeHold(h: RecordedHold, mask: readonly string[]): string {
-  return `approval ${h.approvalNumber ?? h.shortRef} (${h.toolName}, now ${h.outcome}): ${maskTerms(h.preamble ?? h.description ?? h.toolName, mask).slice(0, 120)}`;
+  return `approval ${h.approvalNumber ?? h.shortRef} (${h.toolName}, now ${h.outcome}): ${maskTerms(maskPii(h.preamble ?? h.description ?? h.toolName), mask).slice(0, 120)}`;
 }
 
 /**

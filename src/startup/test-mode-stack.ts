@@ -343,6 +343,20 @@ export interface TestModeStackOptions {
    * scenario suite narrows approve-action's "the sole pending approval" to the calling run's.
    */
   wrapActionLog?: (repo: ActionLogRepo) => ActionLogRepo;
+  /**
+   * Refuse to boot when the band-review judge (escalation.judge) cannot be built (recordSends
+   * only). Without it band review fails every detected item closed, so a run tests the missing
+   * key, not the agent. The scenario CLI sets it when a selected case is `through_gateway`; a
+   * stack booted without it reports the gap in `bandReviewJudgeMissing` instead.
+   */
+  requireBandReviewJudge?: boolean;
+  /**
+   * Whether the work in hand follows its autonomy fixture's gating on the layer agents call.
+   * That layer otherwise keeps the gating it was built with (tier), as before #2312: the fixture
+   * sets its score and the prompt block only. The scenario suite answers true for a
+   * `through_gateway` run. The review layer always follows the fixture's gating.
+   */
+  agentLayerFollowsFixtureGating?: () => boolean;
 }
 
 /** A pinned autonomy score and the gating its prompt block describes. */
@@ -385,8 +399,9 @@ export function runWithAutonomyFixture<T>(fixture: AutonomyFixture | undefined, 
  * The autonomy config with a fixture's score and gating in place of the database's: the
  * fixture entered with runWithAutonomyFixture, else the stack's default fixture, else the
  * database's row under the configured gating. Only getConfig() changes, so the prompt block
- * still comes from the real formatPromptBlock(), and the OutboundGateway and ExecutionLayer
- * read the gating from it on each call. Nothing is written: autonomy_config and its history
+ * still comes from the real formatPromptBlock(), and the recording OutboundGateway and the
+ * review ExecutionLayer read the gating from it on each call (the agents' layer reads it
+ * through agentLayerAutonomy). Nothing is written: autonomy_config and its history
  * stay as they were.
  */
 export class FixtureAutonomyService extends AutonomyService {
@@ -529,7 +544,77 @@ export interface TestModeStack {
    * runtime omits it and carries on, a render must not.
    */
   renderSystemPrompt(agentName?: string, opts?: { now?: Date }): Promise<string>;
+  /**
+   * Why the recording stack's band review has no judge (recordSends only), or undefined when it
+   * has one. A through-gateway run on such a stack is an error, not a scored result.
+   */
+  bandReviewJudgeMissing?: string;
   shutdown(): Promise<void>;
+}
+
+/** The vault key each LLM provider's client is built from (src/secrets/apply-vault-secrets.ts). */
+const PROVIDER_VAULT_KEYS: Readonly<Record<string, string>> = {
+  anthropic: 'anthropic_api_key',
+  openrouter: 'openrouter_api_key',
+  bedrock: 'aws_access_key_id and aws_secret_access_key',
+};
+
+/**
+ * Why the band-review judge is missing, naming the model, its provider and the vault key that
+ * provider needs when that is the gap. `err` is undefined when the config turned the judge off.
+ */
+export function describeMissingBandJudge(err: EscalationJudgeConfigError | undefined): string {
+  if (!err) return 'escalation.judge.enabled is false, so band review has no judge and holds every detected item';
+  const { model, provider } = err.detail;
+  if (typeof provider === 'string' && typeof model === 'string') {
+    const key = PROVIDER_VAULT_KEYS[provider];
+    return `the band-review judge (escalation.judge.model '${model}') needs the '${provider}' provider, ` +
+      `which is not registered${key ? `: add ${key} to the vault` : ''}`;
+  }
+  return `the band-review judge cannot be built: ${err.message}`;
+}
+
+/**
+ * The recording stack's escalation judge, which band review and Gate C share, or why there is
+ * none. Band review without it fails every detected item closed, so a through-gateway run would
+ * score the missing key as the agent's error: with `require` a missing judge throws, naming
+ * the provider key; without, the caller errors each such run. Any other build error throws.
+ */
+export function resolveBandReviewJudge(deps: Parameters<typeof buildEscalationJudge>[0] & { require: boolean }): {
+  judge: EscalationJudge | undefined;
+  missing: string | undefined;
+} {
+  let judgeError: EscalationJudgeConfigError | undefined;
+  try {
+    const judge = buildEscalationJudge(deps);
+    if (judge) return { judge, missing: undefined };
+  } catch (err) {
+    if (!(err instanceof EscalationJudgeConfigError)) throw err;
+    judgeError = err;
+  }
+  const missing = describeMissingBandJudge(judgeError);
+  if (deps.require) throw new Error(`through_gateway cases need the band-review judge: ${missing}`);
+  return { judge: undefined, missing };
+}
+
+/**
+ * The autonomy service the layer agents call reads (#2312 review): the fixture's score, but the
+ * gating the layer was built with (tier) unless `followsFixtureGating()` says the work in hand
+ * is a through-gateway run. Before #2312 that layer never followed a fixture's gating; band
+ * fixture cases that stub their sends (25a–25n) still run tier Gate C, without a judge call.
+ * The prompt block reads the full service, so it still describes the fixture's gating.
+ */
+export function agentLayerAutonomy(service: AutonomyService, followsFixtureGating: () => boolean): AutonomyService {
+  return Object.assign(Object.create(service) as AutonomyService, {
+    getConfig: async (): Promise<AutonomyConfig | null> => {
+      const config = await service.getConfig();
+      if (!config || followsFixtureGating()) return config;
+      // No gating named: the layer falls back to its constructed one (execution.ts currentGating).
+      const tierGated: AutonomyConfig = { ...config };
+      delete tierGated.gating;
+      return tierGated;
+    },
+  });
 }
 
 /** A provider that refuses to talk to anyone. Used for llm: 'offline'. */
@@ -604,6 +689,8 @@ interface RecordingSends {
   >;
   /** Task reads (getTask, project root) for outreach titles and band evidence. Never handed to agents. */
   taskReads: Pick<TaskRepo, 'getTask' | 'resolveProjectRootTaskId'>;
+  /** Why band review has no judge, or undefined when it has one. */
+  bandReviewJudgeMissing: string | undefined;
 }
 
 /**
@@ -616,7 +703,9 @@ interface RecordingSends {
  *     production keeps one per process and also emails the principal.
  *   - A judge whose config cannot be built is a warning, not a boot failure: the review then
  *     runs as production's does with that judge off (Gate C escalates ambiguous actions,
- *     band review holds).
+ *     band review holds). The band-review judge is the exception when `requireBandReviewJudge`
+ *     is set (the boot fails, naming the missing provider key); otherwise the gap is returned
+ *     as `bandReviewJudgeMissing`, which errors each through-gateway run.
  */
 function buildRecordingSends(deps: {
   recorder: SendRecorder;
@@ -643,16 +732,17 @@ function buildRecordingSends(deps: {
   taskOutreachRepo: TaskOutreachRepo;
   outreachNonOrgDomains: ReadonlySet<string>;
   warnings: string[];
+  requireBandReviewJudge?: boolean;
 }): RecordingSends {
   const { pool, bus, logger, yamlConfig, modelRegistry, providerRegistry, warnings } = deps;
   const gating = resolveAutonomyGating(yamlConfig.autonomy);
 
-  let escalationJudge: EscalationJudge | undefined;
-  try {
-    escalationJudge = buildEscalationJudge({ yaml: yamlConfig.escalation?.judge, modelRegistry, providerRegistry, bus, logger });
-  } catch (err) {
-    if (!(err instanceof EscalationJudgeConfigError)) throw err;
-    warnings.push(`Escalation judge off for recorded sends (through_gateway cases only): ${err.message}`);
+  const { judge: escalationJudge, missing: bandReviewJudgeMissing } = resolveBandReviewJudge({
+    yaml: yamlConfig.escalation?.judge, modelRegistry, providerRegistry, bus, logger,
+    require: deps.requireBandReviewJudge === true,
+  });
+  if (bandReviewJudgeMissing) {
+    warnings.push(`Escalation judge off for recorded sends; through_gateway runs will error: ${bandReviewJudgeMissing}`);
   }
 
   // The content filter's Stage 2 judge, from filter.llmJudge as production reads it.
@@ -794,6 +884,7 @@ function buildRecordingSends(deps: {
       sendEvidence,
     },
     taskReads,
+    bandReviewJudgeMissing,
   };
 }
 
@@ -1042,7 +1133,8 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     }
 
     // Gating as production resolves it, so a deployment overlay's `gating: band` reaches the
-    // prompt block, and the gateway and ExecutionLayer, which read it per call (#2312). A
+    // prompt block, and the recording gateway and review layer, which read it per call (#2312;
+    // the layer agents call keeps tier unless the caller says otherwise, agentLayerAutonomy). A
     // fixture service even with no default fixture: a case can enter its own per attempt.
     const autonomyService = new FixtureAutonomyService(pool, logger, {
       gating: resolveAutonomyGating(yamlConfig.autonomy),
@@ -1238,6 +1330,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
           taskOutreachRepo,
           outreachNonOrgDomains,
           warnings,
+          ...(options.requireBandReviewJudge ? { requireBandReviewJudge: true } : {}),
         })
       : undefined;
     // The layer agents call always gets the no-send gateway. A recording stack builds a
@@ -1286,7 +1379,9 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       entityMemory,
       entityContextAssembler,
       agentContactId,
-      autonomyService: agentAutonomy,
+      // The fixture's score, the constructed (tier) gating: Gate C as before #2312, except in
+      // the work the caller says follows the fixture's gating (see agentLayerAutonomy).
+      autonomyService: agentLayerAutonomy(agentAutonomy, options.agentLayerFollowsFixtureGating ?? (() => false)),
       secretsService: createTestModeSecrets(),
       officeIdentityService: agentOfficeIdentity,
       auditLogRepo: new AuditLogRepo(pool, logger),
@@ -1318,6 +1413,8 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     const reviewExecutionLayer = recording
       ? new ExecutionLayer(toolRegistry, logger, {
           ...layerOptions,
+          // Per-call gating, as production's: the case's fixture decides Gate C here.
+          autonomyService: agentAutonomy,
           outboundGateway: recording.gateway,
           taskOutreach: new TaskOutreachService(taskOutreachRepo, {
             ...outreachDeps, lookupTask: taskLookupFrom(recording.taskReads), nonOrgDomains: outreachNonOrgDomains,
@@ -1457,6 +1554,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       disabledTools,
       snapshotMcpTools: snapshotMcp.tools,
       warnings,
+      ...(recording?.bandReviewJudgeMissing ? { bandReviewJudgeMissing: recording.bandReviewJudgeMissing } : {}),
       agent,
       renderSystemPrompt: async (agentName = 'coordinator', renderOpts = {}) => {
         const assembled = agent(agentName);

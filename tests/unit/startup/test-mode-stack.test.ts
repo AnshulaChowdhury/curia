@@ -14,6 +14,9 @@ import type { ContactService } from '../../../src/contacts/contact-service.js';
 import { AutonomyService } from '../../../src/autonomy/autonomy-service.js';
 import { createLogger } from '../../../src/logger.js';
 import { ExecutionLayer } from '../../../src/skills/execution.js';
+import { EscalationJudgeConfigError } from '../../../src/dispatch/outbound-filter-wiring.js';
+import { ModelRegistry } from '../../../src/agents/llm/model-registry.js';
+import type { LLMProvider } from '../../../src/agents/llm/provider.js';
 import { ToolRegistry } from '../../../src/skills/registry.js';
 import type { ToolContext, ToolManifest } from '../../../src/skills/types.js';
 import type { BullpenService } from '../../../src/memory/bullpen.js';
@@ -24,7 +27,10 @@ import type { BandSendReview } from '../../../src/dispatch/band-send-review.js';
 import type { NylasClient } from '../../../src/channels/email/nylas-client.js';
 import { OutboundGateway } from '../../../src/skills/outbound-gateway.js';
 import {
+  agentLayerAutonomy,
   createNoSendOutboundGateway,
+  describeMissingBandJudge,
+  resolveBandReviewJudge,
   runWithAutonomyFixture,
   createTestModeSecrets,
   autonomyFixtureMismatch,
@@ -380,5 +386,92 @@ describe('autonomyFixtureMismatch', () => {
     expect(autonomyFixtureMismatch({ score: 84, gating: 'band' }, { ...config, score: 75, band: 'approval-required', gating: undefined }))
       .toBe('the stack reads autonomy 75 (tier gating); the fixture asked for 84 (band gating)');
     expect(autonomyFixtureMismatch({ score: 84, gating: 'band' }, null)).toMatch(/no autonomy config/);
+  });
+});
+
+// Band review without its judge fails every detected item closed (#2312 review), so a
+// through-gateway run would score the missing key as the agent's error.
+describe('resolveBandReviewJudge', () => {
+  const deps = (providers: string[], yaml?: { enabled?: boolean; model?: string }) => ({
+    yaml,
+    modelRegistry: new ModelRegistry(logger),
+    providerRegistry: new Map<string, LLMProvider>(providers.map(p => [p, { id: p, chat: vi.fn() } as unknown as LLMProvider])),
+    bus: new EventBus(logger),
+    logger,
+  });
+
+  it('builds the judge when its provider is registered', () => {
+    const { judge, missing } = resolveBandReviewJudge({ ...deps(['anthropic']), require: true });
+    expect(judge).toBeDefined();
+    expect(missing).toBeUndefined();
+  });
+
+  it('refuses when required, naming the model, the provider and the vault key', () => {
+    expect(() => resolveBandReviewJudge({ ...deps(['openrouter']), require: true }))
+      .toThrow("through_gateway cases need the band-review judge: the band-review judge (escalation.judge.model 'claude-haiku-5-5') needs the 'anthropic' provider, which is not registered: add anthropic_api_key to the vault");
+  });
+
+  it('reports the gap instead when not required, so each through-gateway run errors', () => {
+    const { judge, missing } = resolveBandReviewJudge({ ...deps(['openrouter']), require: false });
+    expect(judge).toBeUndefined();
+    expect(missing).toMatch(/needs the 'anthropic' provider.*anthropic_api_key/);
+  });
+
+  it('counts a judge the config turned off as missing', () => {
+    expect(() => resolveBandReviewJudge({ ...deps(['anthropic'], { enabled: false }), require: true }))
+      .toThrow(/escalation\.judge\.enabled is false/);
+  });
+
+  it('describes a config error that is not a missing provider by its message', () => {
+    const err = new EscalationJudgeConfigError('escalation.judge.timeout_ms must be an integer >= 250 (ms)', { timeoutMs: 1 });
+    expect(describeMissingBandJudge(err)).toBe('the band-review judge cannot be built: escalation.judge.timeout_ms must be an integer >= 250 (ms)');
+  });
+});
+
+// Review Focus 3 (#2312 review): the layer agents call keeps its pre-#2312 Gate C (tier) under a
+// band fixture, unless the work in hand is a through-gateway run. The fixture's score still applies.
+describe('agentLayerAutonomy', () => {
+  const stored = { score: 95, band: 'full', updated_at: new Date('2026-10-01T00:00:00Z'), updated_by: 'ceo' };
+  const pool = { query: vi.fn(async () => ({ rows: [stored] })) } as unknown as ConstructorParameters<typeof AutonomyService>[0];
+
+  function bandGateCLayer(followsFixtureGating: () => boolean) {
+    const registry = new ToolRegistry();
+    registry.register(
+      { ...manifest('calendar-respond', []), action_risk: 'medium' },
+      { execute: async () => ({ success: true, data: 'responded' }) },
+    );
+    const review = vi.fn(async () => ({ ok: true as const, purpose: 'serving' as const, reason: 'x' }));
+    const classifyAction = vi.fn(async () => ({ verdict: 'serving' as const, reason: 'x' }));
+    const layer = new ExecutionLayer(registry, logger, {
+      autonomyService: agentLayerAutonomy(new FixtureAutonomyService(pool, logger), followsFixtureGating),
+      bus: new EventBus(logger),
+      escalationJudge: { isEnabled: () => true, review, classifyAction } as unknown as EscalationJudge,
+      sendEvidence: { collect: vi.fn().mockResolvedValue({ unavailable: false, toolResults: [] }) },
+    });
+    const invoke = () => runWithAutonomyFixture({ score: 84, gating: 'band' }, () => layer.invoke('calendar-respond', {}, undefined, {
+      conversationId: 'conv-1',
+      taskEventId: 'task-1',
+      taskMetadata: {
+        originator: { contactId: 'contact-abc', systemRole: null, channel: 'email', initiatedAt: new Date().toISOString(), tier: 'unknown' },
+      },
+    }));
+    return { invoke, review };
+  }
+
+  it('reads the fixture score without its gating, so Gate C stays tier with no band review', async () => {
+    const service = agentLayerAutonomy(new FixtureAutonomyService(pool, logger), () => false);
+    const config = await runWithAutonomyFixture({ score: 84, gating: 'band' }, () => service.getConfig());
+    expect(config).toMatchObject({ score: 84, band: 'spot-check' });
+    expect(config?.gating).toBeUndefined();
+
+    const { invoke, review } = bandGateCLayer(() => false);
+    await invoke();
+    expect(review).not.toHaveBeenCalled();
+  });
+
+  it('follows the fixture\'s band gating in a through-gateway run', async () => {
+    const { invoke, review } = bandGateCLayer(() => true);
+    await invoke();
+    expect(review).toHaveBeenCalledOnce();
   });
 });

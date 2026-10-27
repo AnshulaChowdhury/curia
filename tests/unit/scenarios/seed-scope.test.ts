@@ -15,6 +15,7 @@ import {
   removeSeededPrincipalIdentities,
   SeedScope,
   seedConflictKeys,
+  fixtureSignalConversations,
   seedPrincipalIdentity,
 } from '../../scenarios/seed.js';
 import type { DbPool } from '../../../src/db/connection.js';
@@ -342,5 +343,27 @@ describe('seedConflictKeys', () => {
       { site: 'Login.Example-Insurer.ca', status: 'pending' },
       { site: 'aircanada.com', status: 'expired' },
     ]))).toEqual(['verification-site:example-insurer.ca', 'verification-site:aircanada.com']);
+  });
+});
+
+// A through-gateway Signal reply runs in `signal:<fixture number>`, which carries no prefix of
+// the suite's own: the crash sweep finds it by the numbers the loaded cases seed (#2312 review).
+describe('fixtureSignalConversations', () => {
+  const contact = (channel: string, identifier: string) => ({ key: identifier, channel, identifier, displayName: identifier });
+  const scenario = (throughGateway: boolean | undefined, contacts: ReturnType<typeof contact>[]) =>
+    ({ throughGateway, seed: { contacts } }) as unknown as ScenarioCase;
+
+  it('names each through-gateway case\'s Signal fixture number once', () => {
+    expect(fixtureSignalConversations([
+      scenario(true, [contact('signal', '+15195550123'), contact('email', 'priya@northbank.test')]),
+      scenario(true, [contact('signal', '+15195550123'), contact('signal', '+15195550188')]),
+    ])).toEqual(['signal:+15195550123', 'signal:+15195550188']);
+  });
+
+  it('leaves out cases that stub their sends: their turns never run in a signal: conversation', () => {
+    expect(fixtureSignalConversations([
+      scenario(undefined, [contact('signal', '+15195550999')]),
+      scenario(false, [contact('signal', '+15195550998')]),
+    ])).toEqual([]);
   });
 });

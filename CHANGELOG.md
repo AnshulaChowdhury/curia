@@ -80,7 +80,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Canadian SIN detection** — PII redaction now checks the checksum. (#2312)
 - **Task outreach** — sends and web forms on task-bound turns are recorded; rows close when the task ends. (#2312)
 - **`record-outreach`** — records web forms and calls for a task so the organization's reply finds it. (#2312)
-- **Linked outreach replies** — an email answering Curia's outreach arrives knowing its task; a strong link adds a task note. (#2312)
+- **Linked outreach replies** — an email answering Curia's outreach arrives knowing its task; strong links add a task note. (#2312)
 - **`taskOutreach` capability** — **public API:** new `ToolContext` field for recording task outreach. (#2312)
 - **PII ask and memory** — the principal is asked when someone requests their data; the answer sticks per thread. (#2312)
 - **`disclosureDecisions` capability** — **public API:** new `ToolContext` field recording the principal's answer to an ask. (#2312)

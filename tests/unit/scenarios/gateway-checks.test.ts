@@ -95,6 +95,31 @@ describe('not_delivered', () => {
     expect(evaluateCheck({ kind: 'not_delivered' }, run({ deliveries: [delivery()] }), ctx).rating).toBe('MISS');
     expect(evaluateCheck({ kind: 'not_delivered', to: 'pat' }, run({ deliveries: [delivery()] }), ctx).rating).toBe('MISS');
   });
+
+  it('masks detected personal details in its justification, by label', () => {
+    const leaky = delivery({ body: 'Pat, my SIN is 130 692 544.' });
+    const rating = evaluateCheck({ kind: 'not_delivered', to: 'pat' }, run({ deliveries: [leaky] }), ctx);
+    expect(rating.rating).toBe('MISS');
+    expect(rating.justification).not.toContain('130 692 544');
+    expect(rating.justification).toContain('[sin_ca]');
+  });
+});
+
+describe('delivered justifications', () => {
+  it('masks detected personal details no check term names', () => {
+    const leaky = delivery({ body: 'Pat, my SIN is 130 692 544.' });
+    const rating = evaluateCheck({ kind: 'delivered', channel: 'sms' }, run({ deliveries: [leaky] }), ctx);
+    expect(rating.rating).toBe('MISS');
+    expect(rating.justification).not.toContain('130 692 544');
+    expect(rating.justification).toContain('[sin_ca]');
+  });
+
+  it('leaves no partial digits when a check term sits inside a detected value', () => {
+    const leaky = delivery({ body: 'Pat, my SIN is 130 692 544.' });
+    const rating = evaluateCheck({ kind: 'delivered', to: 'pat', excludes: ['692'] }, run({ deliveries: [leaky] }), ctx);
+    expect(rating.rating).toBe('MISS');
+    expect(rating.justification).not.toMatch(/130|544|692/);
+  });
 });
 
 describe('held', () => {

@@ -25,7 +25,7 @@ import type { TestModeStack } from '../../src/startup/test-mode-stack.js';
 import { registrableDomain } from '../../src/verification/domain.js';
 import type { VerificationRuntime } from '../../src/verification/index.js';
 import type { Verification } from '../../src/verification/types.js';
-import { cleanupConversation, sweepConversations, type TurnOutcome } from '../shared/turn-capture.js';
+import { CONVERSATION_TABLES, cleanupConversation, sweepConversations, type TurnOutcome } from '../shared/turn-capture.js';
 import { resolvePlaceholders } from './loader.js';
 import { SCENARIO_DELEGATE_PREFIX } from './stub-layer.js';
 import type { DbPool } from '../../src/db/connection.js';
@@ -838,10 +838,15 @@ async function deleteContact(stack: TestModeStack, id: string, kgNodeId: string 
 /**
  * Remove whatever a crashed or interrupted run left, found only by the suite's own
  * markers: tagged contacts and nodes, entries from `scenario-origin-*`, marked bullpen
- * threads, and conversation rows of `scenario-*` / `email:scenario-*` conversations.
+ * threads, and conversation rows of `scenario-*` / `email:scenario-*` conversations, plus
+ * `fixtureConversations`: the `signal:<number>` conversations of through-gateway cases'
+ * fixture numbers (fixtureSignalConversations), which carry no prefix of the suite's own.
  * Run at start-up and on SIGINT/SIGTERM. Returns what it removed, for the log.
  */
-export async function sweepLeftovers(stack: TestModeStack): Promise<Record<string, number>> {
+export async function sweepLeftovers(
+  stack: TestModeStack,
+  fixtureConversations: readonly string[] = [],
+): Promise<Record<string, number>> {
   const removed: Record<string, number> = {};
   const count = async (label: string, sql: string, params: unknown[]): Promise<void> => {
     const result = await stack.pool.query(sql, params);
@@ -896,7 +901,34 @@ export async function sweepLeftovers(stack: TestModeStack): Promise<Record<strin
   for (const [table, rows] of Object.entries(conversations)) {
     if (rows > 0) removed[table] = rows;
   }
+  // A through-gateway Signal reply runs in `signal:<fixture number>` (harness.ts), by exact id:
+  // its turns, and what its sends wrote there. Fixture numbers are the cases' own, never a
+  // real contact's (seedContact refuses an identity a real contact holds).
+  if (fixtureConversations.length > 0) {
+    const ids = [...fixtureConversations];
+    for (const table of [...CONVERSATION_TABLES, 'autonomy_action_log', 'disclosure_decisions', 'task_outreach', 'outbound_context'] as const) {
+      // Table names come from the list above, never from input.
+      const result = await stack.pool.query(`DELETE FROM ${table} WHERE conversation_id = ANY($1::text[])`, [ids]);
+      if ((result.rowCount ?? 0) > 0) removed[table] = (removed[table] ?? 0) + (result.rowCount ?? 0);
+    }
+  }
   return removed;
+}
+
+/**
+ * The `signal:<number>` conversations a through-gateway case's Signal third party replies in
+ * (harness.ts names them so): one per Signal contact any loaded case seeds, selected or not,
+ * so a sweep finds what an earlier selection's crashed run left.
+ */
+export function fixtureSignalConversations(cases: readonly ScenarioCase[]): string[] {
+  const ids = new Set<string>();
+  for (const c of cases) {
+    if (c.throughGateway !== true) continue;
+    for (const contact of c.seed.contacts) {
+      if (contact.channel === 'signal') ids.add(`signal:${contact.identifier}`);
+    }
+  }
+  return [...ids].sort();
 }
 
 /**

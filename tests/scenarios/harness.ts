@@ -294,7 +294,8 @@ export interface ScenarioHarness {
   /** Model spend no run's figure includes: outside every run, or billed after its run ended. */
   unattributedUsage(): UsageBreakdown;
   /** Remove rows an interrupted run left behind (by the suite's own markers). */
-  sweep(): Promise<Record<string, number>>;
+  /** `fixtureConversations`: through-gateway Signal conversations to sweep by id (fixtureSignalConversations). */
+  sweep(fixtureConversations?: readonly string[]): Promise<Record<string, number>>;
   shutdown(): Promise<void>;
 }
 
@@ -380,13 +381,32 @@ export async function caseAutonomyError(
 }
 
 /**
+ * Why a through-gateway run cannot be scored on this stack, or undefined when it can (#2312
+ * review). Without the band-review judge every detected item fails closed, so the run would
+ * score a missing key as the agent's error: it is an errored run instead.
+ */
+export function throughGatewayJudgeError(
+  scenario: Pick<ScenarioCase, 'throughGateway'>,
+  stack: Pick<TestModeStack, 'bandReviewJudgeMissing'>,
+): string | undefined {
+  if (scenario.throughGateway !== true || !stack.bandReviewJudgeMissing) return undefined;
+  return `through_gateway run needs the band-review judge: ${stack.bandReviewJudgeMissing}`;
+}
+
+/**
  * `officeIdentity`: the run's identity fixture (#2143). One stack serves every case in a
  * run, so the identity is the run's, never a case's. A case's `autonomy:` fixture is its
  * own (#2312): each attempt enters it (see attempt()), so cases with different scores and
  * gatings share the stack and run at once.
  */
 export async function createScenarioHarness(
-  options: { model?: string; reasoning?: TierReasoningOverride; officeIdentity?: OfficeIdentityFixture } & StackSources = {},
+  options: {
+    model?: string;
+    reasoning?: TierReasoningOverride;
+    officeIdentity?: OfficeIdentityFixture;
+    /** Refuse to boot without the band-review judge: the CLI sets it when a through_gateway case is selected. */
+    requireBandReviewJudge?: boolean;
+  } & StackSources = {},
 ): Promise<ScenarioHarness> {
   const context = createCaseContext<ScenarioRunState>();
   const currentScope = (): SeedScope | undefined => context.current()?.scope;
@@ -462,6 +482,10 @@ export async function createScenarioHarness(
     },
     // approve-action's "the sole pending approval" means the run's own.
     wrapActionLog: (repo) => scopedActionLog(repo, currentScope),
+    ...(options.requireBandReviewJudge ? { requireBandReviewJudge: true } : {}),
+    // The agents' layer keeps tier Gate C, as before #2312, except in a through-gateway run,
+    // whose gates follow its fixture's gating as production's would.
+    agentLayerFollowsFixtureGating: () => currentScope()?.throughGateway === true,
     observeBus: (bus) => {
       // A held relay wakes the coordinator to deliver the approval (#2159), in a conversation
       // of its own. In a through-gateway run that turn is the run's: file it under the run (its
@@ -881,6 +905,8 @@ export async function createScenarioHarness(
       // the stack must fail the run, not be scored as in force.
       const autonomyError = await caseAutonomyError(scenario.autonomy, stack.autonomyService);
       if (autonomyError) throw new Error(autonomyError);
+      const judgeError = throughGatewayJudgeError(scenario, stack);
+      if (judgeError) throw new Error(judgeError);
       seeded = await seedRun(dated, { stack, outboundContext, scope });
       const stubTable = resolvePlaceholders(dated.toolStubs, seeded.refs);
       const inbound = resolvePlaceholders(dated.inbound, seeded.refs);
@@ -1272,7 +1298,7 @@ export async function createScenarioHarness(
     inertTools: stack.snapshotMcpTools,
     runOnce,
     unattributedUsage: () => unattributed.snapshot(),
-    sweep: () => sweepLeftovers(stack),
+    sweep: (fixtureConversations) => sweepLeftovers(stack, fixtureConversations),
     shutdown: async () => {
       // Late turns still hold the pool; wait (bounded) so their writes and cleanup land.
       if (lateTurns.size > 0) {

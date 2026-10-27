@@ -26,7 +26,7 @@ import {
 } from './harness.js';
 import { createJudge, judgeRun, type Judge } from './judge.js';
 import { loadScenarioCases, resolveRunPlaceholders, selectRunCases } from './loader.js';
-import { describeError, seedConflictKeys } from './seed.js';
+import { describeError, fixtureSignalConversations, seedConflictKeys } from './seed.js';
 import { DEFAULT_CONCURRENCY, parseConcurrency, runConcurrently } from '../shared/case-scope.js';
 import { liveSearchLines } from '../shared/live-search.js';
 import { formatUsageLines, formatUsd, sumBreakdowns, UsageLedger } from '../shared/usage.js';
@@ -311,8 +311,11 @@ async function main(): Promise<void> {
 
   // The release gate, or a --case / --tags selection; identity cases only alone (loader.ts).
   // Autonomy fixtures are per case (#2312): any mix of them runs in one suite run.
+  const loadedCases = loadScenarioCases(args.casesDir ?? CASES_DIR, args.stubsDir ? { extraStubsDirs: [args.stubsDir] } : {});
+  // Every loaded case's, selected or not: an earlier selection's crashed run may have left them.
+  const signalConversations = fixtureSignalConversations(loadedCases);
   const { cases, onDemandSkipped, identitySkipped } = selectRunCases(
-    loadScenarioCases(args.casesDir ?? CASES_DIR, args.stubsDir ? { extraStubsDirs: [args.stubsDir] } : {}),
+    loadedCases,
     {
       ...(args.caseFilter !== undefined ? { caseFilter: args.caseFilter } : {}),
       ...(args.tags !== undefined ? { tags: args.tags } : {}),
@@ -367,11 +370,15 @@ async function main(): Promise<void> {
       ...(identity ? { officeIdentity: identity.config } : {}),
       ...(overlay ?? {}),
       ...(args.mcpSnapshots ? { mcpSnapshotDirs: [args.mcpSnapshots] } : {}),
+      // Band review without its judge fails every detected item closed: refuse at boot rather
+      // than error each through-gateway run (#2312).
+      ...(cases.some(c => c.throughGateway === true) ? { requireBandReviewJudge: true } : {}),
     });
   } catch (e) {
     overlay?.cleanup();
     err(`\nFailed to boot: ${e instanceof Error ? e.message : String(e)}`);
     err('Needs DATABASE_URL (migrated, with a principal), SECRET_ENCRYPTION_KEY, and the model\'s provider key in the vault (#911).');
+    if (cases.some(c => c.throughGateway === true)) err('through_gateway cases also need the band-review judge\'s provider key (escalation.judge.model; anthropic_api_key by default).');
     process.exit(1);
   }
 
@@ -426,7 +433,7 @@ async function main(): Promise<void> {
 
     // A crashed or interrupted earlier run may have left fixtures a real instance would
     // act on. Found only by the suite's own markers.
-    const swept = await harness.sweep();
+    const swept = await harness.sweep(signalConversations);
     if (Object.keys(swept).length > 0) {
       out(`   Removed leftovers from an interrupted run: ${Object.entries(swept).map(([t, n]) => `${t} ×${n}`).join(', ')}`);
     }
@@ -434,7 +441,7 @@ async function main(): Promise<void> {
     // Ctrl-C mid-run would skip the run's cleanup. Sweep on the way out instead.
     const onSignal = (signal: NodeJS.Signals): void => {
       err(`\n${signal}: cleaning up scenario fixtures before exiting...`);
-      void harness.sweep()
+      void harness.sweep(signalConversations)
         .catch((e: unknown) => err(`  [WARN] cleanup on ${signal} failed: ${e instanceof Error ? e.message : String(e)} — re-run to sweep leftovers`))
         .finally(() => process.exit(130));
     };

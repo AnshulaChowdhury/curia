@@ -72,6 +72,11 @@ out the cases marked `release_gate: false` and says how many it left out
   - `openrouter_api_key`, for the judge (`openai/gpt-4o` through OpenRouter) and for
     OpenRouter models such as the production standard tier;
   - `anthropic_api_key`, if you run an Anthropic model;
+  - for `through_gateway` cases, the key of the band-review judge's provider
+    (`escalation.judge.model`: `claude-haiku-5-5`, so `anthropic_api_key`, by default).
+    Band review without its judge holds every detected item, so the CLI refuses to start
+    when a selected case is `through_gateway` and that key is missing, and a stack booted
+    without the check errors each such run instead of scoring it;
   - `openai_api_key` (valid), for embeddings, unless `EMBEDDING_BASE_URL` names your own
     embedding server (ADR-051). Seeding a contact creates its KG node.
 
@@ -205,8 +210,10 @@ never adopts a real node), entries and verifications a `scenario-origin-` conver
 during a run, the run's or a specialist's), threads a `scenario:` `source_message_id`,
 specialist conversations a `scenario-delegate-` id, and delegation claims those
 conversations. Seeded tasks carry their `created_by` marker; seeded outreach, and what
-through-gateway sends wrote, a run's or a `scenario-origin-` conversation id. On Ctrl-C/SIGTERM, and at every start-up, the CLI sweeps anything carrying
-those markers — and nothing else.
+through-gateway sends wrote, a run's or a `scenario-origin-` conversation id. A through-gateway
+Signal third party's conversation, `signal:<fixture number>`, has no prefix of its own: the sweep
+finds it by the exact numbers the loaded through-gateway cases seed. On Ctrl-C/SIGTERM, and at
+every start-up, the CLI sweeps anything carrying those markers — and nothing else.
 
 ### Stubs, and why nothing can send
 
@@ -594,9 +601,9 @@ later tone & style PRs compare against, are in
 
 `autonomy: { score, gating }` runs a case at that autonomy score and gating (`tier`, or
 `band` as production's deployment runs, #2159): the band descriptions in the prompt, the
-ExecutionLayer's gates, the content filter's tier-keyed rules and the Dispatcher's relay
-Gate C all follow it. The OutboundGateway's band review follows it too, for the sends that
-reach it: a `through_gateway` case's (see [Sends through the gateway](#sends-through-the-gateway)).
+ExecutionLayer's score-keyed gates, the content filter's tier-keyed rules and the
+Dispatcher's relay Gate C all follow it. The OutboundGateway's band review follows it too,
+for the sends that reach it: a `through_gateway` case's (see [Sends through the gateway](#sends-through-the-gateway)).
 Every other case stubs its sends. The stack lays it
 over the database's autonomy config in memory (`FixtureAutonomyService`,
 `src/startup/test-mode-stack.ts`). Nothing is written.
@@ -605,8 +612,14 @@ Unlike `identity:`, it is the case's own (#2312). Each attempt enters its case's
 (`runWithAutonomyFixture`, an `AsyncLocalStorage`) around everything it does: the bus
 delivers an event by awaiting every subscriber in the publisher's call chain, so the
 dispatcher, the turns and their tool calls all read it. The gateway, the content filter
-(through the gateway), the Dispatcher and the ExecutionLayer read the gating from the
-autonomy config on each call, not at construction. So:
+(through the gateway), the Dispatcher and the review ExecutionLayer read the gating from the
+autonomy config on each call, not at construction.
+
+The ExecutionLayer agents call reads the fixture's score but keeps its Gate C on tier gating,
+as before #2312, unless the case is `through_gateway` (`agentLayerAutonomy`,
+`src/startup/test-mode-stack.ts`). So a band fixture case that stubs its sends (25a–25n)
+runs tier Gate C, with no escalation-judge call, exactly as on `main`; only a through-gateway
+case's gates follow its fixture's band gating. So:
 
 - cases under different fixtures, and cases without one, run in the same suite run, at
   `--concurrency` beside each other;

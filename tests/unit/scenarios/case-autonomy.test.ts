@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { AutonomyService } from '../../../src/autonomy/autonomy-service.js';
 import { createLogger } from '../../../src/logger.js';
 import { FixtureAutonomyService, runWithAutonomyFixture } from '../../../src/startup/test-mode-stack.js';
-import { caseAutonomyError } from '../../scenarios/harness.js';
+import { caseAutonomyError, throughGatewayJudgeError } from '../../scenarios/harness.js';
 
 const logger = createLogger('error');
 const stored = { score: 95, band: 'full', updated_at: new Date('2026-10-01T00:00:00Z'), updated_by: 'ceo' };
@@ -31,5 +31,24 @@ describe('caseAutonomyError', () => {
     const service = new FixtureAutonomyService(pool, logger, { fixture: { score: 84, gating: 'band' } });
     const error = await caseAutonomyError({ score: 74, gating: 'band' }, service);
     expect(error).toMatch(/reads autonomy 84 \(band gating\); the fixture asked for 74 \(band gating\)/);
+  });
+});
+
+// Band review without its judge fails every detected item closed (#2312 review): a
+// through-gateway run on such a stack is an error, never a scored result.
+describe('throughGatewayJudgeError', () => {
+  const missing = "the band-review judge (escalation.judge.model 'claude-haiku-5-5') needs the 'anthropic' provider, which is not registered: add anthropic_api_key to the vault";
+
+  it('errors a through-gateway run when the stack has no band-review judge', () => {
+    expect(throughGatewayJudgeError({ throughGateway: true }, { bandReviewJudgeMissing: missing }))
+      .toBe(`through_gateway run needs the band-review judge: ${missing}`);
+  });
+
+  it('leaves a through-gateway run alone when the judge is there', () => {
+    expect(throughGatewayJudgeError({ throughGateway: true }, {})).toBeUndefined();
+  });
+
+  it('leaves a case that stubs its sends alone, judge or not', () => {
+    expect(throughGatewayJudgeError({}, { bandReviewJudgeMissing: missing })).toBeUndefined();
   });
 });
