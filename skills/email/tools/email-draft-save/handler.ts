@@ -15,7 +15,7 @@
 // skill no longer writes a typed address into a draft.
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
-import { buildReplyQuote } from '../../../../src/skills/_shared/reply-quote.js';
+import { buildReplyQuote, quoteParticipants } from '../../../../src/skills/_shared/reply-quote.js';
 import { parseAttachmentInputs } from '../../../_shared/parse-attachments.js';
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -93,10 +93,13 @@ export class EmailDraftSaveHandler implements ToolHandler {
 
     ctx.log.info({ to: address, subject, accountId, replyToMessageId }, 'email-draft-save: saving draft');
 
-    // When replying, fetch the original message and append a quoted copy below
-    // the reply body. Both the fetch and the formatting are non-fatal — if either
-    // fails, proceed with the unquoted body and log a warning at the correct step.
-    let quotedBody = body;
+    // When replying, fetch the original message and quote it below the reply body. Both the
+    // fetch and the formatting are non-fatal — if either fails, proceed with the unquoted body
+    // and log a warning at the correct step. The quote is passed separately, as email-reply
+    // does, so the gateway can tell it from the body: one with personal details that reaches
+    // someone who was not on the quoted message is saved without it (#2312).
+    let htmlQuote: string | undefined;
+    let participants: string[] | undefined;
     if (replyToMessageId) {
       let original: Awaited<ReturnType<typeof ctx.outboundGateway.getEmailMessage>> | undefined;
       try {
@@ -109,7 +112,8 @@ export class EmailDraftSaveHandler implements ToolHandler {
       }
       if (original !== undefined) {
         try {
-          quotedBody = body + buildReplyQuote(original, ctx.timezone);
+          htmlQuote = buildReplyQuote(original, ctx.timezone, { format: 'html' });
+          participants = quoteParticipants(original);
         } catch (err) {
           ctx.log.warn(
             { err, replyToMessageId },
@@ -125,9 +129,10 @@ export class EmailDraftSaveHandler implements ToolHandler {
         channel: 'email',
         to: address,
         subject,
-        body: quotedBody,
+        body,
         accountId,
         replyToMessageId,
+        ...(htmlQuote ? { htmlQuote, quoteParticipants: participants } : {}),
         ...(attachmentsParsed.length > 0 ? { attachments: attachmentsParsed } : {}),
       });
     } catch (err) {

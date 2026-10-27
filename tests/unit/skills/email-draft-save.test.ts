@@ -174,7 +174,7 @@ describe('EmailDraftSaveHandler', () => {
       body: '<p>Let me know your thoughts.</p>',
     };
 
-    it('appends quote when reply_to_message_id is present', async () => {
+    it('passes the quote separately when reply_to_message_id is present', async () => {
       const gateway = {
         createEmailDraft: vi.fn().mockResolvedValue({ success: true, draftId: 'd-q1' }),
         getEmailMessage: vi.fn().mockResolvedValue(originalMessage),
@@ -186,11 +186,11 @@ describe('EmailDraftSaveHandler', () => {
         { timezone: 'America/Toronto' },
       ));
       expect(gateway.getEmailMessage).toHaveBeenCalledWith('msg-orig', undefined);
-      const callBody = (gateway.createEmailDraft.mock.calls[0]! as [{ body: string }])[0].body;
-      expect(callBody).toContain('Sounds good!');
-      expect(callBody).toContain('---------- Original Message ----------');
-      expect(callBody).toContain('Alice <alice@example.com>');
-      expect(callBody).toContain('Let me know your thoughts.');
+      // The quote travels apart from the body, so the gateway can review it as a quote (#2312).
+      const call = (gateway.createEmailDraft.mock.calls[0]! as [{ body: string; htmlQuote?: string }])[0];
+      expect(call.body).toBe('Sounds good!');
+      expect(call.htmlQuote).toContain('alice@example.com');
+      expect(call.htmlQuote).toContain('Let me know your thoughts.');
     });
 
     it('does not fetch original or append quote when reply_to_message_id is absent', async () => {

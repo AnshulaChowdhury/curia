@@ -210,6 +210,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Band judge** — no longer flags Curia's own conduct or what it tells the principal. (#2312)
 - **Send recipients** — Curia's own mailbox no longer counts as a recipient when checking sends. (#2312)
 - **Quoted replies** — details already on the thread no longer page the principal; unauthorized quotes are dropped instead. (#2312)
+- **Reply drafts** — `email-draft-save` saves without a quote whose personal details would reach someone new. (#2312)
 - **`EmailSendRequest`** — **public API:** gains `quoteParticipants`, who was on the quoted message; never sent. (#2312)
 - **Band judge evidence** — reports to the principal count as support. **Public API:** `outbound.message` gains `reportedToPrincipal`. (#2312)
 - **Sender facts** — contact identity and message authentication are stated separately in sender context. (#2312)

@@ -62,7 +62,10 @@ redactor behaves as before and the gateway only reports what it removed.
    gateway confirms from that message's own headers, never from the caller's word. Otherwise
    an unauthorized quote-only item drops the quote rather than bouncing the reply. The
    principal's approval never covers a quote it did not show: an approved replay, and a draft
-   saved for one, go without a quote that has personal details and reaches someone new.
+   saved for one, go without a quote that has personal details and reaches someone new. A
+   reply draft saved by `email-draft-save` follows the same rule. Once saved, its quote is
+   part of the stored body: `send-draft` reviews it as the draft's own text, which can hold a
+   reply the exemption would have let through, but never lets one out.
 5. **Replies are linked to their task by outreach records.** Sends and web forms on a
    task-bound turn write `task_outreach` rows (the `record-outreach` tool covers forms and
    calls; a `web-browser` backstop records a skeleton row). A non-principal email is matched

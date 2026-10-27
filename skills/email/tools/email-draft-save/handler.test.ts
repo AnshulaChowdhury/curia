@@ -251,3 +251,40 @@ describe('EmailDraftSaveHandler — principal mailbox', () => {
     expect(result.success).toBe(true);
   });
 });
+
+// --- Reply quote (#2312) ---
+
+describe('EmailDraftSaveHandler — reply quote', () => {
+  it('passes the quote and its participants separately from the body, so the gateway can review it', async () => {
+    const gateway = makeMockGateway() as unknown as Record<string, unknown>;
+    gateway['getEmailMessage'] = vi.fn().mockResolvedValue({
+      from: [{ email: 'Alice@Example.com' }], to: [{ email: 'ceo@example.com' }], cc: [{ email: 'ops@example.com' }],
+      subject: 'Hello', body: 'Call me at 416-555-0199', date: 0,
+    });
+    const handler = new EmailDraftSaveHandler();
+    const result = await handler.execute(makeCtx({
+      input: { ...BASE_INPUT, reply_to_message_id: 'msg-1' },
+      outboundGateway: gateway as unknown as ToolContext['outboundGateway'],
+    }));
+    expect(result.success).toBe(true);
+    const req = vi.mocked(gateway['createEmailDraft'] as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(req.body).toBe('Hi there');
+    expect(req.htmlQuote).toContain('416-555-0199');
+    expect(req.quoteParticipants).toEqual(['alice@example.com', 'ceo@example.com', 'ops@example.com']);
+    expect(req.replyToMessageId).toBe('msg-1');
+  });
+
+  it('saves the body alone when the original cannot be fetched', async () => {
+    const gateway = makeMockGateway() as unknown as Record<string, unknown>;
+    gateway['getEmailMessage'] = vi.fn().mockRejectedValue(new Error('nylas down'));
+    const handler = new EmailDraftSaveHandler();
+    await handler.execute(makeCtx({
+      input: { ...BASE_INPUT, reply_to_message_id: 'msg-1' },
+      outboundGateway: gateway as unknown as ToolContext['outboundGateway'],
+    }));
+    const req = vi.mocked(gateway['createEmailDraft'] as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(req.body).toBe('Hi there');
+    expect(req).not.toHaveProperty('htmlQuote');
+    expect(req).not.toHaveProperty('quoteParticipants');
+  });
+});
