@@ -319,7 +319,7 @@ Under `band` the outbound filter's `contact-data-leak` rule and Stage 2.5 are of
 | Everything else, at every band | purpose, speaks as principal, grounding, necessity |
 | Any send with detected personal details | plus **disclosure**, principal-directed sends included |
 
-`send-draft` is the exception: a principal-directed draft send (a live turn or an approval) is not reviewed at all, because `send-draft` marks every call `humanApproved` and a stored draft cannot be edited; an autonomous one (a woken task) gets all four questions.
+`send-draft` is the exception: `send-draft` marks every call `humanApproved`, so the review keys on whether the principal directed this draft send (a live turn or an approval). An autonomous one (a woken task) gets all four questions; a principal-directed one is reviewed only for its personal details, and a draft the principal approved as written is not reviewed (see **Saved drafts** below).
 
 | Answer | Effect |
 |---|---|

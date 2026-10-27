@@ -4841,8 +4841,34 @@ describe('band review (#2159)', () => {
       // The sender's own signature phone, quoted back.
       const QUOTED = phone;
       const quote = `<blockquote>Reach me at ${QUOTED}.</blockquote>`;
-      const reply = { channel: 'email' as const, to: 'joel@example.com', subject: 'Re: Forms', body: 'Thanks, got it.', htmlQuote: quote };
+      const reply = { channel: 'email' as const, to: 'joel@example.com', subject: 'Re: Forms', body: 'Thanks, got it.', htmlQuote: quote, replyToMessageId: 'msg-orig' };
       const detected = (review: ReturnType<typeof vi.fn>) => (review.mock.calls[0]![0] as { detectedItems?: unknown }).detectedItems;
+      // The gateway confirms the exemption from the message the reply answers, never the caller's list.
+      const original = (to: string[] = ['curia@example.com'], cc: string[] = []) => {
+        const getMessage = vi.fn().mockResolvedValue({ from: [{ email: 'joel@example.com' }], to: to.map((email) => ({ email })), cc: cc.map((email) => ({ email })) });
+        (mocks.nylasClient as unknown as Record<string, unknown>).getMessage = getMessage;
+        return getMessage;
+      };
+      beforeEach(() => { original(); });
+
+      it('is reviewed when the caller claims participants the quoted message does not have', async () => {
+        const getMessage = original();
+        const review = vi.fn().mockResolvedValue({ kind: 'send' });
+        const { gateway } = await makePiiGateway({ review });
+        await gateway.send({ ...reply, cc: ['newcomer@example.com'], quoteParticipants: ['joel@example.com', 'newcomer@example.com'] }, { taskEventId: 't1' });
+        expect(getMessage).toHaveBeenCalledWith('msg-orig');
+        expect(detected(review)).toEqual([{ id: 'P1', label: 'phone_us', text: QUOTED, field: 'quote' }]);
+      });
+
+      it('is reviewed when the quoted message cannot be fetched, or the reply names none', async () => {
+        for (const req of [reply, { ...reply, replyToMessageId: undefined }]) {
+          (mocks.nylasClient as unknown as Record<string, unknown>).getMessage = vi.fn().mockRejectedValue(new Error('Nylas down'));
+          const review = vi.fn().mockResolvedValue({ kind: 'send' });
+          const { gateway } = await makePiiGateway({ review });
+          await gateway.send({ ...req, quoteParticipants: ['joel@example.com'] }, { taskEventId: 't1' });
+          expect(detected(review)).toEqual([{ id: 'P1', label: 'phone_us', text: QUOTED, field: 'quote' }]);
+        }
+      });
 
       it('is not reviewed when every recipient was on the quoted message, and is sent', async () => {
         const review = vi.fn().mockResolvedValue({ kind: 'send' });

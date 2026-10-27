@@ -56,7 +56,8 @@ redactor behaves as before and the gateway only reports what it removed.
    holds every unreviewed send). Items only in a quoted message follow decision 4: the send
    takes the ordinary judge-failure path without the quote, so an unreviewed quote never goes out.
 4. **Quoted-thread exemption.** A detail that appears only in quoted text is not a
-   disclosure when every non-principal recipient was already on the quoted message. Otherwise
+   disclosure when every non-principal recipient was already on the quoted message, which the
+   gateway confirms from that message's own headers, never from the caller's word. Otherwise
    an unauthorized quote-only item drops the quote rather than bouncing the reply. The
    principal's approval never covers a quote it did not show: an approved replay, and a draft
    saved for one, go without a quote that has personal details and reaches someone new.

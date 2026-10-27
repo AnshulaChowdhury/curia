@@ -24,6 +24,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { NylasClient, NylasMessage, NylasFolder, ListMessagesOptions, SendEmailOptions, AttachmentContent } from '../channels/email/nylas-client.js';
+import { quoteParticipants } from './_shared/reply-quote.js';
 import { readAttachmentFiles, MAX_ATTACHMENT_BYTES, type OutboundAttachmentInput } from './_shared/read-attachments.js';
 import type { EmailRecipientSource, EmailSendRequest } from '../channels/email/outbound-request.js';
 import type { SignalOutboundRequest } from '../channels/signal/outbound-request.js';
@@ -1259,7 +1260,7 @@ export class OutboundGateway {
       // The approval showed the body and subject. A reply's quote is rebuilt at send time and was
       // never shown, so personal details in it go out only after a review: here, without it.
       // Unless everyone it reaches was on the quoted message, as for a reviewed send.
-      if (request.channel === 'email' && request.htmlQuote && !this.quoteIsRecipients(request, recipients)) {
+      if (request.channel === 'email' && request.htmlQuote && !(await this.quoteIsExempt(request, recipients))) {
         try {
           dropIntactQuote = this.piiRedactor.detect(request.htmlQuote, 'email', { recipientId, principalIsSoleRecipient }).length > 0;
         } catch (err) {
@@ -1270,6 +1271,7 @@ export class OutboundGateway {
       }
     } else if (this.piiRedactor && bandReviewRuns) {
       const redactor = this.piiRedactor;
+      const quoteExempt = request.channel === 'email' && request.htmlQuote ? await this.quoteIsExempt(request, recipients) : false;
       try {
         const ctx = { recipientId, principalIsSoleRecipient };
         const detectIn = (text: string | undefined, field: BriefDetectedItem['field']): DetectedPii[] => {
@@ -1285,7 +1287,7 @@ export class OutboundGateway {
         // Quoted history shown back to people who were on it is not a disclosure (#2312): the
         // quote's items are ruled only when someone on this send was not on the quoted message.
         if (request.channel === 'email' && request.htmlQuote) {
-          if (this.quoteIsRecipients(request, recipients)) {
+          if (quoteExempt) {
             this.log.debug({ channel: request.channel }, 'outbound-gateway: quote not reviewed — every recipient was on the quoted message');
           } else {
             detectIn(request.htmlQuote, 'quote');
@@ -2791,6 +2793,27 @@ export class OutboundGateway {
   }
 
   /**
+   * Whether a quote is exempt from review (#2312): every recipient was on the quoted message,
+   * by that message's own headers. The caller's `quoteParticipants` is a claim, not evidence:
+   * any code holding the gateway can build a request. So the exemption holds only when the
+   * message the reply answers (`replyToMessageId`), fetched here, confirms it. Anything that
+   * cannot confirm (no id, no client, a failed fetch) reviews the quote: fail closed.
+   */
+  private async quoteIsExempt(request: EmailSendRequest, recipients: readonly FilterRecipient[]): Promise<boolean> {
+    // A claim that already fails needs no fetch.
+    if (!this.quoteIsRecipients(request, recipients)) return false;
+    const client = request.replyToMessageId ? this.getNylasClient(request.accountId) : undefined;
+    if (!client || !request.replyToMessageId) return false;
+    try {
+      const original = await client.getMessage(request.replyToMessageId);
+      return this.quoteIsRecipients({ ...request, quoteParticipants: quoteParticipants(original) }, recipients);
+    } catch (err) {
+      this.log.warn({ err }, 'outbound-gateway: could not fetch the quoted message to confirm its participants — reviewing the quote');
+      return false;
+    }
+  }
+
+  /**
    * Whether everyone this email reaches, besides the principal, was on the message it quotes
    * (#2312): the quote then only shows them what they already had. Compared as band review
    * compares recipients. No participants recorded is never true: the quote is reviewed.
@@ -3569,7 +3592,7 @@ export class OutboundGateway {
     // A draft is sent as written, and an approved replay of it is not scanned again (#2312). A
     // quote that reaches someone who was not on the quoted message, with personal details in it,
     // has had no review the principal saw: the draft is saved without it.
-    if (toDraft.htmlQuote && this.quoteNeedsReview(toDraft)) {
+    if (toDraft.htmlQuote && await this.quoteNeedsReview(toDraft)) {
       this.log.info('outbound-gateway: draft saved without its quoted message — the quote has personal details and reaches someone who was not on it');
       delete toDraft.htmlQuote;
       delete toDraft.quoteParticipants;
@@ -3582,10 +3605,10 @@ export class OutboundGateway {
    * Whether an email's quote carries personal details to someone who was not on the quoted
    * message (#2312), as send() would review them. A redactor error counts as yes (fail closed).
    */
-  private quoteNeedsReview(request: EmailSendRequest): boolean {
+  private async quoteNeedsReview(request: EmailSendRequest): Promise<boolean> {
     if (!request.htmlQuote || !this.piiRedactor) return false;
     const { recipients, principalIsSoleRecipient } = this.buildFilterRecipients(request);
-    if (this.quoteIsRecipients(request, recipients)) return false;
+    if (await this.quoteIsExempt(request, recipients)) return false;
     try {
       return this.piiRedactor.detect(request.htmlQuote, 'email', { recipientId: request.to, principalIsSoleRecipient }).length > 0;
     } catch (err) {

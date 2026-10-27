@@ -173,7 +173,11 @@ describeIf('test-mode stack with recordSends', () => {
     expect(sends.filter(s => s.subject === 'Quote')).toEqual([]);
   });
 
-  it('seeds a trusted contact, a standing task and outreach, reads the run\'s gateway outcome and removes it all', async () => {
+  it('seeds a trusted contact, a standing task and outreach, reads the run\'s gateway outcome and removes it all', async (ctx) => {
+    // The principal-originated task and send need a principal.
+    if (!stack!.principalContactId) ctx.skip();
+    // Its own conversation, so it depends on no other test's sends.
+    const own = `scenario-recording-${randomUUID()}`;
     const { seedRun, readGatewayOutcome, cleanupRun, SeedScope } = await import('../scenarios/seed.js');
     const { loadScenarioCase } = await import('../scenarios/loader.js');
     const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
@@ -197,31 +201,45 @@ expected_behaviors:
   - { id: a, description: x, check: { held: true } }
 `);
       const scenario = loadScenarioCase(file);
-      if (!stack!.principalContactId) return; // the principal-originated task needs one
       const scope = new SeedScope();
-      scope.rootConversation = conversation;
+      scope.rootConversation = own;
       const seeded = await seedRun(scenario, { stack: stack!, outboundContext: {} as never, scope });
       let cleaned = false;
       try {
         const contact = await stack!.contactService.getContact(seeded.refs.get('contact:pat')!);
         expect(contact?.tier).toBe('trusted');
+        // A principal's live send, which records confirmed outreach (the real TaskOutreachService),
+        // and a known contact's send below the score, which is held: both in this conversation.
+        const to = await recipient();
+        const principal = { contactId: stack!.principalContactId!, systemRole: 'principal', channel: 'signal', initiatedAt: new Date().toISOString(), tier: 'principal', authenticated: true };
+        const sent = await review!.invoke('email-send', { to, subject: 'Forms', body: 'Here are the forms.' }, undefined, {
+          agentId: 'coordinator', channelId: 'signal', conversationId: own, taskEventId: randomUUID(), liveTurn: true,
+          taskMetadata: { originator: principal },
+        });
+        expect(sent.success).toBe(true);
+        const held = await runWithAutonomyFixture({ score: 50, gating: 'tier' }, () => review!.invoke('email-send', { to, subject: 'Quote', body: 'Our quote.' }, undefined, {
+          agentId: 'coordinator', channelId: 'email', conversationId: own, taskEventId: randomUUID(),
+          taskMetadata: { originator: { contactId: to, systemRole: null, channel: 'email', initiatedAt: new Date().toISOString(), tier: 'known' } },
+        }));
+        expect(held.success).toBe(false);
         const outcome = await readGatewayOutcome(stack!, scenario, seeded, scope);
-        // The held send from the test above, in this conversation. The principal's send above
-        // recorded confirmed outreach for it (the real TaskOutreachService); the seeded row,
+        // The held send, and the outreach the principal's send recorded; the seeded row,
         // untouched, is not counted.
         expect(outcome.holds).toEqual([expect.objectContaining({ toolName: 'email-send', outcome: 'pending_approval' })]);
         expect(outcome.outreach).toEqual([expect.objectContaining({ domains: ['vendorco.test'], confirmed: true, seeded: false })]);
-        await cleanupRun(stack!, seeded, scope, conversation);
+        await cleanupRun(stack!, seeded, scope, own);
         cleaned = true;
         const left = await stack!.pool.query<{ n: string }>(
           `SELECT ((SELECT count(*) FROM tasks WHERE id = ANY($1::uuid[])) + (SELECT count(*) FROM task_outreach WHERE id = ANY($2::uuid[]))
                   + (SELECT count(*) FROM autonomy_action_log WHERE conversation_id = $3))::text AS n`,
-          [seeded.taskIds, seeded.outreachIds, conversation],
+          [seeded.taskIds, seeded.outreachIds, own],
         );
         expect(left.rows[0]!.n).toBe('0');
       } finally {
         // A failed assertion above must not leave the seeded rows behind.
-        if (!cleaned) await cleanupRun(stack!, seeded, scope, conversation);
+        if (!cleaned) await cleanupRun(stack!, seeded, scope, own);
+        await stack!.pool.query('DELETE FROM autonomy_action_log WHERE conversation_id = $1', [own]);
+        await stack!.pool.query('DELETE FROM task_outreach WHERE conversation_id = $1', [own]);
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
