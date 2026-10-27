@@ -340,8 +340,8 @@ See [ADR-054](../adr/054-authority-aware-pii-disclosure.md). Under `band` the ga
 |---|---|---|---|
 | `directed` | the principal: live turn, the send's task or its root task, or a recorded yes | send | send |
 | `directed` | a trusted contact on an authenticated channel (stamped and current tier both `trusted`; checked before a principal-rooted task) | send, principal copied | send, principal copied |
-| `inferred` | a principal-directed task, or a strong link to one | send | hold, ask if askable |
-| `inferred` | only a weak link | hold, ask if askable | hold, ask if askable |
+| `inferred` | a principal-directed task, or a strong link to one | send | hold if askable, else bounce |
+| `inferred` | only a weak link | hold if askable, else bounce | hold if askable, else bounce |
 | `unsupported`, requested, requester askable | n/a | hold, ask | hold, ask |
 | `unsupported` or any other `directed`/`inferred` | n/a | bounce | bounce |
 

@@ -98,10 +98,11 @@ redactor behaves as before and the gateway only reports what it removed.
 - **Keep cut-and-send** (cut the sentence or token and send the rest). It produced the
   incident's hollow message and a false report to the principal. A message with something
   removed is a different message; only the drafter can rewrite it so it still makes sense.
-- **Link replies by domain only.** A domain match is cheap but spoofable by anyone at that
-  domain or on a shared host, and misses forms answered from another address. Strength
-  (direct match, authentication, a confirmed act) is what decides authority; the model check
-  only makes a requester askable.
+- **Domain as the only linking signal, or a domain match that grants authority.** A domain
+  match is cheap but spoofable by anyone at that domain or on a shared host, and misses forms
+  answered from another address. Domain is one signal among several; authority needs a direct
+  match, an authenticated sender and a confirmed act (strong link). The model check and
+  unauthenticated matches are weak and only make a requester askable.
 - **Refuse instead of asking.** A refusal turns a legitimate counterparty away and tells the
   principal nothing. Asking costs one approval and records the answer for the thread.
 

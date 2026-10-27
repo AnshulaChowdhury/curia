@@ -1443,5 +1443,8 @@ describe('EmailAdapter — subscribeOutbound once-guard (#2312)', () => {
     expect(subscribed).toBeGreaterThan(0);
     adapter.subscribeOutbound();
     expect((mocks.bus.subscribe as ReturnType<typeof vi.fn>).mock.calls.length).toBe(subscribed);
+    // start() calls subscribeOutbound() itself; as in the suite above, the poll is not awaited.
+    void adapter.start();
+    expect((mocks.bus.subscribe as ReturnType<typeof vi.fn>).mock.calls.length).toBe(subscribed);
   });
 });
