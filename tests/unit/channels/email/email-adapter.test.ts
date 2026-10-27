@@ -351,6 +351,8 @@ describe('EmailAdapter — sendOutboundReply', () => {
     // Original HTML body is preserved inside the blockquote (not stripped to plain text)
     expect(callArg.htmlQuote).toContain('<blockquote');
     expect(callArg.htmlQuote).toContain('Hi Curia, can we sync on Q2?');
+    // Who was on the quoted message, lowercased, for the send review (#2312).
+    expect(callArg.quoteParticipants).toEqual([CEO_EMAIL.toLowerCase(), SELF_EMAIL.toLowerCase()]);
   });
 
   it('uses the configured timezone when rendering the quoted Date line', async () => {

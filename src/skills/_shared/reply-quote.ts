@@ -10,6 +10,7 @@
 import { DateTime } from 'luxon';
 import sanitizeHtml from 'sanitize-html';
 import { htmlToText } from '../../channels/email/html-to-text.js';
+import { normalizeCounterparty } from '../../autonomy/disclosure-decisions.js';
 
 /**
  * Minimal message shape required to build a reply quote block.
@@ -220,4 +221,21 @@ export function buildReplyQuote(
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Everyone on a quoted message, From, To and CC, as the send review compares recipients:
+ * lowercased bare addresses, once each (#2312). Set as `quoteParticipants` beside the
+ * `htmlQuote` built from the same message, so the quote's own details are not ruled a
+ * disclosure to people who already had it.
+ */
+export function quoteParticipants(message: {
+  from: ReadonlyArray<{ email: string }>;
+  to: ReadonlyArray<{ email: string }>;
+  cc?: ReadonlyArray<{ email: string }> | null;
+}): string[] {
+  const all = [...message.from, ...message.to, ...(message.cc ?? [])]
+    .map((p) => normalizeCounterparty(p.email))
+    .filter((e) => e.length > 0);
+  return [...new Set(all)];
 }

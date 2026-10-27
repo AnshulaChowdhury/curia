@@ -1281,7 +1281,15 @@ export class OutboundGateway {
         };
         const bodyItems = detectIn(messageBody, 'body');
         const subjectItems = request.channel === 'email' ? detectIn(request.subject, 'subject') : [];
-        if (request.channel === 'email') detectIn(request.htmlQuote, 'quote');
+        // Quoted history shown back to people who were on it is not a disclosure (#2312): the
+        // quote's items are ruled only when someone on this send was not on the quoted message.
+        if (request.channel === 'email' && request.htmlQuote) {
+          if (this.quoteIsRecipients(request, recipients)) {
+            this.log.debug({ channel: request.channel }, 'outbound-gateway: quote not reviewed — every recipient was on the quoted message');
+          } else {
+            detectIn(request.htmlQuote, 'quote');
+          }
+        }
         // audit: false — nothing is redacted on the wire, so no outbound.pii_redacted.
         redactedBody = redactor.apply(messageBody, bodyItems, request.channel, ctx, { audit: false }).content;
         if (request.channel === 'email' && request.subject) {
@@ -1493,6 +1501,8 @@ export class OutboundGateway {
     let bandReport: BandReviewReport | undefined;
     let bandSignals: BandReviewSignals | undefined;
     let copyPrincipal: { labels: string[] } | undefined;
+    // The review would stop the send only for the quote's details: it goes without the quote.
+    let dropQuote = false;
     if (bandReviewRuns) {
       // People in the finalized set (Curia's own addresses dropped; a group or channel id is
       // still not an audience member), so `recipients` and `principalRecipients` agree. A group
@@ -1519,6 +1529,7 @@ export class OutboundGateway {
       bandReport = outcome.report;
       bandSignals = outcome.signals;
       copyPrincipal = outcome.copyPrincipal;
+      dropQuote = outcome.dropQuote !== undefined;
     }
 
     // Spot-check pool (#2159 Phase 3): a send Curia made on its own. Not a system notice, a
@@ -1572,6 +1583,11 @@ export class OutboundGateway {
       if (dropIntactQuote) delete toSend.htmlQuote;
       delete toSend.recipientSource;
       delete toSend.recipientDisplayName;
+      // Quoted history, not the agent's text: dropping it is not a cut (#2312).
+      if (dropQuote) {
+        delete toSend.htmlQuote;
+        delete toSend.quoteParticipants;
+      }
       this.signEmail(toSend, options?.isSystemNotification === true);
       if (options?.recipientSource === 'email_participant') {
         toSend.recipientSource = 'email_participant';
@@ -2227,6 +2243,7 @@ export class OutboundGateway {
     editable?: boolean;
   }): Promise<{
     result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals; copyPrincipal?: { labels: string[] };
+    dropQuote?: { labels: string[] };
   }> {
     const { request, content, recipients, principalRecipients, options } = args;
     const score = this.bandScore(args.autonomy);
@@ -2303,10 +2320,14 @@ export class OutboundGateway {
     }
 
     if (decision.kind === 'send') {
+      if (decision.dropQuote) {
+        this.log.info({ channel: request.channel, labels: decision.dropQuote.labels }, 'outbound-gateway: band review sends without the quoted message — its details are not authorized for every recipient');
+      }
       return {
         ...(decision.report ? { report: decision.report } : {}),
         ...(decision.signals ? { signals: decision.signals } : {}),
         ...(decision.copyPrincipal ? { copyPrincipal: decision.copyPrincipal } : {}),
+        ...(decision.dropQuote ? { dropQuote: decision.dropQuote } : {}),
       };
     }
 
@@ -2765,6 +2786,20 @@ export class OutboundGateway {
       );
     }
     return result;
+  }
+
+  /**
+   * Whether everyone this email reaches, besides the principal, was on the message it quotes
+   * (#2312): the quote then only shows them what they already had. Compared as band review
+   * compares recipients. No participants recorded is never true: the quote is reviewed.
+   */
+  private quoteIsRecipients(request: EmailSendRequest, recipients: readonly FilterRecipient[]): boolean {
+    if (!request.quoteParticipants || request.quoteParticipants.length === 0) return false;
+    const participants = new Set(request.quoteParticipants.map(normalizeCounterparty));
+    const people = new Set(this.personRecipients(request).map(normalizeCounterparty));
+    return recipients
+      .filter((r) => !r.isPrincipal && people.has(normalizeCounterparty(r.email)))
+      .every((r) => participants.has(normalizeCounterparty(r.email)));
   }
 
   /** Recipient identifiers that name a person (never a group or conversation id). */

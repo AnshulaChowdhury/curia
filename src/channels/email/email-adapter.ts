@@ -32,7 +32,7 @@ import {
 import { isDbUnavailableError } from '../../db/resilience.js';
 import { INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS } from '../../audit/inbound-replay.js';
 import { sanitizeOutput } from '../../skills/sanitize.js';
-import { buildReplyQuote } from '../../skills/_shared/reply-quote.js';
+import { buildReplyQuote, quoteParticipants } from '../../skills/_shared/reply-quote.js';
 import {
   EMAIL_INBOUND_TURN_STALL_MS,
   EMAIL_POLL_PAGE_SIZE,
@@ -1430,6 +1430,8 @@ export class EmailAdapter implements Channel {
         body,
         replyToMessageId: threadMessage.id,
         htmlQuote,
+        // Who already has the quoted message: its details are not a disclosure to them (#2312).
+        ...(htmlQuote ? { quoteParticipants: quoteParticipants(threadMessage) } : {}),
         ...(ccAddresses.length > 0 ? { cc: ccAddresses } : {}),
       };
 

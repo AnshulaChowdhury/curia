@@ -39,6 +39,13 @@ export interface EmailSendRequest {
    *  Used for the quoted original message block: the quote is already sanitized
    *  HTML and must remain outside the generated-body wrapper. */
   htmlQuote?: string;
+  /**
+   * Everyone on the quoted message (from, to, cc), as lowercased bare addresses (#2312). Set by
+   * whoever builds `htmlQuote`. Under band review the quote's personal details are not a
+   * disclosure when every non-principal recipient was on that message; absent, they are
+   * reviewed. Not sent to the provider.
+   */
+  quoteParticipants?: string[];
   /** File attachments to include. Each entry must have a file:// URL pointing
    *  to a temp file (from email-download-attachment or similar). The gateway
    *  reads the files from disk before passing them to Nylas. */

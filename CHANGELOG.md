@@ -206,6 +206,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **PII asks** — never hide another finding; relayed asks reach the coordinator; `send-draft` records the yes. (#2312)
 - **Band judge** — no longer flags Curia's own conduct or what it tells the principal. (#2312)
 - **Send recipients** — Curia's own mailbox no longer counts as a recipient when checking sends. (#2312)
+- **Quoted replies** — details already on the thread no longer page the principal; unauthorized quotes are dropped instead. (#2312)
 - **Band judge evidence** — reports to the principal count as support. **Public API:** `outbound.message` gains `reportedToPrincipal`. (#2312)
 - **Sender facts** — contact identity and message authentication are stated separately in sender context. (#2312)
 - **Sender facts** — an email with no authentication result reads as not confirmed, not failed. (#2312)

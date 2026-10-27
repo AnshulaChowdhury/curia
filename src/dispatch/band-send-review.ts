@@ -48,6 +48,11 @@
 // a bounce beside it wins, so the drafter fixes the other finding and the recheck asks. A cold stranger's request bounces with `strangerRequest`, so the
 // digest says Curia did not share it. Both name labels and the requester only, never values.
 //
+// Items in an email's quoted message (field `quote`) are reached only when someone on the send
+// was not on that message; the gateway skips them otherwise. They never decide the outcome: if
+// the rest of the send goes out but they would not, it goes out with `dropQuote` and the gateway
+// removes the quote. Any other outcome is decided without them.
+//
 // The principal's answer to an ask is remembered per thread (#2312, disclosure_decisions): a
 // latest yes for a label from every non-principal recipient sends that item whatever the judge's
 // basis; a latest no from any of them bounces it (then blocks or holds on the recheck like any
@@ -148,7 +153,8 @@ export type BandReviewAsk = { labels: string[]; requester: string; counterpartie
 
 export type BandReviewDecision =
   // copyPrincipal: a trusted contact directed these items out; the principal is copied (#2312).
-  | { kind: 'send'; report?: BandReviewReport; signals?: BandReviewSignals; copyPrincipal?: { labels: string[] } }
+  // dropQuote: only the quoted message's details stopped it; it goes without the quote (#2312).
+  | { kind: 'send'; report?: BandReviewReport; signals?: BandReviewSignals; copyPrincipal?: { labels: string[] }; dropQuote?: { labels: string[] } }
   // strangerRequest: a recipient nobody can ask about requested these items; the digest is told (#2312).
   | { kind: 'bounce'; findings: FilterFinding[]; strangerRequest?: { labels: string[]; requester: string } }
   // Not sent, and not held for the principal: the drafter must rewrite it again (80+ only). The gateway converts it to a hold for a relayed reply or a saved draft.
@@ -185,8 +191,15 @@ export class BandSendReview {
     const taskIds = [...new Set([...(prior?.taskEventIds ?? []), ...(input.taskEventId ? [input.taskEventId] : [])])];
 
     const items = input.detectedItems ?? [];
-    // Past the cap the judge is not asked about the items at all: they are all unsupported.
-    const askedItems = items.length > 0 && items.length <= MAX_REVIEWED_ITEMS ? items : undefined;
+    // A quoted message's items (#2312) are ruled apart: the gateway sends without the quote
+    // when they alone would stop the send, so they never decide the outcome otherwise.
+    const own = items.filter((i) => i.field !== 'quote');
+    const quoted = items.filter((i) => i.field === 'quote');
+    // Past the cap the judge is not asked about the items at all: they are all unsupported. A
+    // long quote does not push the message's own items past it: only those are asked then.
+    const askedItems = items.length > 0 && items.length <= MAX_REVIEWED_ITEMS
+      ? items
+      : own.length > 0 && own.length <= MAX_REVIEWED_ITEMS ? own : undefined;
     const questions: readonly BriefQuestion[] = askedItems ? [...this.questionsFor(input), 'disclosure'] : this.questionsFor(input);
     const hasToken = REDACTION_TOKEN.test(input.content) || (input.subject !== undefined && REDACTION_TOKEN.test(input.subject));
 
@@ -199,7 +212,7 @@ export class BandSendReview {
     }
 
     if (!verdict.ok) {
-      if (items.length === 0 && !hasToken) {
+      if (own.length === 0 && !hasToken) {
         this.bounced.delete(key);
         if (prior) {
           // This draft already bounced on a finding the drafter has not shown resolved.
@@ -207,7 +220,8 @@ export class BandSendReview {
           this.deps.logger.warn({ conversationId: input.conversationId, failure: verdict.failure }, 'band review: reviewer unavailable on the recheck of a bounced draft — holding');
           return this.hold(BAND_RULES.unreviewed, recheckReason(prior.rules));
         }
-        return this.onJudgeFailure(input, verdict.failure);
+        // An unreviewed quote never goes out: a fail-open send drops it.
+        return withoutQuote(await this.onJudgeFailure(input, verdict.failure), quoted);
       }
       // Personal data or a placeholder never goes out unreviewed: no fail-open send, and the
       // fail-open allowance is not spent on it.
@@ -215,17 +229,22 @@ export class BandSendReview {
       const other = prior
         ? this.hold(BAND_RULES.unreviewed, recheckReason(prior.rules))
         : !isSpotCheckOrAbove(input.score)
-          ? this.unreviewedBelow80Hold(items, hasToken)
+          ? this.unreviewedBelow80Hold(own, hasToken)
           : undefined;
-      const pii = this.unreviewedPiiOutcome(input, items, hasToken, prior !== undefined);
+      const pii = this.unreviewedPiiOutcome(input, own, hasToken, prior !== undefined);
       // PII first, so its reason leads a merged hold: the bounce may have been for the items.
       return this.settle(key, taskIds, input, prior !== undefined, other ? combine(pii, other) : pii);
     }
     this.deps.limiter.recordJudgeSuccess();
 
     const other = this.otherRulesOutcome(input, verdict, items, prior !== undefined);
-    const pii = await this.piiOutcome(input, items, askedItems ? verdict.disclosures ?? [] : undefined, asked, hasToken, prior !== undefined);
-    return this.settle(key, taskIds, input, prior !== undefined, combine(other, pii));
+    const rulings = askedItems ? verdict.disclosures ?? [] : undefined;
+    const base = combine(other, await this.piiOutcome(input, own, rulings, asked, hasToken, prior !== undefined));
+    if (quoted.length === 0 || base.kind !== 'send') return this.settle(key, taskIds, input, prior !== undefined, base);
+    // The rest of the send goes out: the quote does too only if its items would.
+    const quoteRulings = askedItems && quoted.every((q) => askedItems.includes(q)) ? rulings : undefined;
+    const quote = await this.piiOutcome(input, quoted, quoteRulings, asked, false, prior !== undefined);
+    return this.settle(key, taskIds, input, prior !== undefined, quote.kind === 'send' ? combine(base, quote) : withoutQuote(base, quoted));
   }
 
   /** The band rules other than disclosure, as before #2312. Writes nothing to the ledger. */
@@ -662,11 +681,13 @@ export function combine(a: BandReviewDecision, b: BandReviewDecision): BandRevie
     const report = a.report ?? b.report;
     const signals = a.signals || b.signals ? { ...a.signals, ...b.signals } : undefined;
     const labels = [...new Set([...(a.copyPrincipal?.labels ?? []), ...(b.copyPrincipal?.labels ?? [])])];
+    const dropped = [...new Set([...(a.dropQuote?.labels ?? []), ...(b.dropQuote?.labels ?? [])])];
     return {
       kind: 'send',
       ...(report ? { report } : {}),
       ...(signals ? { signals } : {}),
       ...(labels.length > 0 ? { copyPrincipal: { labels } } : {}),
+      ...(a.dropQuote || b.dropQuote ? { dropQuote: { labels: dropped } } : {}),
     };
   }
   if (a.kind === 'bounce' && b.kind === 'bounce') {
@@ -677,6 +698,15 @@ export function combine(a: BandReviewDecision, b: BandReviewDecision): BandRevie
   // A merged hold has a reason besides the requester's data, so it is never an ask (#2312).
   if (a.kind === 'hold' && b.kind === 'hold') return { kind: 'hold', reason: a.reason, findings: [...a.findings, ...b.findings] };
   return a;
+}
+
+/**
+ * A send that goes out without its quoted message (#2312), when the quote has items. Quoted
+ * history, not the drafter's text, so this is not a cut. Any other outcome is unchanged.
+ */
+function withoutQuote(decision: BandReviewDecision, quoted: readonly BriefDetectedItem[]): BandReviewDecision {
+  if (decision.kind !== 'send' || quoted.length === 0) return decision;
+  return { ...decision, dropQuote: { labels: [...new Set(quoted.map((q) => q.label))] } };
 }
 
 /** The first recipient who is not the principal: who an ask or a stranger's request names (#2312). */

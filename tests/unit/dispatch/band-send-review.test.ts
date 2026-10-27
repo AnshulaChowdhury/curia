@@ -1035,6 +1035,74 @@ describe('BandSendReview', () => {
         expect(recheck).not.toHaveProperty('strangerRequest');
       });
     });
+
+    // A quoted message's items (#2312) never decide the outcome: alone they drop the quote.
+    describe('items in the quoted message', () => {
+      const Q: BriefDetectedItem = { id: 'P2', label: 'phone_us', text: '415-555-0100', field: 'quote' };
+      const quoteOnly: BandReviewInput = { ...base, detectedItems: [{ ...Q, id: 'P1' }] };
+
+      it('sends without the quote when only the quote\'s items are unauthorized, and asks about them', async () => {
+        const { svc, review } = make([withRulings(ruling('unsupported'))], { evidence: { authority: fromOutsider } });
+        const d = await svc.review(quoteOnly);
+        expect(d).toEqual({ kind: 'send', signals: {}, dropQuote: { labels: ['phone_us'] } });
+        expect(review.mock.calls[0]![0].detectedItems).toEqual(quoteOnly.detectedItems);
+        // A send clears the ledger: the next draft is not a recheck.
+        const next = make([withRulings(ruling('unsupported'))], { evidence: { authority: fromOutsider } });
+        expect((await next.svc.review(quoteOnly)).kind).toBe('send');
+      });
+
+      it('drops the quote instead of asking, even when the recipient asked for it', async () => {
+        const { svc } = make([withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
+        const d = await svc.review({ ...quoteOnly, recipientTier: 'trusted' });
+        expect(d).toMatchObject({ kind: 'send', dropQuote: { labels: ['phone_us'] } });
+      });
+
+      it('keeps the quote when its items are authorized', async () => {
+        const { svc } = make([withRulings(ruling('directed'))], { evidence: { authority: live } });
+        const d = await svc.review(quoteOnly);
+        expect(d).toEqual({ kind: 'send', signals: {} });
+      });
+
+      it('lets the body decide when the body also has a problem', async () => {
+        const { svc } = make([withRulings(ruling('unsupported'), ruling('unsupported', false, 'P2'))], { evidence: { authority: fromOutsider } });
+        const d = await svc.review({ ...pii, detectedItems: [P1, Q] });
+        expect(d.kind).toBe('bounce');
+        if (d.kind === 'bounce') {
+          // The body's label only: the rewrite's own review rules on the quote again.
+          expect(d.findings.map((f) => f.detail).join(' ')).toContain('sin_ca');
+          expect(d.findings.map((f) => f.detail).join(' ')).not.toContain('phone_us');
+        }
+      });
+
+      it('lets another finding decide too', async () => {
+        const { svc } = make([{ ...withRulings(ruling('unsupported')), purpose: 'steered' }], { evidence: { authority: fromOutsider } });
+        const d = await svc.review(quoteOnly);
+        expect(d.kind).toBe('hold');
+        expect(d).not.toHaveProperty('dropQuote');
+      });
+
+      it('sends an authorized body item with the quote dropped', async () => {
+        const { svc } = make([withRulings(ruling('directed'), ruling('unsupported', false, 'P2'))], { evidence: { authority: live } });
+        expect(await svc.review({ ...pii, detectedItems: [P1, Q] })).toEqual({ kind: 'send', signals: {}, dropQuote: { labels: ['phone_us'] } });
+      });
+
+      it('drops an unreviewed quote on a fail-open send, and ignores it on a hold', async () => {
+        const at84 = make([{ ok: false, failure: 'unreachable' }]);
+        expect(await at84.svc.review(quoteOnly)).toMatchObject({ kind: 'send', report: { source: 'sent_without_review' }, dropQuote: { labels: ['phone_us'] } });
+        const withBody = make([{ ok: false, failure: 'unreachable' }]);
+        const d = await withBody.svc.review({ ...pii, detectedItems: [P1, Q] });
+        expect(d.kind).toBe('bounce');
+        if (d.kind === 'bounce') expect(d.findings.map((f) => f.detail).join(' ')).not.toContain('phone_us');
+      });
+
+      it('asks only about the message\'s own items when a long quote passes the cap', async () => {
+        const quoted = Array.from({ length: 10 }, (_, i): BriefDetectedItem => ({ ...Q, id: `P${i + 2}` }));
+        const { svc, review } = make([withRulings(ruling('directed'))], { evidence: { authority: live } });
+        const d = await svc.review({ ...pii, detectedItems: [P1, ...quoted] });
+        expect(review.mock.calls[0]![0].detectedItems).toEqual([P1]);
+        expect(d).toMatchObject({ kind: 'send', dropQuote: { labels: ['phone_us'] } });
+      });
+    });
   });
 
   // PR 5 (#2312): the principal's recorded yes or no on this thread decides, for exactly that

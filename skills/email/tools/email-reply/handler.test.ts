@@ -300,6 +300,8 @@ describe('EmailReplyHandler', () => {
       expect(sendArg.htmlQuote).toContain('<blockquote');
       expect(sendArg.htmlQuote).toContain('alice@example.com');
       expect(sendArg.htmlQuote).toContain('Let me know your thoughts.');
+      // Who was on the quoted message, for the send review (#2312).
+      expect((sendArg as { quoteParticipants?: string[] }).quoteParticipants).toEqual(['alice@example.com', 'curia@example.com']);
     });
 
     it('proceeds without quote when buildReplyQuote throws', async () => {

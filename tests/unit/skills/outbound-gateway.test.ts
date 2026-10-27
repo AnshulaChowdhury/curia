@@ -4836,6 +4836,51 @@ describe('band review (#2159)', () => {
       expect(sentEmail().subject).toBe(`Re: ${phone}`);
     });
 
+    // Quoted history is not a disclosure to people already on it (#2312).
+    describe('the quoted message', () => {
+      // The sender's own signature phone, quoted back.
+      const QUOTED = phone;
+      const quote = `<blockquote>Reach me at ${QUOTED}.</blockquote>`;
+      const reply = { channel: 'email' as const, to: 'joel@example.com', subject: 'Re: Forms', body: 'Thanks, got it.', htmlQuote: quote };
+      const detected = (review: ReturnType<typeof vi.fn>) => (review.mock.calls[0]![0] as { detectedItems?: unknown }).detectedItems;
+
+      it('is not reviewed when every recipient was on the quoted message, and is sent', async () => {
+        const review = vi.fn().mockResolvedValue({ kind: 'send' });
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.send(
+          { ...reply, cc: ['Principal@Example.com'], quoteParticipants: ['joel@example.com', 'curia@example.com'] },
+          { taskEventId: 't1', postTurn: true },
+        );
+        expect(result.success).toBe(true);
+        expect(detected(review)).toBeUndefined();
+        expect(sentEmail().body).toContain(QUOTED);
+      });
+
+      it('is reviewed when a recipient was not on it, or nobody recorded who was', async () => {
+        for (const req of [
+          { ...reply, cc: ['newcomer@example.com'], quoteParticipants: ['joel@example.com'] },
+          reply,
+        ]) {
+          vi.mocked(mocks.nylasClient.sendMessage).mockClear();
+          const review = vi.fn().mockResolvedValue({ kind: 'send' });
+          const { gateway } = await makePiiGateway({ review });
+          await gateway.send(req, { taskEventId: 't1' });
+          expect(detected(review)).toEqual([{ id: 'P1', label: 'phone_us', text: QUOTED, field: 'quote' }]);
+          expect(sentEmail().body).toContain(QUOTED);
+        }
+      });
+
+      it('is dropped when the review says so, leaving the agent\'s text', async () => {
+        const review = vi.fn().mockResolvedValue({ kind: 'send', dropQuote: { labels: ['phone_us'] } });
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.send({ ...reply, to: 'stranger@example.com', quoteParticipants: ['joel@example.com'] }, { taskEventId: 't1' });
+        expect(result.success).toBe(true);
+        expect(sentEmail().body).toContain('Thanks, got it.');
+        expect(sentEmail().body).not.toContain(QUOTED);
+        expect(sentEmail().body).not.toContain('<blockquote>');
+      });
+    });
+
     it('keeps raw values out of the outbound.blocked event on a bounce', async () => {
       const findings = [{ rule: 'pii-not-authorized', detail: 'P1 phone_us was not authorized.' }];
       const { gateway } = await makePiiGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }) });
