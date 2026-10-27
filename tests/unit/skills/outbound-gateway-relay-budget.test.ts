@@ -8,7 +8,6 @@ import type { NylasClient } from '../../../src/channels/email/nylas-client.js';
 import type { SignalRpcClient } from '../../../src/channels/signal/signal-rpc-client.js';
 import type { ContactService } from '../../../src/contacts/contact-service.js';
 import type { OutboundContentFilter } from '../../../src/dispatch/outbound-filter.js';
-import type { PiiRedactor } from '../../../src/dispatch/pii-redactor.js';
 import type { EventBus } from '../../../src/bus/bus.js';
 import type { BusEvent } from '../../../src/bus/events.js';
 import type { TaskOriginator } from '../../../src/contacts/types.js';
@@ -38,7 +37,6 @@ function makeGateway(opts: {
   publish?: (layer: string, event: BusEvent) => Promise<void>;
   getContact?: ContactService['getContact'];
   filterPasses?: boolean;
-  piiRedactor?: PiiRedactor;
 } = {}) {
   const sendMessage = vi.fn().mockResolvedValue({ id: 'msg-1' });
   const signalSend = vi.fn().mockResolvedValue(undefined);
@@ -70,7 +68,6 @@ function makeGateway(opts: {
     principalIdentities: [principalIdentity('email', PRINCIPAL_EMAIL), principalIdentity('signal', PRINCIPAL_SIGNAL)],
     logger,
     relayBudget: budget,
-    piiRedactor: opts.piiRedactor,
   });
   const reports = () => published.filter((e) => e.type === 'principal.report');
   const deferredEvents = () => published.filter((e) => e.type === 'autonomy.relay_deferred');
@@ -114,22 +111,6 @@ describe('relay budget (#1320)', () => {
       payload: { originatorContactId: DANA_ID, tier: 'known', channel: 'signal', conversationId: 'email:t1', taskEventId: 'task-2', noticeSent: true },
     });
     expect(JSON.stringify(ev)).not.toContain('Friday');
-  });
-
-  it('reports redactions on a send held for the digest (#2312)', async () => {
-    const piiRedactor = {
-      redact: vi.fn().mockResolvedValue({
-        content: 'call [REDACTED: PHONE_US]',
-        redactions: [{ patternLabel: 'phone_us', channelId: 'signal', replacedWith: '[REDACTED: PHONE_US]' }],
-      }),
-    } as unknown as PiiRedactor;
-    const g = makeGateway({ perHour: 1, piiRedactor });
-    await g.gateway.send(toPrincipalSignal('first'), { originator: outsider(), taskEventId: 'task-1' });
-    const second = await g.gateway.send(toPrincipalSignal('call 519-555-0100'), { originator: outsider(), taskEventId: 'task-2' });
-
-    expect(second.deferredToDigest).toBe(true);
-    expect(second.redactions).toEqual([{ label: 'phone_us', field: 'body' }]);
-    expect(second.sentContent).toBe('call [REDACTED: PHONE_US]');
   });
 
   it('sends the notice only once per window', async () => {

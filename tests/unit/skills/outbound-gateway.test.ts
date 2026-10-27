@@ -2314,6 +2314,7 @@ describe('PII redaction pipeline step', () => {
         { label: 'phone_us', field: 'body' },
         { label: 'phone_us', field: 'subject' },
       ]);
+      expect(result.sentSubject).toBe(`${piiRequest.subject} [REDACTED: PHONE_US]`);
     });
 
     it('leaves both fields undefined when nothing was redacted', async () => {
@@ -2324,6 +2325,7 @@ describe('PII redaction pipeline step', () => {
       expect(result.success).toBe(true);
       expect(result.redactions).toBeUndefined();
       expect(result.sentContent).toBeUndefined();
+      expect(result.sentSubject).toBeUndefined();
     });
 
     it('reports redactions on a queued send', async () => {
@@ -2415,6 +2417,23 @@ describe('PII redaction pipeline step', () => {
       const sent = (nylasClient.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { body: string };
       expect(sent.body).toContain('[REDACTED: PHONE_US]');
       expect(sent.body).not.toContain('555-1234');
+    });
+
+    it('delivers intact when every recipient is one of the principal\'s own addresses', async () => {
+      const { gateway, nylasClient } = await makeRealGateway([
+        makePrincipalIdentity('ceo@example.com'),
+        makePrincipalIdentity('ceo@home.example'),
+      ]);
+      const result = await gateway.send({
+        channel: 'email',
+        to: 'ceo@example.com',
+        cc: ['ceo@home.example'],
+        subject: 's',
+        body: phoneBody,
+      });
+      expect(result.success).toBe(true);
+      const sent = (nylasClient.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { body: string };
+      expect(sent.body).toContain('(415) 555-1234');
     });
 
     it('delivers a Signal 1:1 to the principal intact', async () => {

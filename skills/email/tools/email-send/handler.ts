@@ -290,7 +290,8 @@ export class EmailSendHandler implements ToolHandler {
           ...(toContactId ? { contact_id: toContactId } : {}),
           ...(toIdentity ? { to_identity: toIdentity } : {}),
           ...(ccIdentities.length > 0 ? { cc_identities: ccIdentities } : {}),
-          subject,
+          // As delivered: redaction may have changed it (#2312).
+          subject: result.sentSubject ?? subject,
           // Held by the relay budget for the principal's digest (#1320).
           ...relayDeferredData(result),
           // Details the gateway removed before sending (#2312).

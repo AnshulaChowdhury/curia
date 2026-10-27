@@ -286,7 +286,13 @@ describe('sin_ca', () => {
     expect(found[0]!.matched).toBe(sin);
   });
 
-  it.each(['SIN: 130692544', 'social insurance number 130692544', 'Social Insurance No. 130692544'])(
+  it.each([
+    'SIN: 130692544',
+    'S.I.N. 130692544',
+    'social insurance number 130692544',
+    'Social Insurance No. 130692544',
+    'SOCIAL INSURANCE NO. 130692544',
+  ])(
     'matches bare digits after keyword in %s, excluding the keyword from the span',
     (text) => {
       const found = sinMatches(text);
@@ -303,6 +309,17 @@ describe('sin_ca', () => {
     const found = sinMatches(text);
     expect(found).toHaveLength(1);
     expect(found[0]!.matched).toBe(expected);
+  });
+
+  it.each(['living in sin 130692544 days', 'Please forgive this sin: 130692544'])(
+    'does not treat the English word "sin" as the keyword in %s',
+    (text) => {
+      expect(sinMatches(text)).toHaveLength(0);
+    },
+  );
+
+  it('still redacts a 3-3-3 SIN labelled "SSN" (the ssn pattern only matches 3-2-4)', () => {
+    expect(scrubPii('SSN: 130-692-544')).toBe('SSN: [SIN]');
   });
 
   it('does not match a formatted SIN followed by digits without a keyword', () => {

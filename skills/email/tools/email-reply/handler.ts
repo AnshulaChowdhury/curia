@@ -328,7 +328,8 @@ export class EmailReplyHandler implements ToolHandler {
           message_id: result.messageId,
           // Every To recipient, comma-separated.
           to: toLabel,
-          subject: replySubject,
+          // As delivered: redaction may have changed it (#2312).
+          subject: result.sentSubject ?? replySubject,
           // Return the CC list that was used; empty string when none.
           cc: ccAddresses?.join(', ') ?? '',
           // Held by the relay budget for the principal's digest (#1320).

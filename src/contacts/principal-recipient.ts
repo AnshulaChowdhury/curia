@@ -41,19 +41,12 @@ export function isPrincipalIdentity(
 }
 
 /**
- * After deduplicating by case-insensitive identifier, true only when exactly one
- * recipient remains and it is the principal.
+ * True only when the principal is the only person receiving the send: at least one
+ * recipient, and every recipient is a verified principal identity. Two of the
+ * principal's own addresses (work + personal) still count as sole (#2312).
  */
 export function computePrincipalIsSoleRecipient(recipients: readonly TaggedRecipient[]): boolean {
-  const seen = new Set<string>();
-  const deduped: TaggedRecipient[] = [];
-  for (const r of recipients) {
-    const key = r.identifier.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(r);
-  }
-  return deduped.length === 1 && deduped[0]!.isPrincipal;
+  return recipients.length > 0 && recipients.every((r) => r.isPrincipal);
 }
 
 /**

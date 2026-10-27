@@ -167,6 +167,17 @@ describe('principal-recipient', () => {
         { identifier: 'CEO@example.com', isPrincipal: true },
       ])).toBe(true);
     });
+
+    it('is true when every recipient is one of the principal\'s identities (#2312)', () => {
+      expect(computePrincipalIsSoleRecipient([
+        { identifier: 'ceo@work.example', isPrincipal: true },
+        { identifier: 'ceo@home.example', isPrincipal: true },
+      ])).toBe(true);
+    });
+
+    it('is false for an empty recipient set', () => {
+      expect(computePrincipalIsSoleRecipient([])).toBe(false);
+    });
   });
 
   describe('resolvePrincipalIsSoleRecipientFromSkillInput', () => {

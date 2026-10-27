@@ -848,11 +848,12 @@ async function main(): Promise<void> {
   // bootstrap. The principal contact is created by the in-app onboarding wizard (#771);
   // this block only *resolves* it once at startup and derives the runtime identity values
   // used downstream:
-  //   - principalContact.id  → PiiRedactor bypass (structural UUID match, tamper-proof)
   //   - principalEmail        → outbound content filter allow-list, principal notifiers,
   //                             email adapter, approval notifications
   //   - principalIdentities   → runtime prompt injection + outbound recipient check,
-  //                             Drive grants to the principal raised to writer
+  //                             Drive grants to the principal raised to writer, and the
+  //                             PiiRedactor bypass (only when the principal is the send's sole
+  //                             recipient: principalIsSoleRecipient, #2312)
   //
   // A missing principal is NOT fatal here: the readiness check below converts it into
   // setup-required mode so the operator can finish onboarding via the web UI. That keeps

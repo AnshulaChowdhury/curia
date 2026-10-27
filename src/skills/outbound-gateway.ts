@@ -170,8 +170,10 @@ export interface OutboundSendResult {
    * held for the digest) where redaction changed something; absent otherwise.
    */
   redactions?: Array<{ label: string; field: 'body' | 'subject' }>;
-  /** The body as delivered. Set with `redactions`, so the agent can see what recipients got. */
+  /** The body as delivered. Set with `redactions`; send skills use it for outbound context. */
   sentContent?: string;
+  /** The email subject as delivered. Set with `redactions` on email sends; skills return it in place of the input subject. */
+  sentSubject?: string;
   /** True when the autonomy gate blocked this send */
   gated?: boolean;
   /** Short reference for the action_log row (e.g. 'a3f7c12b'). Present when gated is true. */
@@ -1377,7 +1379,9 @@ export class OutboundGateway {
         relaySlot = relayOriginator.contactId;
       } else {
         const deferred = await this.deferRelay(request, redactedBody, redactedSubject, relayOriginator, options);
-        if (deferred) return this.withRedactions(deferred, appliedRedactions, redactedBody);
+        // No withRedactions here: deferral needs principalIsSoleRecipient, which is also the
+        // redactor's bypass, so nothing was redacted.
+        if (deferred) return deferred;
         // The digest item could not be recorded: deliver after all. Noise beats a lost message.
       }
     } else if (
@@ -1497,7 +1501,7 @@ export class OutboundGateway {
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
       // toSend.body, not redactedBody: signEmail may have dropped the model's sign-off.
-      return this.withRedactions(result, appliedRedactions, toSend.body);
+      return this.withRedactions(result, appliedRedactions, toSend.body, toSend.subject);
     }
 
     if (request.channel === 'slack') {
@@ -1583,9 +1587,10 @@ export class OutboundGateway {
     result: OutboundSendResult,
     applied: NonNullable<OutboundSendResult['redactions']>,
     sentContent: string,
+    sentSubject?: string,
   ): OutboundSendResult {
     if (!result.success || applied.length === 0) return result;
-    return { ...result, redactions: [...applied], sentContent };
+    return { ...result, redactions: [...applied], sentContent, ...(sentSubject !== undefined ? { sentSubject } : {}) };
   }
 
   /** Whether this channel is registered for durable queueing (#1380). */
@@ -2659,7 +2664,7 @@ export class OutboundGateway {
    * To/CC/BCC counts once — otherwise a principal listed twice (e.g. To + CC) would
    * make `principalIsSoleRecipient` false and the judge would run on an effectively
    * single-recipient principal-only send. `principalIsSoleRecipient` is true ONLY when
-   * exactly one (deduped) recipient remains and it is the principal.
+   * every recipient is a verified principal identity (#2312).
    */
   private finalizeRecipientSet(tagged: FilterRecipient[]): {
     recipients: FilterRecipient[];

@@ -871,6 +871,17 @@ describe('EmailReplyHandler redactions (#2312)', () => {
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: SENT }));
   });
 
+  it('returns the subject as delivered when redaction changed it', async () => {
+    const ctx = makeCtx({ reply_to_message_id: 'nylas-msg-1', body: 'x' });
+    withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true, messageId: 'm', redactions: [{ label: 'phone_us', field: 'subject' }], sentContent: 'x', sentSubject: 'Re: [REDACTED: PHONE_US]',
+    });
+    const result = await new EmailReplyHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toMatchObject({ subject: 'Re: [REDACTED: PHONE_US]' });
+  });
+
   it('adds no redactions key when nothing was removed', async () => {
     const ctx = makeCtx({ reply_to_message_id: 'nylas-msg-1', body: 'hello' });
     const register = withContext(ctx);
