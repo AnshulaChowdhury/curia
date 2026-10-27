@@ -91,14 +91,17 @@ export class SignalAdapter implements Channel {
     return this.config.rpcClient.isConnected();
   }
 
-  async start(): Promise<void> {
-    const { bus, rpcClient } = this.config;
-
-    // Subscribe to outbound messages for the Signal channel.
+  /**
+   * Subscribe the outbound side: replies the dispatcher relays (outbound.message) go back to
+   * the sender through the OutboundGateway. start() calls it before connecting. The test-mode
+   * recording stack (#2312) calls it alone, against a recording client, so a scenario's
+   * relayed reply takes this exact path with no socket. Call once per adapter.
+   */
+  subscribeOutbound(): void {
     // When the coordinator responds to a Signal-triggered conversation, the
     // dispatcher creates an outbound.message with channelId 'signal'. The adapter
     // routes this back to the sender via the OutboundGateway.
-    bus.subscribe('outbound.message', 'channel', async (event) => {
+    this.config.bus.subscribe('outbound.message', 'channel', async (event) => {
       const outbound = event as OutboundMessageEvent;
       if (outbound.payload.channelId !== 'signal') return;
 
@@ -109,6 +112,12 @@ export class SignalAdapter implements Channel {
           'Failed to send Signal response');
       }
     });
+  }
+
+  async start(): Promise<void> {
+    const { bus, rpcClient } = this.config;
+
+    this.subscribeOutbound();
 
     // Register inbound message handler before connecting so no messages are
     // missed during the connect window.

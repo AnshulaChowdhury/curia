@@ -127,6 +127,7 @@ const GATEWAY_CHECK_KEYS: Record<typeof GATEWAY_CHECK_KINDS[number], readonly st
   delivered: ['channel', 'to', 'cc_includes', 'contains', 'excludes', 'count'],
   not_delivered: ['to'],
   held: ['contains'],
+  not_held: ['contains'],
   outreach_recorded: ['domain', 'confirmed'],
   decision_recorded: ['label', 'decision'],
 };
@@ -234,7 +235,8 @@ function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, f
       const to = recipient('to');
       return { kind, ...(to !== undefined ? { to } : {}) };
     }
-    case 'held': {
+    case 'held':
+    case 'not_held': {
       const contains = strList(body, 'contains', file, at);
       return { kind, ...(contains.length > 0 ? { contains } : {}) };
     }

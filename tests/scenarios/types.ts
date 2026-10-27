@@ -108,6 +108,11 @@ export type BehaviorCheck =
    */
   | { kind: 'held'; contains?: string[] }
   /**
+   * No approval was raised this run; with `contains`, none showing every one of those texts.
+   * Resolved or not, an approval raised during the run counts.
+   */
+  | { kind: 'not_held'; contains?: string[] }
+  /**
    * Outreach was recorded this run (a row the run's sends wrote, or a seeded row they added
    * to), naming `domain` when set, with that `confirmed` flag when set.
    */
@@ -127,7 +132,7 @@ export type TextSource = 'reply' | { tool: string; arg: string };
 export type DeliveryChannel = 'email' | 'signal' | 'slack' | 'sms';
 
 /** The check kinds that read what a through-gateway run sent (#2312). */
-export const GATEWAY_CHECK_KINDS = ['delivered', 'not_delivered', 'held', 'outreach_recorded', 'decision_recorded'] as const;
+export const GATEWAY_CHECK_KINDS = ['delivered', 'not_delivered', 'held', 'not_held', 'outreach_recorded', 'decision_recorded'] as const;
 
 export interface ExpectedBehavior {
   id: string;

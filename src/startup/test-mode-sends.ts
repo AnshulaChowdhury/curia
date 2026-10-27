@@ -13,7 +13,7 @@
 //     reports a failed dispatch.
 
 import { randomUUID } from 'node:crypto';
-import type { NylasClient, NylasMessage, SendEmailOptions } from '../channels/email/nylas-client.js';
+import type { ListMessagesOptions, NylasClient, NylasMessage, SendEmailOptions } from '../channels/email/nylas-client.js';
 import type { SignalRpcClient } from '../channels/signal/signal-rpc-client.js';
 import type { SignalSendParams } from '../channels/signal/types.js';
 import type { SlackClient } from '../channels/slack/slack-client.js';
@@ -34,6 +34,10 @@ import type { PiiRedactor } from '../dispatch/pii-redactor.js';
 import type { ConversationEntityState } from '../entity-context/conversation-entities.js';
 import type { Logger } from '../logger.js';
 import { OutboundGateway } from '../skills/outbound-gateway.js';
+import { EmailAdapter } from '../channels/email/email-adapter.js';
+import { SignalAdapter } from '../channels/signal/signal-adapter.js';
+import type { BusEvent, EventType, Layer, OutboundMessageEvent } from '../bus/events.js';
+import type { PrincipalEmailRef } from '../contacts/types.js';
 import type { AgentPersona } from '../skills/types.js';
 
 /** One message a recording transport took: what would have left the process. */
@@ -77,6 +81,20 @@ export interface SendRecorder {
    * finds another's. Absent or undefined: one store for the stack.
    */
   drafts?(): Map<string, NylasMessage> | undefined;
+  /**
+   * The messages of an email thread, most recent first, as the fake mailbox lists them: what a
+   * relayed email reply threads onto (EmailAdapter.sendOutboundReply). Absent: none.
+   */
+  threadMessages?(threadId: string): NylasMessage[];
+  /**
+   * Whether the relay adapters should send this outbound.message (`conversationId`) or, with no
+   * id, this outbound.notification. The scenario suite answers yes only inside a through_gateway
+   * run, for its own conversations, so every other run's relays stay on the bus as before.
+   * Absent: no relay adapter is subscribed.
+   */
+  relays?(conversationId?: string): boolean;
+  /** Addresses that are Curia's own beyond email_accounts (the scenario office's): never a reply recipient. */
+  ownAddresses?: readonly string[];
 }
 
 /**
@@ -196,6 +214,10 @@ export function createRecordingTransports(recorder: SendRecorder, accountNames: 
       emailSend('send', sent);
       return sent;
     },
+    listMessages: async (options?: ListMessagesOptions): Promise<NylasMessage[]> => {
+      const thread = options?.threadId ? recorder.threadMessages?.(options.threadId) ?? [] : [];
+      return thread.slice(0, options?.limit ?? 50);
+    },
     getMessage: async (messageId: string): Promise<NylasMessage> => {
       const message = recorder.message(messageId);
       if (!message) throw new ScenarioMailboxNotFound(`Message ${messageId}`);
@@ -205,7 +227,8 @@ export function createRecordingTransports(recorder: SendRecorder, accountNames: 
   // Cast: the gateway calls only the methods above on a send path. Anything else (archive,
   // labels, attachments) is not a send and fails loudly instead of reaching a network.
   const nylasClient = mailbox as unknown as NylasClient;
-  const names = accountNames.length > 0 ? accountNames : ['scenario'];
+  // `curia` too: a relayed reply with no account names it, as the email adapter defaults to.
+  const names = [...new Set([...accountNames, 'curia'])];
   const nylasClients = new Map(names.map(name => [name, nylasClient] as const));
 
   const signalClient = {
@@ -304,4 +327,78 @@ export function createRecordingOutboundGateway(deps: {
     ...(review.bandReview ? { bandReview: review.bandReview } : {}),
     ...(review.relayBudget ? { relayBudget: review.relayBudget } : {}),
   });
+}
+
+/**
+ * A view of the bus whose subscriptions see only the events `accept` passes. The relay adapters
+ * subscribe through it, so they act for through-gateway runs alone and leave every other run's
+ * outbound.message on the bus, unsent, as test mode always has. Publishing is the real bus.
+ */
+function relayBus(bus: EventBus, accept: (event: BusEvent) => boolean): EventBus {
+  return Object.assign(Object.create(bus) as EventBus, {
+    subscribe: (eventType: EventType, layer: Layer, handler: (event: BusEvent) => void | Promise<void>): void => {
+      bus.subscribe(eventType, layer, (event) => (accept(event) ? handler(event) : undefined));
+    },
+  });
+}
+
+/**
+ * Production's relay path for a recording stack (#2312): the real EmailAdapter (one per mailbox,
+ * plus `curia`, the account a relay with none names) and SignalAdapter, with only their outbound
+ * side subscribed (subscribeOutbound) against the recording gateway. A reply the dispatcher
+ * relays to a third party then goes through sendOutboundReply / handleOutbound exactly as in
+ * production: reply-all recipients, the quote, provenance, postTurn and the relay hold recipe,
+ * the gated-draft fallback, the approval wake. No adapter is started: no poll, no socket, no
+ * inbound, no queue flush. Only events SendRecorder.relays accepts reach them.
+ */
+export function subscribeRecordingRelays(deps: {
+  recorder: SendRecorder;
+  gateway: OutboundGateway;
+  bus: EventBus;
+  logger: Logger;
+  contactService: ContactService;
+  emailAccounts: ReadonlyArray<{ name: string; selfEmail: string }>;
+  /** Further addresses that are Curia's own (the scenario office's), never a reply recipient. */
+  ownAddresses: readonly string[];
+  principalEmail: PrincipalEmailRef;
+  signalPhoneNumber?: string;
+  timezone: string;
+}): void {
+  const relays = deps.recorder.relays?.bind(deps.recorder);
+  if (!relays) return;
+  const bus = relayBus(deps.bus, (event) => {
+    if (event.type === 'outbound.message') return relays((event as OutboundMessageEvent).payload.conversationId);
+    if (event.type === 'outbound.notification') return relays();
+    return false;
+  });
+  const owned = [...new Set([...deps.emailAccounts.map(a => a.selfEmail), ...deps.ownAddresses])];
+  const accounts = [...new Set([...deps.emailAccounts.map(a => a.name), 'curia'])];
+  for (const accountId of accounts) {
+    const selfEmail = deps.emailAccounts.find(a => a.name === accountId)?.selfEmail ?? owned[0] ?? '';
+    new EmailAdapter({
+      accountId,
+      bus,
+      logger: deps.logger,
+      outboundGateway: deps.gateway,
+      contactService: deps.contactService,
+      // Never polls: start() is not called.
+      pollingIntervalMs: 60_000,
+      selfEmail,
+      suppressedSenderEmails: owned.filter(a => a !== selfEmail),
+      ceoEmail: deps.principalEmail,
+      contactCreationMaxPerMessage: 10,
+      contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 1,
+      timezone: deps.timezone,
+    }).subscribeOutbound();
+  }
+  new SignalAdapter({
+    bus,
+    logger: deps.logger,
+    // Never connected: start() is not called, and the outbound side sends through the gateway.
+    rpcClient: { isConnected: () => true } as unknown as SignalRpcClient,
+    outboundGateway: deps.gateway,
+    contactService: deps.contactService,
+    phoneNumber: deps.signalPhoneNumber ?? '+15555550100',
+  }).subscribeOutbound();
 }

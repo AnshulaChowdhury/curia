@@ -393,8 +393,15 @@ export class EmailAdapter implements Channel {
     return this.running;
   }
 
-  async start(): Promise<void> {
-    const { bus, logger, pollingIntervalMs, configStore, accountId } = this.config;
+  /**
+   * Subscribe this account's outbound side: replies the dispatcher relays (outbound.message)
+   * and system notifications (outbound.notification). start() calls it before polling. The
+   * test-mode recording stack (#2312) calls it alone, against recording clients, so a
+   * scenario's relayed reply takes this exact path without an inbox, a poll or a real client.
+   * Call once per adapter.
+   */
+  subscribeOutbound(): void {
+    const { bus, logger } = this.config;
 
     // Subscribe to outbound messages for this specific email account.
     // When the coordinator responds to an email-triggered conversation, the dispatcher
@@ -474,6 +481,12 @@ export class EmailAdapter implements Channel {
         );
       }
     });
+  }
+
+  async start(): Promise<void> {
+    const { bus, logger, pollingIntervalMs, configStore, accountId } = this.config;
+
+    this.subscribeOutbound();
 
     // Restore the persisted high-water mark so restarts resume from where we left off
     // rather than silently dropping messages that arrived during downtime.

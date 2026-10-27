@@ -1,6 +1,6 @@
 // filter.llmJudge and pii.outbound_redaction resolve the same way for production and the
 // test-mode recording stack (#2312), with production's validation.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { OutboundConfigError, resolveOutboundJudgeConfig, resolveOutboundRedactionConfig, type YamlConfig } from '../../src/config.js';
 
 describe('resolveOutboundJudgeConfig', () => {
@@ -21,8 +21,16 @@ describe('resolveOutboundJudgeConfig', () => {
     expect(resolveOutboundJudgeConfig({ llmJudge: { enabled: false, timeout_ms: 0 } }).enabled).toBe(false);
   });
 
-  it('refuses an unknown failMode', () => {
-    expect(() => resolveOutboundJudgeConfig({ llmJudge: { failMode: 'maybe' } } as unknown as YamlConfig['filter'])).toThrow(/failMode/);
+  it('warns on an unknown failMode and uses split', () => {
+    const warn = vi.fn();
+    expect(resolveOutboundJudgeConfig({ llmJudge: { failMode: 'maybe' } } as unknown as YamlConfig['filter'], warn).failMode).toBe('split');
+    expect(warn).toHaveBeenCalledWith({ failMode: 'maybe' }, expect.stringMatching(/failMode/));
+  });
+
+  it('does not check the failMode of a disabled judge', () => {
+    const warn = vi.fn();
+    resolveOutboundJudgeConfig({ llmJudge: { enabled: false, failMode: 'maybe' } } as unknown as YamlConfig['filter'], warn);
+    expect(warn).not.toHaveBeenCalled();
   });
 });
 
@@ -36,7 +44,9 @@ describe('resolveOutboundRedactionConfig', () => {
       .toEqual({ enabled: false, default: 'allow', channel_policies: { email: { allow: [] }, signal: { allow: ['phone'] } } });
   });
 
-  it('refuses an unknown default', () => {
-    expect(() => resolveOutboundRedactionConfig({ outbound_redaction: { default: 'redact' } } as unknown as YamlConfig['pii'])).toThrow(OutboundConfigError);
+  it('warns on an unknown default and blocks', () => {
+    const warn = vi.fn();
+    expect(resolveOutboundRedactionConfig({ outbound_redaction: { default: 'redact' } } as unknown as YamlConfig['pii'], warn).default).toBe('block');
+    expect(warn).toHaveBeenCalledWith({ default: 'redact' }, expect.stringMatching(/default/));
   });
 });

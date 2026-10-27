@@ -71,6 +71,10 @@ expected_behaviors:
     description: any hold
     check:
       held: true
+  - id: no-ask
+    description: no ask about a passport
+    check:
+      not_held: { contains: [passport] }
 `;
 
 describe('through_gateway cases', () => {
@@ -91,6 +95,7 @@ describe('through_gateway cases', () => {
       { kind: 'outreach_recorded', domain: 'vendor.example.test', confirmed: true },
       { kind: 'decision_recorded', label: 'SIN', decision: 'yes' },
       { kind: 'held' },
+      { kind: 'not_held', contains: ['passport'] },
     ]);
   });
 

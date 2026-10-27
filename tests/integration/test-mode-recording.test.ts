@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import * as path from 'node:path';
 import { loadYamlConfig } from '../../src/config.js';
+import { createOutboundMessage } from '../../src/bus/events.js';
 import type { ExecutionLayer } from '../../src/skills/execution.js';
 import { createTestModeStack, runWithAutonomyFixture, type TestModeStack } from '../../src/startup/test-mode-stack.js';
 import type { RecordedSend } from '../../src/startup/test-mode-sends.js';
@@ -31,6 +32,7 @@ describeIf('test-mode stack with recordSends', () => {
   let onTestDb = false;
   const conversation = `scenario-recording-${randomUUID()}`;
   const contactIds: string[] = [];
+  let relaysOn = false;
 
   beforeAll(async () => {
     const probe = new Pool({ connectionString: DATABASE_URL });
@@ -54,7 +56,12 @@ describeIf('test-mode stack with recordSends', () => {
       llm: 'offline',
       enablement: 'all',
       yamlConfig,
-      recordSends: { record: (send) => { sends.push(send); }, message: () => undefined },
+      recordSends: {
+        record: (send) => { sends.push(send); },
+        message: () => undefined,
+        // Relays only while a test turns them on: every other outbound.message stays unsent.
+        relays: () => relaysOn,
+      },
       wrapOutboundContext: (service) => service,
       wrapExecutionLayer: (layer, reviewLayer) => {
         review = reviewLayer;
@@ -130,6 +137,24 @@ describeIf('test-mode stack with recordSends', () => {
       expect(sends).toHaveLength(1);
     } finally {
       fetchSpy.mockRestore();
+    }
+  });
+
+  it('relays a dispatcher reply through the real Signal adapter path only while the recorder accepts it', async () => {
+    const before = sends.length;
+    const relayConversation = `signal:+1555${String(Date.now()).slice(-7)}`;
+    const publish = () => stack!.bus.publish('dispatch', createOutboundMessage({
+      conversationId: relayConversation, channelId: 'signal', content: 'Relayed hello', taskEventId: randomUUID(), parentEventId: randomUUID(),
+    }));
+    try {
+      await publish();
+      expect(sends.length).toBe(before);
+      relaysOn = true;
+      await publish();
+      expect(sends.slice(before)).toEqual([expect.objectContaining({ channel: 'signal', kind: 'send', body: 'Relayed hello' })]);
+    } finally {
+      relaysOn = false;
+      await stack!.pool.query('DELETE FROM autonomy_action_log WHERE conversation_id = $1', [relayConversation]);
     }
   });
 

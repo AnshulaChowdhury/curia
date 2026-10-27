@@ -17,7 +17,10 @@
 //     (test-mode-sends.ts), on a second ExecutionLayer the caller routes chosen calls
 //     to: what passes is handed to the caller's recorder, still with no real client
 //     constructed and no outbound queue. The layer agents call keeps the no-send one.
-//   - No channel adapters. outbound.message events stay on the in-process bus.
+//   - No channel adapters. outbound.message events stay on the in-process bus. With
+//     `recordSends` (#2312) the email and Signal adapters' outbound side (never started:
+//     no poll, no socket) relays the events SendRecorder.relays accepts to the recording
+//     gateway; every other relay stays on the bus.
 //   - Withheld credentials. Skills that call a provider directly with a declared
 //     secret (e.g. ceo-inbox → Nylas) get a "withheld in test mode" error. Only the
 //     read-only secrets in TEST_MODE_PASSTHROUGH_SECRETS fall back to env as usual.
@@ -82,7 +85,7 @@ import { OutboundLlmJudge, type JudgeConfig } from '../dispatch/outbound-judge.j
 import { PiiRedactor } from '../dispatch/pii-redactor.js';
 import { extractPromptExfiltrationMarkers } from '../dispatch/prompt-exfiltration-markers.js';
 import { parseExtraPiiPatterns } from '../pii/scrubber.js';
-import { createRecordingOutboundGateway, PerRunFailOpenLimiter, type SendRecorder } from './test-mode-sends.js';
+import { createRecordingOutboundGateway, PerRunFailOpenLimiter, subscribeRecordingRelays, type SendRecorder } from './test-mode-sends.js';
 import { createVerificationRuntime, type VerificationRuntime } from '../verification/index.js';
 import { createLogger, type Logger } from '../logger.js';
 import { createPool, type DbPool } from '../db/connection.js';
@@ -655,7 +658,7 @@ function buildRecordingSends(deps: {
   // The content filter's Stage 2 judge, from filter.llmJudge as production reads it.
   // Production's resolution and validation (a bad timeout fails the boot, as in production).
   let outboundJudge: OutboundLlmJudge | undefined;
-  const judgeSettings = resolveOutboundJudgeConfig(yamlConfig.filter);
+  const judgeSettings = resolveOutboundJudgeConfig(yamlConfig.filter, (detail, message) => logger.warn(detail, message));
   if (judgeSettings.enabled) {
     const judgeConfig: JudgeConfig = { ...judgeSettings, enabled: true };
     const provider = modelRegistry.isKnownModel(judgeConfig.model) ? modelRegistry.getProvider(judgeConfig.model) : undefined;
@@ -685,7 +688,7 @@ function buildRecordingSends(deps: {
     ? parseExtraPiiPatterns(yamlConfig.pii?.extra_patterns ?? [], path.join(deps.configDir, 'default.yaml'))
     : [];
   const piiRedactor = new PiiRedactor({
-    config: resolveOutboundRedactionConfig(yamlConfig.pii),
+    config: resolveOutboundRedactionConfig(yamlConfig.pii, (detail, message) => logger.warn(detail, message)),
     bus,
     logger,
     extraPatterns,
@@ -764,6 +767,20 @@ function buildRecordingSends(deps: {
       })
     : delivery;
   gateway.setApprovalDelivery(approvalDelivery);
+  // Relayed replies (outbound.message) take production's adapter path to this gateway, for
+  // the events the recorder accepts (its through-gateway runs).
+  subscribeRecordingRelays({
+    recorder: deps.recorder,
+    gateway,
+    bus,
+    logger,
+    contactService: deps.contactService,
+    emailAccounts: deps.emailAccounts,
+    ownAddresses: deps.recorder.ownAddresses ?? [],
+    principalEmail,
+    ...(deps.signalPhoneNumber ? { signalPhoneNumber: deps.signalPhoneNumber } : {}),
+    timezone: deps.config.timezone,
+  });
   return {
     gateway,
     executionOptions: {

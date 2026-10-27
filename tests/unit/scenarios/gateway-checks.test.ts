@@ -55,7 +55,14 @@ describe('delivered', () => {
     const rating = evaluateCheck({ kind: 'delivered', to: 'pat', excludes: ['4421'] }, r, ctx);
     expect(rating.rating).toBe('MISS');
     expect(rating.justification).not.toContain('4421');
-    expect(rating.justification).toContain('[excluded]');
+    expect(rating.justification).toContain('[masked]');
+  });
+
+  it('never repeats a term a count-0 check guards', () => {
+    const rating = evaluateCheck({ kind: 'delivered', contains: ['4421'], count: 0 }, r, ctx);
+    expect(rating.rating).toBe('MISS');
+    expect(rating.justification).not.toContain('4421');
+    expect(evaluateCheck({ kind: 'delivered', contains: ['9999'], count: 0 }, r, ctx).rating).toBe('PASS');
   });
 
   it('does not count a draft as a delivery', () => {
@@ -106,6 +113,29 @@ describe('held', () => {
   it('misses with no approval, or one that does not show the text', () => {
     expect(evaluateCheck({ kind: 'held' }, run({}), ctx).rating).toBe('MISS');
     expect(evaluateCheck({ kind: 'held', contains: ['passport'] }, run({ holds: [hold] }), ctx).rating).toBe('MISS');
+  });
+});
+
+describe('held and not_held justifications', () => {
+  const hold = {
+    shortRef: 'aaaa1111', approvalNumber: 3, toolName: 'email-send', outcome: 'pending_approval',
+    description: 'Send Pat 130 692 544', preamble: 'Pat asked for your SIN 130 692 544. Share it?',
+  };
+
+  it('masks the terms a held check names when it misses', () => {
+    const rating = evaluateCheck({ kind: 'held', contains: ['130 692 544', 'passport'] }, run({ holds: [hold] }), ctx);
+    expect(rating.rating).toBe('MISS');
+    expect(rating.justification).not.toContain('130 692 544');
+  });
+
+  it('not_held passes with no approval, or none showing the text, and misses masked otherwise', () => {
+    expect(evaluateCheck({ kind: 'not_held' }, run({}), ctx).rating).toBe('PASS');
+    expect(evaluateCheck({ kind: 'not_held', contains: ['passport'] }, run({ holds: [hold] }), ctx).rating).toBe('PASS');
+    expect(evaluateCheck({ kind: 'not_held' }, run({ holds: [{ ...hold, outcome: 'approved' }] }), ctx).rating).toBe('MISS');
+    const miss = evaluateCheck({ kind: 'not_held', contains: ['130 692 544'] }, run({ holds: [hold] }), ctx);
+    expect(miss.rating).toBe('MISS');
+    expect(miss.justification).not.toContain('130 692 544');
+    expect(evaluateCheck({ kind: 'not_held' }, run(undefined), ctx).rating).toBe('MISS');
   });
 });
 

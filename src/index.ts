@@ -1544,7 +1544,7 @@ async function main(): Promise<void> {
     // Defaults and the timeout floor live in resolveOutboundJudgeConfig, shared with test mode.
     let judgeSettings: OutboundJudgeSettings;
     try {
-      judgeSettings = resolveOutboundJudgeConfig(yamlConfig.filter);
+      judgeSettings = resolveOutboundJudgeConfig(yamlConfig.filter, (detail, message) => logger.warn(detail, message));
     } catch (err) {
       if (!(err instanceof OutboundConfigError)) throw err;
       logger.fatal(err.detail, err.message);
@@ -1618,8 +1618,8 @@ async function main(): Promise<void> {
   let piiRedactor: PiiRedactor;
   let outboundRedactionConfig: OutboundRedactionSettings;
   try {
-    // Shared with test mode: defaults, and an unknown `default` refused.
-    outboundRedactionConfig = resolveOutboundRedactionConfig(yamlConfig.pii);
+    // Shared with test mode: defaults, and an unknown `default` warned and read as 'block'.
+    outboundRedactionConfig = resolveOutboundRedactionConfig(yamlConfig.pii, (detail, message) => logger.warn(detail, message));
     piiRedactor = new PiiRedactor({
       config: outboundRedactionConfig,
       bus,

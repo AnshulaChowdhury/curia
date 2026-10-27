@@ -25,7 +25,7 @@ import type { TestModeStack } from '../../src/startup/test-mode-stack.js';
 import { registrableDomain } from '../../src/verification/domain.js';
 import type { VerificationRuntime } from '../../src/verification/index.js';
 import type { Verification } from '../../src/verification/types.js';
-import { cleanupConversation, sweepConversations } from '../shared/turn-capture.js';
+import { cleanupConversation, sweepConversations, type TurnOutcome } from '../shared/turn-capture.js';
 import { resolvePlaceholders } from './loader.js';
 import { SCENARIO_DELEGATE_PREFIX } from './stub-layer.js';
 import type { DbPool } from '../../src/db/connection.js';
@@ -86,6 +86,12 @@ export class SeedScope {
    * the run's (#2312).
    */
   rootConversation: string | undefined;
+  /** The run's case sets through_gateway (#2312): its relays, notifications and wakes are the run's. */
+  throughGateway = false;
+  /** Email threads the fake mailbox lists for a relayed reply, by thread id, most recent first (#2312). */
+  readonly threadMessages = new Map<string, NylasMessage[]>();
+  /** Approval-wake turns a held relay started in this run, captured (#2312). */
+  readonly wakeTurns: Array<Promise<TurnOutcome>> = [];
   /** What the recording transports took for this run, in order (#2312). */
   readonly deliveries: RecordedSend[] = [];
   /** What each approval raised this run shows the principal, by short ref (#2312). */
@@ -122,6 +128,9 @@ export class SeedScope {
     this.principalWroteTo.clear();
     this.backlog = undefined;
     this.rootConversation = undefined;
+    this.throughGateway = false;
+    this.threadMessages.clear();
+    this.wakeTurns.length = 0;
     this.deliveries.length = 0;
     this.approvalDisplays.clear();
     this.inboundMessages.clear();
@@ -144,6 +153,16 @@ export function runConversations(scope: SeedScope): string[] {
     ...scope.specialistConversations,
     ...scope.followOnConversations,
   ];
+}
+
+/**
+ * Whether the relay adapters send this outbound.message (`conversationId`) or, with no id, this
+ * outbound.notification (#2312): only inside a through_gateway run, for its own conversations.
+ * Every other run's relays stay on the bus, unsent, as before.
+ */
+export function acceptsRelay(scope: SeedScope | undefined, conversationId?: string): boolean {
+  if (!scope?.throughGateway) return false;
+  return conversationId === undefined || runConversations(scope).includes(conversationId);
 }
 
 /**

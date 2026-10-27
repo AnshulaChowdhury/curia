@@ -351,3 +351,21 @@ describe('the run\'s band-review fail-open cap', () => {
     expect((await readGatewayOutcome(stack, scenario, seededRun(), b.scope)).reviewerFailedOpen).toBe(false);
   });
 });
+
+describe('acceptsRelay', () => {
+  it('relays only a through-gateway run\'s own conversations, and its notifications', async () => {
+    const { acceptsRelay } = await import('../../scenarios/seed.js');
+    const opted = run('A', 'email:scenario-a');
+    opted.scope.throughGateway = true;
+    opted.scope.followOnConversations.add('approval-delivery:aaaa1111');
+    expect(acceptsRelay(opted.scope, 'email:scenario-a')).toBe(true);
+    expect(acceptsRelay(opted.scope, 'approval-delivery:aaaa1111')).toBe(true);
+    expect(acceptsRelay(opted.scope)).toBe(true);
+    expect(acceptsRelay(opted.scope, 'email:scenario-b')).toBe(false);
+    // A case without through_gateway, and work outside every run, relay nothing.
+    const plain = run('B', 'email:scenario-b');
+    expect(acceptsRelay(plain.scope, 'email:scenario-b')).toBe(false);
+    expect(acceptsRelay(plain.scope)).toBe(false);
+    expect(acceptsRelay(undefined, 'email:scenario-b')).toBe(false);
+  });
+});

@@ -33,7 +33,7 @@
 // the run's conversation, and approve-action on a later live principal turn (a `followup`)
 // acts only on the run's own. readGatewayOutcome reads all of it before cleanup removes it.
 import { randomUUID } from 'node:crypto';
-import { createAgentDiscuss, createAgentTask, createInboundMessage, type InjectionDrainPoint } from '../../src/bus/events.js';
+import { createAgentDiscuss, createAgentTask, createInboundMessage, type AgentTaskEvent, type InjectionDrainPoint } from '../../src/bus/events.js';
 import { stampOriginator } from '../../src/contacts/stamp-originator.js';
 import {
   buildInboundEmailIdentifierBlock,
@@ -96,6 +96,7 @@ import {
   resolveEnvelope,
   readGatewayOutcome,
   resolveSender,
+  acceptsRelay,
   SCENARIO_CURIA_EMAIL,
   scopedActionLog,
   scopedOutreachRepo,
@@ -128,6 +129,9 @@ const DELEGATION_RUN_MARGIN_MS = 120_000;
  * run with the flag off still finishes instead of waiting out the case timeout.
  */
 const FOLLOWUP_QUEUE_WAIT_MS = 5_000;
+
+/** Conversation of the coordinator turn a held relay wakes to deliver its approval (buildApprovalDeliveryWake). */
+const APPROVAL_WAKE_PREFIX = 'approval-delivery:';
 
 /** Prefix of the application_name every suite process sets on its connections. */
 export const SCENARIO_APPLICATION_PREFIX = 'curia-scenarios';
@@ -407,6 +411,8 @@ export async function createScenarioHarness(
   );
   // Built in observeBus, ahead of every agent runtime (see delegation-capture.ts).
   let delegationCapture: DelegationCapture | undefined;
+  // The turn capture, built after boot; the approval-wake observer reads it at event time.
+  let lateCapture: ReturnType<typeof createTurnCapture> | undefined;
 
   const stack = await createTestModeStack({
     config: { ...config, databaseUrl: withApplicationName(config.databaseUrl) },
@@ -446,10 +452,29 @@ export async function createScenarioHarness(
       // Each run's own fail-open cap (#2312).
       limiter: () => currentScope()?.failOpen,
       drafts: () => currentScope()?.drafts,
+      // Relayed replies (#2312): production's adapter path, for a through-gateway run's own
+      // conversations only. Every other run's outbound.message stays on the bus, as before.
+      relays: (conversationId) => acceptsRelay(currentScope(), conversationId),
+      threadMessages: (threadId) => currentScope()?.threadMessages.get(threadId) ?? [],
+      ownAddresses: [SCENARIO_CURIA_EMAIL],
     },
     // approve-action's "the sole pending approval" means the run's own.
     wrapActionLog: (repo) => scopedActionLog(repo, currentScope),
     observeBus: (bus) => {
+      // A held relay wakes the coordinator to deliver the approval (#2159), in a conversation
+      // of its own. In a through-gateway run that turn is the run's: file it under the run (its
+      // tool calls get the run's stubs, deliver-approval runs for real) and capture it. Called
+      // before the agent runtime sees the task, so the capture sees the whole turn.
+      bus.subscribe('agent.task', 'system', (event) => {
+        const { conversationId } = (event as AgentTaskEvent).payload;
+        const scope = currentScope();
+        if (!conversationId.startsWith(APPROVAL_WAKE_PREFIX) || !scope?.throughGateway || !scope.rootConversation) return;
+        // The run already closed (a late wake): its tool calls are refused as stale, as before.
+        if (scope.followOnConversations.has(conversationId) || controller.rootOf(scope.rootConversation) === undefined) return;
+        scope.followOnConversations.add(conversationId);
+        controller.attach(scope.rootConversation, conversationId);
+        if (lateCapture) scope.wakeTurns.push(lateCapture.waitFor(conversationId, RUN_TIMEOUT_MS, COORDINATOR));
+      });
       delegationCapture = createDelegationCapture(
         bus,
         (conversationId) => controller.rootOf(conversationId),
@@ -557,6 +582,7 @@ export async function createScenarioHarness(
   new BullpenDispatcher(bus, logger, stack.bullpenService, stack.agentRegistry).register();
 
   const capture = createTurnCapture(bus);
+  lateCapture = capture;
   const delegations = delegationCapture!;
   // Every model call billed to the run it was made in (#1980).
   const unattributed = new UsageLedger();
@@ -738,25 +764,33 @@ export async function createScenarioHarness(
     rootConversationId: string,
     scope: SeedScope,
     timeoutMs: number,
-  ): Promise<TurnOutcome> {
+  ): Promise<{ outcome: TurnOutcome; delivery: Promise<void> }> {
     const sender = await resolveSender({ ...scenario, inbound: { ...scenario.inbound, from: 'principal', channel: turn.channel } }, stack);
     if (typeof sender !== 'object' || !('channelId' in sender)) throw new Error('unreachable: inbound.then sender is not a channel sender');
     const conversationId = sender.channelId === 'email' ? `email:scenario-then-${randomUUID()}` : `scenario-then-${randomUUID()}`;
     scope.followOnConversations.add(conversationId);
     controller.attach(rootConversationId, conversationId);
     const waiter = capture.waitFor(conversationId, timeoutMs, COORDINATOR);
+    // The principal's own verified identity: their mail authenticates as the adapter would see it.
+    const principalEmail = { senderVerified: true };
+    const messageId = `scenario-msg-${randomUUID()}`;
+    if (sender.channelId === 'email') {
+      const message = inboundNylasMessage(messageId, sender.senderId, { content: turn.content, email: principalEmail }, undefined, conversationId.slice('email:'.length));
+      scope.inboundMessages.set(messageId, message);
+      scope.threadMessages.set(message.threadId, [message]);
+    }
     const delivery = bus.publish('channel', createInboundMessage({
       conversationId,
       channelId: sender.channelId,
       senderId: sender.senderId,
       content: turn.content,
-      ...(sender.channelId === 'email' ? { metadata: emailMetadata(sender.senderId, undefined, undefined, `scenario-msg-${randomUUID()}`) } : {}),
+      ...(sender.channelId === 'email' ? { metadata: emailMetadata(sender.senderId, principalEmail, undefined, messageId) } : {}),
       ...(sender.channelId === 'signal' ? { metadata: { isGroup: false } } : {}),
       ...(sender.channelId === 'slack' ? { metadata: { isDm: true } } : {}),
     }));
     delivery.catch((err: unknown) => capture.fail(conversationId, err));
     trackDelivery(delivery, conversationId);
-    return waiter;
+    return { outcome: await waiter, delivery };
   }
 
   async function runOnce(
@@ -876,10 +910,17 @@ export async function createScenarioHarness(
           ? `scheduler:scenario-${randomUUID()}:${randomUUID()}` // scheduler:<job>:<run>
           : typeof sender === 'object' && 'channelId' in sender && sender.channelId === 'email'
             ? `email:scenario-${randomUUID()}`
-            : `scenario-${randomUUID()}`;
+            // A through-gateway Signal reply relays to the number the conversation names, as
+            // the adapter reads it (#2312). Third parties only: cases seeding one identity never
+            // run at once, while the principal's number is every case's.
+            : scenario.throughGateway && typeof sender === 'object' && 'channelId' in sender
+                && sender.channelId === 'signal' && scenario.inbound.from !== 'principal'
+              ? `signal:${sender.senderId}`
+              : `scenario-${randomUUID()}`;
       conversationId = runConversationId;
 
       scope.rootConversation = runConversationId;
+      scope.throughGateway = scenario.throughGateway === true;
       controller.beginRun(stubTable, runConversationId, { realDelegation, throughGateway: scenario.throughGateway === true });
       // Armed before the inbound is published. A fast first tool call must
       // already be held, or the follow-up lands after the model has moved on.
@@ -896,6 +937,9 @@ export async function createScenarioHarness(
       let stillWorking: string[] = [];
       // The principal's `inbound.then` turn (#2312), when the case has one and it ran.
       let thenOutcome: TurnOutcome | undefined;
+      // Approval-wake turns a held relay started (#2312): their calls join the run's.
+      let wakeCalls: TurnOutcome['calls'] = [];
+      let wakeError: string | undefined;
       try {
         // Capture matches events by conversation id, so a second live turn is
         // not a second reply: it is mixed in or dropped. A follow-up that was
@@ -957,7 +1001,9 @@ export async function createScenarioHarness(
           const nylasMessageId = inbound.email?.nylasMessageId ?? `scenario-msg-${randomUUID()}`;
           // What the fake mailbox serves an email-reply to this message (#2312).
           if (sender.channelId === 'email' && scenario.throughGateway) {
-            scope.inboundMessages.set(nylasMessageId, inboundNylasMessage(nylasMessageId, sender.senderId, inbound, envelope));
+            const message = inboundNylasMessage(nylasMessageId, sender.senderId, inbound, envelope, runConversationId.slice('email:'.length));
+            scope.inboundMessages.set(nylasMessageId, message);
+            scope.threadMessages.set(message.threadId, [message]);
           }
           const hostInbound = createInboundMessage({
             conversationId: runConversationId,
@@ -1096,12 +1142,20 @@ export async function createScenarioHarness(
           outcome = { ...outcome, error: followupError };
         }
         if (outcome.errorKind === 'timeout') stillWorking = controller.pendingDelegations(runConversationId);
+        // In a through-gateway run the reply is relayed after the turn replies (the adapter path,
+        // its review, a hold's approval wake): let that finish before the run is cancelled.
+        if (scenario.throughGateway) await settleWithin(delivery, timeoutMs);
         if (inbound.then && outcome.error === undefined) {
           // The first turn has replied; let its publish (and anything it set off) finish, so the
           // principal's next message is a turn of its own, as it would be in production.
           await settleWithin(delivery, timeoutMs);
-          thenOutcome = await runPrincipalTurn(scenario, inbound.then, runConversationId, scope, timeoutMs);
+          const then = await runPrincipalTurn(scenario, inbound.then, runConversationId, scope, timeoutMs);
+          thenOutcome = then.outcome;
+          await settleWithin(then.delivery, timeoutMs);
         }
+        const wakes = await Promise.all(scope.wakeTurns);
+        wakeCalls = wakes.flatMap(w => w.calls);
+        wakeError = wakes.find(w => w.error)?.error;
       } finally {
         // Before endRun resolves a waiting first-call, so the publisher sees
         // the follow-up is no longer armed.
@@ -1125,7 +1179,7 @@ export async function createScenarioHarness(
         process.stderr.write(`  [WARN] ${state.label}: a turn was still running ${CANCEL_SETTLE_MS / 1000}s after the run ended; its later spend is counted outside any run\n`);
       }
 
-      const merged = mergeCalls([...inRunOrder(outcome.calls, trace, agent), ...(thenOutcome?.calls ?? [])], stubbedCalls);
+      const merged = mergeCalls([...inRunOrder(outcome.calls, trace, agent), ...wakeCalls, ...(thenOutcome?.calls ?? [])], stubbedCalls);
       // Read after the run's turns settled, before cleanup removes the rows (#2312).
       const gateway = scenario.throughGateway ? await readGatewayOutcome(stack, scenario, seeded, scope) : undefined;
       // A scoped view failing means the case ran without its premise (no block, no thread).
@@ -1140,7 +1194,8 @@ export async function createScenarioHarness(
         : undefined;
       const error = timeoutKind === 'delegate_wait'
         ? `${outcome.error} — a specialist was still working (${[...new Set(stillWorking)].join(', ')}): the run's wait ran out before the delegate wait did`
-        : outcome.error ?? (thenOutcome?.error ? `inbound.then turn: ${thenOutcome.error}` : undefined) ?? premiseError ?? reviewerError;
+        : outcome.error ?? (thenOutcome?.error ? `inbound.then turn: ${thenOutcome.error}` : undefined)
+          ?? (wakeError ? `approval wake turn: ${wakeError}` : undefined) ?? premiseError ?? reviewerError;
       result = {
         runIndex,
         inboundContent,
@@ -1288,12 +1343,14 @@ export function inboundNylasMessage(
   senderEmail: string,
   inbound: Pick<ScenarioCase['inbound'], 'content' | 'email'>,
   envelope: ResolvedEnvelope | undefined,
+  /** The email conversation's thread (its id after `email:`), which a relayed reply lists. */
+  threadId = `scenario-thread-${id}`,
 ): NylasMessage {
   const domain = senderEmail.slice(senderEmail.lastIndexOf('@') + 1);
   const verdict = inbound.email?.senderVerified === true ? 'pass' : 'fail';
   return {
     id,
-    threadId: `scenario-thread-${id}`,
+    threadId,
     subject: '',
     from: [{ email: senderEmail }],
     to: (envelope?.to ?? [SCENARIO_CURIA_EMAIL]).map(email => ({ email })),
