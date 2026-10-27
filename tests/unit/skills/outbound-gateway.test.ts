@@ -4076,10 +4076,13 @@ describe('band review (#2159)', () => {
 
   const emailReq = { channel: 'email' as const, to: 'joel@example.com', subject: 'Forms', body: 'Hi Joel. I am out of office until the 13th.' };
 
-  function makeBandGateway(opts: { review: ReturnType<typeof vi.fn>; score: number; gating?: 'band' | 'tier'; actionLogRepo?: ActionLogRepo; emailAccountAddresses?: Map<string, string> }) {
+  function makeBandGateway(opts: { review: ReturnType<typeof vi.fn>; score: number; gating?: 'band' | 'tier'; actionLogRepo?: ActionLogRepo; emailAccountAddresses?: Map<string, string>; signalPhoneNumber?: string }) {
     return new OutboundGateway({
       nylasClients: new Map([['curia', mocks.nylasClient]]),
       ...(opts.emailAccountAddresses ? { emailAccountAddresses: opts.emailAccountAddresses } : {}),
+      ...(opts.signalPhoneNumber
+        ? { signalClient: makeSignalClient() as unknown as import('../../../src/channels/signal/signal-rpc-client.js').SignalRpcClient, signalPhoneNumber: opts.signalPhoneNumber }
+        : {}),
       contactService: mocks.contactService,
       contentFilter: mocks.contentFilter,
       bus: mocks.bus,
@@ -4105,6 +4108,22 @@ describe('band review (#2159)', () => {
     expect(result.success).toBe(true);
     const sent = vi.mocked(mocks.nylasClient.sendMessage).mock.calls[0]![0] as { body: string };
     expect(sent.body).toContain('out of office until the 13th');
+  });
+
+  it('reviews an email addressed only to Curia\'s own mailbox with no outside audience', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84, emailAccountAddresses: new Map([['curia', 'curia@example.com']]) });
+    const result = await gw.send({ ...emailReq, to: 'curia@example.com' }, { taskEventId: 't1', conversationId: 'c1' });
+    expect(result.success).toBe(true);
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({ recipients: [], principalRecipients: [] }));
+  });
+
+  it('does not count Curia\'s own Signal number as an audience member', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84, signalPhoneNumber: '+15555550000' });
+    const result = await gw.send({ channel: 'signal', recipient: '+15555550000', message: 'note to self' }, { taskEventId: 't1', conversationId: 'c1' });
+    expect(result.success).toBe(true);
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({ recipients: [] }));
   });
 
   it('passes the review what it needs', async () => {
@@ -4363,6 +4382,17 @@ describe('band review (#2159)', () => {
       }, { taskEventId: 't1' });
       expect(result.success).toBe(true);
       expect(review).not.toHaveBeenCalled();
+    });
+
+    it('reviews a draft addressed only to Curia\'s own address with no outside audience', async () => {
+      withDraftClient();
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, emailAccountAddresses: new Map([['curia', 'curia@example.com']]) });
+      const result = await gw.sendEmailDraft('d1', 'curia', {
+        ...draftMeta, recipientEmail: 'curia@example.com', allRecipients: ['curia@example.com'],
+      }, { taskEventId: 't1' });
+      expect(result.success).toBe(true);
+      expect(review).toHaveBeenCalledWith(expect.objectContaining({ recipients: [], principalRecipients: [] }));
     });
 
     it('sends a draft the review passes', async () => {

@@ -28,6 +28,8 @@ export interface RelayOutboundContext {
   liveTurn?: boolean;
   /** Propagated so rewrite retries still enforce Gate C (#1733). */
   originator?: TaskOriginator;
+  /** The note queued for the principal with the first reply: evidence for the rewrite's review (#2312). */
+  reportedToPrincipal?: string;
 }
 
 /** Whether the block reason is fixable by rewriting the message body. */

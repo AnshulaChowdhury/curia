@@ -25,7 +25,10 @@
 //
 // The bounce ledger is in memory, keyed by conversation, channel and recipients, so a relay
 // rewrite (a new task on the same conversation) counts as the recheck and sees the first
-// turn's lookups. A restart between a bounce and its recheck gives one more bounce.
+// turn's lookups. A restart between a bounce and its recheck gives one more bounce. The two
+// post-bounce fates treat the entry differently: a block (80+) keeps it, so the drafter's next
+// dirty attempt blocks again; a hold (below 80) clears it, because the principal now decides
+// and a later draft on the same key starts a fresh cycle with its own bounce.
 
 import type { Logger } from '../logger.js';
 import type { EscalationJudge } from '../autonomy/escalation-judge.js';

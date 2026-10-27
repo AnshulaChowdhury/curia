@@ -22,7 +22,7 @@ describe('AuditLogRepo.findPrincipalReportsForTasks (#2312)', () => {
     const [sql, params] = query.mock.calls[0]!;
     expect(sql).toMatch(/event_type = 'principal\.report'/);
     expect(sql).toMatch(/parent_event_id = ANY\(\$1::text\[\]\)/);
-    expect(sql).toMatch(/payload->>'source' = ANY\(ARRAY\['agent', 'principal_note'\]::text\[\]\)/);
+    expect(sql).toMatch(/payload->>'source' = 'agent'/);
     expect(sql).toMatch(/ORDER BY timestamp DESC, id DESC/);
     expect(params).toEqual([['task-1', 'task-2'], 10]);
   });

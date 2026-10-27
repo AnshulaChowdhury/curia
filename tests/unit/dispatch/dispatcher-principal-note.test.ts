@@ -8,7 +8,9 @@ import type { Logger } from '../../../src/logger.js';
 import type { ChannelIdentity } from '../../../src/contacts/types.js';
 import {
   createAgentResponse,
+  createOutboundBlocked,
   createToolResult,
+  type AgentTaskEvent,
   type BusEvent,
   type OutboundMessageEvent,
   type OutboundNoReplyEvent,
@@ -131,6 +133,32 @@ describe('Dispatcher — note for the principal (prompt trim PR 5)', () => {
     seedRouting(dispatcher, 'task-2');
     await respond(handlers, { taskId: 'task-2' });
     expect(relays(published)[1]!.payload).not.toHaveProperty('reportedToPrincipal');
+  });
+
+  it('carries the note to the rewrite of a bounced reply (#2312)', async () => {
+    const { dispatcher, handlers, published } = harness();
+    seedRouting(dispatcher, 'task-1');
+    await respond(handlers, { taskId: 'task-1', principalNote: 'Provider asked for your number.' });
+    const [first] = relays(published);
+
+    // The band review bounced the reply: the dispatcher schedules a rewrite task.
+    await handlers.get('outbound.blocked')!(createOutboundBlocked({
+      blockId: 'block-1',
+      conversationId: CONVERSATION,
+      channelId: 'email',
+      content: first!.payload.content,
+      recipientId: SENDER,
+      reason: 'ungrounded-claim: x',
+      findings: [{ rule: 'ungrounded-claim', detail: 'x' }],
+      parentEventId: first!.id,
+    }));
+    const rewrite = published.find((e): e is AgentTaskEvent => e.type === 'agent.task');
+    expect(rewrite).toBeDefined();
+
+    // The rewrite repeats no note, and still tells the review what the principal was told.
+    await respond(handlers, { taskId: rewrite!.id, content: 'Thursday at 10 works; I have passed your question on.' });
+    expect(relays(published)[1]!.payload.reportedToPrincipal).toBe('Provider asked for your number.');
+    expect(reports(published)).toHaveLength(1);
   });
 
   it('does not mark the reply as reported when the note was skipped (a send already reached the principal)', async () => {

@@ -268,6 +268,8 @@ export class Dispatcher {
        * on the response is then not emailed as well (prompt trim PR 5).
        */
       principalSendMade?: boolean;
+      /** A rewrite's inherited principal note, queued with the first reply (#2312). */
+      reportedToPrincipal?: string;
     }
   >();
   /**
@@ -2002,6 +2004,9 @@ export class Dispatcher {
     // Publish outbound.message to the bus — the email adapter will pick it up
     // and route it through OutboundGateway (blocked-contact check + content filter).
     // No filter logic lives here anymore; it all runs inside the gateway.
+    // The note queued for the principal, only if it was: evidence for the send review (#2312). A
+    // rewrite rarely repeats the note, so it inherits the first reply's.
+    const reportedToPrincipal = noteQueued ? event.payload.principalNote : routing.reportedToPrincipal;
     const outbound = createOutboundMessage({
       conversationId: routing.conversationId,
       channelId: routing.channelId,
@@ -2015,8 +2020,7 @@ export class Dispatcher {
       // this through so the email adapter can pass it to gateway.send() for action_log context.
       taskEventId: event.parentEventId ?? undefined,
       contentBlockSalvage: routing.contentBlockSalvage,
-      // The note queued for the principal above, only if it was: evidence for the send review (#2312).
-      ...(noteQueued && { reportedToPrincipal: event.payload.principalNote }),
+      ...(reportedToPrincipal && { reportedToPrincipal }),
     });
 
     // Track for content-filter block handling (#1355) — cleared on delivery or block.
@@ -2032,6 +2036,7 @@ export class Dispatcher {
         contentBlockRetryAttempt: routing.contentBlockRetryAttempt ?? 0,
         liveTurn: routing.liveTurn,
         originator: routing.originator,
+        ...(reportedToPrincipal && { reportedToPrincipal }),
       });
     }
 
@@ -2271,6 +2276,7 @@ export class Dispatcher {
         contentBlockRetryAttempt: nextAttempt,
         liveTurn: ctx.liveTurn,
         blockedDraft: ctx.content,
+        ...(ctx.reportedToPrincipal && { reportedToPrincipal: ctx.reportedToPrincipal }),
       });
       await this.bus.publish('dispatch', taskEvent);
       return;
