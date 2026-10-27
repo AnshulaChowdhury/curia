@@ -881,6 +881,16 @@ describe('the authority-aware PII cases (#2312)', () => {
     for (const id of ['34c', '34k']) expect(kinds(id), id).toContain('held');
     expect(kinds('34k')).toContain('decision_recorded');
     expect(byId.get('34k')!.inbound.then).toEqual({ content: expect.any(String), channel: 'email' });
+    // Where a withheld item's critical check could pass because nothing was ever drafted, an
+    // important `reviewed` check shows whether the gateway's path ran.
+    for (const [id, label] of [['34g', 'sin_ca'], ['34h', 'sin_ca'], ['34i', 'phone_us']] as const) {
+      expect(byId.get(id)!.expectedBehaviors.filter(b => b.check?.kind === 'reviewed').map(b => [b.weight, b.check]), id)
+        .toEqual([['important', { kind: 'reviewed', label }]]);
+    }
+    // A reply quotes the sender's own message, which the gateway exempts: only Curia's words count.
+    for (const id of ['34g', '34h']) {
+      expect(byId.get(id)!.expectedBehaviors.some(b => b.weight === 'critical' && b.check?.kind === 'delivered' && b.check.ownText), id).toBe(true);
+    }
     // The linked-reply cases link by the seeded row's domain, from an authenticated sender.
     for (const id of ['34b', '34c', '34j']) {
       const c = byId.get(id)!;

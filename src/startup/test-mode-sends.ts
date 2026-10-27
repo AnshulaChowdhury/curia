@@ -39,6 +39,7 @@ import { SignalAdapter } from '../channels/signal/signal-adapter.js';
 import type { BusEvent, EventType, Layer, OutboundMessageEvent } from '../bus/events.js';
 import type { PrincipalEmailRef } from '../contacts/types.js';
 import type { AgentPersona } from '../skills/types.js';
+import { REPLY_QUOTE_HTML_OPEN } from '../skills/_shared/reply-quote.js';
 
 /** One message a recording transport took: what would have left the process. */
 export interface RecordedSend {
@@ -51,8 +52,25 @@ export interface RecordedSend {
   subject?: string;
   /** The text delivered. An email's HTML is reduced to its text. */
   body: string;
+  /**
+   * An email reply's own text: the body above the quoted message (the reply quote's
+   * attribution block), reduced to text. Absent when nothing was quoted (#2312).
+   */
+  ownBody?: string;
   /** The synthetic message (or draft) id the transport returned. */
   id: string;
+}
+
+/**
+ * One band review of a send (#2312): the labels of the personal data it ruled on, never the
+ * values. `labels` are the message's own items (body and subject); `quoteLabels` the quoted
+ * message's, which the gateway reviews only when someone on the send was not on the quote.
+ */
+export interface RecordedReview {
+  labels: string[];
+  quoteLabels: string[];
+  /** What the review decided for the send: send, bounce, block or hold. */
+  outcome: 'send' | 'bounce' | 'block' | 'hold';
 }
 
 /**
@@ -95,6 +113,8 @@ export interface SendRecorder {
   relays?(conversationId?: string): boolean;
   /** Addresses that are Curia's own beyond email_accounts (the scenario office's): never a reply recipient. */
   ownAddresses?: readonly string[];
+  /** Take one band review's labels and outcome (#2312). Absent: reviews are not recorded. */
+  reviewed?(review: RecordedReview): void;
 }
 
 /**
@@ -182,6 +202,7 @@ export function createRecordingTransports(recorder: SendRecorder, accountNames: 
     attachments: [],
   });
   const emailSend = (kind: RecordedSend['kind'], message: NylasMessage): void => {
+    const quoteAt = message.body.indexOf(REPLY_QUOTE_HTML_OPEN);
     recorder.record({
       channel: 'email',
       kind,
@@ -189,6 +210,7 @@ export function createRecordingTransports(recorder: SendRecorder, accountNames: 
       cc: addresses(message.cc),
       subject: message.subject,
       body: emailText(message.body),
+      ...(quoteAt >= 0 ? { ownBody: emailText(message.body.slice(0, quoteAt)) } : {}),
       id: message.id,
     });
   };
@@ -301,6 +323,7 @@ export function createRecordingOutboundGateway(deps: {
 }): OutboundGateway {
   const transports = createRecordingTransports(deps.recorder, deps.emailAccounts.map(a => a.name));
   const { review } = deps;
+  const bandReview = review.bandReview ? recordingBandReview(review.bandReview, deps.recorder) : undefined;
   return new OutboundGateway({
     nylasClients: transports.nylasClients,
     emailAccountAddresses: new Map(deps.emailAccounts.map(a => [a.name, a.selfEmail])),
@@ -324,9 +347,29 @@ export function createRecordingOutboundGateway(deps: {
     // No outboundQueue and no readiness probes: nothing is ever deferred to a later flush,
     // which a real instance sharing the database would perform with real transports.
     gating: review.gating ?? 'tier',
-    ...(review.bandReview ? { bandReview: review.bandReview } : {}),
+    ...(bandReview ? { bandReview } : {}),
     ...(review.relayBudget ? { relayBudget: review.relayBudget } : {}),
   });
+}
+
+/**
+ * Band review as the recording gateway calls it: production's, with each review's detected
+ * labels and outcome handed to the recorder (#2312), so a case can tell a run whose drafter
+ * never wrote an item from one whose review ruled on it. Labels only, never the matched text.
+ */
+export function recordingBandReview(inner: Pick<BandSendReview, 'review'>, recorder: SendRecorder): Pick<BandSendReview, 'review'> {
+  return {
+    review: async (input) => {
+      const decision = await inner.review(input);
+      const items = input.detectedItems ?? [];
+      recorder.reviewed?.({
+        labels: [...new Set(items.filter(i => i.field !== 'quote').map(i => i.label))],
+        quoteLabels: [...new Set(items.filter(i => i.field === 'quote').map(i => i.label))],
+        outcome: decision.kind,
+      });
+      return decision;
+    },
+  };
 }
 
 /**

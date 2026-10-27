@@ -36,10 +36,14 @@ import type { ContactService } from '../../../src/contacts/contact-service.js';
 import { OutboundContentFilter } from '../../../src/dispatch/outbound-filter.js';
 import { createLogger } from '../../../src/logger.js';
 import type { OutboundGateway } from '../../../src/skills/outbound-gateway.js';
+import { buildReplyQuote } from '../../../src/skills/_shared/reply-quote.js';
+import type { BandReviewInput } from '../../../src/dispatch/band-send-review.js';
 import {
   createRecordingOutboundGateway,
   createRecordingTransports,
   emailText,
+  recordingBandReview,
+  type RecordedReview,
   type RecordedSend,
   type SendRecorder,
 } from '../../../src/startup/test-mode-sends.js';
@@ -184,6 +188,22 @@ describe('createRecordingTransports', () => {
     expect(await mailbox.getDraft(draft.id)).not.toBeNull();
   });
 
+  it('records a reply\'s own text apart from the message it quotes', async () => {
+    const recorder = runRecorder();
+    const mailbox = createRecordingTransports(recorder, ['curia']).nylasClients.get('curia')!;
+    const quote = buildReplyQuote(
+      { from: [{ email: 'pat@vendor.example.test' }], to: [{ email: 'curia@example.test' }], subject: 'Records', date: 0, body: 'Our records list it as 130 692 544.' },
+      'UTC',
+      { format: 'html' },
+    );
+    await mailbox.sendMessage({ to: [{ email: 'pat@vendor.example.test' }], subject: 'Re: Records', body: `<p>I can't confirm that.</p>${quote}` });
+    await mailbox.sendMessage({ to: [{ email: 'pat@vendor.example.test' }], subject: 'Hi', body: '<p>No quote here.</p>' });
+    const [reply, plain] = recorder.sends;
+    expect(reply!.body).toContain('130 692 544');
+    expect(reply!.ownBody).toBe('I can\'t confirm that.');
+    expect(plain!.ownBody).toBeUndefined();
+  });
+
   it('keys one fake mailbox by every account name', () => {
     const { nylasClients } = createRecordingTransports(runRecorder(), ['curia', 'principal']);
     expect([...nylasClients.keys()]).toEqual(['curia', 'principal']);
@@ -193,5 +213,32 @@ describe('createRecordingTransports', () => {
 describe('emailText', () => {
   it('reduces HTML to its text', () => {
     expect(emailText('<p>Hi &amp; bye</p><p>Line&nbsp;2<br>3</p>')).toBe('Hi & bye\nLine 2\n3');
+  });
+});
+
+describe('recordingBandReview', () => {
+  it('hands each review\'s labels (own and quoted) and outcome to the recorder, never the values', async () => {
+    const reviews: RecordedReview[] = [];
+    const recorder: SendRecorder = { ...runRecorder(), reviewed: (r) => { reviews.push(r); } };
+    const inner = { review: vi.fn().mockResolvedValue({ kind: 'bounce', findings: [] }) };
+    const input = {
+      detectedItems: [
+        { id: 'P1', label: 'phone_us', text: '(519) 555-0186', field: 'body' },
+        { id: 'P2', label: 'phone_us', text: '519-555-0186', field: 'subject' },
+        { id: 'P3', label: 'sin_ca', text: '130 692 544', field: 'quote' },
+      ],
+    } as unknown as BandReviewInput;
+    const decision = await recordingBandReview(inner, recorder).review(input);
+    expect(decision).toEqual({ kind: 'bounce', findings: [] });
+    expect(inner.review).toHaveBeenCalledWith(input);
+    expect(reviews).toEqual([{ labels: ['phone_us'], quoteLabels: ['sin_ca'], outcome: 'bounce' }]);
+    expect(JSON.stringify(reviews)).not.toMatch(/555|692/);
+  });
+
+  it('records a review with no detected items as one with no labels', async () => {
+    const reviews: RecordedReview[] = [];
+    const recorder: SendRecorder = { ...runRecorder(), reviewed: (r) => { reviews.push(r); } };
+    await recordingBandReview({ review: vi.fn().mockResolvedValue({ kind: 'send' }) }, recorder).review({} as BandReviewInput);
+    expect(reviews).toEqual([{ labels: [], quoteLabels: [], outcome: 'send' }]);
   });
 });

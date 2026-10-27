@@ -16,11 +16,13 @@ import {
   ANY_AGENT,
   COORDINATOR,
   GATEWAY_CHECK_KINDS,
+  REVIEW_OUTCOMES,
   type BehaviorCheck,
   type BehaviorWeight,
   type DelegationMode,
   type DeliveryChannel,
   type ExpectedBehavior,
+  type ReviewOutcome,
   type IdentityFixture,
   type ScenarioCase,
   type ScenarioFollowup,
@@ -124,12 +126,13 @@ const CHECK_KEYS: Record<string, readonly string[]> = {
   any_of: ['any_of'],
 };
 const GATEWAY_CHECK_KEYS: Record<typeof GATEWAY_CHECK_KINDS[number], readonly string[]> = {
-  delivered: ['channel', 'to', 'cc_includes', 'contains', 'excludes', 'count'],
+  delivered: ['channel', 'to', 'cc_includes', 'contains', 'excludes', 'count', 'own_text'],
   not_delivered: ['to'],
   held: ['contains'],
   not_held: ['contains'],
   outreach_recorded: ['domain', 'confirmed'],
   decision_recorded: ['label', 'decision'],
+  reviewed: ['label', 'outcome'],
 };
 const DELIVERY_CHANNELS: readonly DeliveryChannel[] = ['email', 'signal', 'slack', 'sms'];
 const TEXT_TOOL_KEYS = ['tool', 'arg'] as const;
@@ -221,6 +224,8 @@ function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, f
       const cc = recipient('cc_includes');
       const contains = strList(body, 'contains', file, at);
       const excludes = strList(body, 'excludes', file, at);
+      const ownText = optBool(body, 'own_text', file, at);
+      if (ownText === false) throw new CaseError(file, `${at}: 'own_text' is true or absent`);
       return {
         kind,
         ...(channel !== undefined ? { channel: channel as DeliveryChannel } : {}),
@@ -229,6 +234,7 @@ function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, f
         ...(contains.length > 0 ? { contains } : {}),
         ...(excludes.length > 0 ? { excludes } : {}),
         ...(count !== undefined ? { count } : {}),
+        ...(ownText ? { ownText: true } : {}),
       };
     }
     case 'not_delivered': {
@@ -249,6 +255,13 @@ function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, f
       const decision = body['decision'];
       if (decision !== 'yes' && decision !== 'no') throw new CaseError(file, `${at}: 'decision' must be yes or no`);
       return { kind, label: str(body, 'label', file, at), decision };
+    }
+    case 'reviewed': {
+      const outcome = optStr(body, 'outcome', file, at);
+      if (outcome !== undefined && !(REVIEW_OUTCOMES as readonly string[]).includes(outcome)) {
+        throw new CaseError(file, `${at}: 'outcome' must be one of ${REVIEW_OUTCOMES.join(', ')}`);
+      }
+      return { kind, label: str(body, 'label', file, at), ...(outcome !== undefined ? { outcome: outcome as ReviewOutcome } : {}) };
     }
   }
 }

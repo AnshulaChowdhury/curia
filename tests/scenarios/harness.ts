@@ -452,6 +452,8 @@ export async function createScenarioHarness(
       // Each run's own fail-open cap (#2312).
       limiter: () => currentScope()?.failOpen,
       drafts: () => currentScope()?.drafts,
+      // Labels and outcome of each band review, for the `reviewed` check (#2312).
+      reviewed: (review) => { currentScope()?.reviews.push(review); },
       // Relayed replies (#2312): production's adapter path, for a through-gateway run's own
       // conversations only. Every other run's outbound.message stays on the bus, as before.
       relays: (conversationId) => acceptsRelay(currentScope(), conversationId),

@@ -6,6 +6,7 @@
 import type { InjectionDrainPoint } from '../../src/bus/events.js';
 import type { PrincipalBacklogCounts } from '../../src/agents/prompts/backlog-line.js';
 import type { AutonomyFixture, OfficeIdentityFixture } from '../../src/startup/test-mode-stack.js';
+import type { RecordedReview } from '../../src/startup/test-mode-sends.js';
 import type { VerificationDelivery, VerificationStatus } from '../../src/verification/types.js';
 import type { LiveSearchTally } from '../shared/live-search.js';
 import type { ObservedToolCall } from '../shared/turn-capture.js';
@@ -97,9 +98,11 @@ export type BehaviorCheck =
    * least one delivered message (exactly `count` when set) matching every filter. `to` and
    * `cc_includes` name a seeded contact key, `principal`, or an address; `contains` and
    * `excludes` are case-insensitive substrings of the delivered text (subject and body). An
-   * email draft is not a delivery; a sent draft is.
+   * email draft is not a delivery; a sent draft is. `ownText`: match the reply's own text
+   * only (subject and the body above a quoted message), so the sender's own quoted words do
+   * not count as something Curia sent them.
    */
-  | { kind: 'delivered'; channel?: DeliveryChannel; to?: string; ccIncludes?: string; contains?: string[]; excludes?: string[]; count?: number }
+  | { kind: 'delivered'; channel?: DeliveryChannel; to?: string; ccIncludes?: string; contains?: string[]; excludes?: string[]; count?: number; ownText?: boolean }
   /** Nothing was delivered this run, or nothing to `to` when it is set. */
   | { kind: 'not_delivered'; to?: string }
   /**
@@ -120,6 +123,12 @@ export type BehaviorCheck =
   /** The principal's answer to a personal-data ask was recorded this run for `label`. */
   | { kind: 'decision_recorded'; label: string; decision: 'yes' | 'no' }
   /**
+   * The gateway's band review ruled on a detected item with `label` in a send's own text
+   * (body or subject, not a quoted message) this run, with that `outcome` when set: whether
+   * the path a case exists for was exercised at all (#2312).
+   */
+  | { kind: 'reviewed'; label: string; outcome?: ReviewOutcome }
+  /**
    * Passes when any alternative passes. For a behavior the platform accepts in more
    * than one shape — e.g. delegate links an entry from `outbound_entry_id` or from its
    * id quoted in the brief (#1972).
@@ -132,7 +141,11 @@ export type TextSource = 'reply' | { tool: string; arg: string };
 export type DeliveryChannel = 'email' | 'signal' | 'slack' | 'sms';
 
 /** The check kinds that read what a through-gateway run sent (#2312). */
-export const GATEWAY_CHECK_KINDS = ['delivered', 'not_delivered', 'held', 'not_held', 'outreach_recorded', 'decision_recorded'] as const;
+export const GATEWAY_CHECK_KINDS = ['delivered', 'not_delivered', 'held', 'not_held', 'outreach_recorded', 'decision_recorded', 'reviewed'] as const;
+
+/** What a band review decided for a send. */
+export type ReviewOutcome = RecordedReview['outcome'];
+export const REVIEW_OUTCOMES: readonly ReviewOutcome[] = ['send', 'bounce', 'block', 'hold'];
 
 export interface ExpectedBehavior {
   id: string;
@@ -589,6 +602,11 @@ export interface GatewayOutcome {
   /** The principal's answers to personal-data asks, recorded in the run's conversations. */
   decisions: RecordedDecision[];
   /**
+   * Each band review of the run's sends, labels and outcome only (#2312). Absent on results
+   * saved before it existed.
+   */
+  reviews?: RecordedReview[];
+  /**
    * The band review's fail-open cap tripped in this run: its judge failed on too many sends,
    * so later sends held for want of a reviewer. The run is then an error, not a score.
    */
@@ -606,6 +624,8 @@ export interface RecordedDelivery {
   ccNames: string[];
   subject?: string;
   body: string;
+  /** An email reply's own text, above the quoted message; absent when nothing was quoted. */
+  ownBody?: string;
 }
 
 export interface RecordedHold {

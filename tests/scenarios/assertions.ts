@@ -201,6 +201,7 @@ export function evaluateCheck(check: BehaviorCheck, run: ScenarioRun, ctx: Check
     case 'not_held':
     case 'outreach_recorded':
     case 'decision_recorded':
+    case 'reviewed':
       return evaluateGatewayCheck(check, run);
     case 'any_of': {
       const ratings = check.checks.map(alt => evaluateCheck(alt, run, ctx));
@@ -260,7 +261,9 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
   const delivered = outcome.deliveries.filter(d => d.kind === 'send');
   switch (check.kind) {
     case 'delivered': {
-      const text = (d: RecordedDelivery): string => `${d.subject ?? ''}\n${d.body}`.toLowerCase();
+      // own_text: the reply's own words, not the sender's message quoted below them.
+      const text = (d: RecordedDelivery): string =>
+        `${d.subject ?? ''}\n${check.ownText ? d.ownBody ?? d.body : d.body}`.toLowerCase();
       const matching = delivered.filter(d =>
         (check.channel === undefined || d.channel === check.channel)
         && (check.to === undefined || names(check.to, d.to, d.toNames))
@@ -274,6 +277,7 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
       const wanted = JSON.stringify({
         channel: check.channel, to: check.to, cc_includes: check.ccIncludes,
         contains: termCount(check.contains), excludes: termCount(check.excludes),
+        ...(check.ownText ? { own_text: true } : {}),
       });
       return ok
         ? pass(`${matching.length} delivery(ies) matching ${wanted}`)
@@ -316,6 +320,15 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
       return hit
         ? pass(`the principal's ${check.decision} on ${check.label} was recorded`)
         : miss(`no ${check.decision} recorded for ${check.label}; recorded: ${outcome.decisions.map(d => `${d.label}=${d.decision}`).join(', ') || 'none'}`);
+    }
+    case 'reviewed': {
+      const reviews = outcome.reviews ?? [];
+      const label = check.label.toLowerCase();
+      const hit = reviews.find(r => r.labels.some(l => l.toLowerCase() === label) && (check.outcome === undefined || r.outcome === check.outcome));
+      const seen = reviews.map(r => `${r.outcome} [${r.labels.join(', ') || 'no items'}]`).join('; ') || 'no band review';
+      return hit
+        ? pass(`band review ruled on ${check.label} (${hit.outcome})`)
+        : miss(`no band review ruled on ${check.label}${check.outcome ? ` with outcome ${check.outcome}` : ''} in a send's own text: the path was not exercised. Reviews: ${seen}`);
     }
   }
 }

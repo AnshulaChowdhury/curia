@@ -37,7 +37,7 @@ import type { TaskOriginator } from '../../src/contacts/types.js';
 import { buildInitialTaskProgress } from '../../src/db/task-repo.js';
 import { FailOpenLimiter } from '../../src/autonomy/band-policy.js';
 import type { TaskOutreachRepo, TaskOutreachRow } from '../../src/dispatch/task-outreach.js';
-import type { RecordedSend } from '../../src/startup/test-mode-sends.js';
+import type { RecordedReview, RecordedSend } from '../../src/startup/test-mode-sends.js';
 import type { GatewayOutcome, ScenarioCase, SeedContact, SeedOutreach, SeedPrincipalIdentity, SeedTask } from './types.js';
 
 /**
@@ -94,6 +94,8 @@ export class SeedScope {
   readonly wakeTurns: Array<Promise<TurnOutcome>> = [];
   /** What the recording transports took for this run, in order (#2312). */
   readonly deliveries: RecordedSend[] = [];
+  /** Each band review of the run's sends: labels and outcome only (#2312). */
+  readonly reviews: RecordedReview[] = [];
   /** What each approval raised this run shows the principal, by short ref (#2312). */
   readonly approvalDisplays = new Map<string, ApprovalDisplay>();
   /** The run's inbound email as the fake mailbox serves it, by Nylas message id (#2312). */
@@ -132,6 +134,7 @@ export class SeedScope {
     this.threadMessages.clear();
     this.wakeTurns.length = 0;
     this.deliveries.length = 0;
+    this.reviews.length = 0;
     this.approvalDisplays.clear();
     this.inboundMessages.clear();
     this.taskIds.clear();
@@ -1156,7 +1159,9 @@ export async function readGatewayOutcome(stack: TestModeStack, scenario: Scenari
       ccNames: d.cc.map(nameOf),
       ...(d.subject !== undefined ? { subject: d.subject } : {}),
       body: d.body,
+      ...(d.ownBody !== undefined ? { ownBody: d.ownBody } : {}),
     })),
+    reviews: scope.reviews.map(r => ({ labels: [...r.labels], quoteLabels: [...r.quoteLabels], outcome: r.outcome })),
     holds: holds.rows.map(r => {
       const shown = scope.approvalDisplays.get(r.short_ref);
       return {

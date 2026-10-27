@@ -124,6 +124,28 @@ expected_behaviors:`));
     expect(email.inbound.then).toEqual({ content: 'approve 3', channel: 'email' });
   });
 
+  it('reads reviewed (a label, and an optional outcome) and delivered own_text', () => {
+    const c = load(CASE.replace('  - id: no-ask\n', `  - id: ruled
+    description: the review ruled on the SIN
+    check:
+      reviewed: { label: sin_ca }
+  - id: bounced
+    description: the review bounced the phone
+    check:
+      reviewed: { label: phone_us, outcome: bounce }
+  - id: own-words
+    description: Curia's own words carry no SIN
+    check:
+      delivered: { to: pat, contains: ["692"], count: 0, own_text: true }
+  - id: no-ask
+`));
+    expect(c.expectedBehaviors.map(b => b.check).slice(-4, -1)).toEqual([
+      { kind: 'reviewed', label: 'sin_ca' },
+      { kind: 'reviewed', label: 'phone_us', outcome: 'bounce' },
+      { kind: 'delivered', to: 'pat', contains: ['692'], count: 0, ownText: true },
+    ]);
+  });
+
   it('accepts third-party fixtures under any .test name', () => {
     const c = load(CASE.replaceAll('vendor.example.test', 'vendorco.test').replace('[Vendor.example.test]', '[vendorco.test]'));
     expect(c.seed.contacts[0]!.identifier).toBe('pat@vendorco.test');
@@ -140,6 +162,9 @@ expected_behaviors:`));
     ['a stub for a send that runs for real', (s: string) => s.replace('expected_behaviors:', 'tool_stubs:\n  email-reply:\n    - match: {}\n      return: { sent: true }\nexpected_behaviors:'), /runs email-reply for real; remove its stubs/],
     ['an unknown delivered filter', (s: string) => s.replace('count: 1 }', 'count: 1, bcc: x }'), /unknown key/],
     ['a bad delivery channel', (s: string) => s.replace('channel: signal, to: principal', 'channel: fax, to: principal'), /'channel' must be one of/],
+    ['a reviewed check without a label', (s: string) => s.replace('held: true', 'reviewed: true'), /'label' must be a non-empty string/],
+    ['a reviewed check with an unknown outcome', (s: string) => s.replace('held: true', 'reviewed: { label: sin_ca, outcome: shred }'), /'outcome' must be one of send, bounce, block, hold/],
+    ['delivered own_text: false', (s: string) => s.replace('count: 1 }', 'count: 1, own_text: false }'), /'own_text' is true or absent/],
     ['a decision other than yes or no', (s: string) => s.replace('decision: "yes"', 'decision: maybe'), /'decision' must be yes or no/],
     ['a gateway check that is not a mapping', (s: string) => s.replace('held: true', 'held: [SIN]'), /must be true or a mapping/],
     ['a task originator that is not seeded', (s: string) => s.replace('originator: principal', 'originator: lee'), /originator 'lee' is not principal or a seeded contact key/],
