@@ -523,10 +523,10 @@ describe('BandSendReview', () => {
           expect((await own.svc.review(input)).kind).toBe('bounce');
         });
 
-        it('covers the linked sender by address, and a recipient whose contact id the row or sender has', async () => {
+        it('covers a recipient whose address or contact id the row has, or who is the linked sender', async () => {
           const none = { addresses: [], contactIds: [], domains: [] };
-          const bySender: SendAuthority = { ...link('strong', principal, { counterparty: none }), originator: { ...outsider, contactId: 'Joel@Example.com' } };
-          const a = make([withRulings(ruling('inferred'))], { evidence: { authority: bySender } });
+          const byRowAddress = link('strong', principal, { counterparty: { ...none, addresses: ['joel@example.com'] } });
+          const a = make([withRulings(ruling('inferred'))], { evidence: { authority: byRowAddress } });
           expect((await a.svc.review(pii)).kind).toBe('send');
 
           const byRowContact = link('strong', principal, { counterparty: { ...none, contactIds: ['c-joel'] } });
@@ -537,6 +537,10 @@ describe('BandSendReview', () => {
           const bySenderContact: SendAuthority = { ...link('strong', principal, { counterparty: none }), originator: { ...outsider, contactId: joelUuid } };
           const c = make([withRulings(ruling('inferred'))], { evidence: { authority: bySenderContact } });
           expect((await c.svc.review({ ...pii, recipientContactIds: { 'joel@example.com': joelUuid } })).kind).toBe('send');
+
+          // The linked sender's contact id never stands in for an address.
+          const d = make([withRulings(ruling('inferred'))], { evidence: { authority: bySenderContact } });
+          expect((await d.svc.review(pii)).kind).not.toBe('send');
         });
 
         it('gives no link authority or askability when the row could not be read', async () => {

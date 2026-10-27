@@ -85,6 +85,7 @@ import { applyChannelVaultSecrets } from '../channels/apply-channel-vault-secret
 import { EmailAccountsRepo } from '../channels/email/email-accounts-repo.js';
 import { resolveEmailAccounts } from '../channels/email/resolve-email-accounts.js';
 import { resolvePrincipalCalendarGrant } from '../channels/calendar/resolve-calendar-grant.js';
+import { principalOrgDomainSet } from '../contacts/non-org-domains.js';
 import { ContactService } from '../contacts/contact-service.js';
 import { ContactResolver } from '../contacts/contact-resolver.js';
 import { ConfidencePipeline } from '../contacts/confidence-pipeline.js';
@@ -961,6 +962,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       principalIdentities,
       selfEmails,
       selfPhones: [signalPhoneNumber, smsFromNumber].filter((n): n is string => typeof n === 'string' && n !== ''),
+      nonOrgDomains: principalOrgDomainSet(yamlConfig.security?.principal_org_domains ?? []),
       log: logger,
     });
     const baseExecutionLayer = new ExecutionLayer(toolRegistry, logger, {

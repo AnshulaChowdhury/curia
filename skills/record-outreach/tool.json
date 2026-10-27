@@ -1,9 +1,10 @@
 {
   "name": "record-outreach",
   "description": "Record outreach for a task that no send tool made. Call it after you submit a web form, make a call, or contact an organization outside email for a task, so their reply can find the task. Sends are recorded automatically.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "sensitivity": "normal",
   "action_risk": "low",
+  "allowed_callers": ["coordinator"],
   "inputs": {
     "via": "string ('web_form' | 'phone' | 'other')",
     "summary": "string (what you asked for)",

@@ -51,7 +51,8 @@ export interface OutreachMatcherDeps {
 }
 
 // Some cancel paths do not close their outreach rows, so the task's own status decides.
-const TERMINAL_TASK_STATUSES: ReadonlySet<string> = new Set(['done', 'cancelled']);
+// `failed` too: the circuit breaker's failure is terminal, and the work was abandoned.
+const TERMINAL_TASK_STATUSES: ReadonlySet<string> = new Set(['done', 'cancelled', 'failed']);
 const MODEL_ROW_LIMIT = 10;
 const MODEL_BODY_CHARS = 1500;
 

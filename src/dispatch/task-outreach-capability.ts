@@ -82,9 +82,14 @@ export function sendSummaryFallback(via: OutreachVia, subject: string | undefine
   return `${CHANNEL_LABELS[via]} message`;
 }
 
+/**
+ * The task a strongly linked reply belongs to. A weak link binds nothing (#2312): an unverified
+ * sender's turn must not widen that task's outreach with addresses or domains of its choosing.
+ */
 function linkedTaskId(metadata: Record<string, unknown> | undefined): string | null {
   const linked = metadata?.['linkedTask'];
   if (!linked || typeof linked !== 'object' || Array.isArray(linked)) return null;
+  if ((linked as Record<string, unknown>)['strength'] !== 'strong') return null;
   const taskId = (linked as Record<string, unknown>)['taskId'];
   return typeof taskId === 'string' && taskId !== '' ? taskId : null;
 }

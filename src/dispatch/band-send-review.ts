@@ -569,6 +569,7 @@ function linkCoversRecipients(input: BandReviewInput, a: SendAuthority | undefin
   const cp = a?.linkedTask?.counterparty;
   if (!cp) return false;
   const principals = new Set((input.principalRecipients ?? []).map(bareId));
+  // The linked sender is matched by contact id: an originator carries no address.
   const sender = a!.originator ? bareId(a!.originator.contactId) : undefined;
   const senderContact = sender !== undefined && isUuid(sender) ? sender : undefined;
   const contactOf = new Map(Object.entries(input.recipientContactIds ?? {}).map(([k, v]) => [bareId(k), v.trim().toLowerCase()]));
@@ -576,7 +577,7 @@ function linkCoversRecipients(input: BandReviewInput, a: SendAuthority | undefin
   const contacts = new Set(cp.contactIds);
   const domains = new Set(cp.domains);
   return input.recipients.map(bareId).filter((r) => !principals.has(r)).every((r) => {
-    if (r === sender || addresses.has(r)) return true;
+    if (addresses.has(r)) return true;
     const contact = contactOf.get(r);
     if (contact !== undefined && (contact === senderContact || contacts.has(contact))) return true;
     return orgDomainsOf([r], nonOrgDomains).some((d) => domains.has(d));

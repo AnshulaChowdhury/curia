@@ -1,6 +1,6 @@
 // tests/unit/db/task-repo-outreach-close.test.ts
 //
-// A task that ends (done or cancelled) closes its task_outreach rows, and those of the
+// A task that ends (done, cancelled or failed) closes its task_outreach rows, and those of the
 // children reconciled with it (#2312). Best-effort: a failed close never fails the update.
 
 import { describe, it, expect, vi } from 'vitest';
@@ -56,6 +56,15 @@ describe('TaskRepo closes task outreach when a task ends', () => {
     const repo = new TaskRepo(pool, bus, logger, 'UTC', undefined, outreach);
     await repo.updateTask(TASK_ID, { status: 'cancelled' });
     expect(outreach.closeForTask).toHaveBeenCalledWith(TASK_ID);
+  });
+
+  it('failResumableTask closes the task and its reconciled children', async () => {
+    const { pool } = makePool('failed', [CHILD_ID]);
+    const outreach = { closeForTask: vi.fn(async () => 1) };
+    const repo = new TaskRepo(pool, bus, logger, 'UTC', undefined, outreach);
+    await repo.failResumableTask(TASK_ID, { progressNote: 'circuit open', circuitState: {} as never, tags: [] });
+    expect(outreach.closeForTask).toHaveBeenCalledWith(TASK_ID);
+    expect(outreach.closeForTask).toHaveBeenCalledWith(CHILD_ID);
   });
 
   it('a non-terminal update closes nothing', async () => {

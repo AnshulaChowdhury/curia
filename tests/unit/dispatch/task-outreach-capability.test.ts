@@ -62,11 +62,18 @@ describe('outreachScope', () => {
     })).toEqual({ taskId: TASK_ID, conversationId: 'conv-1', directingEventId: 'evt-1', originator: outsiderOriginator });
   });
 
-  it('a linked task is task-bound', () => {
+  it('a strongly linked task is task-bound', () => {
     expect(outreachScope({
-      taskMetadata: { originator: outsiderOriginator, linkedTask: { taskId: TASK_ID } },
+      taskMetadata: { originator: outsiderOriginator, linkedTask: { taskId: TASK_ID, strength: 'strong' } },
       conversationId: 'conv-1',
     })?.taskId).toBe(TASK_ID);
+  });
+
+  it('a weak link binds nothing: an outsider turn may not record outreach on it', () => {
+    expect(outreachScope({
+      taskMetadata: { originator: outsiderOriginator, linkedTask: { taskId: TASK_ID, strength: 'weak' } },
+      conversationId: 'conv-1',
+    })).toBeNull();
   });
 
   it('a live principal turn with no task is scoped to its conversation', () => {
@@ -152,7 +159,7 @@ describe('TaskOutreachService confirmed (#2312)', () => {
     const { service, record } = makeService();
     await recordSendOutreach(
       {
-        turn: { taskMetadata: { originator: outsiderOriginator, linkedTask: { taskId: TASK_ID } }, conversationId: 'c', taskOutreach: service },
+        turn: { taskMetadata: { originator: outsiderOriginator, linkedTask: { taskId: TASK_ID, strength: 'strong' } }, conversationId: 'c', taskOutreach: service },
         via: 'email',
         addresses: ['bookings@acme.example'],
       },

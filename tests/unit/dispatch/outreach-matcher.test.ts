@@ -337,10 +337,10 @@ describe('OutreachMatcher — closed work never matches (focus 5)', () => {
     expect(await matcher.match(baseMsg)).toMatchObject({ outreachId: 'row-live', linkKind: 'org-domain' });
   });
 
-  it('a cancelled task never matches', async () => {
+  it.each(['cancelled', 'failed'])('a %s task never matches', async (status) => {
     const { matcher } = makeMatcher({
       rows: { byDomain: { 'acme.example': [row()] } },
-      taskStatus: async () => 'cancelled',
+      taskStatus: async () => status,
     });
     expect(await matcher.match(baseMsg)).toBeNull();
   });

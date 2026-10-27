@@ -189,6 +189,8 @@ describe('TaskOutreachRepo.learnCounterparty and closeForTask', () => {
     await new TaskOutreachRepo(pool).learnCounterparty('row-id', { address: 'X@Acme.com', contactId: CONTACT_ID });
     const [sql, params] = query.mock.calls[0]! as [string, unknown[]];
     expect(sql).toMatch(/UPDATE task_outreach/);
+    // A row closed between the match and the learn stays closed to new identifiers.
+    expect(sql).toMatch(/closed_at IS NULL AND expires_at > now\(\)/);
     expect(params).toEqual(['row-id', ['x@acme.com'], [CONTACT_ID]]);
   });
 

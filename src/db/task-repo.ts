@@ -1497,6 +1497,9 @@ export class TaskRepo {
       await this.publishReconcileChildEvents(reconciledChildren, reconcileReason, undefined, taskId);
     }
 
+    // A failed task is abandoned work: a reply to its outreach must not link to it (#2312).
+    await this.closeOutreach([taskId, ...reconciledChildren.map((c) => c.id)]);
+
     this.logger.warn({ taskId }, 'task-repo: resumable task failed by circuit breaker');
     return updated;
   }

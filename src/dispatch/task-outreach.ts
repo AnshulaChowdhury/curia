@@ -181,7 +181,7 @@ export class TaskOutreachRepo {
       `UPDATE task_outreach
           SET addresses = ARRAY(SELECT DISTINCT a FROM unnest(addresses || $2::text[]) AS a ORDER BY a),
               contact_ids = ARRAY(SELECT DISTINCT c FROM unnest(contact_ids || $3::uuid[]) AS c ORDER BY c)
-        WHERE id = $1`,
+        WHERE id = $1 AND ${OPEN}`,
       [id, addresses, contactIds],
     );
   }
