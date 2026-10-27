@@ -496,8 +496,11 @@ Two slow turns would flip it, so the next check should take more calls. The mode
 - **On tool turns `voice.ttfa_ms` times the filler.** The "one moment" line goes through the
   same speech path, so it is the first audio. That is what the caller hears, so the field
   stays as is.
-- **Neither field covers the delay before the turn.** Both clocks start inside
-  `runAssistantTurn`. Before it: Deepgram endpointing (400 ms), the turn hold
+- **Only turns that streamed text are counted.** A turn that errors before its first token,
+  or never streams text, logs no `voice llm first token` line, so a slow failure does not
+  show up in the gate.
+- **Neither field covers the delay before the turn.** Both clocks start once
+  `runAssistantTurn` is running. Before it: Deepgram endpointing (400 ms), the turn hold
   (`turnHoldMs`, 600 ms default; it fires `flushPendingUtterance` before the turn is
   queued, so it is outside `voice.ttfa_ms`), any wait behind a turn still running, the
   `inbound.message` audit publish, the history read and the user-row write. Inline
