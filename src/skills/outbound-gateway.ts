@@ -464,6 +464,9 @@ function buildBlockReasonSummary(findings: Array<{ rule: string; detail: string 
         || f.rule === 'principal-note-markup'
         || f.rule === BAND_RULES.ungrounded
         || f.rule === BAND_RULES.unneeded
+        // Labels and fixed text only, never values (#2312): the drafter needs them to rewrite.
+        || f.rule === BAND_RULES.pii
+        || f.rule === BAND_RULES.token
       ) && f.detail;
       return showDetail ? `${f.rule}: ${f.detail}` : f.rule;
     })

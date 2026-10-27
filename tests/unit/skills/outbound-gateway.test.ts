@@ -4151,6 +4151,18 @@ describe('band review (#2159)', () => {
       .filter((e) => e.type === type);
   }
 
+  it('tells the drafter which personal details bounced, by label, and about a placeholder', async () => {
+    const findings = [
+      { rule: 'pii-not-authorized', detail: 'This message shares personal details nothing authorizes for this recipient: phone_us. Rewrite it without them.' },
+      { rule: 'redaction-token', detail: 'The message has a redaction placeholder in it. Rewrite it without the placeholder.' },
+    ];
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }), score: 84 });
+    const result = await gw.send(emailReq, { taskEventId: 't1' });
+    expect(result.success).toBe(false);
+    expect(result.blockedReason).toContain('pii-not-authorized: This message shares personal details nothing authorizes for this recipient: phone_us.');
+    expect(result.blockedReason).toContain('redaction-token: The message has a redaction placeholder');
+  });
+
   it('sends the message unchanged when the review passes it', async () => {
     const review = vi.fn().mockResolvedValue({ kind: 'send' });
     const gw = makeBandGateway({ review, score: 84 });
