@@ -286,6 +286,12 @@ overrides:
   # refuses separate FTP transfer hosts by default (bounce-attack hardening); get-uri
   # calls only access/list/lastMod/downloadTo/close, which are unchanged.
   'get-uri>basic-ftp': '>=6.2.2'
+  # HIGH CVE from Trivy, 2026-10-24 (code-scanning #321, #323):
+  # GHSA-mrhx-c7xc-m3w5 / CVE-2023-54404 (HIGH, <4.6.6): memory-exhaustion DoS when an
+  # unbounded z.array()/set/map schema validates a large failing input. Unpinned, the
+  # prod tree (@anthropic-ai/sdk, @modelcontextprotocol/sdk) resolved 4.6.5 and
+  # eslint-plugin-react-hooks (dev) 4.5.4. 4.6.6 is the first patched release.
+  zod: '>=4.6.6'
   #
   # No advisory is currently left without a clearing override. The extract-zip pair that
   # used to sit here (GHSA-7pqw-9j4j-h8q3, GHSA-jmr9-qjv8-65gv; no fixed release) left the
