@@ -1026,6 +1026,7 @@ export class OutboundGateway {
     // 'unknown' tier rather than treat it as a genuinely unknown recipient (#1870).
     let recipientTierUnresolved = false;
     let recipientContactId: string | undefined;
+    let recipientIdentityVerified = false;
     try {
       const contact = await this.contactService.resolveByChannelIdentity(request.channel, recipientId);
       if (contact !== null) {
@@ -1041,6 +1042,7 @@ export class OutboundGateway {
         // audit and delivery events (the PII redactor no longer uses it for a principal bypass).
         recipientTier = contact.tier;
         recipientContactId = contact.contactId;
+        recipientIdentityVerified = contact.verified === true;
       }
     } catch (err) {
       // DB or service error — log at warn and proceed.
@@ -1058,8 +1060,10 @@ export class OutboundGateway {
     // it is refused, not only the primary (#2273). Fail-open, as above.
     // Every resolved person recipient's tier, for the band review's ask (#2312).
     const recipientTiers: Record<string, ContactTier> = {};
+    // Contact ids for link coverage, from verified identities only (#2312): an unverified
+    // address on a linked contact must not count as that contact.
     const recipientContactIds: Record<string, string> = {};
-    if (recipientContactId !== undefined) recipientContactIds[normalizeCounterparty(recipientId)] = recipientContactId;
+    if (recipientContactId !== undefined && recipientIdentityVerified) recipientContactIds[normalizeCounterparty(recipientId)] = recipientContactId;
     if (!recipientTierUnresolved && recipientContactId !== undefined) recipientTiers[normalizeCounterparty(recipientId)] = recipientTier;
     const blockedOther = await this.findBlockedRecipient(
       request.channel,
@@ -2766,8 +2770,8 @@ export class OutboundGateway {
    * is refused. On a lookup error, `failClosed` returns `lookup-failed`;
    * otherwise that identifier is logged and skipped, as the primary check does.
    * `opts.tiers`, when given, collects each resolved contact's tier by normalized
-   * identifier, for the band review's ask (#2312), and `opts.contactIds` its contact id, for
-   * matching a linked outreach row.
+   * identifier, for the band review's ask (#2312), and `opts.contactIds` its contact id when
+   * the identity is verified, for matching a linked outreach row.
    */
   private async findBlockedRecipient(
     channel: string,
@@ -2787,7 +2791,7 @@ export class OutboundGateway {
         }
         if (contact !== null) {
           if (opts.tiers) opts.tiers[normalizeCounterparty(identifier)] = contact.tier;
-          if (opts.contactIds) opts.contactIds[normalizeCounterparty(identifier)] = contact.contactId;
+          if (opts.contactIds && contact.verified === true) opts.contactIds[normalizeCounterparty(identifier)] = contact.contactId;
         }
       } catch (err) {
         this.log.warn(
@@ -3621,6 +3625,7 @@ export class OutboundGateway {
     let recipientTierForDraft: ContactTier = 'unknown';
     let recipientTierUnresolvedForDraft = false;
     let recipientContactIdForDraft: string | undefined;
+    let recipientVerifiedForDraft = false;
     try {
       const contact = await this.contactService.resolveByChannelIdentity('email', recipientEmail);
       if (contact !== null) {
@@ -3634,6 +3639,7 @@ export class OutboundGateway {
         }
         recipientTierForDraft = contact.tier;
         recipientContactIdForDraft = contact.contactId; // hoisted for outbound.delivered audit
+        recipientVerifiedForDraft = contact.verified === true;
       }
     } catch (err) {
       // Fail-open on DB errors — log at warn so anomalies are visible, but don't
@@ -3653,7 +3659,7 @@ export class OutboundGateway {
     const draftContactIds: Record<string, string> = {};
     if (recipientContactIdForDraft !== undefined) {
       draftTiers[normalizeCounterparty(recipientEmail)] = recipientTierForDraft;
-      draftContactIds[normalizeCounterparty(recipientEmail)] = recipientContactIdForDraft;
+      if (recipientVerifiedForDraft) draftContactIds[normalizeCounterparty(recipientEmail)] = recipientContactIdForDraft;
     }
     const blockedOther = await this.findBlockedRecipient('email', draftOthers, { failClosed: false, tiers: draftTiers, contactIds: draftContactIds });
     if (blockedOther?.kind === 'blocked') {

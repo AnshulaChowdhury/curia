@@ -4215,12 +4215,30 @@ describe('band review (#2159)', () => {
 
   it('passes the review a cc\'d contact\'s id even when their tier is unknown (#2312)', async () => {
     vi.mocked(mocks.contactService.resolveByChannelIdentity).mockImplementation(async (_channel: string, id: string) => (
-      { contactId: `c-${id.toLowerCase()}`, displayName: id, role: null, tier: id.toLowerCase() === 'joel@example.com' ? 'known' : 'unknown', kind: 'person', kgNodeId: null, verified: false }
+      { contactId: `c-${id.toLowerCase()}`, displayName: id, role: null, tier: id.toLowerCase() === 'joel@example.com' ? 'known' : 'unknown', kind: 'person', kgNodeId: null, verified: true }
     ) as never);
     const review = vi.fn().mockResolvedValue({ kind: 'send' });
     const gw = makeBandGateway({ review, score: 84 });
     await gw.send({ ...emailReq, cc: ['ops@other.example'] }, { taskEventId: 't1', conversationId: 'c1' });
     expect(review.mock.calls[0]![0].recipientContactIds).toEqual({ 'joel@example.com': 'c-joel@example.com', 'ops@other.example': 'c-ops@other.example' });
+  });
+
+  it('passes no contact id for an unverified address, primary or cc\'d (#2312)', async () => {
+    // An unverified address on a linked contact must not count as that contact.
+    vi.mocked(mocks.contactService.resolveByChannelIdentity).mockImplementation(async (_channel: string, id: string) => (
+      { contactId: 'c-linked', displayName: id, role: null, tier: 'known', kind: 'person', kgNodeId: null, verified: id.toLowerCase() === 'joel@example.com' }
+    ) as never);
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send({ ...emailReq, cc: ['joel.alt@other.example'] }, { taskEventId: 't1', conversationId: 'c1' });
+    expect(review.mock.calls[0]![0].recipientContactIds).toEqual({ 'joel@example.com': 'c-linked' });
+    // An unverified primary carries none either.
+    vi.mocked(mocks.contactService.resolveByChannelIdentity).mockImplementation(async (_channel: string, id: string) => (
+      { contactId: 'c-linked', displayName: id, role: null, tier: 'known', kind: 'person', kgNodeId: null, verified: false }
+    ) as never);
+    const review2 = vi.fn().mockResolvedValue({ kind: 'send' });
+    await makeBandGateway({ review: review2, score: 84 }).send(emailReq, { taskEventId: 't1', conversationId: 'c1' });
+    expect(review2.mock.calls[0]![0]).not.toHaveProperty('recipientContactIds');
   });
 
   it('forwards the note reported to the principal to the review (#2312)', async () => {
@@ -4701,7 +4719,7 @@ describe('band review (#2159)', () => {
     it('passes the review the detected items, the raw content, the recipient tier and the subject', async () => {
       const review = vi.fn().mockResolvedValue({ kind: 'send' });
       vi.mocked(mocks.contactService.resolveByChannelIdentity).mockResolvedValue({
-        contactId: 'joel-1', displayName: 'Joel', tier: 'trusted', kind: 'person',
+        contactId: 'joel-1', displayName: 'Joel', tier: 'trusted', kind: 'person', verified: true,
       } as unknown as Awaited<ReturnType<ContactService['resolveByChannelIdentity']>>);
       const { gateway } = await makePiiGateway({ review });
       await gateway.send(
