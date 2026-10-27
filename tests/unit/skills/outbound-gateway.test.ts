@@ -4381,14 +4381,15 @@ describe('band review (#2159)', () => {
       const actionLogRepo = makeActionLogRepo();
       const gw = makeBandGateway({
         review: vi.fn().mockResolvedValue(askHold({
-          labels: ['phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'], outreachId: 'o-1',
+          // A display-name requester: the stored key is the bare, lowercased address.
+          labels: ['phone_us'], requester: 'Joel <Joel@Example.com>', counterparties: ['joel@example.com'], outreachId: 'o-1', taskTitle: 'Book physio',
         })),
         score: 84, actionLogRepo,
       });
       await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
       expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({
         payload: { to: 'contact-1' },
-        disclosureAsk: { conversationId: 'c1', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com', outreachId: 'o-1' },
+        disclosureAsk: { conversationId: 'c1', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com', outreachId: 'o-1', taskTitle: 'Book physio' },
       }));
     });
 
@@ -4407,13 +4408,16 @@ describe('band review (#2159)', () => {
       expect(vi.mocked(other.insert).mock.calls[0]![0]).not.toHaveProperty('disclosureAsk');
     });
 
-    it('names the primary requester and counts the other recipients in the question', () => {
+    it('names the requester bare, and every other recipient a yes covers, in the question', () => {
       const ask = { labels: ['sin_ca'], requester: 'Joel <Joel@Example.com>', counterparties: ['joel@example.com'] };
-      expect(askPreamble(ask)).toBe('Joel <Joel@Example.com> is asking for your SIN. Share it? Reply yes to send the message below as written, or no to keep it private.');
-      expect(askPreamble({ ...ask, counterparties: ['joel@example.com', 'ops@example.com'] }))
-        .toBe('Joel <Joel@Example.com> and 1 other are asking for your SIN. Share it? Reply yes to send the message below as written, or no to keep it private.');
+      const tail = 'Share it? Reply yes to send the message below as written, or no to keep it private.';
+      expect(askPreamble(ask)).toBe(`joel@example.com is asking for your SIN. ${tail}`);
+      expect(askPreamble({ ...ask, counterparties: ['joel@example.com', 'Ops@Example.com'] }))
+        .toBe(`joel@example.com is asking for your SIN. The message also goes to ops@example.com, and a yes covers them too. ${tail}`);
       expect(askPreamble({ ...ask, counterparties: ['joel@example.com', 'ops@example.com', 'sam@example.com'], taskTitle: 'Book physio' }))
-        .toBe('Joel <Joel@Example.com> and 2 others are asking for your SIN for "Book physio". Share it? Reply yes to send the message below as written, or no to keep it private.');
+        .toBe(`joel@example.com is asking for your SIN for "Book physio". The message also goes to ops@example.com, sam@example.com, and a yes covers them too. ${tail}`);
+      const many = ['joel@example.com', ...Array.from({ length: 7 }, (_, i) => `cc${i}@example.com`)];
+      expect(askPreamble({ ...ask, counterparties: many })).toContain('cc0@example.com, cc1@example.com, cc2@example.com, cc3@example.com, cc4@example.com and 2 more');
     });
 
     // A relayed reply's agent is gone: the coordinator wake must say this is an ask.
@@ -4491,6 +4495,28 @@ describe('band review (#2159)', () => {
       });
       expect(actionLogRepo.insert).not.toHaveBeenCalled();
       expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('refuses a saved draft answering a cold stranger, with the digest note and no approval', async () => {
+      const sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = sendDraft;
+      const actionLogRepo = makeActionLogRepo();
+      const findings = [{ rule: 'pii-not-authorized', detail: 'x' }];
+      const gw = makeBandGateway({
+        review: vi.fn().mockResolvedValue({ kind: 'bounce', findings, strangerRequest: { labels: ['sin_ca'], requester: 'Joel <Joel@Example.com>' } }),
+        score: 84, actionLogRepo,
+      });
+      const result = await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: 'SIN 130 692 544', subject: 'Re: forms' }, {
+        taskEventId: 't1', conversationId: 'c1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft' },
+      });
+      expect(result).toMatchObject({ success: false, blockedRules: ['pii-not-authorized'] });
+      expect(result.gated).toBeUndefined();
+      expect(result.blockedReason).not.toContain('130 692 544');
+      const reports = publishedOfType(mocks.bus, 'principal.report');
+      expect(reports).toHaveLength(1);
+      expect(reports[0]!.payload['summary']).toBe('joel@example.com asked for your SIN. Curia didn\'t send the saved draft that shared it.');
+      expect(actionLogRepo.insert).not.toHaveBeenCalled();
+      expect(sendDraft).not.toHaveBeenCalled();
     });
 
     it('queues no digest note for an ordinary bounce', async () => {

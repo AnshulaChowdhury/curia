@@ -63,7 +63,7 @@ import {
   BAND_RULES, describePiiLabels, type BandReviewAsk, type BandReviewReport, type BandReviewSignals, type BandSendReview,
 } from '../dispatch/band-send-review.js';
 import type { OutboundNotificationPayload } from '../bus/events.js';
-import { normalizeCounterparty, type DisclosureAsk } from '../autonomy/disclosure-decisions.js';
+import { askPreamble, normalizeCounterparty, type DisclosureAsk } from '../autonomy/disclosure-decisions.js';
 import { markdownToHtml } from '../format/markdown-to-html.js';
 import { bodyEndsWithSignature, emailSignatureHtml, emailSignatureText, stripModelSignOff } from '../channels/email/signature.js';
 import type { AgentPersona } from './types.js';
@@ -606,18 +606,8 @@ function truncatePreview(text: string): string {
   return line.length > 80 ? `${line.slice(0, 77)}...` : line;
 }
 
-/**
- * The question an ask's approval opens with (#2312): who wants which details, and for what
- * task when the principal's authority is that task's. The primary requester is named; anyone
- * else on the send is counted.
- */
-export function askPreamble(ask: BandReviewAsk): string {
-  const requester = normalizeCounterparty(ask.requester);
-  const others = ask.counterparties.filter((c) => c !== requester).length;
-  const who = others > 0 ? `${ask.requester} and ${others} other${others === 1 ? '' : 's'} are` : `${ask.requester} is`;
-  const forTask = ask.taskTitle ? ` for "${ask.taskTitle}"` : '';
-  return `${who} asking for your ${describePiiLabels(ask.labels)}${forTask}. Share it? Reply yes to send the message below as written, or no to keep it private.`;
-}
+// The question an ask's approval opens with (#2312); approval delivery rebuilds it from the row.
+export { askPreamble };
 
 /**
  * A personal-data ask as a relayed reply's coordinator wake states it (#2312): human labels and
@@ -627,7 +617,7 @@ function wakeAskFor(request: OutboundSendRequest, ask: BandReviewAsk): ApprovalW
   const replyTo = request.channel === 'email' && request.replyToMessageId
     ? { messageId: request.replyToMessageId, ...(request.accountId ? { account: request.accountId } : {}) }
     : undefined;
-  return { details: describePiiLabels(ask.labels), requester: ask.requester, ...(replyTo ? { replyTo } : {}) };
+  return { details: describePiiLabels(ask.labels), requester: normalizeCounterparty(ask.requester), ...(replyTo ? { replyTo } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2256,6 +2246,25 @@ export class OutboundGateway {
       };
     }
 
+    // A cold stranger's request in a saved draft (#2312): nobody is asked, as for a live send,
+    // so it is not held either. Refused, with the digest note. Labels only, never values.
+    if (args.editable === false && decision.kind === 'bounce' && decision.strangerRequest) {
+      const { requester, labels } = decision.strangerRequest;
+      const details = describePiiLabels(labels);
+      await this.queueBlockReport(
+        `${normalizeCounterparty(requester)} asked for your ${details}. Curia didn't send the saved draft that shared it.`,
+        options?.conversationId ?? undefined,
+        options?.taskEventId ?? options?.parentEventId ?? 'system',
+      );
+      return {
+        result: {
+          success: false,
+          blockedReason: `Not sent: this saved draft shares the principal's ${details} with someone who asked for it, and nothing authorizes that. Save a version without them, or tell the principal.`,
+          blockedRules: decision.findings.map((f) => f.rule),
+        },
+      };
+    }
+
     // A saved draft with personal data in it is sent as written or not at all (#2312). A bounce
     // asks for a rewrite it cannot get, and copying the principal would change its stored
     // recipients: the principal decides either way. Rule names and labels only, never values.
@@ -2303,7 +2312,7 @@ export class OutboundGateway {
         // says it was not shared (#2312). Labels only, never the values.
         const { requester, labels } = decision.strangerRequest;
         await this.queueBlockReport(
-          `${requester} asked for your ${describePiiLabels(labels)}. Curia didn't share it and replied without it.`,
+          `${normalizeCounterparty(requester)} asked for your ${describePiiLabels(labels)}. Curia didn't share it and replied without it.`,
           options?.conversationId ?? undefined,
           options?.taskEventId ?? options?.parentEventId ?? 'system',
         );
@@ -2371,7 +2380,7 @@ export class OutboundGateway {
       );
       if (!raised) await reportUnapprovedHold('the approval row could not be written');
       const askGuidance = ask && raised
-        ? ` This is waiting on the principal. Deliver approval ${raised.approvalNumber ?? raised.shortRef} to them now with deliver-approval on their urgent channel, then send ${ask.requester} a short holding reply that doesn't include the requested details.`
+        ? ` This is waiting on the principal. Deliver approval ${raised.approvalNumber ?? raised.shortRef} to them now with deliver-approval on their urgent channel, then send ${normalizeCounterparty(ask.requester)} a short holding reply that doesn't include the requested details.`
         : '';
       return {
         result: {
@@ -2406,6 +2415,7 @@ export class OutboundGateway {
       labels: ask.labels,
       requester: normalizeCounterparty(ask.requester),
       ...(ask.outreachId ? { outreachId: ask.outreachId } : {}),
+      ...(ask.taskTitle ? { taskTitle: ask.taskTitle } : {}),
     };
   }
 

@@ -61,7 +61,9 @@ export class ApproveActionHandler implements ToolHandler {
       // detail it carries; one never delivered showed the principal none of them (a digest
       // line or list-pending-actions names only the description). Refused, not resolved: it
       // stays pending until delivered.
-      if (row.notificationSentAt === null && hasPersonalDetails(row.toolName, row.payload)) {
+      // A personal-data ask too, whatever its payload holds yet: approving records a lasting yes
+      // for the thread, and only the delivered approval asked the question.
+      if (row.notificationSentAt === null && (row.disclosureAsk || hasPersonalDetails(row.toolName, row.payload))) {
         ctx.log.info(
           { rowId: row.id, shortRef: row.shortRef, toolName: row.toolName },
           'approve-action: undelivered approval carries personal details — refusing until it is delivered',

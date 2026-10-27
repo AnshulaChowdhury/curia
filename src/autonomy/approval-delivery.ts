@@ -21,6 +21,7 @@ import type { OutboundGateway, OutboundSendRequest } from '../skills/outbound-ga
 import { resolvePrincipalEmail, type ChannelIdentity, type PrincipalEmailRef } from '../contacts/types.js';
 import type { Logger } from '../logger.js';
 import { buildApprovalNotificationBody } from './approval-notification.js';
+import { askPreamble } from './disclosure-decisions.js';
 
 export type ApprovalChannel = 'signal' | 'sms' | 'slack' | 'email';
 
@@ -211,7 +212,8 @@ export class ApprovalDelivery {
       this.deps.logger.debug({ rowId: row.id }, 'approval-delivery: no registered display — rendering the stored payload');
     }
     const display = registered ?? {
-      preamble: row.description ?? `Curia wants to run ${row.toolName}.`,
+      // A personal-data ask leads with its question (#2312), rebuilt from what the row stores.
+      preamble: row.disclosureAsk ? askPreamble(row.disclosureAsk) : row.description ?? `Curia wants to run ${row.toolName}.`,
       payload: row.payload ?? {},
     };
     // The row's number, never the display's: "approve 3" resolves against the row, so showing

@@ -94,6 +94,14 @@ describe('sender context: identity and authentication are separate facts', () =>
     expect(block).toContain('Message authentication: passed (SPF/DKIM/DMARC for this message)');
   });
 
+  it('renders an email with no authentication result as not confirmed, not failed (#2312)', async () => {
+    const block = await senderBlock({
+      channelId: 'email', resolved: true, identityVerified: true, metadata: { senderVerified: false, senderAuthentication: 'not confirmed' },
+    });
+    expect(block).toContain('Message authentication: not confirmed (SPF/DKIM/DMARC for this message)');
+    expect(block).not.toContain('Message authentication: failed');
+  });
+
   it('renders authentication as not available on a non-email channel', async () => {
     const block = await senderBlock({ channelId: 'signal', resolved: true, identityVerified: true });
     expect(block).toContain(IDENTITY_VERIFIED);

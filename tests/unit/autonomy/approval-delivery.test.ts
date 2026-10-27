@@ -135,6 +135,22 @@ describe('ApprovalDelivery.deliver', () => {
     expect(send.mock.calls[0]![0].message).toContain('phone_us (415) 555-1234');
   });
 
+  it('leads a personal-data ask with its question after a restart, rebuilt from the row (#2312)', async () => {
+    const { delivery, send } = makeDelivery({
+      row: makeRow({
+        toolName: 'email-send',
+        payload: { to: 'joel@example.com', subject: 'Forms', body: 'My number is (415) 555-1234.' },
+        disclosureAsk: { conversationId: 'email:t1', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com', taskTitle: 'Book physio' },
+      }),
+    });
+
+    await delivery.deliver('abcd1234', 'signal');
+
+    const message = String(send.mock.calls[0]![0].message);
+    expect(message.startsWith('joel@example.com is asking for your phone number for "Book physio". Share it?')).toBe(true);
+    expect(message).toContain('phone_us (415) 555-1234');
+  });
+
   it('emails with a reply-to-answer call to action and no reaction binding', async () => {
     const { delivery, send, repo } = makeDelivery({ sendResult: { success: true } });
 

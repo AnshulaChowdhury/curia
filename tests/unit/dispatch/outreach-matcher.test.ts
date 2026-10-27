@@ -225,6 +225,15 @@ describe('OutreachMatcher — direct matches', () => {
       expect(findOpenByDomain).not.toHaveBeenCalled();
     });
 
+    it('an unconfirmed address hit on other work keeps a confirmed domain match weak: which task is unknown', async () => {
+      const otherTask = '77777777-7777-4777-8777-777777777777';
+      const guessed = row({ id: 'row-guessed', taskId: otherTask, addresses: ['bookings@acme.example'], confirmed: false });
+      const confirmed = row({ id: 'row-confirmed', domains: ['acme.example'] });
+      const { matcher, learnCounterparty } = makeMatcher({ rows: { byAddress: [guessed], byDomain: { 'acme.example': [confirmed] } } });
+      expect(await matcher.match(baseMsg)).toMatchObject({ outreachId: 'row-confirmed', linkKind: 'org-domain', strength: 'weak' });
+      expect(learnCounterparty).not.toHaveBeenCalled();
+    });
+
     it('with no confirmed match anywhere, the first unconfirmed hit links weakly, and the model is not asked', async () => {
       const { infraLlm, extract } = makeLlm({ ok: true, text: '{"outreach_id": "row-open"}' });
       const first = row({ id: 'row-first', confirmed: false });

@@ -42,6 +42,12 @@ export interface ConvertedEmail {
      */
     senderVerified: boolean;
     /**
+     * The same check as a status, for stating it to the agent (#2312): `failed` when a
+     * mechanism explicitly failed, `not confirmed` when no header vouches either way.
+     * senderVerified stays the boolean every security decision reads.
+     */
+    senderAuthentication: SenderAuthentication;
+    /**
      * Curia's role in this email's recipient fields.
      * - 'to': Curia was directly addressed as a primary recipient
      * - 'cc': Curia was copied; someone else is the primary recipient
@@ -145,6 +151,19 @@ export function parseSenderVerified(headers?: Array<{ name: string; value: strin
   if (!providerHeader) return false;
   if (authHeaders.some((h) => authenticationMechanismFailed(h.value))) return false;
   return authenticationMechanismsPass(providerHeader.value);
+}
+
+export type SenderAuthentication = 'passed' | 'failed' | 'not confirmed';
+
+/**
+ * parseSenderVerified as a status (#2312): `passed` exactly when it is true, `failed` when an
+ * Authentication-Results header reports a failed mechanism, otherwise `not confirmed` (no
+ * header, or nothing passed). Absent evidence is not a failed check.
+ */
+export function senderAuthenticationStatus(headers?: Array<{ name: string; value: string }>): SenderAuthentication {
+  if (parseSenderVerified(headers)) return 'passed';
+  const auth = headers && headers.length > 0 ? authenticationResultsHeaders(headers) : [];
+  return auth.some((h) => authenticationMechanismFailed(h.value)) ? 'failed' : 'not confirmed';
 }
 
 /**
@@ -314,6 +333,7 @@ export function convertNylasMessage(msg: NylasMessage, selfEmail?: string): Conv
       // Nylas stores timestamps as Unix seconds; Date expects milliseconds
       receivedAt: new Date(msg.date * 1000),
       senderVerified: parseSenderVerified(msg.headers),
+      senderAuthentication: senderAuthenticationStatus(msg.headers),
       curiaRole,
       primaryRecipientEmails,
       ...(curiaMailbox ? { curiaMailbox } : {}),

@@ -35,12 +35,51 @@ export interface DisclosureAsk {
   labels: string[];
   requester: string;
   outreachId?: string;
+  /** The task the ask's authority came from, as its question names it. Display only. */
+  taskTitle?: string;
 }
 
 export interface DisclosureDecisionRow {
   counterparty: string;
   label: string;
   decision: DisclosureDecision;
+}
+
+const HUMAN_PII_LABELS: Readonly<Record<string, string>> = {
+  phone_us: 'phone number',
+  phone_uk_mobile: 'mobile number',
+  email: 'email address',
+  credit_card: 'card number',
+  ssn: 'SSN',
+  sin_ca: 'SIN',
+};
+
+/**
+ * Detected labels as the principal reads them (#2312), once each, joined with "and": `phone_us`
+ * is "phone number". A configured pattern (`extra_N`) or any other label is "personal detail".
+ */
+export function describePiiLabels(labels: readonly string[]): string {
+  return [...new Set(labels.map((l) => HUMAN_PII_LABELS[l] ?? 'personal detail'))].join(' and ');
+}
+
+/** How many other recipients of an ask its question names before counting the rest. */
+const MAX_NAMED_COUNTERPARTIES = 5;
+
+/**
+ * The question that leads a personal-data ask's approval (#2312). Built from what the row
+ * stores, so a delivery after a restart asks the same question. Every other recipient a yes
+ * covers is named (up to five, then a count); addresses are shown bare, never a display name.
+ */
+export function askPreamble(ask: { labels: readonly string[]; requester: string; counterparties: readonly string[]; taskTitle?: string }): string {
+  const requester = normalizeCounterparty(ask.requester);
+  const others = [...new Set(ask.counterparties.map(normalizeCounterparty))].filter((c) => c !== requester);
+  const named = others.slice(0, MAX_NAMED_COUNTERPARTIES);
+  const more = others.length - named.length;
+  const alsoTo = others.length > 0
+    ? ` The message also goes to ${named.join(', ')}${more > 0 ? ` and ${more} more` : ''}, and a yes covers them too.`
+    : '';
+  const forTask = ask.taskTitle ? ` for "${ask.taskTitle}"` : '';
+  return `${requester} is asking for your ${describePiiLabels(ask.labels)}${forTask}.${alsoTo} Share it? Reply yes to send the message below as written, or no to keep it private.`;
 }
 
 /** A recipient identifier as decisions are keyed: the last `<addr>` of a display-name form, trimmed and lowercased. */
@@ -63,7 +102,7 @@ function nonEmptyStrings(v: unknown): string[] | null {
  */
 export function readDisclosureAsk(raw: unknown): DisclosureAsk | null {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const { conversationId, counterparties, labels, requester, outreachId } = raw as Record<string, unknown>;
+  const { conversationId, counterparties, labels, requester, outreachId, taskTitle } = raw as Record<string, unknown>;
   const cps = nonEmptyStrings(counterparties);
   const ls = nonEmptyStrings(labels);
   if (!isNonEmptyString(conversationId) || !cps || !ls || !isNonEmptyString(requester)) return null;
@@ -74,6 +113,8 @@ export function readDisclosureAsk(raw: unknown): DisclosureAsk | null {
     labels: [...new Set(ls)],
     requester: normalizeCounterparty(requester),
     ...(outreachId !== undefined ? { outreachId } : {}),
+    // Display only, so a malformed title is dropped rather than failing the ask.
+    ...(isNonEmptyString(taskTitle) ? { taskTitle } : {}),
   };
 }
 

@@ -67,6 +67,11 @@ function errorName(err: unknown): string {
   return err instanceof Error ? err.name : typeof err;
 }
 
+/** The work an outreach row belongs to: its task, else the conversation it was made on. */
+function scopeOf(row: TaskOutreachRow): string {
+  return row.taskId !== null ? `task:${row.taskId}` : `conversation:${row.conversationId ?? row.id}`;
+}
+
 export class OutreachMatcher {
   constructor(private readonly deps: OutreachMatcherDeps) {}
 
@@ -88,7 +93,9 @@ export class OutreachMatcher {
 
     // Steps 1-3: direct matches, each finder newest first. The first confirmed row across the
     // steps wins; the first unconfirmed hit is used only when no step finds a confirmed one, so a
-    // backstop row an earlier step finds never shadows a confirmed row a later step finds.
+    // backstop row an earlier step finds never shadows a confirmed row a later step finds. When
+    // that earlier, more specific hit belongs to other work, which one the reply is about is not
+    // known: the confirmed row is linked, but only weakly.
     let fallback: { row: TaskOutreachRow; kind: OutreachLinkKind } | null = null;
     const steps: Array<[OutreachLinkKind, () => Promise<TaskOutreachRow[]>]> = [];
     if (address !== '') steps.push(['address', () => repo.findOpenByAddress(address)]);
@@ -98,7 +105,7 @@ export class OutreachMatcher {
     if (domain) steps.push(['org-domain', () => repo.findOpenByDomain(domain)]);
     for (const [kind, find] of steps) {
       const row = await this.firstMatchable(await find());
-      if (row?.confirmed) return this.link(row, kind, msg);
+      if (row?.confirmed) return this.link(row, kind, msg, fallback !== null && scopeOf(fallback.row) !== scopeOf(row));
       if (row && fallback === null) fallback = { row, kind };
     }
     if (fallback) return this.link(fallback.row, fallback.kind, msg);
@@ -165,10 +172,10 @@ export class OutreachMatcher {
     }
   }
 
-  private async link(row: TaskOutreachRow, linkKind: OutreachLinkKind, msg: InboundForMatch): Promise<OutreachLink> {
-    const strength = linkKind !== 'inferred' && msg.senderAuthenticated && row.confirmed ? 'strong' : 'weak';
+  private async link(row: TaskOutreachRow, linkKind: OutreachLinkKind, msg: InboundForMatch, ambiguous = false): Promise<OutreachLink> {
+    const strength = linkKind !== 'inferred' && msg.senderAuthenticated && row.confirmed && !ambiguous ? 'strong' : 'weak';
     this.deps.logger.info(
-      { outreachId: row.id, taskId: row.taskId, linkKind, strength, confirmed: row.confirmed },
+      { outreachId: row.id, taskId: row.taskId, linkKind, strength, confirmed: row.confirmed, ambiguous },
       'outreach-matcher: inbound linked to outreach',
     );
     // Only a strong link teaches the row this sender, so the next message matches directly.

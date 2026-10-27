@@ -493,6 +493,18 @@ describe('ApproveActionHandler', () => {
       expect(unshown.recordForApproval).not.toHaveBeenCalled();
     });
 
+    it('refuses an undelivered ask whose payload has no details yet: a yes would outlive the question', async () => {
+      const recorderNoBody = recorder();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: { ...ASK_ROW, notificationSentAt: null, payload: { account: 'curia' } } }) }),
+        bus: makeMockBus(), executionLayer: execLayer, disclosureDecisions: recorderNoBody,
+      }));
+      expect(result).toEqual({ success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR });
+      expect(recorderNoBody.recordForApproval).not.toHaveBeenCalled();
+      expect(execLayer.invoke).not.toHaveBeenCalled();
+    });
+
     it('still replays the approved send when the recorder is not wired', async () => {
       const execLayer = makeMockExecutionLayer();
       const result = await new ApproveActionHandler().execute(makeCtx({

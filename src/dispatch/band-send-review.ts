@@ -64,7 +64,7 @@
 import type { Logger } from '../logger.js';
 import type { EscalationJudge } from '../autonomy/escalation-judge.js';
 import { reportEvidence, type CollectedEvidence, type SendEvidenceCollector } from '../autonomy/send-evidence.js';
-import { normalizeCounterparty, type DisclosureDecisionRow } from '../autonomy/disclosure-decisions.js';
+import { describePiiLabels, normalizeCounterparty, type DisclosureDecisionRow } from '../autonomy/disclosure-decisions.js';
 import type {
   BriefAnswers, BriefDetectedItem, BriefQuestion, BriefVerdict, DisclosureRuling, SendAuthority,
 } from '../autonomy/judge-brief.js';
@@ -743,22 +743,8 @@ function askTaskTitle(a: SendAuthority | undefined, who: Authority, linkCovers: 
   return title.length > TASK_TITLE_MAX ? `${title.slice(0, TASK_TITLE_MAX - 1).trimEnd()}…` : title;
 }
 
-const HUMAN_PII_LABELS: Readonly<Record<string, string>> = {
-  phone_us: 'phone number',
-  phone_uk_mobile: 'mobile number',
-  email: 'email address',
-  credit_card: 'card number',
-  ssn: 'SSN',
-  sin_ca: 'SIN',
-};
-
-/**
- * Detected labels as the principal reads them (#2312), once each, joined with "and": `phone_us`
- * is "phone number". A configured pattern (`extra_N`) or any other label is "personal detail".
- */
-export function describePiiLabels(labels: readonly string[]): string {
-  return [...new Set(labels.map((l) => HUMAN_PII_LABELS[l] ?? 'personal detail'))].join(' and ');
-}
+// Lives with the ask it words (the approval's delivery rebuilds it), re-exported for callers here.
+export { describePiiLabels };
 
 /** The link is to a task the principal directed: its own originator, or its project root's. */
 function linkToPrincipalTask(a: SendAuthority | undefined): boolean {

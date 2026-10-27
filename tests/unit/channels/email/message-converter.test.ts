@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { convertNylasMessage, parseSenderVerified } from '../../../../src/channels/email/message-converter.js';
+import { convertNylasMessage, parseSenderVerified, senderAuthenticationStatus } from '../../../../src/channels/email/message-converter.js';
 import type { NylasMessage } from '../../../../src/channels/email/nylas-client.js';
 
 // ---------------------------------------------------------------------------
@@ -367,6 +367,21 @@ describe('convertNylasMessage — curiaMailbox', () => {
 // ---------------------------------------------------------------------------
 // parseSenderVerified — Authentication-Results header parsing
 // ---------------------------------------------------------------------------
+
+describe('senderAuthenticationStatus (#2312)', () => {
+  const ar = (value: string) => [{ name: 'Authentication-Results', value }];
+  it('is passed exactly when parseSenderVerified is true', () => {
+    expect(senderAuthenticationStatus(ar('mx.google.com; spf=pass; dkim=pass; dmarc=pass'))).toBe('passed');
+  });
+  it('is failed when a mechanism explicitly failed', () => {
+    expect(senderAuthenticationStatus(ar('mx.google.com; spf=pass; dkim=pass; dmarc=fail'))).toBe('failed');
+  });
+  it('is not confirmed with no Authentication-Results, or nothing that passed or failed', () => {
+    expect(senderAuthenticationStatus(undefined)).toBe('not confirmed');
+    expect(senderAuthenticationStatus([{ name: 'Subject', value: 'hi' }])).toBe('not confirmed');
+    expect(senderAuthenticationStatus(ar('mx.google.com; spf=none; dkim=none; dmarc=none'))).toBe('not confirmed');
+  });
+});
 
 describe('parseSenderVerified', () => {
   it('returns true when SPF, DKIM, and DMARC all pass', () => {

@@ -47,8 +47,12 @@ export class DenyActionHandler implements ToolHandler {
         return { success: false, error: `${approvalLabel(row)} was already resolved by another action` };
       }
 
-      // A personal-data ask (#2312): later asks on the thread become bounces. Never throws.
-      if (row.disclosureAsk) {
+      // A personal-data ask (#2312): later asks on the thread become bounces. Never throws. Only
+      // for a delivered ask: a deny of one the principal never saw answers no question, so it
+      // resolves the row without silencing later asks.
+      if (row.disclosureAsk && row.notificationSentAt === null) {
+        ctx.log.info({ rowId: row.id, shortRef: row.shortRef }, 'deny-action: the ask was never delivered — denied without remembering a no for the thread');
+      } else if (row.disclosureAsk) {
         if (ctx.disclosureDecisions) {
           await ctx.disclosureDecisions.recordForApproval(row, 'no', 'principal_via_coordinator');
         } else {

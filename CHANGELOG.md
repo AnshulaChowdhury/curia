@@ -206,6 +206,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Send recipients** — Curia's own mailbox no longer counts as a recipient when checking sends. (#2312)
 - **Band judge evidence** — reports to the principal count as support. **Public API:** `outbound.message` gains `reportedToPrincipal`. (#2312)
 - **Sender facts** — contact identity and message authentication are stated separately in sender context. (#2312)
+- **Sender facts** — an email with no authentication result reads as not confirmed, not failed. (#2312)
+- **PII asks** — an ask is approved or denied only once delivered; a stranger's saved draft is refused. (#2312)
 - **Scenario follow-up** — an unpublished second message fails the run, and its own turn is cleaned up. (#2018)
 - **Scenario follow-up** — scoring waits for the injection decision, and a miss still fails the run. (#2018)
 - **Turn injection config** — startup accepts `dispatch.turnInjection` in the config schema. (#2018)

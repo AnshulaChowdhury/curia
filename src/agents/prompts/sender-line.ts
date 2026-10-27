@@ -44,13 +44,19 @@ export function renderSenderLine(input: SenderLineInput): string {
  * called a verified contact an "unverified sender" because the message failed SPF/DKIM/DMARC.
  *   - Contact identity: the address is confirmed as belonging to this contact.
  *   - Message authentication: this message passed SPF/DKIM/DMARC (email only; the email
- *     adapter sets `metadata.senderVerified`).
+ *     adapter sets `metadata.senderVerified`, and `metadata.senderAuthentication` to tell
+ *     an explicit failure from a message with no result).
  */
-export function renderSenderFacts(input: { identityVerified: boolean; messageAuthenticated: unknown }): string {
+export function renderSenderFacts(input: { identityVerified: boolean; messageAuthenticated: unknown; messageAuthentication?: unknown }): string {
   const identity = input.identityVerified ? 'verified' : 'not verified';
-  const auth = typeof input.messageAuthenticated !== 'boolean'
-    ? 'not available'
-    : input.messageAuthenticated ? 'passed' : 'failed';
+  // The adapter's status when present: a message with no Authentication-Results is "not
+  // confirmed", not "failed". Otherwise the boolean, as before.
+  const status = input.messageAuthentication;
+  const auth = status === 'passed' || status === 'failed' || status === 'not confirmed'
+    ? status
+    : typeof input.messageAuthenticated !== 'boolean'
+      ? 'not available'
+      : input.messageAuthenticated ? 'passed' : 'failed';
   return `Contact identity: ${identity} (whether this address is confirmed as belonging to this contact)\n`
     + `Message authentication: ${auth} (SPF/DKIM/DMARC for this message)`;
 }

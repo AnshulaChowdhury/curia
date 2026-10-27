@@ -276,7 +276,7 @@ describe('DenyActionHandler', () => {
   // PR 5 (#2312): denying a personal-data ask records the principal's no for the thread.
   describe('a row carrying a personal-data ask', () => {
     const ASK = { conversationId: 'conv-1', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com' };
-    const ASK_ROW = { ...PENDING_ROW, toolName: 'email-send', disclosureAsk: ASK };
+    const ASK_ROW = { ...PENDING_ROW, toolName: 'email-send', disclosureAsk: ASK, notificationSentAt: new Date() };
     const recorder = () => ({ recordForApproval: vi.fn().mockResolvedValue(undefined) });
 
     it('records the no once the row is denied', async () => {
@@ -299,6 +299,16 @@ describe('DenyActionHandler', () => {
         bus: makeMockBus(), disclosureDecisions: raced,
       }));
       expect(raced.recordForApproval).not.toHaveBeenCalled();
+    });
+
+    it('denies an ask the principal was never shown without remembering a no', async () => {
+      const disclosureDecisions = recorder();
+      const result = await new DenyActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: { ...ASK_ROW, notificationSentAt: null } }) }),
+        bus: makeMockBus(), disclosureDecisions,
+      }));
+      expect(result.success).toBe(true);
+      expect(disclosureDecisions.recordForApproval).not.toHaveBeenCalled();
     });
 
     it('still denies when the recorder is not wired', async () => {
