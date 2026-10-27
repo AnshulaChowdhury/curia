@@ -48,12 +48,19 @@ export interface OutreachMatcherDeps {
   nonOrgDomains: ReadonlySet<string>;
   /** The status of a task (TaskRepo.getTask), or null when it does not exist. */
   taskStatus: (taskId: string) => Promise<string | null>;
+  /** Overrides MODEL_CHECK_TIMEOUT_MS (tests). */
+  modelTimeoutMs?: number;
 }
 
 // Some cancel paths do not close their outreach rows, so the task's own status decides.
 // `failed` too: the circuit breaker's failure is terminal, and the work was abandoned.
 const TERMINAL_TASK_STATUSES: ReadonlySet<string> = new Set(['done', 'cancelled', 'failed']);
 const MODEL_ROW_LIMIT = 10;
+/**
+ * The model check runs on the inbound path, before the task is published (#2312): it is
+ * bounded so a slow provider delays an email by at most this long. Timing out is no link.
+ */
+export const MODEL_CHECK_TIMEOUT_MS = 8_000;
 const MODEL_BODY_CHARS = 1500;
 
 function errorName(err: unknown): string {
@@ -194,12 +201,21 @@ export class OutreachMatcher {
   ): Promise<TaskOutreachRow | null> {
     const ids = rows.map((r) => r.id);
     let result;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      result = await infraLlm.extract(buildPrompt(rows, msg), { tier: 'fast', maxTokens: 200 });
+      const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), this.deps.modelTimeoutMs ?? MODEL_CHECK_TIMEOUT_MS); });
+      const raced = await Promise.race([infraLlm.extract(buildPrompt(rows, msg), { tier: 'fast', maxTokens: 200 }), timeout]);
+      if (raced === 'timeout') {
+        this.deps.logger.warn({ candidates: ids }, 'outreach-matcher: model check timed out; no link');
+        return null;
+      }
+      result = raced;
     } catch (err) {
       // Provider errors can echo the request, so only the error's class is logged.
       this.deps.logger.warn({ errName: errorName(err), candidates: ids }, 'outreach-matcher: model check threw; no link');
       return null;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
     if (!result.ok) {
       // result.error is the provider's message, which can echo the prompt: not logged.

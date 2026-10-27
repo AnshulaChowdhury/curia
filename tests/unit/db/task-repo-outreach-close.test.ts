@@ -24,13 +24,13 @@ function taskRow(status: string) {
 }
 
 /** A pool whose task reads return `open`, writes return `newStatus`, and reconcile returns `children`. */
-function makePool(newStatus: string, children: string[] = []) {
+function makePool(newStatus: string, children: string[] = [], currentStatus = 'open') {
   const query = vi.fn(async (sql: string) => {
     if (/^\s*(BEGIN|COMMIT|ROLLBACK)/.test(sql)) return { rows: [] };
     if (sql.includes('previous_status')) {
       return { rows: children.map((id) => ({ id, previous_status: 'open' })) };
     }
-    if (/SELECT[\s\S]*FROM tasks WHERE id = \$1/.test(sql) && !sql.includes('UPDATE')) return { rows: [taskRow('open')] };
+    if (/SELECT[\s\S]*FROM tasks WHERE id = \$1/.test(sql) && !sql.includes('UPDATE')) return { rows: [taskRow(currentStatus)] };
     return { rows: [taskRow(newStatus)] };
   });
   const client = { query, release: vi.fn() };
@@ -43,7 +43,7 @@ const bus = { publish: vi.fn(async () => undefined) } as unknown as EventBus;
 describe('TaskRepo closes task outreach when a task ends', () => {
   it('completeTask closes the task and its reconciled children', async () => {
     const { pool } = makePool('done', [CHILD_ID]);
-    const outreach = { closeForTask: vi.fn(async () => 1) };
+    const outreach = { closeForTask: vi.fn(async () => 1), reopenForTask: vi.fn(async () => 0) };
     const repo = new TaskRepo(pool, bus, logger, 'UTC', undefined, outreach);
     await repo.completeTask(TASK_ID, 'Booked');
     expect(outreach.closeForTask).toHaveBeenCalledWith(TASK_ID);
@@ -52,7 +52,7 @@ describe('TaskRepo closes task outreach when a task ends', () => {
 
   it("updateTask to 'cancelled' closes the task's rows", async () => {
     const { pool } = makePool('cancelled');
-    const outreach = { closeForTask: vi.fn(async () => 2) };
+    const outreach = { closeForTask: vi.fn(async () => 2), reopenForTask: vi.fn(async () => 0) };
     const repo = new TaskRepo(pool, bus, logger, 'UTC', undefined, outreach);
     await repo.updateTask(TASK_ID, { status: 'cancelled' });
     expect(outreach.closeForTask).toHaveBeenCalledWith(TASK_ID);
@@ -60,16 +60,31 @@ describe('TaskRepo closes task outreach when a task ends', () => {
 
   it('failResumableTask closes the task and its reconciled children', async () => {
     const { pool } = makePool('failed', [CHILD_ID]);
-    const outreach = { closeForTask: vi.fn(async () => 1) };
+    const outreach = { closeForTask: vi.fn(async () => 1), reopenForTask: vi.fn(async () => 0) };
     const repo = new TaskRepo(pool, bus, logger, 'UTC', undefined, outreach);
     await repo.failResumableTask(TASK_ID, { progressNote: 'circuit open', circuitState: {} as never, tags: [] });
     expect(outreach.closeForTask).toHaveBeenCalledWith(TASK_ID);
     expect(outreach.closeForTask).toHaveBeenCalledWith(CHILD_ID);
   });
 
+  it('reopenTask reopens the task\'s outreach so replies find it again', async () => {
+    const { pool } = makePool('open', [], 'done');
+    const outreach = { closeForTask: vi.fn(async () => 0), reopenForTask: vi.fn(async () => 1) };
+    const repo = new TaskRepo(pool, bus, logger, 'UTC', undefined, outreach);
+    await repo.reopenTask(TASK_ID, 'Undo');
+    expect(outreach.reopenForTask).toHaveBeenCalledWith(TASK_ID);
+  });
+
+  it('a failed outreach reopen does not fail the task reopen', async () => {
+    const { pool } = makePool('open', [], 'done');
+    const outreach = { closeForTask: vi.fn(async () => 0), reopenForTask: vi.fn(async () => { throw new Error('db down'); }) };
+    const repo = new TaskRepo(pool, bus, logger, 'UTC', undefined, outreach);
+    await expect(repo.reopenTask(TASK_ID, 'Undo')).resolves.toMatchObject({ id: TASK_ID, status: 'open' });
+  });
+
   it('a non-terminal update closes nothing', async () => {
     const { pool } = makePool('waiting');
-    const outreach = { closeForTask: vi.fn(async () => 0) };
+    const outreach = { closeForTask: vi.fn(async () => 0), reopenForTask: vi.fn(async () => 0) };
     const repo = new TaskRepo(pool, bus, logger, 'UTC', undefined, outreach);
     await repo.updateTask(TASK_ID, { status: 'waiting' });
     expect(outreach.closeForTask).not.toHaveBeenCalled();
@@ -77,7 +92,7 @@ describe('TaskRepo closes task outreach when a task ends', () => {
 
   it('a failed close does not fail the completion', async () => {
     const { pool } = makePool('done');
-    const outreach = { closeForTask: vi.fn(async () => { throw new Error('db down'); }) };
+    const outreach = { closeForTask: vi.fn(async () => { throw new Error('db down'); }), reopenForTask: vi.fn(async () => 0) };
     const repo = new TaskRepo(pool, bus, logger, 'UTC', undefined, outreach);
     await expect(repo.completeTask(TASK_ID)).resolves.toMatchObject({ id: TASK_ID, status: 'done' });
   });

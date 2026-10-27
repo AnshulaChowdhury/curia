@@ -94,6 +94,11 @@ describeIf('task_outreach repo', () => {
     expect((await repo.findOpen(500)).map((r) => r.id)).not.toContain(row.id);
     expect(await repo.closeForTask(taskId)).toBe(0);
 
+    // Reopening the task reopens its unexpired rows, then closing them again works as before.
+    expect(await repo.reopenForTask(taskId)).toBe(1);
+    expect((await repo.findOpenByDomain(`${run}-acme.test`)).map((r) => r.id)).toContain(row.id);
+    expect(await repo.closeForTask(taskId)).toBe(1);
+
     // A closed row learns nothing more.
     await repo.learnCounterparty(row.id, { address: `late@${run}-acme.test` });
     const { rows: [after] } = await pool.query<{ addresses: string[] }>('SELECT addresses FROM task_outreach WHERE id = $1', [row.id]);

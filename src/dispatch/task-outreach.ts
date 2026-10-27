@@ -186,6 +186,18 @@ export class TaskOutreachRepo {
     );
   }
 
+  /**
+   * Reopen a reopened task's closed rows that have not expired, so a reply can find the task
+   * again (#2312). Returns how many were reopened.
+   */
+  async reopenForTask(taskId: string): Promise<number> {
+    const result = await this.pool.query(
+      `UPDATE task_outreach SET closed_at = NULL WHERE task_id = $1 AND closed_at IS NOT NULL AND expires_at > now()`,
+      [taskId],
+    );
+    return result.rowCount ?? 0;
+  }
+
   /** Close every open row for a task; returns how many were closed. */
   async closeForTask(taskId: string): Promise<number> {
     const result = await this.pool.query(

@@ -379,6 +379,15 @@ describe('OutreachMatcher — closed work never matches (focus 5)', () => {
 describe('OutreachMatcher — model check', () => {
   const gmailMsg = { ...baseMsg, senderAddress: 'owner@gmail.com', senderDisplayName: 'Sam Owner' };
 
+  it('gives up on a model check that does not answer in time: no link, and the email is not held up', async () => {
+    const { infraLlm } = makeLlm(() => new Promise<InfraLlmResult>(() => { /* never answers */ }));
+    const repo = makeRepo({ open: [row({ id: 'row-1' })] });
+    const matcher = new OutreachMatcher({
+      repo: repo.repo, infraLlm, logger, nonOrgDomains: NON_ORG, taskStatus: async () => 'in_progress', modelTimeoutMs: 20,
+    });
+    expect(await matcher.match(gmailMsg)).toBeNull();
+  });
+
   it('asks the fast tier with a small cap, and passes rows and message as encoded data', async () => {
     const r = row({ id: 'row-1', givenContact: 'Sam <owner@gmail.com>' });
     const { infraLlm, extract } = makeLlm({ ok: true, text: '```json\n{"outreach_id": "row-1"}\n```' });

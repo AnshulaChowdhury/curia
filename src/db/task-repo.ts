@@ -201,7 +201,7 @@ export class TaskRepo {
      * Closes a finished task's outreach rows (#2312). Injected rather than imported so the
      * repo stays free of dispatch wiring; absent in tests and tools that build their own repo.
      */
-    private readonly outreach?: Pick<TaskOutreachRepo, 'closeForTask'>,
+    private readonly outreach?: Pick<TaskOutreachRepo, 'closeForTask' | 'reopenForTask'>,
   ) {}
 
   /**
@@ -1062,6 +1062,15 @@ export class TaskRepo {
       }));
     } catch (busErr) {
       this.logger.error({ busErr, taskId: updated.id }, 'task-repo: bus publish failed after reopenTask');
+    }
+
+    // Its outreach closed with it: replies must find the task again (#2312). Best-effort.
+    if (this.outreach) {
+      try {
+        await this.outreach.reopenForTask(updated.id);
+      } catch (err) {
+        this.logger.warn({ err, taskId: updated.id }, 'task-repo: failed to reopen task outreach — replies will not link to the reopened task');
+      }
     }
 
     this.logger.info({ taskId: updated.id }, 'task-repo: reopened task');
