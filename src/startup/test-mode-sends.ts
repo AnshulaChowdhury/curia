@@ -57,6 +57,8 @@ export interface RecordedSend {
    * attribution block), reduced to text. Absent when nothing was quoted (#2312).
    */
   ownBody?: string;
+  /** The quoted message below that block, reduced to text. Absent when nothing was quoted. */
+  quotedBody?: string;
   /** The synthetic message (or draft) id the transport returned. */
   id: string;
 }
@@ -210,7 +212,7 @@ export function createRecordingTransports(recorder: SendRecorder, accountNames: 
       cc: addresses(message.cc),
       subject: message.subject,
       body: emailText(message.body),
-      ...(quoteAt >= 0 ? { ownBody: emailText(message.body.slice(0, quoteAt)) } : {}),
+      ...(quoteAt >= 0 ? { ownBody: emailText(message.body.slice(0, quoteAt)), quotedBody: emailText(message.body.slice(quoteAt)) } : {}),
       id: message.id,
     });
   };

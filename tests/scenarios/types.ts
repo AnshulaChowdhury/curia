@@ -102,7 +102,7 @@ export type BehaviorCheck =
    * only (subject and the body above a quoted message), so the sender's own quoted words do
    * not count as something Curia sent them.
    */
-  | { kind: 'delivered'; channel?: DeliveryChannel; to?: string; ccIncludes?: string; contains?: string[]; excludes?: string[]; count?: number; ownText?: boolean }
+  | { kind: 'delivered'; channel?: DeliveryChannel; to?: string; ccIncludes?: string; contains?: string[]; excludes?: string[]; count?: number; ownText?: boolean; quoteContains?: string[] }
   /** Nothing was delivered this run, or nothing to `to` when it is set. */
   | { kind: 'not_delivered'; to?: string }
   /**
@@ -626,6 +626,8 @@ export interface RecordedDelivery {
   body: string;
   /** An email reply's own text, above the quoted message; absent when nothing was quoted. */
   ownBody?: string;
+  /** The quoted message below it; absent when nothing was quoted. */
+  quotedBody?: string;
 }
 
 export interface RecordedHold {

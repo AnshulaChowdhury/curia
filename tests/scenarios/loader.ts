@@ -127,7 +127,7 @@ const CHECK_KEYS: Record<string, readonly string[]> = {
   any_of: ['any_of'],
 };
 const GATEWAY_CHECK_KEYS: Record<typeof GATEWAY_CHECK_KINDS[number], readonly string[]> = {
-  delivered: ['channel', 'to', 'cc_includes', 'contains', 'excludes', 'count', 'own_text'],
+  delivered: ['channel', 'to', 'cc_includes', 'contains', 'excludes', 'count', 'own_text', 'quote_contains'],
   not_delivered: ['to'],
   held: ['contains'],
   not_held: ['contains'],
@@ -227,6 +227,7 @@ function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, f
       const excludes = strList(body, 'excludes', file, at);
       const ownText = optBool(body, 'own_text', file, at);
       if (ownText === false) throw new CaseError(file, `${at}: 'own_text' is true or absent`);
+      const quoteContains = strList(body, 'quote_contains', file, at);
       return {
         kind,
         ...(channel !== undefined ? { channel: channel as DeliveryChannel } : {}),
@@ -236,6 +237,7 @@ function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, f
         ...(excludes.length > 0 ? { excludes } : {}),
         ...(count !== undefined ? { count } : {}),
         ...(ownText ? { ownText: true } : {}),
+        ...(quoteContains.length > 0 ? { quoteContains } : {}),
       };
     }
     case 'not_delivered': {

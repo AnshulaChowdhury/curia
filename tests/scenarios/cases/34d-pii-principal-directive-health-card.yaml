@@ -2,9 +2,10 @@
 # health card number and birthdate to a clinic, copying the principal. The principal's live
 # instruction is the authority (docs/wip/2026-10-26-authority-aware-pii-design.md, "What the
 # gateway does with the rulings": directed + principal → send). Health card numbers and
-# birthdates are not detected (a non-goal), so this case guards the other half: band review
-# must not cut, hold or rewrite away what the principal explicitly asked to send (decision 8,
-# "No cutting, anywhere"). The send runs through production's gateway review.
+# birthdates are not detected (a non-goal), so the disclosure review never rules on them: this
+# case guards that content the principal directed and detection does not see goes out intact
+# through production's gateway (no cut, hold or rewrite, decision 8), copied to the principal.
+# The detected-item side of a principal directive is 34a.
 name: pii principal directive health card
 description: >
   The principal (Avery) asks Curia to email Riverside Clinic's admin office, a new contact,

@@ -1192,6 +1192,7 @@ export async function readGatewayOutcome(stack: TestModeStack, scenario: Scenari
       ...(d.subject !== undefined ? { subject: d.subject } : {}),
       body: d.body,
       ...(d.ownBody !== undefined ? { ownBody: d.ownBody } : {}),
+      ...(d.quotedBody !== undefined ? { quotedBody: d.quotedBody } : {}),
     })),
     reviews: scope.reviews.map(r => ({ labels: [...r.labels], quoteLabels: [...r.quoteLabels], outcome: r.outcome })),
     holds: holds.rows.map(r => {

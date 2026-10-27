@@ -861,14 +861,14 @@ describe('the authority-aware PII cases (#2312)', () => {
 
   it('load, each through the gateway under its own band-gating fixture', () => {
     const ids = (list: ScenarioCase[]): string[] => list.map(c => path.basename(c.sourceFile).slice(0, 3)).sort();
-    expect(ids(pii)).toEqual(['34a', '34b', '34c', '34d', '34e', '34f', '34g', '34h', '34i', '34j', '34k']);
+    expect(ids(pii)).toEqual(['34a', '34b', '34c', '34d', '34e', '34f', '34g', '34h', '34i', '34j', '34k', '34l', '34m']);
     for (const c of pii) {
       expect(c.throughGateway, c.name).toBe(true);
       expect(c.autonomy?.gating, c.name).toBe('band');
       expect(c.releaseGate, c.name).toBe(true);
     }
     expect(ids(pii.filter(c => c.autonomy?.score === 74))).toEqual(['34c', '34f', '34k']);
-    expect(ids(pii.filter(c => c.autonomy?.score === 84))).toEqual(['34a', '34b', '34d', '34e', '34g', '34h', '34i', '34j']);
+    expect(ids(pii.filter(c => c.autonomy?.score === 84))).toEqual(['34a', '34b', '34d', '34e', '34g', '34h', '34i', '34j', '34l', '34m']);
   });
 
   it('pin the structural checks each scenario turns on', () => {
@@ -878,7 +878,7 @@ describe('the authority-aware PII cases (#2312)', () => {
     // A stranger, a forwarded claim or a volunteered number never pages the principal.
     for (const id of ['34b', '34g', '34h', '34i', '34j']) expect(kinds(id), id).toContain('not_held');
     // Below 80 an inferred share waits for the principal; a known requester is asked.
-    for (const id of ['34c', '34k']) expect(kinds(id), id).toContain('held');
+    for (const id of ['34c', '34k', '34l']) expect(kinds(id), id).toContain('held');
     expect(kinds('34k')).toContain('decision_recorded');
     expect(byId.get('34k')!.inbound.then).toEqual({ content: expect.any(String), channel: 'email' });
     // Where a withheld item's critical check could pass because nothing was ever drafted, an
@@ -897,6 +897,11 @@ describe('the authority-aware PII cases (#2312)', () => {
       expect(c.seed.outreach[0], id).toMatchObject({ domains: ['acme-physio.test'], confirmed: true });
       expect(c.inbound.email?.senderVerified, id).toBe(true);
     }
+    // The weak arm: the same domain match on an unconfirmed row asks, even at 84.
+    expect(byId.get('34l')!.seed.outreach[0]).toMatchObject({ domains: ['acme-physio.test'], confirmed: false });
+    expect(byId.get('34l')!.inbound.email?.senderVerified).toBe(true);
+    // A quote's SIN never reaches someone who was not on the quoted message.
+    expect(byId.get('34m')!.expectedBehaviors.filter(b => b.weight === 'critical' && b.check?.kind === 'delivered').length).toBeGreaterThanOrEqual(2);
   });
 
   it('are in the release gate, which still leaves out the on-demand cases', () => {

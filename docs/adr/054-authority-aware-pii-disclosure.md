@@ -52,10 +52,14 @@ redactor behaves as before and the gateway only reports what it removed.
    principal). A relayed reply or a saved draft has no drafter to rewrite, so a block holds
    it. Any `[REDACTED: …]` token in a band-gated body or subject is a defect and bounces the
    same way. The agent always learns which labels were removed or refused. If the judge fails,
-   every item counts as unsupported and the draft bounces: it fails closed, never open.
+   the message's own items fail closed, never open: the draft bounces (held below 80, which
+   holds every unreviewed send). Items only in a quoted message follow decision 4: the send
+   takes the ordinary judge-failure path without the quote, so an unreviewed quote never goes out.
 4. **Quoted-thread exemption.** A detail that appears only in quoted text is not a
    disclosure when every non-principal recipient was already on the quoted message. Otherwise
-   an unauthorized quote-only item drops the quote rather than bouncing the reply.
+   an unauthorized quote-only item drops the quote rather than bouncing the reply. The
+   principal's approval never covers a quote it did not show: an approved replay, and a draft
+   saved for one, go without a quote that has personal details and reaches someone new.
 5. **Replies are linked to their task by outreach records.** Sends and web forms on a
    task-bound turn write `task_outreach` rows (the `record-outreach` tool covers forms and
    calls; a `web-browser` backstop records a skeleton row). A non-principal email is matched
@@ -113,7 +117,9 @@ redactor behaves as before and the gateway only reports what it removed.
   tool-result evidence already did; the content filter's Stage 2 still sees the redacted copy.
 - More holds below 80 and an extra deliver step for approvals with personal details; approval
   messages are longer. Principals see asks for linked or known requesters only.
-- Judge failures or more than ten items bounce the draft: larger messages must be split.
+- A judge failure bounces a draft carrying personal details (holds it below 80), and more than
+  ten items always bounce: larger messages must be split. A quote-only judge failure sends
+  without the quote.
 - The outreach tables and `disclosure_decisions` (migrations 107 and 108) add state to keep
   correct; weak links and unconfirmed rows cost an ask where a strong link would have shared.
 - `gating: tier` is unchanged apart from reporting: sends say what was redacted, the quoted

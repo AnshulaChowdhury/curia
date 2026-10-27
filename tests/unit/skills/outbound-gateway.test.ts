@@ -4856,6 +4856,18 @@ describe('band review (#2159)', () => {
         expect(sentEmail().body).toContain(QUOTED);
       });
 
+      it('is left out of a held reply\'s fallback draft that reaches a newcomer, so an approved draft cannot carry it', async () => {
+        const createDraft = vi.fn().mockResolvedValue({ id: 'draft-1', subject: 'Re: Forms', body: 'x' });
+        (mocks.nylasClient as unknown as Record<string, unknown>).createDraft = createDraft;
+        const { gateway } = await makePiiGateway({ review: vi.fn() });
+        await gateway.createEmailDraft({ ...reply, cc: ['newcomer@example.com'], quoteParticipants: ['joel@example.com'] });
+        expect(JSON.stringify(createDraft.mock.calls[0]![0])).not.toContain(QUOTED);
+
+        createDraft.mockClear();
+        await gateway.createEmailDraft({ ...reply, quoteParticipants: ['joel@example.com'] });
+        expect(JSON.stringify(createDraft.mock.calls[0]![0])).toContain(QUOTED);
+      });
+
       it('stays on an approved replay when every recipient was on the quoted message, and goes otherwise', async () => {
         const { gateway } = await makePiiGateway({ review: vi.fn() });
         await gateway.send({ ...reply, quoteParticipants: ['joel@example.com'] }, { humanApproved: true });

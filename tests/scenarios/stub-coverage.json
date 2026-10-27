@@ -525,6 +525,14 @@
       "unstubbed": null,
       "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
     },
+    "pii weak linked reply asks at 84": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6 review; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
+    "pii quoted sin never reaches a newcomer": {
+      "unstubbed": null,
+      "reason": "Unmeasured: new in #2312 PR 6 review; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."
+    },
     "pii linked reply callback number at 84": {
       "unstubbed": null,
       "reason": "Unmeasured: new in #2312 PR 6; recorded by the first paid run of the pii-authority cases, after the maintainer approves its cost."

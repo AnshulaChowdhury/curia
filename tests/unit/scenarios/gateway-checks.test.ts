@@ -213,6 +213,16 @@ describe('delivered own_text', () => {
   });
 });
 
+describe('delivered quote_contains (#2312)', () => {
+  it('passes only when the quoted message carries the text, not the reply\'s own words', () => {
+    const kept = delivery({ body: 'Call me on 0186.\nFront desk: 555-0123', ownBody: 'Call me on 0186.', quotedBody: 'Front desk: 555-0123' });
+    const echoed = delivery({ body: 'Call 555-0123 or 0186.' });
+    expect(evaluateCheck({ kind: 'delivered', to: 'pat', quoteContains: ['0123'] }, run({ deliveries: [kept] }), ctx).rating).toBe('PASS');
+    // A dropped quote with the number echoed in Curia's own text does not pass.
+    expect(evaluateCheck({ kind: 'delivered', to: 'pat', quoteContains: ['0123'] }, run({ deliveries: [echoed] }), ctx).rating).toBe('MISS');
+  });
+});
+
 describe('reviewed', () => {
   const r = run({
     reviews: [

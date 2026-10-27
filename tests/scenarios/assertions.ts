@@ -288,15 +288,19 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
         && (check.to === undefined || names(check.to, d.to, d.toNames))
         && (check.ccIncludes === undefined || names(check.ccIncludes, d.cc, d.ccNames))
         && (check.contains ?? []).every(s => text(d).includes(s.toLowerCase()))
-        && !(check.excludes ?? []).some(s => text(d).includes(s.toLowerCase())));
+        && !(check.excludes ?? []).some(s => text(d).includes(s.toLowerCase()))
+        // quote_contains: the quoted message is on the wire and carries these, so a quote that was
+        // dropped never passes on the reply's own words.
+        && (check.quoteContains ?? []).every(s => d.quotedBody !== undefined && d.quotedBody.toLowerCase().includes(s.toLowerCase())));
       const ok = check.count === undefined ? matching.length > 0 : matching.length === check.count;
       // The check's terms never appear in a justification, only their count: `contains` with
       // count 0 and `excludes` name values that must not go out.
-      const terms = [...(check.contains ?? []), ...(check.excludes ?? [])];
+      const terms = [...(check.contains ?? []), ...(check.excludes ?? []), ...(check.quoteContains ?? [])];
       const wanted = JSON.stringify({
         channel: check.channel, to: check.to, cc_includes: check.ccIncludes,
         contains: termCount(check.contains), excludes: termCount(check.excludes),
         ...(check.ownText ? { own_text: true } : {}),
+        ...(check.quoteContains ? { quote_contains: termCount(check.quoteContains) } : {}),
       });
       return ok
         ? pass(`${matching.length} delivery(ies) matching ${wanted}`)

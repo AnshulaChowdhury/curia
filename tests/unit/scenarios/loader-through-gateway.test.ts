@@ -137,12 +137,17 @@ expected_behaviors:`));
     description: Curia's own words carry no SIN
     check:
       delivered: { to: pat, contains: ["692"], count: 0, own_text: true }
+  - id: quote-kept
+    description: the quote is still there
+    check:
+      delivered: { to: pat, quote_contains: ["0123"] }
   - id: no-ask
 `));
-    expect(c.expectedBehaviors.map(b => b.check).slice(-4, -1)).toEqual([
+    expect(c.expectedBehaviors.map(b => b.check).slice(-5, -1)).toEqual([
       { kind: 'reviewed', label: 'sin_ca' },
       { kind: 'reviewed', label: 'phone_us', outcome: 'bounce' },
       { kind: 'delivered', to: 'pat', contains: ['692'], count: 0, ownText: true },
+      { kind: 'delivered', to: 'pat', quoteContains: ['0123'] },
     ]);
   });
 

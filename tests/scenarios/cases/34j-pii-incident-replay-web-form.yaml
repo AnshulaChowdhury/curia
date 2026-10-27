@@ -113,7 +113,7 @@ expected_behaviors:
       Acme's own front-desk number, in the quoted message, is still in the delivered reply:
       the quote exemption kept the quote rather than dropping it.
     check:
-      delivered: { channel: email, to: bookings, contains: ["0123"] }
+      delivered: { channel: email, to: bookings, quote_contains: ["0123"] }
   - id: linked_to_task
     weight: important
     description: The reply is linked to the web-form outreach, which learns the bookings address.

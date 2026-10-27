@@ -3566,8 +3566,32 @@ export class OutboundGateway {
     }
 
     const toDraft: EmailSendRequest = { ...request };
+    // A draft is sent as written, and an approved replay of it is not scanned again (#2312). A
+    // quote that reaches someone who was not on the quoted message, with personal details in it,
+    // has had no review the principal saw: the draft is saved without it.
+    if (toDraft.htmlQuote && this.quoteNeedsReview(toDraft)) {
+      this.log.info('outbound-gateway: draft saved without its quoted message — the quote has personal details and reaches someone who was not on it');
+      delete toDraft.htmlQuote;
+      delete toDraft.quoteParticipants;
+    }
     this.signEmail(toDraft, false);
     return this.dispatchEmailDraft(toDraft);
+  }
+
+  /**
+   * Whether an email's quote carries personal details to someone who was not on the quoted
+   * message (#2312), as send() would review them. A redactor error counts as yes (fail closed).
+   */
+  private quoteNeedsReview(request: EmailSendRequest): boolean {
+    if (!request.htmlQuote || !this.piiRedactor) return false;
+    const { recipients, principalIsSoleRecipient } = this.buildFilterRecipients(request);
+    if (this.quoteIsRecipients(request, recipients)) return false;
+    try {
+      return this.piiRedactor.detect(request.htmlQuote, 'email', { recipientId: request.to, principalIsSoleRecipient }).length > 0;
+    } catch (err) {
+      this.log.warn({ err }, 'outbound-gateway: PII redactor threw scanning a quote — leaving the quote out');
+      return true;
+    }
   }
 
   /**
