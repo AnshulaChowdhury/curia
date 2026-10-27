@@ -180,10 +180,11 @@ describe('cleanupRun: what through-gateway sends wrote', () => {
     await cleanupRun(stack, seededRun(), scope, 'scenario-a');
     const deletes = statements.filter(s => s.sql.trim().startsWith('DELETE'));
     const on = (table: string) => deletes.filter(s => s.sql.includes(`DELETE FROM ${table} `));
+    // Each conversation is cleaned whole (cleanupScenarioConversation), the specialist's included.
     for (const table of ['autonomy_action_log', 'disclosure_decisions']) {
-      expect(on(table).map(s => s.params[0]), table).toEqual([['scenario-a', 'scenario-delegate-1']]);
+      expect(on(table).map(s => s.params[0]), table).toEqual(['scenario-a', 'scenario-delegate-1']);
     }
-    expect(on('task_outreach').map(s => s.params[0])).toEqual([['scenario-a', 'scenario-delegate-1'], ['seeded']]);
+    expect(on('task_outreach').map(s => s.params[0])).toEqual(['scenario-a', 'scenario-delegate-1', ['seeded']]);
     // Only rows the suite made: the creator marker guards a task delete.
     expect(on('tasks')).toEqual([{ sql: expect.stringContaining('created_by = $2'), params: [['task-a'], SCENARIO_TASK_CREATOR] }]);
   });

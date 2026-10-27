@@ -1007,14 +1007,8 @@ export async function cleanupRun(
   for (const specialist of specialists) {
     await attempt(() => cleanupScenarioConversation(stack.pool, specialist));
   }
-  // What the run's sends wrote (#2312): approvals and their replays, the principal's answers,
-  // outreach rows. Then the seeded tasks (their outreach rows cascade) and task-less outreach.
-  const conversations = [...new Set([...(conversationId ? [conversationId] : []), ...specialists])];
-  if (conversations.length > 0) {
-    await attempt(() => stack.pool.query(`DELETE FROM autonomy_action_log WHERE conversation_id = ANY($1::text[])`, [conversations]));
-    await attempt(() => stack.pool.query(`DELETE FROM disclosure_decisions WHERE conversation_id = ANY($1::text[])`, [conversations]));
-    await attempt(() => stack.pool.query(`DELETE FROM task_outreach WHERE conversation_id = ANY($1::text[])`, [conversations]));
-  }
+  // The seeded tasks (their outreach rows cascade) and task-less seeded outreach. What the run's
+  // sends wrote is gone already, with each conversation (cleanupScenarioConversation).
   if (seeded.outreachIds.length > 0) {
     await attempt(() => stack.pool.query(`DELETE FROM task_outreach WHERE id = ANY($1::uuid[])`, [seeded.outreachIds]));
   }
