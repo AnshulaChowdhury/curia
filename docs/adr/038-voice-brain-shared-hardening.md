@@ -461,7 +461,10 @@ reconsidered for voice.
 Production first speech must stay at **p50 under 1 s** (spike: ~660 ms at `none`). Above
 that, put `channels.voice.model` back to `claude-haiku-4-5` while it is still served.
 - **Measured on `llm_ttft_ms`** (`voice llm first token`): turn start to first text delta,
-  the span the spike measured, so the two are comparable.
+  the span the spike measured, so the two are comparable. **Gate on `round: 0` lines
+  only** (#2271). When the model opens with a tool call and no text, the first text comes
+  in a later round, so the line also times the tool and a second model call. Those turns
+  measure the tool, not the model. The budget is unchanged; this pins the span it applies to.
 - **`voice.ttfa_ms` is recorded beside it** (`voice time-to-first-audio`). It is what the
   caller hears: prompt assembly, the model, sentence chunking and TTS. Its gap over
   `llm_ttft_ms` is not the model's, so it is not the gate. A large gap is a reason to look
@@ -473,4 +476,30 @@ that, put `channels.voice.model` back to `claude-haiku-4-5` while it is still se
 Measured after curia-deploy moved `channels.voice.model` (startup log `Voice runtime
 constructed` naming `claude-haiku-5-5`), over at least 5 calls:
 
-_Pending deploy: fill in calls, `llm_ttft_ms` and `voice.ttfa_ms` p50 / p90, and the date._
+**2026-10-27, image `edge` at `b72aacc`** (includes #2263, #2265 and #2266). Startup log
+names `claude-haiku-5-5`. 5 calls: 5 greetings and 14 user turns, two of them
+`async-offramp` handoffs and one other tool turn.
+
+| Field | Turns | n | p50 | p90 |
+|---|---|---|---|---|
+| `llm_ttft_ms` (gate) | text-first: greetings + user turns | 16 | **954 ms** | 1489 ms |
+| `llm_ttft_ms` | all, tool turns included | 19 | 1031 ms | 3373 ms |
+| `voice.ttfa_ms` | user turns | 14 | 1484 ms | 3154 ms |
+
+**Verdict: pass, narrowly.** 954 ms against the 1 s budget, well above the spike's ~660 ms.
+Two slow turns would flip it, so the next check should take more calls. The model stays.
+
+- **Tool turns were sorted by hand.** This image predates the `round` field, so the three
+  tool turns were identified from the log order: their `voice.ttfa_ms` (the filler) landed
+  before `voice llm first token`. They ran 3197, 4078 and 8975 ms. Later checks filter on
+  `round: 0`.
+- **On tool turns `voice.ttfa_ms` times the filler.** The "one moment" line goes through the
+  same speech path, so it is the first audio. That is what the caller hears, so the field
+  stays as is.
+- **Neither field covers the delay before the turn.** Both clocks start inside
+  `runAssistantTurn`. Before it: Deepgram endpointing (400 ms), the turn hold
+  (`turnHoldMs`, 600 ms default; it fires `flushPendingUtterance` before the turn is
+  queued, so it is outside `voice.ttfa_ms`), any wait behind a turn still running, the
+  `inbound.message` audit publish, the history read and the user-row write. Inline
+  summarization is no longer on this path (#2266). `voice.ttfa_ms` does include building
+  the system prompt; `llm_ttft_ms` does not.
