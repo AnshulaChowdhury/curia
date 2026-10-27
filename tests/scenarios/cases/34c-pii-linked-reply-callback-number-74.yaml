@@ -67,6 +67,12 @@ tool_stubs:
   delegate:
     - match: {}
       error: specialist unavailable
+  # Called outside a scheduled run in the first paid run (2026-10-27): the real tool's error.
+  scheduler-report:
+    - match: { job_id: null }
+      error: "Missing job_id: call scheduler-report from a scheduled run (or pass job_id explicitly outside one)"
+    - match: {}
+      return: { success: true }
   # Noting progress on the seeded task, or recording the reply as outreach, is fair.
   task-update:
     - match: { task_id: "{{task:physio}}" }

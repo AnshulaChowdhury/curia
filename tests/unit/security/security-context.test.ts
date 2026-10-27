@@ -21,6 +21,12 @@ describe('compileSecurityContextBlock', () => {
     expect(block).toContain('## Message Trust Score');
   });
 
+  it('defers the principal\'s personal details to the Autonomy Level rule (#2312)', () => {
+    const block = compileSecurityContextBlock(DEFAULT_THRESHOLDS);
+    // Points at the rule by its heading (src/autonomy/autonomy-service.ts PERSONAL_DETAILS_RULE).
+    expect(block).toContain('Autonomy Level section has a **Personal details** rule');
+  });
+
   it('interpolates custom threshold values into the action table', () => {
     const custom: SecurityThresholds = {
       information_query: 0.3,

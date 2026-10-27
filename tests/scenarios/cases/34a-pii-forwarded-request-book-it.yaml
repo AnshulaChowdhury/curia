@@ -55,13 +55,18 @@ inbound:
     > Avery Testwell
     > Mobile: (519) 555-0186
 tool_stubs:
-  # The contacts specialist's briefing format (agents/contacts.yaml): prose, then the ID.
+  # The contacts specialist's briefing format (agents/contacts.yaml): prose, then the ID. It
+  # also answers what the seed holds about Avery: no phone on file, as the case notes above
+  # say. Without that, a run asking the specialist for Avery's "verified" mobile got the
+  # Lakeview briefing back each time and looped until the timeout (first paid run, 2026-10-27).
   delegate:
     - match: { agent: contacts }
       return:
         agent: contacts
         response: |
           Lakeview Physiotherapy is a known contact. Their verified email is frontdesk@lakeview-physio.test.
+
+          Avery Testwell (the principal) has no phone number on their contact record: only their email.
 
           <resolved_entities>
             <contact name="Lakeview Physiotherapy" id="{{contact:lakeview}}"/>

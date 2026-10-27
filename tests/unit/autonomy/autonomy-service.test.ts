@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AutonomyService } from '../../../src/autonomy/autonomy-service.js';
 import type { AutonomyBand } from '../../../src/autonomy/autonomy-service.js';
+import { PERSONAL_DETAILS_RULE } from '../../../src/autonomy/autonomy-service.js';
 
 function mockPool() {
   return { query: vi.fn() };
@@ -82,6 +83,15 @@ describe('AutonomyService', () => {
     it('injects the band-gating text when the config says band', () => {
       const block = AutonomyService.formatPromptBlock({ score: 74, band: 'approval-required', updatedAt: new Date(), updatedBy: 't', gating: 'band' });
       expect(block).toContain('Ask the principal first before you speak for them');
+    });
+
+    it('adds the personal-details rule under band gating only (#2312)', () => {
+      const config = { score: 84, band: 'spot-check' as const, updatedAt: new Date(), updatedBy: 't' };
+      const band = AutonomyService.formatPromptBlock({ ...config, gating: 'band' });
+      expect(band).toContain(PERSONAL_DETAILS_RULE);
+      expect(band).toContain('**Personal details.**');
+      // Under tier the redactor still decides, so the drafter is not told to write them.
+      expect(AutonomyService.formatPromptBlock(config)).not.toContain('Personal details');
     });
 
     it('has band-gating text for every band', () => {

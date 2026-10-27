@@ -1520,6 +1520,8 @@ describe('AgentRuntime', () => {
     };
     const senderMsg = chatCall.messages.find(m => m.role === 'system' && m.content.includes('AUTHORIZATION'));
     expect(senderMsg?.content).toContain('LOW-TRUST SENDER');
+    // The principal's details are left to the band rule, when the autonomy block has one (#2312).
+    expect(senderMsg?.content).toContain('Autonomy Level section has a **Personal details** rule');
     expect(senderMsg?.content).not.toContain('view_basic_info');
     expect(senderMsg?.content).not.toContain('Allowed:');
   });

@@ -44,6 +44,16 @@ tool_stubs:
   delegate:
     - match: {}
       error: specialist unavailable
+  # Dana is already a contact; creating one is answered with the existing record, as the
+  # handler's duplicate check would find it.
+  contact-create:
+    - match: {}
+      return:
+        contact_id: "{{contact:dana}}"
+        display_name: Dana Whitfield
+        role: null
+        kg_node_id: null
+        identities_added: 0
   memory-store:
     - match: {}
       return: { stored: true, action: created, node_id: 3a4b5c6d-7e8f-4a1b-9c2d-34bb00000001, sensitivity: internal }

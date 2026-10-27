@@ -29,7 +29,10 @@ cannot tell the two apart. The data's sensitivity does not either.
 ## Decision
 
 Under band gating, personal details are authorized per item by the judge, with the authority
-computed by code, and the gateway never cuts or tokenizes text. Under `gating: tier`, the
+computed by code, and the gateway never cuts or tokenizes text. The drafter writes the details
+it was asked for and leaves the decision to the gateway: the band autonomy block's
+**Personal details** rule says so, and the LOW-TRUST and trust-score prompt rules defer to it.
+Without that, they had the drafter withhold the detail before review saw it. Under `gating: tier`, the
 redactor behaves as before and the gateway only reports what it removed.
 
 1. **Detect, then decide, then act.** The gateway detects PII items (body, subject and the
