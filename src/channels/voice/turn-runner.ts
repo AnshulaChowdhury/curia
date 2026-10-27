@@ -177,6 +177,10 @@ export class VoiceTurnRunner {
     const chunker = new SentenceChunker();
     const turnStartedAt = Date.now();
     let ttftLogged = false;
+    // Round in flight when the first text arrives. A round that only calls a tool
+    // streams no text, so a first token in round ≥1 includes the tool run and is
+    // not model latency. ADR-038's gate keeps round 0 only (#2271).
+    let currentRound = 0;
     // Everything handed to TTS this turn, so finalText matches what was heard
     // even when we fall out of the loop without a message_end.
     let spokenText = '';
@@ -199,12 +203,15 @@ export class VoiceTurnRunner {
       requestOptions: { reasoning: NO_REASONING },
       logger: this.log,
       hooks: {
+        beforeRound: ({ round }) => {
+          currentRound = round;
+        },
         onTextDelta: async (text) => {
           if (!ttftLogged) {
             ttftLogged = true;
             // info, not debug: this is how prod checks ADR-038's first-speech budget (#2245).
             this.log.info(
-              { streamId, model: this.config.model, llm_ttft_ms: Date.now() - turnStartedAt },
+              { streamId, model: this.config.model, llm_ttft_ms: Date.now() - turnStartedAt, round: currentRound },
               'voice llm first token',
             );
           }

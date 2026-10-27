@@ -488,6 +488,31 @@ describe('VoiceTurnRunner first-token log', () => {
 
     const firstToken = info.mock.calls.filter(([, msg]) => msg === 'voice llm first token');
     expect(firstToken).toHaveLength(1);
-    expect(firstToken[0]![0]).toMatchObject({ model: 'claude-haiku-5-5', llm_ttft_ms: expect.any(Number) });
+    expect(firstToken[0]![0]).toMatchObject({ model: 'claude-haiku-5-5', llm_ttft_ms: expect.any(Number), round: 0 });
+  });
+
+  // A round that only calls a tool streams no text, so the first token lands in a
+  // later round and llm_ttft_ms spans the tool run. `round` lets the ADR-038 gate
+  // keep only round-0 lines, which measure the model alone (#2271).
+  it('names the round that produced the first text when an earlier round only called a tool', async () => {
+    const info = vi.fn();
+    const spyLogger = { debug: vi.fn(), info, warn: vi.fn(), error: vi.fn(), fatal: vi.fn(), child: () => spyLogger } as unknown as Logger;
+    const toolCall: ToolCall = { id: 'call_1', name: 'lookup', input: {} };
+    const provider = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [toolCall], usage, provenance }],
+      [textDelta('Found it.'), { type: 'message_end', content: 'Found it.', usage, provenance }],
+    ]);
+    const runner = new VoiceTurnRunner({
+      provider,
+      model: 'claude-haiku-5-5',
+      logger: spyLogger,
+      invokeTool: async () => ({ content: 'ok' }),
+      onSpeechText: async () => {},
+    });
+    await runner.runTurn({ messages: [{ role: 'user', content: 'hi' }], signal: new AbortController().signal });
+
+    const firstToken = info.mock.calls.filter(([, msg]) => msg === 'voice llm first token');
+    expect(firstToken).toHaveLength(1);
+    expect(firstToken[0]![0]).toMatchObject({ round: 1 });
   });
 });
