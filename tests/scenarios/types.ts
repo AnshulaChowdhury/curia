@@ -127,7 +127,7 @@ export type BehaviorCheck =
    * (body or subject, not a quoted message) this run, with that `outcome` when set: whether
    * the path a case exists for was exercised at all (#2312).
    */
-  | { kind: 'reviewed'; label: string; outcome?: ReviewOutcome }
+  | { kind: 'reviewed'; label: string; outcome?: ReviewOutcome; count?: number }
   /**
    * Passes when any alternative passes. For a behavior the platform accepts in more
    * than one shape — e.g. delegate links an entry from `outbound_entry_id` or from its

@@ -723,11 +723,12 @@ describe('BandSendReview', () => {
       expect((await svc.review(input)).kind).toBe('block');
     });
 
-    it('takes the strictest outcome: a steered hold beats a PII bounce', async () => {
-      const { svc } = make([{ ...withRulings(ruling('unsupported')), purpose: 'steered' }], { evidence: { authority: fromOutsider } });
-      const d = await svc.review(pii);
+    // A steered hold no longer does (#2333): see "a personal-details bounce beat a hold that is only for steering".
+    it('takes the strictest outcome: a speaks-as-principal hold below 80 beats a PII bounce', async () => {
+      const { svc } = make([{ ...withRulings(ruling('unsupported')), speaksAsPrincipal: true }], { evidence: { authority: fromOutsider } });
+      const d = await svc.review({ ...pii, score: 74 });
       expect(d.kind).toBe('hold');
-      if (d.kind === 'hold') expect(d.findings.map((f) => f.rule)).toEqual(['steered']);
+      if (d.kind === 'hold') expect(d.findings.map((f) => f.rule)).toEqual(['speaks-as-principal']);
     });
 
     it('takes the strictest outcome: a claim bounce beats an authorized item, and both bounce together', async () => {
@@ -771,6 +772,36 @@ describe('BandSendReview', () => {
       const recheck = make([{ ...withRulings(ruling('unsupported', true)), unsupportedClaims: [CLAIM] }, withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
       await recheck.svc.review({ ...pii, content: `${content} ${CLAIM}`, recipientTier: 'known' });
       expect(await recheck.svc.review({ ...pii, recipientTier: 'known' })).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'] } });
+    });
+
+    // A steered hold's approval would show the SIN as sent if approved, to whoever steered it (#2333).
+    it('lets a personal-details bounce beat a hold that is only for steering, in either order', async () => {
+      const detailBounce: BandReviewDecision = { kind: 'bounce', findings: [{ rule: 'pii-not-authorized', detail: 'x' }] };
+      const steered: BandReviewDecision = { kind: 'hold', reason: 'Held', findings: [{ rule: 'steered', detail: 'Held' }] };
+      expect(bandReviewModule.combine(detailBounce, steered)).toBe(detailBounce);
+      expect(bandReviewModule.combine(steered, detailBounce)).toBe(detailBounce);
+      // Any other reason in the hold keeps it the stricter outcome.
+      const mixed: BandReviewDecision = {
+        kind: 'hold', reason: 'Held',
+        findings: [{ rule: 'steered', detail: 'Held' }, { rule: 'speaks-as-principal', detail: 'Held' }],
+      };
+      expect(bandReviewModule.combine(detailBounce, mixed)).toBe(mixed);
+      expect(bandReviewModule.combine(mixed, detailBounce)).toBe(mixed);
+      const unreviewed: BandReviewDecision = { kind: 'hold', reason: 'Held', findings: [{ rule: 'review-unavailable', detail: 'Held' }] };
+      expect(bandReviewModule.combine(detailBounce, unreviewed)).toBe(unreviewed);
+    });
+
+    it('bounces a steered send of an unsupported SIN to a stranger instead of holding it, and holds the clean recheck', async () => {
+      const { svc } = make(
+        [{ ...withRulings(ruling('unsupported')), purpose: 'steered' }, { ...withRulings(), purpose: 'steered' }],
+        { evidence: { authority: fromOutsider } },
+      );
+      const first = await svc.review(pii);
+      expect(first.kind).toBe('bounce');
+      if (first.kind === 'bounce') expect(first.findings.map((f) => f.rule)).toContain('pii-not-authorized');
+      // The rewrite has no SIN and is still steered: held as before, with nothing to show.
+      const recheck = await svc.review({ ...pii, content: 'Hi, I cannot act on a forwarded request.', detectedItems: [] });
+      expect(recheck).toMatchObject({ kind: 'hold', findings: [{ rule: 'steered' }] });
     });
 
     it('counts the bound or root task\'s principal only with a ruling that names it: an outsider\'s turn under a principal root still bounces unsupported', async () => {

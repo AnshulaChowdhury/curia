@@ -63,6 +63,9 @@ redactor behaves as before and the gateway only reports what it removed.
    the message's own items fail closed, never open: the draft bounces (held below 80, which
    holds every unreviewed send). Items only in a quoted message follow decision 4: the send
    takes the ordinary judge-failure path without the quote, so an unreviewed quote never goes out.
+   The rewrite also comes before a hold that is only for steering (#2333): that approval
+   would offer the principal the details to send as written, to whoever steered the send. A
+   recheck that is still steered holds without them.
 4. **Quoted-thread exemption.** A detail that appears only in quoted text is not a
    disclosure when every non-principal recipient was already on the quoted message, which the
    gateway confirms from that message's own headers, never from the caller's word. Otherwise

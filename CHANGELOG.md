@@ -177,6 +177,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Security
 
+- **Band review** — a steered reply carrying unsupported personal details is rewritten, not held showing them. (#2333)
 - **Blocked contacts on CC** — email sends and drafts refuse a blocked contact anywhere on To or CC. (#2273)
 - **Principal-addressed email** — autonomy and identity gates still run when anyone besides the principal receives it. (#2273)
 - **workspace-mcp dependencies** — cutoff moved to 2026-10-22 for pypdf 6.21.2, clearing three HIGH advisories (CVE-2026-115572, CVE-2026-115580, CVE-2026-115585). (curia-deploy#335)
@@ -199,6 +200,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **PII scenarios 34a, 34h, 34i** — stub the inbox specialist, ask Curia to send, and check held SINs precisely. (#2333)
 - **task-create** — placeholder ids are omitted, and a missing task is reported as not found. (#2328)
 - **task-create** — optional id inputs say to omit the field when there is none. (#2328)
 - **task-update** — string placeholder blockers are rejected; JSON null still clears one. (#2328)

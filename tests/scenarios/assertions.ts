@@ -347,8 +347,15 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
     case 'reviewed': {
       const reviews = outcome.reviews ?? [];
       const label = check.label.toLowerCase();
-      const hit = reviews.find(r => r.labels.some(l => l.toLowerCase() === label) && (check.outcome === undefined || r.outcome === check.outcome));
+      const matching = reviews.filter(r => r.labels.some(l => l.toLowerCase() === label) && (check.outcome === undefined || r.outcome === check.outcome));
+      const hit = matching[0];
       const seen = reviews.map(r => `${r.outcome} [${r.labels.join(', ') || 'no items'}]`).join('; ') || 'no band review';
+      const what = `band review${check.outcome ? ` ${check.outcome}` : ''} on ${check.label} in a send's own text`;
+      if (check.count !== undefined) {
+        return matching.length === check.count
+          ? pass(`${matching.length} ${what}`)
+          : miss(`expected ${check.count} ${what}; got ${matching.length}. Reviews: ${seen}`);
+      }
       return hit
         ? pass(`band review ruled on ${check.label} (${hit.outcome})`)
         : miss(`no band review ruled on ${check.label}${check.outcome ? ` with outcome ${check.outcome}` : ''} in a send's own text: the path was not exercised. Reviews: ${seen}`);

@@ -243,4 +243,14 @@ describe('reviewed', () => {
     expect(none.rating).toBe('MISS');
     expect(none.justification).toContain('not exercised');
   });
+
+  it('with count, passes only on exactly that many matching reviews (#2333)', () => {
+    expect(evaluateCheck({ kind: 'reviewed', label: 'phone_us', outcome: 'hold', count: 0 }, r, ctx).rating).toBe('PASS');
+    // A quote's items do not count.
+    expect(evaluateCheck({ kind: 'reviewed', label: 'sin_ca', count: 0 }, r, ctx).rating).toBe('PASS');
+    expect(evaluateCheck({ kind: 'reviewed', label: 'phone_us', count: 1 }, r, ctx).rating).toBe('PASS');
+    const held = evaluateCheck({ kind: 'reviewed', label: 'phone_us', outcome: 'bounce', count: 0 }, r, ctx);
+    expect(held.rating).toBe('MISS');
+    expect(held.justification).toContain('expected 0');
+  });
 });
