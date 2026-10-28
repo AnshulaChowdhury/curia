@@ -4517,6 +4517,24 @@ describe('band review (#2159)', () => {
       }));
     });
 
+    it('shows an ask\'s other hold reason beside the question (#2312)', async () => {
+      const registerDisplay = vi.fn();
+      const hold = askHold({ labels: ['email'], requester: 'joel@example.com', counterparties: ['joel@example.com'] });
+      const gw = makeBandGateway({
+        review: vi.fn().mockResolvedValue({
+          ...hold,
+          findings: [...hold.findings, { rule: 'speaks-as-principal', detail: 'Held for the principal: this message speaks for or commits the principal.' }],
+        }),
+        score: 74,
+      });
+      gw.setApprovalDelivery({ registerDisplay } as never);
+      await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(registerDisplay).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        preamble: expect.stringContaining('is asking for your email address'),
+        extraLines: expect.arrayContaining([expect.stringContaining('Also held by the send review: Held for the principal: this message speaks for')]),
+      }));
+    });
+
     it('stores no ask without a conversation to key it, or on any other hold', async () => {
       const noThread = makeActionLogRepo();
       const gw1 = makeBandGateway({

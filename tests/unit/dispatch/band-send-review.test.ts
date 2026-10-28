@@ -930,12 +930,19 @@ describe('BandSendReview', () => {
         expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca', 'phone_us'] } });
       });
 
-      it('does not ask when anything but a requester\'s data holds the send', async () => {
+      // The principal is asked first either way below 80: the ask survives, so its question names
+      // the requester and records the answer, and both reasons are on the hold.
+      it('keeps the ask beside a hold for speaking as the principal below 80', async () => {
+        const { svc } = make([{ ...withRulings(ruling('unsupported', true)), speaksAsPrincipal: true }], { evidence: { authority: fromOutsider } });
+        const d = await svc.review({ ...pii, score: 74, recipientTier: 'known' });
+        expect(d).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'] }, reason: expect.stringContaining('the recipient asked') });
+        if (d.kind === 'hold') expect(d.findings.map((f) => f.rule)).toEqual(expect.arrayContaining(['speaks-as-principal', 'pii-not-authorized']));
+      });
+
+      it('does not ask when anything but a requester\'s data, or speaking as the principal, holds the send', async () => {
         const cases: Array<{ verdict: BriefVerdict; input: BandReviewInput; authority: SendAuthority }> = [
           // A steered hold beside the ask.
           { verdict: { ...withRulings(ruling('unsupported', true)), purpose: 'steered' }, input: { ...pii, recipientTier: 'known' }, authority: fromOutsider },
-          // Speaks for the principal below 80, beside the ask.
-          { verdict: { ...withRulings(ruling('unsupported', true)), speaksAsPrincipal: true }, input: { ...pii, score: 74, recipientTier: 'known' }, authority: fromOutsider },
           // A second item held below 80 that nobody asked for.
           { verdict: withRulings(ruling('inferred', true), ruling('inferred', false, 'P2')), input: { ...pii, score: 74, detectedItems: [P1, P2] }, authority: linked('strong') },
           // Held below 80 under the principal's task, but not requested.

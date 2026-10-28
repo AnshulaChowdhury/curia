@@ -39,7 +39,8 @@
 //   authority only when every non-principal recipient is a counterparty it links: the linked
 //   sender, or an address, contact or org domain on the outreach row. A `[REDACTED: …]`
 //   placeholder in the content bounces the same way. The strictest outcome of all the rules
-//   wins: block > hold > bounce > send, except that a bounce beats an ask.
+//   wins: block > hold > bounce > send, except that a bounce beats an ask, and an ask survives
+//   a hold for speaking as the principal below 80 (both reasons show on the approval).
 //
 // A hold that waits only on the principal's yes to a requester (an askable recipient's request,
 // or a requested item held below 80 under the principal's task) carries `ask`: the gateway
@@ -676,6 +677,11 @@ type Authority = 'principal' | 'principal-task' | 'none';
  *
  * One exception (#2312): a bounce beats an ask. The ask waits only on the principal's yes, and
  * a yes would send the other finding too; the drafter fixes that first, and the recheck asks.
+ *
+ * Two holds merge into a plain hold, except that an ask survives a hold for speaking as the
+ * principal below 80 (#2312): the principal is asked first either way, and the question names
+ * who asked and records the answer. The approval shows the other reason beside it. Any other
+ * hold (steered, a judge failure) drops the ask, so its warning leads.
  */
 export function combine(a: BandReviewDecision, b: BandReviewDecision): BandReviewDecision {
   if (a.kind === 'bounce' && b.kind === 'hold' && b.ask) return a;
@@ -697,8 +703,16 @@ export function combine(a: BandReviewDecision, b: BandReviewDecision): BandRevie
     return { kind: 'bounce', findings: [...a.findings, ...b.findings], ...(strangerRequest ? { strangerRequest } : {}) };
   }
   if (a.kind === 'block' && b.kind === 'block') return { kind: 'block', reason: a.reason, findings: [...a.findings, ...b.findings] };
-  // A merged hold has a reason besides the requester's data, so it is never an ask (#2312).
-  if (a.kind === 'hold' && b.kind === 'hold') return { kind: 'hold', reason: a.reason, findings: [...a.findings, ...b.findings] };
+  if (a.kind === 'hold' && b.kind === 'hold') {
+    const findings = [...a.findings, ...b.findings];
+    const ask = a.ask ?? b.ask;
+    const plain = a.ask ? b : a;
+    // Leads with the ask's reason, so the question and its reason stay together.
+    if (ask && !(a.ask && b.ask) && plain.findings.every((f) => f.rule === BAND_RULES.speaksAsPrincipal)) {
+      return { kind: 'hold', reason: (a.ask ? a : b).reason, findings, ask };
+    }
+    return { kind: 'hold', reason: a.reason, findings };
+  }
   return a;
 }
 

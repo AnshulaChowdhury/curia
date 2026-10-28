@@ -44,7 +44,7 @@ import {
 } from '../contacts/principal-recipient.js';
 import { findPrincipalChannelRules } from '../contacts/principal-channel-registry.js';
 import type { ProjectedRecipient } from '../contacts/principal-channel-rules.js';
-import type { OutboundContentFilter, FilterRecipient } from '../dispatch/outbound-filter.js';
+import type { OutboundContentFilter, FilterFinding, FilterRecipient } from '../dispatch/outbound-filter.js';
 import type { DetectedPii, PiiRedactor } from '../dispatch/pii-redactor.js';
 import type { BriefDetectedItem } from '../autonomy/judge-brief.js';
 import type { EventBus } from '../bus/bus.js';
@@ -618,6 +618,15 @@ function truncatePreview(text: string): string {
 
 // The question an ask's approval opens with (#2312); approval delivery rebuilds it from the row.
 export { askPreamble };
+
+/**
+ * An ask's approval shows any other reason it was held beside the question (#2312): a hold for
+ * speaking as the principal below 80 keeps the ask (band-send-review.ts, combine).
+ */
+function alsoHeld(findings: readonly FilterFinding[]): string[] {
+  const other = findings.filter((f) => f.rule !== BAND_RULES.pii);
+  return other.length > 0 ? [`Also held by the send review: ${other.map((f) => f.detail).join(' ')}`] : [];
+}
 
 /**
  * A personal-data ask as a relayed reply's coordinator wake states it (#2312): human labels and
@@ -2375,7 +2384,7 @@ export class OutboundGateway {
         request,
         recipe,
         { taskEventId: options.taskEventId, conversationId: options.conversationId, postTurn: options.postTurn },
-        ask ? [] : [`Held by the send review: ${decision.reason}`],
+        ask ? alsoHeld(decision.findings) : [`Held by the send review: ${decision.reason}`],
         ask ? askPreamble({ ...ask, ...this.requesterNameFor(ask, args.requester) }) : undefined,
         stored,
         ask,
