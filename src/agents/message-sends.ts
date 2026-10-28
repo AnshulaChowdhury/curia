@@ -26,8 +26,8 @@ function hasGuests(record: Record<string, unknown>): boolean {
 export function isMessageSend(toolName: string, input: unknown): boolean {
   if (isHumanReplySkill(toolName)) return true;
   const record = inputRecord(input);
-  // Google honours notifyAttendees=false; Microsoft and iCloud notify anyway, which this
-  // undercounts. The skill's own warnings say so to the specialist.
+  // Google and EWS honour notifyAttendees=false; Microsoft rejects it (the call fails); iCloud
+  // notifies anyway, which this undercounts. The skill's own warnings say so to the specialist.
   const notifies = record['notifyAttendees'] !== false;
   switch (toolName) {
     case 'calendar-create-event':

@@ -25,7 +25,7 @@
 //     and Date.now() is used. Do NOT set this in the scheduler payload.
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
-import { isHoldEvent, isHoldStale } from '../../../../src/channels/calendar/holds.js';
+import { holdHasAttendees, isHoldEvent, isHoldStale } from '../../../../src/channels/calendar/holds.js';
 import { isUnresolvedPlaceholder, unresolvedPlaceholderError } from '../../../../src/skills/_shared/placeholder-guard.js';
 import { isUuid } from '../../../../src/util/uuid.js';
 
@@ -113,7 +113,7 @@ export class CalendarHoldsSweepHandler implements ToolHandler {
     // Nothing to do if the contact has no registered calendars.
     if (calendars.length === 0) {
       ctx.log.info({ contactId }, 'calendar-holds-sweep: no calendars registered, skipping');
-      return { success: true, data: { scanned: 0, expired: 0 } };
+      return { success: true, data: { scanned: 0, expired: 0, failed: 0, calendarErrors: 0, skippedWithAttendees: 0 } };
     }
 
     // Sweep counters.
@@ -121,6 +121,7 @@ export class CalendarHoldsSweepHandler implements ToolHandler {
     let expired = 0;          // holds successfully deleted
     let failed = 0;           // stale holds where deleteEvent threw (partial failure)
     let calendarErrors = 0;   // calendars whose listEvents threw / were skipped
+    let skippedWithAttendees = 0; // stale holds left in place because someone added attendees
 
     // Process each calendar independently.
     // A failure on one calendar (revoked grant, temporary Nylas error) does not
@@ -128,7 +129,7 @@ export class CalendarHoldsSweepHandler implements ToolHandler {
     for (const cal of calendars) {
       const calId = cal.nylasCalendarId;
 
-      let events: Array<{ id: string; startTime: number | null; endTime: number | null; metadata: Record<string, string> | null }>;
+      let events: Array<{ id: string; startTime: number | null; endTime: number | null; metadata: Record<string, string> | null; participants: readonly unknown[] }>;
       try {
         events = await ctx.nylasCalendarClient.listEvents(calId, windowStartIso, windowEndIso);
       } catch (err) {
@@ -154,12 +155,20 @@ export class CalendarHoldsSweepHandler implements ToolHandler {
           continue;
         }
 
+        // A hold someone added attendees to would email them a cancellation on
+        // delete; leave it for a person to handle.
+        if (holdHasAttendees(event)) {
+          skippedWithAttendees++;
+          ctx.log.warn({ calId, eventId: event.id }, 'calendar-holds-sweep: stale hold has attendees, leaving it in place');
+          continue;
+        }
+
         // Stale hold — attempt deletion.
         // Per-event try/catch: one failure must not abort the rest of the sweep.
-        // Holds are internal-only (no attendees), so notifyAttendees=false suppresses
-        // any Nylas cancellation email logic.
+        // The hold has no attendees, so the default delete emails nobody. Omit
+        // notifyAttendees: Microsoft rejects notify_participants=false with a 400.
         try {
-          await ctx.nylasCalendarClient.deleteEvent(calId, event.id, false);
+          await ctx.nylasCalendarClient.deleteEvent(calId, event.id);
           expired++;
           ctx.log.info({ calId, eventId: event.id }, 'calendar-holds-sweep: deleted stale hold');
         } catch (err) {
@@ -174,7 +183,7 @@ export class CalendarHoldsSweepHandler implements ToolHandler {
       }
     }
 
-    ctx.log.info({ contactId, scanned, expired, failed, calendarErrors }, 'calendar-holds-sweep: sweep complete');
-    return { success: true, data: { scanned, expired, failed, calendarErrors } };
+    ctx.log.info({ contactId, scanned, expired, failed, calendarErrors, skippedWithAttendees }, 'calendar-holds-sweep: sweep complete');
+    return { success: true, data: { scanned, expired, failed, calendarErrors, skippedWithAttendees } };
   }
 }

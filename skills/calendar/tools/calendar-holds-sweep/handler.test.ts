@@ -137,17 +137,38 @@ describe('CalendarHoldsSweepHandler — core sweep logic', () => {
     expect(deletedIds).not.toContain('evt-real');
   });
 
-  it('passes notifyAttendees=false to deleteEvent (no cancellation emails)', async () => {
+  it('omits notifyAttendees on deleteEvent (holds have no attendees; Microsoft rejects false)', async () => {
     const handler = new CalendarHoldsSweepHandler();
     const ctx = makeCtx();
 
     await handler.execute(ctx);
 
     const deleteEvent = ctx.nylasCalendarClient!.deleteEvent as ReturnType<typeof vi.fn>;
-    for (const call of deleteEvent.mock.calls as [string, string, boolean][]) {
-      // Third argument must be false — we never notify for holds
-      expect(call[2]).toBe(false);
+    expect(deleteEvent).toHaveBeenCalled();
+    for (const call of deleteEvent.mock.calls as unknown[][]) {
+      expect(call).toHaveLength(2);
     }
+  });
+
+  it('leaves a stale hold with attendees in place and counts it', async () => {
+    const handler = new CalendarHoldsSweepHandler();
+    const pastHoldWithGuest = { ...pastHold, participants: [{ email: 'guest@example.test', name: 'Guest', status: 'noreply' }] };
+    const deleteEvent = vi.fn().mockResolvedValue(undefined);
+    const ctx = makeCtx({
+      nylasCalendarClient: {
+        listEvents: vi.fn().mockResolvedValue([pastHoldWithGuest, oldHold]),
+        deleteEvent,
+      } as unknown as ToolContext['nylasCalendarClient'],
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    const data = (result as { success: true; data: { expired: number; skippedWithAttendees: number } }).data;
+    expect(data.expired).toBe(1);
+    expect(data.skippedWithAttendees).toBe(1);
+    expect(deleteEvent).toHaveBeenCalledTimes(1);
+    expect(deleteEvent).toHaveBeenCalledWith('cal-work', 'evt-old');
   });
 
   it('returns scanned=0, expired=0 when the calendar has no events', async () => {
@@ -308,9 +329,9 @@ describe('CalendarHoldsSweepHandler — resilience', () => {
     const result = await handler.execute(ctx);
 
     expect(result.success).toBe(true);
-    const data = (result as { success: true; data: { scanned: number; expired: number; failed: number; calendarErrors: number } }).data;
-    expect(data.scanned).toBe(0);
-    expect(data.expired).toBe(0);
+    const data = (result as { success: true; data: Record<string, number> }).data;
+    // Every success result carries every declared output, zeroed here.
+    expect(data).toEqual({ scanned: 0, expired: 0, failed: 0, calendarErrors: 0, skippedWithAttendees: 0 });
   });
 
   it('returns success:false when nylasCalendarClient is not configured', async () => {
@@ -372,6 +393,6 @@ describe('CalendarHoldsSweepHandler — resilience', () => {
     expect(data.calendarErrors).toBe(1);
     // No per-event delete failures
     expect(data.failed).toBe(0);
-    expect(ctx.nylasCalendarClient!.deleteEvent).toHaveBeenCalledWith('cal-personal', 'evt-past', false);
+    expect(ctx.nylasCalendarClient!.deleteEvent).toHaveBeenCalledWith('cal-personal', 'evt-past');
   });
 });

@@ -135,12 +135,31 @@ describe('CalendarCreateEventHandler -- self-release holds', () => {
 
     // Only the hold is deleted — exactly once, with notifyAttendees=false
     expect(deleteEvent).toHaveBeenCalledTimes(1);
-    expect(deleteEvent).toHaveBeenCalledWith('cal-work', 'hold-event-id', false);
+    expect(deleteEvent).toHaveBeenCalledWith('cal-work', 'hold-event-id');
 
     // The real meeting and the new event are never deleted
     const deletedIds = deleteEvent.mock.calls.map((c: unknown[]) => c[1]);
     expect(deletedIds).not.toContain('real-meeting-id');
     expect(deletedIds).not.toContain('new-event-id');
+  });
+
+  it('does not release an overlapping hold that has attendees', async () => {
+    const deleteEvent = vi.fn().mockResolvedValue(undefined);
+    const holdWithGuest = { ...OVERLAPPING_HOLD, participants: [{ email: 'guest@example.test', name: 'Guest', status: 'noreply' }] };
+    const ctx = makeCtx({
+      listEvents: vi.fn().mockResolvedValue([CREATED_EVENT, holdWithGuest]),
+      deleteEvent,
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(deleteEvent).not.toHaveBeenCalled();
+    if (result.success) {
+      const data = result.data as { warnings?: string[] };
+      expect(data.warnings).toHaveLength(1);
+      expect(data.warnings?.[0]).toContain('hold-event-id');
+    }
   });
 
   it('returns success:true and does NOT call deleteEvent when listEvents throws (self-release failure must not fail booking)', async () => {

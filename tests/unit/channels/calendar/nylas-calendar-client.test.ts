@@ -129,7 +129,7 @@ describe('NylasCalendarClient — updateEvent attendee writes', () => {
     for (const participant of call.requestBody.participants) {
       expect(participant).not.toHaveProperty('status');
     }
-    expect(call.queryParams).toEqual({ calendar_id: 'cal_1' });
+    expect(call.queryParams).toEqual({ calendarId: 'cal_1' });
   });
 
   it('throws rather than forwarding organizer-set participant status', async () => {
@@ -144,7 +144,7 @@ describe('NylasCalendarClient — updateEvent attendee writes', () => {
     expect(update).not.toHaveBeenCalled();
   });
 
-  it('sets notify_participants when notifyAttendees is provided', async () => {
+  it('sets notifyParticipants when notifyAttendees is provided', async () => {
     const update = vi.fn().mockResolvedValue({
       data: { id: 'evt_1', when: { startTime: 1000, endTime: 2000 } },
     });
@@ -155,7 +155,7 @@ describe('NylasCalendarClient — updateEvent attendee writes', () => {
     expect(update).toHaveBeenCalledWith({
       identifier: 'grant_test',
       eventId: 'evt_1',
-      queryParams: { calendar_id: 'cal_1', notify_participants: false },
+      queryParams: { calendarId: 'cal_1', notifyParticipants: false },
       requestBody: { title: 'Quiet' },
     });
   });
@@ -173,7 +173,7 @@ describe('NylasCalendarClient — RSVP plumbing', () => {
     expect(sendRsvp).toHaveBeenCalledWith({
       identifier: 'grant_test',
       eventId: 'evt_1',
-      queryParams: { calendar_id: 'cal_1' },
+      queryParams: { calendarId: 'cal_1' },
       requestBody: { status: 'yes' },
     });
     // Pin the body shape: sendRsvp must carry ONLY { status } — never a participants
@@ -202,7 +202,7 @@ describe('NylasCalendarClient — RSVP plumbing', () => {
     expect(find).toHaveBeenCalledWith({
       identifier: 'grant_test',
       eventId: 'evt_1',
-      queryParams: { calendar_id: 'cal_1' },
+      queryParams: { calendarId: 'cal_1' },
     });
     expect(event.id).toBe('evt_1');
     expect(event.participants[0]!.status).toBe('yes');

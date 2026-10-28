@@ -204,7 +204,7 @@ describe('CalendarUpdateEventHandler', () => {
     }
   });
 
-  it('passes notifyAttendees through and warns that Microsoft/iCloud still notify', async () => {
+  it('passes notifyAttendees through and warns that iCloud still notifies', async () => {
     const nylasCalendarClient = { updateEvent: vi.fn().mockResolvedValue(makeEvent()) };
     const result = await handler.execute(makeCtx(
       { calendarId: 'cal-1', eventId: 'evt-1', title: 'Quiet update', notifyAttendees: false },
@@ -219,7 +219,32 @@ describe('CalendarUpdateEventHandler', () => {
     );
     if (result.success) {
       const data = result.data as { warnings?: string[] };
-      expect(data.warnings?.[0]).toMatch(/Microsoft and iCloud/i);
+      expect(data.warnings?.[0]).toMatch(/iCloud ignores it/i);
     }
+  });
+
+  it('names the Microsoft limit when a silent update gets a 400', async () => {
+    const badRequest = Object.assign(new Error('400 Bad Request'), { statusCode: 400 });
+    const nylasCalendarClient = { updateEvent: vi.fn().mockRejectedValue(badRequest) };
+    const result = await handler.execute(makeCtx(
+      { calendarId: 'cal-1', eventId: 'evt-1', title: 'Quiet update', notifyAttendees: false },
+      { nylasCalendarClient: nylasCalendarClient as never },
+    ));
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain('400 Bad Request');
+      expect(result.error).toContain('Microsoft calendars reject notifyAttendees=false');
+    }
+  });
+
+  it('adds no Microsoft hint when a silent update fails with a 5xx (outcome unknown)', async () => {
+    const serverError = Object.assign(new Error('502 Bad Gateway'), { statusCode: 502 });
+    const nylasCalendarClient = { updateEvent: vi.fn().mockRejectedValue(serverError) };
+    const result = await handler.execute(makeCtx(
+      { calendarId: 'cal-1', eventId: 'evt-1', title: 'Quiet update', notifyAttendees: false },
+      { nylasCalendarClient: nylasCalendarClient as never },
+    ));
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).not.toContain('was not changed');
   });
 });

@@ -8,6 +8,7 @@ import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skill
 import type { NylasCalendarEvent, NylasRsvpStatus } from '../../../../src/channels/calendar/nylas-calendar-client.js';
 import {
   findHoldsForConversationRelease,
+  holdHasAttendees,
   type HoldMatchCriteria,
 } from '../../../../src/channels/calendar/holds.js';
 import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
@@ -172,8 +173,15 @@ export class CalendarRespondToInviteHandler implements ToolHandler {
     const releasedHolds: string[] = [];
     const releaseWarnings: string[] = [];
     for (const hold of matches) {
+      if (holdHasAttendees(hold)) {
+        // Deleting would email its attendees a cancellation; leave it for a person.
+        releaseWarnings.push(`Hold ${hold.id} has attendees, so it was left in place to avoid emailing them a cancellation.`);
+        ctx.log.warn({ calendarId, holdId: hold.id }, 'calendar-respond-to-invite: matching hold has attendees, not releasing');
+        continue;
+      }
       try {
-        await ctx.nylasCalendarClient.deleteEvent(calendarId, hold.id, false);
+        // No notify flag: no attendees to email, and Microsoft rejects false.
+        await ctx.nylasCalendarClient.deleteEvent(calendarId, hold.id);
         releasedHolds.push(hold.id);
         ctx.log.info(
           { calendarId, holdId: hold.id },

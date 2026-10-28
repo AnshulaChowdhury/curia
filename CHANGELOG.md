@@ -93,6 +93,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Hold sweep** — first post-deploy run deletes stale holds within ±14 days; older ones remain. (#2329)
 - **Voice latency on Haiku 5.5** — prod user-turn p50 954 ms passes ADR-038's 1 s budget; first-token log adds `round`, `turnKind`. (#2271)
 - **Band send review** — flagged text is rewritten, never cut; findings that survive block at 80+. (#2312)
 - **Small-cap model check** — boot refuses fast-tier, judge or voice models that cannot turn thinking off. (#2224)
@@ -201,6 +202,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **task-create** — optional id inputs say to omit the field when there is none. (#2328)
 - **task-update** — string placeholder blockers are rejected; JSON null still clears one. (#2328)
 - **task-update** — a task cannot list itself as its blocker. (#2328)
+- **`calendar-delete-event`** — silent deletes and hold cleanup pass `notifyParticipants`, so Nylas accepts them. (#2329)
+- **Calendar hold cleanup** — hold deletes omit the notify flag, so Microsoft accepts them; holds with attendees stay. (#2329)
 - **Scenario follow-up** — the harness scans inbound text, so a clean follow-up can join. (#2018)
 - **Scenario follow-up** — sends a correction on the first tool call, or at the exit hook. (#2018)
 - **Scenario follow-up** — a turn-start drain fails the run, and the point is recorded. (#2018)
