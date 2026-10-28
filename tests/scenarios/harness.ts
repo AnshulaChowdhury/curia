@@ -107,6 +107,8 @@ import {
   scopedVerification,
   SeedScope,
   cleanupScenarioConversation,
+  createOutcomeGate,
+  runConversations,
   describeError,
   seedRun,
   sweepLeftovers,
@@ -680,6 +682,8 @@ export async function createScenarioHarness(
    * shutdown waits for them before closing the pool.
    */
   const lateTurns = new Map<Promise<void>, ScenarioRunState | undefined>();
+  // A run's conversations keep their rows until its outcome is read (createOutcomeGate).
+  const outcomeGate = createOutcomeGate((conversationId) => cleanupScenarioConversation(stack.pool, conversationId));
 
   function trackDelivery(delivery: Promise<void>, conversationId: string): void {
     const settled: Promise<void> = delivery
@@ -688,7 +692,7 @@ export async function createScenarioHarness(
         // records that the late turn ended in an error.
         logger.error({ err, conversationId }, 'scenario harness: a coordinator turn failed');
       })
-      .then(() => cleanupScenarioConversation(stack.pool, conversationId))
+      .then(() => outcomeGate.clean(conversationId))
       .catch((err: unknown) => {
         logger.error({ err, conversationId }, 'scenario harness: late conversation cleanup failed');
         process.stderr.write(`  [WARN] late cleanup failed for ${conversationId}: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -710,7 +714,7 @@ export async function createScenarioHarness(
     const settled: Promise<void> = observeFollowupDelivery(
       delivery,
       joinedHost,
-      () => cleanupScenarioConversation(stack.pool, conversationId),
+      () => outcomeGate.clean(conversationId),
     )
       .catch((err: unknown) => {
         logger.error({ err, conversationId }, 'scenario harness: follow-up conversation cleanup failed');
@@ -795,6 +799,7 @@ export async function createScenarioHarness(
     if (typeof sender !== 'object' || !('channelId' in sender)) throw new Error('unreachable: inbound.then sender is not a channel sender');
     const conversationId = sender.channelId === 'email' ? `email:scenario-then-${randomUUID()}` : `scenario-then-${randomUUID()}`;
     scope.followOnConversations.add(conversationId);
+    outcomeGate.hold(conversationId);
     controller.attach(rootConversationId, conversationId);
     const waiter = capture.waitFor(conversationId, timeoutMs, COORDINATOR);
     // The principal's own verified identity: their mail authenticates as the adapter would see it.
@@ -951,6 +956,7 @@ export async function createScenarioHarness(
       // reused across runs and attempts: start it clean, or the last run's turns are this run's
       // history.
       if (runConversationId.startsWith('signal:')) await cleanupScenarioConversation(stack.pool, runConversationId);
+      outcomeGate.hold(runConversationId);
 
       scope.rootConversation = runConversationId;
       scope.throughGateway = scenario.throughGateway === true;
@@ -1279,6 +1285,8 @@ export async function createScenarioHarness(
           process.stderr.write(`  [WARN] cleanup failed after '${scenario.name}' run ${runIndex + 1}: ${cleanupError}\n`);
         }
       }
+      // Read and cleaned: a turn there that settles from now on cleans up after itself.
+      outcomeGate.release([...runConversations(scope), ...(conversationId ? [conversationId] : [])]);
     }
     // Spend billed from here on is no longer this run's figure (case-scope.ts: closeAttempt).
     closeAttempt(state);

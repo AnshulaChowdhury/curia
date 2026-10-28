@@ -968,6 +968,24 @@ export async function cleanupScenarioConversation(pool: DbPool, conversationId: 
   await pool.query(`DELETE FROM disclosure_decisions WHERE conversation_id = $1`, [conversationId]);
 }
 
+/**
+ * Holds back a turn's own cleanup while its run's gateway outcome is unread (#2312). A turn that
+ * settles first would delete the approvals and answers readGatewayOutcome reads; the run's
+ * cleanupRun removes them after the read instead. Released, a late turn cleans up after itself.
+ */
+export function createOutcomeGate(clean: (conversationId: string) => Promise<void>): {
+  hold(conversationId: string): void;
+  release(conversationIds: Iterable<string>): void;
+  clean(conversationId: string): Promise<void>;
+} {
+  const unread = new Set<string>();
+  return {
+    hold: (id) => { unread.add(id); },
+    release: (ids) => { for (const id of ids) unread.delete(id); },
+    clean: (id) => (unread.has(id) ? Promise.resolve() : clean(id)),
+  };
+}
+
 export async function cleanupRun(
   stack: TestModeStack,
   seeded: SeededRun,
