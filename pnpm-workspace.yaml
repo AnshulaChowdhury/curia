@@ -172,7 +172,11 @@ overrides:
   # upstream only:
   #   - GHSA-6pq8-jhm2-2vcw (MED, >=6.7.0 <=6.16.0): stringify() with arrayFormat 'comma'
   #     throws on an element with a non-callable own toString (DoS)
-  qs: '>=6.16.1'
+  # Raised off >=6.16.1 (#2335), which admitted 6.16.1 itself (the resolved version).
+  # Published upstream only:
+  #   - GHSA-w4cr-vjpx-p82q (LOW, >=6.16.0 <6.16.2): stringify() with allowEmptyArrays
+  #     does not encode empty-array keys, allowing query-string parameter injection
+  qs: '>=6.16.2'
   # Two MED SSRF / trust-boundary advisories, both fixed in 10.5.1. The prior >=10.1.1
   # floor was satisfied by 10.5.0, so @fastify/rate-limit and express-rate-limit (the
   # MCP SDK's) kept resolving a vulnerable version even though socks already had 10.7.2:
