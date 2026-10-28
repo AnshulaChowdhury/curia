@@ -1,7 +1,7 @@
 {
   "name": "approve-action",
   "description": "Approve a pending approval request. Re-executes the originally blocked skill with principal authorization. Specify short_ref to target a specific request, or omit when only one is pending. Approvals ('Approval N') only, not learning items ('task N').",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "sensitivity": "elevated",
   "action_risk": "none",
   "inputs": {
@@ -13,6 +13,6 @@
   "permissions": [],
   "secrets": [],
   "timeout": 60000,
-  "capabilities": ["bus", "actionLogRepo", "executionLayer"],
+  "capabilities": ["bus", "actionLogRepo", "executionLayer", "disclosureDecisions"],
   "allowed_callers": ["coordinator"]
 }

@@ -20,7 +20,7 @@
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { runner } from 'node-pg-migrate';
-import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveReportFallbackConfig, resolveIdentityGateMode, resolveAutonomyGating, resolveVerificationConfig, resolveRelayBudgetConfig, resolveTurnInjectionConfig } from './config.js';
+import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveReportFallbackConfig, resolveIdentityGateMode, resolveAutonomyGating, resolveVerificationConfig, resolveRelayBudgetConfig, resolveTurnInjectionConfig, resolveOutboundJudgeConfig, resolveOutboundRedactionConfig, OutboundConfigError, type OutboundJudgeSettings, type OutboundRedactionSettings } from './config.js';
 import { createVerificationRuntime } from './verification/index.js';
 import { createLogger } from './logger.js';
 import { HttpAdapter } from './channels/http/http-adapter.js';
@@ -144,6 +144,11 @@ import { repairPrincipalMetadata } from './contacts/ceo-bootstrap.js';
 import { AutonomyService } from './autonomy/autonomy-service.js';
 import { ActionLogRepo } from './autonomy/action-log-repo.js';
 import { TaskRepo } from './db/task-repo.js';
+import { TaskOutreachRepo } from './dispatch/task-outreach.js';
+import { DisclosureDecisionRecorder, DisclosureDecisionsRepo } from './autonomy/disclosure-decisions.js';
+import { OutreachMatcher } from './dispatch/outreach-matcher.js';
+import { principalOrgDomainSet } from './contacts/non-org-domains.js';
+import { TaskOutreachService, taskLookupFrom } from './dispatch/task-outreach-capability.js';
 import { WorkingDocsRepo } from './db/working-docs-repo.js';
 import { ApprovalTriggerService } from './autonomy/approval-trigger.js';
 import { ApprovalDelivery } from './autonomy/approval-delivery.js';
@@ -848,11 +853,12 @@ async function main(): Promise<void> {
   // bootstrap. The principal contact is created by the in-app onboarding wizard (#771);
   // this block only *resolves* it once at startup and derives the runtime identity values
   // used downstream:
-  //   - principalContact.id  → PiiRedactor bypass (structural UUID match, tamper-proof)
   //   - principalEmail        → outbound content filter allow-list, principal notifiers,
   //                             email adapter, approval notifications
   //   - principalIdentities   → runtime prompt injection + outbound recipient check,
-  //                             Drive grants to the principal raised to writer
+  //                             Drive grants to the principal raised to writer, and the
+  //                             PiiRedactor bypass (only when the principal is the send's sole
+  //                             recipient: principalIsSoleRecipient, #2312)
   //
   // A missing principal is NOT fatal here: the readiness check below converts it into
   // setup-required mode so the operator can finish onboarding via the web UI. That keeps
@@ -1535,27 +1541,17 @@ async function main(): Promise<void> {
     // model→provider router so any registered model works. The judge model is validated
     // against the registry here so a typo fails fast at startup.
     let outboundJudge: OutboundLlmJudge | undefined;
-    const judgeYaml = yamlConfig.filter?.llmJudge;
-    const judgeEnabled = judgeYaml?.enabled ?? true;
-    if (judgeEnabled) {
-      const judgeConfig: JudgeConfig = {
-        enabled: true,
-        model: judgeYaml?.model ?? 'claude-haiku-5-5',
-        timeoutMs: judgeYaml?.timeout_ms ?? 5000,
-        failMode: judgeYaml?.failMode ?? 'split',
-      };
-      // Validate timeout_ms. local.yaml overrides are deep-merged but NOT schema-checked
-      // at startup, so a 0/negative/non-integer value could slip through — with the default
-      // 'split' failMode that would make every judge call time out instantly and silently
-      // fail open, disabling Stage 2. Fail fast instead. The 250ms floor rejects values too
-      // low for any real model round-trip (also a likely misconfiguration).
-      if (!Number.isInteger(judgeConfig.timeoutMs) || judgeConfig.timeoutMs < 250) {
-        logger.fatal(
-          { timeoutMs: judgeConfig.timeoutMs },
-          'filter.llmJudge.timeout_ms must be an integer >= 250 (ms) — fix config (default.yaml or local.yaml)',
-        );
-        process.exit(1);
-      }
+    // Defaults and the timeout floor live in resolveOutboundJudgeConfig, shared with test mode.
+    let judgeSettings: OutboundJudgeSettings;
+    try {
+      judgeSettings = resolveOutboundJudgeConfig(yamlConfig.filter, (detail, message) => logger.warn(detail, message));
+    } catch (err) {
+      if (!(err instanceof OutboundConfigError)) throw err;
+      logger.fatal(err.detail, err.message);
+      process.exit(1);
+    }
+    if (judgeSettings.enabled) {
+      const judgeConfig: JudgeConfig = { ...judgeSettings, enabled: true };
       if (!modelRegistry.isKnownModel(judgeConfig.model)) {
         logger.fatal(
           { model: judgeConfig.model },
@@ -1619,27 +1615,16 @@ async function main(): Promise<void> {
   // Config defaults: enabled=true, default='block'.
   //
   // Must be constructed BEFORE OutboundGateway, which receives it as a constructor arg.
-  const outboundRedactionConfig = {
-    enabled: yamlConfig.pii?.outbound_redaction?.enabled ?? true,
-    default: (yamlConfig.pii?.outbound_redaction?.default ?? 'block') as 'block' | 'allow',
-    // Normalize channel_policies: the YAML type allows `allow` to be optional on
-    // each entry, but OutboundRedactionConfig requires it. Default to [] per entry.
-    channel_policies: Object.fromEntries(
-      Object.entries(yamlConfig.pii?.outbound_redaction?.channel_policies ?? {}).map(
-        ([ch, policy]) => [ch, { allow: policy.allow ?? [] }],
-      ),
-    ),
-  };
   let piiRedactor: PiiRedactor;
+  let outboundRedactionConfig: OutboundRedactionSettings;
   try {
+    // Shared with test mode: defaults, and an unknown `default` warned and read as 'block'.
+    outboundRedactionConfig = resolveOutboundRedactionConfig(yamlConfig.pii, (detail, message) => logger.warn(detail, message));
     piiRedactor = new PiiRedactor({
       config: outboundRedactionConfig,
       bus,
       logger,
       extraPatterns, // same patterns used by the inbound scrubber
-      // Principal bypass: resolved once from findContactBySystemRole('principal') above.
-      // undefined in setup-required mode (no principal yet) — then nothing bypasses redaction.
-      ceoContactId: principalContact?.id,
     });
   } catch (err) {
     logger.fatal({ err }, 'Failed to initialize PiiRedactor — check pii.outbound_redaction config');
@@ -1660,7 +1645,23 @@ async function main(): Promise<void> {
 
   // TaskRepo — used by task-create, task-list, task-update, task-complete skills.
   const workingDocsRepo = new WorkingDocsRepo(pool, logger);
-  const taskRepo = new TaskRepo(pool, bus, logger, config.timezone, workingDocsRepo);
+  // Who Curia contacted for a task (#2312): tools write it, and a task's rows close when it ends.
+  const taskOutreachRepo = new TaskOutreachRepo(pool);
+  // The principal's own company is never an outreach org domain, on either side (#2312).
+  const outreachNonOrgDomains = principalOrgDomainSet(yamlConfig.security?.principal_org_domains ?? []);
+  const taskRepo = new TaskRepo(pool, bus, logger, config.timezone, workingDocsRepo, taskOutreachRepo);
+  // The principal's yes or no on a personal-data ask, per thread (#2312): approve/deny write
+  // it, band review reads it. A yes on a strongly linked thread learns the requester onto the outreach row.
+  const disclosureDecisionsRepo = new DisclosureDecisionsRepo(pool);
+  const disclosureDecisions = new DisclosureDecisionRecorder({ repo: disclosureDecisionsRepo, taskOutreachRepo, logger });
+  const taskOutreach = new TaskOutreachService(taskOutreachRepo, {
+    principalIdentities,
+    selfEmails: resolvedEmailAccounts.map(a => a.selfEmail),
+    selfPhones: [config.signalPhoneNumber, config.smsFromNumber].filter((n): n is string => typeof n === 'string' && n !== ''),
+    lookupTask: taskLookupFrom(taskRepo),
+    nonOrgDomains: outreachNonOrgDomains,
+    log: logger,
+  });
 
   // principalContact + principalIdentities were resolved once near the top of bootstrap
   // (see the "Principal contact resolution" block above, #1049). They are reused here for
@@ -1831,6 +1832,11 @@ async function main(): Promise<void> {
   // Band gating's send review (#2159). The evidence is what the drafting turn looked up.
   const sendEvidence = new SendEvidenceCollector({
     auditLogRepo,
+    taskRepo,
+    // A task-less reply-to-outreach link reads its originator from the outreach row (#2312).
+    taskOutreachRepo,
+    // The principal's earlier answers on this thread (#2312).
+    disclosureDecisionsRepo,
     // Read per call: principal identities hot-reload in place (#1514).
     principalBlock: () => formatWhoYouServeBlock(principalIdentities, principalPrimaryEmail.current, principalProfile.current),
     logger,
@@ -1838,6 +1844,8 @@ async function main(): Promise<void> {
   const bandReview = autonomyGating === 'band'
     ? new BandSendReview({
       judge: escalationJudge,
+      // The principal's own domains never make a recipient a link's counterparty (#2312).
+      nonOrgDomains: outreachNonOrgDomains,
       evidence: sendEvidence,
       limiter: new FailOpenLimiter(),
       // Once, when unreviewed sends pass the hourly cap: sends now hold until the reviewer
@@ -1862,6 +1870,9 @@ async function main(): Promise<void> {
           logger.error({ err }, 'band review: could not tell the principal that sends are holding');
         }
       },
+      // Current tier, for a trusted contact's authority to direct a disclosure (#2312). A
+      // missing contact is no authority; a throw is caught by the review and treated the same.
+      contactTier: async (contactId) => (await contactService.getContact(contactId))?.tier ?? null,
       logger,
     })
     : undefined;
@@ -2601,7 +2612,7 @@ async function main(): Promise<void> {
   // the subscriber and sweep below. Wiring the lookup while those are off would let a
   // pending row block that agent in that conversation with nothing left to resolve it.
   const lateDeliveryConfig = resolveLateDeliveryConfig(yamlConfig.delegate);
-  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, taskRepo, workingDocsRepo, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
+  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, taskRepo, workingDocsRepo, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
     findInFlight: (targetAgent: string, originConversationId: string) =>
       findInFlightPendingDelegation(pool, { targetAgent, originConversationId }),
     acquireRunning: (params: Parameters<typeof acquireRunningDelegation>[1]) =>
@@ -3094,6 +3105,18 @@ async function main(): Promise<void> {
     principalBacklog: createPrincipalBacklogSource(pool),
     verification: verificationRuntime,
     turnLanes,
+    // A non-principal email that replies to Curia's outreach arrives linked to its task
+    // (#2312). Webmail, form, tenant and private-suffix hosts are excluded by
+    // isNonOrgDomain inside the matcher; this set adds the principal's own domains.
+    outreachMatcher: new OutreachMatcher({
+      repo: taskOutreachRepo,
+      // One scope for the process: the matcher's model check runs outside any skill call.
+      infraLlm: infraLlmService.scoped({ toolName: 'outreach-matcher' }),
+      logger,
+      nonOrgDomains: outreachNonOrgDomains,
+      taskStatus: (id) => taskRepo.getTask(id).then((t) => t?.status ?? null),
+    }),
+    taskProgress: taskRepo,
   });
   dispatcher.register();
   // Deferred delegations wake in the originating conversation (#1893). The
@@ -3117,6 +3140,7 @@ async function main(): Promise<void> {
     contactService,
     executionLayer,
     principalIdentities,
+    disclosureDecisions,
     reactionIntents: {
       approve: reactionIntentsConfig?.approve ?? [...DEFAULT_REACTION_INTENTS.approve],
       reject: reactionIntentsConfig?.reject ?? [...DEFAULT_REACTION_INTENTS.reject],

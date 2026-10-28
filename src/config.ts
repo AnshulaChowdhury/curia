@@ -375,6 +375,89 @@ export function resolveRelayBudgetConfig(yaml: YamlConfig['autonomy']): RelayBud
   return { perHour: yaml?.relay_budget?.per_hour ?? DEFAULT_RELAY_BUDGET_PER_HOUR };
 }
 
+/** The outbound content filter's Stage 2 judge settings (filter.llmJudge), defaults applied. */
+export interface OutboundJudgeSettings {
+  enabled: boolean;
+  model: string;
+  timeoutMs: number;
+  failMode: 'split' | 'open' | 'closed';
+}
+
+/** Thrown for a filter.llmJudge value production refuses to boot on (the timeout). */
+export class OutboundConfigError extends Error {
+  constructor(message: string, readonly detail: Record<string, unknown>) {
+    super(message);
+    this.name = 'OutboundConfigError';
+  }
+}
+
+/**
+ * Resolve filter.llmJudge (#547). local.yaml overrides are deep-merged but not schema-checked,
+ * so the timeout is validated here: with the default 'split' failMode a 0, negative or tiny
+ * timeout would make every judge call time out and fail open, silently disabling Stage 2.
+ * The 250ms floor rejects values too low for any real model round-trip, and is fatal. An
+ * unknown failMode on an enabled judge is reported through `warn` and read as the default
+ * 'split', as an unvalidated value was before. The model is checked against the registry by the
+ * caller, which holds it. Shared by src/index.ts and test mode.
+ */
+export function resolveOutboundJudgeConfig(
+  yaml: YamlConfig['filter'],
+  warn: ConfigWarn = () => {},
+): OutboundJudgeSettings {
+  const judge = yaml?.llmJudge;
+  const settings: OutboundJudgeSettings = {
+    enabled: judge?.enabled ?? true,
+    model: judge?.model ?? 'claude-haiku-5-5',
+    timeoutMs: judge?.timeout_ms ?? 5000,
+    failMode: judge?.failMode ?? 'split',
+  };
+  if (!settings.enabled) return settings;
+  if (!Number.isInteger(settings.timeoutMs) || settings.timeoutMs < 250) {
+    throw new OutboundConfigError(
+      'filter.llmJudge.timeout_ms must be an integer >= 250 (ms) — fix config (default.yaml or local.yaml)',
+      { timeoutMs: settings.timeoutMs },
+    );
+  }
+  if (!['split', 'open', 'closed'].includes(settings.failMode)) {
+    warn({ failMode: settings.failMode }, "filter.llmJudge.failMode must be split, open or closed — using 'split'");
+    settings.failMode = 'split';
+  }
+  return settings;
+}
+
+/** Where a resolver reports a value it replaced with its default (logger.warn's shape). */
+export type ConfigWarn = (detail: Record<string, unknown>, message: string) => void;
+
+/** The outbound PII redaction policy (pii.outbound_redaction), defaults applied. */
+export interface OutboundRedactionSettings {
+  enabled: boolean;
+  default: 'block' | 'allow';
+  channel_policies: Record<string, { allow: string[] }>;
+}
+
+/**
+ * Resolve pii.outbound_redaction: enabled and 'block' by default, each channel's allow list
+ * defaulting to []. An unknown default is reported through `warn` and read as 'block', the
+ * fail-safe choice. Shared by src/index.ts and test mode.
+ */
+export function resolveOutboundRedactionConfig(yaml: YamlConfig['pii'], warn: ConfigWarn = () => {}): OutboundRedactionSettings {
+  const redaction = yaml?.outbound_redaction;
+  const configured: string = redaction?.default ?? 'block';
+  let fallback: OutboundRedactionSettings['default'] = 'block';
+  if (configured === 'block' || configured === 'allow') {
+    fallback = configured;
+  } else {
+    warn({ default: configured }, "pii.outbound_redaction.default must be 'block' or 'allow' — using 'block'");
+  }
+  return {
+    enabled: redaction?.enabled ?? true,
+    default: fallback,
+    channel_policies: Object.fromEntries(
+      Object.entries(redaction?.channel_policies ?? {}).map(([ch, policy]) => [ch, { allow: policy.allow ?? [] }]),
+    ),
+  };
+}
+
 /** Resolve the optional YAML tasks block to a fully-populated config with defaults. */
 export function resolveTasksConfig(yaml: YamlConfig['tasks']): TasksConfig {
   return {

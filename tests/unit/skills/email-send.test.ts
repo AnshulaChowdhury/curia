@@ -66,6 +66,8 @@ describe('EmailSendHandler — reply quote', () => {
     expect(sendArg.htmlQuote).toContain('alice@example.com');
     expect(sendArg.htmlQuote).toContain('Let me know your thoughts.');
     expect(sendArg.replyToMessageId).toBe('msg-orig');
+    // Who was on the quoted message, for the send review (#2312).
+    expect((sendArg as { quoteParticipants?: string[] }).quoteParticipants).toEqual(['alice@example.com', 'ceo@example.com']);
   });
 
   it('does not fetch original or append quote when reply_to_message_id is absent', async () => {

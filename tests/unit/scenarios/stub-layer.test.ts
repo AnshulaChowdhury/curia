@@ -606,3 +606,143 @@ describe('mustStub with real delegation (#2027)', () => {
     expect(mustStub('context-bridge-keep-open', registry)).toBe(true);
   });
 });
+
+describe('through-gateway runs (#2312)', () => {
+  /** The send and approval tools, plus a stub for each a shared set would bring. */
+  function gatewaySetup() {
+    const registry = new ToolRegistry();
+    const executed: Array<{ name: string; liveTurn: unknown; layer: string }> = [];
+    for (const [name, risk, caps] of [
+      ['email-send', 'medium', ['outboundGateway']],
+      ['send-draft', 'none', ['outboundGateway']],
+      ['approve-action', 'none', ['bus', 'actionLogRepo', 'executionLayer', 'disclosureDecisions']],
+      ['deliver-approval', 'none', ['approvalDelivery']],
+      ['list-pending-actions', 'none', ['actionLogRepo']],
+      ['calendar-create-event', 'high', []],
+      ['contact-merge', 'low', []],
+    ] as const) {
+      registry.register({ ...manifest(name, risk), capabilities: [...caps] }, {
+        execute: async (ctx) => {
+          executed.push({ name, liveTurn: ctx.liveTurn, layer: (ctx.outboundGateway as { id?: string } | undefined)?.id ?? (ctx.actionLogRepo ? 'review' : 'base') });
+          return { success: true, data: `real ${name}` };
+        },
+      });
+    }
+    // The layer agents call has a gateway but none of the approval wiring, as in test mode;
+    // the recording stack's review layer has all of it.
+    const bus = { publish: async () => {} } as never;
+    const base = new ExecutionLayer(registry, logger, { bus, outboundGateway: { id: 'base' } as never });
+    const review = new ExecutionLayer(registry, logger, {
+      bus,
+      outboundGateway: { id: 'review' } as never,
+      actionLogRepo: {} as never,
+      approvalDelivery: {} as never,
+      disclosureDecisions: {} as never,
+    });
+    const unavailable = new Set(['approve-action', 'deliver-approval', 'list-pending-actions']);
+    const controller = createStubController(() => registry, () => unavailable);
+    const layer = controller.wrap(base, review);
+    const stubs = {
+      'email-send': [{ match: {}, return: { stubbed: true } }],
+      'calendar-create-event': [{ match: {}, return: { stubbed: true } }],
+    };
+    return { layer, controller, executed, stubs };
+  }
+
+  it('runs a send for real past its stub, and still stubs every other tool', async () => {
+    const { layer, controller, executed, stubs } = gatewaySetup();
+    controller.beginRun(stubs, 'scenario-1', { throughGateway: true });
+    expect(await layer.invoke('email-send', { to: 'c0ffee00-0000-4000-8000-000000000001' }, undefined, coordinatorCall))
+      .toEqual({ success: true, data: 'real email-send' });
+    expect(await layer.invoke('calendar-create-event', {}, undefined, coordinatorCall))
+      .toEqual({ success: true, data: { stubbed: true } });
+    // The run's own approvals are listed for real, so a later "yes" can find the one it means.
+    expect(await layer.invoke('list-pending-actions', {}, undefined, coordinatorCall))
+      .toEqual({ success: true, data: 'real list-pending-actions' });
+    // Not a send or approval tool, and no stub: refused as in any run.
+    expect((await layer.invoke('contact-merge', {}, undefined, coordinatorCall)).success).toBe(false);
+    // On the review layer, not the one agents call.
+    expect(executed.map(e => [e.name, e.layer])).toEqual([['email-send', 'review'], ['list-pending-actions', 'review']]);
+    expect(controller.endRun('scenario-1').map(c => [c.toolName, c.disposition])).toEqual([
+      ['email-send', 'passthrough'], ['calendar-create-event', 'stubbed'], ['list-pending-actions', 'passthrough'], ['contact-merge', 'refused'],
+    ]);
+  });
+
+  it('leaves a run without through_gateway exactly as before: stubs answer, unstubbed approvals are refused', async () => {
+    const { layer, controller, executed, stubs } = gatewaySetup();
+    controller.beginRun(stubs, 'scenario-1');
+    expect(await layer.invoke('email-send', {}, undefined, coordinatorCall)).toEqual({ success: true, data: { stubbed: true } });
+    for (const tool of ['send-draft', 'approve-action', 'deliver-approval']) {
+      const result = await layer.invoke(tool, {}, undefined, coordinatorCall);
+      expect(result.success, tool).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/no stub/);
+    }
+    expect(executed).toEqual([]);
+  });
+
+  it('lets a follow-up principal turn reach approve-action with its live-turn signal (elevated gate)', async () => {
+    const { layer, controller, executed } = gatewaySetup();
+    controller.beginRun({}, 'scenario-1', { throughGateway: true });
+    const liveTurn = true;
+    const result = await layer.invoke('approve-action', { short_ref: '3' }, undefined, { ...coordinatorCall, liveTurn });
+    expect(result).toEqual({ success: true, data: 'real approve-action' });
+    expect(executed).toEqual([{ name: 'approve-action', liveTurn, layer: 'review' }]);
+    controller.endRun('scenario-1');
+  });
+});
+
+describe('mustStub with through_gateway (#2312)', () => {
+  it('lets the send and approval tools run, and nothing else', () => {
+    const registry = new ToolRegistry();
+    for (const [name, risk, caps] of [
+      ['email-send', 'medium', []], ['email-reply', 'medium', []], ['signal-send', 'medium', []], ['sms-send', 'medium', []],
+      ['slack-send', 'medium', []], ['send-draft', 'none', ['outboundGateway']], ['deliver-approval', 'none', ['approvalDelivery']],
+      ['approve-action', 'none', ['actionLogRepo', 'executionLayer']], ['deny-action', 'none', ['actionLogRepo']],
+      ['list-pending-actions', 'none', ['actionLogRepo']], ['email-draft-save', 'low', []],
+    ] as const) {
+      registry.register({ ...manifest(name, risk), capabilities: [...caps] }, { execute: async () => ({ success: true, data: null }) });
+    }
+    const gw = { throughGateway: true };
+    // list-pending-actions too: a stub saying "none pending" hid the approval a send raised from
+    // the principal's later "yes" (#2312). It reads the run-scoped action log (scopedActionLog).
+    for (const tool of ['email-send', 'email-reply', 'signal-send', 'sms-send', 'slack-send', 'send-draft', 'list-pending-actions', 'deliver-approval', 'approve-action', 'deny-action']) {
+      expect(mustStub(tool, registry, new Set(), new Set(), gw), tool).toBe(false);
+      expect(mustStub(tool, registry), `${tool} without through_gateway`).toBe(true);
+    }
+    expect(mustStub('email-draft-save', registry, new Set(), new Set(), gw)).toBe(true);
+    // The review layer serves them, whatever the layer agents call lacks.
+    expect(mustStub('approve-action', registry, new Set(['approve-action']), new Set(), gw)).toBe(false);
+    expect(mustStub('approve-action', registry, new Set(['approve-action']))).toBe(true);
+  });
+});
+
+describe('a through-gateway run on a stack without a review layer', () => {
+  it('refuses the send rather than run it on the layer agents call', async () => {
+    const registry = new ToolRegistry();
+    const executed: string[] = [];
+    registry.register(manifest('email-send', 'medium'), { execute: async () => { executed.push('email-send'); return { success: true, data: null }; } });
+    const controller = createStubController(() => registry);
+    const layer = controller.wrap(new ExecutionLayer(registry, logger));
+    controller.beginRun({}, 'scenario-1', { throughGateway: true });
+    const result = await layer.invoke('email-send', {}, undefined, coordinatorCall);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(/no review layer/);
+    expect(executed).toEqual([]);
+    controller.endRun('scenario-1');
+  });
+});
+
+describe('attach (#2312: inbound.then)', () => {
+  it('files a later conversation under the open run: same stubs, calls recorded with the run, released at endRun', async () => {
+    const { layer, controller } = setup();
+    controller.beginRun({ 'email-send': [{ match: {}, return: { sent: true } }] }, 'scenario-1');
+    controller.attach('scenario-1', 'scenario-then-1');
+    expect(controller.rootOf('scenario-then-1')).toBe('scenario-1');
+    expect(await layer.invoke('email-send', {}, undefined, { agentId: 'coordinator', conversationId: 'scenario-then-1' }))
+      .toEqual({ success: true, data: { sent: true } });
+    expect(() => controller.attach('scenario-1', 'scenario-then-1')).toThrow(/already belongs/);
+    expect(controller.endRun('scenario-1').map(c => c.toolName)).toEqual(['email-send']);
+    expect(controller.rootOf('scenario-then-1')).toBeUndefined();
+    expect(() => controller.attach('scenario-1', 'scenario-then-2')).toThrow(/no open run/);
+  });
+});

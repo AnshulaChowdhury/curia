@@ -351,6 +351,8 @@ describe('EmailAdapter — sendOutboundReply', () => {
     // Original HTML body is preserved inside the blockquote (not stripped to plain text)
     expect(callArg.htmlQuote).toContain('<blockquote');
     expect(callArg.htmlQuote).toContain('Hi Curia, can we sync on Q2?');
+    // Who was on the quoted message, lowercased, for the send review (#2312).
+    expect(callArg.quoteParticipants).toEqual([CEO_EMAIL.toLowerCase(), SELF_EMAIL.toLowerCase()]);
   });
 
   it('uses the configured timezone when rendering the quoted Date line', async () => {
@@ -942,6 +944,37 @@ describe('EmailAdapter — sendWithGatedDraftFallback gated-fallback', () => {
     await adapter.stop();
   });
 
+  it('forwards the note reported to the principal into the gateway send options (#2312)', async () => {
+    const adapter = makeAdapter(mocks);
+    await adapter.start();
+
+    const humanMessage = makeMockMessage({
+      from: [{ email: CEO_EMAIL }],
+      to: [{ email: SELF_EMAIL }],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([humanMessage]);
+
+    await triggerOutbound(createOutboundMessage({
+      conversationId: 'email:thread-abc',
+      channelId: 'email',
+      content: 'Here is my reply.',
+      parentEventId: 'response-1',
+      taskEventId: 'task-evt-1',
+      reportedToPrincipal: 'Provider asked for your number.',
+    }));
+    expect(mocks.outboundGateway.send).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ reportedToPrincipal: 'Provider asked for your number.' }),
+    );
+
+    // Absent on the event, absent in the options.
+    await triggerOutbound(makeOutboundEventWithTask('email:thread-abc', 'task-evt-2'));
+    const options = vi.mocked(mocks.outboundGateway.send).mock.calls.at(-1)![1] as Record<string, unknown>;
+    expect(options).not.toHaveProperty('reportedToPrincipal');
+
+    await adapter.stop();
+  });
+
   it('creates draft and links action when gateway returns gated', async () => {
     // Gateway returns gated result
     (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -952,6 +985,7 @@ describe('EmailAdapter — sendWithGatedDraftFallback gated-fallback', () => {
     (mocks.outboundGateway.createEmailDraft as ReturnType<typeof vi.fn>).mockResolvedValue({
       success: true,
       draftId: 'draft-abc',
+      draft: { subject: 'Re: Hello', body: '<p>Call me at the office</p>' },
     });
 
     const adapter = makeAdapter(mocks);
@@ -970,12 +1004,12 @@ describe('EmailAdapter — sendWithGatedDraftFallback gated-fallback', () => {
       expect.objectContaining({ to: CEO_EMAIL, channel: 'email' }),
     );
 
-    // linkGatedAction should be called with the actionRef, taskEventId, and just the draft_id.
-    // account is already in the partialPayload stored at gate time — no need to repeat it here.
+    // linkGatedAction links the draft_id and the draft's subject and body as created (#2312),
+    // so an approval replay matches what was shown. account is already in the partialPayload.
     expect(mocks.outboundGateway.linkGatedAction).toHaveBeenCalledWith(
       'email-42',
       'task-evt-2',
-      { draft_id: 'draft-abc' },
+      { draft_id: 'draft-abc', subject: 'Re: Hello', body: '<p>Call me at the office</p>' },
     );
 
     await adapter.stop();
@@ -1397,5 +1431,20 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
     await triggerOutbound(makeOutboundEvent('email:thread-abc'));
 
     expect(mocks.outboundGateway.send).not.toHaveBeenCalled();
+  });
+});
+
+describe('EmailAdapter — subscribeOutbound once-guard (#2312)', () => {
+  it('a second subscribeOutbound() subscribes nothing more, and start() after it adds none', () => {
+    const mocks = createMocks();
+    const adapter = makeAdapter(mocks);
+    adapter.subscribeOutbound();
+    const subscribed = (mocks.bus.subscribe as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(subscribed).toBeGreaterThan(0);
+    adapter.subscribeOutbound();
+    expect((mocks.bus.subscribe as ReturnType<typeof vi.fn>).mock.calls.length).toBe(subscribed);
+    // start() calls subscribeOutbound() itself; as in the suite above, the poll is not awaited.
+    void adapter.start();
+    expect((mocks.bus.subscribe as ReturnType<typeof vi.fn>).mock.calls.length).toBe(subscribed);
   });
 });

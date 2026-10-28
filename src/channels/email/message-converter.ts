@@ -42,6 +42,12 @@ export interface ConvertedEmail {
      */
     senderVerified: boolean;
     /**
+     * The same check as a status, for stating it to the agent (#2312): `failed` when a
+     * mechanism explicitly failed, `not confirmed` when no header vouches either way.
+     * senderVerified stays the boolean every security decision reads.
+     */
+    senderAuthentication: SenderAuthentication;
+    /**
      * Curia's role in this email's recipient fields.
      * - 'to': Curia was directly addressed as a primary recipient
      * - 'cc': Curia was copied; someone else is the primary recipient
@@ -70,6 +76,13 @@ export interface ConvertedEmail {
      * treat a missing count as not one-to-one.
      */
     otherRecipientCount?: number;
+    /**
+     * The To address that is Curia's own (normalizeForComparison, so a plus-tag of it counts),
+     * trimmed and lowercased with its tag kept (#2312). Published only when that is known: absent
+     * when Curia was CC'd, when it is in neither To nor CC (BCC, or an alias forwarding to it),
+     * and when selfEmail is unknown. The outreach matcher's model check reads it as `sent_to`.
+     */
+    curiaMailbox?: string;
     /** Non-inline file attachments on this email. Empty array when none. */
     attachments: EmailAttachment[];
     /**
@@ -140,6 +153,19 @@ export function parseSenderVerified(headers?: Array<{ name: string; value: strin
   return authenticationMechanismsPass(providerHeader.value);
 }
 
+export type SenderAuthentication = 'passed' | 'failed' | 'not confirmed';
+
+/**
+ * parseSenderVerified as a status (#2312): `passed` exactly when it is true, `failed` when an
+ * Authentication-Results header reports a failed mechanism, otherwise `not confirmed` (no
+ * header, or nothing passed). Absent evidence is not a failed check.
+ */
+export function senderAuthenticationStatus(headers?: Array<{ name: string; value: string }>): SenderAuthentication {
+  if (parseSenderVerified(headers)) return 'passed';
+  const auth = headers && headers.length > 0 ? authenticationResultsHeaders(headers) : [];
+  return auth.some((h) => authenticationMechanismFailed(h.value)) ? 'failed' : 'not confirmed';
+}
+
 /**
  * Normalize an email address for self-identity comparison.
  * Strips plus-addressing (local+tag@domain → local@domain) and lowercases.
@@ -161,22 +187,23 @@ export function normalizeForComparison(email: string): string {
  * `curia+tag@` is Curia (#2261).
  *
  * Returns 'to' as the fail-safe default when selfEmail is absent or not found in
- * either To or CC (e.g. genuine BCC, which is not currently detectable).
+ * either To or CC (e.g. genuine BCC, which is not currently detectable). `curiaMailbox`
+ * is set only when Curia's own address is in To, so the fallback never names one.
  */
 function resolveCuriaRole(
   toList: Array<{ email: string }>,
   ccList: Array<{ email: string }>,
   selfEmail: string,
-): { curiaRole: 'to' | 'cc' | 'bcc'; primaryRecipientEmails: string[] } {
+): { curiaRole: 'to' | 'cc' | 'bcc'; primaryRecipientEmails: string[]; curiaMailbox?: string } {
   const self = normalizeForComparison(selfEmail);
 
-  const inTo = toList.some((p) => normalizeForComparison(p.email) === self);
+  const inTo = toList.find((p) => normalizeForComparison(p.email) === self);
   if (inTo) {
     // Curia is a primary recipient — other To addresses (if any) are also primary.
     const primaryRecipientEmails = toList
       .map((p) => p.email)
       .filter((e) => normalizeForComparison(e) !== self);
-    return { curiaRole: 'to', primaryRecipientEmails };
+    return { curiaRole: 'to', primaryRecipientEmails, curiaMailbox: inTo.email.trim().toLowerCase() };
   }
 
   const inCc = ccList.some((p) => normalizeForComparison(p.email) === self);
@@ -271,9 +298,9 @@ export function convertNylasMessage(msg: NylasMessage, selfEmail?: string): Conv
 
   // Determine Curia's role in this email (To vs CC) when selfEmail is known.
   // Defaults to 'to' / empty primary recipients when selfEmail is not provided.
-  const { curiaRole, primaryRecipientEmails } = selfEmail
+  const { curiaRole, primaryRecipientEmails, curiaMailbox } = selfEmail
     ? resolveCuriaRole(msg.to, msg.cc, selfEmail)
-    : { curiaRole: 'to' as const, primaryRecipientEmails: [] };
+    : { curiaRole: 'to' as const, primaryRecipientEmails: [], curiaMailbox: undefined };
 
   // Everyone else the email reached, for the dispatcher's one-to-one test (#2261).
   const otherRecipientCount = selfEmail
@@ -306,8 +333,10 @@ export function convertNylasMessage(msg: NylasMessage, selfEmail?: string): Conv
       // Nylas stores timestamps as Unix seconds; Date expects milliseconds
       receivedAt: new Date(msg.date * 1000),
       senderVerified: parseSenderVerified(msg.headers),
+      senderAuthentication: senderAuthenticationStatus(msg.headers),
       curiaRole,
       primaryRecipientEmails,
+      ...(curiaMailbox ? { curiaMailbox } : {}),
       ...(otherRecipientCount !== undefined ? { otherRecipientCount } : {}),
       attachments,
       ...autoGenerated,

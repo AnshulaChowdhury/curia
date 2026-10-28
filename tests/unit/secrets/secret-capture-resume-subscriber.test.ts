@@ -215,6 +215,17 @@ describe('SecretCaptureResumeSubscriber', () => {
     expect(outcome).toMatchObject({ kind: 'decide', decision: 'escalate' });
   });
 
+  it('carries the originator\'s authenticated flag through the resume, counting only an exact true (#2312)', async () => {
+    const first = makeSubscriber();
+    await first.emit(makeCapturedEvent({ originator: { ...ORIGINATOR, authenticated: true } }));
+    expect(first.routingCalls[0]!.routing.originator.authenticated).toBe(true);
+    expect(((first.published[0]!.event as AgentTaskEvent).payload.metadata as { originator: { authenticated?: boolean } }).originator.authenticated).toBe(true);
+
+    const forged = makeSubscriber();
+    await forged.emit(makeCapturedEvent({ originator: { ...ORIGINATOR, authenticated: 'yes' as unknown as boolean } }));
+    expect(forged.routingCalls[0]!.routing.originator.authenticated).toBe(false);
+  });
+
   it('rolls back the dedup marker and propagates when publish fails', async () => {
     const { emit } = makeSubscriber({ publishThrows: true });
     const event = makeCapturedEvent();

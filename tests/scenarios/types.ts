@@ -6,6 +6,7 @@
 import type { InjectionDrainPoint } from '../../src/bus/events.js';
 import type { PrincipalBacklogCounts } from '../../src/agents/prompts/backlog-line.js';
 import type { AutonomyFixture, OfficeIdentityFixture } from '../../src/startup/test-mode-stack.js';
+import type { RecordedReview } from '../../src/startup/test-mode-sends.js';
 import type { VerificationDelivery, VerificationStatus } from '../../src/verification/types.js';
 import type { LiveSearchTally } from '../shared/live-search.js';
 import type { ObservedToolCall } from '../shared/turn-capture.js';
@@ -93,6 +94,41 @@ export type BehaviorCheck =
    */
   | { kind: 'text'; of: TextSource; agent?: CheckAgent; maxWords?: number; excludes?: string[] }
   /**
+   * Over what the recording transports took this run (`through_gateway` cases, #2312): at
+   * least one delivered message (exactly `count` when set) matching every filter. `to` and
+   * `cc_includes` name a seeded contact key, `principal`, or an address; `contains` and
+   * `excludes` are case-insensitive substrings of the delivered text (subject and body). An
+   * email draft is not a delivery; a sent draft is. `ownText`: match the reply's own text
+   * only (subject and the body above a quoted message), so the sender's own quoted words do
+   * not count as something Curia sent them.
+   */
+  | { kind: 'delivered'; channel?: DeliveryChannel; to?: string; ccIncludes?: string; contains?: string[]; excludes?: string[]; count?: number; ownText?: boolean; quoteContains?: string[] }
+  /** Nothing was delivered this run, or nothing to `to` when it is set. */
+  | { kind: 'not_delivered'; to?: string }
+  /**
+   * An approval was raised this run (a held send or a gated tool): its row in the action log,
+   * and what the principal is shown contains every one of `contains` (case-insensitive).
+   */
+  | { kind: 'held'; contains?: string[] }
+  /**
+   * No approval was raised this run; with `contains`, none showing every one of those texts.
+   * Resolved or not, an approval raised during the run counts.
+   */
+  | { kind: 'not_held'; contains?: string[] }
+  /**
+   * Outreach was recorded this run (a row the run's sends wrote, or a seeded row they added
+   * to), naming `domain` when set, with that `confirmed` flag when set.
+   */
+  | { kind: 'outreach_recorded'; domain?: string; confirmed?: boolean }
+  /** The principal's answer to a personal-data ask was recorded this run for `label`. */
+  | { kind: 'decision_recorded'; label: string; decision: 'yes' | 'no' }
+  /**
+   * The gateway's band review ruled on a detected item with `label` in a send's own text
+   * (body or subject, not a quoted message) this run, with that `outcome` when set: whether
+   * the path a case exists for was exercised at all (#2312).
+   */
+  | { kind: 'reviewed'; label: string; outcome?: ReviewOutcome }
+  /**
    * Passes when any alternative passes. For a behavior the platform accepts in more
    * than one shape — e.g. delegate links an entry from `outbound_entry_id` or from its
    * id quoted in the brief (#1972).
@@ -101,6 +137,15 @@ export type BehaviorCheck =
 
 /** What a `text` check reads: the reply, or one argument of each call to a tool. */
 export type TextSource = 'reply' | { tool: string; arg: string };
+
+export type DeliveryChannel = 'email' | 'signal' | 'slack' | 'sms';
+
+/** The check kinds that read what a through-gateway run sent (#2312). */
+export const GATEWAY_CHECK_KINDS = ['delivered', 'not_delivered', 'held', 'not_held', 'outreach_recorded', 'decision_recorded', 'reviewed'] as const;
+
+/** What a band review decided for a send. */
+export type ReviewOutcome = RecordedReview['outcome'];
+export const REVIEW_OUTCOMES: readonly ReviewOutcome[] = ['send', 'bounce', 'block', 'hold'];
 
 export interface ExpectedBehavior {
   id: string;
@@ -114,8 +159,8 @@ export interface ExpectedBehavior {
 export interface SeedContact {
   key: string;
   displayName: string;
-  /** `trusted` is a grant made after creation; createContact refuses it. */
-  tier: 'known' | 'unknown';
+  /** `trusted` is a grant made after creation (createContact refuses it), so seeding sets it then. */
+  tier: 'trusted' | 'known' | 'unknown';
   kind?: 'person' | 'organization' | 'automated';
   role?: string;
   /** Channel identity used when this contact is the sender. */
@@ -126,6 +171,43 @@ export interface SeedContact {
    * Dispatcher makes for an unknown sender answers yes (#2227).
    */
   principalWrote?: boolean;
+}
+
+/**
+ * A standing task (#2312): a `tasks` row with an originator, which band review reads as the
+ * authority a send on it carries. Referenced as `{{task:<key>}}` (the row's id), e.g. as a
+ * task wake's `inbound.task.id`.
+ */
+export interface SeedTask {
+  key: string;
+  title: string;
+  /** The intent anchor. Default: the title. */
+  intent?: string;
+  /** Who started it: `principal` or a seeded contact key. */
+  originator: string;
+  /** The agent that owns it. Default: the coordinator. */
+  agent: string;
+}
+
+/**
+ * A `task_outreach` row (#2312): who Curia already contacted, so a reply from them links to
+ * the task. Referenced as `{{outreach:<key>}}`.
+ */
+export interface SeedOutreach {
+  key: string;
+  /** A seeded task key. Absent: live-turn outreach, keyed by a conversation of its own. */
+  task?: string;
+  via: 'email' | 'web_form' | 'signal' | 'sms' | 'slack' | 'phone' | 'other';
+  orgName?: string;
+  /** Lowercased org domains, under example.test. */
+  domains: string[];
+  /** Addresses contacted, under example.test. */
+  addresses: string[];
+  /** Seeded contact keys contacted. */
+  contacts: string[];
+  summary: string;
+  /** An explicit act on a principal turn (a strong link); false is a backstop guess (weak only). */
+  confirmed: boolean;
 }
 
 /** A row in outbound_context. Referenced as `{{entry:<key>}}`. */
@@ -272,6 +354,21 @@ export interface ScenarioInbound {
    * is on, and a second turn on the same conversation fails the run.
    */
   followup?: ScenarioFollowup;
+  /**
+   * The principal's next message, as its own turn once the first has ended (#2312): an
+   * inbound from the principal's verified identity on `channel`, in a second conversation of
+   * the same run. It is a live principal turn, so the elevated gate is production's: this is
+   * how a hold raised on someone else's turn gets approved within the run. Its calls join the
+   * run's; its reply is `then.reply` on the run.
+   */
+  then?: ScenarioPrincipalTurn;
+}
+
+/** A principal turn after the first one (ScenarioInbound.then). */
+export interface ScenarioPrincipalTurn {
+  content: string;
+  /** A channel the principal has a verified identity on (seed one with principal_identities). */
+  channel: string;
 }
 
 /** When the harness publishes `ScenarioInbound.followup`. */
@@ -350,6 +447,10 @@ export interface ScenarioCase {
     bullpen: SeedBullpenThread[];
     verifications: SeedVerification[];
     principalIdentities: SeedPrincipalIdentity[];
+    /** Standing tasks (#2312). */
+    tasks: SeedTask[];
+    /** Outreach rows (#2312). */
+    outreach: SeedOutreach[];
     /**
      * What is waiting on the principal on this run's principal turn (prompt trim PR 7):
      * the counts the Dispatcher's backlog line reports. Absent means nothing is waiting.
@@ -384,11 +485,18 @@ export interface ScenarioCase {
    */
   identity?: IdentityFixture;
   /**
-   * The autonomy score and gating the case runs under, laid over the database's. Like
-   * `identity`, it is the run's: every case in a run shares it, and such a case is never
-   * in the release gate.
+   * The autonomy score and gating the case runs under, laid over the database's. Unlike
+   * `identity` it is the case's own (#2312): each attempt enters it, so cases under
+   * different fixtures share a run, and such a case can be in the release gate.
    */
   autonomy?: AutonomyFixture;
+  /**
+   * Send tools run their real handlers through production's gateway review (#2312): PII
+   * detection, the content filter, band review, holds and asks, outreach records. The
+   * transports record instead of sending. THROUGH_GATEWAY_TOOLS skip the stub table, and the
+   * gateway check kinds read what they sent. Each send calls the review's judges.
+   */
+  throughGateway?: true;
   /** File the case came from, for messages. */
   sourceFile: string;
 }
@@ -465,6 +573,10 @@ export interface ScenarioRun {
   injectionDrainPoints?: InjectionDrainPoint[];
   /** Every real specialist run the coordinator started (#2027). Absent for stubbed delegation. */
   delegations?: DelegationRecord[];
+  /** What a through-gateway run sent, held and recorded (#2312). Absent for other cases. */
+  gateway?: GatewayOutcome;
+  /** The principal's `inbound.then` turn (#2312): the coordinator's reply to it. */
+  then?: { reply: string | null };
   /** Set when removing the run's rows failed; leftovers may be in the database. */
   cleanupError?: string;
   /**
@@ -477,6 +589,71 @@ export interface ScenarioRun {
    * and run again, one reason each. The run above is the last attempt.
    */
   providerRetries: string[];
+}
+
+/** What a through-gateway run's sends did (#2312), read when the run ends. */
+export interface GatewayOutcome {
+  /** Every message a recording transport took, in order. */
+  deliveries: RecordedDelivery[];
+  /** Approvals raised in the run's conversations, in order. */
+  holds: RecordedHold[];
+  /** Outreach rows the run's sends wrote, or seeded rows they added to. */
+  outreach: RecordedOutreach[];
+  /** The principal's answers to personal-data asks, recorded in the run's conversations. */
+  decisions: RecordedDecision[];
+  /**
+   * Each band review of the run's sends, labels and outcome only (#2312). Absent on results
+   * saved before it existed.
+   */
+  reviews?: RecordedReview[];
+  /**
+   * The band review's fail-open cap tripped in this run: its judge failed on too many sends,
+   * so later sends held for want of a reviewer. The run is then an error, not a score.
+   */
+  reviewerFailedOpen: boolean;
+}
+
+export interface RecordedDelivery {
+  channel: DeliveryChannel;
+  /** `draft`: created, not delivered. */
+  kind: 'send' | 'draft';
+  to: string[];
+  cc: string[];
+  /** The recipients as the case names them: a seeded contact key, `principal`, or the address. */
+  toNames: string[];
+  ccNames: string[];
+  subject?: string;
+  body: string;
+  /** An email reply's own text, above the quoted message; absent when nothing was quoted. */
+  ownBody?: string;
+  /** The quoted message below it; absent when nothing was quoted. */
+  quotedBody?: string;
+}
+
+export interface RecordedHold {
+  shortRef: string;
+  approvalNumber: number | null;
+  toolName: string;
+  /** The row's outcome now: pending_approval, or how it was resolved during the run. */
+  outcome: string;
+  description: string | null;
+  /** What the principal is shown at the top of the approval (an ask's question), when registered. */
+  preamble?: string;
+  extraLines?: string[];
+}
+
+export interface RecordedOutreach {
+  domains: string[];
+  addresses: string[];
+  confirmed: boolean;
+  via: string;
+  /** A seeded row the run's sends added to. */
+  seeded: boolean;
+}
+
+export interface RecordedDecision {
+  label: string;
+  decision: 'yes' | 'no';
 }
 
 /** One real specialist run inside a scenario run (#2027). */
@@ -553,8 +730,13 @@ export interface SuiteResult {
   onDemandSkipped?: string[];
   /** The office identity fixture every case ran under (#2143). Absent: the database's own. */
   identity?: string;
-  /** The autonomy every case ran under, read back from the stack, e.g. "84 (band gating)". */
+  /**
+   * The autonomy cases without a fixture ran under, read back from the stack at boot, e.g.
+   * "84 (band gating)" or "none (no autonomy_config row)".
+   */
   autonomy?: string;
+  /** Cases that ran under their own autonomy fixture (#2312), by name, e.g. "74 (band gating)". */
+  caseAutonomy?: Record<string, string>;
   /** Runs each case actually got (a case's `runs` or --runs can differ from the default). */
   runsPerCase: Record<string, number>;
   cases: CaseResult[];

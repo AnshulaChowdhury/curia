@@ -84,6 +84,10 @@ function parseOriginator(raw: Record<string, unknown> | undefined): TaskOriginat
   if (tier !== undefined) {
     result.tier = tier as ContactTier | null;
   }
+  // Same absent-stays-absent rule; present, only an exact true counts (#2312).
+  if (raw.authenticated !== undefined) {
+    result.authenticated = raw.authenticated === true;
+  }
   return result;
 }
 

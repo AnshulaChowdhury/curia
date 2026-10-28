@@ -12,6 +12,7 @@ import type { ContactService } from '../contacts/contact-service.js';
 import type { Logger } from '../logger.js';
 import { meetsMinimumTier, type ContactTier } from '../contacts/types.js';
 import { sanitizeOutput } from '../skills/sanitize.js';
+import { detectPii } from '../pii/scrubber.js';
 
 // ---------------------------------------------------------------------------
 // Constants — exported for tests
@@ -64,6 +65,18 @@ const SKILL_DETAIL_FIELDS: Array<{ test: (name: string) => boolean; fields: Deta
       { key: 'draft_id', label: 'Draft' },
       // partialPayload at gate time may omit draft_id; merge live send fields below.
       { key: 'to', label: 'To' },
+      { key: 'subject', label: 'Subject' },
+      { key: 'body', label: 'Body' },
+    ],
+  },
+  {
+    // Before the export rule below, which matched email-send and showed no message at all:
+    // an approved email goes out as written, so the principal is shown it (#2312).
+    test: (n) => n === 'email-send',
+    fields: [
+      { key: 'export_items', label: 'Export items' },
+      { key: 'to', label: 'To' },
+      { key: 'cc', label: 'CC' },
       { key: 'subject', label: 'Subject' },
       { key: 'body', label: 'Body' },
     ],
@@ -313,7 +326,57 @@ export function buildApprovalDetails(
     seenLabels.add(label);
   }
 
+  // Outside the caps: an approved send goes out as written (#2312), so every personal detail
+  // in it is listed even when the field above is cut short.
+  const personal = buildPersonalDetailsLine(toolName, payload);
+  if (personal) lines.push(personal);
+
   return lines.join('\n');
+}
+
+/** Send skills whose approval replays the message as written (#2312). */
+function isSendSkill(toolName: string): boolean {
+  return SEND_SKILLS.has(toolName)
+    || toolName.startsWith('signal-') || toolName.startsWith('sms-') || toolName.startsWith('slack-');
+}
+const SEND_SKILLS = new Set(['email-send', 'email-reply', 'send-draft', 'dispatcher-relay']);
+/** The payload fields a sent message's text lives in, in the order they are scanned. */
+const MESSAGE_FIELD_KEYS = ['subject', 'body', 'message', 'html_quote', 'htmlQuote'] as const;
+/**
+ * The personal details a send skill's approval would send, as `<label> <value>`, each once
+ * (#2312): the full, untruncated message fields scanned with the shared scrubber core. [] for
+ * other skills. Deliberately broader than what a channel would redact: an approved send goes
+ * out as written, so the principal sees every detail that leaves, allow-listed ones included.
+ */
+function findPersonalDetails(toolName: string, payload: Record<string, unknown>): string[] {
+  if (!isSendSkill(toolName)) return [];
+  const found = new Set<string>();
+  for (const key of MESSAGE_FIELD_KEYS) {
+    const text = payload[key];
+    if (typeof text !== 'string' || text.length === 0) continue;
+    for (const match of detectPii(text)) found.add(`${match.label} ${match.matched}`);
+  }
+  return [...found];
+}
+
+/**
+ * Whether approving this payload would send personal details (#2312): the same scan as the
+ * approval's personal details line. approve-action refuses such an approval until it is shown.
+ */
+export function hasPersonalDetails(toolName: string, payload: Record<string, unknown>): boolean {
+  return findPersonalDetails(toolName, payload).length > 0;
+}
+
+/**
+ * The line listing the personal details a send skill's approval would send (#2312), or null
+ * when there are none. Scans the full, untruncated message fields with the shared scrubber
+ * core. The approval goes only to the principal, so the values are shown, every one of them:
+ * approving sends them all, so none may be summarized away.
+ */
+export function buildPersonalDetailsLine(toolName: string, payload: Record<string, unknown>): string | null {
+  const found = findPersonalDetails(toolName, payload);
+  if (found.length === 0) return null;
+  return sanitizeOutput(`Personal details in this message (sent as written if you approve): ${found.join('; ')}`);
 }
 
 export interface BuildApprovalNotificationBodyOpts {

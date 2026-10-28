@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { scrubPii, parseExtraPiiPatterns, detectPii } from '../../../src/pii/scrubber.js';
+import { scrubPii, parseExtraPiiPatterns, detectPii, isKnownPiiLabel } from '../../../src/pii/scrubber.js';
 
 describe('scrubPii — built-in patterns', () => {
   // ── Email ──────────────────────────────────────────────────────────────────
@@ -254,5 +254,132 @@ describe('detectPii', () => {
     );
     const matches = detectPii('employee EMP-123456 at step 3', extras);
     expect(matches.some(m => m.label === 'extra_0')).toBe(true);
+  });
+});
+
+describe('sin_ca', () => {
+  // Luhn check digit for an 8-digit prefix, so fixtures with a chosen leading
+  // digit are valid by construction. Fixed fixtures: 130 692 544 is Luhn-valid
+  // (sum 40); 130 692 545 is not; 046 454 286 is valid but leads with 0.
+  function withLuhnCheckDigit(prefix8: string): string {
+    let sum = 0;
+    for (let i = 0; i < prefix8.length; i++) {
+      let d = Number(prefix8[i]);
+      // Check digit sits in position 9 (odd), so prefix positions 2,4,6,8 double.
+      if (i % 2 === 1) {
+        d *= 2;
+        if (d > 9) d -= 9;
+      }
+      sum += d;
+    }
+    return prefix8 + String((10 - (sum % 10)) % 10);
+  }
+  const sinMatches = (text: string) => detectPii(text).filter((m) => m.label === 'sin_ca');
+
+  it('rejects a Luhn-valid number that starts with 0', () => {
+    expect(sinMatches('My SIN is 046 454 286')).toHaveLength(0);
+  });
+
+  it.each(['130 692 544', '130-692-544'])('matches formatted SIN %s without a keyword', (sin) => {
+    const found = sinMatches(`number ${sin} here`);
+    expect(found).toHaveLength(1);
+    expect(found[0]!.matched).toBe(sin);
+  });
+
+  it.each([
+    'SIN: 130692544',
+    'S.I.N. 130692544',
+    'social insurance number 130692544',
+    'Social Insurance No. 130692544',
+    'SOCIAL INSURANCE NO. 130692544',
+  ])(
+    'matches bare digits after keyword in %s, excluding the keyword from the span',
+    (text) => {
+      const found = sinMatches(text);
+      expect(found).toHaveLength(1);
+      expect(found[0]!.matched).toBe('130692544');
+    },
+  );
+
+  it.each([
+    ['SIN 130 692 544 2024', '130 692 544'],
+    ['SIN: 130-692-544.', '130-692-544'],
+    ['social insurance number 130 692 544 5', '130 692 544'],
+  ])('matches keyword-led formatted SIN in %s even when digits follow', (text, expected) => {
+    const found = sinMatches(text);
+    expect(found).toHaveLength(1);
+    expect(found[0]!.matched).toBe(expected);
+  });
+
+  it.each(['living in sin 130692544 days', 'Please forgive this sin: 130692544'])(
+    'does not treat the English word "sin" as the keyword in %s',
+    (text) => {
+      expect(sinMatches(text)).toHaveLength(0);
+    },
+  );
+
+  it('still redacts a 3-3-3 SIN labelled "SSN" (the ssn pattern only matches 3-2-4)', () => {
+    expect(scrubPii('SSN: 130-692-544')).toBe('SSN: [SIN]');
+  });
+
+  it('does not match a formatted SIN followed by digits without a keyword', () => {
+    expect(sinMatches('ref 130 692 544 2024')).toHaveLength(0);
+  });
+
+  it('does not match a keyword-led 10-digit run split as a formatted SIN', () => {
+    expect(sinMatches('SIN number is 130 692 5441')).toHaveLength(0);
+  });
+
+  it('does not match bare 9 digits without a keyword', () => {
+    expect(sinMatches('130692544')).toHaveLength(0);
+  });
+
+  it('rejects a Luhn-invalid number', () => {
+    expect(sinMatches('130 692 545')).toHaveLength(0);
+  });
+
+  it('rejects Luhn-valid numbers starting with 0 or 8', () => {
+    const lead8 = withLuhnCheckDigit('83069254');
+    const lead0 = withLuhnCheckDigit('03069254');
+    expect(sinMatches(`SIN ${lead8}`)).toHaveLength(0);
+    expect(sinMatches(`SIN ${lead0}`)).toHaveLength(0);
+  });
+
+  it('rejects mixed separators', () => {
+    expect(sinMatches('130-692 544')).toHaveLength(0);
+  });
+
+  it('does not match inside a UUID, a 10-digit number, or an order id', () => {
+    // A Luhn-valid formatted SIN whose last group runs straight into a UUID's
+    // first group (\b sits between the space and the UUID). Without UUID
+    // shielding, '130 692 544' would match (next char is 'a', not a digit).
+    expect(sinMatches('130 692 544abcde-1234-4678-9abc-def012345678')).toHaveLength(0);
+    expect(sinMatches('1306925440')).toHaveLength(0);
+    expect(sinMatches('SIN 1306925440')).toHaveLength(0);
+    expect(sinMatches('ORD-130-692-5441')).toHaveLength(0);
+  });
+
+  it.each(['416-555-1234', '(416) 555-1234', '+1 416 555 1234', '1-800-130-692-544'])(
+    'does not match phone-like string %s',
+    (phone) => {
+      expect(sinMatches(`call ${phone} today`)).toHaveLength(0);
+    },
+  );
+
+  it('scrubs with the [SIN] replacement', () => {
+    expect(scrubPii('SIN 130 692 544')).toBe('SIN [SIN]');
+  });
+});
+
+describe('isKnownPiiLabel', () => {
+  it('knows built-in pattern names and extra_N, nothing else', () => {
+    expect(isKnownPiiLabel('phone_us')).toBe(true);
+    expect(isKnownPiiLabel('sin_ca')).toBe(true);
+    expect(isKnownPiiLabel('email')).toBe(true);
+    expect(isKnownPiiLabel('extra_0')).toBe(true);
+    expect(isKnownPiiLabel('extra_12')).toBe(true);
+    expect(isKnownPiiLabel('sin')).toBe(false);
+    expect(isKnownPiiLabel('extra_')).toBe(false);
+    expect(isKnownPiiLabel('PHONE_US')).toBe(false);
   });
 });

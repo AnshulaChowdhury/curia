@@ -32,7 +32,7 @@ import {
 import { isDbUnavailableError } from '../../db/resilience.js';
 import { INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS } from '../../audit/inbound-replay.js';
 import { sanitizeOutput } from '../../skills/sanitize.js';
-import { buildReplyQuote } from '../../skills/_shared/reply-quote.js';
+import { buildReplyQuote, quoteParticipants } from '../../skills/_shared/reply-quote.js';
 import {
   EMAIL_INBOUND_TURN_STALL_MS,
   EMAIL_POLL_PAGE_SIZE,
@@ -229,6 +229,8 @@ export class EmailAdapter implements Channel {
   private readonly slotWaiters = new Set<string>();
   /** True between start() and stop() — outbound-queue readiness (#1380). */
   private running = false;
+  /** subscribeOutbound() ran: the bus has no unsubscribe, so a second call would double every send. */
+  private outboundSubscribed = false;
 
   // ── Watchdog state ─────────────────────────────────────────────────────────
   // Tracks the last successful poll completion time for stall detection.
@@ -393,8 +395,17 @@ export class EmailAdapter implements Channel {
     return this.running;
   }
 
-  async start(): Promise<void> {
-    const { bus, logger, pollingIntervalMs, configStore, accountId } = this.config;
+  /**
+   * Subscribe this account's outbound side: replies the dispatcher relays (outbound.message)
+   * and system notifications (outbound.notification). start() calls it before polling. The
+   * test-mode recording stack (#2312) calls it alone, against recording clients, so a
+   * scenario's relayed reply takes this exact path without an inbox, a poll or a real client.
+   * Safe to call twice: the second call is a no-op, so a reply is never sent twice.
+   */
+  subscribeOutbound(): void {
+    if (this.outboundSubscribed) return;
+    this.outboundSubscribed = true;
+    const { bus, logger } = this.config;
 
     // Subscribe to outbound messages for this specific email account.
     // When the coordinator responds to an email-triggered conversation, the dispatcher
@@ -474,6 +485,12 @@ export class EmailAdapter implements Channel {
         );
       }
     });
+  }
+
+  async start(): Promise<void> {
+    const { bus, logger, pollingIntervalMs, configStore, accountId } = this.config;
+
+    this.subscribeOutbound();
 
     // Restore the persisted high-water mark so restarts resume from where we left off
     // rather than silently dropping messages that arrived during downtime.
@@ -1417,6 +1434,8 @@ export class EmailAdapter implements Channel {
         body,
         replyToMessageId: threadMessage.id,
         htmlQuote,
+        // Who already has the quoted message: its details are not a disclosure to them (#2312).
+        ...(htmlQuote ? { quoteParticipants: quoteParticipants(threadMessage) } : {}),
         ...(ccAddresses.length > 0 ? { cc: ccAddresses } : {}),
       };
 
@@ -1450,6 +1469,8 @@ export class EmailAdapter implements Channel {
         ...(fromName ? { recipientDisplayName: fromName } : {}),
         // The principal approved this text (dispatcher-relay): do not hold it for review again (#2159).
         ...(outbound.payload.principalApproved === true ? { humanApproved: true } : {}),
+        // The note queued for the principal from this reply: evidence for the send review (#2312).
+        ...(outbound.payload.reportedToPrincipal ? { reportedToPrincipal: outbound.payload.reportedToPrincipal } : {}),
       });
     } catch (err) {
       logger.error({ err, threadId }, 'Failed to send email reply');
@@ -1472,6 +1493,7 @@ export class EmailAdapter implements Channel {
       recipientDisplayName?: string;
       /** The principal approved this exact text (#2159). */
       humanApproved?: boolean;
+      reportedToPrincipal?: string;
     },
   ): Promise<void> {
     const { outboundGateway, logger, accountId } = this.config;
@@ -1482,8 +1504,11 @@ export class EmailAdapter implements Channel {
     //   partialPayload: { account } — the draft's account; draft_id is filled in by
     //                                 linkGatedAction() after the draft is created below
     //   description: human-readable label for the pending_approval row + notification
+    //   askDescription: the same for a personal-data ask (#2312), where either tool records the
+    //                   principal's yes for the thread
     const recipientLabel = [sendRequest.to, ...(sendRequest.additionalTo ?? [])].join(', ');
     const subjectLabel = sendRequest.subject;
+    const draftLabel = `Draft reply to ${recipientLabel}${subjectLabel ? ` — "${subjectLabel}"` : ''}.`;
     const result = await outboundGateway.send(sendRequest, {
       taskEventId: context.taskEventId,
       conversationId: context.conversationId,
@@ -1491,12 +1516,14 @@ export class EmailAdapter implements Channel {
       // A relayed reply: the agent's turn is over, so a held approval wakes the coordinator (#2159).
       postTurn: true,
       ...(context.humanApproved ? { humanApproved: true } : {}),
+      ...(context.reportedToPrincipal ? { reportedToPrincipal: context.reportedToPrincipal } : {}),
       ...(context.recipientSource ? { recipientSource: context.recipientSource } : {}),
       ...(context.recipientDisplayName ? { recipientDisplayName: context.recipientDisplayName } : {}),
       reExecRecipe: {
         toolName: 'send-draft',
         partialPayload: { account: accountId },
-        description: `Draft reply to ${recipientLabel}${subjectLabel ? ` — "${subjectLabel}"` : ''}. Use send-draft to approve.`,
+        description: `${draftLabel} Use send-draft to approve.`,
+        askDescription: `${draftLabel} Approve it with approve-action or send-draft; either records the principal's yes.`,
       },
     });
 
@@ -1539,10 +1566,13 @@ export class EmailAdapter implements Channel {
           // linkGatedAction is internally guarded (no-throw), so no outer try/catch needed here.
           // Pass context.taskEventId so linkPayload can scope the update to this specific task,
           // preventing short_ref collisions across tasks from smearing draft_id onto the wrong row.
-          // Only draft_id needs linking — account was already stored in reExecRecipe.partialPayload
-          // at gate time, so the merged payload matches send-draft's expected inputs exactly.
+          // account was already stored in reExecRecipe.partialPayload at gate time. The draft's
+          // subject and body, as created, ride along (#2312): send-draft counts a replay as
+          // principal-approved only when the draft still matches them, and the approval and
+          // approve-action's unseen-details check read the text from them.
           await outboundGateway.linkGatedAction(result.actionRef, context.taskEventId, {
             draft_id: draftResult.draftId,
+            ...(draftResult.draft ? { subject: draftResult.draft.subject, body: draftResult.draft.body } : {}),
           });
         } else {
           // actionRef is absent either because taskEventId was not passed, or because

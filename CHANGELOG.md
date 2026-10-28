@@ -77,10 +77,24 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`browser.settleCapMs`** — **config:** caps the web-browser redirect wait; default 35s, at most 90s. (#2244)
 - **`voice.session.ended` turn stats** — **public API:** optional `turnStats` counts utterances, turns, barge-in cancels and joined fragments. (#2240)
 - **`pnpm repair:config-store-labels`** — reports and realigns config keys mislabelled by the old merge; dry-run by default. (#2252)
+- **Canadian SIN detection** — PII redaction now checks the checksum. (#2312)
+- **Task outreach** — sends and web forms on task-bound turns are recorded; rows close when the task ends. (#2312)
+- **`record-outreach`** — records web forms and calls for a task so the organization's reply finds it. (#2312)
+- **Linked outreach replies** — an email answering Curia's outreach arrives knowing its task; strong links add a task note. (#2312)
+- **`taskOutreach` capability** — **public API:** new `ToolContext` field for recording task outreach. (#2312)
+- **PII ask and memory** — the principal is asked when someone requests their data; the answer sticks per thread. (#2312)
+- **`disclosureDecisions` capability** — **public API:** new `ToolContext` field recording the principal's answer to an ask. (#2312)
+- **Per-case autonomy fixtures** — scenario cases pin their own score and gating, so mixed fixtures share one run. (#2312)
+- **Through-gateway scenario sends** — opted-in cases send through production's review into recording transports, checked deterministically. (#2312, #2192)
+- **Authority-aware PII scenarios** — cases 34a–34m cover directives, links, asks, strangers and quoted threads. (#2312)
+- **Scenario gateway checks** — cases assert delivered, held, not-held, reviewed, outreach and decision outcomes. (#2312)
+- **Scenario `inbound.then`** — a case sends the principal a second message after the first turn replies. (#2312)
+- **ADR-054** — authority-aware PII disclosure: the judge rules per item; code decides who authorized. (#2312)
 
 ### Changed
 
 - **Voice latency on Haiku 5.5** — prod user-turn p50 954 ms passes ADR-038's 1 s budget; first-token log adds `round`, `turnKind`. (#2271)
+- **Band send review** — flagged text is rewritten, never cut; findings that survive block at 80+. (#2312)
 - **Small-cap model check** — boot refuses fast-tier, judge or voice models that cannot turn thinking off. (#2224)
 - **Small-cap calls on the fast tier** — the drift detector and every `infraLlm.extract` call moved off the standard tier. (#2224)
 - **`infraLlm.extract` (public API, additive)** — optional `tier: 'fast' | 'standard'`; defaults to standard. (#2191)
@@ -145,6 +159,14 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Task reply binding** — skipped while a sign-in verification is pending for that task. (#2017)
 - **Coordinator tool budget** — raised 78,745 → 79,600 for the `verification` tool. (#2017)
 - **`query-relationships` / `delete-relationship`** — no longer require `openai_api_key`; they fail closed without entity memory. (#2023)
+- **Send results** — now report which details were redacted. (#2312)
+- **PII disclosure review** — band review authorizes each personal detail by who directed the work. (#2312)
+- **Linked-reply authority** — band review trusts a strong link to the principal's task; weak links only ask. (#2312)
+- **Trusted-contact directives** — sending the principal's details at a trusted contact's request needs the principal's approval. (#2312)
+- **Approval displays** — approvals for sends list every personal detail they would send. (#2312)
+- **Unseen approvals** — a send approval with personal details can't be approved until it's shown. (#2312)
+- **Disclosure audit** — **Public API:** `outbound.delivered` gains `disclosed`, labels of details sent as written. (#2312)
+- **Draft sends** — a draft edited after its checks is not sent. (#2312)
 
 ### Removed
 
@@ -170,6 +192,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Judgment elevation** — email senders become known only on SPF/DKIM/DMARC-verified mail. (#2227)
 - **Contact-visible outbound context** — contacts see only their own entries, one-to-one, on authenticated channels; their wakes likewise. (#2261)
 - **zod** — override floor set to 4.6.6, clearing a HIGH DoS advisory (CVE-2023-54404).
+- **Principal redaction bypass** — a third party CC'd on a message to the principal no longer bypasses redaction. (#2312)
+- **Saved drafts** — `send-draft` checks drafts for PII; unallowed details hold, or refuse unless principal-directed. (#2312)
 
 ### Fixed
 
@@ -182,6 +206,17 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Scenario follow-up** — a turn-start drain fails the run, and the point is recorded. (#2018)
 - **Scenario case 26** — stubs the task writes and email-button shapes the gate run used. (#2018)
 - **Scenario case 26** — bare-ref and label email clicks sent as a one-click batch now succeed. (#2018)
+- **PII asks** — never hide another finding; relayed asks reach the coordinator; `send-draft` records the yes. (#2312)
+- **Band judge** — no longer flags Curia's own conduct or what it tells the principal. (#2312)
+- **Send recipients** — Curia's own mailbox no longer counts as a recipient when checking sends. (#2312)
+- **Quoted replies** — details already on the thread no longer page the principal; unauthorized quotes are dropped instead. (#2312)
+- **Reply drafts** — `email-draft-save` saves without a quote whose personal details would reach someone new. (#2312)
+- **Asked-for details** — under band gating Curia writes requested personal details; the gateway decides, not trust prompts. (#2312)
+- **`EmailSendRequest`** — **public API:** gains `quoteParticipants`, who was on the quoted message; never sent. (#2312)
+- **Band judge evidence** — reports to the principal count as support. **Public API:** `outbound.message` gains `reportedToPrincipal`. (#2312)
+- **Sender facts** — contact identity and message authentication are stated separately in sender context. (#2312)
+- **Sender facts** — an email with no authentication result reads as not confirmed, not failed. (#2312)
+- **PII asks** — approving needs a delivered ask; an undelivered deny records no "no"; strangers' drafts are refused. (#2312)
 - **Scenario follow-up** — an unpublished second message fails the run, and its own turn is cleaned up. (#2018)
 - **Scenario follow-up** — scoring waits for the injection decision, and a miss still fails the run. (#2018)
 - **Turn injection config** — startup accepts `dispatch.turnInjection` in the config schema. (#2018)

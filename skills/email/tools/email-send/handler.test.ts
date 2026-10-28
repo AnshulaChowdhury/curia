@@ -1,8 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { REDACTION_NOTE } from '../../../../src/skills/_shared/principal-directed.js';
 import { EmailSendHandler } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { OutboundGateway } from '../../../../src/skills/outbound-gateway.js';
 import pino from 'pino';
+import { TaskOutreachService } from '../../../../src/dispatch/task-outreach-capability.js';
+import type { TaskOutreachInput, TaskOutreachRepo, TaskOutreachRow } from '../../../../src/dispatch/task-outreach.js';
+import type { ChannelIdentity } from '../../../../src/contacts/types.js';
 
 function makeLogger() {
   return pino({ level: 'silent' });
@@ -490,5 +494,122 @@ describe('email-send relay budget (#1320)', () => {
     // Nothing reached the principal, so no reply should bind to it.
     expect(outboundContext.register).not.toHaveBeenCalled();
     if (result.success) expect(result.data).toMatchObject({ deferred_to_digest: true, note: expect.stringMatching(/digest/) });
+  });
+});
+
+// #2312: the agent is told what was removed, and the entry records what was delivered.
+describe('EmailSendHandler redactions (#2312)', () => {
+  const RED = [{ label: 'phone_us', field: 'body' as const }];
+  const SENT = 'x [REDACTED: PHONE_US]';
+
+  function withContext(ctx: ToolContext) {
+    const register = vi.fn().mockResolvedValue('entry-1');
+    (ctx as unknown as Record<string, unknown>).outboundContext = {
+      register, release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6,
+    };
+    return register;
+  }
+
+  it('reports the redactions and records the delivered content', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'S', body: 'x 519-555-0100' });
+    const register = withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'm', redactions: RED, sentContent: SENT });
+    const result = await new EmailSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toMatchObject({ redactions: RED, redaction_note: REDACTION_NOTE });
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: SENT }));
+  });
+
+  it('returns the subject as delivered when redaction changed it', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Call 519-555-0100', body: 'x' });
+    withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true, messageId: 'm', redactions: [{ label: 'phone_us', field: 'subject' }], sentContent: 'x', sentSubject: 'Call [REDACTED: PHONE_US]',
+    });
+    const result = await new EmailSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toMatchObject({ subject: 'Call [REDACTED: PHONE_US]' });
+  });
+
+  it('adds no redactions key when nothing was removed', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'S', body: 'hello' });
+    const register = withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'm' });
+    const result = await new EmailSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).not.toHaveProperty('redactions');
+      expect(result.data).not.toHaveProperty('redaction_note');
+    }
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: 'hello' }));
+  });
+});
+
+describe('EmailSendHandler task outreach (#2312)', () => {
+  const TASK_ID = '33333333-3333-4333-8333-333333333333';
+  const PAL_ID = '44444444-4444-4444-8444-444444444444';
+  const principal = { contactId: 'principal-id', systemRole: 'principal', channel: 'email', initiatedAt: '2026-10-26T00:00:00Z', tier: 'principal' };
+  const outsider = { contactId: ALICE_ID, systemRole: null, channel: 'email', initiatedAt: '2026-10-26T00:00:00Z', tier: 'known' };
+
+  function withOutreach(ctx: ToolContext) {
+    const record = vi.fn(async (input: TaskOutreachInput) => ({ id: 'outreach-1', ...input } as unknown as TaskOutreachRow));
+    (ctx as unknown as Record<string, unknown>).taskOutreach = new TaskOutreachService({ record } as unknown as TaskOutreachRepo, {
+      principalIdentities: [{ contactId: 'principal-id', channel: 'email', channelIdentifier: 'ceo@example.com' } as unknown as ChannelIdentity],
+      selfEmails: ['curia@office.example'],
+      lookupTask: async () => ({ title: 'Book physio', rootTaskId: TASK_ID }),
+      log: makeLogger(),
+    });
+    (ctx as unknown as Record<string, unknown>).conversationId = 'conv-1';
+    (ctx as unknown as Record<string, unknown>).taskEventId = 'evt-1';
+    return record;
+  }
+
+  beforeEach(() => {
+    resolveRecipientReference.mockImplementation(async (_channel: string, value: string) => {
+      if (value === 'principal') return { ok: true, kind: 'principal', contactId: 'principal-id', identifier: 'ceo@example.com', displayName: 'Principal' };
+      if (value === ALICE_ID) return { ok: true, kind: 'contact', contactId: ALICE_ID, identifier: 'Bookings@Acme.example', displayName: 'Acme' };
+      if (value === PAL_ID) return { ok: true, kind: 'contact', contactId: PAL_ID, identifier: 'pal@gmail.com', displayName: 'Pal' };
+      return { ok: false, error: 'No contact' };
+    });
+  });
+
+  it('on a task wake, records the task, the recipients and their org domain (gmail excluded)', async () => {
+    const ctx = makeCtx(
+      { to: ALICE_ID, cc: `${PAL_ID},principal`, subject: 'Appointment', body: 'Could we book Tuesday?' },
+      { taskMetadata: { originator: principal, boundTask: { taskId: TASK_ID } } },
+    );
+    const record = withOutreach(ctx);
+
+    expect((await new EmailSendHandler().execute(ctx)).success).toBe(true);
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: TASK_ID,
+      via: 'email',
+      // The principal, copied in, is not a counterparty.
+      addresses: ['bookings@acme.example', 'pal@gmail.com'],
+      contactIds: [ALICE_ID, PAL_ID],
+      domains: ['acme.example'],
+      summary: 'Book physio',
+    }));
+  });
+
+  it('on a live principal turn with no task, records against the conversation, summarised by subject not body', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Appointment', body: 'Could we book Tuesday?' }, { taskMetadata: { originator: principal } });
+    (ctx as unknown as Record<string, unknown>).liveTurn = true;
+    const record = withOutreach(ctx);
+
+    await new EmailSendHandler().execute(ctx);
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: null, conversationId: 'conv-1', directingEventId: 'evt-1', summary: 'Appointment',
+    }));
+    expect(JSON.stringify(record.mock.calls)).not.toContain('Could we book Tuesday?');
+  });
+
+  it('on an outsider turn with no task, records nothing', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Re', body: 'Thanks' }, { taskMetadata: { originator: outsider } });
+    (ctx as unknown as Record<string, unknown>).liveTurn = true;
+    const record = withOutreach(ctx);
+
+    expect((await new EmailSendHandler().execute(ctx)).success).toBe(true);
+    expect(record).not.toHaveBeenCalled();
   });
 });

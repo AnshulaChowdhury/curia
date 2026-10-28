@@ -227,6 +227,12 @@ interface OutboundMessagePayload {
    * humanApproved, so band review does not hold an approved reply a second time.
    */
   principalApproved?: boolean;
+  /**
+   * The principal note the dispatcher cut from this reply and queued for the principal
+   * (#2312). The adapter hands it to the gateway so the send review counts it as evidence
+   * that Curia told the principal; it is never part of the outbound text.
+   */
+  reportedToPrincipal?: string;
 }
 
 // OutboundDeliveredPayload — emitted by OutboundGateway after a successful
@@ -246,10 +252,9 @@ interface OutboundDeliveredPayload {
    *  promoteOrCreateRecipientContact() runs after dispatch, so v1 does not
    *  resolve twice. */
   recipientContactId?: string;
-  /** Message body that actually went on the wire. For sends routed through
-   *  OutboundGateway.send(), this is the post-PII-redaction body. For
-   *  sendEmailDraft(), PII redaction is skipped (draft content passed
-   *  through the pipeline at creation time). */
+  /** Message body that went on the wire, or its redacted copy when personal data
+   *  the review authorized went out raw: this event never carries the values
+   *  (#2312). Applies to send() and sendEmailDraft() alike. */
   content: string;
   /** Conversation ID when available (dispatcher-routed and skill-invoked
    *  sends initiated from a coordinator task both have one). */
@@ -266,6 +271,10 @@ interface OutboundDeliveredPayload {
     toolName?: string;
     agentId?: string;
   };
+  /** Personal details that went out as written (authorized by the band review, or a draft
+   *  the principal directed), by label and field, never the values (#2312). `content` is the
+   *  redacted body and cannot show a quote's, so this does. */
+  disclosed?: Array<{ label: string; field: 'body' | 'subject' | 'quote' }>;
 }
 
 // ExportDeliveredPayload — emitted by ExecutionLayer after a successful MCP
@@ -1764,7 +1773,7 @@ export type PrincipalReportSource =
   | 'approval_expired'
   | 'gate_proceeded'       // band gating let through an action the tier policy would have held (#2159)
   | 'sent_without_review'  // the judge was unavailable at 80+, so the send went out unreviewed (#2159)
-  | 'claim_trimmed'        // unverified statements were cut from a send after one bounce (#2159)
+  | 'claim_trimmed'        // no longer emitted (#2312: Curia never cuts text); kept for historical audit rows
   | 'relay_deferred';      // an outside contact used up their relay budget; the relay waits here (#1320)
 export interface PrincipalReportPayload {
   /** One or two sentences, written for the principal. */

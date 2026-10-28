@@ -70,25 +70,56 @@ export async function readApprovalNumber(
 }
 
 /**
+ * A personal-data ask behind a held relayed reply (#2312): `details` are the human labels
+ * ("SIN and phone number"), never the values; `requester` is who asked. `replyTo` is the email
+ * the held reply answers, so the holding reply can thread under it.
+ */
+export interface ApprovalWakeAsk {
+  details: string;
+  requester: string;
+  replyTo?: { messageId: string; account?: string };
+}
+
+/**
  * A task that wakes the coordinator to deliver an approval raised after an agent's turn ended
  * (a dispatcher-relayed reply), when no agent is there to read the advisory (#2159). If it is
  * lost, the expiry sweep's safety net still delivers the approval.
+ *
+ * With `ask` (#2312) the wake says the hold is the requester's request for the principal's
+ * personal data, that it is urgent, and that the coordinator may send the requester one short
+ * holding reply on the thread, without the requested details. Nothing else.
  */
-export function buildApprovalDeliveryWake(shortRef: string, what: string, parentEventId: string): AgentTaskEvent {
+export function buildApprovalDeliveryWake(shortRef: string, what: string, parentEventId: string, ask?: ApprovalWakeAsk): AgentTaskEvent {
+  const lines = ask
+    ? [
+      `${what} was held for the principal's approval (ref: ${shortRef}).`,
+      `It is a personal-data request: ${ask.requester} asked for the principal's ${ask.details}, and the reply that shares it waits on the principal's yes.`,
+      "This is urgent. Deliver it now with deliver-approval, on the channel the principal's standing preferences name for urgent items.",
+      `Then you may send ${ask.requester} one short holding reply on the thread${holdingReplyHow(ask.replyTo)}. It must not include the requested details.`,
+      'Do not do anything else.',
+    ]
+    : [
+      `${what} was held for the principal's approval (ref: ${shortRef}).`,
+      "Deliver it with deliver-approval, on the channel the principal's standing preferences name for urgent items.",
+      'Do not do anything else.',
+    ];
   return createAgentTask({
     agentId: 'coordinator',
     conversationId: `approval-delivery:${shortRef}`,
     channelId: 'scheduler',
     senderId: 'system',
-    content: [
-      `${what} was held for the principal's approval (ref: ${shortRef}).`,
-      "Deliver it with deliver-approval, on the channel the principal's standing preferences name for urgent items.",
-      'Do not do anything else.',
-    ].join(' '),
+    content: lines.join(' '),
     // Curia telling itself to deliver an approval, not a person reaching out (#2018).
     syntheticTurn: true,
     parentEventId,
   });
+}
+
+/** How to thread the holding reply: email-reply on the message the held reply answers. */
+function holdingReplyHow(replyTo: ApprovalWakeAsk['replyTo']): string {
+  if (!replyTo) return '';
+  const account = replyTo.account ? `, account ${replyTo.account}` : '';
+  return ` (email-reply with reply_to_message_id ${replyTo.messageId}${account})`;
 }
 
 // ---------------------------------------------------------------------------

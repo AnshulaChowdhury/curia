@@ -19,6 +19,12 @@ export interface StampOriginatorInput {
    * could not be resolved — consistent with non-UUID values like 'system' / 'primary-user'.
    */
   senderId: string;
+  /**
+   * The originating message authenticated its sender (#2312) — the caller computes it from the
+   * channel and its adapter metadata (inboundSenderAuthenticated). Required so no caller can
+   * forget it; voice always passes false.
+   */
+  authenticated: boolean;
   /** Optional fixed timestamp for tests; defaults to now. */
   initiatedAt?: string;
 }
@@ -48,6 +54,7 @@ export function stampOriginator(input: StampOriginatorInput): StampOriginatorRes
         channel: input.channel,
         initiatedAt,
         tier: input.senderContext.tier,
+        authenticated: input.authenticated,
       }
     : {
         contactId: input.senderId,
@@ -55,6 +62,9 @@ export function stampOriginator(input: StampOriginatorInput): StampOriginatorRes
         channel: input.channel,
         initiatedAt,
         tier: 'unknown',
+        // Authentication is about the message, not the contact: an unknown sender on Signal
+        // is still that Signal account. Tier keeps it from authorizing anything.
+        authenticated: input.authenticated,
       };
 
   // The LIVE PRINCIPAL TURN signal (#1126) is `true` iff this inbound resolved to the principal.

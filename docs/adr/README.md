@@ -75,6 +75,7 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 | [051](051-knowledge-graph-embeddings-from-a-configurable-endpoint.md) | Knowledge graph embeddings come from any OpenAI-compatible endpoint, with a per-model profile (width, prefixes, thresholds), vectors stamped with their model, a boot gate and `pnpm reembed:kg` (#2023) | Accepted |
 | [052](052-knowledge-graph-node-merge.md) | Knowledge-graph node merge — previewed, plan-token-gated, single-transaction console merge; the survivor's type is the result type; the absorbed node is archived as a tombstone; contacts fold by survivor type; contact merges re-point calendars, grants and task/message references (#2233) | Accepted |
 | [053](053-turn-lanes-and-mid-turn-injection.md) | Turn lanes and mid-turn injection — one coordinator turn at a time per human conversation; only a live follow-up from that turn's resolved contact may join it; synthetic wakes wait (#2018; amended 2026-10-26) | Accepted |
+| [054](054-authority-aware-pii-disclosure.md) | Authority-aware PII disclosure — the band judge rules on each personal detail, code computes who authorized it, no cut-and-send, outreach links and asks instead of refusals (#2312) | Accepted |
 
 ## Adding new ADRs
 

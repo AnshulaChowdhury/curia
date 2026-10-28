@@ -32,6 +32,7 @@ import {
 } from '../../../src/dispatch/relay-gate-c.js';
 import type { ApprovalTriggerService } from '../../../src/autonomy/approval-trigger.js';
 import type { EscalationJudge } from '../../../src/autonomy/escalation-judge.js';
+import type { AutonomyService } from '../../../src/autonomy/autonomy-service.js';
 
 function makeOriginator(tier: ContactTier | null, systemRole: TaskOriginator['systemRole'] = null): TaskOriginator {
   return {
@@ -173,6 +174,7 @@ function makeStubs(opts: {
   escalationJudge?: EscalationJudge;
   contactResolver?: ContactResolver;
   gating?: 'band' | 'tier';
+  autonomyService?: { getConfig: () => Promise<unknown> };
 } = {}) {
   const publishedEvents: BusEvent[] = [];
   const subscribeHandlers = new Map<string, (event: BusEvent) => void | Promise<void>>();
@@ -200,6 +202,7 @@ function makeStubs(opts: {
     escalationJudge: opts.escalationJudge,
     contactResolver: opts.contactResolver,
     ...(opts.gating ? { gating: opts.gating } : {}),
+    ...(opts.autonomyService ? { autonomyService: opts.autonomyService as unknown as Pick<AutonomyService, 'getConfig'> } : {}),
     channelPolicies: {
       email: { trust: 'medium', unknownSender: 'allow', threaded: true },
       http: { trust: 'medium', unknownSender: 'allow', threaded: false },
@@ -259,6 +262,14 @@ describe('relaySendOptions (#2159)', () => {
     });
   });
 
+  it('passes the principal note the reply was cut from as reportedToPrincipal (#2312)', () => {
+    const event = createOutboundMessage({
+      conversationId: 'slack:C1', channelId: 'slack', content: 'x', recipientId: 'U1', parentEventId: 'r',
+      reportedToPrincipal: 'Provider asked for your number.',
+    });
+    expect(relaySendOptions(event, 'U1')).toMatchObject({ reportedToPrincipal: 'Provider asked for your number.' });
+  });
+
   it('carries the principal\'s approval of an approved relay as humanApproved', () => {
     const event = createOutboundMessage({
       conversationId: 'slack:C1', channelId: 'slack', content: 'x', recipientId: 'U1', parentEventId: 'r', principalApproved: true,
@@ -292,6 +303,39 @@ describe('decideRelayGateC under band gating (#2159)', () => {
     }));
 
     expect(publishedEvents.filter((e) => e.type === 'outbound.message')).toHaveLength(1);
+  });
+
+  // Per-relay gating (#2312): the scenario suite pins it per case on one dispatcher.
+  describe('reads the gating from the autonomy config on each relay', () => {
+    const config = (gating?: 'band' | 'tier') => ({ score: 84, band: 'spot-check', updatedAt: new Date(), updatedBy: 't', ...(gating ? { gating } : {}) });
+    const relay = async (stubs: ReturnType<typeof makeStubs>, taskId: string) => {
+      seedRouting(stubs.dispatcher, taskId, { originator: makeOriginator('known') });
+      await stubs.subscribeHandlers.get('agent.response')!(createAgentResponse({
+        agentId: 'coordinator', conversationId: 'conv-1', content: 'Adam has the forms.', parentEventId: taskId,
+      }));
+      return stubs.publishedEvents.filter((e) => e.type === 'outbound.message').length;
+    };
+
+    it('skips the tier gate when the config says band, though the dispatcher was built tier', async () => {
+      const stubs = makeStubs({ gating: 'tier', autonomyService: { getConfig: vi.fn(async () => config('band')) } });
+      stubs.dispatcher.register();
+      expect(await relay(stubs, 'task-a')).toBe(1);
+    });
+
+    it('applies the tier gate when the config says tier, though the dispatcher was built band', async () => {
+      const stubs = makeStubs({ gating: 'band', autonomyService: { getConfig: vi.fn(async () => config('tier')) } });
+      stubs.dispatcher.register();
+      expect(await relay(stubs, 'task-b')).toBe(0);
+    });
+
+    it('keeps the constructed gating when the config names none or cannot be read', async () => {
+      const none = makeStubs({ gating: 'band', autonomyService: { getConfig: vi.fn(async () => config()) } });
+      none.dispatcher.register();
+      expect(await relay(none, 'task-c')).toBe(1);
+      const failing = makeStubs({ gating: 'band', autonomyService: { getConfig: vi.fn(async () => { throw new Error('db down'); }) } });
+      failing.dispatcher.register();
+      expect(await relay(failing, 'task-d')).toBe(1);
+    });
   });
 });
 

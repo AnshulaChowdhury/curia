@@ -25,6 +25,9 @@
 //      is recorded as `canned`, a stub hole like a refusal: the model acted on an empty
 //      stand-in result, not on data the case chose. In a real-delegation run, so do
 //      `delegate` and the outbound-context tools in REAL_IN_DELEGATION.
+//   4. In a `through_gateway` run (#2312), the THROUGH_GATEWAY_TOOLS skip 1 and 2: the send
+//      tools and the approval tools run their real handlers through production's gateway
+//      review, whose recording transports keep what passes. Every other run is unchanged.
 //
 // Stubs can be scoped to an agent (`agent: calendar`); an unscoped stub answers every
 // agent. Everything other than invoke() goes to the real layer, so tool definitions,
@@ -62,6 +65,37 @@ export const REAL_IN_DELEGATION: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * The send tools a `through_gateway` case runs for real (#2312): they skip the stub table and
+ * go through production's gateway review, whose recording transports keep what passes in the
+ * run. Never sent anywhere: the stack has no real transport and no outbound queue.
+ */
+export const THROUGH_GATEWAY_SEND_TOOLS: ReadonlySet<string> = new Set([
+  'email-send',
+  'email-reply',
+  'signal-send',
+  'sms-send',
+  'slack-send',
+  'send-draft',
+]);
+
+/**
+ * What runs for real in a through-gateway case: the sends, and the approval tools that act on
+ * what they hold. list-pending-actions lists the run's own approvals, so a principal's later
+ * "yes" can be matched to the one a send raised (the default stub always said there were none);
+ * deliver-approval sends the approval to the principal (recorded too);
+ * approve-action and deny-action resolve it on a later live principal turn (the execution
+ * layer's elevated gate still applies) and replay or refuse the send. Their action log is
+ * narrowed to the run's own rows (seed.ts: scopedActionLog).
+ */
+export const THROUGH_GATEWAY_TOOLS: ReadonlySet<string> = new Set([
+  ...THROUGH_GATEWAY_SEND_TOOLS,
+  'list-pending-actions',
+  'deliver-approval',
+  'approve-action',
+  'deny-action',
+]);
+
+/**
  * conversation_id prefix of every specialist conversation in a real-delegation run. It
  * starts with `scenario-`, so the start-up sweep finds a crashed run's rows by it.
  */
@@ -79,6 +113,9 @@ const DANGEROUS_CAPABILITIES: ReadonlySet<string> = new Set([
   'outboundGateway',
   'actionLogRepo',
   'secretCapture',
+  // The recording review layer wires these (#2312): deliver-approval sends, the recorder resolves.
+  'approvalDelivery',
+  'disclosureDecisions',
 ]);
 
 /**
@@ -87,15 +124,17 @@ const DANGEROUS_CAPABILITIES: ReadonlySet<string> = new Set([
  * only produces a failure production never shows, so it is refused — and counted as a
  * stub hole — instead. `inert` names tools whose real handler reaches nothing (the
  * stack's snapshot-served MCP tools, #2024), so they run. `realDelegation` lets the
- * REAL_IN_DELEGATION tools run.
+ * REAL_IN_DELEGATION tools run; `throughGateway` the THROUGH_GATEWAY_TOOLS (#2312).
  */
 export function mustStub(
   toolName: string,
   registry: ToolRegistry,
   unavailable: ReadonlySet<string> = new Set(),
   inert: ReadonlySet<string> = new Set(),
-  options: { realDelegation?: boolean } = {},
+  options: { realDelegation?: boolean; throughGateway?: boolean } = {},
 ): boolean {
+  // The review layer serves these (#2312), whatever the layer agents call lacks.
+  if (options.throughGateway && THROUGH_GATEWAY_TOOLS.has(toolName)) return false;
   if (unavailable.has(toolName)) return true;
   if (options.realDelegation && REAL_IN_DELEGATION.has(toolName)) return false;
   if (ALWAYS_STUB.has(toolName)) return true;
@@ -120,16 +159,26 @@ export interface StubbedCall {
 
 export interface StubController {
   /** Wrap the real layer. Pass the result as createTestModeStack's wrapExecutionLayer. */
-  wrap(layer: ExecutionLayer): ExecutionLayer;
+  /**
+   * `reviewLayer`: the stack's recording review layer (#2312), where a through-gateway run's
+   * THROUGH_GATEWAY_TOOLS go. Every other call goes to `layer`.
+   */
+  wrap(layer: ExecutionLayer, reviewLayer?: ExecutionLayer): ExecutionLayer;
   /**
    * Install a run's stubs for its conversation. Throws if that conversation already has
    * an open run. A call from a conversation with no open run — a timed-out turn from a
    * run already closed — is refused and not recorded: it must never be answered by
-   * another run's stubs. `realDelegation` runs `delegate` for real (#2027).
+   * another run's stubs. `realDelegation` runs `delegate` for real (#2027); `throughGateway`
+   * runs the THROUGH_GATEWAY_TOOLS for real (#2312).
    */
-  beginRun(stubs: Record<string, ToolStub[]>, conversationId: string, options?: { realDelegation?: boolean }): void;
+  beginRun(stubs: Record<string, ToolStub[]>, conversationId: string, options?: { realDelegation?: boolean; throughGateway?: boolean }): void;
   /** Close the conversation's run (and its specialists' conversations) and return its calls in order. */
   endRun(conversationId: string): StubbedCall[];
+  /**
+   * File `conversationId` under the open run of `rootConversationId` (#2312): an `inbound.then`
+   * principal turn. Its calls get the run's stubs and are recorded with the run's.
+   */
+  attach(rootConversationId: string, conversationId: string): void;
   /** The conversation of the open run `conversationId` belongs to: itself, or a specialist's run's root. */
   rootOf(conversationId: string): string | undefined;
   /**
@@ -181,6 +230,8 @@ export function createStubController(
     calls: StubbedCall[];
     tools: CaseToolState;
     realDelegation: boolean;
+    /** THROUGH_GATEWAY_TOOLS run for real, past the stub table (#2312). */
+    throughGateway: boolean;
     /** Specialist conversations this run started, each also a key of `delegated`. */
     specialists: Set<string>;
     /** Real delegate calls not yet returned, one entry (the target agent) per call. */
@@ -221,6 +272,7 @@ export function createStubController(
 
   const invokeStubbed = async (
     real: ExecutionLayer,
+    review: ExecutionLayer | undefined,
     args: Parameters<ExecutionLayer['invoke']>,
   ): Promise<ToolResult> => {
     const [toolName, input, , options] = args;
@@ -254,10 +306,13 @@ export function createStubController(
       if (run.holdFirst) await run.holdFirst;
     };
 
-    const stub = stubs ? matchToolStub(toolName, input, stubs, options?.agentId) : undefined;
+    // A through-gateway send skips the stub table (#2312): production's handler and review
+    // decide, and the recording transports keep what passes.
+    const realSend = run?.throughGateway === true && THROUGH_GATEWAY_TOOLS.has(toolName);
+    const stub = stubs && !realSend ? matchToolStub(toolName, input, stubs, options?.agentId) : undefined;
     // Same write-then-read replay as smoke (#2074). A stub that names draft_id
     // still answers that ceo-inbox-read itself.
-    if (run) {
+    if (run && !realSend) {
       const draft = recordedDraftRead(toolName, input, run.tools, stub?.match);
       if (draft) {
         await note('stubbed');
@@ -285,7 +340,7 @@ export function createStubController(
       return { success: true, data };
     }
 
-    if (stubs === null || mustStub(toolName, registry(), unavailable(), inert(), { realDelegation: run?.realDelegation })) {
+    if (stubs === null || mustStub(toolName, registry(), unavailable(), inert(), { realDelegation: run?.realDelegation, throughGateway: run?.throughGateway })) {
       await note('refused');
       return {
         success: false,
@@ -318,17 +373,23 @@ export function createStubController(
         if (i >= 0) run.waiting.splice(i, 1);
       }
     }
+    if (realSend) {
+      if (!review) {
+        return { success: false, error: skillError(`Tool '${toolName}' runs through the gateway, but this stack has no review layer.`) };
+      }
+      return review.invoke(...args);
+    }
     const result = await real.invoke(...args);
     recordLiveCall(liveSearch, toolName, result);
     return result;
   };
 
   return {
-    wrap(layer) {
+    wrap(layer, reviewLayer) {
       return new Proxy(layer, {
         get(target, prop, receiver) {
           if (prop === 'invoke') {
-            return (...args: Parameters<ExecutionLayer['invoke']>) => invokeStubbed(target, args);
+            return (...args: Parameters<ExecutionLayer['invoke']>) => invokeStubbed(target, reviewLayer, args);
           }
           const value: unknown = Reflect.get(target, prop, receiver);
           return typeof value === 'function'
@@ -345,12 +406,21 @@ export function createStubController(
         calls: [],
         tools: new CaseToolState(),
         realDelegation: options.realDelegation === true,
+        throughGateway: options.throughGateway === true,
         specialists: new Set(),
         waiting: [],
         token: randomUUID().slice(0, 8),
         firstCall: deferredVoid(),
         gateOpened: false,
       });
+    },
+    attach(rootConversationId, conversationId) {
+      const run = runs.get(rootConversationId);
+      if (!run) throw new Error(`StubController.attach: no open run for ${rootConversationId}`);
+      if (runFor(conversationId)) throw new Error(`StubController.attach: ${conversationId} already belongs to a run`);
+      delegated.set(conversationId, run);
+      // endRun releases it with the run's specialists.
+      run.specialists.add(conversationId);
     },
     holdFirstCall(conversationId, until) {
       const run = runs.get(conversationId);

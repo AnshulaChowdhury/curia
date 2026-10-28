@@ -3,7 +3,9 @@
 // Sits between the agent response and the channel adapter. For each outbound
 // message it:
 //   1. Checks whether the kill switch is active (enabled: false → pass through)
-//   2. Checks principal contact ID — principal bypass via immutable UUID (silent)
+//   2. Checks principalIsSoleRecipient — the principal is the only human recipient of the
+//      send, computed by the gateway from verified principal identities across every To/CC
+//      recipient (silent bypass). A third party sharing the send disables it (#2312).
 //   3. Detects PII using the shared detectPii() core from src/pii/scrubber.ts
 //   4. Filters matches to those not in the channel's allow list
 //   5. Replaces them end-to-start with labelled tokens (e.g. [REDACTED: CREDIT_CARD])
@@ -44,7 +46,19 @@ export interface RedactionEntry {
   replacedWith: string;
 }
 
-/** Result of a redact() call. */
+/** A PII span detect() found that channel policy says to redact. Carries the matched text. */
+export interface DetectedPii {
+  /** Pattern label as the scrubber reports it. */
+  label: string;
+  /** Start offset in the content passed to detect(). */
+  start: number;
+  /** End offset (exclusive). */
+  end: number;
+  /** The matched text. Never log or publish it. */
+  matched: string;
+}
+
+/** Result of a redact() or apply() call. */
 export interface RedactionResult {
   /** The content with PII replaced (or the original if nothing was redacted). */
   content: string;
@@ -60,14 +74,6 @@ export interface PiiRedactorOptions {
   logger: Logger;
   /** Extra patterns from config (loaded once at startup and threaded through). */
   extraPatterns: PiiPattern[];
-  /**
-   * The principal's contact UUID, resolved at startup via findContactBySystemRole('principal') (#1049).
-   * When set, any message destined for this exact contact ID bypasses PII redaction entirely,
-   * regardless of trust_level. This is the primary principal identification mechanism — more stable
-   * than trust_level because it is an immutable UUID resolved once at startup, not a DB field
-   * that could be accidentally updated by contact-management code paths.
-   */
-  ceoContactId?: string;
 }
 
 // -- Optional context for audit event --
@@ -77,10 +83,11 @@ export interface RedactContext {
   recipientId?: string;
   parentEventId?: string;
   /**
-   * The recipient's contact UUID (from the contacts table).
-   * Used to bypass redaction when it matches PiiRedactorOptions.ceoContactId.
+   * True only when the principal is the sole human recipient of the send. The gateway computes
+   * it from the verified principal identities over every To and CC recipient, so a third party
+   * on the same send keeps it false. Redaction is bypassed iff this is exactly `true`.
    */
-  recipientContactId?: string;
+  principalIsSoleRecipient?: boolean;
 }
 
 // -- PiiRedactor class --
@@ -90,53 +97,46 @@ export class PiiRedactor {
   private readonly bus: EventBus;
   private readonly logger: Logger;
   private readonly extraPatterns: PiiPattern[];
-  private readonly ceoContactId: string | undefined;
 
   constructor(opts: PiiRedactorOptions) {
     this.config = opts.config;
     this.bus = opts.bus;
     this.logger = opts.logger;
     this.extraPatterns = opts.extraPatterns;
-    this.ceoContactId = opts.ceoContactId;
   }
 
   /**
-   * Redact PII from outbound content based on channel policy.
+   * Detect the PII in outbound content that channel policy would redact.
    *
-   * Returns the (possibly modified) content and a list of applied redactions.
-   * Returns the original content unchanged if:
-   *   - redaction is disabled (kill switch)
-   *   - the recipient is the principal (principal contact UUID match — structural bypass)
-   *   - no PII is detected
-   *   - all detected PII is in the channel's allow list
+   * Returns [] if redaction is disabled (kill switch), the principal is the sole recipient
+   * (context.principalIsSoleRecipient === true), no PII is found, or everything found is in the
+   * channel's allow list. Items are in start-offset order. Pure: logs and publishes nothing.
    *
    * @param content    The outbound message content.
    * @param channelId  The destination channel (e.g. 'email', 'signal').
-   * @param context    Optional metadata for the audit bus event.
+   * @param context    Optional context; only principalIsSoleRecipient is read here.
    */
-  async redact(
+  detect(
     content: string,
     channelId: string,
     context: RedactContext = {},
-  ): Promise<RedactionResult> {
+  ): DetectedPii[] {
     // Step 1: Kill switch — if disabled, pass through without any inspection.
     if (!this.config.enabled) {
-      return { content, redactions: [] };
+      return [];
     }
 
-    // Step 2: principal contact ID bypass — structural principal bypass.
-    // The principal contact UUID is resolved once via findContactBySystemRole('principal')
-    // at startup and stored here (#1049).
-    // A UUID match is tamper-proof: it cannot be accidentally elevated via contact management
-    // code paths (unlike a trust-level field, which has a setTrustLevel() API).
-    if (this.ceoContactId && context.recipientContactId === this.ceoContactId) {
-      return { content, redactions: [] };
+    // Step 2: principal bypass — the principal is the only human recipient. The gateway derives
+    // this from verified principal identities across every To/CC recipient, so "To: principal,
+    // CC: third party" is NOT a bypass (#2312). Strict `=== true`: absent or false redacts.
+    if (context.principalIsSoleRecipient === true) {
+      return [];
     }
 
     // Step 3: Detect PII using the shared scrubber core.
     const matches = detectPii(content, this.extraPatterns);
     if (matches.length === 0) {
-      return { content, redactions: [] };
+      return [];
     }
 
     // Step 4: Build the allow set for this channel (lowercase comparison).
@@ -149,31 +149,57 @@ export class PiiRedactor {
     // If default is 'allow' and the channel has no explicit policy, everything is allowed.
     // If default is 'block' and the channel has no explicit policy, all PII is blocked.
     // Filter to matches that are NOT in the allow set.
-    const toRedact = matches.filter((m) => {
-      const label = m.label.toLowerCase();
-      if (allowSet.has(label)) {
-        // Explicitly allowed on this channel — pass through.
-        return false;
-      }
-      // Not in the allow list — check the default action.
-      // 'block' → redact; 'allow' → pass (but only for channels without an explicit policy).
-      if (!channelPolicy && this.config.default === 'allow') {
-        return false;
-      }
-      return true;
-    });
+    return matches
+      .filter((m) => {
+        const label = m.label.toLowerCase();
+        if (allowSet.has(label)) {
+          // Explicitly allowed on this channel — pass through.
+          return false;
+        }
+        // Not in the allow list — check the default action.
+        // 'block' → redact; 'allow' → pass (but only for channels without an explicit policy).
+        if (!channelPolicy && this.config.default === 'allow') {
+          return false;
+        }
+        return true;
+      })
+      .map((m) => ({ label: m.label, start: m.start, end: m.end, matched: m.matched }));
+  }
 
-    if (toRedact.length === 0) {
+  /**
+   * Replace the given detected items in content with labelled tokens.
+   *
+   * Items must come from detect() on this same content (offsets are positions in it); pass a
+   * subset to redact only some. Logs and, unless options.audit is false, publishes the
+   * outbound.pii_redacted audit event. Pass audit: false to build a redacted copy that is not
+   * what goes on the wire (e.g. for the content filter), so the audit trail stays truthful.
+   *
+   * @param content    The outbound message content the items were detected in.
+   * @param items      The items to redact. Empty → content returned unchanged, nothing logged.
+   * @param channelId  The destination channel.
+   * @param context    Optional metadata for the audit bus event.
+   * @param options    audit (default true): false skips the log line and the bus event.
+   */
+  apply(
+    content: string,
+    items: readonly DetectedPii[],
+    channelId: string,
+    context: RedactContext = {},
+    options: { audit?: boolean } = {},
+  ): RedactionResult {
+    if (items.length === 0) {
       return { content, redactions: [] };
     }
 
     // Step 5: Apply replacements end-to-start so earlier indices remain valid
-    // as the string length changes with each substitution.
+    // as the string length changes with each substitution. Sort a copy by start so a
+    // caller-built subset still works and redactions come back in original order.
+    const ordered = [...items].sort((a, b) => a.start - b.start);
     let redacted = content;
     const redactions: RedactionEntry[] = [];
 
-    for (let i = toRedact.length - 1; i >= 0; i--) {
-      const match = toRedact[i]!;
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      const match = ordered[i]!;
       const replacedWith = `[REDACTED: ${match.label.toUpperCase()}]`;
       redacted = redacted.slice(0, match.start) + replacedWith + redacted.slice(match.end);
       // Build entry without the original matched value — intentional PII-safety design.
@@ -182,6 +208,10 @@ export class PiiRedactor {
         channelId,
         replacedWith,
       });
+    }
+
+    if (options.audit === false) {
+      return { content: redacted, redactions };
     }
 
     // Step 6: Log the redaction event.
@@ -217,5 +247,19 @@ export class PiiRedactor {
     });
 
     return { content: redacted, redactions };
+  }
+
+  /**
+   * Redact PII from outbound content based on channel policy: apply(content, detect(...)).
+   *
+   * Returns the (possibly modified) content and a list of applied redactions; the original
+   * content unchanged when detect() finds nothing to redact.
+   */
+  async redact(
+    content: string,
+    channelId: string,
+    context: RedactContext = {},
+  ): Promise<RedactionResult> {
+    return this.apply(content, this.detect(content, channelId, context), channelId, context);
   }
 }

@@ -118,6 +118,65 @@ describe('buildApprovalDetails', () => {
     });
     expect(details.length).toBeLessThanOrEqual(MAX_DETAIL_TOTAL_LENGTH + 50);
   });
+
+  describe('personal details line (#2312)', () => {
+    const PREFIX = 'Personal details in this message (sent as written if you approve):';
+
+    it('lists a phone number past the field cap, from the full body', () => {
+      const body = `${'x'.repeat(MAX_DETAIL_FIELD_LENGTH + 20)} call (415) 555-1234 today`;
+      const details = buildApprovalDetails('signal-send', { recipient: '+15550142', message: body });
+      // The capped Message line cut it off; the line still names it.
+      expect(details.split('\n').find((l) => l.startsWith('Message:'))).not.toContain('555-1234');
+      expect(details).toContain(`${PREFIX} phone_us (415) 555-1234`);
+    });
+
+    it('is exempt from the total cap', () => {
+      const chunk = 'hello '.repeat(120);
+      const details = buildApprovalDetails('email-send', {
+        to: chunk, cc: chunk, subject: chunk, body: `${chunk}${chunk}${chunk}${chunk} card 4111111111111111`,
+      });
+      expect(details).toContain(`${PREFIX} credit_card 4111111111111111`);
+    });
+
+    it('scans the subject and the quote as well as the body', () => {
+      const details = buildApprovalDetails('email-reply', {
+        subject: 'Call (415) 555-1234', body: 'See below.', html_quote: '<p>write to dana.home@example.org</p>',
+      });
+      expect(details).toContain('phone_us (415) 555-1234');
+      expect(details).toContain('email dana.home@example.org');
+    });
+
+    it('names every detail, however many: approving sends them all', () => {
+      const phones = Array.from({ length: 14 }, (_, i) => `(415) 555-${String(1000 + i)}`);
+      const line = buildApprovalDetails('sms-send', { recipient: '+15550142', message: phones.join(' and ') })
+        .split('\n').find((l) => l.startsWith(PREFIX))!;
+      for (const phone of phones) expect(line).toContain(`phone_us ${phone}`);
+      expect(line).not.toContain('more');
+    });
+
+    it('names a repeated detail once', () => {
+      const line = buildApprovalDetails('sms-send', { recipient: '+15550142', message: 'Call (415) 555-1234, again (415) 555-1234.' })
+        .split('\n').find((l) => l.startsWith(PREFIX))!;
+      expect(line.split('phone_us').length).toBe(2);
+    });
+
+    it('is absent when the message has none, and for skills that send nothing', () => {
+      expect(buildApprovalDetails('signal-send', { recipient: '+15550142', message: 'Thursday works.' })).not.toContain(PREFIX);
+      expect(buildApprovalDetails('store-fact', { label: 'Dana phone', value: '(415) 555-1234' })).not.toContain(PREFIX);
+    });
+
+    it('covers every send skill a humanApproved replay runs', () => {
+      for (const tool of ['email-send', 'email-reply', 'send-draft', 'signal-send', 'sms-send', 'slack-send', 'dispatcher-relay']) {
+        expect(buildApprovalDetails(tool, { body: 'call (415) 555-1234', message: 'call (415) 555-1234' })).toContain(PREFIX);
+      }
+    });
+  });
+
+  it('shows an email-send approval its subject and body', () => {
+    const details = buildApprovalDetails('email-send', { to: 'dana@example.com', subject: 'Budget', body: 'Numbers attached.' });
+    expect(details).toContain('Subject: Budget');
+    expect(details).toContain('Body: Numbers attached.');
+  });
 });
 
 describe('enrichGatewayApprovalPayload', () => {

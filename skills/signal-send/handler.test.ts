@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { REDACTION_NOTE } from '../../src/skills/_shared/principal-directed.js';
 import { SignalSendHandler } from './handler.js';
 import type { ToolContext } from '../../src/skills/types.js';
 import type { OutboundGateway } from '../../src/skills/outbound-gateway.js';
@@ -518,5 +519,63 @@ describe('signal-send relay budget (#1320)', () => {
     // Nothing reached the principal, so no reply should bind to it.
     expect(outboundContext.register).not.toHaveBeenCalled();
     if (result.success) expect(result.data).toMatchObject({ deferred_to_digest: true, note: expect.stringMatching(/digest/) });
+  });
+});
+
+// #2312: the agent is told what was removed, and the entry records what was delivered.
+describe('signal-send redactions (#2312)', () => {
+  const RED = [{ label: 'phone_us', field: 'body' as const }];
+  const SENT = 'x [REDACTED: PHONE_US]';
+
+  function withContext(ctx: ToolContext, register: ReturnType<typeof vi.fn>): ToolContext {
+    (ctx as unknown as Record<string, unknown>).outboundContext = {
+      register, release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6,
+    };
+    return ctx;
+  }
+
+  it('1:1: reports the redactions and records the delivered content', async () => {
+    const register = vi.fn().mockResolvedValue('entry-1');
+    const ctx = withContext(makeCtx({ input: { recipient: BOB_ID, message: 'x 519-555-0100' } }), register);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'm', redactions: RED, sentContent: SENT });
+    const result = await new SignalSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toMatchObject({ redactions: RED, redaction_note: REDACTION_NOTE });
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: SENT }));
+  });
+
+  it('1:1: adds no redactions key when nothing was removed', async () => {
+    const register = vi.fn().mockResolvedValue('entry-1');
+    const ctx = withContext(makeCtx({ input: { recipient: BOB_ID, message: 'hello' } }), register);
+    const result = await new SignalSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).not.toHaveProperty('redactions');
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: 'hello' }));
+  });
+
+  it('group: reports the redactions and records the delivered content', async () => {
+    const register = vi.fn().mockResolvedValue('entry-1');
+    const gateway = {
+      send: vi.fn().mockResolvedValue({ success: true, messageId: 'm', redactions: RED, sentContent: SENT }),
+      getSignalGroupMembers: vi.fn().mockResolvedValue(['+14155551234']),
+    };
+    const ctx = withContext(makeCtx({ input: { group_id: 'grpABC==', message: 'x 519-555-0100' }, gateway }), register);
+    const result = await new SignalSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toMatchObject({ redactions: RED, redaction_note: REDACTION_NOTE });
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: SENT }));
+  });
+
+  it('group: adds no redactions key when nothing was removed', async () => {
+    const register = vi.fn().mockResolvedValue('entry-1');
+    const gateway = {
+      send: vi.fn().mockResolvedValue({ success: true }),
+      getSignalGroupMembers: vi.fn().mockResolvedValue(['+14155551234']),
+    };
+    const ctx = withContext(makeCtx({ input: { group_id: 'grpABC==', message: 'hello' }, gateway }), register);
+    const result = await new SignalSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).not.toHaveProperty('redactions');
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: 'hello' }));
   });
 });

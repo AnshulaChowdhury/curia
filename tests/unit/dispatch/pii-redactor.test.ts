@@ -102,72 +102,30 @@ describe('PiiRedactor', () => {
     );
   });
 
-  it('bypasses redaction when recipientContactId matches ceoContactId', async () => {
-    // Simulates the case where startup resolved the principal's UUID and stored it.
-    const ceoUUID = 'b1a2c3d4-e5f6-7890-abcd-ef1234567890';
-    const redactorWithCeoId = new PiiRedactor({
-      config: defaultConfig,
-      bus,
-      logger,
-      extraPatterns: [],
-      ceoContactId: ceoUUID,
-    });
-
-    // Recipient is CEO — should pass through unredacted via structural UUID bypass.
-    const result = await redactorWithCeoId.redact(
+  it('bypasses redaction when the principal is the sole recipient (#2312)', async () => {
+    const result = await redactor.redact(
       'Your card is 4111 1111 1111 1111.',
       'email',
-      { recipientContactId: ceoUUID },
+      { principalIsSoleRecipient: true },
     );
     expect(result.content).toContain('4111 1111 1111 1111');
     expect(result.redactions).toHaveLength(0);
     expect(mockBusPublish).not.toHaveBeenCalled();
   });
 
-  it('does NOT bypass redaction when recipientContactId differs from ceoContactId', async () => {
-    const ceoUUID = 'b1a2c3d4-e5f6-7890-abcd-ef1234567890';
-    const redactorWithCeoId = new PiiRedactor({
-      config: defaultConfig,
-      bus,
-      logger,
-      extraPatterns: [],
-      ceoContactId: ceoUUID,
-    });
-
-    // Recipient is someone else — redaction must apply
-    const result = await redactorWithCeoId.redact(
+  it('redacts when principalIsSoleRecipient is false (a third party shares the send)', async () => {
+    const result = await redactor.redact(
       'Your card is 4111 1111 1111 1111.',
       'email',
-      { recipientContactId: 'ffffffff-ffff-ffff-ffff-ffffffffffff' },
+      { principalIsSoleRecipient: false },
     );
     expect(result.content).toContain('[REDACTED: CREDIT_CARD]');
     expect(result.redactions).toHaveLength(1);
   });
 
-  it('initializing ceoContactId from findContactBySystemRole result bypasses redaction for that recipient (#1049)', async () => {
-    // Mirrors the startup wiring in src/index.ts: the principal contact id comes from
-    // contactService.findContactBySystemRole('principal'), not from CEO_PRIMARY_EMAIL.
-    const principalUUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
-    const findContactBySystemRole = async (systemRole: string) =>
-      systemRole === 'principal' ? { id: principalUUID } : null;
-
-    const principal = await findContactBySystemRole('principal');
-    const redactorFromResolution = new PiiRedactor({
-      config: defaultConfig,
-      bus,
-      logger,
-      extraPatterns: [],
-      ceoContactId: principal?.id,
-    });
-
-    const result = await redactorFromResolution.redact(
-      'Your card is 4111 1111 1111 1111.',
-      'email',
-      { recipientContactId: principalUUID },
-    );
-    expect(result.content).toContain('4111 1111 1111 1111');
-    expect(result.redactions).toHaveLength(0);
-    expect(mockBusPublish).not.toHaveBeenCalled();
+  it('redacts when principalIsSoleRecipient is absent', async () => {
+    const result = await redactor.redact('Your card is 4111 1111 1111 1111.', 'email', {});
+    expect(result.content).toContain('[REDACTED: CREDIT_CARD]');
   });
 
   it('redaction entries do not contain the original PII value', async () => {
@@ -214,5 +172,77 @@ describe('PiiRedactor', () => {
     // email channel has explicit policy with empty allow list → redacted despite default: 'allow'
     expect(result.content).toContain('[REDACTED:');
     expect(result.content).not.toContain('user@example.com');
+  });
+
+  describe('detect()', () => {
+    const text = 'Mail user@example.com, card 4111 1111 1111 1111.';
+
+    it('returns only non-allowed items with offsets (email allowed on email)', () => {
+      const items = redactor.detect(text, 'email');
+      expect(items).toHaveLength(1);
+      const item = items[0]!;
+      expect(item.label.toLowerCase()).toBe('credit_card');
+      expect(text.slice(item.start, item.end)).toBe(item.matched);
+      expect(item.matched).toContain('4111');
+    });
+
+    it('returns every item on a channel that allows nothing', () => {
+      const items = redactor.detect(text, 'signal');
+      expect(items.map((i) => i.label.toLowerCase())).toEqual(['email', 'credit_card']);
+    });
+
+    it('returns [] when disabled', () => {
+      const disabled = new PiiRedactor({
+        config: { ...defaultConfig, enabled: false },
+        bus,
+        logger,
+        extraPatterns: [],
+      });
+      expect(disabled.detect(text, 'signal')).toEqual([]);
+    });
+
+    it('returns [] when the principal is the sole recipient', () => {
+      expect(redactor.detect(text, 'signal', { principalIsSoleRecipient: true })).toEqual([]);
+    });
+
+    it('does not publish anything', () => {
+      redactor.detect(text, 'signal');
+      expect(mockBusPublish).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('apply()', () => {
+    const text = 'Mail user@example.com, card 4111 1111 1111 1111.';
+
+    it('returns content unchanged and publishes nothing for an empty item list', () => {
+      const result = redactor.apply(text, [], 'signal');
+      expect(result).toEqual({ content: text, redactions: [] });
+      expect(mockBusPublish).not.toHaveBeenCalled();
+    });
+
+    it('redacts only the items passed in', () => {
+      const items = redactor.detect(text, 'signal');
+      const card = items.filter((i) => i.label.toLowerCase() === 'credit_card');
+      const result = redactor.apply(text, card, 'signal');
+      expect(result.content).toContain('user@example.com');
+      expect(result.content).toContain('[REDACTED: CREDIT_CARD]');
+      expect(result.redactions).toHaveLength(1);
+      expect(mockBusPublish).toHaveBeenCalledTimes(1);
+    });
+
+    it('builds the redacted copy without publishing when audit is false', () => {
+      const items = redactor.detect(text, 'signal');
+      const result = redactor.apply(text, items, 'signal', {}, { audit: false });
+      expect(result.content).not.toContain('user@example.com');
+      expect(result.content).not.toContain('4111');
+      expect(result.redactions).toHaveLength(2);
+      expect(mockBusPublish).not.toHaveBeenCalled();
+    });
+
+    it('matches redact() output for detect() items', async () => {
+      const viaRedact = await redactor.redact(text, 'signal');
+      const viaSplit = redactor.apply(text, redactor.detect(text, 'signal'), 'signal');
+      expect(viaSplit).toEqual(viaRedact);
+    });
   });
 });

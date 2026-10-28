@@ -69,4 +69,23 @@ describeIf('audit-log findToolResultsForTasks (#2159)', () => {
   it('returns nothing for an unknown task', async () => {
     expect(await repo.findToolResultsForTasks([randomUUID()], 10)).toEqual([]);
   });
+
+  // #2312: the report-to-principal tool files principal.report under the drafting turn's agent.task.
+  it('returns the principal reports filed under the tasks, newest first, and nothing else', async () => {
+    const task = await seed('agent.task', '2026-10-18T11:00:00.000Z', null);
+    const other = await seed('agent.task', '2026-10-18T11:00:00.000Z', null);
+    await seed('principal.report', '2026-10-18T11:00:01.000Z', task, { source: 'agent', summary: 'first' });
+    await seed('principal.report', '2026-10-18T11:00:02.000Z', task, { source: 'agent', summary: 'second' });
+    // The dispatcher's relay note arrives with the send, never from this query.
+    await seed('principal.report', '2026-10-18T11:00:02.500Z', task, { source: 'principal_note', summary: 'relay note' });
+    await seed('principal.report', '2026-10-18T11:00:03.000Z', other, { source: 'agent', summary: 'someone else\'s' });
+    await seed('tool.result', '2026-10-18T11:00:04.000Z', task, { toolName: 'not-a-report' });
+    // System-generated reports (a held draft verbatim, etc.) are not something Curia told the principal.
+    await seed('principal.report', '2026-10-18T11:00:05.000Z', task, { source: 'relay_deferred', summary: 'held draft text' });
+
+    const rows = await repo.findPrincipalReportsForTasks([task], 10);
+
+    expect(rows.map((r) => r.payload['summary'])).toEqual(['second', 'first']);
+    expect(await repo.findPrincipalReportsForTasks([task], 1)).toHaveLength(1);
+  });
 });

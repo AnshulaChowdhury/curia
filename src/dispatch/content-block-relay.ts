@@ -28,6 +28,8 @@ export interface RelayOutboundContext {
   liveTurn?: boolean;
   /** Propagated so rewrite retries still enforce Gate C (#1733). */
   originator?: TaskOriginator;
+  /** The note queued for the principal with the first reply: evidence for the rewrite's review (#2312). */
+  reportedToPrincipal?: string;
 }
 
 /** Whether the block reason is fixable by rewriting the message body. */
@@ -42,11 +44,14 @@ export function summarizeBlockFindings(findings: Array<{ rule: string; detail: s
   return findings
     .map((f) => {
       // A band bounce quotes the agent's own sentences, which it needs to fix the reply (#2159).
+      // The PII and placeholder findings name labels only, never values (#2312).
       const showDetail = (
         f.rule.startsWith('llm-judge-')
         || f.rule === 'disclosure-tier-gate'
         || f.rule === 'ungrounded-claim'
         || f.rule === 'unneeded-disclosure'
+        || f.rule === 'pii-not-authorized'
+        || f.rule === 'redaction-token'
       ) && f.detail;
       return showDetail ? `${f.rule}: ${f.detail}` : f.rule;
     })

@@ -8,7 +8,9 @@ import {
   placeholdersIn,
   resolvePlaceholders,
   resolveRunPlaceholders,
+  selectRunCases,
 } from '../../scenarios/loader.js';
+import type { ScenarioCase } from '../../scenarios/types.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(path.join(tmpdir(), 'scenarios-')); });
@@ -189,8 +191,9 @@ describe('loadScenarioCase', () => {
   });
 
   it.each([
-    ['a trusted tier (a grant, refused at create)', VALID.replace('tier: known', 'tier: trusted'), /tier must be one of known, unknown/],
-    ['an email outside example.test', VALID.replace('sam@example.test', 'sam@gmail.com'), /under example.test/],
+    // trusted is seeded as a grant after creation (#2312); principal is structural.
+    ['a principal tier', VALID.replace('tier: known', 'tier: principal'), /tier must be one of trusted, known, unknown/],
+    ['an email outside example.test', VALID.replace('sam@example.test', 'sam@gmail.com'), /under a .test name/],
     ['a misspelled weight key', VALID.replace('weight: critical', 'weigth: critical'), /unknown key\(s\) weigth/],
     ['a misspelled check key', VALID.replace('    check:\n      called: delegate', '    checks:\n      called: delegate'), /unknown key\(s\) checks/],
     ['an unknown key inside a check', VALID.replace('with: { agent: ceo-inbox }\n      contains', 'wth: { agent: ceo-inbox }\n      contains'), /unknown key\(s\) wth/],
@@ -798,8 +801,10 @@ expected_behaviors:
     expect(c.inbound.email?.cc).toEqual(['curia', 'principal', 'ops@northwind.example.test']);
   });
 
-  it('keeps a case with an autonomy fixture out of the release gate', () => {
-    expect(() => loadScenarioCase(write('a.yaml', CC.replace('release_gate: false\n', '')))).toThrow(/'autonomy' fixture runs on demand/);
+  it('lets a case with an autonomy fixture join the release gate (#2312): it is pinned per case', () => {
+    const c = loadScenarioCase(write('a.yaml', CC.replace('release_gate: false\n', '')));
+    expect(c.releaseGate).toBe(true);
+    expect(c.autonomy).toEqual({ score: 84, gating: 'band' });
   });
 
   it.each([
@@ -810,5 +815,110 @@ expected_behaviors:
     ['an unknown key', 'autonomy: { score: 84, gating: band, band: full }', /unknown key\(s\) band/],
   ])('rejects an autonomy fixture with %s', (_label, line, error) => {
     expect(() => loadScenarioCase(write('a.yaml', CC.replace('autonomy: { score: 84, gating: band }', line)))).toThrow(error);
+  });
+});
+
+describe('selectRunCases', () => {
+  // Only the fields selection reads.
+  const scenario = (name: string, extra: Partial<ScenarioCase> = {}): ScenarioCase =>
+    ({ name, tags: ['pii'], releaseGate: true, ...extra }) as ScenarioCase;
+  const plain = scenario('plain');
+  const at84 = scenario('pii at 84', { autonomy: { score: 84, gating: 'band' } });
+  const at74 = scenario('pii at 74', { autonomy: { score: 74, gating: 'band' } });
+  const tier = scenario('pii tier', { autonomy: { score: 84, gating: 'tier' } });
+  const onDemand = scenario('on demand', { releaseGate: false });
+  const styled = scenario('styled', { releaseGate: false, identity: { name: 'formal' } as ScenarioCase['identity'] });
+
+  it('puts cases under different autonomy fixtures, and ordinary ones, in one unfiltered run (#2312)', () => {
+    const picked = selectRunCases([plain, at84, at74, tier, onDemand], {});
+    expect(picked.cases.map(c => c.name)).toEqual(['plain', 'pii at 84', 'pii at 74', 'pii tier']);
+    expect(picked.onDemandSkipped).toEqual(['on demand']);
+    expect(picked.identitySkipped).toEqual([]);
+  });
+
+  it('keeps mixed autonomy fixtures together in a --tags selection', () => {
+    const picked = selectRunCases([plain, at84, at74], { tags: ['pii'] });
+    expect(picked.cases.map(c => c.name)).toEqual(['plain', 'pii at 84', 'pii at 74']);
+  });
+
+  it('still runs identity cases only in a selection of them alone', () => {
+    expect(selectRunCases([plain, styled], { onDemand: true }).identitySkipped).toEqual(['styled']);
+    expect(selectRunCases([plain, styled], { tags: ['pii'] }).identitySkipped).toEqual(['styled']);
+    const alone = selectRunCases([plain, styled], { caseFilter: 'styled' });
+    expect(alone.cases.map(c => c.name)).toEqual(['styled']);
+    expect(alone.identitySkipped).toEqual([]);
+  });
+
+  it('filters by case name, case-insensitively', () => {
+    expect(selectRunCases([plain, at84, at74], { caseFilter: 'PII AT' }).cases.map(c => c.name)).toEqual(['pii at 84', 'pii at 74']);
+  });
+});
+
+describe('the authority-aware PII cases (#2312)', () => {
+  // The committed cases, as the CLI loads them: the release gate is an unfiltered selection.
+  const committed = loadScenarioCases(path.resolve(import.meta.dirname, '../../scenarios/cases'));
+  const pii = committed.filter(c => c.tags.includes('pii-authority'));
+
+  it('load, each through the gateway under its own band-gating fixture', () => {
+    const ids = (list: ScenarioCase[]): string[] => list.map(c => path.basename(c.sourceFile).slice(0, 3)).sort();
+    expect(ids(pii)).toEqual(['34a', '34b', '34c', '34d', '34e', '34f', '34g', '34h', '34i', '34j', '34k', '34l', '34m']);
+    for (const c of pii) {
+      expect(c.throughGateway, c.name).toBe(true);
+      expect(c.autonomy?.gating, c.name).toBe('band');
+      expect(c.releaseGate, c.name).toBe(true);
+    }
+    expect(ids(pii.filter(c => c.autonomy?.score === 74))).toEqual(['34c', '34f', '34k']);
+    expect(ids(pii.filter(c => c.autonomy?.score === 84))).toEqual(['34a', '34b', '34d', '34e', '34g', '34h', '34i', '34j', '34l', '34m']);
+  });
+
+  it('pin the structural checks each scenario turns on', () => {
+    const byId = new Map(pii.map(c => [path.basename(c.sourceFile).slice(0, 3), c]));
+    const kinds = (id: string): string[] =>
+      byId.get(id)!.expectedBehaviors.filter(b => b.weight === 'critical').map(b => b.check?.kind ?? 'judge');
+    // A stranger, a forwarded claim or a volunteered number never pages the principal.
+    for (const id of ['34b', '34g', '34h', '34i', '34j']) expect(kinds(id), id).toContain('not_held');
+    // Below 80 an inferred share waits for the principal; a known requester is asked.
+    for (const id of ['34c', '34k', '34l']) expect(kinds(id), id).toContain('held');
+    // The yes is recorded as an important check: it can also reach the requester as a fresh send
+    // the principal directed, with the held one left to expire.
+    expect(byId.get('34k')!.expectedBehaviors.filter(b => b.check?.kind === 'decision_recorded').map(b => b.weight)).toEqual(['important']);
+    expect(byId.get('34k')!.inbound.then).toEqual({ content: expect.any(String), channel: 'email' });
+    // Where a withheld item's critical check could pass because nothing was ever drafted, an
+    // important `reviewed` check shows whether the gateway's path ran.
+    for (const [id, label] of [['34g', 'sin_ca'], ['34h', 'sin_ca'], ['34i', 'phone_us']] as const) {
+      expect(byId.get(id)!.expectedBehaviors.filter(b => b.check?.kind === 'reviewed').map(b => [b.weight, b.check]), id)
+        .toEqual([['important', { kind: 'reviewed', label }]]);
+    }
+    // A reply quotes the sender's own message, which the gateway exempts: only Curia's words count.
+    for (const id of ['34g', '34h']) {
+      expect(byId.get(id)!.expectedBehaviors.some(b => b.weight === 'critical' && b.check?.kind === 'delivered' && b.check.ownText), id).toBe(true);
+    }
+    // The linked-reply cases link by the seeded row's domain, from an authenticated sender.
+    for (const id of ['34b', '34c', '34j']) {
+      const c = byId.get(id)!;
+      expect(c.seed.outreach[0], id).toMatchObject({ domains: ['acme-physio.test'], confirmed: true });
+      expect(c.inbound.email?.senderVerified, id).toBe(true);
+    }
+    // The weak arm: the same domain match on an unconfirmed row asks, even at 84.
+    expect(byId.get('34l')!.seed.outreach[0]).toMatchObject({ domains: ['acme-physio.test'], confirmed: false });
+    expect(byId.get('34l')!.inbound.email?.senderVerified).toBe(true);
+    // A quote's SIN never reaches someone who was not on the quoted message.
+    expect(byId.get('34m')!.expectedBehaviors.filter(b => b.weight === 'critical' && b.check?.kind === 'delivered').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('are in the release gate, which still leaves out the on-demand cases', () => {
+    const gate = selectRunCases(committed, {});
+    const gated = new Set(gate.cases.map(c => c.name));
+    for (const c of pii) expect(gated.has(c.name), c.name).toBe(true);
+    const onDemand = committed.filter(c => !c.releaseGate);
+    expect(onDemand.length).toBeGreaterThan(0);
+    for (const c of onDemand) expect(gated.has(c.name), c.name).toBe(false);
+  });
+
+  it('score what reaches the recipient in code: a critical delivered check each (count 0 for a withheld item)', () => {
+    for (const c of pii) {
+      const critical = c.expectedBehaviors.filter(b => b.weight === 'critical').map(b => b.check?.kind);
+      expect(critical, c.name).toContain('delivered');
+    }
   });
 });

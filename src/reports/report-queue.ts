@@ -41,7 +41,7 @@ const SOURCE_KEYS: Record<PrincipalReportSource, true> = {
   approval_expired: true,
   gate_proceeded: true,
   sent_without_review: true,
-  claim_trimmed: true,
+  claim_trimmed: true, // no longer emitted (#2312); kept so historical rows still validate
   relay_deferred: true,
 };
 const SOURCES: ReadonlySet<string> = new Set(Object.keys(SOURCE_KEYS));

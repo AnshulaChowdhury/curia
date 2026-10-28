@@ -6,7 +6,7 @@
 //      one: the agent delivers the approval on one channel (#2159).
 
 import { describe, it, expect, vi } from 'vitest';
-import { generateShortRef, buildDescription, approvalAdvisory, ApprovalTriggerService } from '../../../src/autonomy/approval-trigger.js';
+import { generateShortRef, buildDescription, approvalAdvisory, buildApprovalDeliveryWake, ApprovalTriggerService } from '../../../src/autonomy/approval-trigger.js';
 import type { ActionLogRepo } from '../../../src/autonomy/action-log-repo.js';
 import type { ApprovalDelivery } from '../../../src/autonomy/approval-delivery.js';
 import type { EventBus } from '../../../src/bus/bus.js';
@@ -179,6 +179,38 @@ describe('approvalAdvisory', () => {
   it('reads as before without a number', () => {
     expect(approvalAdvisory('abcd1234', undefined, null)).toBe(approvalAdvisory('abcd1234'));
     expect(approvalAdvisory('abcd1234', 'calendar', null)).toBe(approvalAdvisory('abcd1234', 'calendar'));
+  });
+});
+
+// A relayed reply's approval wakes the coordinator (#2159); an ask's wake says what it is (#2312).
+describe('buildApprovalDeliveryWake', () => {
+  it('tells the coordinator to deliver the approval and nothing else', () => {
+    const wake = buildApprovalDeliveryWake('ab12cd34', 'Draft reply to joel@example.com', 'task-1');
+    expect(wake.payload).toMatchObject({ agentId: 'coordinator', conversationId: 'approval-delivery:ab12cd34', syntheticTurn: true });
+    expect(wake.parentEventId).toBe('task-1');
+    const content = String(wake.payload.content);
+    expect(content).toContain('Draft reply to joel@example.com was held for the principal\'s approval (ref: ab12cd34).');
+    expect(content).toContain('Deliver it with deliver-approval');
+    expect(content).not.toContain('personal-data request');
+    expect(content.endsWith('Do not do anything else.')).toBe(true);
+  });
+
+  it('with an ask, says it is an urgent personal-data request and allows one holding reply on the thread', () => {
+    const wake = buildApprovalDeliveryWake('ab12cd34', 'Draft reply to joel@example.com', 'task-1', {
+      details: 'SIN and phone number', requester: 'joel@example.com', replyTo: { messageId: 'msg-7', account: 'curia' },
+    });
+    const content = String(wake.payload.content);
+    expect(content).toContain('(ref: ab12cd34)');
+    expect(content).toContain('joel@example.com asked for the principal\'s SIN and phone number');
+    expect(content).toContain('This is urgent. Deliver it now with deliver-approval');
+    expect(content).toContain('(email-reply with reply_to_message_id msg-7, account curia)');
+    expect(content).toContain('It must not include the requested details.');
+    expect(content.endsWith('Do not do anything else.')).toBe(true);
+  });
+
+  it('with an ask but no message to reply to, still allows the holding reply on the thread', () => {
+    const wake = buildApprovalDeliveryWake('ab12cd34', 'Email to joel@example.com', 'task-1', { details: 'SIN', requester: 'joel@example.com' });
+    expect(wake.payload.content).toContain('Then you may send joel@example.com one short holding reply on the thread. It must not include the requested details.');
   });
 });
 

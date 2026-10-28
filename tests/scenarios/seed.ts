@@ -25,11 +25,20 @@ import type { TestModeStack } from '../../src/startup/test-mode-stack.js';
 import { registrableDomain } from '../../src/verification/domain.js';
 import type { VerificationRuntime } from '../../src/verification/index.js';
 import type { Verification } from '../../src/verification/types.js';
-import { cleanupConversation, sweepConversations } from '../shared/turn-capture.js';
+import { CONVERSATION_TABLES, cleanupConversation, sweepConversations, type TurnOutcome } from '../shared/turn-capture.js';
 import { resolvePlaceholders } from './loader.js';
 import { SCENARIO_DELEGATE_PREFIX } from './stub-layer.js';
 import type { DbPool } from '../../src/db/connection.js';
-import type { ScenarioCase, SeedContact, SeedPrincipalIdentity } from './types.js';
+import type { ActionLogRepo } from '../../src/autonomy/action-log-repo.js';
+import { NO_REF_RETRY_GUIDANCE, type ActionLogRow, type ResolveResult } from '../../src/autonomy/action-log-types.js';
+import type { ApprovalDisplay } from '../../src/autonomy/approval-delivery.js';
+import type { NylasMessage } from '../../src/channels/email/nylas-client.js';
+import type { TaskOriginator } from '../../src/contacts/types.js';
+import { buildInitialTaskProgress } from '../../src/db/task-repo.js';
+import { FailOpenLimiter } from '../../src/autonomy/band-policy.js';
+import type { TaskOutreachRepo, TaskOutreachRow } from '../../src/dispatch/task-outreach.js';
+import type { RecordedReview, RecordedSend } from '../../src/startup/test-mode-sends.js';
+import type { GatewayOutcome, ScenarioCase, SeedContact, SeedOutreach, SeedPrincipalIdentity, SeedTask } from './types.js';
 
 /**
  * Stamped into `notes` on every seeded contact — contacts have no source column, and
@@ -61,6 +70,8 @@ export class SeedScope {
   readonly threadIds = new Set<string>();
   /** Conversations real specialists ran in for this run (#2027); cleaned with the run's own. */
   readonly specialistConversations = new Set<string>();
+  /** The run's later principal turns (`inbound.then`, #2312); cleaned with the run's own. */
+  readonly followOnConversations = new Set<string>();
   /** Sign-in verifications the run seeded (#2017), plus any opened during it. */
   readonly verificationIds = new Set<string>();
   /** Browser session ids the run's verification block reads as alive (#2017). */
@@ -69,6 +80,39 @@ export class SeedScope {
   readonly principalWroteTo = new Set<string>();
   /** What the run says is waiting on the principal (`seed.backlog`); none when unset. */
   backlog: PrincipalBacklogCounts | undefined;
+  /**
+   * The run's own conversation (harness.ts sets it when the run begins). With
+   * specialistConversations, the conversations whose approvals, outreach and decisions are
+   * the run's (#2312).
+   */
+  rootConversation: string | undefined;
+  /** The run's case sets through_gateway (#2312): its relays, notifications and wakes are the run's. */
+  throughGateway = false;
+  /** Email threads the fake mailbox lists for a relayed reply, by thread id, most recent first (#2312). */
+  readonly threadMessages = new Map<string, NylasMessage[]>();
+  /** Approval-wake turns a held relay started in this run, captured (#2312). */
+  readonly wakeTurns: Array<Promise<TurnOutcome>> = [];
+  /** What the recording transports took for this run, in order (#2312). */
+  readonly deliveries: RecordedSend[] = [];
+  /** Each band review of the run's sends: labels and outcome only (#2312). */
+  readonly reviews: RecordedReview[] = [];
+  /** What each approval raised this run shows the principal, by short ref (#2312). */
+  readonly approvalDisplays = new Map<string, ApprovalDisplay>();
+  /** The run's inbound email as the fake mailbox serves it, by Nylas message id (#2312). */
+  readonly inboundMessages = new Map<string, NylasMessage>();
+  /** Tasks the run seeded (#2312). */
+  readonly taskIds = new Set<string>();
+  /** Outreach rows the run seeded, with their domains and addresses as seeded (#2312). */
+  readonly seededOutreach = new Map<string, { domains: string[]; addresses: string[] }>();
+  /**
+   * The band review's fail-open cap for this run (#2312): another run's judge failures never
+   * hold this run's sends. Tripped means the run's sends held for want of a reviewer.
+   */
+  failOpen = new FailOpenLimiter();
+  /** The fake mailbox's drafts for this run (#2312). */
+  readonly drafts = new Map<string, NylasMessage>();
+  /** Action-log row ids the run wrote or read as its own (#2312): the only ids its delivery may claim. */
+  readonly approvalRowIds = new Set<number>();
   /**
    * Failures inside the scoped views. The Dispatcher and runtime log such a failure
    * and carry on WITHOUT the block — a case would then be scored on a premise it never
@@ -80,16 +124,133 @@ export class SeedScope {
     this.entryIds.clear();
     this.threadIds.clear();
     this.specialistConversations.clear();
+    this.followOnConversations.clear();
     this.verificationIds.clear();
     this.aliveSessions.clear();
     this.principalWroteTo.clear();
     this.backlog = undefined;
+    this.rootConversation = undefined;
+    this.throughGateway = false;
+    this.threadMessages.clear();
+    this.wakeTurns.length = 0;
+    this.deliveries.length = 0;
+    this.reviews.length = 0;
+    this.approvalDisplays.clear();
+    this.inboundMessages.clear();
+    this.taskIds.clear();
+    this.seededOutreach.clear();
+    this.failOpen = new FailOpenLimiter();
+    this.approvalRowIds.clear();
+    this.drafts.clear();
     this.errors.length = 0;
   }
 }
 
 /** The calling run's scope; undefined outside every run, which then sees nothing. */
 export type CurrentScope = () => SeedScope | undefined;
+
+/** The conversations whose rows are the run's: its own and its specialists' (#2027, #2312). */
+export function runConversations(scope: SeedScope): string[] {
+  return [
+    ...(scope.rootConversation ? [scope.rootConversation] : []),
+    ...scope.specialistConversations,
+    ...scope.followOnConversations,
+  ];
+}
+
+/**
+ * Whether the relay adapters send this outbound.message (`conversationId`) or, with no id, this
+ * outbound.notification (#2312): only inside a through_gateway run, for its own conversations.
+ * Every other run's relays stay on the bus, unsent, as before.
+ */
+export function acceptsRelay(scope: SeedScope | undefined, conversationId?: string): boolean {
+  if (!scope?.throughGateway) return false;
+  return conversationId === undefined || runConversations(scope).includes(conversationId);
+}
+
+/**
+ * The action log narrowed for approve-action, deny-action and approval delivery (#2312).
+ * Production resolves a missing reference to "the sole pending approval" across the whole
+ * table, and a reference or number against every row, so one run could act on another's
+ * approval (or a real instance's). Here a missing reference means the run's sole pending
+ * approval; a reference, number or short ref that resolves to a row outside the run reads as
+ * not found; and the delivery writes keyed by row id (claim, release, bind) touch only rows the
+ * run wrote or read as its own. Inserts and everything else are production's.
+ */
+export function scopedActionLog(real: ActionLogRepo, currentScope: CurrentScope): ActionLogRepo {
+  const owned = (row: ActionLogRow, scope: SeedScope | undefined): boolean => {
+    const mine = scope !== undefined && row.conversationId !== null && runConversations(scope).includes(row.conversationId);
+    if (mine) scope.approvalRowIds.add(row.id);
+    return mine;
+  };
+  const ownsId = (id: number): boolean => currentScope()?.approvalRowIds.has(id) ?? false;
+  const runPending = async (): Promise<ActionLogRow[]> => {
+    const scope = currentScope();
+    return (await real.findAllPending()).filter(r => owned(r, scope));
+  };
+  const ownRow = (row: ActionLogRow | null): ActionLogRow | null => (row && owned(row, currentScope()) ? row : null);
+  return Object.assign(Object.create(real) as ActionLogRepo, {
+    insert: async (row: Parameters<ActionLogRepo['insert']>[0]): Promise<number> => {
+      const id = await real.insert(row);
+      const scope = currentScope();
+      if (scope && row.conversationId !== undefined && runConversations(scope).includes(row.conversationId)) scope.approvalRowIds.add(id);
+      return id;
+    },
+    findAllPending: runPending,
+    findPendingByShortRef: async (shortRef: string) => ownRow(await real.findPendingByShortRef(shortRef)),
+    findPendingByApprovalNumber: async (n: number) => ownRow(await real.findPendingByApprovalNumber(n)),
+    claimNotification: async (id: number): Promise<boolean> => (ownsId(id) ? real.claimNotification(id) : false),
+    releaseNotification: async (id: number): Promise<void> => {
+      if (ownsId(id)) await real.releaseNotification(id);
+    },
+    bindDeliveryMessage: async (...args: Parameters<ActionLogRepo['bindDeliveryMessage']>): Promise<boolean> =>
+      (ownsId(args[0]) ? real.bindDeliveryMessage(...args) : false),
+    resolvePending: async (ref?: string): Promise<ResolveResult> => {
+      if (ref === undefined) {
+        const pending = await runPending();
+        if (pending.length === 0) return { found: false, reason: 'not_found', error: 'No pending approval requests' };
+        if (pending.length > 1) {
+          return { found: false, reason: 'ambiguous', error: 'Multiple pending requests — specify the approval number.', pending };
+        }
+        // Production's own lookup on the one row, so its checks (expiry) still apply.
+        return real.resolvePending(pending[0]!.shortRef ?? String(pending[0]!.approvalNumber));
+      }
+      const result = await real.resolvePending(ref);
+      const scope = currentScope();
+      if (result.found && !owned(result.row, scope)) {
+        return { found: false, reason: 'not_found', error: `No approval request found with reference '${ref}'. ${NO_REF_RETRY_GUIDANCE}` };
+      }
+      if (!result.found && result.reason === 'ambiguous') {
+        const mine = result.pending.filter(r => owned(r, scope));
+        if (mine.length === 1) return { found: true, row: mine[0]! };
+      }
+      return result;
+    },
+  });
+}
+
+/**
+ * The outreach rows the Dispatcher's OutreachMatcher can link a reply to, narrowed to the
+ * calling run's (#2312): the rows it seeded and the rows its sends wrote. Production's finders
+ * scan every open row. Outside every run there is nothing to match.
+ */
+export function scopedOutreachRepo(real: TaskOutreachRepo, currentScope: CurrentScope): TaskOutreachRepo {
+  const mine = (rows: TaskOutreachRow[]): TaskOutreachRow[] => {
+    const scope = currentScope();
+    if (!scope) return [];
+    const conversations = runConversations(scope);
+    return rows.filter(r =>
+      scope.seededOutreach.has(r.id)
+      || (r.taskId !== null && scope.taskIds.has(r.taskId))
+      || (r.conversationId !== null && conversations.includes(r.conversationId)));
+  };
+  return Object.assign(Object.create(real) as TaskOutreachRepo, {
+    findOpen: async (limit: number) => mine(await real.findOpen(1000)).slice(0, limit),
+    findOpenByAddress: async (address: string) => mine(await real.findOpenByAddress(address)),
+    findOpenByContact: async (contactId: string) => mine(await real.findOpenByContact(contactId)),
+    findOpenByDomain: async (domain: string) => mine(await real.findOpenByDomain(domain)),
+  });
+}
 
 /**
  * The outbound-context service narrowed to the calling run's entries: what the
@@ -323,6 +484,10 @@ export interface SeededRun {
   verificationIds: string[];
   /** Principal identities this run added (seed.principal_identities), and only those. */
   principalIdentityIds: string[];
+  /** Seeded tasks (#2312); their outreach rows cascade with them. */
+  taskIds: string[];
+  /** Seeded outreach rows (#2312). */
+  outreachIds: string[];
 }
 
 export interface SeedDeps {
@@ -383,6 +548,7 @@ export async function seedRun(scenario: ScenarioCase, deps: SeedDeps): Promise<S
   const { stack, outboundContext, scope } = deps;
   const seeded: SeededRun = {
     refs: new Map(), contacts: [], entryIds: [], threads: new Map(), verificationIds: [], principalIdentityIds: [],
+    taskIds: [], outreachIds: [],
   };
   if (stack.principalContactId) seeded.refs.set('principal_contact_id', stack.principalContactId);
 
@@ -399,6 +565,19 @@ export async function seedRun(scenario: ScenarioCase, deps: SeedDeps): Promise<S
       seeded.contacts.push(created);
       seeded.refs.set(`contact:${contact.key}`, created.id);
       if (contact.principalWrote) scope.principalWroteTo.add(contact.identifier.trim().toLowerCase());
+    }
+
+    for (const task of scenario.seed.tasks) {
+      const id = await seedTask(stack, scenario, task, seeded.refs);
+      seeded.taskIds.push(id);
+      scope.taskIds.add(id);
+      seeded.refs.set(`task:${task.key}`, id);
+    }
+    for (const outreach of scenario.seed.outreach) {
+      const row = await seedOutreach(stack, scenario, outreach, seeded.refs);
+      seeded.outreachIds.push(row.id);
+      scope.seededOutreach.set(row.id, { domains: row.domains, addresses: row.addresses });
+      seeded.refs.set(`outreach:${outreach.key}`, row.id);
     }
 
     for (const raw of scenario.seed.outboundContext) {
@@ -514,6 +693,66 @@ export async function seedRun(scenario: ScenarioCase, deps: SeedDeps): Promise<S
   return seeded;
 }
 
+/** `tasks.created_by` of every seeded task: cleanup and the sweep delete only rows carrying it. */
+export const SCENARIO_TASK_CREATOR = 'scenario-suite (#2312)';
+
+/** Who a seeded task or outreach row says started it (#2312): the principal or a seeded contact. */
+function seedOriginator(stack: TestModeStack, scenario: ScenarioCase, who: string, refs: ReadonlyMap<string, string>): TaskOriginator {
+  const initiatedAt = new Date().toISOString();
+  if (who === 'principal') {
+    if (!stack.principalContactId) throw new Error('No principal contact in this database');
+    // What the Dispatcher stamps on a principal's Signal message (an authenticated channel).
+    return { contactId: stack.principalContactId, systemRole: 'principal', channel: 'signal', initiatedAt, tier: 'principal', authenticated: true };
+  }
+  const contact = scenario.seed.contacts.find(c => c.key === who)!;
+  const contactId = refs.get(`contact:${who}`)!;
+  return { contactId, systemRole: null, channel: contact.channel, initiatedAt, tier: contact.tier, authenticated: false };
+}
+
+/**
+ * A standing task (#2312), written as TaskRepo.createTask writes an open task, without its
+ * bus event or a wake job: nothing schedules it, and the run removes it.
+ */
+async function seedTask(stack: TestModeStack, scenario: ScenarioCase, task: SeedTask, refs: ReadonlyMap<string, string>): Promise<string> {
+  const originator = seedOriginator(stack, scenario, task.originator, refs);
+  const result = await stack.pool.query<{ id: string }>(
+    `INSERT INTO tasks (agent_id, title, intent_anchor, status, progress, error_budget, owner, priority, tags, source, created_by, originator)
+     VALUES ($1, $2, $3, 'open', $4::jsonb, '{}'::jsonb, 'curia', 50, '{}', 'agent', $5, $6::jsonb)
+     RETURNING id`,
+    [task.agent, task.title, task.intent ?? task.title, JSON.stringify(buildInitialTaskProgress({})), SCENARIO_TASK_CREATOR, JSON.stringify(originator)],
+  );
+  return result.rows[0]!.id;
+}
+
+/**
+ * An outreach row (#2312), inserted as it is, not through TaskOutreachRepo.record: record()
+ * would merge it into another open row it overlaps. A task-less row gets a conversation of its
+ * own under the suite's prefix, as live-turn outreach is keyed.
+ */
+async function seedOutreach(
+  stack: TestModeStack,
+  scenario: ScenarioCase,
+  outreach: SeedOutreach,
+  refs: ReadonlyMap<string, string>,
+): Promise<{ id: string; domains: string[]; addresses: string[] }> {
+  const task = outreach.task ? scenario.seed.tasks.find(t => t.key === outreach.task)! : undefined;
+  const taskId = outreach.task ? refs.get(`task:${outreach.task}`)! : null;
+  const originator = seedOriginator(stack, scenario, task?.originator ?? 'principal', refs);
+  const contactIds = outreach.contacts.map(k => refs.get(`contact:${k}`)!);
+  const result = await stack.pool.query<{ id: string; domains: string[]; addresses: string[] }>(
+    `INSERT INTO task_outreach
+       (task_id, root_task_id, conversation_id, originator, via, org_name, domains, addresses, contact_ids, summary, confirmed)
+     VALUES ($1, $1, $2, $3::jsonb, $4, $5, $6, $7, $8::uuid[], $9, $10)
+     RETURNING id, domains, addresses`,
+    [
+      taskId, taskId === null ? `${SCENARIO_ENTRY_ORIGIN}outreach-${outreach.key}-${randomUUID()}` : null,
+      JSON.stringify(originator), outreach.via, outreach.orgName ?? null, outreach.domains, outreach.addresses,
+      contactIds, outreach.summary, outreach.confirmed,
+    ],
+  );
+  return result.rows[0]!;
+}
+
 async function seedContact(stack: TestModeStack, contact: SeedContact): Promise<{ id: string; kgNodeId: string | null }> {
   // A leftover from a crashed run would make linkIdentity fail on the unique identity.
   // Remove it — but only if it is ours. A real contact on that identity is a fixture
@@ -554,7 +793,8 @@ async function seedContact(stack: TestModeStack, contact: SeedContact): Promise<
   try {
     created = await stack.contactService.createContact({
       displayName: contact.displayName,
-      tier: contact.tier,
+      // createContact refuses 'trusted': it is granted below, after the identity.
+      tier: contact.tier === 'trusted' ? 'known' : contact.tier,
       kind: contact.kind,
       role: contact.role,
       notes: SCENARIO_CONTACT_NOTE,
@@ -574,6 +814,7 @@ async function seedContact(stack: TestModeStack, contact: SeedContact): Promise<
       source: 'ceo_stated',
       verified: true,
     });
+    if (contact.tier === 'trusted') await stack.contactService.setTier(created.id, 'trusted');
   } catch (err) {
     await deleteContact(stack, created.id, kgNodeId);
     throw err;
@@ -597,10 +838,15 @@ async function deleteContact(stack: TestModeStack, id: string, kgNodeId: string 
 /**
  * Remove whatever a crashed or interrupted run left, found only by the suite's own
  * markers: tagged contacts and nodes, entries from `scenario-origin-*`, marked bullpen
- * threads, and conversation rows of `scenario-*` / `email:scenario-*` conversations.
+ * threads, and conversation rows of `scenario-*` / `email:scenario-*` conversations, plus
+ * `fixtureConversations`: the `signal:<number>` conversations of through-gateway cases'
+ * fixture numbers (fixtureSignalConversations), which carry no prefix of the suite's own.
  * Run at start-up and on SIGINT/SIGTERM. Returns what it removed, for the log.
  */
-export async function sweepLeftovers(stack: TestModeStack): Promise<Record<string, number>> {
+export async function sweepLeftovers(
+  stack: TestModeStack,
+  fixtureConversations: readonly string[] = [],
+): Promise<Record<string, number>> {
   const removed: Record<string, number> = {};
   const count = async (label: string, sql: string, params: unknown[]): Promise<void> => {
     const result = await stack.pool.query(sql, params);
@@ -640,11 +886,49 @@ export async function sweepLeftovers(stack: TestModeStack): Promise<Record<strin
   await count('verifications',
     `DELETE FROM verifications WHERE conversation_id LIKE ANY($1::text[])`,
     [[`${SCENARIO_VERIFICATION_ORIGIN}%`, ...SCENARIO_CONVERSATION_PREFIXES.map(p => `${p}%`)]]);
+  // What through-gateway sends wrote (#2312), by the run conversations they ran in, and the
+  // seeded tasks (their outreach cascades) and task-less seeded outreach.
+  const runPatterns = SCENARIO_CONVERSATION_PREFIXES.map(p => `${p}%`);
+  await count('autonomy_action_log',
+    `DELETE FROM autonomy_action_log WHERE conversation_id LIKE ANY($1::text[])`, [runPatterns]);
+  await count('disclosure_decisions',
+    `DELETE FROM disclosure_decisions WHERE conversation_id LIKE ANY($1::text[])`, [runPatterns]);
+  await count('tasks', `DELETE FROM tasks WHERE created_by = $1`, [SCENARIO_TASK_CREATOR]);
+  await count('task_outreach',
+    `DELETE FROM task_outreach WHERE conversation_id LIKE ANY($1::text[])`,
+    [[`${SCENARIO_ENTRY_ORIGIN}%`, ...runPatterns]]);
   const conversations = await sweepConversations(stack.pool, SCENARIO_CONVERSATION_PREFIXES);
   for (const [table, rows] of Object.entries(conversations)) {
     if (rows > 0) removed[table] = rows;
   }
+  // A through-gateway Signal reply runs in `signal:<fixture number>` (harness.ts), by exact id:
+  // its turns, and what its sends wrote there. Fixture numbers are the cases' own, never a
+  // real contact's (seedContact refuses an identity a real contact holds).
+  if (fixtureConversations.length > 0) {
+    const ids = [...fixtureConversations];
+    for (const table of [...CONVERSATION_TABLES, 'autonomy_action_log', 'disclosure_decisions', 'task_outreach', 'outbound_context'] as const) {
+      // Table names come from the list above, never from input.
+      const result = await stack.pool.query(`DELETE FROM ${table} WHERE conversation_id = ANY($1::text[])`, [ids]);
+      if ((result.rowCount ?? 0) > 0) removed[table] = (removed[table] ?? 0) + (result.rowCount ?? 0);
+    }
+  }
   return removed;
+}
+
+/**
+ * The `signal:<number>` conversations a through-gateway case's Signal third party replies in
+ * (harness.ts names them so): one per Signal contact any loaded case seeds, selected or not,
+ * so a sweep finds what an earlier selection's crashed run left.
+ */
+export function fixtureSignalConversations(cases: readonly ScenarioCase[]): string[] {
+  const ids = new Set<string>();
+  for (const c of cases) {
+    if (c.throughGateway !== true) continue;
+    for (const contact of c.seed.contacts) {
+      if (contact.channel === 'signal') ids.add(`signal:${contact.identifier}`);
+    }
+  }
+  return [...ids].sort();
 }
 
 /**
@@ -669,7 +953,38 @@ export function seedConflictKeys(scenario: ScenarioCase): string[] {
 }
 
 /** Conversation ids a run uses (harness.ts); the sweep finds leftovers by them. */
-export const SCENARIO_CONVERSATION_PREFIXES = ['scenario-', 'email:scenario-'] as const;
+export const SCENARIO_CONVERSATION_PREFIXES = ['scenario-', 'email:scenario-', 'scheduler:scenario-'] as const;
+
+/**
+ * A run conversation's rows (cleanupConversation), plus the outreach its sends recorded
+ * (#2312). Late turns (an abandoned specialist, a timed-out coordinator turn, a follow-up)
+ * clean up with this too, so a send that finishes after the run's cleanup leaves nothing.
+ */
+export async function cleanupScenarioConversation(pool: DbPool, conversationId: string): Promise<void> {
+  await cleanupConversation(pool, conversationId);
+  await pool.query(`DELETE FROM task_outreach WHERE conversation_id = $1`, [conversationId]);
+  // What a through-gateway send there wrote: approvals and the principal's answers.
+  await pool.query(`DELETE FROM autonomy_action_log WHERE conversation_id = $1`, [conversationId]);
+  await pool.query(`DELETE FROM disclosure_decisions WHERE conversation_id = $1`, [conversationId]);
+}
+
+/**
+ * Holds back a turn's own cleanup while its run's gateway outcome is unread (#2312). A turn that
+ * settles first would delete the approvals and answers readGatewayOutcome reads; the run's
+ * cleanupRun removes them after the read instead. Released, a late turn cleans up after itself.
+ */
+export function createOutcomeGate(clean: (conversationId: string) => Promise<void>): {
+  hold(conversationId: string): void;
+  release(conversationIds: Iterable<string>): void;
+  clean(conversationId: string): Promise<void>;
+} {
+  const unread = new Set<string>();
+  return {
+    hold: (id) => { unread.add(id); },
+    release: (ids) => { for (const id of ids) unread.delete(id); },
+    clean: (id) => (unread.has(id) ? Promise.resolve() : clean(id)),
+  };
+}
 
 export async function cleanupRun(
   stack: TestModeStack,
@@ -701,12 +1016,24 @@ export async function cleanupRun(
     // Messages and read watermarks cascade.
     await attempt(() => stack.pool.query(`DELETE FROM bullpen_threads WHERE id = ANY($1::uuid[])`, [threadIds]));
   }
+  // Conversation rows and the outreach the run's sends recorded (#2312), taskless rows included.
   if (conversationId) {
-    await attempt(() => cleanupConversation(stack.pool, conversationId));
+    await attempt(() => cleanupScenarioConversation(stack.pool, conversationId));
   }
-  const specialists = [...scope.specialistConversations];
+  // A later principal turn's conversation is cleaned like a specialist's.
+  const specialists = [...scope.specialistConversations, ...scope.followOnConversations];
   for (const specialist of specialists) {
-    await attempt(() => cleanupConversation(stack.pool, specialist));
+    await attempt(() => cleanupScenarioConversation(stack.pool, specialist));
+  }
+  // The seeded tasks (their outreach rows cascade) and task-less seeded outreach. What the run's
+  // sends wrote is gone already, with each conversation (cleanupScenarioConversation).
+  if (seeded.outreachIds.length > 0) {
+    await attempt(() => stack.pool.query(`DELETE FROM task_outreach WHERE id = ANY($1::uuid[])`, [seeded.outreachIds]));
+  }
+  if (seeded.taskIds.length > 0) {
+    await attempt(() => stack.pool.query(
+      `DELETE FROM tasks WHERE id = ANY($1::uuid[]) AND created_by = $2`, [seeded.taskIds, SCENARIO_TASK_CREATOR],
+    ));
   }
   if (conversationId || specialists.length > 0) {
     // A dispatch claim a timed-out delegation kept (#1893): nothing in test mode promotes
@@ -831,4 +1158,77 @@ export async function resolveEnvelope(scenario: ScenarioCase, stack: TestModeSta
 /** A fresh outbound-context service on the stack's pool (the stack does not build one). */
 export function createOutboundContextService(stack: TestModeStack): OutboundContextService {
   return new OutboundContextService(stack.pool, stack.logger);
+}
+
+/**
+ * What a through-gateway run's sends did (#2312), read when its turns have ended and before its
+ * rows are removed: the recorded deliveries, the approvals raised in its conversations (with
+ * what each shows the principal), the outreach its sends recorded, and the principal's answers.
+ * Recipients are named the way the case names them, so checks can say `to: pat` or `principal`.
+ */
+export async function readGatewayOutcome(stack: TestModeStack, scenario: ScenarioCase, seeded: SeededRun, scope: SeedScope): Promise<GatewayOutcome> {
+  const principal = new Set(stack.principalIdentities.map(i => i.channelIdentifier.toLowerCase()));
+  const byIdentifier = new Map(scenario.seed.contacts.map(c => [c.identifier.toLowerCase(), c.key]));
+  const nameOf = (address: string): string => {
+    const lower = address.toLowerCase();
+    if (principal.has(lower)) return 'principal';
+    return byIdentifier.get(lower) ?? address;
+  };
+  const conversations = runConversations(scope);
+
+  const holds = await stack.pool.query<{
+    short_ref: string; approval_number: number | null; tool_name: string; outcome: string; description: string | null;
+  }>(
+    `SELECT short_ref, approval_number, skill_name AS tool_name, outcome, description FROM autonomy_action_log
+      WHERE conversation_id = ANY($1::text[]) AND short_ref IS NOT NULL AND parent_action_id IS NULL
+      ORDER BY id`,
+    [conversations],
+  );
+  const outreach = await stack.pool.query<{ id: string; domains: string[]; addresses: string[]; confirmed: boolean; via: string }>(
+    `SELECT id, domains, addresses, confirmed, via FROM task_outreach
+      WHERE conversation_id = ANY($1::text[]) OR task_id = ANY($2::uuid[]) OR id = ANY($3::uuid[])
+      ORDER BY created_at`,
+    [conversations, seeded.taskIds, seeded.outreachIds],
+  );
+  const decisions = await stack.pool.query<{ label: string; decision: 'yes' | 'no' }>(
+    `SELECT label, decision FROM disclosure_decisions WHERE conversation_id = ANY($1::text[]) ORDER BY id`,
+    [conversations],
+  );
+
+  const same = (a: string[], b: string[]): boolean => a.length === b.length && [...a].sort().every((v, i) => v === [...b].sort()[i]);
+  return {
+    deliveries: scope.deliveries.map(d => ({
+      channel: d.channel,
+      kind: d.kind,
+      to: d.to,
+      cc: d.cc,
+      toNames: d.to.map(nameOf),
+      ccNames: d.cc.map(nameOf),
+      ...(d.subject !== undefined ? { subject: d.subject } : {}),
+      body: d.body,
+      ...(d.ownBody !== undefined ? { ownBody: d.ownBody } : {}),
+      ...(d.quotedBody !== undefined ? { quotedBody: d.quotedBody } : {}),
+    })),
+    reviews: scope.reviews.map(r => ({ labels: [...r.labels], quoteLabels: [...r.quoteLabels], outcome: r.outcome })),
+    holds: holds.rows.map(r => {
+      const shown = scope.approvalDisplays.get(r.short_ref);
+      return {
+        shortRef: r.short_ref,
+        approvalNumber: r.approval_number,
+        toolName: r.tool_name,
+        outcome: r.outcome,
+        description: r.description,
+        ...(shown ? { preamble: shown.preamble } : {}),
+        ...(shown?.extraLines ? { extraLines: shown.extraLines } : {}),
+      };
+    }),
+    // A seeded row counts only when the run's sends added to it.
+    outreach: outreach.rows.flatMap(r => {
+      const seededRow = scope.seededOutreach.get(r.id);
+      if (seededRow && same(seededRow.domains, r.domains) && same(seededRow.addresses, r.addresses)) return [];
+      return [{ domains: r.domains, addresses: r.addresses, confirmed: r.confirmed, via: r.via, seeded: seededRow !== undefined }];
+    }),
+    decisions: decisions.rows.map(r => ({ label: r.label, decision: r.decision })),
+    reviewerFailedOpen: scope.failOpen.isTripped(),
+  };
 }

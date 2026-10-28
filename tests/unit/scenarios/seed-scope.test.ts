@@ -1,5 +1,5 @@
 // Seeded state stays with the run that seeded it when runs overlap (#1980).
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { BullpenService } from '../../../src/memory/bullpen.js';
 import type { OutboundContextRow, OutboundContextService } from '../../../src/dispatch/outbound-context.js';
 import { createCaseContext, newAttempt, type CaseAttempt } from '../../shared/case-scope.js';
@@ -15,7 +15,9 @@ import {
   removeSeededPrincipalIdentities,
   SeedScope,
   seedConflictKeys,
+  fixtureSignalConversations,
   seedPrincipalIdentity,
+  createOutcomeGate,
 } from '../../scenarios/seed.js';
 import type { DbPool } from '../../../src/db/connection.js';
 import type { ScenarioCase } from '../../scenarios/types.js';
@@ -342,5 +344,44 @@ describe('seedConflictKeys', () => {
       { site: 'Login.Example-Insurer.ca', status: 'pending' },
       { site: 'aircanada.com', status: 'expired' },
     ]))).toEqual(['verification-site:example-insurer.ca', 'verification-site:aircanada.com']);
+  });
+});
+
+// A through-gateway Signal reply runs in `signal:<fixture number>`, which carries no prefix of
+// the suite's own: the crash sweep finds it by the numbers the loaded cases seed (#2312 review).
+describe('fixtureSignalConversations', () => {
+  const contact = (channel: string, identifier: string) => ({ key: identifier, channel, identifier, displayName: identifier });
+  const scenario = (throughGateway: boolean | undefined, contacts: ReturnType<typeof contact>[]) =>
+    ({ throughGateway, seed: { contacts } }) as unknown as ScenarioCase;
+
+  it('names each through-gateway case\'s Signal fixture number once', () => {
+    expect(fixtureSignalConversations([
+      scenario(true, [contact('signal', '+15195550123'), contact('email', 'priya@northbank.test')]),
+      scenario(true, [contact('signal', '+15195550123'), contact('signal', '+15195550188')]),
+    ])).toEqual(['signal:+15195550123', 'signal:+15195550188']);
+  });
+
+  it('leaves out cases that stub their sends: their turns never run in a signal: conversation', () => {
+    expect(fixtureSignalConversations([
+      scenario(undefined, [contact('signal', '+15195550999')]),
+      scenario(false, [contact('signal', '+15195550998')]),
+    ])).toEqual([]);
+  });
+});
+
+describe('createOutcomeGate (#2312)', () => {
+  it('holds a conversation\'s cleanup until its outcome is released, then cleans as before', async () => {
+    const clean = vi.fn().mockResolvedValue(undefined);
+    const gate = createOutcomeGate(clean);
+    gate.hold('scenario-a');
+    // A turn settling before the outcome read leaves its approvals and answers in place.
+    await gate.clean('scenario-a');
+    expect(clean).not.toHaveBeenCalled();
+    // Another conversation is not held.
+    await gate.clean('scenario-b');
+    expect(clean).toHaveBeenCalledWith('scenario-b');
+    gate.release(['scenario-a']);
+    await gate.clean('scenario-a');
+    expect(clean).toHaveBeenCalledWith('scenario-a');
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { convertNylasMessage, parseSenderVerified } from '../../../../src/channels/email/message-converter.js';
+import { convertNylasMessage, parseSenderVerified, senderAuthenticationStatus } from '../../../../src/channels/email/message-converter.js';
 import type { NylasMessage } from '../../../../src/channels/email/nylas-client.js';
 
 // ---------------------------------------------------------------------------
@@ -333,8 +333,55 @@ describe('convertNylasMessage — curiaRole and primaryRecipientEmails', () => {
 });
 
 // ---------------------------------------------------------------------------
+// curiaMailbox — the Curia address in To, for the outreach matcher (#2312)
+// ---------------------------------------------------------------------------
+
+describe('convertNylasMessage — curiaMailbox', () => {
+  const SELF_EMAIL = 'curia@example.com';
+
+  it('is Curia\'s own To address, lowercased, plus-tag kept', () => {
+    const plain = convertNylasMessage(mockMessage({ to: [{ email: 'nik@example.com' }, { email: 'Curia@Example.com' }] }), SELF_EMAIL);
+    expect(plain.metadata.curiaMailbox).toBe('curia@example.com');
+    const tagged = convertNylasMessage(mockMessage({ to: [{ email: 'Curia+Ops@Example.com' }] }), SELF_EMAIL);
+    expect(tagged.metadata.curiaMailbox).toBe('curia+ops@example.com');
+  });
+
+  it('is absent when Curia is CC\'d', () => {
+    const r = convertNylasMessage(mockMessage({ to: [{ email: 'nik@example.com' }], cc: [{ email: SELF_EMAIL }] }), SELF_EMAIL);
+    expect(r.metadata).not.toHaveProperty('curiaMailbox');
+  });
+
+  it('is absent when Curia is in neither To nor CC (BCC, or an alias that forwards to it)', () => {
+    const bcc = convertNylasMessage(mockMessage({ to: [{ email: 'nik@example.com' }], cc: [{ email: 'alice@example.com' }] }), SELF_EMAIL);
+    expect(bcc.metadata.curiaRole).toBe('to');
+    expect(bcc.metadata).not.toHaveProperty('curiaMailbox');
+    const alias = convertNylasMessage(mockMessage({ to: [{ email: 'assistant@example.com' }] }), SELF_EMAIL);
+    expect(alias.metadata).not.toHaveProperty('curiaMailbox');
+  });
+
+  it('is absent when Curia\'s own address is unknown', () => {
+    expect(convertNylasMessage(mockMessage()).metadata).not.toHaveProperty('curiaMailbox');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // parseSenderVerified — Authentication-Results header parsing
 // ---------------------------------------------------------------------------
+
+describe('senderAuthenticationStatus (#2312)', () => {
+  const ar = (value: string) => [{ name: 'Authentication-Results', value }];
+  it('is passed exactly when parseSenderVerified is true', () => {
+    expect(senderAuthenticationStatus(ar('mx.google.com; spf=pass; dkim=pass; dmarc=pass'))).toBe('passed');
+  });
+  it('is failed when a mechanism explicitly failed', () => {
+    expect(senderAuthenticationStatus(ar('mx.google.com; spf=pass; dkim=pass; dmarc=fail'))).toBe('failed');
+  });
+  it('is not confirmed with no Authentication-Results, or nothing that passed or failed', () => {
+    expect(senderAuthenticationStatus(undefined)).toBe('not confirmed');
+    expect(senderAuthenticationStatus([{ name: 'Subject', value: 'hi' }])).toBe('not confirmed');
+    expect(senderAuthenticationStatus(ar('mx.google.com; spf=none; dkim=none; dmarc=none'))).toBe('not confirmed');
+  });
+});
 
 describe('parseSenderVerified', () => {
   it('returns true when SPF, DKIM, and DMARC all pass', () => {

@@ -225,6 +225,13 @@ export interface TaskOriginator {
    * Used by execution-layer Gate C to apply the action policy from issue #948.
    */
   tier?: ContactTier | null;
+  /**
+   * The originating message authenticated its sender (inboundSenderAuthenticated: Signal and
+   * Slack, email only when the adapter verified it; never SMS or voice). Missing reads as false:
+   * originators stamped before #2312, system/console originators, and anything not proven.
+   * Travels with the originator to child tasks, like the rest of the lineage.
+   */
+  authenticated?: boolean;
 }
 
 // -- Authorization types --

@@ -6,6 +6,7 @@
 import type { BoundTaskContext } from '../agents/resumable-task.js';
 import type { Logger } from '../logger.js';
 import type { OutboundContextCapability } from './outbound-context.js';
+import { recordSendOutreach, type SendOutreach } from './task-outreach-capability.js';
 import { buildTaskWakeAutoBridge, TASK_WAKE_BIND_REPLY_KEY, TASK_WAKE_TASK_ID_KEY, TASK_WAKE_REPLY_TTL_HOURS } from './task-wake-reply.js';
 
 export interface ContextBridgeInput {
@@ -94,6 +95,8 @@ async function taskBindSuppressed(
  *   the channel's default window
  * - If absent/null/malformed → registers minimal entry (agentId + channelId + content);
  *   TTL = the channel's default window (defaultExpiryHoursFor)
+ * - With `outreach`, also records the send as task outreach on a task-bound turn (#2312),
+ *   independently of the outbound-context entry
  * - Never throws — logs warnings on failure
  */
 export async function registerOutboundContext(
@@ -111,11 +114,18 @@ export async function registerOutboundContext(
      * reply from one of them; omitted, the entry is shown on principal turns only.
      */
     recipientContactIds?: readonly string[];
+    /** The turn and recipients, so a task-bound send leaves a task_outreach row (#2312). */
+    outreach?: SendOutreach;
   },
 ): Promise<void> {
+  const { channelId, content, agentId, log, boundTask, recipientContactIds, outreach } = opts;
+
+  // Before the early return: a deployment without outbound context still records outreach.
+  // recordSendOutreach never throws.
+  if (outreach) await recordSendOutreach(outreach, { recipientContactIds, log });
+
   if (!outboundContext) return;
 
-  const { channelId, content, agentId, log, boundTask, recipientContactIds } = opts;
   const recipients = recipientContactIds && recipientContactIds.length > 0 ? { recipientContactIds } : {};
 
   try {

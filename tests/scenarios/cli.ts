@@ -25,13 +25,13 @@ import {
   type ScenarioHarness,
 } from './harness.js';
 import { createJudge, judgeRun, type Judge } from './judge.js';
-import { loadScenarioCases, resolveRunPlaceholders } from './loader.js';
-import { describeError, seedConflictKeys } from './seed.js';
+import { loadScenarioCases, resolveRunPlaceholders, selectRunCases } from './loader.js';
+import { describeError, fixtureSignalConversations, seedConflictKeys } from './seed.js';
 import { DEFAULT_CONCURRENCY, parseConcurrency, runConcurrently } from '../shared/case-scope.js';
 import { liveSearchLines } from '../shared/live-search.js';
 import { formatUsageLines, formatUsd, sumBreakdowns, UsageLedger } from '../shared/usage.js';
 import { describeReasoningOverride, parseReasoningEffortFlag } from '../shared/reasoning-flag.js';
-import { autonomyFixtureMismatch, type AutonomyFixture, type TierReasoningOverride } from '../../src/startup/test-mode-stack.js';
+import type { AutonomyFixture, TierReasoningOverride } from '../../src/startup/test-mode-stack.js';
 import { mustStub } from './stub-layer.js';
 import { buildOverlay } from './overlay.js';
 import { coverageViolations, mergeCoverage, readCoverage, writeCoverage } from './stub-coverage.js';
@@ -144,7 +144,7 @@ function staticProblems(cases: ScenarioCase[], harness: ScenarioHarness): string
       ? `${agents[0] === COORDINATOR ? 'the coordinator' : `'${agents[0]}'`} is neither offered nor can activate`
       : 'no agent in the run is offered or can activate');
     const mustStubHere = (tool: string): boolean =>
-      mustStub(tool, registry, harness.unavailableTools, harness.inertTools, { realDelegation: real });
+      mustStub(tool, registry, harness.unavailableTools, harness.inertTools, { realDelegation: real, throughGateway: c.throughGateway === true });
     /** Stubs for `tool` that can answer a call by one of `agents`. */
     const stubsFor = (tool: string, agents: string[]) =>
       (c.toolStubs[tool] ?? []).filter(st => st.agent === undefined || agents.includes(st.agent));
@@ -309,21 +309,19 @@ async function main(): Promise<void> {
   // A deployment's agents and cases are its own repo's code: name that commit too.
   const overlayCommit = args.overlay ? gitCommit(args.overlay) : undefined;
 
-  let cases = loadScenarioCases(args.casesDir ?? CASES_DIR, args.stubsDir ? { extraStubsDirs: [args.stubsDir] } : {});
-  if (args.caseFilter) cases = cases.filter(c => c.name.toLowerCase().includes(args.caseFilter!.toLowerCase()));
-  if (args.tags) cases = cases.filter(c => c.tags.some(t => args.tags!.includes(t)));
-  // An unfiltered run is the release gate: on-demand cases join it only when asked (#2027).
-  // A --case or --tags selection runs whatever it names.
-  const selected = args.caseFilter !== undefined || args.tags !== undefined;
-  const onDemandSkipped = selected || args.onDemand ? [] : cases.filter(c => !c.releaseGate).map(c => c.name);
-  cases = cases.filter(c => !onDemandSkipped.includes(c.name));
-  // A case with an identity fixture (#2143) or an autonomy fixture needs the whole stack on
-  // it, and a run has one stack. So it runs only in a selection of fixture cases alone
-  // (--tags style): never in an unfiltered run, --on-demand included, and not beside
-  // ordinary cases a wider selection (--tags ceo-inbox) also picks.
-  const hasFixture = (c: ScenarioCase): boolean => c.identity !== undefined || c.autonomy !== undefined;
-  const identitySkipped = selected && cases.every(hasFixture) ? [] : cases.filter(hasFixture).map(c => c.name);
-  cases = cases.filter(c => !identitySkipped.includes(c.name));
+  // The release gate, or a --case / --tags selection; identity cases only alone (loader.ts).
+  // Autonomy fixtures are per case (#2312): any mix of them runs in one suite run.
+  const loadedCases = loadScenarioCases(args.casesDir ?? CASES_DIR, args.stubsDir ? { extraStubsDirs: [args.stubsDir] } : {});
+  // Every loaded case's, selected or not: an earlier selection's crashed run may have left them.
+  const signalConversations = fixtureSignalConversations(loadedCases);
+  const { cases, onDemandSkipped, identitySkipped } = selectRunCases(
+    loadedCases,
+    {
+      ...(args.caseFilter !== undefined ? { caseFilter: args.caseFilter } : {}),
+      ...(args.tags !== undefined ? { tags: args.tags } : {}),
+      onDemand: args.onDemand,
+    },
+  );
   if (cases.length === 0) {
     err('No scenario cases match the filters.');
     process.exit(1);
@@ -334,14 +332,11 @@ async function main(): Promise<void> {
     err('Select one fixture\'s cases at a time.');
     process.exit(1);
   }
-  const autonomyNames = new Set(cases.map(c => (c.autonomy ? describeAutonomy(c.autonomy) : 'the database\'s')));
-  if (autonomyNames.size > 1) {
-    err(`These cases need different autonomy fixtures (${[...autonomyNames].join(', ')}), and a run has one.`);
-    err('Select one fixture\'s cases at a time.');
-    process.exit(1);
-  }
   const identity = cases[0]!.identity;
-  const autonomy = cases[0]!.autonomy;
+  // Each entered per attempt by the harness, which reads it back there (#2312).
+  const caseAutonomy: Record<string, string> = Object.fromEntries(
+    cases.filter(c => c.autonomy).map(c => [c.name, describeAutonomy(c.autonomy!)]),
+  );
 
   out('\nScenario suite');
   out(`   ${cases.length} case(s); runs per case: ${args.runs ?? `per case, default ${DEFAULT_RUNS}`}`);
@@ -352,10 +347,15 @@ async function main(): Promise<void> {
     out(`   On demand, not run: ${onDemandSkipped.length} case(s) marked release_gate: false (--on-demand runs them)`);
   }
   if (identitySkipped.length > 0) {
-    out(`   Not run: ${identitySkipped.length} case(s) with an identity or autonomy fixture (select only them, e.g. --tags style)`);
+    out(`   Not run: ${identitySkipped.length} case(s) with an identity fixture (select only them, e.g. --tags style)`);
   }
   if (identity) out(`   Office identity: fixture '${identity.name}' over the database's assistant (tests/scenarios/identities)`);
-  if (autonomy) out(`   Autonomy: fixture ${describeAutonomy(autonomy)} over the database's score`);
+  const fixtureCounts = new Map<string, number>();
+  for (const label of Object.values(caseAutonomy)) fixtureCounts.set(label, (fixtureCounts.get(label) ?? 0) + 1);
+  if (fixtureCounts.size > 0) {
+    const counts = [...fixtureCounts].map(([label, n]) => `${label} ×${n}`).join(', ');
+    out(`   Autonomy fixtures: ${Object.keys(caseAutonomy).length} case(s) pin their own over the database's (${counts})`);
+  }
   out(`   Concurrency: ${args.concurrency} case(s) at a time (--concurrency)`);
   if (args.overlay) out(`   Overlay: ${args.overlay} (agents, skills and config laid over core's)`);
   if (args.casesDir) out(`   Cases: ${args.casesDir}`);
@@ -368,33 +368,27 @@ async function main(): Promise<void> {
       model: args.model,
       ...(args.reasoning ? { reasoning: args.reasoning } : {}),
       ...(identity ? { officeIdentity: identity.config } : {}),
-      ...(autonomy ? { autonomy } : {}),
       ...(overlay ?? {}),
       ...(args.mcpSnapshots ? { mcpSnapshotDirs: [args.mcpSnapshots] } : {}),
+      // Band review without its judge fails every detected item closed: refuse at boot rather
+      // than error each through-gateway run (#2312).
+      ...(cases.some(c => c.throughGateway === true) ? { requireBandReviewJudge: true } : {}),
     });
   } catch (e) {
     overlay?.cleanup();
     err(`\nFailed to boot: ${e instanceof Error ? e.message : String(e)}`);
     err('Needs DATABASE_URL (migrated, with a principal), SECRET_ENCRYPTION_KEY, and the model\'s provider key in the vault (#911).');
+    if (cases.some(c => c.throughGateway === true)) err('through_gateway cases also need the band-review judge\'s provider key (escalation.judge.model; anthropic_api_key by default).');
     process.exit(1);
   }
 
-  // What the agents actually see, read back from the stack: a fixture that never reached
-  // it must stop the run, not be reported as in force.
+  // What a case without a fixture sees, read back from the stack outside any case. A case's
+  // own fixture is read back inside each of its attempts (harness.ts: caseAutonomyError).
   const autonomyConfig = await harness.stack.autonomyService.getConfig();
-  if (autonomy) {
-    const mismatch = autonomyFixtureMismatch(autonomy, autonomyConfig);
-    if (mismatch) {
-      err(`\nAutonomy fixture not in force: ${mismatch}.`);
-      await harness.shutdown();
-      overlay?.cleanup();
-      process.exit(1);
-    }
-  }
   const autonomyInForce = autonomyConfig
     ? describeAutonomy({ score: autonomyConfig.score, gating: autonomyConfig.gating ?? 'tier' })
     : 'none (no autonomy_config row)';
-  out(`   Autonomy in force: ${autonomyInForce}${autonomy ? ' (fixture)' : ' (database)'}`);
+  out(`   Autonomy in force: ${autonomyInForce} (database${fixtureCounts.size > 0 ? '; cases without a fixture' : ''})`);
 
   const model = args.model ?? harness.stack.yamlConfig.model_routing?.tiers.standard.model ?? 'configured routing';
   const reasoningLabel = describeReasoningOverride(args.reasoning);
@@ -439,7 +433,7 @@ async function main(): Promise<void> {
 
     // A crashed or interrupted earlier run may have left fixtures a real instance would
     // act on. Found only by the suite's own markers.
-    const swept = await harness.sweep();
+    const swept = await harness.sweep(signalConversations);
     if (Object.keys(swept).length > 0) {
       out(`   Removed leftovers from an interrupted run: ${Object.entries(swept).map(([t, n]) => `${t} ×${n}`).join(', ')}`);
     }
@@ -447,7 +441,7 @@ async function main(): Promise<void> {
     // Ctrl-C mid-run would skip the run's cleanup. Sweep on the way out instead.
     const onSignal = (signal: NodeJS.Signals): void => {
       err(`\n${signal}: cleaning up scenario fixtures before exiting...`);
-      void harness.sweep()
+      void harness.sweep(signalConversations)
         .catch((e: unknown) => err(`  [WARN] cleanup on ${signal} failed: ${e instanceof Error ? e.message : String(e)} — re-run to sweep leftovers`))
         .finally(() => process.exit(130));
     };
@@ -573,6 +567,7 @@ async function main(): Promise<void> {
       ...(onDemandSkipped.length > 0 ? { onDemandSkipped } : {}),
       ...(identity ? { identity: identity.name } : {}),
       autonomy: autonomyInForce,
+      ...(Object.keys(caseAutonomy).length > 0 ? { caseAutonomy } : {}),
       runsPerCase: Object.fromEntries(results.map(r => [r.name, r.runs.length])),
       cases: results,
       passed: failures.length === 0,
@@ -596,6 +591,7 @@ async function main(): Promise<void> {
       const retried = r.runs.reduce((n, run) => n + run.providerRetries.length, 0);
       out(
         `   ${status} ${formatPct(r.weightedScore).padStart(4)}  ${formatUsd(r.usage.total.estimatedCostUsd).padStart(7)}  ${r.name}` +
+        `${caseAutonomy[r.name] ? `  (autonomy ${caseAutonomy[r.name]})` : ''}` +
         `${r.knownFailure ? `  (known failure ${r.knownFailure.issue})` : ''}` +
         `${retried > 0 ? `  (${retried} provider retr${retried === 1 ? 'y' : 'ies'})` : ''}`,
       );
@@ -605,7 +601,7 @@ async function main(): Promise<void> {
     out(`   Model:   ${model}`);
     out(`   Reasoning: ${reasoningLabel}`);
     if (identity) out(`   Identity: ${identity.name}`);
-    out(`   Autonomy: ${autonomyInForce}`);
+    out(`   Autonomy: ${autonomyInForce}${Object.keys(caseAutonomy).length > 0 ? ' (cases without a fixture; the others as marked)' : ''}`);
     out(`   Results: ${resultsFile}`);
     out(`   Time:    ${Math.round(suite.durationMs / 1000)}s (concurrency ${args.concurrency})`);
     out('\n   Model spend (estimated from registry prices; tests/shared/usage.ts):');

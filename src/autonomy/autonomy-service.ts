@@ -88,6 +88,19 @@ const BAND_DESCRIPTIONS_BAND_GATING: Record<AutonomyBand, string> = {
     'Propose and draft only. Take no action with an external effect.',
 };
 
+// Under band gating the outbound gateway rules on each personal detail a send carries (#2312,
+// ADR-054), so the drafter writes what was asked and the gateway decides. Without this the
+// LOW-TRUST and trust-score rules have the drafter withhold the detail before review sees it.
+// The LOW-TRUST block (src/agents/runtime.ts) and the trust-score table
+// (src/security/security-context.ts) point here by this heading.
+export const PERSONAL_DETAILS_RULE =
+  '**Personal details.** When someone asks for the principal\'s details (a phone number, email ' +
+  'address, home address, SIN, health card or similar), or the principal or a trusted contact ' +
+  'tells you to send them, write the details asked for in your message, as they are. Do not ' +
+  'decline, withhold or paraphrase them because of the sender\'s tier or trust score: the ' +
+  'outbound gateway reviews each detail against who authorized it, and sends it, holds it for ' +
+  'the principal\'s yes, or returns your draft with a reason. Follow that reason.';
+
 // Human-readable band labels for display.
 const BAND_LABELS: Record<AutonomyBand, string> = {
   'full': 'Full',
@@ -168,6 +181,7 @@ export class AutonomyService {
       `Your current autonomy score is ${config.score} (${label}).`,
       '',
       description,
+      ...(config.gating === 'band' ? ['', PERSONAL_DETAILS_RULE] : []),
     ].join('\n');
   }
 

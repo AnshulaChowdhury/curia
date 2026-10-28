@@ -1032,4 +1032,32 @@ describe('band gating (#2159)', () => {
     });
     expect(leak.findings.map((f) => f.rule)).toContain('system-prompt-fragment');
   });
+  // The gateway passes the send's gating (#2312): the scenario suite pins it per case.
+  describe('per-call gating overrides the constructed one', () => {
+    const leakInput = {
+      content: 'Adam is copied at adam@example.com.', recipientEmail: 'joel@example.com',
+      conversationId: 'c', channelId: 'email', recipientTier: 'known' as const,
+    };
+    const judge = () => ({ isEnabled: () => true, classifyDisclosure: vi.fn(async () => ({ decision: 'allow', reason: 'x' })) }) as unknown as EscalationJudge;
+
+    it('turns contact-data-leak and Stage 2.5 off when a tier-built filter is told band', async () => {
+      const escalationJudge = judge();
+      const filter = new OutboundContentFilter({ systemPromptMarkers: [], ceoEmail: 'principal@example.com', escalationJudge, gating: 'tier' });
+      expect((await filter.check({ ...leakInput, gating: 'band' })).passed).toBe(true);
+      expect(escalationJudge.classifyDisclosure).not.toHaveBeenCalled();
+    });
+
+    it('turns them back on when a band-built filter is told tier', async () => {
+      const escalationJudge = judge();
+      const filter = new OutboundContentFilter({ systemPromptMarkers: [], ceoEmail: 'principal@example.com', escalationJudge, gating: 'band' });
+      expect((await filter.check({ ...leakInput, gating: 'tier' })).findings.map((f) => f.rule)).toContain('contact-data-leak');
+      await filter.check({ ...leakInput, content: 'hello', gating: 'tier' });
+      expect(escalationJudge.classifyDisclosure).toHaveBeenCalledOnce();
+    });
+
+    it('keeps the constructed gating when the input names none', async () => {
+      const filter = new OutboundContentFilter({ systemPromptMarkers: [], ceoEmail: 'principal@example.com', gating: 'band' });
+      expect((await filter.check(leakInput)).passed).toBe(true);
+    });
+  });
 });

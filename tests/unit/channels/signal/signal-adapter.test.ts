@@ -766,3 +766,22 @@ describe('SignalAdapter', () => {
     });
   });
 });
+
+describe('SignalAdapter — subscribeOutbound once-guard (#2312)', () => {
+  it('a second subscribeOutbound() subscribes nothing more', () => {
+    const bus = new EventBus(createLogger('error'));
+    const subscribe = vi.spyOn(bus, 'subscribe');
+    const adapter = new SignalAdapter({
+      bus,
+      logger: makeSilentLogger(),
+      rpcClient: makeMockRpcClient(),
+      outboundGateway: makeMockGateway(),
+      contactService: makeMockContactService(),
+      phoneNumber: '+15555550000',
+    });
+    adapter.subscribeOutbound();
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    adapter.subscribeOutbound();
+    expect(subscribe).toHaveBeenCalledTimes(1);
+  });
+});

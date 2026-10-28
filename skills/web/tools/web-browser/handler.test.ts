@@ -45,6 +45,9 @@ import { CodeTracker } from '../../../../src/verification/code-tracker.js';
 import type { VerificationRuntime } from '../../../../src/verification/index.js';
 import type { Verification } from '../../../../src/verification/types.js';
 import { focusProbe, isFocusedFrameHost } from './focus-frame.js';
+import { TaskOutreachService } from '../../../../src/dispatch/task-outreach-capability.js';
+import type { TaskOutreachRepo } from '../../../../src/dispatch/task-outreach.js';
+import type { ChannelIdentity } from '../../../../src/contacts/types.js';
 
 const logger = pino({ level: 'silent' });
 
@@ -2435,5 +2438,116 @@ describe('web-browser sign-in verification (#2017)', () => {
     expect(result.success).toBe(true);
     if (result.success) expect('verification_suspected' in (result.data as object)).toBe(false);
     expect(session.redactInjectedSecrets(CODE)).toBe(CODE);
+  });
+});
+
+describe('web-browser task outreach backstop (#2312)', () => {
+  const TASK_ID = '11111111-1111-4111-8111-111111111111';
+  const principal = { contactId: 'p', systemRole: 'principal', channel: 'email', initiatedAt: '2026-10-26T00:00:00Z', tier: 'principal' };
+  const PRINCIPAL_EMAIL = 'joe@example.com';
+
+  function withOutreach(
+    input: Record<string, unknown>,
+    opts: { taskMetadata?: Record<string, unknown>; liveTurn?: boolean; resolveSecretRef?: (ref: string) => Promise<string> } = {},
+  ) {
+    const { ctx } = makeToolContext({ input, pageUrl: 'https://form.typeform.com/to/abc', resolveSecretRef: opts.resolveSecretRef });
+    const recordForTurn = vi.fn().mockResolvedValue({ id: 'outreach-1', taskId: TASK_ID, via: 'web_form' });
+    const ownIdentity = vi.fn((text: string) => (text.trim().toLowerCase() === PRINCIPAL_EMAIL ? PRINCIPAL_EMAIL : null));
+    Object.assign(ctx, {
+      taskOutreach: { recordForTurn, ownIdentity, isPrincipalContact: vi.fn().mockReturnValue(false) },
+      taskMetadata: opts.taskMetadata ?? { originator: principal, boundTask: { taskId: TASK_ID } },
+      liveTurn: opts.liveTurn,
+      conversationId: 'conv-1',
+    });
+    return { ctx, recordForTurn };
+  }
+
+  it("records a web form when the principal's email is typed on a task", async () => {
+    const { ctx, recordForTurn } = withOutreach({ action: 'type', selector: '#email', text: ' Joe@Example.com ' });
+    const result = await new WebBrowserHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    expect(recordForTurn).toHaveBeenCalledWith(ctx, {
+      via: 'web_form',
+      domains: ['typeform.com'],
+      givenContact: PRINCIPAL_EMAIL,
+      orgName: null,
+      summary: 'Web form submitted',
+      useTaskTitle: true,
+      // Inferred, not an explicit act: always unconfirmed (#2312).
+      backstop: true,
+    });
+  });
+
+  it('records from a batch step too', async () => {
+    const { ctx, recordForTurn } = withOutreach({
+      actions: [
+        { action: 'type', selector: '#name', text: 'Joe Fung' },
+        { action: 'type', selector: '#email', text: PRINCIPAL_EMAIL },
+      ],
+    });
+    await new WebBrowserHandler().execute(ctx);
+    expect(recordForTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a second matching field on the same page records the same task, via and domain, so it merges', async () => {
+    const { ctx, recordForTurn } = withOutreach({
+      actions: [
+        { action: 'type', selector: '#email', text: PRINCIPAL_EMAIL },
+        { action: 'type', selector: '#email2', text: PRINCIPAL_EMAIL },
+      ],
+    });
+    await new WebBrowserHandler().execute(ctx);
+    // record() merges on task + via + overlapping domain (covered against Postgres in
+    // tests/integration/task-outreach.test.ts), so both calls land on one row.
+    expect(recordForTurn).toHaveBeenCalledTimes(2);
+    expect(recordForTurn.mock.calls[0]![1]).toEqual(recordForTurn.mock.calls[1]![1]);
+  });
+
+  it('skips a page with no registrable domain', async () => {
+    const { ctx, recordForTurn } = withOutreach({ action: 'type', selector: '#email', text: PRINCIPAL_EMAIL });
+    const page = (await (ctx.browserService as unknown as { getOrCreateSession: () => Promise<{ session: { page: { url: ReturnType<typeof vi.fn> } } }> })
+      .getOrCreateSession()).session.page;
+    page.url.mockReturnValue('http://192.168.1.10/form');
+    await new WebBrowserHandler().execute(ctx);
+    expect(recordForTurn).not.toHaveBeenCalled();
+  });
+
+  it('does not record other text', async () => {
+    const { ctx, recordForTurn } = withOutreach({ action: 'type', selector: '#name', text: 'Joe Fung' });
+    await new WebBrowserHandler().execute(ctx);
+    expect(recordForTurn).not.toHaveBeenCalled();
+  });
+
+  it('never records a secret_ref fill', async () => {
+    const { ctx, recordForTurn } = withOutreach(
+      { action: 'type', selector: '#email', secret_ref: 'user.login' },
+      { resolveSecretRef: vi.fn().mockResolvedValue(PRINCIPAL_EMAIL) },
+    );
+    await new WebBrowserHandler().execute(ctx);
+    expect(recordForTurn).not.toHaveBeenCalled();
+  });
+
+  it('writes nothing off-task (an outsider turn with no task)', async () => {
+    const { ctx } = withOutreach({ action: 'type', selector: '#email', text: PRINCIPAL_EMAIL });
+    const record = vi.fn();
+    Object.assign(ctx, {
+      taskOutreach: new TaskOutreachService({ record } as unknown as TaskOutreachRepo, {
+        principalIdentities: [{ contactId: 'p', channel: 'email', channelIdentifier: PRINCIPAL_EMAIL } as unknown as ChannelIdentity],
+        selfEmails: [],
+        log: logger,
+      }),
+      taskMetadata: { originator: { ...principal, systemRole: null, tier: 'known' } },
+      liveTurn: true,
+    });
+    const result = await new WebBrowserHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    expect(record).not.toHaveBeenCalled();
+  });
+
+  it('a failed write does not fail the browser action', async () => {
+    const { ctx, recordForTurn } = withOutreach({ action: 'type', selector: '#email', text: PRINCIPAL_EMAIL });
+    recordForTurn.mockRejectedValueOnce(new Error('db down'));
+    const result = await new WebBrowserHandler().execute(ctx);
+    expect(result.success).toBe(true);
   });
 });

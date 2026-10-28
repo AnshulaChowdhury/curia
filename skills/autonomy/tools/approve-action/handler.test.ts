@@ -1,7 +1,7 @@
 // handler.test.ts — unit tests for approve-action skill.
 
 import { describe, it, expect, vi } from 'vitest';
-import { ApproveActionHandler } from './handler.js';
+import { ApproveActionHandler, UNSHOWN_PERSONAL_DETAILS_ERROR } from './handler.js';
 import { STALE_SEND_APPROVAL_ERROR } from '../../../../src/skills/_shared/recipient-reference.js';
 import type { ToolContext, ToolResult } from '../../../../src/skills/types.js';
 import type { ActionLogRepo } from '../../../../src/autonomy/action-log-repo.js';
@@ -125,6 +125,40 @@ describe('ApproveActionHandler', () => {
     // Verify return
     expect(result.success).toBe(true);
     expect((result as { data: unknown }).data).toHaveProperty('reExecutionResult');
+  });
+
+  describe('an undelivered approval carrying personal details (#2312)', () => {
+    const smsRow = {
+      ...PENDING_ROW, toolName: 'sms-send', shortRef: 'sms-1',
+      payload: { recipient: 'contact-1', message: 'Her cell is (415) 555-1234.' },
+    };
+
+    async function approve(row: typeof smsRow | typeof PENDING_ROW) {
+      const repo = makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row }) });
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({ actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer }));
+      return { result, repo, execLayer };
+    }
+
+    it('refuses it and leaves the row pending', async () => {
+      const { result, repo, execLayer } = await approve(smsRow);
+      expect(result).toEqual({ success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR });
+      expect(repo.resolveRow).not.toHaveBeenCalled();
+      expect(execLayer.invoke).not.toHaveBeenCalled();
+    });
+
+    it('approves and replays it once delivered', async () => {
+      const { result, repo, execLayer } = await approve({ ...smsRow, notificationSentAt: new Date() } as unknown as typeof smsRow);
+      expect(result.success).toBe(true);
+      expect(repo.resolveRow).toHaveBeenCalledWith(10, 'approved', 'coordinator');
+      expect(execLayer.invoke).toHaveBeenCalledWith('sms-send', smsRow.payload, expect.anything(), expect.objectContaining({ humanApproved: true }));
+    });
+
+    it('approves an undelivered one with no personal details', async () => {
+      const { result, execLayer } = await approve({ ...smsRow, payload: { recipient: 'contact-1', message: 'See you Thursday.' } });
+      expect(result.success).toBe(true);
+      expect(execLayer.invoke).toHaveBeenCalledOnce();
+    });
   });
 
   it('writes failure child row when re-execution fails', async () => {
@@ -406,6 +440,79 @@ describe('ApproveActionHandler', () => {
         expect(result.error).toContain('Approval 3');
         expect(result.error).not.toContain('a3f7c12b');
       }
+    });
+  });
+
+  // PR 5 (#2312): approving a personal-data ask records the principal's yes for the thread.
+  describe('a row carrying a personal-data ask', () => {
+    const ASK = { conversationId: 'conv-1', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com' };
+    const ASK_ROW = {
+      ...PENDING_ROW, toolName: 'email-send', shortRef: 'ab12cd34', notificationSentAt: new Date(),
+      payload: { recipient_contact_id: 'c-1', subject: 'Booking', body: 'The number is 415-555-0100.' },
+      disclosureAsk: ASK,
+    };
+    const recorder = () => ({ recordForApproval: vi.fn().mockResolvedValue(undefined) });
+
+    it('records the yes, then replays the stored payload intact (Review Focus 3)', async () => {
+      const disclosureDecisions = recorder();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }) }),
+        bus: makeMockBus(), executionLayer: execLayer, disclosureDecisions,
+      }));
+      expect(result.success).toBe(true);
+      expect(disclosureDecisions.recordForApproval).toHaveBeenCalledExactlyOnceWith(ASK_ROW, 'yes', 'principal_via_coordinator');
+      const invoke = vi.mocked(execLayer.invoke);
+      // Exactly the input it was held with: the ask is never part of the replayed payload.
+      expect(invoke.mock.calls[0]![1]).toEqual({ recipient_contact_id: 'c-1', subject: 'Booking', body: 'The number is 415-555-0100.' });
+      expect(invoke.mock.calls[0]![3]).toMatchObject({ humanApproved: true });
+      expect(disclosureDecisions.recordForApproval.mock.invocationCallOrder[0]!).toBeLessThan(invoke.mock.invocationCallOrder[0]!);
+    });
+
+    it('records nothing for a row without an ask', async () => {
+      const disclosureDecisions = recorder();
+      await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo(), bus: makeMockBus(), executionLayer: makeMockExecutionLayer(), disclosureDecisions,
+      }));
+      expect(disclosureDecisions.recordForApproval).not.toHaveBeenCalled();
+    });
+
+    it('records nothing when the row was resolved concurrently or never shown', async () => {
+      const raced = recorder();
+      await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }), resolveRow: vi.fn().mockResolvedValue(false) }),
+        bus: makeMockBus(), executionLayer: makeMockExecutionLayer(), disclosureDecisions: raced,
+      }));
+      expect(raced.recordForApproval).not.toHaveBeenCalled();
+      const unshown = recorder();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: { ...ASK_ROW, notificationSentAt: null } }) }),
+        bus: makeMockBus(), executionLayer: makeMockExecutionLayer(), disclosureDecisions: unshown,
+      }));
+      expect(result).toEqual({ success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR });
+      expect(unshown.recordForApproval).not.toHaveBeenCalled();
+    });
+
+    it('refuses an undelivered ask whose payload has no details yet: a yes would outlive the question', async () => {
+      const recorderNoBody = recorder();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: { ...ASK_ROW, notificationSentAt: null, payload: { account: 'curia' } } }) }),
+        bus: makeMockBus(), executionLayer: execLayer, disclosureDecisions: recorderNoBody,
+      }));
+      expect(result).toEqual({ success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR });
+      expect(recorderNoBody.recordForApproval).not.toHaveBeenCalled();
+      expect(execLayer.invoke).not.toHaveBeenCalled();
+    });
+
+    it('still replays the approved send when the recorder is not wired', async () => {
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }) }),
+        bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(true);
+      expect(execLayer.invoke).toHaveBeenCalledOnce();
     });
   });
 });

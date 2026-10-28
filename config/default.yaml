@@ -303,7 +303,8 @@ pii:
 
   # Outbound PII redaction policy for channel messages (email, Signal).
   # default: 'block' — all detected PII is redacted unless explicitly allowed per channel.
-  # Principal bypass is handled structurally (ceoContactId UUID match at startup).
+  # Principal bypass is structural: no redaction only when the principal (a verified
+  # identity) is the sole recipient of the send (principalIsSoleRecipient, #2312).
   outbound_redaction:
     enabled: true
     default: block

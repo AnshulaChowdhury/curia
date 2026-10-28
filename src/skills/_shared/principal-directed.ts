@@ -56,6 +56,22 @@ export function relayDeferredData(result: { deferredToDigest?: boolean }): Recor
   return result.deferredToDigest ? { deferred_to_digest: true, note: RELAY_DEFERRED_NOTE } : {};
 }
 
+/** What a send skill tells the agent when the gateway removed details before delivery (#2312). */
+export const REDACTION_NOTE =
+  'Some details were removed before sending (see redactions). They were not shared: do not say they were. ' +
+  'If the recipient needs them, ask the principal.';
+
+/** Result-data fields for a send that had details removed; empty when nothing was. Labels only, never values. */
+export function redactionData(
+  result: { redactions?: ReadonlyArray<{ label: string; field: string }> },
+): Record<string, unknown> {
+  if (!result.redactions || result.redactions.length === 0) return {};
+  return {
+    redactions: result.redactions.map((r) => ({ label: r.label, field: r.field })),
+    redaction_note: REDACTION_NOTE,
+  };
+}
+
 /**
  * Why a digest tool refused (#1320): the task was started by an outside contact. The
  * principal's digest holds other contacts' held messages and Curia's notes for the principal,

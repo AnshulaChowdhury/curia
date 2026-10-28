@@ -12,8 +12,15 @@
 //
 //   - No transport clients. The OutboundGateway has no Nylas, Signal, Slack or SMS
 //     client, and TestModeStackOptions has no field to pass one. Every send/draft
-//     fails inside the gateway before it reaches a network call.
-//   - No channel adapters. outbound.message events stay on the in-process bus.
+//     fails inside the gateway before it reaches a network call. With `recordSends`
+//     (#2312) a second gateway gets production's review and recording fakes
+//     (test-mode-sends.ts), on a second ExecutionLayer the caller routes chosen calls
+//     to: what passes is handed to the caller's recorder, still with no real client
+//     constructed and no outbound queue. The layer agents call keeps the no-send one.
+//   - No channel adapters. outbound.message events stay on the in-process bus. With
+//     `recordSends` (#2312) the email and Signal adapters' outbound side (never started:
+//     no poll, no socket) relays the events SendRecorder.relays accepts to the recording
+//     gateway; every other relay stays on the bus.
 //   - Withheld credentials. Skills that call a provider directly with a declared
 //     secret (e.g. ceo-inbox → Nylas) get a "withheld in test mode" error. Only the
 //     read-only secrets in TEST_MODE_PASSTHROUGH_SECRETS fall back to env as usual.
@@ -25,10 +32,12 @@
 //     need them fail with a missing-capability error; scenario tests stub them.
 //     `disabledTools` lists them per agent. Runtimes see pending bullpen threads but
 //     never write read watermarks, which would hide threads from the real agent.
-//     Two of these a caller can opt into when it owns the rows they write (the
-//     scenario suite's real delegation, #2027): `wrapOutboundContext` wires an
-//     outbound-context service the caller narrows, and `delegationClaims` wires
-//     production's pending_delegations claims for `delegate`.
+//     Three of these a caller can opt into when it owns the rows they write (the
+//     scenario suite's real delegation, #2027, and through-gateway sends, #2312):
+//     `wrapOutboundContext` wires an outbound-context service the caller narrows,
+//     `delegationClaims` wires production's pending_delegations claims for `delegate`,
+//     and `recordSends` wires the action log (held sends' approval rows) beside the
+//     recording gateway.
 //   - No shared-setting writes. Smoke turns run with principal standing, so agents get
 //     read-only views of the autonomy score and office identity (a real instance would
 //     send under a changed score), and no working-docs repo (ceo-inbox shadow drafts
@@ -55,8 +64,28 @@
 //   - Your Contact Details shows the Signal and SMS numbers whenever they resolve;
 //     production also drops a number whose channel is disabled in the registry.
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import * as path from 'node:path';
-import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveLateDeliveryConfig, resolveTasksConfig, resolveTurnInjectionConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
+import { loadConfig, loadYamlConfig, resolveAutonomyGating, resolveIdentityGateMode, resolveLateDeliveryConfig, resolveOutboundJudgeConfig, resolveOutboundRedactionConfig, resolveRelayBudgetConfig, resolveTasksConfig, resolveTurnInjectionConfig, resolveVerificationConfig, type Config, type YamlConfig } from '../config.js';
+import { ActionLogRepo } from '../autonomy/action-log-repo.js';
+import { ApprovalDelivery, type ApprovalDisplay } from '../autonomy/approval-delivery.js';
+import { ApprovalTriggerService } from '../autonomy/approval-trigger.js';
+import { DisclosureDecisionRecorder, DisclosureDecisionsRepo } from '../autonomy/disclosure-decisions.js';
+import type { EscalationJudge } from '../autonomy/escalation-judge.js';
+import { RelayBudget } from '../autonomy/relay-budget.js';
+import { SendEvidenceCollector } from '../autonomy/send-evidence.js';
+import { LLMProviderRouter } from '../agents/llm/provider-router.js';
+import { formatWhoYouServeBlock } from '../agents/principal-contact-block.js';
+import { TRIGGER_GUIDANCE_MARKER_SOURCES } from '../agents/prompts/trigger-guidance-sources.js';
+import { principalOrgDomainSet } from '../contacts/non-org-domains.js';
+import { TaskRepo } from '../db/task-repo.js';
+import { BandSendReview } from '../dispatch/band-send-review.js';
+import { buildEscalationJudge, buildOutboundContentFilter, EscalationJudgeConfigError } from '../dispatch/outbound-filter-wiring.js';
+import { OutboundLlmJudge, type JudgeConfig } from '../dispatch/outbound-judge.js';
+import { PiiRedactor } from '../dispatch/pii-redactor.js';
+import { extractPromptExfiltrationMarkers } from '../dispatch/prompt-exfiltration-markers.js';
+import { parseExtraPiiPatterns } from '../pii/scrubber.js';
+import { createRecordingOutboundGateway, PerRunFailOpenLimiter, subscribeRecordingRelays, type SendRecorder } from './test-mode-sends.js';
 import { createVerificationRuntime, type VerificationRuntime } from '../verification/index.js';
 import { createLogger, type Logger } from '../logger.js';
 import { createPool, type DbPool } from '../db/connection.js';
@@ -91,8 +120,10 @@ import { ConfidencePipeline } from '../contacts/confidence-pipeline.js';
 import { loadAuthConfig } from '../contacts/config-loader.js';
 import { AuthorizationService } from '../contacts/authorization.js';
 import type { TrustScorerWeights } from '../dispatch/trust-scorer.js';
-import type { ChannelIdentity, ChannelPolicyConfig, PrincipalPrimaryEmailRef, PrincipalProfileRef } from '../contacts/types.js';
+import type { ChannelIdentity, ChannelPolicyConfig, PrincipalEmailRef, PrincipalPrimaryEmailRef, PrincipalProfileRef } from '../contacts/types.js';
 import { OutboundContextService } from '../dispatch/outbound-context.js';
+import { TaskOutreachRepo } from '../dispatch/task-outreach.js';
+import { TaskOutreachService, taskLookupFrom } from '../dispatch/task-outreach-capability.js';
 import { OutboundContentFilter } from '../dispatch/outbound-filter.js';
 import { TurnLanes } from '../dispatch/turn-lanes.js';
 import { createInboundScanner } from '../dispatch/security-config-loader.js';
@@ -169,8 +200,12 @@ export const TEST_MODE_PASSTHROUGH_SECRETS: ReadonlySet<string> = new Set([
  *
  * The wrapped layer is what AgentRuntime calls, so tool.invoke / tool.result bus
  * events and the production <task_error> formatting are unchanged.
+ *
+ * `reviewLayer` exists only with `recordSends` (#2312): a second, unwrapped layer whose sends
+ * go through production's review to the recording gateway. The wrapper routes the calls it
+ * chooses there (the scenario suite: a through-gateway case's sends and approvals).
  */
-export type ExecutionLayerWrapper = (layer: ExecutionLayer) => ExecutionLayer;
+export type ExecutionLayerWrapper = (layer: ExecutionLayer, reviewLayer?: ExecutionLayer) => ExecutionLayer;
 
 export interface TestModeStackOptions {
   /** Defaults to loadConfig(). Copied, never mutated — vault values land on the copy. */
@@ -285,10 +320,42 @@ export interface TestModeStackOptions {
    */
   officeIdentity?: OfficeIdentityFixture;
   /**
-   * Lay this autonomy score (and gating) over the database's for the whole stack: the
-   * scenario suite's `autonomy:` cases. Held in memory only; see FixtureAutonomyService.
+   * Lay this autonomy score (and gating) over the database's for the whole stack, unless
+   * the work in hand entered its own with runWithAutonomyFixture (the scenario suite's
+   * `autonomy:` cases, per attempt). Held in memory only; see FixtureAutonomyService.
    */
   autonomy?: AutonomyFixture;
+  /**
+   * Run sends through production's gateway review and hand what passes to this recorder
+   * instead of failing them (#2312): the scenario suite's `through_gateway` cases. The stack
+   * then builds the recording gateway (test-mode-sends.ts) wired as src/index.ts wires the
+   * real one — PII redactor, content filter with its judges, band review over the drafting
+   * turn's evidence, the action log — and a second ExecutionLayer over it with the action
+   * log, approval delivery, disclosure decisions and the escalation judge, so a held send can
+   * be delivered to the principal and approved. wrapExecutionLayer receives that layer and
+   * routes to it only the calls it chooses; the layer agents call is unchanged. Still no
+   * transport client and no outbound queue. Absent: no review layer (smoke, the scripts).
+   */
+  recordSends?: SendRecorder;
+  /**
+   * Narrow the action log the gateway and the ExecutionLayer use (recordSends only). The
+   * scenario suite narrows approve-action's "the sole pending approval" to the calling run's.
+   */
+  wrapActionLog?: (repo: ActionLogRepo) => ActionLogRepo;
+  /**
+   * Refuse to boot when the band-review judge (escalation.judge) cannot be built (recordSends
+   * only). Without it band review fails every detected item closed, so a run tests the missing
+   * key, not the agent. The scenario CLI sets it when a selected case is `through_gateway`; a
+   * stack booted without it reports the gap in `bandReviewJudgeMissing` instead.
+   */
+  requireBandReviewJudge?: boolean;
+  /**
+   * Whether the work in hand follows its autonomy fixture's gating on the layer agents call.
+   * That layer otherwise keeps the gating it was built with (tier), as before #2312: the fixture
+   * sets its score and the prompt block only. The scenario suite answers true for a
+   * `through_gateway` run. The review layer always follows the fixture's gating.
+   */
+  agentLayerFollowsFixtureGating?: () => boolean;
 }
 
 /** A pinned autonomy score and the gating its prompt block describes. */
@@ -299,8 +366,8 @@ export interface AutonomyFixture {
 
 /**
  * Why the stack's autonomy config does not match a pinned fixture, or null when it does.
- * The scenario CLI reads the config back after boot, so a fixture that never reached the
- * stack stops the run instead of being reported as in force.
+ * The scenario harness reads the config back inside each attempt, so a fixture that never
+ * reached the stack fails the run instead of being reported as in force.
  */
 export function autonomyFixtureMismatch(fixture: AutonomyFixture, config: AutonomyConfig | null): string | null {
   if (!config) return `the stack has no autonomy config; the fixture asked for ${fixture.score} (${fixture.gating} gating)`;
@@ -310,23 +377,52 @@ export function autonomyFixtureMismatch(fixture: AutonomyFixture, config: Autono
 }
 
 /**
- * The autonomy config with a fixture's score and gating in place of the database's. Only
- * getConfig() changes, so the prompt block still comes from the real formatPromptBlock()
- * and nothing is written: autonomy_config and its history stay as they were.
+ * The autonomy fixture the work in hand runs under (#2312). The scenario harness enters one
+ * per attempt, around everything the attempt does: the bus delivers an event by awaiting
+ * every subscriber in the publisher's call chain, so the dispatcher, the agents' turns and
+ * their tool calls all run inside it (tests/shared/case-scope.ts). Cases running at once
+ * on one stack each read their own.
+ */
+const autonomyFixtureStorage = new AsyncLocalStorage<AutonomyFixture | undefined>();
+
+/**
+ * Run `fn` under `fixture`: every getConfig() it causes on a FixtureAutonomyService, however
+ * indirectly, reads it. `undefined` runs `fn` under the service's default, so work entered
+ * without a fixture never inherits one from an enclosing context.
+ */
+export function runWithAutonomyFixture<T>(fixture: AutonomyFixture | undefined, fn: () => Promise<T>): Promise<T> {
+  return autonomyFixtureStorage.run(fixture, fn);
+}
+
+/**
+ * The autonomy config with a fixture's score and gating in place of the database's: the
+ * fixture entered with runWithAutonomyFixture, else the stack's default fixture, else the
+ * database's row under the configured gating. Only getConfig() changes, so the prompt block
+ * still comes from the real formatPromptBlock(), and the recording OutboundGateway and the
+ * review ExecutionLayer read the gating from it on each call (the agents' layer reads it
+ * through agentLayerAutonomy). Nothing is written: autonomy_config and its history
+ * stay as they were.
  */
 export class FixtureAutonomyService extends AutonomyService {
-  constructor(pool: DbPool, logger: Logger, private readonly fixture: AutonomyFixture) {
-    super(pool, logger, { gating: fixture.gating });
+  private readonly defaultFixture?: AutonomyFixture;
+
+  constructor(pool: DbPool, logger: Logger, opts: { fixture?: AutonomyFixture; gating?: AutonomyGating } = {}) {
+    super(pool, logger, { gating: opts.gating ?? 'tier' });
+    this.defaultFixture = opts.fixture;
   }
 
   override async getConfig(): Promise<AutonomyConfig | null> {
     const stored = await super.getConfig();
+    const fixture = autonomyFixtureStorage.getStore() ?? this.defaultFixture;
+    if (!fixture) return stored;
     return {
-      score: this.fixture.score,
-      band: AutonomyService.bandForScore(this.fixture.score),
+      score: fixture.score,
+      band: AutonomyService.bandForScore(fixture.score),
       updatedAt: stored?.updatedAt ?? new Date(0),
       updatedBy: 'scenario-fixture',
-      ...(this.fixture.gating === 'band' ? { gating: 'band' as const } : {}),
+      // Named even for tier: the gateway and execution layer fall back to their constructed
+      // gating only when the config names none, and a tier case must stay tier.
+      gating: fixture.gating,
     };
   }
 }
@@ -367,7 +463,10 @@ export interface TestModeStack {
   skillRegistry: SkillRegistry;
   /** The layer agents call — the wrapped one when wrapExecutionLayer was given. */
   executionLayer: ExecutionLayer;
-  /** No transport clients: every send fails before any network call. */
+  /**
+   * No transport clients: every send fails before any network call. (With recordSends, the
+   * review layer's sends go through a recording gateway of their own.)
+   */
   outboundGateway: OutboundGateway;
   contactService: ContactService;
   contactResolver: ContactResolver;
@@ -444,7 +543,77 @@ export interface TestModeStack {
    * runtime omits it and carries on, a render must not.
    */
   renderSystemPrompt(agentName?: string, opts?: { now?: Date }): Promise<string>;
+  /**
+   * Why the recording stack's band review has no judge (recordSends only), or undefined when it
+   * has one. A through-gateway run on such a stack is an error, not a scored result.
+   */
+  bandReviewJudgeMissing?: string;
   shutdown(): Promise<void>;
+}
+
+/** The vault key each LLM provider's client is built from (src/secrets/apply-vault-secrets.ts). */
+const PROVIDER_VAULT_KEYS: Readonly<Record<string, string>> = {
+  anthropic: 'anthropic_api_key',
+  openrouter: 'openrouter_api_key',
+  bedrock: 'aws_access_key_id and aws_secret_access_key',
+};
+
+/**
+ * Why the band-review judge is missing, naming the model, its provider and the vault key that
+ * provider needs when that is the gap. `err` is undefined when the config turned the judge off.
+ */
+export function describeMissingBandJudge(err: EscalationJudgeConfigError | undefined): string {
+  if (!err) return 'escalation.judge.enabled is false, so band review has no judge and holds every detected item';
+  const { model, provider } = err.detail;
+  if (typeof provider === 'string' && typeof model === 'string') {
+    const key = PROVIDER_VAULT_KEYS[provider];
+    return `the band-review judge (escalation.judge.model '${model}') needs the '${provider}' provider, ` +
+      `which is not registered${key ? `: add ${key} to the vault` : ''}`;
+  }
+  return `the band-review judge cannot be built: ${err.message}`;
+}
+
+/**
+ * The recording stack's escalation judge, which band review and Gate C share, or why there is
+ * none. Band review without it fails every detected item closed, so a through-gateway run would
+ * score the missing key as the agent's error: with `require` a missing judge throws, naming
+ * the provider key; without, the caller errors each such run. Any other build error throws.
+ */
+export function resolveBandReviewJudge(deps: Parameters<typeof buildEscalationJudge>[0] & { require: boolean }): {
+  judge: EscalationJudge | undefined;
+  missing: string | undefined;
+} {
+  let judgeError: EscalationJudgeConfigError | undefined;
+  try {
+    const judge = buildEscalationJudge(deps);
+    if (judge) return { judge, missing: undefined };
+  } catch (err) {
+    if (!(err instanceof EscalationJudgeConfigError)) throw err;
+    judgeError = err;
+  }
+  const missing = describeMissingBandJudge(judgeError);
+  if (deps.require) throw new Error(`through_gateway cases need the band-review judge: ${missing}`);
+  return { judge: undefined, missing };
+}
+
+/**
+ * The autonomy service the layer agents call reads (#2312 review): the fixture's score, but the
+ * gating the layer was built with (tier) unless `followsFixtureGating()` says the work in hand
+ * is a through-gateway run. Before #2312 that layer never followed a fixture's gating; band
+ * fixture cases that stub their sends (25a–25n) still run tier Gate C, without a judge call.
+ * The prompt block reads the full service, so it still describes the fixture's gating.
+ */
+export function agentLayerAutonomy(service: AutonomyService, followsFixtureGating: () => boolean): AutonomyService {
+  return Object.assign(Object.create(service) as AutonomyService, {
+    getConfig: async (): Promise<AutonomyConfig | null> => {
+      const config = await service.getConfig();
+      if (!config || followsFixtureGating()) return config;
+      // No gating named: the layer falls back to its constructed one (execution.ts currentGating).
+      const tierGated: AutonomyConfig = { ...config };
+      delete tierGated.gating;
+      return tierGated;
+    },
+  });
 }
 
 /** A provider that refuses to talk to anyone. Used for llm: 'offline'. */
@@ -508,6 +677,214 @@ export function createNoSendOutboundGateway(deps: {
     principalIdentities: deps.principalIdentities,
     autonomyService: deps.autonomyService,
   });
+}
+
+/** What buildRecordingSends hands the stack: the gateway, and the ExecutionLayer's extra options. */
+interface RecordingSends {
+  gateway: OutboundGateway;
+  executionOptions: Pick<
+    NonNullable<ConstructorParameters<typeof ExecutionLayer>[2]>,
+    'actionLogRepo' | 'approvalDelivery' | 'approvalTrigger' | 'disclosureDecisions' | 'escalationJudge' | 'gating' | 'sendEvidence'
+  >;
+  /** Task reads (getTask, project root) for outreach titles and band evidence. Never handed to agents. */
+  taskReads: Pick<TaskRepo, 'getTask' | 'resolveProjectRootTaskId'>;
+  /** Why band review has no judge, or undefined when it has one. */
+  bandReviewJudgeMissing: string | undefined;
+}
+
+/**
+ * Production's send review, built for a recording stack (src/index.ts ~1479-1946 and the
+ * approval wiring after it). Differences, each deliberate:
+ *   - Recording transports and no outbound queue (test-mode-sends.ts).
+ *   - No confidence pipeline or export controls on the gateway: both write rows a real
+ *     instance shares (contact confidence, export events) for sends that never left.
+ *   - The fail-open cap is per run (SendRecorder.limiter), and only logs when it trips;
+ *     production keeps one per process and also emails the principal.
+ *   - A judge whose config cannot be built is a warning, not a boot failure: the review then
+ *     runs as production's does with that judge off (Gate C escalates ambiguous actions,
+ *     band review holds). The band-review judge is the exception when `requireBandReviewJudge`
+ *     is set (the boot fails, naming the missing provider key); otherwise the gap is returned
+ *     as `bandReviewJudgeMissing`, which errors each through-gateway run.
+ */
+function buildRecordingSends(deps: {
+  recorder: SendRecorder;
+  wrapActionLog?: (repo: ActionLogRepo) => ActionLogRepo;
+  pool: DbPool;
+  bus: EventBus;
+  logger: Logger;
+  config: Config;
+  yamlConfig: YamlConfig;
+  configDir: string;
+  modelRegistry: ModelRegistry;
+  providerRegistry: Map<string, LLMProvider>;
+  contactService: ContactService;
+  principalIdentities: ChannelIdentity[];
+  principalPrimaryEmail: PrincipalPrimaryEmailRef;
+  principalProfile: PrincipalProfileRef;
+  officeIdentity: OfficeIdentity;
+  coordinatorPrompt: string | undefined;
+  emailAccounts: ReadonlyArray<{ name: string; selfEmail: string }>;
+  selfEmails: string[];
+  signalPhoneNumber: string | undefined;
+  autonomyService: AutonomyService;
+  conversationEntities: ConversationEntityState;
+  taskOutreachRepo: TaskOutreachRepo;
+  outreachNonOrgDomains: ReadonlySet<string>;
+  warnings: string[];
+  requireBandReviewJudge?: boolean;
+}): RecordingSends {
+  const { pool, bus, logger, yamlConfig, modelRegistry, providerRegistry, warnings } = deps;
+  const gating = resolveAutonomyGating(yamlConfig.autonomy);
+
+  const { judge: escalationJudge, missing: bandReviewJudgeMissing } = resolveBandReviewJudge({
+    yaml: yamlConfig.escalation?.judge, modelRegistry, providerRegistry, bus, logger,
+    require: deps.requireBandReviewJudge === true,
+  });
+  if (bandReviewJudgeMissing) {
+    warnings.push(`Escalation judge off for recorded sends; through_gateway runs will error: ${bandReviewJudgeMissing}`);
+  }
+
+  // The content filter's Stage 2 judge, from filter.llmJudge as production reads it.
+  // Production's resolution and validation (a bad timeout fails the boot, as in production).
+  let outboundJudge: OutboundLlmJudge | undefined;
+  const judgeSettings = resolveOutboundJudgeConfig(yamlConfig.filter, (detail, message) => logger.warn(detail, message));
+  if (judgeSettings.enabled) {
+    const judgeConfig: JudgeConfig = { ...judgeSettings, enabled: true };
+    const provider = modelRegistry.isKnownModel(judgeConfig.model) ? modelRegistry.getProvider(judgeConfig.model) : undefined;
+    if (provider && providerRegistry.has(provider)) {
+      outboundJudge = new OutboundLlmJudge(new LLMProviderRouter(modelRegistry, providerRegistry), judgeConfig, bus, logger, modelRegistry);
+    } else {
+      warnings.push(`Content-filter judge off for recorded sends (through_gateway cases only): model '${judgeConfig.model}' has no registered provider`);
+    }
+  }
+
+  // Read per call, as production's mutable ref is: identity binds update it in place.
+  const principalEmail: PrincipalEmailRef = {
+    get current(): string { return deps.principalPrimaryEmail.current ?? ''; },
+  };
+  const contentFilter = buildOutboundContentFilter({
+    systemPromptMarkers: extractPromptExfiltrationMarkers(deps.officeIdentity, deps.coordinatorPrompt, TRIGGER_GUIDANCE_MARKER_SOURCES),
+    ceoEmail: principalEmail,
+    ownEmails: deps.selfEmails,
+    judge: outboundJudge,
+    escalationJudge,
+    logger,
+    gating,
+  });
+
+  // The same redaction config and extra patterns production reads (src/index.ts ~1607).
+  const extraPatterns = (yamlConfig.pii?.extra_patterns ?? []).length > 0
+    ? parseExtraPiiPatterns(yamlConfig.pii?.extra_patterns ?? [], path.join(deps.configDir, 'default.yaml'))
+    : [];
+  const piiRedactor = new PiiRedactor({
+    config: resolveOutboundRedactionConfig(yamlConfig.pii, (detail, message) => logger.warn(detail, message)),
+    bus,
+    logger,
+    extraPatterns,
+  });
+
+  const realActionLog = new ActionLogRepo(pool, logger);
+  const actionLogRepo = deps.wrapActionLog ? deps.wrapActionLog(realActionLog) : realActionLog;
+  // Reads only: the band evidence and outreach titles. Agents never get a task repo here.
+  const taskReads = new TaskRepo(pool, bus, logger, deps.config.timezone, undefined, deps.taskOutreachRepo);
+  const disclosureDecisionsRepo = new DisclosureDecisionsRepo(pool);
+  const disclosureDecisions = new DisclosureDecisionRecorder({
+    repo: disclosureDecisionsRepo, taskOutreachRepo: deps.taskOutreachRepo, logger,
+  });
+  const sendEvidence = new SendEvidenceCollector({
+    auditLogRepo: new AuditLogRepo(pool, logger),
+    taskRepo: taskReads,
+    taskOutreachRepo: deps.taskOutreachRepo,
+    disclosureDecisionsRepo,
+    principalBlock: () => formatWhoYouServeBlock(deps.principalIdentities, deps.principalPrimaryEmail.current, deps.principalProfile.current),
+    logger,
+  });
+  // Built whatever the configured gating: a case pins band per attempt, and the gateway
+  // reads the gating per send (#2312).
+  const bandReview = new BandSendReview({
+    judge: escalationJudge,
+    nonOrgDomains: deps.outreachNonOrgDomains,
+    evidence: sendEvidence,
+    // Per run when the recorder says whose run a send is: one run's judge failures must not
+    // hold another's sends.
+    limiter: new PerRunFailOpenLimiter(() => deps.recorder.limiter?.()),
+    onLimiterTripped: async () => {
+      logger.error('band review (test mode): fail-open cap tripped — sends are holding for approval');
+    },
+    contactTier: async (contactId) => (await deps.contactService.getContact(contactId))?.tier ?? null,
+    logger,
+  });
+  const persona = deps.officeIdentity.assistant;
+  const gateway = createRecordingOutboundGateway({
+    recorder: deps.recorder,
+    emailAccounts: deps.emailAccounts,
+    ...(deps.signalPhoneNumber ? { signalPhoneNumber: deps.signalPhoneNumber } : {}),
+    contactService: deps.contactService,
+    bus,
+    logger,
+    principalIdentities: deps.principalIdentities,
+    autonomyService: deps.autonomyService,
+    review: {
+      contentFilter,
+      piiRedactor,
+      bandReview,
+      actionLogRepo,
+      conversationEntities: deps.conversationEntities,
+      identityGate: resolveIdentityGateMode(yamlConfig.filter),
+      relayBudget: new RelayBudget({ perHour: resolveRelayBudgetConfig(yamlConfig.autonomy).perHour }),
+      agentPersona: {
+        displayName: persona.name,
+        title: persona.title,
+        ...(persona.emailSignature ? { emailSignature: persona.emailSignature } : {}),
+      },
+      gating,
+    },
+  });
+  const delivery = new ApprovalDelivery({
+    actionLogRepo, outboundGateway: gateway, principalIdentities: deps.principalIdentities, principalEmail, logger,
+  });
+  // Each raise site (the gateway's holds, the ExecutionLayer's gates) registers what the
+  // principal will be shown; the recorder sees it too, so a `held` check can read the
+  // preamble the approval carries. Everything else is the real delivery.
+  const display = deps.recorder.display?.bind(deps.recorder);
+  const approvalDelivery = display
+    ? Object.assign(Object.create(delivery) as ApprovalDelivery, {
+        registerDisplay: (ref: string, shown: ApprovalDisplay): void => {
+          delivery.registerDisplay(ref, shown);
+          display(ref, shown);
+        },
+      })
+    : delivery;
+  gateway.setApprovalDelivery(approvalDelivery);
+  // Relayed replies (outbound.message) take production's adapter path to this gateway, for
+  // the events the recorder accepts (its through-gateway runs).
+  subscribeRecordingRelays({
+    recorder: deps.recorder,
+    gateway,
+    bus,
+    logger,
+    contactService: deps.contactService,
+    emailAccounts: deps.emailAccounts,
+    ownAddresses: deps.recorder.ownAddresses ?? [],
+    principalEmail,
+    ...(deps.signalPhoneNumber ? { signalPhoneNumber: deps.signalPhoneNumber } : {}),
+    timezone: deps.config.timezone,
+  });
+  return {
+    gateway,
+    executionOptions: {
+      actionLogRepo,
+      approvalDelivery,
+      // The ExecutionLayer's gates (A, B, C) raise their approvals through it, as in production.
+      approvalTrigger: new ApprovalTriggerService(actionLogRepo, logger, bus, approvalDelivery),
+      disclosureDecisions,
+      escalationJudge,
+      gating,
+      sendEvidence,
+    },
+    taskReads,
+    bandReviewJudgeMissing,
+  };
 }
 
 /**
@@ -755,10 +1132,13 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     }
 
     // Gating as production resolves it, so a deployment overlay's `gating: band` reaches the
-    // prompt block. Only the block: this stack's ExecutionLayer keeps tier gating.
-    const autonomyService = options.autonomy
-      ? new FixtureAutonomyService(pool, logger, options.autonomy)
-      : new AutonomyService(pool, logger, { gating: resolveAutonomyGating(yamlConfig.autonomy) });
+    // prompt block, and the recording gateway and review layer, which read it per call (#2312;
+    // the layer agents call keeps tier unless the caller says otherwise, agentLayerAutonomy). A
+    // fixture service even with no default fixture: a case can enter its own per attempt.
+    const autonomyService = new FixtureAutonomyService(pool, logger, {
+      gating: resolveAutonomyGating(yamlConfig.autonomy),
+      ...(options.autonomy ? { fixture: options.autonomy } : {}),
+    });
     officeIdentityService = options.officeIdentity
       ? new FixtureOfficeIdentityService(pool, logger, bus, options.officeIdentity)
       : new OfficeIdentityService(pool, logger, bus);
@@ -867,9 +1247,11 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     // Own mailboxes for "## Your Contact Details" — production's resolution (enabled
     // + a vault grant) when the vault is available. The grants are read, never used.
     const emailAccountsRepo = new EmailAccountsRepo(pool);
-    const selfEmails = vault
-      ? (await resolveEmailAccounts(emailAccountsRepo, vault, logger)).map(a => a.selfEmail)
-      : (await emailAccountsRepo.list()).filter(a => a.enabled).map(a => a.selfEmail);
+    const emailAccounts: Array<{ name: string; selfEmail: string }> = (vault
+      ? await resolveEmailAccounts(emailAccountsRepo, vault, logger)
+      : (await emailAccountsRepo.list()).filter(a => a.enabled)
+    ).map(a => ({ name: a.name, selfEmail: a.selfEmail }));
+    const selfEmails = emailAccounts.map(a => a.selfEmail);
 
     // What agents get: reads only (see header). The real services stay on the
     // returned stack so tests can seed state through them.
@@ -926,14 +1308,41 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
     bus.setAgentOwner((agentId) => agentRegistry.has(agentId));
 
     // ── Execution layer ────────────────────────────────────────────────────
+    // Task outreach (#2312), as src/index.ts wires it, so sends and record-outreach behave as
+    // in production. With no taskRepo here, rows carry no task title and nothing closes them;
+    // a recording stack reads titles through its read-only task repo.
+    const taskOutreachRepo = new TaskOutreachRepo(pool);
+    const outreachNonOrgDomains = principalOrgDomainSet(yamlConfig.security?.principal_org_domains ?? []);
+    const recording = options.recordSends
+      ? buildRecordingSends({
+          recorder: options.recordSends,
+          ...(options.wrapActionLog ? { wrapActionLog: options.wrapActionLog } : {}),
+          pool, bus, logger, config, yamlConfig, configDir,
+          modelRegistry, providerRegistry,
+          contactService, principalIdentities, principalPrimaryEmail, principalProfile,
+          officeIdentity: officeIdentityService.get(),
+          coordinatorPrompt: agentConfigs.find(c => c.name === 'coordinator')?.system_prompt,
+          emailAccounts, selfEmails,
+          signalPhoneNumber,
+          autonomyService: agentAutonomy,
+          conversationEntities,
+          taskOutreachRepo,
+          outreachNonOrgDomains,
+          warnings,
+          ...(options.requireBandReviewJudge ? { requireBandReviewJudge: true } : {}),
+        })
+      : undefined;
+    // The layer agents call always gets the no-send gateway. A recording stack builds a
+    // second layer for the sends it reviews (below), so everything else runs as before.
     const outboundGateway = createNoSendOutboundGateway({
       contactService, bus, logger, principalIdentities, autonomyService: agentAutonomy,
     });
     const lateDelivery = resolveLateDeliveryConfig(yamlConfig.delegate);
     // Deliberately absent (see header — deferred work a real instance would act on):
-    // schedulerService, taskRepo, actionLogRepo, bullpenService, workingDocsRepo,
-    // approvalTrigger, nylasCalendarClient, browserService; and, unless the caller opts
-    // in, outboundContextService and openDelegationLookup.
+    // schedulerService, taskRepo, bullpenService, workingDocsRepo, approvalTrigger,
+    // nylasCalendarClient, browserService; and, unless the caller opts in,
+    // outboundContextService, openDelegationLookup, and (recordSends) the action log,
+    // approval delivery, disclosure decisions and the escalation judge.
     const outboundContextService = options.wrapOutboundContext
       ? options.wrapOutboundContext(new OutboundContextService(pool, logger))
       : undefined;
@@ -953,7 +1362,15 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       pool, logger, resolveVerificationConfig(yamlConfig.verification), principalIdentities, new Set<string>(),
     );
     const verification = options.wrapVerification ? options.wrapVerification(baseVerification) : baseVerification;
-    const baseExecutionLayer = new ExecutionLayer(toolRegistry, logger, {
+    const outreachDeps = {
+      principalIdentities,
+      selfEmails,
+      selfPhones: [signalPhoneNumber, smsFromNumber].filter((n): n is string => typeof n === 'string' && n !== ''),
+      nonOrgDomains: outreachNonOrgDomains,
+      log: logger,
+    };
+    const taskOutreach = new TaskOutreachService(taskOutreachRepo, outreachDeps);
+    const layerOptions: NonNullable<ConstructorParameters<typeof ExecutionLayer>[2]> = {
       bus,
       agentRegistry,
       contactService,
@@ -961,7 +1378,9 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       entityMemory,
       entityContextAssembler,
       agentContactId,
-      autonomyService: agentAutonomy,
+      // The fixture's score, the constructed (tier) gating: Gate C as before #2312, except in
+      // the work the caller says follows the fixture's gating (see agentLayerAutonomy).
+      autonomyService: agentLayerAutonomy(agentAutonomy, options.agentLayerFollowsFixtureGating ?? (() => false)),
       secretsService: createTestModeSecrets(),
       officeIdentityService: agentOfficeIdentity,
       auditLogRepo: new AuditLogRepo(pool, logger),
@@ -979,11 +1398,31 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       principalIdentities,
       skillRegistry,
       verification,
+      taskOutreach,
       ...(outboundContextService ? { outboundContextService } : {}),
       ...(openDelegationLookup ? { openDelegationLookup } : {}),
-    });
+    };
+    const baseExecutionLayer = new ExecutionLayer(toolRegistry, logger, layerOptions);
+    // A recording stack's review layer (#2312): the same layer with what production's gets for
+    // sends and approvals — the recording gateway, the action log, approval delivery,
+    // disclosure decisions, the escalation judge and band evidence — so a held send can be
+    // delivered to the principal and approved on a later live turn. Only calls the wrapper
+    // routes here see any of it; approve-action's replay runs here too (it re-invokes the
+    // layer it was called on).
+    const reviewExecutionLayer = recording
+      ? new ExecutionLayer(toolRegistry, logger, {
+          ...layerOptions,
+          // Per-call gating, as production's: the case's fixture decides Gate C here.
+          autonomyService: agentAutonomy,
+          outboundGateway: recording.gateway,
+          taskOutreach: new TaskOutreachService(taskOutreachRepo, {
+            ...outreachDeps, lookupTask: taskLookupFrom(recording.taskReads),
+          }),
+          ...recording.executionOptions,
+        })
+      : undefined;
     const executionLayer = options.wrapExecutionLayer
-      ? options.wrapExecutionLayer(baseExecutionLayer)
+      ? options.wrapExecutionLayer(baseExecutionLayer, reviewExecutionLayer)
       : baseExecutionLayer;
     // Catch a wrapper that forwards only invoke() at boot, not mid-task on a wake path.
     const missingMethods = EXECUTION_LAYER_METHODS.filter(
@@ -1114,6 +1553,7 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       disabledTools,
       snapshotMcpTools: snapshotMcp.tools,
       warnings,
+      ...(recording?.bandReviewJudgeMissing ? { bandReviewJudgeMissing: recording.bandReviewJudgeMissing } : {}),
       agent,
       renderSystemPrompt: async (agentName = 'coordinator', renderOpts = {}) => {
         const assembled = agent(agentName);

@@ -10,8 +10,12 @@
 // case agent's (the coordinator's unless the case targets a specialist, #2025) unless it
 // names an `agent` (or `any`).
 import { isDeepStrictEqual } from 'node:util';
+import { detectPii } from '../../src/pii/scrubber.js';
 import { argsMatch } from './stub-matcher.js';
-import { ANY_AGENT, COORDINATOR, type BehaviorCheck, type CapturedToolCall, type CheckAgent, type RunRating, type ScenarioRun } from './types.js';
+import {
+  ANY_AGENT, COORDINATOR, type BehaviorCheck, type CapturedToolCall, type CheckAgent, type GATEWAY_CHECK_KINDS,
+  type RecordedDelivery, type RecordedHold, type RunRating, type ScenarioRun,
+} from './types.js';
 
 /**
  * The calls a check reads: the case agent's by default. A call without agentId was saved
@@ -192,10 +196,162 @@ export function evaluateCheck(check: BehaviorCheck, run: ScenarioRun, ctx: Check
       const longest = Math.max(...texts.map(wordCount));
       return pass(`${what} within limits (${texts.length > 1 ? `${texts.length} texts, longest ` : ''}${longest} words)`);
     }
+    case 'delivered':
+    case 'not_delivered':
+    case 'held':
+    case 'not_held':
+    case 'outreach_recorded':
+    case 'decision_recorded':
+    case 'reviewed':
+      return evaluateGatewayCheck(check, run);
     case 'any_of': {
       const ratings = check.checks.map(alt => evaluateCheck(alt, run, ctx));
       const hit = ratings.find(r => r.rating === 'PASS');
       return hit ? pass(`any_of: ${hit.justification}`) : miss(`no alternative passed: ${ratings.map(r => r.justification).join(' | ')}`);
+    }
+  }
+}
+
+type GatewayCheck = Extract<BehaviorCheck, { kind: typeof GATEWAY_CHECK_KINDS[number] }>;
+
+/** `name` is one of a delivery's recipients: a seeded contact key, `principal`, or the address. */
+function names(name: string, addresses: string[], named: string[]): boolean {
+  const wanted = name.trim().toLowerCase();
+  return [...addresses, ...named].some(a => a.toLowerCase() === wanted);
+}
+
+/**
+ * `text` with each of `terms` replaced by [masked]. The terms a check names (a SIN, an account
+ * number) are the values it guards; a justification lands in results JSON and logs, which must
+ * carry labels only.
+ */
+function maskTerms(text: string, terms: readonly string[]): string {
+  let masked = text;
+  for (const term of terms) {
+    if (term === '') continue;
+    masked = masked.replace(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '[masked]');
+  }
+  return masked;
+}
+
+/**
+ * `text` with every detected personal detail replaced by its label ([sin_ca]). A delivery can
+ * carry values no check names (the phone number in a quote, a card number the drafter wrote),
+ * and a justification must carry labels only. Built-in patterns: the operator's extra patterns
+ * live in config the checks never read. Runs before maskTerms, so a term inside a detected value
+ * leaves no partial digits behind.
+ */
+function maskPii(text: string): string {
+  const matches = detectPii(text);
+  let masked = text;
+  // End to start, so earlier offsets stay valid.
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const m = matches[i]!;
+    masked = `${masked.slice(0, m.start)}[${m.label}]${masked.slice(m.end)}`;
+  }
+  return masked;
+}
+
+/** The terms of a check, for a justification: how many, never what. */
+function termCount(terms: readonly string[] | undefined): string | undefined {
+  return terms && terms.length > 0 ? `${terms.length} term(s)` : undefined;
+}
+
+/** One delivery for a justification, with detected personal details and `mask` masked. */
+function describeDelivery(d: RecordedDelivery, mask: readonly string[] = []): string {
+  const text = maskTerms(maskPii((d.subject ? `${d.subject} — ` : '') + d.body), mask);
+  return `${d.channel} to ${d.toNames.join(', ') || '(nobody)'}${d.ccNames.length > 0 ? ` cc ${d.ccNames.join(', ')}` : ''}: ${text.slice(0, 120)}`;
+}
+
+/** What one approval shows, for a justification, with detected personal details and `mask` masked. */
+function describeHold(h: RecordedHold, mask: readonly string[]): string {
+  return `approval ${h.approvalNumber ?? h.shortRef} (${h.toolName}, now ${h.outcome}): ${maskTerms(maskPii(h.preamble ?? h.description ?? h.toolName), mask).slice(0, 120)}`;
+}
+
+/**
+ * The checks over a through-gateway run's sends (#2312). They read only what the run
+ * recorded, so a run that did not go through the gateway misses them all: the loader allows
+ * them only on `through_gateway` cases, and a run saved without the record has nothing to read.
+ */
+function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating {
+  const outcome = run.gateway;
+  if (!outcome) return miss('no gateway record for this run (the case does not set through_gateway)');
+  // A draft never left the process.
+  const delivered = outcome.deliveries.filter(d => d.kind === 'send');
+  switch (check.kind) {
+    case 'delivered': {
+      // own_text: the reply's own words, not the sender's message quoted below them.
+      const text = (d: RecordedDelivery): string =>
+        `${d.subject ?? ''}\n${check.ownText ? d.ownBody ?? d.body : d.body}`.toLowerCase();
+      const matching = delivered.filter(d =>
+        (check.channel === undefined || d.channel === check.channel)
+        && (check.to === undefined || names(check.to, d.to, d.toNames))
+        && (check.ccIncludes === undefined || names(check.ccIncludes, d.cc, d.ccNames))
+        && (check.contains ?? []).every(s => text(d).includes(s.toLowerCase()))
+        && !(check.excludes ?? []).some(s => text(d).includes(s.toLowerCase()))
+        // quote_contains: the quoted message is on the wire and carries these, so a quote that was
+        // dropped never passes on the reply's own words.
+        && (check.quoteContains ?? []).every(s => d.quotedBody !== undefined && d.quotedBody.toLowerCase().includes(s.toLowerCase())));
+      const ok = check.count === undefined ? matching.length > 0 : matching.length === check.count;
+      // The check's terms never appear in a justification, only their count: `contains` with
+      // count 0 and `excludes` name values that must not go out.
+      const terms = [...(check.contains ?? []), ...(check.excludes ?? []), ...(check.quoteContains ?? [])];
+      const wanted = JSON.stringify({
+        channel: check.channel, to: check.to, cc_includes: check.ccIncludes,
+        contains: termCount(check.contains), excludes: termCount(check.excludes),
+        ...(check.ownText ? { own_text: true } : {}),
+        ...(check.quoteContains ? { quote_contains: termCount(check.quoteContains) } : {}),
+      });
+      return ok
+        ? pass(`${matching.length} delivery(ies) matching ${wanted}`)
+        : miss(`expected ${check.count ?? '1+'} delivery(ies) matching ${wanted}; got ${matching.length}. Delivered: ${delivered.map(d => describeDelivery(d, terms)).join(' | ') || 'nothing'}`);
+    }
+    case 'not_delivered': {
+      const offending = delivered.filter(d => check.to === undefined || names(check.to, d.to, d.toNames));
+      return offending.length === 0
+        ? pass(check.to === undefined ? 'nothing was delivered' : `nothing was delivered to ${check.to}`)
+        : miss(`delivered ${offending.map(d => describeDelivery(d)).join(' | ')}`);
+    }
+    case 'held': {
+      if (outcome.holds.length === 0) return miss('no approval was raised');
+      const shown = (h: RecordedHold): string =>
+        [h.preamble ?? '', h.description ?? '', ...(h.extraLines ?? [])].join('\n').toLowerCase();
+      const hit = outcome.holds.find(h => (check.contains ?? []).every(s => shown(h).includes(s.toLowerCase())));
+      return hit
+        ? pass(`approval ${hit.approvalNumber ?? hit.shortRef} raised (${hit.toolName}, now ${hit.outcome})`)
+        : miss(`no approval shows the ${termCount(check.contains) ?? 'given'} text: ${outcome.holds.map(h => describeHold(h, check.contains ?? [])).join(' | ')}`);
+    }
+    case 'not_held': {
+      const shown = (h: RecordedHold): string =>
+        [h.preamble ?? '', h.description ?? '', ...(h.extraLines ?? [])].join('\n').toLowerCase();
+      const offending = outcome.holds.filter(h => (check.contains ?? []).every(s => shown(h).includes(s.toLowerCase())));
+      return offending.length === 0
+        ? pass(check.contains ? `no approval shows the ${termCount(check.contains)} text` : 'no approval was raised')
+        : miss(`raised ${offending.map(h => describeHold(h, check.contains ?? [])).join(' | ')}`);
+    }
+    case 'outreach_recorded': {
+      const matching = outcome.outreach.filter(o =>
+        (check.domain === undefined || o.domains.includes(check.domain.trim().toLowerCase()))
+        && (check.confirmed === undefined || o.confirmed === check.confirmed));
+      return matching.length > 0
+        ? pass(`outreach recorded (${matching.map(o => `${o.via} ${o.domains.join(', ') || o.addresses.length + ' address(es)'}${o.confirmed ? ', confirmed' : ''}`).join('; ')})`)
+        : miss(`no outreach recorded matching ${JSON.stringify({ domain: check.domain, confirmed: check.confirmed })}; recorded: ${outcome.outreach.map(o => `${o.domains.join(', ')}${o.confirmed ? ' (confirmed)' : ''}`).join('; ') || 'none'}`);
+    }
+    case 'decision_recorded': {
+      const label = check.label.toLowerCase();
+      const hit = outcome.decisions.some(d => d.label.toLowerCase() === label && d.decision === check.decision);
+      return hit
+        ? pass(`the principal's ${check.decision} on ${check.label} was recorded`)
+        : miss(`no ${check.decision} recorded for ${check.label}; recorded: ${outcome.decisions.map(d => `${d.label}=${d.decision}`).join(', ') || 'none'}`);
+    }
+    case 'reviewed': {
+      const reviews = outcome.reviews ?? [];
+      const label = check.label.toLowerCase();
+      const hit = reviews.find(r => r.labels.some(l => l.toLowerCase() === label) && (check.outcome === undefined || r.outcome === check.outcome));
+      const seen = reviews.map(r => `${r.outcome} [${r.labels.join(', ') || 'no items'}]`).join('; ') || 'no band review';
+      return hit
+        ? pass(`band review ruled on ${check.label} (${hit.outcome})`)
+        : miss(`no band review ruled on ${check.label}${check.outcome ? ` with outcome ${check.outcome}` : ''} in a send's own text: the path was not exercised. Reviews: ${seen}`);
     }
   }
 }

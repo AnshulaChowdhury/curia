@@ -7,34 +7,43 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import * as path from 'node:path';
 import * as yaml from 'js-yaml';
 import { hasBacklog, type PrincipalBacklogCounts } from '../../src/agents/prompts/backlog-line.js';
+import { isKnownPiiLabel } from '../../src/pii/scrubber.js';
 import { registrableDomain } from '../../src/verification/domain.js';
 import { hasDatePlaceholders, resolveDatePlaceholders } from '../shared/date-placeholders.js';
 import { LIVE_SEARCH_TOOL } from '../shared/live-search.js';
 import { leafChecks } from './assertions.js';
+import { THROUGH_GATEWAY_TOOLS } from './stub-layer.js';
 import {
   ANY_AGENT,
   COORDINATOR,
+  GATEWAY_CHECK_KINDS,
+  REVIEW_OUTCOMES,
   type BehaviorCheck,
   type BehaviorWeight,
   type DelegationMode,
+  type DeliveryChannel,
   type ExpectedBehavior,
+  type ReviewOutcome,
   type IdentityFixture,
   type ScenarioCase,
   type ScenarioFollowup,
   type ScenarioInbound,
+  type ScenarioPrincipalTurn,
   type ScenarioWakeTask,
   type SeedBullpenThread,
   type SeedContact,
   type SeedOutboundEntry,
+  type SeedOutreach,
   type SeedPrincipalIdentity,
+  type SeedTask,
   type SeedVerification,
   type ToolStub,
 } from './types.js';
 import type { AutonomyFixture } from '../../src/startup/test-mode-stack.js';
 
 const WEIGHTS: readonly BehaviorWeight[] = ['critical', 'important', 'nice-to-have'];
-// Not 'trusted': that tier is a grant made after creation, and createContact refuses it.
-const CONTACT_TIERS = ['known', 'unknown'] as const;
+// 'trusted' is a grant made after creation (createContact refuses it); seeding sets it then.
+const CONTACT_TIERS = ['trusted', 'known', 'unknown'] as const;
 const CONTACT_KINDS = ['person', 'organization', 'automated'] as const;
 const DELEGATION_MODES: readonly DelegationMode[] = ['stubbed', 'real'];
 
@@ -65,8 +74,11 @@ function onlyKeys(raw: Raw, allowed: readonly string[], file: string, where: str
   }
 }
 
-const CASE_KEYS = ['name', 'description', 'tags', 'agent', 'delegation', 'release_gate', 'runs', 'timeout_seconds', 'known_failure', 'stub_sets', 'live_search', 'seed', 'inbound', 'tool_stubs', 'expected_behaviors', 'failure_modes', 'identity', 'autonomy'] as const;
-const SEED_KEYS = ['contacts', 'outbound_context', 'bullpen', 'backlog', 'verifications', 'principal_identities'] as const;
+const CASE_KEYS = ['name', 'description', 'tags', 'agent', 'delegation', 'release_gate', 'runs', 'timeout_seconds', 'known_failure', 'stub_sets', 'live_search', 'seed', 'inbound', 'tool_stubs', 'expected_behaviors', 'failure_modes', 'identity', 'autonomy', 'through_gateway'] as const;
+const SEED_KEYS = ['contacts', 'outbound_context', 'bullpen', 'backlog', 'verifications', 'principal_identities', 'tasks', 'outreach'] as const;
+const TASK_KEYS = ['key', 'title', 'intent', 'originator', 'agent'] as const;
+const OUTREACH_KEYS = ['key', 'task', 'via', 'org_name', 'domains', 'addresses', 'contacts', 'summary', 'confirmed'] as const;
+const OUTREACH_VIAS: readonly SeedOutreach['via'][] = ['email', 'web_form', 'signal', 'sms', 'slack', 'phone', 'other'];
 const PRINCIPAL_IDENTITY_KEYS = ['channel', 'identifier'] as const;
 /** Channels the resolver maps to the principal without an identity (seed.ts: PRINCIPAL_LOCAL_CHANNELS). */
 const PRINCIPAL_LOCAL_CHANNELS = ['cli', 'smoke-test', 'web'];
@@ -79,7 +91,8 @@ const ENTRY_KEYS = ['key', 'channel', 'agent', 'content', 'expected_reply', 'del
 const RESUME_KEYS = ['agent', 'original_task', 'context'] as const;
 const REPLY_KEYS = ['from', 'content'] as const;
 const THREAD_KEYS = ['key', 'topic', 'creator', 'participants', 'content', 'mentions'] as const;
-const INBOUND_KEYS = ['from', 'channel', 'content', 'thread', 'author', 'requester', 'email', 'task', 'followup'] as const;
+const INBOUND_KEYS = ['from', 'channel', 'content', 'thread', 'author', 'requester', 'email', 'task', 'followup', 'then'] as const;
+const THEN_KEYS = ['content', 'channel'] as const;
 const FOLLOWUP_KEYS = ['after', 'from', 'content', 'channel'] as const;
 /** A follow-up held this long still releases the first tool, so a flag-off run can finish. */
 const FOLLOWUP_MAX_DELAY_MS = 120_000;
@@ -90,6 +103,14 @@ const AUTONOMY_GATINGS = ['band', 'tier'] as const;
 const ENVELOPE_TOKENS = ['curia', 'principal'];
 const WAKE_TASK_KEYS = ['id', 'title', 'intent', 'notes', 'tags'] as const;
 const WAKE_NOTE_KEYS = ['at', 'note'] as const;
+/**
+ * A third party's fixture address or domain: under any `.test` name (RFC 6761 reserves the
+ * TLD, so none is real). Distinct names give distinct registrable domains, so an org-domain
+ * outreach link can tell fixture organizations apart (#2312). The principal stays under
+ * example.test.
+ */
+const TEST_DOMAIN = /^([a-z0-9-]+\.)+test$/i;
+const TEST_ADDRESS = /^[^@\s]+@([a-z0-9-]+\.)+test$/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STUB_KEYS = ['match', 'agent', 'return', 'error'] as const;
 const BEHAVIOR_KEYS = ['id', 'weight', 'description', 'check'] as const;
@@ -105,6 +126,16 @@ const CHECK_KEYS: Record<string, readonly string[]> = {
   text: ['text', 'agent', 'max_words', 'excludes'],
   any_of: ['any_of'],
 };
+const GATEWAY_CHECK_KEYS: Record<typeof GATEWAY_CHECK_KINDS[number], readonly string[]> = {
+  delivered: ['channel', 'to', 'cc_includes', 'contains', 'excludes', 'count', 'own_text', 'quote_contains'],
+  not_delivered: ['to'],
+  held: ['contains'],
+  not_held: ['contains'],
+  outreach_recorded: ['domain', 'confirmed'],
+  decision_recorded: ['label', 'decision'],
+  reviewed: ['label', 'outcome'],
+};
+const DELIVERY_CHANNELS: readonly DeliveryChannel[] = ['email', 'signal', 'slack', 'sms'];
 const TEXT_TOOL_KEYS = ['tool', 'arg'] as const;
 const IDENTITY_FILE_KEYS = ['judge_brief', 'identity'] as const;
 /**
@@ -165,13 +196,97 @@ function list(raw: Raw, key: string, file: string): Raw[] {
   return v;
 }
 
+/**
+ * A gateway check (#2312): `<kind>: { …filters }`, or `<kind>: true` with none. The filters
+ * sit inside the kind's own mapping, so `contains` here (a list of texts) never meets a tool
+ * check's `contains` (argument → text).
+ */
+function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, file: string, where: string): BehaviorCheck {
+  onlyKeys(raw, [kind], file, where);
+  const value = raw[kind];
+  const at = `${where}.${kind}`;
+  if (value !== true && !isObject(value)) throw new CaseError(file, `${where}: '${kind}' must be true or a mapping of filters`);
+  const body: Raw = value === true ? {} : value;
+  onlyKeys(body, GATEWAY_CHECK_KEYS[kind], file, at);
+  const recipient = (key: string): string | undefined => {
+    const v = optStr(body, key, file, at);
+    if (v !== undefined && v.trim() === '') throw new CaseError(file, `${at}: '${key}' must be a contact key, principal or an address`);
+    return v;
+  };
+  switch (kind) {
+    case 'delivered': {
+      const channel = optStr(body, 'channel', file, at);
+      if (channel !== undefined && !(DELIVERY_CHANNELS as readonly string[]).includes(channel)) {
+        throw new CaseError(file, `${at}: 'channel' must be one of ${DELIVERY_CHANNELS.join(', ')}`);
+      }
+      const count = optNum(body, 'count', file, at);
+      if (count !== undefined && !Number.isInteger(count)) throw new CaseError(file, `${at}: 'count' must be a whole number`);
+      const to = recipient('to');
+      const cc = recipient('cc_includes');
+      const contains = strList(body, 'contains', file, at);
+      const excludes = strList(body, 'excludes', file, at);
+      const ownText = optBool(body, 'own_text', file, at);
+      if (ownText === false) throw new CaseError(file, `${at}: 'own_text' is true or absent`);
+      const quoteContains = strList(body, 'quote_contains', file, at);
+      return {
+        kind,
+        ...(channel !== undefined ? { channel: channel as DeliveryChannel } : {}),
+        ...(to !== undefined ? { to } : {}),
+        ...(cc !== undefined ? { ccIncludes: cc } : {}),
+        ...(contains.length > 0 ? { contains } : {}),
+        ...(excludes.length > 0 ? { excludes } : {}),
+        ...(count !== undefined ? { count } : {}),
+        ...(ownText ? { ownText: true } : {}),
+        ...(quoteContains.length > 0 ? { quoteContains } : {}),
+      };
+    }
+    case 'not_delivered': {
+      const to = recipient('to');
+      return { kind, ...(to !== undefined ? { to } : {}) };
+    }
+    case 'held':
+    case 'not_held': {
+      const contains = strList(body, 'contains', file, at);
+      return { kind, ...(contains.length > 0 ? { contains } : {}) };
+    }
+    case 'outreach_recorded': {
+      const domain = optStr(body, 'domain', file, at);
+      const confirmed = optBool(body, 'confirmed', file, at);
+      return { kind, ...(domain !== undefined ? { domain } : {}), ...(confirmed !== undefined ? { confirmed } : {}) };
+    }
+    case 'decision_recorded': {
+      const decision = body['decision'];
+      if (decision !== 'yes' && decision !== 'no') throw new CaseError(file, `${at}: 'decision' must be yes or no`);
+      return { kind, label: piiLabel(body, file, at), decision };
+    }
+    case 'reviewed': {
+      const outcome = optStr(body, 'outcome', file, at);
+      if (outcome !== undefined && !(REVIEW_OUTCOMES as readonly string[]).includes(outcome)) {
+        throw new CaseError(file, `${at}: 'outcome' must be one of ${REVIEW_OUTCOMES.join(', ')}`);
+      }
+      return { kind, label: piiLabel(body, file, at), ...(outcome !== undefined ? { outcome: outcome as ReviewOutcome } : {}) };
+    }
+  }
+}
+
+/** A `label` that must name a PII pattern (built-in or extra_N): a typo would pass a `reviewed` check never or a count:0 check always. */
+function piiLabel(body: Raw, file: string, at: string): string {
+  const label = str(body, 'label', file, at);
+  if (!isKnownPiiLabel(label)) {
+    throw new CaseError(file, `${at}: 'label' ${label} is not a PII label (a built-in pattern name such as phone_us or sin_ca, or extra_N)`);
+  }
+  return label;
+}
+
 function parseCheck(raw: unknown, file: string, where: string): BehaviorCheck {
   if (!isObject(raw)) throw new CaseError(file, `${where}: check must be a mapping`);
-  const kinds = ['called', 'not_called', 'order', 'reply', 'reply_excludes', 'reply_excludes_internal_names', 'briefed', 'principal_note', 'text', 'any_of']
+  const kinds = ['called', 'not_called', 'order', 'reply', 'reply_excludes', 'reply_excludes_internal_names', 'briefed', 'principal_note', 'text', 'any_of', ...GATEWAY_CHECK_KINDS]
     .filter(k => k in raw);
   if (kinds.length !== 1) {
-    throw new CaseError(file, `${where}: check needs exactly one of called, not_called, order, reply, reply_excludes, reply_excludes_internal_names, briefed, principal_note, text, any_of (got ${kinds.join(', ') || 'none'})`);
+    throw new CaseError(file, `${where}: check needs exactly one of called, not_called, order, reply, reply_excludes, reply_excludes_internal_names, briefed, principal_note, text, any_of, ${GATEWAY_CHECK_KINDS.join(', ')} (got ${kinds.join(', ') || 'none'})`);
   }
+  const gatewayKind = GATEWAY_CHECK_KINDS.find(k => k === kinds[0]);
+  if (gatewayKind) return parseGatewayCheck(gatewayKind, raw, file, where);
   onlyKeys(raw, CHECK_KEYS[kinds[0]!]!, file, where);
   const withArgs = raw['with'];
   if (withArgs !== undefined && !isObject(withArgs)) throw new CaseError(file, `${where}: 'with' must be a mapping`);
@@ -493,6 +608,58 @@ function parsePrincipalIdentities(raw: Raw, file: string): SeedPrincipalIdentity
   });
 }
 
+function parseTasks(raw: Raw, file: string): SeedTask[] {
+  return list(raw, 'tasks', file).map((t, i) => {
+    const where = `seed.tasks[${i}]`;
+    onlyKeys(t, TASK_KEYS, file, where);
+    const intent = optStr(t, 'intent', file, where);
+    return {
+      key: str(t, 'key', file, where),
+      title: str(t, 'title', file, where),
+      ...(intent !== undefined ? { intent } : {}),
+      originator: str(t, 'originator', file, where),
+      agent: optStr(t, 'agent', file, where) ?? COORDINATOR,
+    };
+  });
+}
+
+function parseOutreach(raw: Raw, file: string): SeedOutreach[] {
+  return list(raw, 'outreach', file).map((o, i) => {
+    const where = `seed.outreach[${i}]`;
+    onlyKeys(o, OUTREACH_KEYS, file, where);
+    const via = str(o, 'via', file, where);
+    if (!(OUTREACH_VIAS as readonly string[]).includes(via)) {
+      throw new CaseError(file, `${where}: via must be one of ${OUTREACH_VIAS.join(', ')}`);
+    }
+    const confirmed = optBool(o, 'confirmed', file, where);
+    if (confirmed === undefined) throw new CaseError(file, `${where}: 'confirmed' must be true or false`);
+    const task = optStr(o, 'task', file, where);
+    const orgName = optStr(o, 'org_name', file, where);
+    const row: SeedOutreach = {
+      key: str(o, 'key', file, where),
+      ...(task !== undefined ? { task } : {}),
+      via: via as SeedOutreach['via'],
+      ...(orgName !== undefined ? { orgName } : {}),
+      domains: strList(o, 'domains', file, where).map(d => d.trim().toLowerCase()),
+      addresses: strList(o, 'addresses', file, where).map(a => a.trim().toLowerCase()),
+      contacts: strList(o, 'contacts', file, where),
+      summary: str(o, 'summary', file, where),
+      confirmed,
+    };
+    // Fixtures never name a real organization or person.
+    for (const d of row.domains) {
+      if (!TEST_DOMAIN.test(d)) throw new CaseError(file, `${where}: domain '${d}' must be a .test name`);
+    }
+    for (const a of row.addresses) {
+      if (!TEST_ADDRESS.test(a)) throw new CaseError(file, `${where}: address '${a}' must be under a .test name`);
+    }
+    if (row.domains.length === 0 && row.addresses.length === 0 && row.contacts.length === 0) {
+      throw new CaseError(file, `${where}: name at least one of domains, addresses or contacts (a reply must have something to match)`);
+    }
+    return row;
+  });
+}
+
 /** `seed.backlog`: each count a whole number, absent ones zero, at least one positive. */
 function parseBacklog(raw: Raw, file: string): PrincipalBacklogCounts | undefined {
   if (raw['backlog'] === undefined) return undefined;
@@ -516,7 +683,10 @@ function parseWakeTask(raw: unknown, file: string): ScenarioWakeTask {
   if (!isObject(raw)) throw new CaseError(file, `inbound.task must be a mapping`);
   onlyKeys(raw, WAKE_TASK_KEYS, file, 'inbound.task');
   const id = str(raw, 'id', file, 'inbound.task');
-  if (!UUID.test(id)) throw new CaseError(file, `inbound.task: 'id' must be a UUID`);
+  // A seeded task (#2312) is named by its placeholder; the row's id fills it in per run.
+  if (!UUID.test(id) && !/^\{\{\s*task:[A-Za-z0-9_-]+\s*\}\}$/.test(id)) {
+    throw new CaseError(file, `inbound.task: 'id' must be a UUID or {{task:<key>}}`);
+  }
   const notes = list(raw, 'notes', file).map((n, i) => {
     onlyKeys(n, WAKE_NOTE_KEYS, file, `inbound.task.notes[${i}]`);
     return { at: str(n, 'at', file, `inbound.task.notes[${i}]`), note: str(n, 'note', file, `inbound.task.notes[${i}]`) };
@@ -571,7 +741,20 @@ function parseInbound(raw: unknown, file: string): ScenarioInbound {
         }
       : {}),
     ...(raw['followup'] !== undefined ? { followup: parseFollowup(raw['followup'], file, from) } : {}),
+    ...(raw['then'] !== undefined ? { then: parseThen(raw['then'], file) } : {}),
   };
+}
+
+/** `inbound.then` (#2312): the principal's next turn, on a channel with a verified identity. */
+function parseThen(raw: unknown, file: string): ScenarioPrincipalTurn {
+  if (!isObject(raw)) throw new CaseError(file, `inbound.then must be a mapping {content, channel}`);
+  onlyKeys(raw, THEN_KEYS, file, 'inbound.then');
+  const channel = optStr(raw, 'channel', file, 'inbound.then') ?? 'signal';
+  // A live principal turn comes from a verified identity; a console channel has none.
+  if (PRINCIPAL_LOCAL_CHANNELS.includes(channel)) {
+    throw new CaseError(file, `inbound.then.channel must be a channel the principal has a verified identity on (not '${channel}')`);
+  }
+  return { content: str(raw, 'content', file, 'inbound.then'), channel };
 }
 
 function parseFollowup(raw: unknown, file: string, inboundFrom: string): ScenarioFollowup {
@@ -781,6 +964,8 @@ export function loadScenarioCase(file: string, options: LoadOptions = {}): Scena
     bullpen: parseBullpen(seedRaw, file),
     verifications: parseVerifications(seedRaw, file),
     principalIdentities: parsePrincipalIdentities(seedRaw, file),
+    tasks: parseTasks(seedRaw, file),
+    outreach: parseOutreach(seedRaw, file),
     ...(backlog && { backlog }),
   };
 
@@ -819,12 +1004,12 @@ export function loadScenarioCase(file: string, options: LoadOptions = {}): Scena
     : loadIdentityFixture(identityName, file, options.identitiesDir ?? DEFAULT_IDENTITIES_DIR);
   const autonomy = parseAutonomy(raw, file);
   const releaseGate = optBool(raw, 'release_gate', file, 'case') ?? true;
-  // The release gate is one unfiltered run on the database's identity and autonomy.
+  const throughGateway = optBool(raw, 'through_gateway', file, 'case');
+  if (throughGateway === false) throw new CaseError(file, `'through_gateway' is true or absent`);
+  // The release gate is one unfiltered run on the database's identity. An autonomy fixture
+  // is pinned per case (#2312), so a case with one can join it.
   if (identity && releaseGate) {
     throw new CaseError(file, `a case with an 'identity' fixture runs on demand; set release_gate: false`);
-  }
-  if (autonomy && releaseGate) {
-    throw new CaseError(file, `a case with an 'autonomy' fixture runs on demand; set release_gate: false`);
   }
   const scenario: ScenarioCase = {
     name: str(raw, 'name', file, 'case'),
@@ -846,13 +1031,37 @@ export function loadScenarioCase(file: string, options: LoadOptions = {}): Scena
     failureModes: strList(raw, 'failure_modes', file, 'case'),
     ...(identity ? { identity } : {}),
     ...(autonomy ? { autonomy } : {}),
+    ...(throughGateway ? { throughGateway: true as const } : {}),
     sourceFile: file,
   };
 
   validateReferences(scenario, file);
   validateDelegation(scenario, file);
   validateEnvelope(scenario, file);
+  validateThroughGateway(scenario, file);
   return scenario;
+}
+
+/**
+ * The gateway checks read what a through-gateway run sent (#2312), so they need the case to
+ * set `through_gateway`; elsewhere they would miss on every run. A stub for a tool that runs
+ * for real there would never answer, so it is a mistake too.
+ */
+function validateThroughGateway(scenario: ScenarioCase, file: string): void {
+  for (const b of scenario.expectedBehaviors) {
+    for (const check of b.check ? leafChecks(b.check) : []) {
+      if (!scenario.throughGateway && (GATEWAY_CHECK_KINDS as readonly string[]).includes(check.kind)) {
+        throw new CaseError(file, `behavior '${b.id}': a '${check.kind}' check needs through_gateway: true`);
+      }
+    }
+  }
+  if (!scenario.throughGateway) return;
+  // Only the case's own stubs: a shared set (human-channels) stubs every send, and those go unused.
+  for (const tool of scenario.ownStubTools) {
+    if (THROUGH_GATEWAY_TOOLS.has(tool)) {
+      throw new CaseError(file, `tool_stubs.${tool}: through_gateway runs ${tool} for real; remove its stubs`);
+    }
+  }
 }
 
 /** A case's `autonomy:` fixture: a score in 0..100 and the gating its prompt block describes. */
@@ -874,7 +1083,7 @@ function parseAutonomy(raw: Raw, file: string): AutonomyFixture | undefined {
 /**
  * An email envelope (inbound.email.to / cc) names Curia exactly once: it received the
  * message, as a To or a CC. Every other entry is the principal, a seeded contact or an
- * address under example.test.
+ * address under a .test name.
  */
 function validateEnvelope(scenario: ScenarioCase, file: string): void {
   const { to, cc } = scenario.inbound.email ?? {};
@@ -894,8 +1103,8 @@ function validateEnvelope(scenario: ScenarioCase, file: string): void {
   const contactKeys = new Set(scenario.seed.contacts.map(c => c.key));
   for (const token of all) {
     if (ENVELOPE_TOKENS.includes(token) || contactKeys.has(token)) continue;
-    if (!/^[^@\s]+@([a-z0-9-]+\.)*example\.test$/i.test(token)) {
-      throw new CaseError(file, `inbound.email: '${token}' is not curia, principal, a seeded contact key, or an address under example.test`);
+    if (!TEST_ADDRESS.test(token)) {
+      throw new CaseError(file, `inbound.email: '${token}' is not curia, principal, a seeded contact key, or an address under a .test name`);
     }
   }
 }
@@ -940,6 +1149,8 @@ function validateReferences(scenario: ScenarioCase, file: string): void {
     ['thread', new Set()],
     ['resume_token', new Set()],
     ['verification', new Set()],
+    ['task', new Set()],
+    ['outreach', new Set()],
   ]);
   const add = (kind: string, key: string): void => {
     const set = keys.get(kind)!;
@@ -951,6 +1162,22 @@ function validateReferences(scenario: ScenarioCase, file: string): void {
   scenario.seed.outboundContext.filter(e => e.resume).forEach(e => add('resume_token', e.key));
   scenario.seed.bullpen.forEach(t => add('thread', t.key));
   scenario.seed.verifications.forEach(v => add('verification', v.key));
+  scenario.seed.tasks.forEach(t => add('task', t.key));
+  scenario.seed.outreach.forEach(o => add('outreach', o.key));
+  const contactKeys = keys.get('contact')!;
+  for (const t of scenario.seed.tasks) {
+    if (t.originator !== 'principal' && !contactKeys.has(t.originator)) {
+      throw new CaseError(file, `seed.tasks '${t.key}': originator '${t.originator}' is not principal or a seeded contact key`);
+    }
+  }
+  for (const o of scenario.seed.outreach) {
+    if (o.task !== undefined && !keys.get('task')!.has(o.task)) {
+      throw new CaseError(file, `seed.outreach '${o.key}': task '${o.task}' is not a seeded task key`);
+    }
+    for (const c of o.contacts) {
+      if (!contactKeys.has(c)) throw new CaseError(file, `seed.outreach '${o.key}': contact '${c}' is not a seeded contact key`);
+    }
+  }
   // Seeding opens each row as pending (one pending row per site, a unique index) before
   // setting its status, so a second row for the site would reuse the first.
   const sites = scenario.seed.verifications.map(v => registrableDomain(v.site) ?? v.site.toLowerCase());
@@ -983,8 +1210,8 @@ function validateReferences(scenario: ScenarioCase, file: string): void {
   }
   // Fixture contacts must never collide with a real person's address.
   for (const c of scenario.seed.contacts) {
-    if (c.channel === 'email' && !/@([a-z0-9-]+\.)*example\.test$/i.test(c.identifier)) {
-      throw new CaseError(file, `seed contact '${c.key}': email identifiers must be under example.test`);
+    if (c.channel === 'email' && !TEST_ADDRESS.test(c.identifier)) {
+      throw new CaseError(file, `seed contact '${c.key}': email identifiers must be under a .test name (e.g. example.test)`);
     }
   }
 
@@ -1041,6 +1268,9 @@ function validateReferences(scenario: ScenarioCase, file: string): void {
   }
 
   const follow = scenario.inbound.followup;
+  if (scenario.inbound.then && toSpecialist) {
+    throw new CaseError(file, `inbound.then is a principal turn to the coordinator; a case for '${scenario.agent}' cannot take one`);
+  }
   if (follow && follow.from !== 'principal') {
     const contact = scenario.seed.contacts.find(c => c.key === follow.from);
     if (!contact) throw new CaseError(file, `inbound.followup.from '${follow.from}' is not principal or a seeded contact`);
@@ -1061,4 +1291,40 @@ export function loadScenarioCases(dir: string, options: LoadOptions = {}): Scena
     seen.add(key);
   }
   return cases;
+}
+
+/** The cases a `pnpm scenarios` run gets, and the ones it leaves out and why. */
+export interface RunSelection {
+  cases: ScenarioCase[];
+  /** release_gate: false cases an unfiltered run leaves out (#2027). */
+  onDemandSkipped: string[];
+  /** Identity-fixture cases left out because the selection holds other cases too (#2143). */
+  identitySkipped: string[];
+}
+
+/**
+ * Pick a run's cases from `all`. An unfiltered run is the release gate: on-demand cases join
+ * it only with `onDemand` (#2027); a `caseFilter` or `tags` selection runs whatever it names.
+ * A case with an identity fixture (#2143) needs the whole stack on that identity, and a run
+ * has one stack, so it runs only in a selection of fixture cases alone (--tags style): never
+ * in an unfiltered run, `onDemand` included, nor beside ordinary cases a wider selection also
+ * picks. An autonomy fixture is the case's own (#2312), so those cases run beside any others.
+ */
+export function selectRunCases(
+  all: readonly ScenarioCase[],
+  args: { caseFilter?: string; tags?: readonly string[]; onDemand?: boolean },
+): RunSelection {
+  let cases = [...all];
+  if (args.caseFilter !== undefined) {
+    const needle = args.caseFilter.toLowerCase();
+    cases = cases.filter(c => c.name.toLowerCase().includes(needle));
+  }
+  if (args.tags !== undefined) cases = cases.filter(c => c.tags.some(t => args.tags!.includes(t)));
+  const selected = args.caseFilter !== undefined || args.tags !== undefined;
+  const onDemandSkipped = selected || args.onDemand ? [] : cases.filter(c => !c.releaseGate).map(c => c.name);
+  cases = cases.filter(c => !onDemandSkipped.includes(c.name));
+  const hasIdentity = (c: ScenarioCase): boolean => c.identity !== undefined;
+  const identitySkipped = selected && cases.every(hasIdentity) ? [] : cases.filter(hasIdentity).map(c => c.name);
+  cases = cases.filter(c => !identitySkipped.includes(c.name));
+  return { cases, onDemandSkipped, identitySkipped };
 }

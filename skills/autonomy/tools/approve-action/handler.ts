@@ -3,7 +3,8 @@
 // Approves a pending approval request: transitions the row to 'approved',
 // re-executes the originally blocked skill with humanApproved: true,
 // writes a child autonomy_action_log row for the re-execution result,
-// and publishes a human.decision audit event.
+// and publishes a human.decision audit event. A row carrying a personal-data ask (#2312)
+// first records the principal's yes for that thread (disclosure_decisions).
 //
 // SECURITY: sensitivity: "elevated" — authorization is enforced solely by the execution-layer
 // live-principal gate (#1126). No handler-level re-check: the gate already guarantees this skill
@@ -15,6 +16,11 @@ import { parseApprovalRefInput } from '../../../_shared/approval-ref.js';
 import { STALE_SEND_APPROVAL_ERROR } from '../../../../src/skills/_shared/recipient-reference.js';
 import { createHumanDecision } from '../../../../src/bus/events.js';
 import type { TaskOriginator } from '../../../../src/contacts/types.js';
+import { hasPersonalDetails } from '../../../../src/autonomy/approval-notification.js';
+
+/** The refusal when an undelivered approval would send personal details (#2312). */
+export const UNSHOWN_PERSONAL_DETAILS_ERROR =
+  'The principal hasn\'t been shown this approval yet, and it contains personal details. Deliver it with deliver-approval first, then ask again.';
 
 export class ApproveActionHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -51,6 +57,20 @@ export class ApproveActionHandler implements ToolHandler {
         return { success: false, error: `Cannot approve ${approvalLabel(row)}: no stored payload for re-execution` };
       }
 
+      // An approved send replays as written (#2312). The approval message lists every personal
+      // detail it carries; one never delivered showed the principal none of them (a digest
+      // line or list-pending-actions names only the description). Refused, not resolved: it
+      // stays pending until delivered.
+      // A personal-data ask too, whatever its payload holds yet: approving records a lasting yes
+      // for the thread, and only the delivered approval asked the question.
+      if (row.notificationSentAt === null && (row.disclosureAsk || hasPersonalDetails(row.toolName, row.payload))) {
+        ctx.log.info(
+          { rowId: row.id, shortRef: row.shortRef, toolName: row.toolName },
+          'approve-action: undelivered approval carries personal details — refusing until it is delivered',
+        );
+        return { success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR };
+      }
+
       const pins = row.sendResolution;
       if (pins && pins.length > 0) {
         const still = await ctx.executionLayer.confirmPinnedSendResolution(row.toolName, pins);
@@ -75,6 +95,19 @@ export class ApproveActionHandler implements ToolHandler {
         return { success: false, error: `${approvalLabel(row)} was already resolved by another action — approval aborted` };
       }
       ctx.log.info({ rowId: row.id, shortRef: row.shortRef }, 'approve-action: row transitioned to approved');
+
+      // A personal-data ask (#2312): the yes is recorded before the replay, so a reply drafted
+      // on the thread in the meantime already sees it. The recorder never throws. Only a delivered
+      // approval records one: a yes to a message the principal never received is no consent
+      // (the refusal above already stops every undelivered ask; this is the belt to those
+      // braces).
+      if (row.disclosureAsk && row.notificationSentAt !== null) {
+        if (ctx.disclosureDecisions) {
+          await ctx.disclosureDecisions.recordForApproval(row, 'yes', 'principal_via_coordinator');
+        } else {
+          ctx.log.error({ rowId: row.id }, 'approve-action: disclosureDecisions not wired — the principal\'s yes is not remembered for the thread');
+        }
+      }
 
       // Step 2: Re-execute the original skill with humanApproved bypass.
       // humanApproved skips the autonomy + caller gates (ADR-018). taskMetadata is forwarded so

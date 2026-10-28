@@ -110,7 +110,9 @@ const DEFAULT_REVIEW_TIMEOUT_MS = 15_000;
 // The brief can quote several sentences back (#2159), so it gets the most room.
 // A four-question brief over a six-claim message measured 229 tokens on Haiku 4.5
 // and up to 408 on Haiku 5.5; 1200 keeps the ~3x headroom 800 used to give (#2077).
-const REVIEW_MAX_TOKENS = 1200;
+// The disclosure question adds one ~60-token ruling per detected item (#2312): 10 items
+// would not fit beside the rest in 1200, so it is 1800.
+const REVIEW_MAX_TOKENS = 1800;
 
 interface LlmCallResult {
   content: string;
@@ -251,7 +253,9 @@ export class EscalationJudge {
     // gating a malformed verdict can send unreviewed at 80+, and the archive is how to tell
     // a truncated answer from a garbled one. Fire-and-forget: never delays the review.
     void this.publishTelemetry(result, userPrompt, input.conversationId, 'review');
-    const answers = parseBriefVerdict(result.content, input.questions);
+    const answers = parseBriefVerdict(result.content, input.questions, {
+      detectedIds: input.detectedItems?.map((i) => i.id),
+    });
     if (answers === null) {
       this.logger.error(
         {

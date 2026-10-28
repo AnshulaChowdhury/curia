@@ -106,6 +106,8 @@ import { formatEmailSummary, isNoOpResult, isSampledTool, sampleEmailFromResult,
 import { TempFileStore } from './temp-file-store.js';
 import type { InfraLlmService } from './infra-llm.js';
 import { OutboundContextService, ScopedOutboundContext } from '../dispatch/outbound-context.js';
+import type { TaskOutreachCapability } from '../dispatch/task-outreach-capability.js';
+import type { DisclosureDecisionRecorder } from '../autonomy/disclosure-decisions.js';
 import { relayRequesterFor, rosterFromRegistry } from '../dispatch/delegation-hint.js';
 import { buildRateLimitSourceKey } from '../memory/rate-limit-key.js';
 import { DEFAULT_RESUMABLE_CEILINGS, type ResumableCeilingsConfig } from '../config.js';
@@ -315,6 +317,10 @@ export class ExecutionLayer {
   private tempFileStore?: TempFileStore;
   private readonly infraLlmService?: InfraLlmService;
   private outboundContextService?: OutboundContextService;
+  /** Task outreach writer (#2312) — backs the 'taskOutreach' capability. */
+  private taskOutreach?: TaskOutreachCapability;
+  /** The principal's answer to a personal-data ask (#2312) — backs the 'disclosureDecisions' capability. */
+  private disclosureDecisions?: Pick<DisclosureDecisionRecorder, 'recordForApproval'>;
   /** The agent's own contactId — injected into ctx.agentContactId for entity_enrichment default='agent' */
   private agentContactId?: string;
   /** IANA timezone name used for normalizing offset-less timestamp inputs from the LLM. */
@@ -377,7 +383,8 @@ export class ExecutionLayer {
     /**
      * Which policy Gate C follows (#2159). Under 'band' the autonomy score decides and the
      * escalation judge's brief flags an outsider steering Curia or a send that speaks for
-     * the principal. Default 'tier'.
+     * the principal. Default 'tier'. A gating on the autonomy config overrides it per call
+     * (#2312): production stamps this same value there; the scenario suite pins it per case.
      */
     gating?: AutonomyGating;
     /** The drafting turn's evidence, for Gate C's band questions (#2159). */
@@ -392,6 +399,10 @@ export class ExecutionLayer {
     tempFileStore?: TempFileStore;
     infraLlmService?: InfraLlmService;
     outboundContextService?: OutboundContextService;
+    /** Task outreach writer (#2312) — backs the 'taskOutreach' capability. */
+    taskOutreach?: TaskOutreachCapability;
+    /** The principal's answer to a personal-data ask (#2312) — backs the 'disclosureDecisions' capability. */
+    disclosureDecisions?: Pick<DisclosureDecisionRecorder, 'recordForApproval'>;
     agentContactId?: string;
     timezone?: string;
     selfEmail?: string;
@@ -464,6 +475,8 @@ export class ExecutionLayer {
     this.sensitivityClassifier = options?.sensitivityClassifier;
     this.openDelegationLookup = options?.openDelegationLookup;
     this.verification = options?.verification;
+    this.taskOutreach = options?.taskOutreach;
+    this.disclosureDecisions = options?.disclosureDecisions;
     if (!this.actionLogRepo) {
       // Once here rather than per call: without the repo no autonomous action reaches the
       // spot-check pool (#2159 Phase 3), and that should not be invisible.
@@ -531,6 +544,10 @@ export class ExecutionLayer {
       sensitivityClassifier: this.sensitivityClassifier,
       // verification (#2017) — plain field injection: the service, code tracker and ask channel.
       verification: this.verification,
+      // taskOutreach (#2312) — plain field injection: record outreach for a task-bound turn.
+      taskOutreach: this.taskOutreach,
+      // disclosureDecisions (#2312) — plain field injection: approve/deny record the principal's answer to an ask.
+      disclosureDecisions: this.disclosureDecisions,
     };
   }
 
@@ -1409,6 +1426,16 @@ export class ExecutionLayer {
   }
 
   /**
+   * The gating this call follows (#2312): the autonomy config's, else the constructed value.
+   * Production's AutonomyService stamps the configured gating on every read, so the two agree
+   * there; the scenario suite's fixture service pins it per case on one shared layer. Takes the
+   * invocation's one config read rather than reading again, so score and gating always agree.
+   */
+  private currentGating(config: AutonomyConfig | null): AutonomyGating {
+    return config?.gating ?? this.gating;
+  }
+
+  /**
    * Gate C under band gating (#2159, spec "Phase 2 → Gate C"). Runs after Gates A and B, for
    * a consequential action that is not principal-originated. Returns `{ blocked: null }` to
    * proceed, or `{ blocked }` with a failed ToolResult that escalates (an approval request, as
@@ -1782,6 +1809,8 @@ export class ExecutionLayer {
         skillLogger.warn({ err, toolName }, 'autonomy gate: failed to read autonomy_config — skipping gate (fail-open)');
       }
     }
+    // Gate C's policy, from the same read (#2312): the config's gating, else the constructed one.
+    const gating = this.currentGating(autonomyConfig);
 
     // Effective standing (#1125): for a live turn this is the raw task metadata (lineage IS the
     // standing); for a heartbeat wake the bypass ladder lets the live score only DOWNGRADE the
@@ -2075,7 +2104,7 @@ export class ExecutionLayer {
                 error: this.wrapSkillError(gateCError),
               };
             }
-            if (this.gating === 'band') {
+            if (gating === 'band') {
               // Band gating (#2159): the score decides; the judge flags steering and speaking
               // for the principal. The #1290 KG-write block above still applies.
               const gate = await this.runBandGateC({
@@ -2316,7 +2345,7 @@ export class ExecutionLayer {
               success: false,
               error: this.wrapSkillError(gateCError),
             };
-          } else if (this.gating === 'band' && manifest.action_risk !== 'none') {
+          } else if (gating === 'band' && manifest.action_risk !== 'none') {
             // System and agent originators (#2159): tier gating skipped them, but the band
             // table is about what Curia does, not who asked.
             const gate = await this.runBandGateC({

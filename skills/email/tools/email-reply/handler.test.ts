@@ -1,10 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { REDACTION_NOTE } from '../../../../src/skills/_shared/principal-directed.js';
 import { EmailReplyHandler } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { OutboundGateway } from '../../../../src/skills/outbound-gateway.js';
 import pino from 'pino';
 import { ContactService } from '../../../../src/contacts/contact-service.js';
 import { resolveRecipientReference } from '../../../../src/skills/_shared/recipient-reference.js';
+import { TaskOutreachService } from '../../../../src/dispatch/task-outreach-capability.js';
+import type { TaskOutreachInput, TaskOutreachRepo, TaskOutreachRow } from '../../../../src/dispatch/task-outreach.js';
 
 function makeLogger() {
   return pino({ level: 'silent' });
@@ -297,6 +300,8 @@ describe('EmailReplyHandler', () => {
       expect(sendArg.htmlQuote).toContain('<blockquote');
       expect(sendArg.htmlQuote).toContain('alice@example.com');
       expect(sendArg.htmlQuote).toContain('Let me know your thoughts.');
+      // Who was on the quoted message, for the send review (#2312).
+      expect((sendArg as { quoteParticipants?: string[] }).quoteParticipants).toEqual(['alice@example.com', 'curia@example.com']);
     });
 
     it('proceeds without quote when buildReplyQuote throws', async () => {
@@ -844,5 +849,79 @@ describe('email-reply relay budget (#1320)', () => {
     // Nothing reached the principal, so no reply should bind to it.
     expect(outboundContext.register).not.toHaveBeenCalled();
     if (result.success) expect(result.data).toMatchObject({ deferred_to_digest: true, note: expect.stringMatching(/digest/) });
+  });
+});
+
+// #2312: the agent is told what was removed, and the entry records what was delivered.
+describe('EmailReplyHandler redactions (#2312)', () => {
+  const RED = [{ label: 'phone_us', field: 'body' as const }];
+  const SENT = 'x [REDACTED: PHONE_US]';
+
+  function withContext(ctx: ToolContext) {
+    const register = vi.fn().mockResolvedValue('entry-1');
+    (ctx as unknown as Record<string, unknown>).outboundContext = {
+      register, release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6,
+    };
+    return register;
+  }
+
+  it('reports the redactions and records the delivered content', async () => {
+    const ctx = makeCtx({ reply_to_message_id: 'nylas-msg-1', body: 'x 519-555-0100' });
+    const register = withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'm', redactions: RED, sentContent: SENT });
+    const result = await new EmailReplyHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toMatchObject({ redactions: RED, redaction_note: REDACTION_NOTE });
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: SENT }));
+  });
+
+  it('returns the subject as delivered when redaction changed it', async () => {
+    const ctx = makeCtx({ reply_to_message_id: 'nylas-msg-1', body: 'x' });
+    withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true, messageId: 'm', redactions: [{ label: 'phone_us', field: 'subject' }], sentContent: 'x', sentSubject: 'Re: [REDACTED: PHONE_US]',
+    });
+    const result = await new EmailReplyHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toMatchObject({ subject: 'Re: [REDACTED: PHONE_US]' });
+  });
+
+  it('adds no redactions key when nothing was removed', async () => {
+    const ctx = makeCtx({ reply_to_message_id: 'nylas-msg-1', body: 'hello' });
+    const register = withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'm' });
+    const result = await new EmailReplyHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).not.toHaveProperty('redactions');
+      expect(result.data).not.toHaveProperty('redaction_note');
+    }
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: 'hello' }));
+  });
+});
+
+describe('EmailReplyHandler task outreach (#2312)', () => {
+  it('with no task title, summarises the outreach row by the reply subject, never the body', async () => {
+    const ctx = makeCtx(
+      { reply_to_message_id: 'nylas-msg-1', body: 'My card ends 4242, call me on 416-555-0100.' },
+      { taskMetadata: { originator: { contactId: 'principal-id', systemRole: 'principal', channel: 'email', initiatedAt: '2026-10-26T00:00:00Z' } } },
+    );
+    (ctx.outboundGateway!.getEmailMessage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      from: [{ email: 'bookings@acme.example' }], to: [], cc: [], subject: 'Appointment', body: '', date: 0,
+    });
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'reply-1' });
+    const record = vi.fn(async (input: TaskOutreachInput) => ({ id: 'outreach-1', ...input } as unknown as TaskOutreachRow));
+    Object.assign(ctx as unknown as Record<string, unknown>, {
+      liveTurn: true,
+      conversationId: 'conv-1',
+      taskEventId: 'evt-1',
+      taskOutreach: new TaskOutreachService({ record } as unknown as TaskOutreachRepo, {
+        principalIdentities: [], selfEmails: ['curia@office.example'], log: makeLogger(),
+      }),
+    });
+
+    expect((await new EmailReplyHandler().execute(ctx)).success).toBe(true);
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({ taskId: null, summary: 'Re: Appointment' }));
+    expect(JSON.stringify(record.mock.calls)).not.toContain('4242');
   });
 });

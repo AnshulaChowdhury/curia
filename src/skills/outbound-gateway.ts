@@ -24,6 +24,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { NylasClient, NylasMessage, NylasFolder, ListMessagesOptions, SendEmailOptions, AttachmentContent } from '../channels/email/nylas-client.js';
+import { quoteParticipants } from './_shared/reply-quote.js';
 import { readAttachmentFiles, MAX_ATTACHMENT_BYTES, type OutboundAttachmentInput } from './_shared/read-attachments.js';
 import type { EmailRecipientSource, EmailSendRequest } from '../channels/email/outbound-request.js';
 import type { SignalOutboundRequest } from '../channels/signal/outbound-request.js';
@@ -43,23 +44,27 @@ import {
 } from '../contacts/principal-recipient.js';
 import { findPrincipalChannelRules } from '../contacts/principal-channel-registry.js';
 import type { ProjectedRecipient } from '../contacts/principal-channel-rules.js';
-import type { OutboundContentFilter, FilterRecipient } from '../dispatch/outbound-filter.js';
-import type { PiiRedactor } from '../dispatch/pii-redactor.js';
+import type { OutboundContentFilter, FilterFinding, FilterRecipient } from '../dispatch/outbound-filter.js';
+import type { DetectedPii, PiiRedactor } from '../dispatch/pii-redactor.js';
+import type { BriefDetectedItem } from '../autonomy/judge-brief.js';
 import type { EventBus } from '../bus/bus.js';
 import type { Logger } from '../logger.js';
 import { createOutboundBlocked, createOutboundDelivered, createOutboundNotification, createAutonomySendBlocked, createAutonomyRelayDeferred, createPrincipalReport } from '../bus/events.js';
 import type { ChannelReconnectEvent } from '../bus/events.js';
-import { AutonomyService } from '../autonomy/autonomy-service.js';
+import { AutonomyService, type AutonomyConfig } from '../autonomy/autonomy-service.js';
 import { markdownToMrkdwn } from '../format/markdown-to-mrkdwn.js';
 import type { ActionLogRepo } from '../autonomy/action-log-repo.js';
-import { approvalAdvisory, buildApprovalDeliveryWake, generateShortRef, readApprovalNumber } from '../autonomy/approval-trigger.js';
+import { approvalAdvisory, buildApprovalDeliveryWake, generateShortRef, readApprovalNumber, type ApprovalWakeAsk } from '../autonomy/approval-trigger.js';
 import { enrichGatewayApprovalPayload } from '../autonomy/approval-notification.js';
 import type { ApprovalDelivery } from '../autonomy/approval-delivery.js';
 import type { AutonomyGating } from '../autonomy/band-policy.js';
 import { budgetedOriginator, type RelayBudget } from '../autonomy/relay-budget.js';
 import { isUuid } from '../util/uuid.js';
-import { BAND_RULES, type BandReviewReport, type BandReviewSignals, type BandSendReview } from '../dispatch/band-send-review.js';
+import {
+  BAND_RULES, describePiiLabels, type BandReviewAsk, type BandReviewReport, type BandReviewSignals, type BandSendReview,
+} from '../dispatch/band-send-review.js';
 import type { OutboundNotificationPayload } from '../bus/events.js';
+import { askPreamble, displayName, normalizeCounterparty, type DisclosureAsk } from '../autonomy/disclosure-decisions.js';
 import { markdownToHtml } from '../format/markdown-to-html.js';
 import { bodyEndsWithSignature, emailSignatureHtml, emailSignatureText, stripModelSignOff } from '../channels/email/signature.js';
 import type { AgentPersona } from './types.js';
@@ -164,6 +169,16 @@ export interface OutboundSendResult {
    * succeeded; `blockedReason` already carries the agent-facing note.
    */
   unmatchedRecipients?: string[];
+  /**
+   * PII redactions that changed what was sent (#2312): the pattern label and which field it hit.
+   * Labels only, never the matched values. Set only on a successful send (dispatched, queued or
+   * held for the digest) where redaction changed something; absent otherwise.
+   */
+  redactions?: Array<{ label: string; field: 'body' | 'subject' }>;
+  /** The body as delivered. Set with `redactions`; send skills use it for outbound context. */
+  sentContent?: string;
+  /** The email subject as delivered. Set with `redactions` on email sends; skills return it in place of the input subject. */
+  sentSubject?: string;
   /** True when the autonomy gate blocked this send */
   gated?: boolean;
   /** Short reference for the action_log row (e.g. 'a3f7c12b'). Present when gated is true. */
@@ -191,6 +206,11 @@ export interface OutboundSendResult {
 export interface OutboundDraftResult extends OutboundSendResult {
   /** Nylas draft ID when success is true. */
   draftId?: string;
+  /**
+   * The draft's subject and body as Nylas stored them, when success is true (#2312). An
+   * approval of the draft stores them so send-draft can match the replay to what was shown.
+   */
+  draft?: { subject: string; body: string };
 }
 
 export interface OutboundGatewayConfig {
@@ -341,7 +361,9 @@ export interface OutboundGatewayConfig {
   /**
    * Which policy reviews sends (#2159). Under 'band', a send that passes the content
    * filter is reviewed by `bandReview` (the escalation judge's brief) before dispatch.
-   * Default 'tier': no band review, today's behavior.
+   * Default 'tier': no band review, today's behavior. A gating on the autonomy config
+   * overrides it per send (#2312): production stamps this same value there; the scenario
+   * suite pins it per case.
    */
   gating?: AutonomyGating;
   /** The band review (#2159). Used only when gating is 'band'. */
@@ -353,11 +375,20 @@ export interface OutboundGatewayConfig {
   relayBudget?: RelayBudget;
 }
 
+/** One send's autonomy config read (#2312). `failed`: the read threw (`error`); config is then null. */
+interface AutonomyRead {
+  config: AutonomyConfig | null;
+  failed: boolean;
+  error?: unknown;
+}
+
 /** What a band hold replays on approval: the same shape as reExecRecipe (#2159). */
 interface SendRecipe {
   toolName: string;
   partialPayload?: Record<string, unknown>;
   description: string;
+  /** Used instead of `description` when the hold is a personal-data ask (#2312). */
+  askDescription?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +479,9 @@ function buildBlockReasonSummary(findings: Array<{ rule: string; detail: string 
         || f.rule === 'principal-note-markup'
         || f.rule === BAND_RULES.ungrounded
         || f.rule === BAND_RULES.unneeded
+        // Labels and fixed text only, never values (#2312): the drafter needs them to rewrite.
+        || f.rule === BAND_RULES.pii
+        || f.rule === BAND_RULES.token
       ) && f.detail;
       return showDetail ? `${f.rule}: ${f.detail}` : f.rule;
     })
@@ -580,6 +614,29 @@ interface FirstContactProbe {
 function truncatePreview(text: string): string {
   const line = text.split('\n').find((l) => l.trim() !== '')?.trim() ?? '';
   return line.length > 80 ? `${line.slice(0, 77)}...` : line;
+}
+
+// The question an ask's approval opens with (#2312); approval delivery rebuilds it from the row.
+export { askPreamble };
+
+/**
+ * An ask's approval shows any other reason it was held beside the question (#2312): a hold for
+ * speaking as the principal below 80 keeps the ask (band-send-review.ts, combine).
+ */
+function alsoHeld(findings: readonly FilterFinding[]): string[] {
+  const other = findings.filter((f) => f.rule !== BAND_RULES.pii);
+  return other.length > 0 ? [`Also held by the send review: ${other.map((f) => f.detail).join(' ')}`] : [];
+}
+
+/**
+ * A personal-data ask as a relayed reply's coordinator wake states it (#2312): human labels and
+ * the requester, plus the email it answers so the holding reply can thread under it.
+ */
+function wakeAskFor(request: OutboundSendRequest, ask: BandReviewAsk): ApprovalWakeAsk {
+  const replyTo = request.channel === 'email' && request.replyToMessageId
+    ? { messageId: request.replyToMessageId, ...(request.accountId ? { account: request.accountId } : {}) }
+    : undefined;
+  return { details: describePiiLabels(ask.labels), requester: normalizeCounterparty(ask.requester), ...(replyTo ? { replyTo } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -749,6 +806,8 @@ export class OutboundGateway {
        * blocked result's advisory.
        */
       postTurn?: boolean;
+      /** The principal note cut from this relayed reply and queued for the principal: judge evidence (#2312). */
+      reportedToPrincipal?: string;
       reExecRecipe?: {
         /** Registered skill name to invoke on approval (e.g. 'send-draft'). */
         toolName: string;
@@ -763,6 +822,8 @@ export class OutboundGateway {
          * row (visible via list-pending-actions) and the principal notification body.
          */
         description: string;
+        /** Used instead of `description` when band review holds the send as a personal-data ask (#2312). */
+        askDescription?: string;
       };
       /** Export gate context for attachment bulk-export audit and approval (#201). */
       exportContext?: {
@@ -807,6 +868,8 @@ export class OutboundGateway {
     // allowed the skill, the gateway independently blocks the actual send
     // when the score is too low. Fail-open if the service is not wired
     // or the config table is missing.
+    // One read per send (#2312): this gate, the gating and the band review's score share it.
+    const autonomy = await this.readAutonomy();
     if (this.autonomyService && options?.humanApproved) {
       // principal is explicitly in the loop — autonomy gate does not apply. Log the bypass
       // so operators can trace every humanApproved send in the log stream. See ADR-017.
@@ -836,13 +899,11 @@ export class OutboundGateway {
       // Fail-open on config read only — getConfig() failure must not block sends.
       // The action_log DB write is kept outside this try/catch so a DB error there
       // does NOT cause fail-open; the send stays blocked even if we can't write the row.
-      let autonomyConfig: Awaited<ReturnType<typeof this.autonomyService.getConfig>> | null = null;
-      try {
-        autonomyConfig = await this.autonomyService.getConfig();
-      } catch (err) {
+      const autonomyConfig = autonomy.config;
+      if (autonomy.failed) {
         // DB error — fail-open. Log at warn so anomalies are visible in alerting.
         this.log.warn(
-          { err, channel: request.channel },
+          { err: autonomy.error, channel: request.channel },
           'outbound-gateway: autonomy gate failed to read config — proceeding without gate (fail-open)',
         );
       }
@@ -984,6 +1045,9 @@ export class OutboundGateway {
     // 'unknown' tier rather than treat it as a genuinely unknown recipient (#1870).
     let recipientTierUnresolved = false;
     let recipientContactId: string | undefined;
+    let recipientIdentityVerified = false;
+    // The contact record's name, for an ask's wording only (#2312).
+    let recipientName: string | undefined;
     try {
       const contact = await this.contactService.resolveByChannelIdentity(request.channel, recipientId);
       if (contact !== null) {
@@ -995,11 +1059,12 @@ export class OutboundGateway {
           );
           return { success: false, blockedReason: 'Recipient is blocked' };
         }
-        // Capture tier for the content filter, and contact UUID for the PII redactor's
-        // principal bypass check. Both are used downstream: tier by the content filter's disclosure
-        // gate, and contact UUID by PiiRedactor.redact() for the principal bypass.
+        // Capture tier for the content filter's disclosure gate, and the contact UUID for the
+        // audit and delivery events (the PII redactor no longer uses it for a principal bypass).
         recipientTier = contact.tier;
         recipientContactId = contact.contactId;
+        recipientIdentityVerified = contact.verified === true;
+        recipientName = contact.displayName;
       }
     } catch (err) {
       // DB or service error — log at warn and proceed.
@@ -1015,10 +1080,17 @@ export class OutboundGateway {
 
     // The rest of the envelope (further To, CC): a blocked contact anywhere on
     // it is refused, not only the primary (#2273). Fail-open, as above.
+    // Every resolved person recipient's tier, for the band review's ask (#2312).
+    const recipientTiers: Record<string, ContactTier> = {};
+    // Contact ids for link coverage, from verified identities only (#2312): an unverified
+    // address on a linked contact must not count as that contact.
+    const recipientContactIds: Record<string, string> = {};
+    if (recipientContactId !== undefined && recipientIdentityVerified) recipientContactIds[normalizeCounterparty(recipientId)] = recipientContactId;
+    if (!recipientTierUnresolved && recipientContactId !== undefined) recipientTiers[normalizeCounterparty(recipientId)] = recipientTier;
     const blockedOther = await this.findBlockedRecipient(
       request.channel,
       this.personRecipients(request).filter((id) => id.toLowerCase() !== recipientId.toLowerCase()),
-      { failClosed: false },
+      { failClosed: false, tiers: recipientTiers, contactIds: recipientContactIds },
     );
     if (blockedOther?.kind === 'blocked') {
       this.log.warn(
@@ -1161,58 +1233,116 @@ export class OutboundGateway {
     //
     // Optional: when piiRedactor is not configured, redactedBody == messageBody
     // and the pipeline behaves identically to the pre-redaction behaviour.
+    // Built once and reused by Step 2: the redactor's principal bypass keys on the same
+    // sole-recipient computation as the content filter (#2312).
+    //
+    // Under band gating (#2312) the review, not the redactor, decides each disclosure. When
+    // the review will run, the PII is detected, the filter gets a redacted copy, and the
+    // message goes out as written only if the review authorizes every item. An approved
+    // replay (humanApproved) goes out intact: the principal approved this exact message.
+    // Otherwise (a system notice, the principal alone, no review wired) band redacts as tier.
+    const { recipients, principalIncluded, principalIsSoleRecipient } = this.buildFilterRecipients(request);
+    const gating = this.currentGating(autonomy);
+    const bandReviewRuns = gating === 'band' && this.bandReview !== undefined
+      && !options?.isSystemNotification && !options?.humanApproved && !principalIsSoleRecipient;
+    const sendIntact = gating === 'band' && options?.humanApproved === true;
+    // The redacted copy: what the content filter and the audit events see. Under tier it is
+    // also what is sent; under band review it never goes on the wire.
     let redactedBody = messageBody;
     // Email subjects can contain PII just as the body can — track a separate
     // variable so we can pass the cleaned subject to dispatchEmail() below.
     let redactedSubject: string | undefined = request.channel === 'email' ? request.subject : undefined;
-    if (this.piiRedactor) {
+    // What goes on the wire. The redacted copy, except under band review, where it stays raw.
+    let sendBody = messageBody;
+    let sendSubject = redactedSubject;
+    // The personal data the band review rules on (#2312), `P1…` in order body, subject, quote.
+    const detectedItems: BriefDetectedItem[] = [];
+    // Labels of what the redactor changed, reported on the send result (#2312).
+    const appliedRedactions: NonNullable<OutboundSendResult['redactions']> = [];
+    // An approved replay's quoted thread holds details the principal was not shown (#2312).
+    let dropIntactQuote = false;
+    if (this.piiRedactor && sendIntact) {
+      this.log.info(
+        { channel: request.channel },
+        'outbound-gateway: PII detection skipped — an approved send goes out as the principal approved it',
+      );
+      // Sent as written, but the content filter and the audit events still get redacted copies.
+      redactedBody = this.redactedCopy(messageBody, request.channel, recipientId);
+      if (request.channel === 'email' && request.subject) redactedSubject = this.redactedCopy(request.subject, 'email', recipientId);
+      // The approval showed the body and subject. A reply's quote is rebuilt at send time and was
+      // never shown, so personal details in it go out only after a review: here, without it.
+      // Unless everyone it reaches was on the quoted message, as for a reviewed send.
+      if (request.channel === 'email' && request.htmlQuote && !(await this.quoteIsExempt(request, recipients))) {
+        try {
+          dropIntactQuote = this.piiRedactor.detect(request.htmlQuote, 'email', { recipientId, principalIsSoleRecipient }).length > 0;
+        } catch (err) {
+          this.log.warn({ err }, 'outbound-gateway: PII redactor threw scanning an approved reply\'s quote — sending without it');
+          dropIntactQuote = true;
+        }
+        if (dropIntactQuote) this.log.info('outbound-gateway: approved reply sent without its quoted message — the quote has details the approval did not show');
+      }
+    } else if (this.piiRedactor && bandReviewRuns) {
+      const redactor = this.piiRedactor;
+      const quoteExempt = request.channel === 'email' && request.htmlQuote ? await this.quoteIsExempt(request, recipients) : false;
+      try {
+        const ctx = { recipientId, principalIsSoleRecipient };
+        const detectIn = (text: string | undefined, field: BriefDetectedItem['field']): DetectedPii[] => {
+          if (!text) return [];
+          const found = redactor.detect(text, request.channel, ctx);
+          for (const item of found) {
+            detectedItems.push({ id: `P${detectedItems.length + 1}`, label: item.label, text: item.matched, field });
+          }
+          return found;
+        };
+        const bodyItems = detectIn(messageBody, 'body');
+        const subjectItems = request.channel === 'email' ? detectIn(request.subject, 'subject') : [];
+        // Quoted history shown back to people who were on it is not a disclosure (#2312): the
+        // quote's items are ruled only when someone on this send was not on the quoted message.
+        if (request.channel === 'email' && request.htmlQuote) {
+          if (quoteExempt) {
+            this.log.debug({ channel: request.channel }, 'outbound-gateway: quote not reviewed — every recipient was on the quoted message');
+          } else {
+            detectIn(request.htmlQuote, 'quote');
+          }
+        }
+        // audit: false — nothing is redacted on the wire, so no outbound.pii_redacted.
+        redactedBody = redactor.apply(messageBody, bodyItems, request.channel, ctx, { audit: false }).content;
+        if (request.channel === 'email' && request.subject) {
+          redactedSubject = redactor.apply(request.subject, subjectItems, request.channel, ctx, { audit: false }).content;
+        }
+      } catch (err) {
+        return this.blockForRedactorError(err, request, messageBody, recipientId, options);
+      }
+    } else if (this.piiRedactor) {
+      // Tier redaction (and band with no review). An email's quoted thread is not scanned or
+      // redacted here: that is the pre-#2312 behavior, unchanged. Band review covers quotes above.
       try {
         const redactionResult = await this.piiRedactor.redact(
           messageBody,
           request.channel,
-          { recipientId, recipientContactId },
+          { recipientId, principalIsSoleRecipient },
         );
         redactedBody = redactionResult.content;
+        for (const r of redactionResult.redactions) {
+          appliedRedactions.push({ label: r.patternLabel, field: 'body' });
+        }
         // Redact the subject too — same channel policy applies.
         if (request.channel === 'email' && request.subject) {
           const subjectResult = await this.piiRedactor.redact(
             request.subject,
             request.channel,
-            { recipientId, recipientContactId },
+            { recipientId, principalIsSoleRecipient },
           );
           redactedSubject = subjectResult.content;
+          for (const r of subjectResult.redactions) {
+            appliedRedactions.push({ label: r.patternLabel, field: 'subject' });
+          }
         }
       } catch (err) {
-        this.log.error(
-          { err, channel: request.channel, recipientId: redactId(recipientId) },
-          'outbound-gateway: PiiRedactor threw — blocking message (fail-closed)',
-        );
-        const blockId = `block_${randomUUID()}`;
-        try {
-          await this.bus.publish('dispatch', createOutboundBlocked({
-            blockId,
-            conversationId: options?.conversationId ?? '',
-            channelId: request.channel,
-            // scrubPii() as a safety fallback — the redactor itself failed, so we apply
-            // a best-effort scrub before writing anything to the audit log. This ensures
-            // no raw PII leaks into the audit trail even on a redactor failure path.
-            content: scrubPii(messageBody),
-            recipientId,
-            reason: 'pii_redactor_error',
-            findings: [{ rule: 'pii_redactor_error', detail: 'PiiRedactor threw an unexpected error' }],
-            parentEventId: options?.parentEventId ?? '',
-          }));
-        } catch (publishErr) {
-          this.log.warn(
-            { publishErr, blockId },
-            'outbound-gateway: failed to publish outbound.blocked event for PII redactor error',
-          );
-        }
-        return this.withUnmatchedRecipientNote(
-          { success: false, blockedReason: 'pii_redactor_error' },
-          await this.findUnmatchedRecipients(request.channel, this.personRecipients(request)),
-        );
+        return this.blockForRedactorError(err, request, messageBody, recipientId, options);
       }
+      sendBody = redactedBody;
+      sendSubject = redactedSubject;
     }
 
     // ------------------------------------------------------------------
@@ -1223,8 +1353,6 @@ export class OutboundGateway {
     // potentially dangerous content through an unchecked pipeline.
     let filterPassed = false;
     let filterFindings: Array<{ rule: string; detail: string }> = [];
-
-    const { recipients, principalIncluded, principalIsSoleRecipient } = this.buildFilterRecipients(request);
 
     try {
       const filterResult = await this.contentFilter.check({
@@ -1243,6 +1371,8 @@ export class OutboundGateway {
         recipients,
         principalIncluded,
         principalIsSoleRecipient,
+        // The send's gating (#2312): the filter's tier-keyed rules follow it, not its constructed value.
+        gating,
       });
       filterPassed = filterResult.passed;
       filterFindings = filterResult.findings;
@@ -1361,6 +1491,8 @@ export class OutboundGateway {
         relaySlot = relayOriginator.contactId;
       } else {
         const deferred = await this.deferRelay(request, redactedBody, redactedSubject, relayOriginator, options);
+        // No withRedactions here: deferral needs principalIsSoleRecipient, which is also the
+        // redactor's bypass, so nothing was redacted.
         if (deferred) return deferred;
         // The digest item could not be recorded: deliver after all. Noise beats a lost message.
       }
@@ -1383,22 +1515,35 @@ export class OutboundGateway {
     // exact message), and for the principal alone (nobody else reads it).
     let bandReport: BandReviewReport | undefined;
     let bandSignals: BandReviewSignals | undefined;
-    if (
-      this.gating === 'band' && this.bandReview
-      && !options?.isSystemNotification && !options?.humanApproved && !principalIsSoleRecipient
-    ) {
-      const people = this.personRecipients(request);
+    // The review would stop the send only for the quote's details: it goes without the quote.
+    let dropQuote = false;
+    if (bandReviewRuns) {
+      // People in the finalized set (Curia's own addresses dropped; a group or channel id is
+      // still not an audience member), so `recipients` and `principalRecipients` agree. A group
+      // send has no person recipients, so the review names the group id instead. A send that
+      // addresses only Curia itself is still reviewed (fail closed), with no outside audience.
+      const people = new Set(this.personRecipients(request).map((p) => p.toLowerCase()));
+      const reviewRecipients = recipients.map((r) => r.email).filter((id) => people.has(id.toLowerCase()));
       const outcome = await this.runBandReview({
         request,
-        content: redactedBody,
-        recipients: people.length > 0 ? people : [recipientId],
-        editable: true,
+        autonomy,
+        // The message as written: the review rules on the raw detected items it contains.
+        content: sendBody,
+        auditContent: redactedBody,
+        recipients: reviewRecipients.length > 0 || people.size > 0 ? reviewRecipients : [recipientId],
+        principalRecipients: recipients.filter((r) => r.isPrincipal).map((r) => r.email),
+        detectedItems,
+        recipientTier,
+        recipientTiers,
+        ...(Object.keys(recipientContactIds).length > 0 ? { recipientContactIds } : {}),
+        ...(recipientName ? { requester: { id: recipientId, name: recipientName } } : {}),
+        ...(sendSubject !== undefined ? { subject: sendSubject } : {}),
         options,
       });
       if (outcome.result) return outcome.result;
-      redactedBody = outcome.content;
       bandReport = outcome.report;
       bandSignals = outcome.signals;
+      dropQuote = outcome.dropQuote !== undefined;
     }
 
     // Spot-check pool (#2159 Phase 3): a send Curia made on its own. Not a system notice, a
@@ -1427,17 +1572,37 @@ export class OutboundGateway {
     // confirmed (or create one if none exists). The act of sending is the principal's
     // implicit trust confirmation — replies from this person should never be held.
     //
-    // IMPORTANT: pass redactedBody here, not request.body / request.message.
+    // IMPORTANT: pass sendBody here, not request.body / request.message.
     // The dispatch methods read the body/message field from the request object
     // they receive — if we pass the original `request`, the unredacted content
     // reaches Nylas / signal-cli even though redactedBody was computed above.
+    // sendBody is raw under band review, which authorized every detected item, and on a band
+    // approved replay, which the principal approved as written (#2312).
+    //
+    // The spot-check preview is the redacted copy whenever the wire is raw: a sample row is
+    // not where a disclosure the review authorized should be repeated (#2312).
+    // Only the review fills detectedItems; naming it here keeps a future path that detects
+    // without reviewing from sending raw behind a redacted audit copy.
+    const rawOnWire = bandReviewRuns && detectedItems.length > 0;
+    // The outbound.delivered content never carries raw values: the redacted copy whenever the
+    // wire may be raw (#2312), an intact replay's included.
+    const auditBody = redactedBody;
+    // What the review let go out raw, by label: the audit's record of the disclosure.
+    const disclosed = rawOnWire
+      ? { disclosed: detectedItems.filter((i) => !(dropQuote && i.field === 'quote')).map(({ label, field }) => ({ label, field })) }
+      : {};
     if (request.channel === 'email') {
       // Provenance lives on the request so a queued payload keeps it. Only send()
       // options set it; a value already on the request is dropped. dispatchEmail
       // copies named provider fields, so Nylas never sees these (#2071).
-      const toSend: EmailSendRequest = { ...request, body: redactedBody, subject: redactedSubject };
+      const toSend: EmailSendRequest = { ...request, body: sendBody, subject: sendSubject };
       delete toSend.recipientSource;
       delete toSend.recipientDisplayName;
+      // Quoted history, not the agent's text: dropping it is not a cut (#2312).
+      if (dropQuote || dropIntactQuote) {
+        delete toSend.htmlQuote;
+        delete toSend.quoteParticipants;
+      }
       this.signEmail(toSend, options?.isSystemNotification === true);
       if (options?.recipientSource === 'email_participant') {
         toSend.recipientSource = 'email_participant';
@@ -1459,12 +1624,14 @@ export class OutboundGateway {
           channel: 'email',
           recipientId,
           recipientContactId,
-          // Without the model's sign-off when signEmail dropped it: what was sent.
-          content: toSend.body,
+          // Without the model's sign-off when signEmail dropped it: what was sent. Redacted when
+          // the review sent details raw: the audit event never carries them (#2312).
+          content: rawOnWire || sendIntact ? this.redactedCopy(toSend.body, 'email', recipientId) : toSend.body,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
+          ...disclosed,
           ...(exportAuditItems && exportAuditItems.length > 0
             ? {
               exportAudit: {
@@ -1476,15 +1643,21 @@ export class OutboundGateway {
             }
             : {}),
         });
-        if (sampled) await this.recordSentAction({ ...sampleArgs, preview: toSend.subject || toSend.body });
+        if (sampled) {
+          await this.recordSentAction({
+            ...sampleArgs,
+            preview: rawOnWire || sendIntact ? (redactedSubject || redactedBody) : (toSend.subject || toSend.body),
+          });
+        }
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return result;
+      // toSend.body, not redactedBody: signEmail may have dropped the model's sign-off.
+      return this.withRedactions(result, appliedRedactions, toSend.body, toSend.subject);
     }
 
     if (request.channel === 'slack') {
-      const toSend = { ...request, message: redactedBody };
+      const toSend = { ...request, message: sendBody };
       const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchSlack(toSend));
       // Contact resolution uses slackUserId (U…) when provided; inbound auto-creates
       // contacts from Slack user ids. Skip promoteOrCreate on conversation ids.
@@ -1493,21 +1666,22 @@ export class OutboundGateway {
           channel: 'slack',
           recipientId,
           recipientContactId,
-          content: redactedBody,
+          content: auditBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
+          ...disclosed,
         });
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return result;
+      return this.withRedactions(result, appliedRedactions, sendBody);
     }
 
     if (request.channel === 'sms') {
-      const toSend = { ...request, message: redactedBody };
+      const toSend = { ...request, message: sendBody };
       const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchSms(toSend));
       if (result.success && !result.queued) {
         await this.promoteOrCreateRecipientContact('sms', request.recipient);
@@ -1515,21 +1689,22 @@ export class OutboundGateway {
           channel: 'sms',
           recipientId,
           recipientContactId,
-          content: redactedBody,
+          content: auditBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
+          ...disclosed,
         });
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return result;
+      return this.withRedactions(result, appliedRedactions, sendBody);
     }
 
     {
-      const toSend: SignalOutboundRequest = { ...request, message: redactedBody };
+      const toSend: SignalOutboundRequest = { ...request, message: sendBody };
       const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchSignal(toSend));
       // Only promote for 1:1 Signal sends — group sends use a groupId, not an individual
       // phone number. Creating a contact for a group token would pollute the contacts table
@@ -1544,18 +1719,91 @@ export class OutboundGateway {
           channel: 'signal',
           recipientId,
           recipientContactId,
-          content: redactedBody,
+          content: auditBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
+          ...disclosed,
         });
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
-      return result;
+      return this.withRedactions(result, appliedRedactions, sendBody);
     }
+  }
+
+  /**
+   * Attach what redaction changed to a successful send result (#2312). Failures carry nothing:
+   * nothing reached the recipient, so there is no delivered content to report.
+   */
+  private withRedactions(
+    result: OutboundSendResult,
+    applied: NonNullable<OutboundSendResult['redactions']>,
+    sentContent: string,
+    sentSubject?: string,
+  ): OutboundSendResult {
+    if (!result.success || applied.length === 0) return result;
+    return { ...result, redactions: [...applied], sentContent, ...(sentSubject !== undefined ? { sentSubject } : {}) };
+  }
+
+  /**
+   * A redacted copy of sent text for an audit event (#2312): what tier redaction would have
+   * sent, never published as a redaction. Without a redactor, or if it throws, the best-effort
+   * scrubber stands in: the audit must not carry values.
+   */
+  private redactedCopy(text: string, channel: string, recipientId: string): string {
+    if (!this.piiRedactor) return scrubPii(text);
+    try {
+      const ctx = { recipientId };
+      return this.piiRedactor.apply(text, this.piiRedactor.detect(text, channel, ctx), channel, ctx, { audit: false }).content;
+    } catch (err) {
+      this.log.warn({ err, channel }, 'outbound-gateway: PII redactor threw building an audit copy — scrubbing it instead');
+      return scrubPii(text);
+    }
+  }
+
+  /**
+   * Step 1.5's fail-closed path: the PII redactor threw, so the message is blocked. Sending
+   * unredacted PII through a broken redactor is worse than dropping the message.
+   */
+  private async blockForRedactorError(
+    err: unknown,
+    request: OutboundSendRequest,
+    messageBody: string,
+    recipientId: string,
+    options: { conversationId?: string; parentEventId?: string } | undefined,
+  ): Promise<OutboundSendResult> {
+    this.log.error(
+      { err, channel: request.channel, recipientId: redactId(recipientId) },
+      'outbound-gateway: PiiRedactor threw — blocking message (fail-closed)',
+    );
+    const blockId = `block_${randomUUID()}`;
+    try {
+      await this.bus.publish('dispatch', createOutboundBlocked({
+        blockId,
+        conversationId: options?.conversationId ?? '',
+        channelId: request.channel,
+        // scrubPii() as a safety fallback — the redactor itself failed, so we apply
+        // a best-effort scrub before writing anything to the audit log. This ensures
+        // no raw PII leaks into the audit trail even on a redactor failure path.
+        content: scrubPii(messageBody),
+        recipientId,
+        reason: 'pii_redactor_error',
+        findings: [{ rule: 'pii_redactor_error', detail: 'PiiRedactor threw an unexpected error' }],
+        parentEventId: options?.parentEventId ?? '',
+      }));
+    } catch (publishErr) {
+      this.log.warn(
+        { publishErr, blockId },
+        'outbound-gateway: failed to publish outbound.blocked event for PII redactor error',
+      );
+    }
+    return this.withUnmatchedRecipientNote(
+      { success: false, blockedReason: 'pii_redactor_error' },
+      await this.findUnmatchedRecipients(request.channel, this.personRecipients(request)),
+    );
   }
 
   /** Whether this channel is registered for durable queueing (#1380). */
@@ -1689,9 +1937,13 @@ export class OutboundGateway {
         // External send already happened — delete this row before the next dispatch.
         await this.outboundQueue.deleteByIds([row.id]);
 
-        const content = row.payload.channel === 'email'
+        const sent = row.payload.channel === 'email'
           ? row.payload.body
           : row.payload.message;
+        // A row queued under band gating may hold details the review authorized raw, and the
+        // gating may have changed since it was queued: the audit event always gets a redacted
+        // copy (#2312), so it never carries them.
+        const content = this.redactedCopy(sent, row.payload.channel, row.recipient);
         if (row.payload.channel === 'signal' && row.payload.recipient) {
           await this.promoteOrCreateRecipientContact('signal', row.payload.recipient);
         } else if (row.payload.channel === 'sms') {
@@ -1774,13 +2026,20 @@ export class OutboundGateway {
    * Nobody is notified here: the agent that tried the send delivers the approval on one
    * channel with deliver-approval. Returns the short ref and approval number (#2159 Phase 3;
    * null when the row has none), or undefined when there is no action log or the row could not
-   * be written (the send stays held either way).
+   * be written (the send stays held either way). `preamble` replaces the recipe's description
+   * at the top of what the principal is shown (an ask's question, #2312); the row and its
+   * digest mention keep the description. `disclosureAsk` is stored in its own column, never
+   * in the replayed payload, so approving or denying the row records the principal's answer.
+   * `ask` tells a relayed reply's coordinator wake that this is a personal-data request.
    */
   private async raiseSendApproval(
     request: OutboundSendRequest,
     recipe: SendRecipe,
     ctx: { taskEventId: string; conversationId?: string | null; postTurn?: boolean },
     extraLines: string[],
+    preamble?: string,
+    disclosureAsk?: DisclosureAsk,
+    ask?: BandReviewAsk,
   ): Promise<{ shortRef: string; approvalNumber: number | null } | undefined> {
     const actionLogRepo = this.actionLogRepo;
     if (!actionLogRepo) {
@@ -1800,6 +2059,7 @@ export class OutboundGateway {
         shortRef: candidateRef,
         description: recipe.description,
         payload: recipe.partialPayload ?? {},
+        ...(disclosureAsk ? { disclosureAsk } : {}),
         expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
       });
     } catch (err) {
@@ -1822,14 +2082,14 @@ export class OutboundGateway {
           : { recipient: request.recipient, message: request.message },
     );
     this.approvalDelivery?.registerDisplay(candidateRef, {
-      preamble: recipe.description,
+      preamble: preamble ?? recipe.description,
       payload: displayPayload,
       extraLines,
       approvalNumber,
     });
     await this.queueApprovalMention(candidateRef, recipe.description, ctx.taskEventId, ctx.conversationId ?? undefined);
     if (ctx.postTurn) {
-      await this.wakeCoordinatorToDeliver(candidateRef, recipe.description, ctx.taskEventId);
+      await this.wakeCoordinatorToDeliver(candidateRef, recipe.description, ctx.taskEventId, ask ? wakeAskFor(request, ask) : undefined);
     }
     return { shortRef: candidateRef, approvalNumber };
   }
@@ -1879,11 +2139,10 @@ export class OutboundGateway {
     if (!this.actionLogRepo) return;
     const { band } = args;
     const firstContact = await this.isFirstContact(args.recipient);
-    // One review outcome per row, most telling first: a trim or an unreviewed send says
-    // more than a bounce the drafter then fixed.
-    const review = band?.report?.source === 'claim_trimmed' ? 'trimmed'
-      : band?.report?.source === 'sent_without_review' ? 'unreviewed'
-        : band?.signals?.bounced ? 'bounced' : undefined;
+    // One review outcome per row, most telling first: an unreviewed send says more than a
+    // bounce the drafter then fixed.
+    const review = band?.report?.source === 'sent_without_review' ? 'unreviewed'
+      : band?.signals?.bounced ? 'bounced' : undefined;
     try {
       await this.actionLogRepo.insertSampled({
         taskId: args.options?.taskEventId ?? args.options?.parentEventId ?? 'system',
@@ -1914,39 +2173,69 @@ export class OutboundGateway {
 
   /**
    * Step 2.5 under band gating (#2159): ask the band review, and act on its decision.
-   * Returns `result` when the send must not go out (bounce or hold), otherwise the content
-   * to send — trimmed when the review cut unverified statements — and any report item to
-   * publish once it is delivered. `editable` is false for a stored draft, which cannot be
-   * trimmed: a trimmed decision holds it instead.
+   * Returns `result` when the send must not go out (bounce, block or hold), otherwise any
+   * report item to publish once it is delivered. The message itself is never changed: the
+   * review sends it as written or asks the drafter to rewrite it (#2312).
    */
   private async runBandReview(args: {
     request: OutboundSendRequest;
     content: string;
+    /** The send's one autonomy read (#2312): the review's score comes from it. */
+    autonomy: AutonomyRead;
+    /** What a bounce's outbound.blocked event carries: the redacted copy, never raw values (#2312). Defaults to content. */
+    auditContent?: string;
     recipients: readonly string[];
-    editable: boolean;
+    principalRecipients: readonly string[];
+    /** The personal data detected in the send, and the primary recipient's tier (#2312). */
+    detectedItems?: readonly BriefDetectedItem[];
+    recipientTier?: ContactTier;
+    /** Every resolved person recipient's tier, by normalized id: an ask needs each one askable (#2312). */
+    recipientTiers?: Readonly<Record<string, ContactTier>>;
+    /** The primary recipient's resolved contact id, by lowercased id: a link's counterparty check (#2312). */
+    recipientContactIds?: Readonly<Record<string, string>>;
+    /** The email subject as it will be sent: the review scans it for redaction tokens. */
+    subject?: string;
+    /** The primary recipient and their contact record's name: an ask names them (#2312). Display only. */
+    requester?: { id: string; name: string };
     options: {
       taskEventId?: string;
       conversationId?: string | null;
       parentEventId?: string;
       postTurn?: boolean;
+      reportedToPrincipal?: string;
       principalDirected?: boolean;
       holdRecipe?: SendRecipe;
       reExecRecipe?: SendRecipe;
     } | undefined;
-  }): Promise<{ result?: OutboundSendResult; content: string; report?: BandReviewReport; signals?: BandReviewSignals }> {
-    const { request, content, recipients, editable, options } = args;
-    const score = await this.bandScore();
+    /**
+     * False for a saved draft: its drafter cannot rewrite it, so a block holds instead, and so
+     * does a bounce when it holds personal data (#2312).
+     */
+    editable?: boolean;
+  }): Promise<{
+    result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals;
+    dropQuote?: { labels: string[] };
+  }> {
+    const { request, content, recipients, principalRecipients, options } = args;
+    const score = this.bandScore(args.autonomy);
     let decision: Awaited<ReturnType<BandSendReview['review']>>;
     try {
       decision = await this.bandReview!.review({
         content,
         channel: request.channel,
         recipients,
+        principalRecipients,
         score,
         ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
         ...(options?.taskEventId ? { taskEventId: options.taskEventId } : {}),
         principalDirected: options?.principalDirected === true,
         postTurn: options?.postTurn === true,
+        ...(options?.reportedToPrincipal ? { reportedToPrincipal: options.reportedToPrincipal } : {}),
+        ...(args.detectedItems && args.detectedItems.length > 0 ? { detectedItems: args.detectedItems } : {}),
+        ...(args.recipientTier ? { recipientTier: args.recipientTier } : {}),
+        ...(args.recipientTiers ? { recipientTiers: args.recipientTiers } : {}),
+        ...(args.recipientContactIds ? { recipientContactIds: args.recipientContactIds } : {}),
+        ...(args.subject !== undefined ? { subject: args.subject } : {}),
       });
     } catch (err) {
       // BandSendReview is not meant to throw; if it does, the send was not reviewed. Hold.
@@ -1955,16 +2244,56 @@ export class OutboundGateway {
       decision = { kind: 'hold', reason, findings: [{ rule: BAND_RULES.unreviewed, detail: reason }] };
     }
 
-    if (decision.kind === 'send' && !editable && decision.content !== content) {
-      const reason = 'Held for the principal: the draft states things about the principal that nothing looked up supports, and a saved draft cannot be trimmed.';
-      decision = { kind: 'hold', reason, findings: [{ rule: BAND_RULES.ungrounded, detail: reason }] };
+    // A block asks the drafter to rewrite, so it needs one waiting. A dispatcher relay's
+    // drafter is gone and a saved draft cannot be rewritten in place: the principal decides.
+    if (decision.kind === 'block' && (options?.postTurn === true || args.editable === false)) {
+      const rules = decision.findings.map((f) => f.rule).join(', ');
+      decision = {
+        kind: 'hold',
+        reason: `Held for the principal: after one rewrite it still has these problems (${rules}).`,
+        findings: decision.findings,
+      };
+    }
+
+    // A cold stranger's request in a saved draft (#2312): nobody is asked, as for a live send,
+    // so it is not held either. Refused, with the digest note. Labels only, never values.
+    if (args.editable === false && decision.kind === 'bounce' && decision.strangerRequest) {
+      const { requester, labels } = decision.strangerRequest;
+      const details = describePiiLabels(labels);
+      await this.queueBlockReport(
+        `${normalizeCounterparty(requester)} asked for your ${details}. Curia didn't send the saved draft that shared it.`,
+        options?.conversationId ?? undefined,
+        options?.taskEventId ?? options?.parentEventId ?? 'system',
+      );
+      return {
+        result: {
+          success: false,
+          blockedReason: `Not sent: this saved draft shares the principal's ${details} with someone who asked for it, and nothing authorizes that. Save a version without them, or tell the principal.`,
+          blockedRules: decision.findings.map((f) => f.rule),
+        },
+      };
+    }
+
+    // A saved draft with personal data in it is sent as written or not at all (#2312). A bounce
+    // asks for a rewrite it cannot get, and copying the principal would change its stored
+    // recipients: the principal decides either way. Rule names and labels only, never values.
+    if (args.editable === false && (args.detectedItems?.length ?? 0) > 0 && decision.kind === 'bounce') {
+      const rules = decision.findings.map((f) => f.rule).join(', ');
+      decision = {
+        kind: 'hold',
+        reason: `Held for the principal: a saved draft can't be rewritten in place, and the review found these problems (${rules}).`,
+        findings: decision.findings,
+      };
     }
 
     if (decision.kind === 'send') {
+      if (decision.dropQuote) {
+        this.log.info({ channel: request.channel, labels: decision.dropQuote.labels }, 'outbound-gateway: band review sends without the quoted message — its details are not authorized for every recipient');
+      }
       return {
-        content: decision.content,
         ...(decision.report ? { report: decision.report } : {}),
         ...(decision.signals ? { signals: decision.signals } : {}),
+        ...(decision.dropQuote ? { dropQuote: decision.dropQuote } : {}),
       };
     }
 
@@ -1977,7 +2306,7 @@ export class OutboundGateway {
           blockId,
           conversationId: options?.conversationId ?? '',
           channelId: request.channel,
-          content,
+          content: args.auditContent ?? content,
           recipientId: recipients[0] ?? '',
           reason: decision.findings.map((f) => `${f.rule}: ${f.detail}`).join('; '),
           findings: decision.findings,
@@ -1986,8 +2315,18 @@ export class OutboundGateway {
       } catch (err) {
         this.log.warn({ err, blockId }, 'outbound-gateway: failed to publish outbound.blocked for a band bounce — the send is still bounced');
       }
+      if (decision.strangerRequest) {
+        // A cold stranger asked for the principal's data: nobody can be asked, so the digest
+        // says it was not shared (#2312), not that a reply went: the drafter may not rewrite.
+        // Labels only, never the values.
+        const { requester, labels } = decision.strangerRequest;
+        await this.queueBlockReport(
+          `${normalizeCounterparty(requester)} asked for your ${describePiiLabels(labels)}. Curia didn't share it.`,
+          options?.conversationId ?? undefined,
+          options?.taskEventId ?? options?.parentEventId ?? 'system',
+        );
+      }
       return {
-        content,
         result: {
           success: false,
           blockedReason: buildBlockReasonSummary(decision.findings),
@@ -1996,10 +2335,32 @@ export class OutboundGateway {
       };
     }
 
+    if (decision.kind === 'block') {
+      // The rewrite did not fix it. Not sent, and no outbound.blocked: on a relay it would
+      // start the #1355 rewrite loop again. The drafter is told in the result; the digest
+      // gets the rule labels (never the quoted sentences) so a relayed reply's block, whose
+      // drafter may be gone, still reaches someone.
+      const rules = decision.findings.map((f) => f.rule);
+      this.log.info({ channel: request.channel, rules }, 'outbound-gateway: band review blocked the send');
+      await this.queueBlockReport(
+        `Outbound ${request.channel} message to ${recipients.join(', ')} was not sent: after one rewrite it still had these problems (${rules.join(', ')}).`,
+        options?.conversationId ?? undefined,
+        options?.taskEventId ?? options?.parentEventId ?? 'system',
+      );
+      return {
+        result: {
+          success: false,
+          blockedReason: `${decision.reason}\n${buildBlockReasonSummary(decision.findings)}`,
+          blockedRules: rules,
+        },
+      };
+    }
+
     // Hold. Never publish outbound.blocked here: on a relay it would start the #1355
     // rewrite loop, and this message needs the principal, not a rewrite.
     const rule = decision.findings[0]?.rule ?? BAND_RULES.unreviewed;
-    const recipe = options?.holdRecipe ?? options?.reExecRecipe;
+    const baseRecipe = options?.holdRecipe ?? options?.reExecRecipe;
+    const recipe = decision.ask && baseRecipe?.askDescription ? { ...baseRecipe, description: baseRecipe.askDescription } : baseRecipe;
     this.log.info({ channel: request.channel, rule, hasRecipe: recipe !== undefined }, 'outbound-gateway: band review held the send');
     // A hold with no approval behind it reaches nobody unless it is reported: the agent may
     // be gone (a relayed reply), and nothing else records it. The digest gets it then.
@@ -2015,46 +2376,108 @@ export class OutboundGateway {
       );
     };
     if (recipe && options?.taskEventId) {
+      // An ask leads with the question; the personal-details line and the draft follow (#2312).
+      const ask = decision.ask;
+      // The question is worded from the stored ask, so it names the requester as a re-delivery does.
+      const stored = ask ? this.disclosureAskFor(ask, options.conversationId, args.requester) : undefined;
       const raised = await this.raiseSendApproval(
         request,
         recipe,
         { taskEventId: options.taskEventId, conversationId: options.conversationId, postTurn: options.postTurn },
-        [`Held by the send review: ${decision.reason}`],
+        ask ? alsoHeld(decision.findings) : [`Held by the send review: ${decision.reason}`],
+        ask ? askPreamble({ ...ask, ...this.requesterNameFor(ask, args.requester) }) : undefined,
+        stored,
+        ask,
       );
       if (!raised) await reportUnapprovedHold('the approval row could not be written');
+      const askGuidance = ask && raised
+        ? ` This is waiting on the principal. Deliver approval ${raised.approvalNumber ?? raised.shortRef} to them now with deliver-approval on their urgent channel, then send ${normalizeCounterparty(ask.requester)} a short holding reply that doesn't include the requested details.`
+        : '';
       return {
-        content,
         result: {
           success: false,
           gated: true,
           ...(raised ? { actionRef: raised.shortRef } : {}),
           blockedReason: raised
-            ? `${decision.reason} ${approvalAdvisory(raised.shortRef, undefined, raised.approvalNumber)}`
+            ? `${decision.reason} ${approvalAdvisory(raised.shortRef, undefined, raised.approvalNumber)}${askGuidance}`
             : `${decision.reason} No approval request could be recorded — ask the principal before sending it.`,
         },
       };
     }
     await reportUnapprovedHold(recipe ? 'the send has no task to attach it to' : 'this send has no way to replay it');
     return {
-      content,
       result: { success: false, blockedReason: `${decision.reason} Ask the principal before sending it.`, blockedRules: [rule] },
     };
   }
 
-  /** The live score for band review. Unreadable counts as 0: below 80, failures hold. */
-  private async bandScore(): Promise<number> {
-    if (!this.autonomyService) return 0;
+  /**
+   * The ask as its approval row stores it (#2312), keyed by the thread the principal's answer
+   * applies to. Without a conversation there is no thread to remember it for: the question is
+   * still asked, but the answer decides this one send only.
+   */
+  /**
+   * The requester's name for an ask's wording (#2312): only when it is the primary recipient's
+   * own (the ask's requester), and only when it says more than the address (an auto-created
+   * contact is often named by it).
+   */
+  private requesterNameFor(ask: BandReviewAsk, named: { id: string; name: string } | undefined): { requesterName?: string } {
+    if (!named || normalizeCounterparty(named.id) !== normalizeCounterparty(ask.requester)) return {};
+    const name = displayName(named.name);
+    return name && name.toLowerCase() !== normalizeCounterparty(ask.requester) ? { requesterName: name } : {};
+  }
+
+  private disclosureAskFor(ask: BandReviewAsk, conversationId: string | null | undefined, named?: { id: string; name: string }): DisclosureAsk | undefined {
+    if (!conversationId || ask.counterparties.length === 0) {
+      this.log.warn({ labels: ask.labels, hasConversation: Boolean(conversationId) }, 'outbound-gateway: a personal-data ask has no thread or recipient to remember the answer for');
+      return undefined;
+    }
+    return {
+      conversationId,
+      counterparties: ask.counterparties,
+      labels: ask.labels,
+      requester: normalizeCounterparty(ask.requester),
+      ...(ask.outreachId ? { outreachId: ask.outreachId } : {}),
+      ...(ask.taskTitle ? { taskTitle: ask.taskTitle } : {}),
+      ...this.requesterNameFor(ask, named),
+    };
+  }
+
+  /**
+   * The autonomy config, read once per send (#2312) and shared by the autonomy gate, the
+   * gating and the band review's score. Never throws: a failed read is reported in the result
+   * and each user fails open or closed as it always has.
+   */
+  private async readAutonomy(): Promise<AutonomyRead> {
+    if (!this.autonomyService) return { config: null, failed: false };
     try {
-      const config = await this.autonomyService.getConfig();
-      if (config === null) {
-        this.log.warn('outbound-gateway: no autonomy score for band review — reviewing as score 0');
-        return 0;
-      }
-      return config.score;
+      return { config: await this.autonomyService.getConfig(), failed: false };
     } catch (err) {
-      this.log.warn({ err }, 'outbound-gateway: autonomy score unreadable for band review — reviewing as score 0');
+      return { config: null, failed: true, error: err };
+    }
+  }
+
+  /**
+   * The gating this send follows (#2312): the autonomy config's, else the constructed value.
+   * Production's AutonomyService stamps the configured gating on every read, so the two agree
+   * there; the scenario suite's fixture service pins it per case on one shared gateway. An
+   * unreadable config keeps the constructed gating, as before this was read per send.
+   */
+  private currentGating(autonomy: AutonomyRead): AutonomyGating {
+    return autonomy.config?.gating ?? this.gating;
+  }
+
+  /** The live score for band review, from the send's read. Unreadable counts as 0: below 80, failures hold. */
+  private bandScore(autonomy: AutonomyRead): number {
+    if (!this.autonomyService) return 0;
+    if (autonomy.failed) {
+      this.log.warn({ err: autonomy.error }, 'outbound-gateway: autonomy score unreadable for band review — reviewing as score 0');
       return 0;
     }
+    if (autonomy.config === null) {
+      this.log.warn('outbound-gateway: no autonomy score for band review — reviewing as score 0');
+      return 0;
+    }
+    return autonomy.config.score;
   }
 
   /**
@@ -2205,9 +2628,9 @@ export class OutboundGateway {
   }
 
   /** Wake the coordinator to deliver an approval nobody is there to deliver (#2159). Never throws. */
-  private async wakeCoordinatorToDeliver(shortRef: string, description: string, taskEventId: string): Promise<void> {
+  private async wakeCoordinatorToDeliver(shortRef: string, description: string, taskEventId: string, ask?: ApprovalWakeAsk): Promise<void> {
     try {
-      await this.bus.publish('dispatch', buildApprovalDeliveryWake(shortRef, description, taskEventId));
+      await this.bus.publish('dispatch', buildApprovalDeliveryWake(shortRef, description, taskEventId, ask));
     } catch (err) {
       this.log.error({ err, shortRef }, 'outbound-gateway: could not wake the coordinator — the expiry sweep will deliver the approval');
     }
@@ -2274,6 +2697,7 @@ export class OutboundGateway {
       toolName?: string;
       agentId?: string;
     };
+    disclosed?: Array<{ label: string; field: 'body' | 'subject' | 'quote' }>;
   }): Promise<void> {
     try {
       const { exportAudit, ...rest } = payload;
@@ -2344,6 +2768,41 @@ export class OutboundGateway {
     return result;
   }
 
+  /**
+   * Whether a quote is exempt from review (#2312): every recipient was on the quoted message,
+   * by that message's own headers. The caller's `quoteParticipants` is a claim, not evidence:
+   * any code holding the gateway can build a request. So the exemption holds only when the
+   * message the reply answers (`replyToMessageId`), fetched here, confirms it. Anything that
+   * cannot confirm (no id, no client, a failed fetch) reviews the quote: fail closed.
+   */
+  private async quoteIsExempt(request: EmailSendRequest, recipients: readonly FilterRecipient[]): Promise<boolean> {
+    // A claim that already fails needs no fetch.
+    if (!this.quoteIsRecipients(request, recipients)) return false;
+    const client = request.replyToMessageId ? this.getNylasClient(request.accountId) : undefined;
+    if (!client || !request.replyToMessageId) return false;
+    try {
+      const original = await client.getMessage(request.replyToMessageId);
+      return this.quoteIsRecipients({ ...request, quoteParticipants: quoteParticipants(original) }, recipients);
+    } catch (err) {
+      this.log.warn({ err }, 'outbound-gateway: could not fetch the quoted message to confirm its participants — reviewing the quote');
+      return false;
+    }
+  }
+
+  /**
+   * Whether everyone this email reaches, besides the principal, was on the message it quotes
+   * (#2312): the quote then only shows them what they already had. Compared as band review
+   * compares recipients. No participants recorded is never true: the quote is reviewed.
+   */
+  private quoteIsRecipients(request: EmailSendRequest, recipients: readonly FilterRecipient[]): boolean {
+    if (!request.quoteParticipants || request.quoteParticipants.length === 0) return false;
+    const participants = new Set(request.quoteParticipants.map(normalizeCounterparty));
+    const people = new Set(this.personRecipients(request).map(normalizeCounterparty));
+    return recipients
+      .filter((r) => !r.isPrincipal && people.has(normalizeCounterparty(r.email)))
+      .every((r) => participants.has(normalizeCounterparty(r.email)));
+  }
+
   /** Recipient identifiers that name a person (never a group or conversation id). */
   private personRecipients(request: OutboundSendRequest): string[] {
     return this.projectRecipients(request)
@@ -2384,11 +2843,14 @@ export class OutboundGateway {
    * rest of the envelope (further To, CC), so a blocked contact anywhere on it
    * is refused. On a lookup error, `failClosed` returns `lookup-failed`;
    * otherwise that identifier is logged and skipped, as the primary check does.
+   * `opts.tiers`, when given, collects each resolved contact's tier by normalized
+   * identifier, for the band review's ask (#2312), and `opts.contactIds` its contact id when
+   * the identity is verified, for matching a linked outreach row.
    */
   private async findBlockedRecipient(
     channel: string,
     identifiers: readonly string[],
-    opts: { failClosed: boolean },
+    opts: { failClosed: boolean; tiers?: Record<string, ContactTier>; contactIds?: Record<string, string> },
   ): Promise<{ kind: 'blocked'; identifier: string; contactId: string } | { kind: 'lookup-failed'; identifier: string } | null> {
     const seen = new Set<string>();
     for (const identifier of identifiers) {
@@ -2400,6 +2862,10 @@ export class OutboundGateway {
         // Uses tier for the blocked check (issue #945); tier='blocked' == old status='blocked'.
         if (contact !== null && contact.tier === 'blocked') {
           return { kind: 'blocked', identifier, contactId: contact.contactId };
+        }
+        if (contact !== null) {
+          if (opts.tiers) opts.tiers[normalizeCounterparty(identifier)] = contact.tier;
+          if (opts.contactIds && contact.verified === true) opts.contactIds[normalizeCounterparty(identifier)] = contact.contactId;
         }
       } catch (err) {
         this.log.warn(
@@ -2629,17 +3095,24 @@ export class OutboundGateway {
    * To/CC/BCC counts once — otherwise a principal listed twice (e.g. To + CC) would
    * make `principalIsSoleRecipient` false and the judge would run on an effectively
    * single-recipient principal-only send. `principalIsSoleRecipient` is true ONLY when
-   * exactly one (deduped) recipient remains and it is the principal.
+   * every recipient is a verified principal identity (#2312).
    */
   private finalizeRecipientSet(tagged: FilterRecipient[]): {
     recipients: FilterRecipient[];
     principalIncluded: boolean;
     principalIsSoleRecipient: boolean;
   } {
+    // Curia's own mailboxes and Signal number are not an audience: a status email addressed to
+    // Curia with the principal on CC is a principal-only message, not a send to a third party.
+    const ownAddresses = new Set([
+      ...[...this.emailAccountAddresses.values()].map((a) => a.toLowerCase()),
+      ...(this.signalPhoneNumber ? [this.signalPhoneNumber.toLowerCase()] : []),
+    ]);
     const seen = new Set<string>();
     const recipients: FilterRecipient[] = [];
     for (const r of tagged) {
       const key = r.email.toLowerCase();
+      if (ownAddresses.has(key)) continue;
       if (seen.has(key)) continue;
       seen.add(key);
       recipients.push(r);
@@ -3092,8 +3565,32 @@ export class OutboundGateway {
     }
 
     const toDraft: EmailSendRequest = { ...request };
+    // A draft is sent as written, and an approved replay of it is not scanned again (#2312). A
+    // quote that reaches someone who was not on the quoted message, with personal details in it,
+    // has had no review the principal saw: the draft is saved without it.
+    if (toDraft.htmlQuote && await this.quoteNeedsReview(toDraft)) {
+      this.log.info('outbound-gateway: draft saved without its quoted message — the quote has personal details and reaches someone who was not on it');
+      delete toDraft.htmlQuote;
+      delete toDraft.quoteParticipants;
+    }
     this.signEmail(toDraft, false);
     return this.dispatchEmailDraft(toDraft);
+  }
+
+  /**
+   * Whether an email's quote carries personal details to someone who was not on the quoted
+   * message (#2312), as send() would review them. A redactor error counts as yes (fail closed).
+   */
+  private async quoteNeedsReview(request: EmailSendRequest): Promise<boolean> {
+    if (!request.htmlQuote || !this.piiRedactor) return false;
+    const { recipients, principalIsSoleRecipient } = this.buildFilterRecipients(request);
+    if (await this.quoteIsExempt(request, recipients)) return false;
+    try {
+      return this.piiRedactor.detect(request.htmlQuote, 'email', { recipientId: request.to, principalIsSoleRecipient }).length > 0;
+    } catch (err) {
+      this.log.warn({ err }, 'outbound-gateway: PII redactor threw scanning a quote — leaving the quote out');
+      return true;
+    }
   }
 
   /**
@@ -3125,13 +3622,16 @@ export class OutboundGateway {
    * Safety pipeline:
    *   0. Autonomy gate — skipped when options.humanApproved is true (principal in the loop)
    *   1. Blocked-contact check on the primary To recipient
-   *   2. Content filter on the draft body
+   *   1.5 PII detection on the body and subject (#2312)
+   *   2. Content filter on the redacted copy of the draft body
+   *   2.5 Band review
    *   3. Nylas drafts.send() dispatch — sends the actual draft, not a reconstructed copy
    *   4. Recipient contact promotion (provisional → confirmed)
    *
-   * Note: PII redaction is not applied here. The draft was created by Curia
-   * (content passed through our pipeline at creation time) or authored directly
-   * by the principal. Sending the stored draft as-is is intentional.
+   * A stored draft is sent as written: it cannot be redacted in place (#2312). Under band
+   * gating the review rules on each detected detail, and anything but a send holds the draft.
+   * Under tier gating a draft with details the channel does not allow is refused, unless
+   * the send is principal-directed.
    *
    * @param draftId        Nylas draft ID to send
    * @param accountId      Which named account to use. Defaults to the primary account.
@@ -3139,6 +3639,8 @@ export class OutboundGateway {
    * @param options        humanApproved: true skips Step 0 only (principal in the loop).
    *                       principalDirected: true lifts the Stage 2.5 disclosure gate only,
    *                       as in send() (#1870).
+   *                       principalApproved: true when the principal approved this draft as
+   *                       written: no PII detection, sent intact (#2312).
    */
   async sendEmailDraft(
     draftId: string,
@@ -3147,6 +3649,8 @@ export class OutboundGateway {
     options?: {
       humanApproved?: boolean;
       principalDirected?: boolean;
+      /** The principal approved this draft as written (an approval replay): sent intact (#2312). */
+      principalApproved?: boolean;
       conversationId?: string;
       taskEventId?: string;
       parentEventId?: string;
@@ -3157,6 +3661,8 @@ export class OutboundGateway {
     // ------------------------------------------------------------------
     // Step 0: Autonomy gate
     // ------------------------------------------------------------------
+    // One read per draft send (#2312): this gate, the gating and the band review's score share it.
+    const autonomy = await this.readAutonomy();
     if (this.autonomyService && options?.humanApproved) {
       this.log.info(
         { draftId },
@@ -3178,36 +3684,35 @@ export class OutboundGateway {
         'outbound-gateway: autonomy gate skipped — draft recipient is principal (agent-to-principal communication)',
       );
     } else if (this.autonomyService) {
-      try {
-        const autonomyConfig = await this.autonomyService.getConfig();
-        const sendThreshold = AutonomyService.minScoreForActionRisk('medium');
-        if (autonomyConfig !== null && autonomyConfig.score < sendThreshold) {
-          this.log.info(
-            { draftId, currentScore: autonomyConfig.score, sendThreshold },
-            `outbound-gateway: draft send blocked by autonomy gate — score < ${sendThreshold}`,
-          );
-          this.bus.publish('dispatch', createAutonomySendBlocked({
-            channel: 'email',
-            currentScore: autonomyConfig.score,
-            requiredScore: sendThreshold,
-          }, options?.parentEventId)).catch((err) => {
-            this.log.warn(
-              { err, draftId },
-              'outbound-gateway: failed to publish autonomy.send_blocked event',
-            );
-          });
-          return {
-            success: false,
-            blockedReason:
-              `Autonomy score is ${autonomyConfig.score} — direct sends require a score of at least ${sendThreshold}. ` +
-              `Use createEmailDraft() for drafts, or ask the principal to raise the score with set-autonomy.`,
-          };
-        }
-      } catch (err) {
+      if (autonomy.failed) {
         this.log.warn(
-          { err, draftId },
+          { err: autonomy.error, draftId },
           'outbound-gateway: autonomy gate failed to read config — proceeding without gate (fail-open)',
         );
+      }
+      const autonomyConfig = autonomy.config;
+      const sendThreshold = AutonomyService.minScoreForActionRisk('medium');
+      if (autonomyConfig !== null && autonomyConfig.score < sendThreshold) {
+        this.log.info(
+          { draftId, currentScore: autonomyConfig.score, sendThreshold },
+          `outbound-gateway: draft send blocked by autonomy gate — score < ${sendThreshold}`,
+        );
+        this.bus.publish('dispatch', createAutonomySendBlocked({
+          channel: 'email',
+          currentScore: autonomyConfig.score,
+          requiredScore: sendThreshold,
+        }, options?.parentEventId)).catch((err) => {
+          this.log.warn(
+            { err, draftId },
+            'outbound-gateway: failed to publish autonomy.send_blocked event',
+          );
+        });
+        return {
+          success: false,
+          blockedReason:
+            `Autonomy score is ${autonomyConfig.score} — direct sends require a score of at least ${sendThreshold}. ` +
+            `Use createEmailDraft() for drafts, or ask the principal to raise the score with set-autonomy.`,
+        };
       }
     }
 
@@ -3219,6 +3724,8 @@ export class OutboundGateway {
     let recipientTierForDraft: ContactTier = 'unknown';
     let recipientTierUnresolvedForDraft = false;
     let recipientContactIdForDraft: string | undefined;
+    let recipientVerifiedForDraft = false;
+    let recipientNameForDraft: string | undefined;
     try {
       const contact = await this.contactService.resolveByChannelIdentity('email', recipientEmail);
       if (contact !== null) {
@@ -3232,6 +3739,8 @@ export class OutboundGateway {
         }
         recipientTierForDraft = contact.tier;
         recipientContactIdForDraft = contact.contactId; // hoisted for outbound.delivered audit
+        recipientVerifiedForDraft = contact.verified === true;
+        recipientNameForDraft = contact.displayName;
       }
     } catch (err) {
       // Fail-open on DB errors — log at warn so anomalies are visible, but don't
@@ -3246,7 +3755,14 @@ export class OutboundGateway {
     // The rest of the draft's envelope (#2273). Fail-open, as above.
     const draftOthers = (draftMeta.allRecipients ?? [])
       .filter((r) => r.toLowerCase() !== recipientEmail.toLowerCase());
-    const blockedOther = await this.findBlockedRecipient('email', draftOthers, { failClosed: false });
+    // Every resolved person recipient's tier, for the band review's ask (#2312).
+    const draftTiers: Record<string, ContactTier> = {};
+    const draftContactIds: Record<string, string> = {};
+    if (recipientContactIdForDraft !== undefined) {
+      draftTiers[normalizeCounterparty(recipientEmail)] = recipientTierForDraft;
+      if (recipientVerifiedForDraft) draftContactIds[normalizeCounterparty(recipientEmail)] = recipientContactIdForDraft;
+    }
+    const blockedOther = await this.findBlockedRecipient('email', draftOthers, { failClosed: false, tiers: draftTiers, contactIds: draftContactIds });
     if (blockedOther?.kind === 'blocked') {
       this.log.warn(
         { draftId, recipientId: redactId(blockedOther.identifier), contactId: blockedOther.contactId },
@@ -3287,19 +3803,77 @@ export class OutboundGateway {
       );
     }
 
+    const { recipients: draftRecipients, principalIncluded: draftPrincipalIncluded, principalIsSoleRecipient: draftPrincipalSole } = this.buildRecipientSet(draftEnvelope);
+    const draftRequest: EmailSendRequest = {
+      channel: 'email',
+      to: recipientEmail,
+      subject: draftMeta.subject,
+      body,
+      ...(draftEnvelope.length > 1 ? { cc: draftEnvelope.filter((r) => r !== recipientEmail) } : {}),
+    };
+
+    // ------------------------------------------------------------------
+    // Step 1.5: PII detection (#2312)
+    // ------------------------------------------------------------------
+    // A stored draft is sent as written: it cannot be redacted in place. So its personal data
+    // is detected here and either authorized by the band review or the draft is not sent.
+    // Skipped for a draft the principal approved (they saw it as written) and for the
+    // principal alone (the redactor's own bypass). Fail-closed if the redactor throws.
+    const detectedItems: BriefDetectedItem[] = [];
+    // What the content filter and the audit events see: never the raw values.
+    let redactedBody = body;
+    let redactedSubject = draftMeta.subject;
+    if (this.piiRedactor && options?.principalApproved === true) {
+      this.log.info({ draftId }, 'outbound-gateway: PII detection skipped — the principal approved this draft as written');
+      // Sent as written, but the content filter and the audit events still get redacted copies.
+      redactedBody = this.redactedCopy(body, 'email', recipientEmail);
+      if (draftMeta.subject) redactedSubject = this.redactedCopy(draftMeta.subject, 'email', recipientEmail);
+    } else if (this.piiRedactor && !draftPrincipalSole) {
+      const redactor = this.piiRedactor;
+      try {
+        const ctx = { recipientId: recipientEmail, principalIsSoleRecipient: draftPrincipalSole };
+        const bodyItems = redactor.detect(body, 'email', ctx);
+        const subjectItems = draftMeta.subject ? redactor.detect(draftMeta.subject, 'email', ctx) : [];
+        for (const [items, field] of [[bodyItems, 'body'], [subjectItems, 'subject']] as const) {
+          for (const item of items) {
+            detectedItems.push({ id: `P${detectedItems.length + 1}`, label: item.label, text: item.matched, field });
+          }
+        }
+        // audit: false — nothing is redacted on the wire, so no outbound.pii_redacted.
+        redactedBody = redactor.apply(body, bodyItems, 'email', ctx, { audit: false }).content;
+        if (draftMeta.subject) redactedSubject = redactor.apply(draftMeta.subject, subjectItems, 'email', ctx, { audit: false }).content;
+      } catch (err) {
+        return this.blockForRedactorError(err, draftRequest, body, recipientEmail, options);
+      }
+    }
+    const gating = this.currentGating(autonomy);
+    const bandReviewRuns = gating === 'band' && this.bandReview !== undefined && !draftPrincipalSole;
+    // Under tier gating a principal-directed draft (a live principal turn, or an approval
+    // replay) is sent as written: the principal is in the loop, as tier has no review to ask.
+    // Band with no review wired still refuses: band means a review decides, and none can.
+    const tierPrincipalDirected = gating === 'tier' && options?.principalDirected === true;
+    if (detectedItems.length > 0 && !bandReviewRuns && !tierPrincipalDirected) {
+      // Tier gating (or band with no review wired) would redact these, and a stored draft
+      // cannot be. Labels only, never the values.
+      const labels = [...new Set(detectedItems.map((d) => d.label))].join(', ');
+      this.log.info({ draftId, labels }, 'outbound-gateway: draft send refused — it contains personal data that cannot be redacted in place');
+      return {
+        success: false,
+        blockedReason: `Not sent: this draft contains ${labels}, which can't be sent to this recipient. Edit the draft to remove them, or ask the principal.`,
+      };
+    }
+
     // ------------------------------------------------------------------
     // Step 2: Content filter
     // ------------------------------------------------------------------
-    // Run on the draft body. The draft is sent as-is by Nylas (PII redaction is not
-    // applied — see method doc), but we still run the content filter to catch any
-    // flagged patterns before committing to sending. Fail-closed on filter crash.
+    // Run on the redacted copy of the draft body: the draft is sent as written, but the filter
+    // never needs the raw values (#2312). Fail-closed on filter crash.
     let filterPassed = false;
     let filterFindings: Array<{ rule: string; detail: string }> = [];
-    const { recipients: draftRecipients, principalIncluded: draftPrincipalIncluded, principalIsSoleRecipient: draftPrincipalSole } = this.buildRecipientSet(draftEnvelope);
 
     try {
       const filterResult = await this.contentFilter.check({
-        content: body,
+        content: redactedBody,
         recipientEmail,
         conversationId: '',
         channelId: 'email',
@@ -3309,6 +3883,7 @@ export class OutboundGateway {
         recipients: draftRecipients,
         principalIncluded: draftPrincipalIncluded,
         principalIsSoleRecipient: draftPrincipalSole,
+        gating,
       });
       filterPassed = filterResult.passed;
       filterFindings = filterResult.findings;
@@ -3342,7 +3917,7 @@ export class OutboundGateway {
         blockId,
         conversationId: options?.conversationId ?? '',
         channelId: 'email',
-        content: body,
+        content: redactedBody,
         recipientId: recipientEmail,
         reason: fullReason,
         findings: filterFindings,
@@ -3384,28 +3959,33 @@ export class OutboundGateway {
     }
 
     // ------------------------------------------------------------------
-    // Step 2.5: Band review (#2159) — as in send(). A stored draft cannot be trimmed, so a
-    // review that would cut statements holds it instead.
+    // Step 2.5: Band review (#2159) — as in send().
     // ------------------------------------------------------------------
     // Keyed on principalDirected, not humanApproved: send-draft sets humanApproved on every
     // call (its task-origin check is its gate), so it does not mean the principal read this
     // draft. A live principal turn or an explicit approval did; a woken task did not. This
     // is also when tier gating skips Stage 2.5.
+    //
+    // A principal-directed draft is still reviewed when it holds personal data (#2312): the
+    // review rules on each item, as it does for send(). Any outcome but send holds it.
     let bandReport: BandReviewReport | undefined;
     let bandSignals: BandReviewSignals | undefined;
-    if (this.gating === 'band' && this.bandReview && !options?.principalDirected && !draftPrincipalSole) {
+    if (bandReviewRuns && options?.principalApproved !== true && (options?.principalDirected !== true || detectedItems.length > 0)) {
       const outcome = await this.runBandReview({
-        request: {
-          channel: 'email',
-          to: recipientEmail,
-          subject: draftMeta.subject,
-          body,
-          ...(draftEnvelope.length > 1 ? { cc: draftEnvelope.filter((r) => r !== recipientEmail) } : {}),
-        },
+        request: draftRequest,
+        autonomy,
         content: body,
-        recipients: draftEnvelope,
-        editable: false,
+        auditContent: redactedBody,
+        recipients: draftRecipients.map((r) => r.email),
+        principalRecipients: draftRecipients.filter((r) => r.isPrincipal).map((r) => r.email),
+        detectedItems,
+        recipientTier: recipientTierForDraft,
+        recipientTiers: draftTiers,
+        ...(Object.keys(draftContactIds).length > 0 ? { recipientContactIds: draftContactIds } : {}),
+        ...(recipientNameForDraft ? { requester: { id: recipientEmail, name: recipientNameForDraft } } : {}),
+        subject: draftMeta.subject,
         options,
+        editable: false,
       });
       if (outcome.result) return outcome.result;
       bandReport = outcome.report;
@@ -3420,6 +4000,16 @@ export class OutboundGateway {
       return {
         success: false,
         blockedReason: `Email client not configured for account: ${accountId ?? 'primary'}`,
+      };
+    }
+
+    // The checks above read the draft as fetched, and the send is by id after a review that can
+    // take seconds. Send only if the draft is still what was checked (#2312): an edit in the
+    // meantime gets checked again on the next send, not sent unchecked.
+    if (await this.draftChangedSinceFetch(nylasClient, draftId, draftMeta)) {
+      return {
+        success: false,
+        blockedReason: 'The draft changed while it was being checked, so it was not sent. Send it again to check the current version.',
       };
     }
 
@@ -3453,11 +4043,13 @@ export class OutboundGateway {
       channel: 'email',
       recipientId: recipientEmail,
       recipientContactId: recipientContactIdForDraft,
-      content: body,
+      // Never the raw values (#2312): the redacted copy, an approved draft's included.
+      content: redactedBody,
       messageId: sentMessage.id,
       conversationId: options?.conversationId,
       taskEventId: options?.taskEventId,
       parentEventId: options?.parentEventId,
+      ...(detectedItems.length > 0 ? { disclosed: detectedItems.map(({ label, field }) => ({ label, field })) } : {}),
     });
     // Spot-check pool (#2159 Phase 3). Keyed on principalDirected, not humanApproved, for
     // the reason given at the band review above: send-draft sets humanApproved on every call.
@@ -3466,7 +4058,8 @@ export class OutboundGateway {
         channel: 'email',
         toolName: 'send-draft',
         recipientLabel: draftEnvelope.join(', '),
-        preview: draftMeta.subject || body,
+        // The redacted copy, as in send(): the draft itself when nothing was detected (#2312).
+        preview: redactedSubject || redactedBody,
         // A draft's recipient is always an email address, so always a person.
         recipient: { person: true, contactId: recipientContactIdForDraft, lookupFailed: recipientTierUnresolvedForDraft },
         band: { report: bandReport, signals: bandSignals },
@@ -3476,6 +4069,32 @@ export class OutboundGateway {
     if (bandReport) await this.publishBandReport(bandReport, options);
 
     return { success: true, messageId: sentMessage.id };
+  }
+
+  /**
+   * Whether the stored draft differs from what sendEmailDraft checked (#2312): body, subject or
+   * envelope. A draft that is gone, or a lookup that fails, counts as changed (fail closed).
+   */
+  private async draftChangedSinceFetch(
+    nylasClient: NylasClient,
+    draftId: string,
+    draftMeta: { recipientEmail: string; body: string; subject: string; allRecipients?: string[] },
+  ): Promise<boolean> {
+    let current: NylasMessage | null;
+    try {
+      current = await nylasClient.getDraft(draftId);
+    } catch (err) {
+      this.log.warn({ err, draftId }, 'outbound-gateway: draft re-read before send failed — not sending it (fail-closed)');
+      return true;
+    }
+    const envelope = (addrs: readonly string[]) => [...new Set(addrs.map((a) => a.toLowerCase()))].sort().join(',');
+    const checked = draftMeta.allRecipients && draftMeta.allRecipients.length > 0 ? draftMeta.allRecipients : [draftMeta.recipientEmail];
+    const changed = current === null
+      || current.body !== draftMeta.body
+      || current.subject !== draftMeta.subject
+      || envelope([...current.to, ...(current.cc ?? []), ...(current.bcc ?? [])].map((r) => r.email)) !== envelope(checked);
+    if (changed) this.log.warn({ draftId, gone: current === null }, 'outbound-gateway: draft changed between its checks and the send — not sending it');
+    return changed;
   }
 
   /**
@@ -3789,7 +4408,7 @@ export class OutboundGateway {
         'outbound-gateway: draft created successfully',
       );
 
-      return { success: true, draftId: draft.id };
+      return { success: true, draftId: draft.id, draft: { subject: draft.subject, body: draft.body } };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error(

@@ -33,6 +33,8 @@ function makeCtx(overrides: {
   bus?: Partial<EventBus>;
   taskEventId?: string;
   actionLogRepo?: Partial<ActionLogRepo> | null;
+  disclosureDecisions?: ToolContext['disclosureDecisions'];
+  liveTurn?: boolean;
 }): ToolContext {
   const gateway = {
     getEmailDraft: vi.fn().mockResolvedValue(DRAFT_STUB),
@@ -74,6 +76,8 @@ function makeCtx(overrides: {
         },
     taskEventId: overrides.taskEventId ?? 'task-event-1',
     actionLogRepo,
+    ...(overrides.disclosureDecisions ? { disclosureDecisions: overrides.disclosureDecisions } : {}),
+    ...(overrides.liveTurn !== undefined ? { liveTurn: overrides.liveTurn } : {}),
   } as unknown as ToolContext;
 
   return ctx;
@@ -326,7 +330,12 @@ describe('SendDraftHandler', () => {
         'personal',
         expect.anything(),
         expect.objectContaining({
-          holdRecipe: { toolName: 'send-draft', partialPayload: ctx.input, description: expect.stringMatching(/^Send draft to /) },
+          holdRecipe: {
+            toolName: 'send-draft',
+            // The draft's text rides in the payload, so the approval shows it after a restart (#2312).
+            partialPayload: { ...ctx.input, subject: DRAFT_STUB.subject, body: DRAFT_STUB.body },
+            description: expect.stringMatching(/^Send draft to /),
+          },
         }),
       );
     });
@@ -340,6 +349,47 @@ describe('SendDraftHandler', () => {
         'personal',
         expect.anything(),
         expect.objectContaining({ principalDirected: true }),
+      );
+    });
+  });
+
+  // ─── principalApproved: an approval replay (#2312) ────────────────────────
+
+  describe('principalApproved', () => {
+    const approvedInput = { draft_id: 'draft-abc123', account: 'personal', subject: DRAFT_STUB.subject, body: DRAFT_STUB.body };
+
+    function approvedCtx(input: Record<string, unknown>, humanApproved: boolean): ToolContext {
+      const ctx = makeCtx({ input });
+      (ctx as { humanApproved?: boolean }).humanApproved = humanApproved;
+      return ctx;
+    }
+
+    it('is true on an approval replay of the draft the principal saw', async () => {
+      const ctx = approvedCtx(approvedInput, true);
+      await handler.execute(ctx);
+      expect(ctx.outboundGateway!.sendEmailDraft).toHaveBeenCalledWith(
+        'draft-abc123', 'personal', expect.anything(), expect.objectContaining({ principalApproved: true }),
+      );
+    });
+
+    it('is false without an approval', async () => {
+      const ctx = approvedCtx(approvedInput, false);
+      await handler.execute(ctx);
+      expect(ctx.outboundGateway!.sendEmailDraft).toHaveBeenCalledWith(
+        'draft-abc123', 'personal', expect.anything(), expect.objectContaining({ principalApproved: false }),
+      );
+    });
+
+    it('is false when the draft changed since the approval, or the approval never showed it', async () => {
+      const edited = approvedCtx({ ...approvedInput, body: '<p>Hello Kevin, an older version</p>' }, true);
+      await handler.execute(edited);
+      expect(edited.outboundGateway!.sendEmailDraft).toHaveBeenCalledWith(
+        'draft-abc123', 'personal', expect.anything(), expect.objectContaining({ principalApproved: false }),
+      );
+      const unseen = approvedCtx({ draft_id: 'draft-abc123', account: 'personal' }, true);
+      await handler.execute(unseen);
+      expect(unseen.outboundGateway!.sendEmailDraft).toHaveBeenCalledWith(
+        'draft-abc123', 'personal', expect.anything(), expect.objectContaining({ principalApproved: false }),
       );
     });
   });
@@ -728,6 +778,56 @@ describe('SendDraftHandler', () => {
       const result = await handler.execute(ctx);
 
       expect(result.success).toBe(true);
+    });
+
+    // Sending the draft of a personal-data ask is the principal's yes, as approve-action records
+    // it (#2312), but only from a live principal turn whose approval was delivered: a yes covers
+    // the whole thread, and principal lineage alone also passes a woken task.
+    describe('a row carrying a personal-data ask', () => {
+      const disclosureAsk = { conversationId: 'conv-1', counterparties: ['joel@example.com'], labels: ['sin_ca'], requester: 'joel@example.com', outreachId: 'o-1' };
+      const delivered = { id: 55, shortRef: 'ab12cd34', disclosureAsk, notificationSentAt: new Date('2026-10-26T10:00:00Z') };
+      const undelivered = { ...delivered, notificationSentAt: null };
+      const run = async (row: Record<string, unknown>, opts: { liveTurn?: boolean; resolved?: boolean; recorder?: boolean } = {}) => {
+        const recordForApproval = vi.fn().mockResolvedValue(undefined);
+        const resolveById = vi.fn().mockResolvedValue(opts.resolved ?? true);
+        const ctx = makeCtx({
+          actionLogRepo: { findPendingByPayloadField: vi.fn().mockResolvedValue(row), resolveById },
+          ...(opts.recorder === false ? {} : { disclosureDecisions: { recordForApproval } }),
+          ...(opts.liveTurn !== undefined ? { liveTurn: opts.liveTurn } : {}),
+        });
+        const result = await handler.execute(ctx);
+        return { result, recordForApproval, resolveById };
+      };
+
+      it('records the yes from a live principal turn on a delivered approval', async () => {
+        const { result, recordForApproval } = await run(delivered, { liveTurn: true });
+        expect(result.success).toBe(true);
+        expect(recordForApproval).toHaveBeenCalledWith(delivered, 'yes', 'principal_via_coordinator');
+      });
+
+      it('records nothing from a woken principal-lineage task, but still sends and resolves the row', async () => {
+        for (const liveTurn of [false, undefined]) {
+          const { result, recordForApproval, resolveById } = await run(delivered, liveTurn === undefined ? {} : { liveTurn });
+          expect(result.success).toBe(true);
+          expect(resolveById).toHaveBeenCalledWith(55, 'approved', 'coordinator');
+          expect(recordForApproval).not.toHaveBeenCalled();
+        }
+      });
+
+      it('records nothing for an approval the principal was never shown', async () => {
+        const { result, recordForApproval } = await run(undelivered, { liveTurn: true });
+        expect(result.success).toBe(true);
+        expect(recordForApproval).not.toHaveBeenCalled();
+      });
+
+      it('records nothing when the row was resolved concurrently, or carries no ask', async () => {
+        expect((await run(delivered, { liveTurn: true, resolved: false })).recordForApproval).not.toHaveBeenCalled();
+        expect((await run({ ...delivered, disclosureAsk: null }, { liveTurn: true })).recordForApproval).not.toHaveBeenCalled();
+      });
+
+      it('still sends when the recorder is not wired', async () => {
+        expect((await run(delivered, { liveTurn: true, recorder: false })).result.success).toBe(true);
+      });
     });
 
     it('still succeeds when action_log transition throws', async () => {

@@ -103,8 +103,11 @@ interface AgentBudget {
 // #2328 optional task ids say to omit a placeholder: task-create's three id inputs and
 // task-update's blocker input (+132 bytes). The coordinator had 109 bytes of slack, so its
 // budget rises by 23 to 81,885. ceo-inbox was exact, so its budget rises by 132 to 45,471.
+// record-outreach pinned as a standalone tool (#2312): web forms and calls leave a task_outreach
+// row so the organization's reply can find its task (sends record theirs in code): +677 bytes,
+// 82,671 over 74 local tools. The budget rises by exactly that delta.
 const AGENT_BUDGETS: AgentBudget[] = [
-  { agent: 'coordinator', alwaysOnPromptTokens: 3_200, localToolDefinitionBytes: 81_885, allowMcpPins: false, rosterTokens: 500 },
+  { agent: 'coordinator', alwaysOnPromptTokens: 3_200, localToolDefinitionBytes: 82_671, allowMcpPins: false, rosterTokens: 500 },
   // Specialists, trimmed per ADR-046 in #2025 (baseline log, final phase).
   // calendar: YAML 28,727 → 23,897 chars (~7,187 → ~5,984 tokens always-on); 24,370 bytes over 19 local tools.
   { agent: 'calendar', alwaysOnPromptTokens: 6_200, localToolDefinitionBytes: 25_000, allowMcpPins: false },

@@ -7,7 +7,8 @@
 //   3. Authorizes principal reactors only (unknown/wrong-tier → audited no-op)
 //   4. Maps emoji → approve/reject via config (no channel branching)
 //   5. Unrecognized emoji on a real pending approval → hint reply (not silent)
-//   6. Approves (re-exec) or denies — same outcomes as the elevated skills
+//   6. Approves (re-exec) or denies — same outcomes as the elevated skills, including the
+//      principal's yes or no on a personal-data ask (#2312)
 
 import type { EventBus } from '../bus/bus.js';
 import {
@@ -23,6 +24,7 @@ import { isPrincipalIdentity } from '../contacts/principal-recipient.js';
 import type { ActionLogRepo } from './action-log-repo.js';
 import { RESOLVED_BY, type ActionLogRow } from './action-log-types.js';
 import type { ExecutionLayer } from '../skills/execution.js';
+import type { DisclosureDecisionRecorder } from './disclosure-decisions.js';
 import {
   DEFAULT_REACTION_INTENTS,
   mapEmojiToIntent,
@@ -94,6 +96,8 @@ export interface ReactionApprovalMapperConfig {
   executionLayer: ExecutionLayer;
   principalIdentities: readonly ChannelIdentity[];
   reactionIntents?: ReactionIntentConfig;
+  /** Records the principal's yes or no when the row carries a personal-data ask (#2312). */
+  disclosureDecisions?: Pick<DisclosureDecisionRecorder, 'recordForApproval'>;
 }
 
 export class ReactionApprovalMapper {
@@ -104,6 +108,7 @@ export class ReactionApprovalMapper {
   private readonly executionLayer: ExecutionLayer;
   private readonly principalIdentities: readonly ChannelIdentity[];
   private readonly reactionIntents: ReactionIntentConfig;
+  private readonly disclosureDecisions?: Pick<DisclosureDecisionRecorder, 'recordForApproval'>;
 
   constructor(config: ReactionApprovalMapperConfig) {
     this.bus = config.bus;
@@ -113,6 +118,7 @@ export class ReactionApprovalMapper {
     this.executionLayer = config.executionLayer;
     this.principalIdentities = config.principalIdentities;
     this.reactionIntents = config.reactionIntents ?? DEFAULT_REACTION_INTENTS;
+    this.disclosureDecisions = config.disclosureDecisions;
   }
 
   register(): void {
@@ -183,7 +189,7 @@ export class ReactionApprovalMapper {
     if (intent === 'approve') {
       await this.approve(row, deciderId, channelId, event.id);
     } else {
-      await this.deny(row, deciderId, channelId, event.id);
+      await this.deny(row, deciderId, channelId, event.id, { principalSaidNo: true });
     }
   }
 
@@ -338,8 +344,9 @@ export class ReactionApprovalMapper {
       // than leave the row stuck in pending_approval forever (silent dead end),
       // fail closed: resolve it as denied. The action never ran, so "denied"
       // accurately reflects the outcome even though the principal reacted approve.
+      // Not the principal's no: nothing is recorded for a personal-data ask.
       this.log.error({ rowId: row.id }, 'reaction-approval: cannot approve — null payload; failing closed to deny');
-      await this.deny(row, deciderId, channelId, parentEventId);
+      await this.deny(row, deciderId, channelId, parentEventId, { principalSaidNo: false });
       return;
     }
 
@@ -365,6 +372,9 @@ export class ReactionApprovalMapper {
       );
       return;
     }
+
+    // Before the replay, as approve-action does. The recorder never throws.
+    await this.recordAnswer(row, 'yes');
 
     const reResult = await this.executionLayer.invoke(
       row.toolName,
@@ -409,6 +419,7 @@ export class ReactionApprovalMapper {
     deciderId: string,
     channelId: string,
     parentEventId: string,
+    opts: { principalSaidNo: boolean },
   ): Promise<void> {
     const transitioned = await this.actionLogRepo.resolveRow(row.id, 'denied', RESOLVED_BY.principal);
     if (!transitioned) {
@@ -419,12 +430,24 @@ export class ReactionApprovalMapper {
       return;
     }
 
+    if (opts.principalSaidNo) await this.recordAnswer(row, 'no');
+
     await this.publishDecision('deny', row, deciderId, channelId, parentEventId);
 
     this.log.info(
       { rowId: row.id, shortRef: row.shortRef },
       'reaction-approval: denied via reaction',
     );
+  }
+
+  /** The principal's answer to a personal-data ask (#2312); nothing for any other row. */
+  private async recordAnswer(row: ActionLogRow, decision: 'yes' | 'no'): Promise<void> {
+    if (!row.disclosureAsk) return;
+    if (!this.disclosureDecisions) {
+      this.log.error({ rowId: row.id, decision }, 'reaction-approval: disclosureDecisions not wired — the principal\'s answer is not remembered for the thread');
+      return;
+    }
+    await this.disclosureDecisions.recordForApproval(row, decision, 'principal_reaction');
   }
 
   private async publishDecision(

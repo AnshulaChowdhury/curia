@@ -4675,6 +4675,54 @@ describe('Gate C — band gating (#2159)', () => {
     expect(result.success).toBe(false);
     expect(review).not.toHaveBeenCalled();
   });
+
+  // Gating read per call (#2312): the scenario suite pins it per case on one stack.
+  describe('reads the gating from the autonomy config on each call', () => {
+    function layerReading(gatings: Array<'band' | 'tier' | undefined>, constructed: 'band' | 'tier') {
+      const registry = new ToolRegistry();
+      const review = vi.fn().mockResolvedValue({ ok: true, purpose: 'steered', reason: 'x' });
+      const classifyAction = vi.fn().mockResolvedValue({ decision: 'escalate', actionClass: 'reversible-external', isThirdPartyFacing: false, reason: 'x' });
+      const getConfig = vi.fn();
+      for (const gating of gatings) {
+        getConfig.mockResolvedValueOnce({ score: 84, band: 'spot-check', updatedAt: new Date(), updatedBy: 'test', ...(gating ? { gating } : {}) });
+      }
+      const layer = new ExecutionLayer(registry, logger, {
+        autonomyService: { getConfig } as unknown as AutonomyService,
+        bus: makeBus(),
+        escalationJudge: { isEnabled: () => true, review, classifyAction } as unknown as EscalationJudge,
+        gating: constructed,
+        sendEvidence: { collect: vi.fn().mockResolvedValue({ unavailable: false, toolResults: [] }) },
+      });
+      registry.register(makeRiskyManifest('calendar-create-event', 'high'), makeHandler('should not run'));
+      return { layer, review, getConfig };
+    }
+
+    it('runs band Gate C when the config says band, though the layer was built tier', async () => {
+      const { layer, review } = layerReading(['band'], 'tier');
+      await layer.invoke('calendar-create-event', {}, undefined, bandOriginator('unknown'));
+      expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('runs tier Gate C when the config says tier, though the layer was built band', async () => {
+      const { layer, review } = layerReading(['tier'], 'band');
+      await layer.invoke('calendar-create-event', {}, undefined, bandOriginator('unknown'));
+      expect(review).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the constructed gating when the config names none (production tier)', async () => {
+      const { layer, review } = layerReading([undefined], 'band');
+      await layer.invoke('calendar-create-event', {}, undefined, bandOriginator('unknown'));
+      expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('follows a change between two calls on the same layer, reading the config once per call', async () => {
+      const { layer, review, getConfig } = layerReading(['band', 'tier'], 'tier');
+      await layer.invoke('calendar-create-event', {}, undefined, bandOriginator('unknown'));
+      await layer.invoke('calendar-create-event', {}, undefined, bandOriginator('unknown'));
+      expect(review).toHaveBeenCalledOnce();
+      expect(getConfig).toHaveBeenCalledTimes(2);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -26,7 +26,6 @@ export interface SenderLineInput {
   systemRole: string | null | undefined;
   /** Descriptive role (e.g. "board member"), already sanitized. */
   role: string | null;
-  verified: boolean;
 }
 
 /** `Current sender: …` plus, for anyone but the principal, NOT_PRINCIPAL_LINE. */
@@ -36,7 +35,28 @@ export function renderSenderLine(input: SenderLineInput): string {
   // labelled so it can never read as one.
   if (input.systemRole) line += ` (${input.systemRole})`;
   else if (input.role) line += ` (role: ${input.role})`;
-  line += input.verified ? ' [verified]' : ' [unverified]';
   if (input.systemRole !== 'principal') line += `\n${NOT_PRINCIPAL_LINE}`;
   return line;
+}
+
+/**
+ * Two separate facts about a sender (#2312). "Verified" used to cover both, and a report
+ * called a verified contact an "unverified sender" because the message failed SPF/DKIM/DMARC.
+ *   - Contact identity: the address is confirmed as belonging to this contact.
+ *   - Message authentication: this message passed SPF/DKIM/DMARC (email only; the email
+ *     adapter sets `metadata.senderVerified`, and `metadata.senderAuthentication` to tell
+ *     an explicit failure from a message with no result).
+ */
+export function renderSenderFacts(input: { identityVerified: boolean; messageAuthenticated: unknown; messageAuthentication?: unknown }): string {
+  const identity = input.identityVerified ? 'verified' : 'not verified';
+  // The adapter's status when present: a message with no Authentication-Results is "not
+  // confirmed", not "failed". Otherwise the boolean, as before.
+  const status = input.messageAuthentication;
+  const auth = status === 'passed' || status === 'failed' || status === 'not confirmed'
+    ? status
+    : typeof input.messageAuthenticated !== 'boolean'
+      ? 'not available'
+      : input.messageAuthenticated ? 'passed' : 'failed';
+  return `Contact identity: ${identity} (whether this address is confirmed as belonging to this contact)\n`
+    + `Message authentication: ${auth} (SPF/DKIM/DMARC for this message)`;
 }

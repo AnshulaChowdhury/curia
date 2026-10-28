@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { OutboundGateway, UnknownEmailAccountError, hasTransientErrorSignal } from '../../../src/skills/outbound-gateway.js';
+import { OutboundGateway, UnknownEmailAccountError, askPreamble, hasTransientErrorSignal } from '../../../src/skills/outbound-gateway.js';
 import { createLogger } from '../../../src/logger.js';
-import type { NylasClient } from '../../../src/channels/email/nylas-client.js';
+import type { NylasClient, NylasMessage } from '../../../src/channels/email/nylas-client.js';
 import type { ContactService } from '../../../src/contacts/contact-service.js';
 import type { OutboundContentFilter } from '../../../src/dispatch/outbound-filter.js';
 import type { EventBus } from '../../../src/bus/bus.js';
@@ -9,7 +9,7 @@ import type { BusEvent } from '../../../src/bus/events.js';
 import type { AutonomyService, AutonomyConfig } from '../../../src/autonomy/autonomy-service.js';
 import type { PiiRedactor } from '../../../src/dispatch/pii-redactor.js';
 import type { ActionLogRepo } from '../../../src/autonomy/action-log-repo.js';
-import type { BandSendReview } from '../../../src/dispatch/band-send-review.js';
+import { BLOCK_REASON, type BandSendReview } from '../../../src/dispatch/band-send-review.js';
 import type { OutboundQueueRepo } from '../../../src/skills/outbound-queue-repo.js';
 import { readFile, realpath } from 'node:fs/promises';
 
@@ -28,6 +28,28 @@ function reasonBeforeRecipientNote(reason: string | undefined): string | undefin
 
 const mockReadFile = readFile as ReturnType<typeof vi.fn>;
 const mockRealpath = realpath as ReturnType<typeof vi.fn>;
+
+type DraftMeta = Parameters<OutboundGateway['sendEmailDraft']>[2];
+/** The stored draft a send checked, as Nylas returns it. */
+function storedDraft(meta: DraftMeta): NylasMessage {
+  const to = (meta.allRecipients && meta.allRecipients.length > 0 ? meta.allRecipients : [meta.recipientEmail]).map((email) => ({ email }));
+  return { id: 'd', threadId: 't', subject: meta.subject, from: [], to, cc: [], bcc: [], body: meta.body, snippet: '', date: 0, unread: false, folders: [], attachments: [] };
+}
+
+// sendEmailDraft re-reads the draft just before sending and refuses one that changed (#2312).
+// Unless a test stubs getDraft itself, the re-read serves back the draft that call checked.
+const echoedGetDrafts = new WeakSet<object>();
+const realSendEmailDraft = OutboundGateway.prototype.sendEmailDraft;
+OutboundGateway.prototype.sendEmailDraft = function (this: OutboundGateway, draftId, accountId, meta, options) {
+  const client = (this as unknown as { getNylasClient(a?: string): Record<string, unknown> | undefined }).getNylasClient(accountId);
+  const own = client?.['getDraft'];
+  if (client && (own === undefined || echoedGetDrafts.has(own as object))) {
+    const echo = vi.fn().mockResolvedValue(storedDraft(meta));
+    echoedGetDrafts.add(echo);
+    client['getDraft'] = echo;
+  }
+  return realSendEmailDraft.call(this, draftId, accountId, meta, options);
+};
 
 /**
  * Build fresh vi.fn() mocks for each test. Using beforeEach + createMocks()
@@ -965,6 +987,7 @@ describe('OutboundGateway', () => {
         recipients: [{ email: baseRequest.to, isPrincipal: false }],
         principalIncluded: false,
         principalIsSoleRecipient: false,
+        gating: 'tier',
       });
     });
 
@@ -1049,6 +1072,7 @@ describe('OutboundGateway', () => {
         recipients: [{ email: baseRequest.to, isPrincipal: false }],
         principalIncluded: false,
         principalIsSoleRecipient: false,
+        gating: 'tier',
       });
     });
   });
@@ -2285,6 +2309,242 @@ describe('PII redaction pipeline step', () => {
     }));
   });
 
+  describe('reports applied redactions on the send result (#2312)', () => {
+    const phone = { patternLabel: 'phone_us', channelId: 'email', replacedWith: '[REDACTED: PHONE_US]' };
+
+    it('reports the body label and the delivered body', async () => {
+      const piiRedactor = makePiiRedactor(async (content) => (
+        content === piiRequest.body
+          ? { content: 'call [REDACTED: PHONE_US]', redactions: [phone] }
+          : { content, redactions: [] }
+      ));
+      const { gateway } = makeGateway(piiRedactor);
+      const result = await gateway.send(piiRequest);
+
+      expect(result.success).toBe(true);
+      expect(result.redactions).toEqual([{ label: 'phone_us', field: 'body' }]);
+      expect(result.sentContent).toBe('call [REDACTED: PHONE_US]');
+    });
+
+    it('reports body and subject redactions separately', async () => {
+      const piiRedactor = makePiiRedactor(async (content) => ({
+        content: `${content} [REDACTED: PHONE_US]`,
+        redactions: [phone],
+      }));
+      const { gateway } = makeGateway(piiRedactor);
+      const result = await gateway.send(piiRequest);
+
+      expect(result.redactions).toEqual([
+        { label: 'phone_us', field: 'body' },
+        { label: 'phone_us', field: 'subject' },
+      ]);
+      expect(result.sentSubject).toBe(`${piiRequest.subject} [REDACTED: PHONE_US]`);
+    });
+
+    it('leaves both fields undefined when nothing was redacted', async () => {
+      const piiRedactor = makePiiRedactor(async (content) => ({ content, redactions: [] }));
+      const { gateway } = makeGateway(piiRedactor);
+      const result = await gateway.send(piiRequest);
+
+      expect(result.success).toBe(true);
+      expect(result.redactions).toBeUndefined();
+      expect(result.sentContent).toBeUndefined();
+      expect(result.sentSubject).toBeUndefined();
+    });
+
+    it('reports redactions on a queued send', async () => {
+      const piiRedactor = makePiiRedactor(async (content) => ({
+        content: 'call [REDACTED: PHONE_US]',
+        redactions: content === piiRequest.body ? [phone] : [],
+      }));
+      const enqueue = vi.fn().mockResolvedValue({ id: 'q-1' });
+      const gateway = new OutboundGateway({
+        nylasClients: new Map([['curia', { sendMessage: vi.fn() } as unknown as NylasClient]]),
+        contactService: { resolveByChannelIdentity: vi.fn().mockResolvedValue(null) } as unknown as ContactService,
+        contentFilter: { check: vi.fn().mockResolvedValue({ passed: true, findings: [] }) } as unknown as OutboundContentFilter,
+        bus: { publish: vi.fn().mockResolvedValue(undefined), subscribe: vi.fn() } as unknown as EventBus,
+        principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+        logger: createLogger('error'),
+        piiRedactor,
+        outboundQueue: { enqueue } as unknown as OutboundQueueRepo,
+        outboundQueueReadiness: new Map([['email', () => false]]),
+      });
+      const result = await gateway.send(piiRequest);
+
+      expect(result.queued).toBe(true);
+      expect(result.redactions).toEqual([{ label: 'phone_us', field: 'body' }]);
+      expect(result.sentContent).toBe('call [REDACTED: PHONE_US]');
+    });
+  });
+
+  describe('principal bypass keys on the sole-recipient set (#2312)', () => {
+    const phoneBody = 'Call me on (415) 555-1234 tomorrow.';
+
+    async function makeRealGateway(identities: ReturnType<typeof makePrincipalIdentity>[]) {
+      const { PiiRedactor: RealPiiRedactor } = await import('../../../src/dispatch/pii-redactor.js');
+      const logger = createLogger('error');
+      const bus = {
+        publish: vi.fn().mockResolvedValue(undefined),
+        subscribe: vi.fn(),
+      } as unknown as EventBus;
+      const nylasClient = {
+        sendMessage: vi.fn().mockResolvedValue({ id: 'msg-pii-2' }),
+      } as unknown as NylasClient;
+      const signalClient = makeSignalClient();
+      const contactService = {
+        resolveByChannelIdentity: vi.fn().mockResolvedValue(null),
+      } as unknown as ContactService;
+      const contentFilter = {
+        check: vi.fn().mockResolvedValue({ passed: true, findings: [] }),
+      } as unknown as OutboundContentFilter;
+      const gateway = new OutboundGateway({
+        nylasClients: new Map([['curia', nylasClient]]),
+        signalClient: signalClient as unknown as import('../../../src/channels/signal/signal-rpc-client.js').SignalRpcClient,
+        signalPhoneNumber: '+15555550000',
+        contactService,
+        contentFilter,
+        bus,
+        principalIdentities: identities,
+        logger,
+        piiRedactor: new RealPiiRedactor({
+          config: {
+            enabled: true,
+            default: 'block',
+            channel_policies: { email: { allow: ['email'] }, signal: { allow: [] } },
+          },
+          bus,
+          logger,
+          extraPatterns: [],
+        }),
+      });
+      return { gateway, nylasClient, signalClient };
+    }
+
+    it('delivers the body intact when the email goes to the principal only', async () => {
+      const { gateway, nylasClient } = await makeRealGateway([makePrincipalIdentity('ceo@example.com')]);
+      const result = await gateway.send({ channel: 'email', to: 'ceo@example.com', subject: 's', body: phoneBody });
+      expect(result.success).toBe(true);
+      const sent = (nylasClient.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { body: string };
+      expect(sent.body).toContain('(415) 555-1234');
+    });
+
+    it('redacts when a third party is CC\'d alongside the principal', async () => {
+      const { gateway, nylasClient } = await makeRealGateway([makePrincipalIdentity('ceo@example.com')]);
+      const result = await gateway.send({
+        channel: 'email',
+        to: 'ceo@example.com',
+        cc: ['third@example.com'],
+        subject: 's',
+        body: phoneBody,
+      });
+      expect(result.success).toBe(true);
+      const sent = (nylasClient.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { body: string };
+      expect(sent.body).toContain('[REDACTED: PHONE_US]');
+      expect(sent.body).not.toContain('555-1234');
+    });
+
+    it('delivers intact when every recipient is one of the principal\'s own addresses', async () => {
+      const { gateway, nylasClient } = await makeRealGateway([
+        makePrincipalIdentity('ceo@example.com'),
+        makePrincipalIdentity('ceo@home.example'),
+      ]);
+      const result = await gateway.send({
+        channel: 'email',
+        to: 'ceo@example.com',
+        cc: ['ceo@home.example'],
+        subject: 's',
+        body: phoneBody,
+      });
+      expect(result.success).toBe(true);
+      const sent = (nylasClient.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { body: string };
+      expect(sent.body).toContain('(415) 555-1234');
+    });
+
+    it('delivers a Signal 1:1 to the principal intact', async () => {
+      const { gateway, signalClient } = await makeRealGateway([makePrincipalIdentity('+15555551111', 'signal')]);
+      const result = await gateway.send({ channel: 'signal', recipient: '+15555551111', message: phoneBody });
+      expect(result.success).toBe(true);
+      expect(JSON.stringify(signalClient.send.mock.calls)).toContain('(415) 555-1234');
+    });
+  });
+
+  describe('Curia\'s own addresses are not recipients (#2312)', () => {
+    const phoneBody = 'Call me on (415) 555-1234 tomorrow.';
+
+    async function makeOwnAddressGateway() {
+      const { PiiRedactor: RealPiiRedactor } = await import('../../../src/dispatch/pii-redactor.js');
+      const logger = createLogger('error');
+      const bus = {
+        publish: vi.fn().mockResolvedValue(undefined),
+        subscribe: vi.fn(),
+      } as unknown as EventBus;
+      const nylasClient = {
+        sendMessage: vi.fn().mockResolvedValue({ id: 'msg-own-1' }),
+      } as unknown as NylasClient;
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gateway = new OutboundGateway({
+        nylasClients: new Map([['curia', nylasClient]]),
+        emailAccountAddresses: new Map([['curia', 'curia@example.com']]),
+        contactService: {
+          resolveByChannelIdentity: vi.fn().mockResolvedValue(null),
+        } as unknown as ContactService,
+        contentFilter: {
+          check: vi.fn().mockResolvedValue({ passed: true, findings: [] }),
+        } as unknown as OutboundContentFilter,
+        bus,
+        principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+        logger,
+        autonomyService: makeAutonomyService(84),
+        actionLogRepo: makeActionLogRepo(),
+        gating: 'band',
+        bandReview: { review: review as unknown as BandSendReview['review'] },
+        piiRedactor: new RealPiiRedactor({
+          config: {
+            enabled: true,
+            default: 'block',
+            channel_policies: { email: { allow: ['email'] }, signal: { allow: [] } },
+          },
+          bus,
+          logger,
+          extraPatterns: [],
+        }),
+      });
+      return { gateway, nylasClient, review };
+    }
+
+    it.each(['curia@example.com', 'Curia@Example.com'])(
+      'treats a send to %s with the principal CC\'d as principal-only',
+      async (to) => {
+        const { gateway, nylasClient, review } = await makeOwnAddressGateway();
+        const result = await gateway.send({
+          channel: 'email', to, cc: ['ceo@example.com'], subject: 's', body: phoneBody,
+        });
+        expect(result.success).toBe(true);
+        expect(review).not.toHaveBeenCalled();
+        const sent = (nylasClient.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]![0] as { body: string };
+        expect(sent.body).toContain('(415) 555-1234');
+      },
+    );
+
+    it('keeps Curia\'s address out of the band review recipients', async () => {
+      const { gateway, review } = await makeOwnAddressGateway();
+      await gateway.send({
+        channel: 'email', to: 'third@example.com', cc: ['curia@example.com'], subject: 's', body: 'Hello there.',
+      });
+      expect(review).toHaveBeenCalledTimes(1);
+      const arg = review.mock.calls[0]![0] as { recipients: string[] };
+      expect(arg.recipients).toEqual(['third@example.com']);
+    });
+
+    it('does not treat a send to Curia alone as principal-only', async () => {
+      const { gateway, review } = await makeOwnAddressGateway();
+      await gateway.send({
+        channel: 'email', to: 'curia@example.com', subject: 's', body: 'Hello there.',
+      });
+      expect(review).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('blocks the message when PiiRedactor throws (fail-closed)', async () => {
     // If the redactor throws, the gateway must block the message rather than
     // sending unredacted PII. This is the fail-closed contract.
@@ -2595,6 +2855,34 @@ describe('OutboundGateway.sendEmailDraft', () => {
     expect(arg.principalIncluded).toBe(true);
     expect(arg.principalIsSoleRecipient).toBe(true);
     expect(arg.recipients).toEqual([{ email: 'ceo@example.com', isPrincipal: true }]);
+  });
+
+  it('does not send a draft edited after it was checked (#2312)', async () => {
+    const getDraft = vi.fn().mockResolvedValue(storedDraft({ ...DRAFT_META, body: '<p>Hello, my SIN is 130 692 544</p>' }));
+    const { gateway, nylasClient } = makeGateway({ nylasClient: { getDraft } });
+    const result = await gateway.sendEmailDraft(DRAFT_ID, 'joseph', DRAFT_META);
+    expect(result).toMatchObject({ success: false, blockedReason: expect.stringContaining('The draft changed while it was being checked') });
+    expect(getDraft).toHaveBeenCalledWith(DRAFT_ID);
+    expect(nylasClient.sendDraft).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a new recipient', { allRecipients: ['partner@example.com', 'other@example.com'] }],
+    ['a draft that is gone', null],
+  ])('does not send a draft with %s since it was checked (#2312)', async (_label, change) => {
+    const getDraft = vi.fn().mockResolvedValue(change === null ? null : storedDraft({ ...DRAFT_META, ...change }));
+    const { gateway, nylasClient } = makeGateway({ nylasClient: { getDraft } });
+    const result = await gateway.sendEmailDraft(DRAFT_ID, 'joseph', DRAFT_META);
+    expect(result.success).toBe(false);
+    expect(nylasClient.sendDraft).not.toHaveBeenCalled();
+  });
+
+  it('does not send a draft when the re-read fails (fail-closed, #2312)', async () => {
+    const getDraft = vi.fn().mockRejectedValue(new Error('Nylas down'));
+    const { gateway, nylasClient } = makeGateway({ nylasClient: { getDraft } });
+    const result = await gateway.sendEmailDraft(DRAFT_ID, 'joseph', DRAFT_META);
+    expect(result.success).toBe(false);
+    expect(nylasClient.sendDraft).not.toHaveBeenCalled();
   });
 
   it('returns failure when nylasClient.sendDraft throws', async () => {
@@ -3840,20 +4128,116 @@ describe('band review (#2159)', () => {
 
   const emailReq = { channel: 'email' as const, to: 'joel@example.com', subject: 'Forms', body: 'Hi Joel. I am out of office until the 13th.' };
 
-  function makeBandGateway(opts: { review: ReturnType<typeof vi.fn>; score: number; gating?: 'band' | 'tier'; actionLogRepo?: ActionLogRepo }) {
+  function makeBandGateway(opts: { review: ReturnType<typeof vi.fn>; score: number; gating?: 'band' | 'tier'; actionLogRepo?: ActionLogRepo; emailAccountAddresses?: Map<string, string>; signalPhoneNumber?: string; autonomyService?: AutonomyService }) {
     return new OutboundGateway({
       nylasClients: new Map([['curia', mocks.nylasClient]]),
+      ...(opts.emailAccountAddresses ? { emailAccountAddresses: opts.emailAccountAddresses } : {}),
+      ...(opts.signalPhoneNumber
+        ? { signalClient: makeSignalClient() as unknown as import('../../../src/channels/signal/signal-rpc-client.js').SignalRpcClient, signalPhoneNumber: opts.signalPhoneNumber }
+        : {}),
       contactService: mocks.contactService,
       contentFilter: mocks.contentFilter,
       bus: mocks.bus,
       principalIdentities: [makePrincipalIdentity('principal@example.com')],
       logger: mocks.logger,
-      autonomyService: makeAutonomyService(opts.score),
+      autonomyService: opts.autonomyService ?? makeAutonomyService(opts.score),
       actionLogRepo: opts.actionLogRepo ?? makeActionLogRepo(),
       gating: opts.gating ?? 'band',
       bandReview: { review: opts.review as unknown as BandSendReview['review'] },
     });
   }
+
+  /** An autonomy service whose reads carry `current.gating` (undefined: none, as production tier). */
+  function autonomyReading(score: number, gating: 'band' | 'tier' | undefined): { service: AutonomyService; current: { gating: 'band' | 'tier' | undefined } } {
+    const base = makeAutonomyService(score);
+    const current = { gating };
+    const getConfig = vi.fn(async (): Promise<AutonomyConfig | null> => {
+      const read = await (base.getConfig as () => Promise<AutonomyConfig>)();
+      return { ...read, ...(current.gating ? { gating: current.gating } : {}) };
+    });
+    return { service: { getConfig } as unknown as AutonomyService, current };
+  }
+
+  // The scenario suite pins gating per case on one stack (#2312): the gateway reads it per call.
+  describe('reads the gating from the autonomy config on each call', () => {
+    it('reviews a send when the config says band, though the gateway was built tier', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, gating: 'tier', autonomyService: autonomyReading(84, 'band').service });
+      expect((await gw.send(emailReq, { taskEventId: 't1' })).success).toBe(true);
+      expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('skips the review when the config says tier, though the gateway was built band', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, gating: 'band', autonomyService: autonomyReading(84, 'tier').service });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(review).not.toHaveBeenCalled();
+    });
+
+    it('keeps the constructed gating when the config names none', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, gating: 'band', autonomyService: autonomyReading(84, undefined).service });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('keeps the constructed gating when the config read fails', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const failing = { getConfig: vi.fn().mockRejectedValue(new Error('db down')) } as unknown as AutonomyService;
+      const gw = makeBandGateway({ review, score: 84, gating: 'band', autonomyService: failing });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('follows a change between two sends on the same gateway', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const autonomy = autonomyReading(84, 'band');
+      const gw = makeBandGateway({ review, score: 84, gating: 'tier', autonomyService: autonomy.service });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(review).toHaveBeenCalledOnce();
+      autonomy.current.gating = 'tier';
+      await gw.send(emailReq, { taskEventId: 't2' });
+      expect(review).toHaveBeenCalledOnce();
+    });
+
+    it('passes the config\'s gating to the content filter, on sends and draft sends', async () => {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, gating: 'tier', autonomyService: autonomyReading(84, 'band').service });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: 'Hi Joel.', subject: 'Forms' }, { taskEventId: 't1' });
+      const gatings = vi.mocked(mocks.contentFilter.check).mock.calls.map(([input]) => input.gating);
+      expect(gatings).toEqual(['band', 'band']);
+    });
+
+    it('reads the autonomy config once per send, for the gate, the gating and the band score', async () => {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const autonomy = autonomyReading(84, 'band');
+      const gw = makeBandGateway({ review, score: 84, gating: 'tier', autonomyService: autonomy.service });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(autonomy.service.getConfig).toHaveBeenCalledOnce();
+      expect(review).toHaveBeenCalledWith(expect.objectContaining({ score: 84 }));
+      await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: 'Hi Joel.', subject: 'Forms' }, { taskEventId: 't1' });
+      expect(autonomy.service.getConfig).toHaveBeenCalledTimes(2);
+    });
+
+    it('reviews at score 0 when the send\'s one read fails', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const failing = { getConfig: vi.fn().mockRejectedValue(new Error('db down')) } as unknown as AutonomyService;
+      const gw = makeBandGateway({ review, score: 84, gating: 'band', autonomyService: failing });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(review).toHaveBeenCalledWith(expect.objectContaining({ score: 0 }));
+    });
+
+    it('reviews a draft send when the config says band, though the gateway was built tier', async () => {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, gating: 'tier', autonomyService: autonomyReading(84, 'band').service });
+      await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: 'Hi Joel.', subject: 'Forms' }, { taskEventId: 't1' });
+      expect(review).toHaveBeenCalledOnce();
+    });
+  });
 
   function publishedOfType(bus: EventBus, type: string): Array<{ type: string; payload: Record<string, unknown> }> {
     return vi.mocked(bus.publish).mock.calls
@@ -3861,27 +4245,112 @@ describe('band review (#2159)', () => {
       .filter((e) => e.type === type);
   }
 
-  it('sends the reviewed content, and reports a trimmed send', async () => {
-    const review = vi.fn().mockResolvedValue({ kind: 'send', content: 'Hi Joel.', report: { source: 'claim_trimmed', summary: 'Removed 1' } });
+  it('tells the drafter which personal details bounced, by label, and about a placeholder', async () => {
+    const findings = [
+      { rule: 'pii-not-authorized', detail: 'This message shares personal details nothing authorizes for this recipient: phone_us. Rewrite it without them.' },
+      { rule: 'redaction-token', detail: 'The message has a redaction placeholder in it. Rewrite it without the placeholder.' },
+    ];
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }), score: 84 });
+    const result = await gw.send(emailReq, { taskEventId: 't1' });
+    expect(result.success).toBe(false);
+    expect(result.blockedReason).toContain('pii-not-authorized: This message shares personal details nothing authorizes for this recipient: phone_us.');
+    expect(result.blockedReason).toContain('redaction-token: The message has a redaction placeholder');
+  });
+
+  it('sends the message unchanged when the review passes it', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
     const gw = makeBandGateway({ review, score: 84 });
     const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1' });
     expect(result.success).toBe(true);
     const sent = vi.mocked(mocks.nylasClient.sendMessage).mock.calls[0]![0] as { body: string };
-    expect(sent.body).toContain('Hi Joel.');
-    expect(sent.body).not.toContain('out of office');
-    expect(publishedOfType(mocks.bus, 'principal.report')).toEqual([
-      expect.objectContaining({ payload: expect.objectContaining({ source: 'claim_trimmed', summary: 'Removed 1' }) }),
-    ]);
+    expect(sent.body).toContain('out of office until the 13th');
+  });
+
+  it('reviews an email addressed only to Curia\'s own mailbox with no outside audience', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84, emailAccountAddresses: new Map([['curia', 'curia@example.com']]) });
+    const result = await gw.send({ ...emailReq, to: 'curia@example.com' }, { taskEventId: 't1', conversationId: 'c1' });
+    expect(result.success).toBe(true);
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({ recipients: [], principalRecipients: [] }));
+  });
+
+  it('does not count Curia\'s own Signal number as an audience member', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84, signalPhoneNumber: '+15555550000' });
+    const result = await gw.send({ channel: 'signal', recipient: '+15555550000', message: 'note to self' }, { taskEventId: 't1', conversationId: 'c1' });
+    expect(result.success).toBe(true);
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({ recipients: [] }));
   });
 
   it('passes the review what it needs', async () => {
-    const review = vi.fn().mockResolvedValue({ kind: 'send', content: emailReq.body });
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
     const gw = makeBandGateway({ review, score: 84 });
     await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', principalDirected: true, postTurn: true });
     expect(review).toHaveBeenCalledWith({
-      content: emailReq.body, channel: 'email', recipients: ['joel@example.com'], score: 84,
+      content: emailReq.body, channel: 'email', recipients: ['joel@example.com'], principalRecipients: [], score: 84,
       conversationId: 'c1', taskEventId: 't1', principalDirected: true, postTurn: true,
+      recipientTier: 'unknown', recipientTiers: {}, subject: 'Forms',
     });
+  });
+
+  it('passes the review every resolved recipient\'s tier, for an ask (#2312)', async () => {
+    const tiers: Record<string, string> = { 'joel@example.com': 'known', 'ops@example.com': 'trusted' };
+    vi.mocked(mocks.contactService.resolveByChannelIdentity).mockImplementation(async (_channel: string, id: string) => (
+      tiers[id.toLowerCase()] ? { contactId: `c-${id}`, displayName: id, role: null, tier: tiers[id.toLowerCase()], kind: 'person', kgNodeId: null, verified: true } : null
+    ) as never);
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send({ ...emailReq, cc: ['Ops@Example.com', 'nobody@example.com'] }, { taskEventId: 't1', conversationId: 'c1' });
+    // Normalized ids; a recipient with no contact is left out, so it is not askable.
+    expect(review.mock.calls[0]![0].recipientTiers).toEqual({ 'joel@example.com': 'known', 'ops@example.com': 'trusted' });
+    // Each resolved contact id too, so a link can cover a cc'd contact by id.
+    expect(review.mock.calls[0]![0].recipientContactIds).toEqual({ 'joel@example.com': 'c-joel@example.com', 'ops@example.com': 'c-Ops@Example.com' });
+  });
+
+  it('passes the review a cc\'d contact\'s id even when their tier is unknown (#2312)', async () => {
+    vi.mocked(mocks.contactService.resolveByChannelIdentity).mockImplementation(async (_channel: string, id: string) => (
+      { contactId: `c-${id.toLowerCase()}`, displayName: id, role: null, tier: id.toLowerCase() === 'joel@example.com' ? 'known' : 'unknown', kind: 'person', kgNodeId: null, verified: true }
+    ) as never);
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send({ ...emailReq, cc: ['ops@other.example'] }, { taskEventId: 't1', conversationId: 'c1' });
+    expect(review.mock.calls[0]![0].recipientContactIds).toEqual({ 'joel@example.com': 'c-joel@example.com', 'ops@other.example': 'c-ops@other.example' });
+  });
+
+  it('passes no contact id for an unverified address, primary or cc\'d (#2312)', async () => {
+    // An unverified address on a linked contact must not count as that contact.
+    vi.mocked(mocks.contactService.resolveByChannelIdentity).mockImplementation(async (_channel: string, id: string) => (
+      { contactId: 'c-linked', displayName: id, role: null, tier: 'known', kind: 'person', kgNodeId: null, verified: id.toLowerCase() === 'joel@example.com' }
+    ) as never);
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send({ ...emailReq, cc: ['joel.alt@other.example'] }, { taskEventId: 't1', conversationId: 'c1' });
+    expect(review.mock.calls[0]![0].recipientContactIds).toEqual({ 'joel@example.com': 'c-linked' });
+    // An unverified primary carries none either.
+    vi.mocked(mocks.contactService.resolveByChannelIdentity).mockImplementation(async (_channel: string, id: string) => (
+      { contactId: 'c-linked', displayName: id, role: null, tier: 'known', kind: 'person', kgNodeId: null, verified: false }
+    ) as never);
+    const review2 = vi.fn().mockResolvedValue({ kind: 'send' });
+    await makeBandGateway({ review: review2, score: 84 }).send(emailReq, { taskEventId: 't1', conversationId: 'c1' });
+    expect(review2.mock.calls[0]![0]).not.toHaveProperty('recipientContactIds');
+  });
+
+  it('forwards the note reported to the principal to the review (#2312)', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', postTurn: true, reportedToPrincipal: 'Provider asked for your number.' });
+    expect(review.mock.calls[0]![0]).toMatchObject({ reportedToPrincipal: 'Provider asked for your number.' });
+    await gw.send(emailReq, { taskEventId: 't2', conversationId: 'c2' });
+    expect(review.mock.calls[1]![0]).not.toHaveProperty('reportedToPrincipal');
+  });
+
+  it('tells the review which recipients are the principal', async () => {
+    const review = vi.fn().mockResolvedValue({ kind: 'send' });
+    const gw = makeBandGateway({ review, score: 84 });
+    await gw.send({ ...emailReq, to: 'principal@example.com', cc: ['joel@example.com'] }, { taskEventId: 't1', conversationId: 'c1' });
+    const arg = review.mock.calls[0]![0] as { recipients: string[]; principalRecipients: string[] };
+    expect(arg.principalRecipients).toEqual(['principal@example.com']);
+    expect(arg.recipients).toEqual(expect.arrayContaining(['principal@example.com', 'joel@example.com']));
   });
 
   it('bounces with the quoted claims and an outbound.blocked event, but no block report', async () => {
@@ -3893,6 +4362,26 @@ describe('band review (#2159)', () => {
     expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(1);
     expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(0);
     expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('refuses a blocked send with the block reason, publishes no outbound.blocked, and tells the digest', async () => {
+    const findings = [{ rule: 'ungrounded-claim', detail: 'not backed: "I am out of office until the 13th."' }];
+    const reason = BLOCK_REASON;
+    const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'block', reason, findings }), score: 84 });
+    const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1' });
+    expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
+    expect(result.blockedReason!.startsWith(BLOCK_REASON)).toBe(true);
+    expect(result.blockedReason).toContain('out of office until the 13th');
+    expect(result.gated).toBeUndefined();
+    // No outbound.blocked: on a relay it would start the #1355 rewrite loop again.
+    expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+    expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+    const reports = publishedOfType(mocks.bus, 'principal.report');
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.payload).toMatchObject({ source: 'blocked_content', urgency: 'digest', summary: expect.stringContaining('joel@example.com') });
+    // Labels only: the digest names the rule, never the agent's quoted sentence.
+    expect(String(reports[0]!.payload['summary'])).toContain('ungrounded-claim');
+    expect(String(reports[0]!.payload['summary'])).not.toContain('out of office');
   });
 
   it('holds a relayed reply as gated with an approval, and never publishes outbound.blocked', async () => {
@@ -3907,6 +4396,47 @@ describe('band review (#2159)', () => {
     expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'send-draft', outcome: 'pending_approval' }));
     expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
     expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+  });
+
+  describe('a block with no drafter waiting holds instead (#2312)', () => {
+    const blockFindings = [{ rule: 'ungrounded-claim', detail: 'not backed: "I am out of office until the 13th."' }];
+    const blockDecision = { kind: 'block', reason: BLOCK_REASON, findings: blockFindings };
+
+    it('holds a relayed reply as gated with an approval, never blocks or publishes outbound.blocked', async () => {
+      const actionLogRepo = makeActionLogRepo();
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(blockDecision), score: 84, actionLogRepo });
+      const result = await gw.send(emailReq, {
+        taskEventId: 't1', postTurn: true,
+        reExecRecipe: { toolName: 'send-draft', partialPayload: { account: 'a' }, description: 'Draft reply to joel@example.com' },
+      });
+      expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+      expect(result.blockedReason).not.toContain('Rewrite it again');
+      expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'send-draft', outcome: 'pending_approval' }));
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the digest for a relayed reply with nothing to replay', async () => {
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(blockDecision), score: 84 });
+      const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', postTurn: true });
+      expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
+      expect(result.blockedReason).toContain('Ask the principal before sending it.');
+      expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(1);
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('holds a saved draft through its holdRecipe', async () => {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const actionLogRepo = makeActionLogRepo();
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(blockDecision), score: 84, actionLogRepo });
+      const result = await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: emailReq.body, subject: 'Forms' }, {
+        taskEventId: 't1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft to joel@example.com' },
+      });
+      expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+      expect((mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft).not.toHaveBeenCalled();
+    });
   });
 
   it('holds a skill send through its holdRecipe', async () => {
@@ -3928,6 +4458,240 @@ describe('band review (#2159)', () => {
     expect(result).toMatchObject({ gated: true, actionRef: expect.any(String) });
     expect(result.blockedReason).toContain('approval 4');
     expect(result.blockedReason).toContain(`ref: ${result.actionRef}`);
+  });
+
+  // PR 5 (#2312): a requester's ask reaches the principal as a question, now.
+  describe('a held request for the principal\'s data asks the principal', () => {
+    const askHold = (ask: Record<string, unknown>) => ({
+      kind: 'hold',
+      reason: 'Held for the principal: the recipient asked for personal details (phone_us) that nothing authorizes sharing yet.',
+      findings: [{ rule: 'pii-not-authorized', detail: 'x' }],
+      ask,
+    });
+    const holdRecipe = { toolName: 'email-send', partialPayload: { to: 'contact-1' }, description: 'Email to joel@example.com' };
+
+    it('leads the approval with the question and tells the agent to deliver it now', async () => {
+      const actionLogRepo = makeNumberedActionLogRepo(4);
+      const registerDisplay = vi.fn();
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(askHold({ labels: ['phone_us', 'sin_ca'], requester: 'joel@example.com', counterparties: ['joel@example.com'], taskTitle: 'Book physio' })), score: 84, actionLogRepo });
+      gw.setApprovalDelivery({ registerDisplay } as never);
+      const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+      expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({
+        preamble: 'joel@example.com is asking for your phone number and SIN for "Book physio". Share it? Reply yes to send the message below as written, or no to keep it private.',
+        extraLines: [],
+      }));
+      expect(result.blockedReason!.endsWith(
+        'This is waiting on the principal. Deliver approval 4 to them now with deliver-approval on their urgent channel, then send joel@example.com a short holding reply that doesn\'t include the requested details.',
+      )).toBe(true);
+      // The action row and its digest mention keep the recipe's description.
+      expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ description: 'Email to joel@example.com' }));
+    });
+
+    it('omits the task when none is known, and names the ref when the approval has no number', async () => {
+      const registerDisplay = vi.fn();
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(askHold({ labels: ['phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'] })), score: 84 });
+      gw.setApprovalDelivery({ registerDisplay } as never);
+      const result = await gw.send(emailReq, { taskEventId: 't1', holdRecipe });
+      expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({
+        preamble: 'joel@example.com is asking for your phone number. Share it? Reply yes to send the message below as written, or no to keep it private.',
+      }));
+      expect(result.blockedReason).toContain(`Deliver approval ${result.actionRef} to them now with deliver-approval on their urgent channel`);
+    });
+
+    // Task 2: the ask is stored beside the payload, so approve and deny can record the answer
+    // while the replay re-invokes the skill with exactly the input it was held with.
+    it('stores the ask on the approval row beside the payload, keyed by the thread', async () => {
+      const actionLogRepo = makeActionLogRepo();
+      const gw = makeBandGateway({
+        review: vi.fn().mockResolvedValue(askHold({
+          // A display-name requester: the stored key is the bare, lowercased address.
+          labels: ['phone_us'], requester: 'Joel <Joel@Example.com>', counterparties: ['joel@example.com'], outreachId: 'o-1', taskTitle: 'Book physio',
+        })),
+        score: 84, actionLogRepo,
+      });
+      await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({
+        payload: { to: 'contact-1' },
+        disclosureAsk: { conversationId: 'c1', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com', outreachId: 'o-1', taskTitle: 'Book physio' },
+      }));
+    });
+
+    it('shows an ask\'s other hold reason beside the question (#2312)', async () => {
+      const registerDisplay = vi.fn();
+      const hold = askHold({ labels: ['email'], requester: 'joel@example.com', counterparties: ['joel@example.com'] });
+      const gw = makeBandGateway({
+        review: vi.fn().mockResolvedValue({
+          ...hold,
+          findings: [...hold.findings, { rule: 'speaks-as-principal', detail: 'Held for the principal: this message speaks for or commits the principal.' }],
+        }),
+        score: 74,
+      });
+      gw.setApprovalDelivery({ registerDisplay } as never);
+      await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(registerDisplay).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        preamble: expect.stringContaining('is asking for your email address'),
+        extraLines: expect.arrayContaining([expect.stringContaining('Also held by the send review: Held for the principal: this message speaks for')]),
+      }));
+    });
+
+    it('stores no ask without a conversation to key it, or on any other hold', async () => {
+      const noThread = makeActionLogRepo();
+      const gw1 = makeBandGateway({
+        review: vi.fn().mockResolvedValue(askHold({ labels: ['phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'] })),
+        score: 84, actionLogRepo: noThread,
+      });
+      const r1 = await gw1.send(emailReq, { taskEventId: 't1', holdRecipe });
+      expect(r1).toMatchObject({ gated: true });
+      expect(vi.mocked(noThread.insert).mock.calls[0]![0]).not.toHaveProperty('disclosureAsk');
+      const other = makeActionLogRepo();
+      const gw2 = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84, actionLogRepo: other });
+      await gw2.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(vi.mocked(other.insert).mock.calls[0]![0]).not.toHaveProperty('disclosureAsk');
+    });
+
+    it('names the requester bare, and every other recipient a yes covers, in the question', () => {
+      const ask = { labels: ['sin_ca'], requester: 'Joel <Joel@Example.com>', counterparties: ['joel@example.com'] };
+      const tail = 'Share it? Reply yes to send the message below as written, or no to keep it private.';
+      expect(askPreamble(ask)).toBe(`joel@example.com is asking for your SIN. ${tail}`);
+      expect(askPreamble({ ...ask, counterparties: ['joel@example.com', 'Ops@Example.com'] }))
+        .toBe(`joel@example.com is asking for your SIN. The message also goes to ops@example.com, and a yes covers them too. ${tail}`);
+      expect(askPreamble({ ...ask, counterparties: ['joel@example.com', 'ops@example.com', 'sam@example.com'], taskTitle: 'Book physio' }))
+        .toBe(`joel@example.com is asking for your SIN for "Book physio". The message also goes to ops@example.com, sam@example.com, and a yes covers them too. ${tail}`);
+      const many = ['joel@example.com', ...Array.from({ length: 7 }, (_, i) => `cc${i}@example.com`)];
+      expect(askPreamble({ ...ask, counterparties: many })).toContain('cc0@example.com, cc1@example.com, cc2@example.com, cc3@example.com, cc4@example.com and 2 more');
+      // The contact's name beside the address, so the principal knows who is asking (#2312).
+      expect(askPreamble({ ...ask, requesterName: 'Joel Fry' })).toBe(`Joel Fry (joel@example.com) is asking for your SIN. ${tail}`);
+    });
+
+    it('names the requester by their contact record in the stored ask, unless the name is the address', async () => {
+      const resolve = (name: string) => vi.mocked(mocks.contactService.resolveByChannelIdentity).mockResolvedValue(
+        { contactId: 'c-joel', displayName: name, role: null, tier: 'known', kind: 'person', kgNodeId: null, verified: true } as never,
+      );
+      const hold = () => vi.fn().mockResolvedValue(askHold({ labels: ['phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'] }));
+      resolve('Joel "the" <Fry>\nSmith');
+      const named = makeActionLogRepo();
+      const registerDisplay = vi.fn();
+      const namedGw = makeBandGateway({ review: hold(), score: 84, actionLogRepo: named });
+      namedGw.setApprovalDelivery({ registerDisplay } as never);
+      await namedGw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      // One line, no quotes or angle brackets: display only, the address stays the key.
+      expect(vi.mocked(named.insert).mock.calls[0]![0].disclosureAsk).toMatchObject({ requester: 'joel@example.com', requesterName: 'Joel the Fry Smith' });
+      // The question raised with the hold names them too, not only a re-delivery of it.
+      expect(registerDisplay).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        preamble: expect.stringContaining('Joel the Fry Smith (joel@example.com) is asking for your phone number'),
+      }));
+      resolve('Joel@Example.com');
+      const bare = makeActionLogRepo();
+      await makeBandGateway({ review: hold(), score: 84, actionLogRepo: bare }).send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(vi.mocked(bare.insert).mock.calls[0]![0].disclosureAsk).not.toHaveProperty('requesterName');
+    });
+
+    // A relayed reply's agent is gone: the coordinator wake must say this is an ask.
+    describe('on a relayed reply', () => {
+      const relayRecipe = {
+        toolName: 'send-draft', partialPayload: { account: 'curia' },
+        description: 'Draft reply to joel@example.com — "Forms". Use send-draft to approve.',
+        askDescription: 'Draft reply to joel@example.com — "Forms". Approve it with approve-action or send-draft; either records the principal\'s yes.',
+      };
+      const relayReq = { ...emailReq, accountId: 'curia', replyToMessageId: 'msg-7' };
+      const wakeContent = (): string => {
+        const wakes = publishedOfType(mocks.bus, 'agent.task');
+        expect(wakes).toHaveLength(1);
+        return String(wakes[0]!.payload['content']);
+      };
+
+      it('wakes the coordinator with the ask: urgent, one holding reply on the thread, no details', async () => {
+        const actionLogRepo = makeActionLogRepo();
+        const gw = makeBandGateway({
+          review: vi.fn().mockResolvedValue(askHold({ labels: ['sin_ca', 'phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'] })),
+          score: 84, actionLogRepo,
+        });
+        const result = await gw.send(relayReq, { taskEventId: 't1', conversationId: 'c1', postTurn: true, reExecRecipe: relayRecipe });
+        expect(result).toMatchObject({ gated: true, actionRef: expect.any(String) });
+        const content = wakeContent();
+        expect(content).toContain(relayRecipe.askDescription);
+        expect(content).toContain('It is a personal-data request: joel@example.com asked for the principal\'s SIN and phone number');
+        expect(content).toContain('This is urgent. Deliver it now with deliver-approval');
+        expect(content).toContain('Then you may send joel@example.com one short holding reply on the thread (email-reply with reply_to_message_id msg-7, account curia). It must not include the requested details.');
+        expect(content.endsWith('Do not do anything else.')).toBe(true);
+        // Labels only, never raw label ids.
+        expect(content).not.toContain('sin_ca');
+        // The row says either tool approves it.
+        expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ description: relayRecipe.askDescription }));
+      });
+
+      it('keeps the plain wake and description for any other relayed hold', async () => {
+        const actionLogRepo = makeActionLogRepo();
+        const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84, actionLogRepo });
+        await gw.send(relayReq, { taskEventId: 't1', conversationId: 'c1', postTurn: true, reExecRecipe: relayRecipe });
+        const content = wakeContent();
+        expect(content).toContain(relayRecipe.description);
+        expect(content).not.toContain('personal-data');
+        expect(content).not.toContain('holding reply');
+        expect(actionLogRepo.insert).toHaveBeenCalledWith(expect.objectContaining({ description: relayRecipe.description }));
+      });
+    });
+
+    it('keeps the recipe\'s description as the preamble of any other hold', async () => {
+      const registerDisplay = vi.fn();
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'steered', detail: 'x' }] }), score: 84 });
+      gw.setApprovalDelivery({ registerDisplay } as never);
+      const result = await gw.send(emailReq, { taskEventId: 't1', holdRecipe });
+      expect(registerDisplay).toHaveBeenCalledWith(result.actionRef, expect.objectContaining({
+        preamble: 'Email to joel@example.com', extraLines: ['Held by the send review: Held.'],
+      }));
+      expect(result.blockedReason).not.toContain('This is waiting on the principal.');
+    });
+
+    it('bounces a cold stranger\'s request with one digest note and no approval', async () => {
+      const actionLogRepo = makeActionLogRepo();
+      const findings = [{ rule: 'pii-not-authorized', detail: 'This message shares personal details nothing authorizes for this recipient: sin_ca. Rewrite it without them.' }];
+      const gw = makeBandGateway({
+        review: vi.fn().mockResolvedValue({ kind: 'bounce', findings, strangerRequest: { labels: ['sin_ca', 'extra_0'], requester: 'joel@example.com' } }),
+        score: 84, actionLogRepo,
+      });
+      const result = await gw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(result).toMatchObject({ success: false, blockedRules: ['pii-not-authorized'] });
+      expect(result.gated).toBeUndefined();
+      const reports = publishedOfType(mocks.bus, 'principal.report');
+      expect(reports).toHaveLength(1);
+      expect(reports[0]!.payload).toMatchObject({
+        source: 'blocked_content', urgency: 'digest', conversationId: 'c1',
+        summary: 'joel@example.com asked for your SIN and personal detail. Curia didn\'t share it.',
+      });
+      expect(actionLogRepo.insert).not.toHaveBeenCalled();
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('refuses a saved draft answering a cold stranger, with the digest note and no approval', async () => {
+      const sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = sendDraft;
+      const actionLogRepo = makeActionLogRepo();
+      const findings = [{ rule: 'pii-not-authorized', detail: 'x' }];
+      const gw = makeBandGateway({
+        review: vi.fn().mockResolvedValue({ kind: 'bounce', findings, strangerRequest: { labels: ['sin_ca'], requester: 'Joel <Joel@Example.com>' } }),
+        score: 84, actionLogRepo,
+      });
+      const result = await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: 'SIN 130 692 544', subject: 'Re: forms' }, {
+        taskEventId: 't1', conversationId: 'c1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft' },
+      });
+      expect(result).toMatchObject({ success: false, blockedRules: ['pii-not-authorized'] });
+      expect(result.gated).toBeUndefined();
+      expect(result.blockedReason).not.toContain('130 692 544');
+      const reports = publishedOfType(mocks.bus, 'principal.report');
+      expect(reports).toHaveLength(1);
+      expect(reports[0]!.payload['summary']).toBe('joel@example.com asked for your SIN. Curia didn\'t send the saved draft that shared it.');
+      expect(actionLogRepo.insert).not.toHaveBeenCalled();
+      expect(sendDraft).not.toHaveBeenCalled();
+    });
+
+    it('queues no digest note for an ordinary bounce', async () => {
+      const findings = [{ rule: 'ungrounded-claim', detail: 'x' }];
+      const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }), score: 84 });
+      await gw.send(emailReq, { taskEventId: 't1' });
+      expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(0);
+    });
   });
 
   it('refuses a held send with no recipe, telling the agent to ask', async () => {
@@ -3990,7 +4754,7 @@ describe('band review (#2159)', () => {
   });
 
   it('emails the principal when a sent-without-review report cannot be recorded', async () => {
-    const review = vi.fn().mockResolvedValue({ kind: 'send', content: emailReq.body, report: { source: 'sent_without_review', summary: 'Sent unreviewed' } });
+    const review = vi.fn().mockResolvedValue({ kind: 'send', report: { source: 'sent_without_review', summary: 'Sent unreviewed' } });
     const gw = makeBandGateway({ review, score: 84 });
     vi.mocked(mocks.bus.publish).mockImplementation(async (_layer, event) => {
       if ((event as { type: string }).type === 'principal.report') throw new Error('audit down');
@@ -3998,6 +4762,540 @@ describe('band review (#2159)', () => {
     await gw.send(emailReq, { taskEventId: 't1' });
     const recipients = vi.mocked(mocks.nylasClient.sendMessage).mock.calls.map((c) => (c[0] as { to: Array<{ email: string }> }).to[0]!.email);
     expect(recipients).toEqual(['joel@example.com', 'principal@example.com']);
+  });
+
+  describe('personal data is sent only when the review authorizes it (#2312)', () => {
+    const phone = '(415) 555-1234';
+    const phoneBody = `Call me on ${phone} tomorrow.`;
+    const phoneReq = { channel: 'email' as const, to: 'joel@example.com', subject: 'Forms', body: phoneBody };
+
+    async function makePiiGateway(opts: {
+      review: ReturnType<typeof vi.fn>; gating?: 'band' | 'tier'; withSignal?: boolean;
+      principalIdentities?: ReturnType<typeof makePrincipalIdentity>[];
+      outboundQueue?: OutboundQueueRepo; emailReady?: () => boolean;
+      piiRedactor?: PiiRedactor;
+      /** Band gating with no review wired. */
+      noReview?: boolean;
+      actionLogRepo?: ReturnType<typeof makeActionLogRepo>;
+    }) {
+      const { PiiRedactor: RealPiiRedactor } = await import('../../../src/dispatch/pii-redactor.js');
+      const signalClient = makeSignalClient();
+      const gateway = new OutboundGateway({
+        nylasClients: new Map([['curia', mocks.nylasClient]]),
+        ...(opts.withSignal
+          ? {
+            signalClient: signalClient as unknown as import('../../../src/channels/signal/signal-rpc-client.js').SignalRpcClient,
+            signalPhoneNumber: '+15555550000',
+          }
+          : {}),
+        contactService: mocks.contactService,
+        contentFilter: mocks.contentFilter,
+        bus: mocks.bus,
+        principalIdentities: opts.principalIdentities ?? [makePrincipalIdentity('principal@example.com')],
+        logger: mocks.logger,
+        autonomyService: makeAutonomyService(84),
+        actionLogRepo: opts.actionLogRepo ?? makeActionLogRepo(),
+        gating: opts.gating ?? 'band',
+        ...(opts.noReview ? {} : { bandReview: { review: opts.review as unknown as BandSendReview['review'] } }),
+        ...(opts.outboundQueue
+          ? { outboundQueue: opts.outboundQueue, outboundQueueReadiness: new Map([['email', opts.emailReady ?? (() => false)]]) }
+          : {}),
+        piiRedactor: opts.piiRedactor ?? new RealPiiRedactor({
+          config: { enabled: true, default: 'block', channel_policies: { email: { allow: ['email'] }, signal: { allow: [] } } },
+          bus: mocks.bus,
+          logger: mocks.logger,
+          extraPatterns: [],
+        }),
+      });
+      return { gateway, signalClient };
+    }
+
+    function sentEmail(): { body: string; subject: string; cc?: Array<{ email: string }> } {
+      return vi.mocked(mocks.nylasClient.sendMessage).mock.calls[0]![0] as { body: string; subject: string; cc?: Array<{ email: string }> };
+    }
+
+    it('delivers the raw value when the review sends it, with no redaction audit', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const { gateway } = await makePiiGateway({ review });
+      const result = await gateway.send(phoneReq, { taskEventId: 't1', conversationId: 'c1' });
+
+      expect(result.success).toBe(true);
+      expect(sentEmail().body).toContain(phone);
+      expect(publishedOfType(mocks.bus, 'outbound.pii_redacted')).toHaveLength(0);
+      // Nothing was redacted on the wire.
+      expect(result.redactions).toBeUndefined();
+      expect(result.sentContent).toBeUndefined();
+      // The audit event carries the redacted copy, never the authorized value.
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered).toHaveLength(1);
+      expect(String(delivered[0]!.payload['content'])).toContain('[REDACTED: PHONE_US]');
+      expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
+      expect(delivered[0]!.payload['disclosed']).toEqual([{ label: 'phone_us', field: 'body' }]);
+    });
+
+    it('records a quoted detail the review let out, which the audit body cannot show', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const { gateway } = await makePiiGateway({ review });
+      await gateway.send({ ...phoneReq, body: 'See below.', htmlQuote: '<blockquote>SIN 130 692 544</blockquote>' }, { taskEventId: 't1' });
+
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered[0]!.payload['disclosed']).toEqual([{ label: 'sin_ca', field: 'quote' }]);
+      expect(JSON.stringify(delivered[0]!.payload)).not.toContain('130 692 544');
+    });
+
+    it('gives the content filter a redacted copy', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const { gateway } = await makePiiGateway({ review });
+      await gateway.send(phoneReq, { taskEventId: 't1' });
+
+      expect(mocks.contentFilter.check).toHaveBeenCalledWith(expect.objectContaining({
+        content: 'Call me on [REDACTED: PHONE_US] tomorrow.',
+      }));
+    });
+
+    it('passes the review the detected items, the raw content, the recipient tier and the subject', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      vi.mocked(mocks.contactService.resolveByChannelIdentity).mockResolvedValue({
+        contactId: 'joel-1', displayName: 'Joel', tier: 'trusted', kind: 'person', verified: true,
+      } as unknown as Awaited<ReturnType<ContactService['resolveByChannelIdentity']>>);
+      const { gateway } = await makePiiGateway({ review });
+      await gateway.send(
+        { ...phoneReq, subject: `Re: ${phone}`, htmlQuote: `<blockquote>Reach me at ${phone}</blockquote>` },
+        { taskEventId: 't1' },
+      );
+
+      const arg = review.mock.calls[0]![0] as Record<string, unknown>;
+      expect(arg['content']).toBe(phoneBody);
+      expect(arg['recipientTier']).toBe('trusted');
+      // The resolved contact, keyed by recipient, for a reply-to-task link's counterparty check.
+      expect(arg['recipientContactIds']).toEqual({ [String(phoneReq.to).toLowerCase()]: 'joel-1' });
+      expect(arg['subject']).toBe(`Re: ${phone}`);
+      expect(arg['detectedItems']).toEqual([
+        { id: 'P1', label: 'phone_us', text: phone, field: 'body' },
+        { id: 'P2', label: 'phone_us', text: phone, field: 'subject' },
+        { id: 'P3', label: 'phone_us', text: phone, field: 'quote' },
+      ]);
+      // The authorized subject goes out as written.
+      expect(sentEmail().subject).toBe(`Re: ${phone}`);
+    });
+
+    // Quoted history is not a disclosure to people already on it (#2312).
+    describe('the quoted message', () => {
+      // The sender's own signature phone, quoted back.
+      const QUOTED = phone;
+      const quote = `<blockquote>Reach me at ${QUOTED}.</blockquote>`;
+      const reply = { channel: 'email' as const, to: 'joel@example.com', subject: 'Re: Forms', body: 'Thanks, got it.', htmlQuote: quote, replyToMessageId: 'msg-orig' };
+      const detected = (review: ReturnType<typeof vi.fn>) => (review.mock.calls[0]![0] as { detectedItems?: unknown }).detectedItems;
+      // The gateway confirms the exemption from the message the reply answers, never the caller's list.
+      const original = (to: string[] = ['curia@example.com'], cc: string[] = []) => {
+        const getMessage = vi.fn().mockResolvedValue({ from: [{ email: 'joel@example.com' }], to: to.map((email) => ({ email })), cc: cc.map((email) => ({ email })) });
+        (mocks.nylasClient as unknown as Record<string, unknown>).getMessage = getMessage;
+        return getMessage;
+      };
+      beforeEach(() => { original(); });
+
+      it('is reviewed when the caller claims participants the quoted message does not have', async () => {
+        const getMessage = original();
+        const review = vi.fn().mockResolvedValue({ kind: 'send' });
+        const { gateway } = await makePiiGateway({ review });
+        await gateway.send({ ...reply, cc: ['newcomer@example.com'], quoteParticipants: ['joel@example.com', 'newcomer@example.com'] }, { taskEventId: 't1' });
+        expect(getMessage).toHaveBeenCalledWith('msg-orig');
+        expect(detected(review)).toEqual([{ id: 'P1', label: 'phone_us', text: QUOTED, field: 'quote' }]);
+      });
+
+      it('is reviewed when the quoted message cannot be fetched, or the reply names none', async () => {
+        for (const req of [reply, { ...reply, replyToMessageId: undefined }]) {
+          (mocks.nylasClient as unknown as Record<string, unknown>).getMessage = vi.fn().mockRejectedValue(new Error('Nylas down'));
+          const review = vi.fn().mockResolvedValue({ kind: 'send' });
+          const { gateway } = await makePiiGateway({ review });
+          await gateway.send({ ...req, quoteParticipants: ['joel@example.com'] }, { taskEventId: 't1' });
+          expect(detected(review)).toEqual([{ id: 'P1', label: 'phone_us', text: QUOTED, field: 'quote' }]);
+        }
+      });
+
+      it('is not reviewed when every recipient was on the quoted message, and is sent', async () => {
+        const review = vi.fn().mockResolvedValue({ kind: 'send' });
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.send(
+          { ...reply, cc: ['Principal@Example.com'], quoteParticipants: ['joel@example.com', 'curia@example.com'] },
+          { taskEventId: 't1', postTurn: true },
+        );
+        expect(result.success).toBe(true);
+        expect(detected(review)).toBeUndefined();
+        expect(sentEmail().body).toContain(QUOTED);
+      });
+
+      it('is left out of a held reply\'s fallback draft that reaches a newcomer, so an approved draft cannot carry it', async () => {
+        const createDraft = vi.fn().mockResolvedValue({ id: 'draft-1', subject: 'Re: Forms', body: 'x' });
+        (mocks.nylasClient as unknown as Record<string, unknown>).createDraft = createDraft;
+        const { gateway } = await makePiiGateway({ review: vi.fn() });
+        await gateway.createEmailDraft({ ...reply, cc: ['newcomer@example.com'], quoteParticipants: ['joel@example.com'] });
+        expect(JSON.stringify(createDraft.mock.calls[0]![0])).not.toContain(QUOTED);
+
+        createDraft.mockClear();
+        await gateway.createEmailDraft({ ...reply, quoteParticipants: ['joel@example.com'] });
+        expect(JSON.stringify(createDraft.mock.calls[0]![0])).toContain(QUOTED);
+      });
+
+      it('stays on an approved replay when every recipient was on the quoted message, and goes otherwise', async () => {
+        const { gateway } = await makePiiGateway({ review: vi.fn() });
+        await gateway.send({ ...reply, quoteParticipants: ['joel@example.com'] }, { humanApproved: true });
+        expect(sentEmail().body).toContain(QUOTED);
+
+        vi.mocked(mocks.nylasClient.sendMessage).mockClear();
+        await gateway.send({ ...reply, cc: ['newcomer@example.com'], quoteParticipants: ['joel@example.com'] }, { humanApproved: true });
+        expect(sentEmail().body).not.toContain(QUOTED);
+      });
+
+      it('is reviewed when a recipient was not on it, or nobody recorded who was', async () => {
+        for (const req of [
+          { ...reply, cc: ['newcomer@example.com'], quoteParticipants: ['joel@example.com'] },
+          reply,
+        ]) {
+          vi.mocked(mocks.nylasClient.sendMessage).mockClear();
+          const review = vi.fn().mockResolvedValue({ kind: 'send' });
+          const { gateway } = await makePiiGateway({ review });
+          await gateway.send(req, { taskEventId: 't1' });
+          expect(detected(review)).toEqual([{ id: 'P1', label: 'phone_us', text: QUOTED, field: 'quote' }]);
+          expect(sentEmail().body).toContain(QUOTED);
+        }
+      });
+
+      it('is dropped when the review says so, leaving the agent\'s text', async () => {
+        const review = vi.fn().mockResolvedValue({ kind: 'send', dropQuote: { labels: ['phone_us'] } });
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.send({ ...reply, to: 'stranger@example.com', quoteParticipants: ['joel@example.com'] }, { taskEventId: 't1' });
+        expect(result.success).toBe(true);
+        expect(sentEmail().body).toContain('Thanks, got it.');
+        expect(sentEmail().body).not.toContain(QUOTED);
+        expect(sentEmail().body).not.toContain('<blockquote>');
+      });
+    });
+
+    it('keeps raw values out of the outbound.blocked event on a bounce', async () => {
+      const findings = [{ rule: 'pii-not-authorized', detail: 'P1 phone_us was not authorized.' }];
+      const { gateway } = await makePiiGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }) });
+      const result = await gateway.send(phoneReq, { taskEventId: 't1' });
+
+      expect(result.success).toBe(false);
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+      const blocked = publishedOfType(mocks.bus, 'outbound.blocked');
+      expect(blocked).toHaveLength(1);
+      expect(String(blocked[0]!.payload['content'])).not.toContain('555-1234');
+      expect(String(blocked[0]!.payload['content'])).toContain('[REDACTED: PHONE_US]');
+    });
+
+    it('redacts the flushed audit event of a band-queued row even after a switch to tier gating', async () => {
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const enqueue = vi.fn().mockResolvedValue({ id: 'q-1' });
+      const outboundQueue = {
+        enqueue,
+        listPending: vi.fn().mockImplementation(async () => [{
+          id: 'q-1', channel: 'email', recipient: 'joel@example.com', payload: enqueue.mock.calls[0]![0],
+          enqueuedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
+        }]),
+        deleteByIds: vi.fn().mockResolvedValue(undefined),
+      } as unknown as OutboundQueueRepo;
+      const { gateway: band } = await makePiiGateway({ review, outboundQueue });
+      expect((await band.send(phoneReq, { taskEventId: 't1' })).queued).toBe(true);
+      expect((enqueue.mock.calls[0]![0] as { body: string }).body).toContain(phone);
+
+      // Restarted with tier gating while the raw row is still queued.
+      const { gateway: tier } = await makePiiGateway({ review, outboundQueue, gating: 'tier', emailReady: () => true });
+      await tier.flushChannel('email');
+      expect(sentEmail().body).toContain(phone);
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered).toHaveLength(1);
+      expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
+    });
+
+    it('blocks with pii_redactor_error when detection throws', async () => {
+      const review = vi.fn();
+      const piiRedactor = {
+        detect: vi.fn().mockImplementation(() => { throw new Error('pattern engine crashed'); }),
+        apply: vi.fn(),
+        redact: vi.fn(),
+      } as unknown as PiiRedactor;
+      const { gateway } = await makePiiGateway({ review, piiRedactor });
+      const result = await gateway.send(phoneReq, { taskEventId: 't1' });
+
+      expect(result).toMatchObject({ success: false, blockedReason: expect.stringContaining('pii_redactor_error') });
+      expect(review).not.toHaveBeenCalled();
+      expect(mocks.nylasClient.sendMessage).not.toHaveBeenCalled();
+      const blocked = publishedOfType(mocks.bus, 'outbound.blocked');
+      expect(blocked).toHaveLength(1);
+      expect(blocked[0]!.payload['reason']).toBe('pii_redactor_error');
+      expect(String(blocked[0]!.payload['content'])).not.toContain('555-1234');
+    });
+
+    it('redacts a system notification as tier does', async () => {
+      const review = vi.fn();
+      const { gateway } = await makePiiGateway({ review });
+      await gateway.send(phoneReq, { isSystemNotification: true });
+
+      expect(review).not.toHaveBeenCalled();
+      expect(sentEmail().body).toContain('[REDACTED: PHONE_US]');
+      expect(sentEmail().body).not.toContain('555-1234');
+    });
+
+    it('sends an approved replay intact, without review', async () => {
+      const review = vi.fn();
+      const { gateway } = await makePiiGateway({ review });
+      const result = await gateway.send({ ...phoneReq, subject: `Re: ${phone}` }, { humanApproved: true });
+
+      expect(result.success).toBe(true);
+      expect(review).not.toHaveBeenCalled();
+      expect(sentEmail().body).toContain(phone);
+      expect(sentEmail().subject).toBe(`Re: ${phone}`);
+      expect(publishedOfType(mocks.bus, 'outbound.pii_redacted')).toHaveLength(0);
+      // The audit event still never carries the value.
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered).toHaveLength(1);
+      expect(String(delivered[0]!.payload['content'])).toContain('[REDACTED: PHONE_US]');
+      expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
+    });
+
+    it('gives the content filter and its block event a redacted copy of an approved replay', async () => {
+      const { gateway } = await makePiiGateway({ review: vi.fn() });
+      vi.mocked(mocks.contentFilter.check).mockResolvedValueOnce({ passed: false, findings: [{ rule: 'llm-judge-audience-leak', detail: 'x' }] });
+      const result = await gateway.send(phoneReq, { humanApproved: true });
+
+      expect(result.success).toBe(false);
+      expect(mocks.contentFilter.check).toHaveBeenCalledWith(expect.objectContaining({ content: 'Call me on [REDACTED: PHONE_US] tomorrow.' }));
+      const blocked = publishedOfType(mocks.bus, 'outbound.blocked');
+      expect(blocked).toHaveLength(1);
+      expect(String(blocked[0]!.payload['content'])).not.toContain('555-1234');
+    });
+
+    it('sends an approved reply without its quote when the quote has details the approval did not show', async () => {
+      const { gateway } = await makePiiGateway({ review: vi.fn() });
+      const result = await gateway.send({ ...phoneReq, body: 'See below.', htmlQuote: '<blockquote>My SIN is 130 692 544</blockquote>' }, { humanApproved: true });
+
+      expect(result.success).toBe(true);
+      expect(sentEmail().body).not.toContain('130 692 544');
+      expect(sentEmail().body).not.toContain('blockquote');
+    });
+
+    it('keeps an approved reply\'s quote when it has no personal details', async () => {
+      const { gateway } = await makePiiGateway({ review: vi.fn() });
+      await gateway.send({ ...phoneReq, body: 'See below.', htmlQuote: '<blockquote>Thanks for the update.</blockquote>' }, { humanApproved: true });
+      expect(sentEmail().body).toContain('Thanks for the update.');
+    });
+
+    it('sends an approved Signal replay intact, with a redacted audit event', async () => {
+      const review = vi.fn();
+      const { gateway, signalClient } = await makePiiGateway({ review, withSignal: true });
+      const result = await gateway.send({ channel: 'signal', recipient: '+15555552222', message: phoneBody }, { humanApproved: true });
+
+      expect(result.success).toBe(true);
+      expect(review).not.toHaveBeenCalled();
+      expect(JSON.stringify(signalClient.send.mock.calls)).toContain(phone);
+      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+      expect(delivered).toHaveLength(1);
+      expect(String(delivered[0]!.payload['content'])).toBe('Call me on [REDACTED: PHONE_US] tomorrow.');
+    });
+
+    it('still redacts under tier gating', async () => {
+      const review = vi.fn();
+      const { gateway } = await makePiiGateway({ review, gating: 'tier' });
+      const result = await gateway.send(phoneReq, { taskEventId: 't1' });
+
+      expect(review).not.toHaveBeenCalled();
+      expect(sentEmail().body).toContain('[REDACTED: PHONE_US]');
+      expect(sentEmail().body).not.toContain('555-1234');
+      expect(result.redactions).toEqual([{ label: 'phone_us', field: 'body' }]);
+    });
+
+    describe('saved drafts (#2312)', () => {
+      const phoneDraft = { recipientEmail: 'joel@example.com', body: phoneBody, subject: 'Forms' };
+      const holdRecipe = { toolName: 'send-draft', partialPayload: { draft_id: 'd1', subject: 'Forms', body: phoneBody }, description: 'Send draft to joel@example.com' };
+
+      function draftSender(): ReturnType<typeof vi.fn> {
+        const sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+        (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = sendDraft;
+        return sendDraft;
+      }
+
+      it('sends a draft whose details the review authorizes, with a redacted filter copy and audit', async () => {
+        const sendDraft = draftSender();
+        const review = vi.fn().mockResolvedValue({ kind: 'send' });
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.sendEmailDraft('d1', 'curia', { ...phoneDraft, subject: `Re: ${phone}` }, { humanApproved: true, taskEventId: 't1' });
+
+        expect(result.success).toBe(true);
+        expect(sendDraft).toHaveBeenCalledWith('d1');
+        const arg = review.mock.calls[0]![0] as Record<string, unknown>;
+        expect(arg['content']).toBe(phoneBody);
+        expect(arg['subject']).toBe(`Re: ${phone}`);
+        expect(arg['detectedItems']).toEqual([
+          { id: 'P1', label: 'phone_us', text: phone, field: 'body' },
+          { id: 'P2', label: 'phone_us', text: phone, field: 'subject' },
+        ]);
+        expect(mocks.contentFilter.check).toHaveBeenCalledWith(expect.objectContaining({ content: 'Call me on [REDACTED: PHONE_US] tomorrow.' }));
+        const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+        expect(delivered).toHaveLength(1);
+        expect(String(delivered[0]!.payload['content'])).toBe('Call me on [REDACTED: PHONE_US] tomorrow.');
+        expect(publishedOfType(mocks.bus, 'outbound.pii_redacted')).toHaveLength(0);
+      });
+
+      it('holds a draft the review bounces: it cannot be rewritten in place', async () => {
+        const sendDraft = draftSender();
+        const findings = [{ rule: 'pii-not-authorized', detail: 'P1 phone_us was not authorized.' }];
+        const { gateway } = await makePiiGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }) });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1', holdRecipe });
+
+        expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+        expect(result.blockedReason).not.toContain('555-1234');
+        expect(sendDraft).not.toHaveBeenCalled();
+        expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+      });
+
+      it('reviews a principal-directed draft that holds personal details', async () => {
+        draftSender();
+        const review = vi.fn().mockResolvedValue({ kind: 'send' });
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, principalDirected: true, taskEventId: 't1' });
+
+        expect(result.success).toBe(true);
+        expect(review).toHaveBeenCalledWith(expect.objectContaining({
+          principalDirected: true,
+          detectedItems: [{ id: 'P1', label: 'phone_us', text: phone, field: 'body' }],
+        }));
+      });
+
+      it('sends a draft the principal approved intact, without review, with a redacted audit', async () => {
+        const sendDraft = draftSender();
+        const review = vi.fn();
+        const { gateway } = await makePiiGateway({ review });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, principalApproved: true, taskEventId: 't1' });
+
+        expect(result.success).toBe(true);
+        expect(review).not.toHaveBeenCalled();
+        expect(sendDraft).toHaveBeenCalledWith('d1');
+        const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+        expect(String(delivered[0]!.payload['content'])).toBe('Call me on [REDACTED: PHONE_US] tomorrow.');
+      });
+
+      it('gives the content filter and its block event a redacted copy of an approved draft', async () => {
+        const sendDraft = draftSender();
+        const { gateway } = await makePiiGateway({ review: vi.fn() });
+        vi.mocked(mocks.contentFilter.check).mockResolvedValueOnce({ passed: false, findings: [{ rule: 'llm-judge-audience-leak', detail: 'x' }] });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, principalApproved: true, taskEventId: 't1' });
+
+        expect(result.success).toBe(false);
+        expect(sendDraft).not.toHaveBeenCalled();
+        expect(mocks.contentFilter.check).toHaveBeenCalledWith(expect.objectContaining({ content: 'Call me on [REDACTED: PHONE_US] tomorrow.' }));
+        const blocked = publishedOfType(mocks.bus, 'outbound.blocked');
+        expect(String(blocked[0]!.payload['content'])).not.toContain('555-1234');
+      });
+
+      it('refuses a draft with details under tier gating: it cannot be redacted in place', async () => {
+        const sendDraft = draftSender();
+        const review = vi.fn();
+        const { gateway } = await makePiiGateway({ review, gating: 'tier' });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1' });
+
+        expect(result).toEqual({
+          success: false,
+          blockedReason: 'Not sent: this draft contains phone_us, which can\'t be sent to this recipient. Edit the draft to remove them, or ask the principal.',
+        });
+        expect(sendDraft).not.toHaveBeenCalled();
+        expect(review).not.toHaveBeenCalled();
+      });
+
+      it('sends a tier draft the principal approved, and one to the principal alone', async () => {
+        const sendDraft = draftSender();
+        const { gateway } = await makePiiGateway({ review: vi.fn(), gating: 'tier' });
+        const approved = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, principalApproved: true, taskEventId: 't1' });
+        const toPrincipal = await gateway.sendEmailDraft('d2', 'curia', { ...phoneDraft, recipientEmail: 'principal@example.com' }, { humanApproved: true, taskEventId: 't1' });
+
+        expect(approved.success).toBe(true);
+        expect(toPrincipal.success).toBe(true);
+        expect(sendDraft.mock.calls).toEqual([['d1'], ['d2']]);
+      });
+
+      it('sends a principal-directed tier draft with details as written, and refuses a woken task\'s', async () => {
+        const sendDraft = draftSender();
+        const { gateway } = await makePiiGateway({ review: vi.fn(), gating: 'tier' });
+        // A live principal turn (or an approval replay): the principal is in the loop.
+        const directed = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, principalDirected: true, taskEventId: 't1' });
+        expect(directed.success).toBe(true);
+        expect(sendDraft.mock.calls).toEqual([['d1']]);
+        const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+        expect(String(delivered[0]!.payload['content'])).toBe('Call me on [REDACTED: PHONE_US] tomorrow.');
+
+        // A woken task: send-draft sets humanApproved, but not principalDirected.
+        const woken = await gateway.sendEmailDraft('d2', 'curia', phoneDraft, { humanApproved: true, principalDirected: false, taskEventId: 't2' });
+        expect(woken).toMatchObject({ success: false, blockedReason: expect.stringContaining('phone_us') });
+        expect(sendDraft.mock.calls).toEqual([['d1']]);
+      });
+
+      it('refuses a draft with details under band gating with no review wired, even principal-directed', async () => {
+        const sendDraft = draftSender();
+        const { gateway } = await makePiiGateway({ review: vi.fn(), noReview: true });
+        for (const principalDirected of [false, true]) {
+          const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, principalDirected, taskEventId: 't1' });
+          expect(result).toMatchObject({ success: false, blockedReason: expect.stringContaining('phone_us') });
+          expect(result.blockedReason).not.toContain('555-1234');
+        }
+        expect(sendDraft).not.toHaveBeenCalled();
+      });
+
+      it('blocks a draft when detection throws: nothing sent, the blocked event scrubbed', async () => {
+        const sendDraft = draftSender();
+        const review = vi.fn();
+        const piiRedactor = {
+          detect: vi.fn().mockImplementation(() => { throw new Error('pattern engine crashed'); }),
+          apply: vi.fn(),
+          redact: vi.fn(),
+        } as unknown as PiiRedactor;
+        const { gateway } = await makePiiGateway({ review, piiRedactor });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1' });
+
+        expect(result).toMatchObject({ success: false, blockedReason: expect.stringContaining('pii_redactor_error') });
+        expect(sendDraft).not.toHaveBeenCalled();
+        expect(review).not.toHaveBeenCalled();
+        const blocked = publishedOfType(mocks.bus, 'outbound.blocked');
+        expect(blocked).toHaveLength(1);
+        expect(String(blocked[0]!.payload['content'])).not.toContain('555-1234');
+      });
+
+      it('sends a draft without details unchanged under tier and band', async () => {
+        const plain = { recipientEmail: 'joel@example.com', body: 'See you at the meeting tomorrow.', subject: 'Forms' };
+        for (const gating of ['tier', 'band'] as const) {
+          const sendDraft = draftSender();
+          const review = vi.fn().mockResolvedValue({ kind: 'send' });
+          const { gateway } = await makePiiGateway({ review, gating });
+          const result = await gateway.sendEmailDraft('d1', 'curia', plain, { humanApproved: true, taskEventId: 't1' });
+
+          expect(result.success).toBe(true);
+          expect(sendDraft).toHaveBeenCalledWith('d1');
+          expect(mocks.contentFilter.check).toHaveBeenLastCalledWith(expect.objectContaining({ content: plain.body }));
+          const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
+          expect(String(delivered[delivered.length - 1]!.payload['content'])).toBe(plain.body);
+          // Band still reviews it as any autonomous send, with no items to rule on.
+          if (gating === 'band') {
+            expect(review).toHaveBeenCalledTimes(1);
+            expect((review.mock.calls[0]![0] as Record<string, unknown>)['detectedItems']).toBeUndefined();
+          } else {
+            expect(review).not.toHaveBeenCalled();
+          }
+        }
+      });
+
+      it('records an approved draft for spot checks with a redacted preview', async () => {
+        draftSender();
+        const actionLogRepo = makeActionLogRepo();
+        const { gateway } = await makePiiGateway({ review: vi.fn(), actionLogRepo });
+        const result = await gateway.sendEmailDraft('d1', 'curia', { ...phoneDraft, subject: `Re: ${phone}` }, { humanApproved: true, principalApproved: true, taskEventId: 't1' });
+
+        expect(result.success).toBe(true);
+        expect(actionLogRepo.insertSampled).toHaveBeenCalledTimes(1);
+        const summary = String((vi.mocked(actionLogRepo.insertSampled).mock.calls[0]![0] as { summary: string }).summary);
+        expect(summary).toContain('[REDACTED: PHONE_US]');
+        expect(summary).not.toContain('555-1234');
+      });
+    });
   });
 
   describe('sendEmailDraft', () => {
@@ -4015,22 +5313,58 @@ describe('band review (#2159)', () => {
       const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, { taskEventId: 't1', conversationId: 'c1' });
       expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
       expect(review).toHaveBeenCalledWith(expect.objectContaining({ content: draftMeta.body, channel: 'email', score: 84 }));
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(1);
     });
 
-    it('holds a draft the review would trim: a stored draft cannot be edited', async () => {
+    it('refuses a blocked draft send, with the digest told and nothing sent', async () => {
       withDraftClient();
-      const review = vi.fn().mockResolvedValue({ kind: 'send', content: 'Hi Joel.', report: { source: 'claim_trimmed', summary: 'x' } });
+      const findings = [{ rule: 'unneeded-disclosure', detail: 'shares details: "x"' }];
+      const review = vi.fn().mockResolvedValue({ kind: 'block', reason: 'Not sent: x', findings });
       const gw = makeBandGateway({ review, score: 84 });
+      const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, { taskEventId: 't1' });
+      expect(result).toMatchObject({ success: false, blockedRules: ['unneeded-disclosure'] });
+      expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(1);
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+      expect((mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft).not.toHaveBeenCalled();
+    });
+
+    it('holds a draft through its holdRecipe, as before', async () => {
+      withDraftClient();
+      const review = vi.fn().mockResolvedValue({ kind: 'hold', reason: 'Held.', findings: [{ rule: 'ungrounded-claim', detail: 'x' }] });
+      const gw = makeBandGateway({ review, score: 74 });
       const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, {
         taskEventId: 't1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft to joel@example.com' },
       });
       expect(result).toMatchObject({ success: false, gated: true });
+      expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
       expect((mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft).not.toHaveBeenCalled();
+    });
+
+    it('does not review a draft to Curia\'s own address with the principal CC\'d', async () => {
+      withDraftClient();
+      const review = vi.fn();
+      const gw = makeBandGateway({ review, score: 84, emailAccountAddresses: new Map([['curia', 'curia@example.com']]) });
+      const result = await gw.sendEmailDraft('d1', 'curia', {
+        ...draftMeta, recipientEmail: 'curia@example.com', allRecipients: ['curia@example.com', 'principal@example.com'],
+      }, { taskEventId: 't1' });
+      expect(result.success).toBe(true);
+      expect(review).not.toHaveBeenCalled();
+    });
+
+    it('reviews a draft addressed only to Curia\'s own address with no outside audience', async () => {
+      withDraftClient();
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
+      const gw = makeBandGateway({ review, score: 84, emailAccountAddresses: new Map([['curia', 'curia@example.com']]) });
+      const result = await gw.sendEmailDraft('d1', 'curia', {
+        ...draftMeta, recipientEmail: 'curia@example.com', allRecipients: ['curia@example.com'],
+      }, { taskEventId: 't1' });
+      expect(result.success).toBe(true);
+      expect(review).toHaveBeenCalledWith(expect.objectContaining({ recipients: [], principalRecipients: [] }));
     });
 
     it('sends a draft the review passes', async () => {
       withDraftClient();
-      const review = vi.fn().mockResolvedValue({ kind: 'send', content: draftMeta.body });
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
       const gw = makeBandGateway({ review, score: 84 });
       const result = await gw.sendEmailDraft('d1', 'curia', draftMeta, { taskEventId: 't1' });
       expect(result.success).toBe(true);
@@ -4048,7 +5382,7 @@ describe('band review (#2159)', () => {
       // send-draft passes humanApproved on every call (its own task-origin check is the
       // gate), so humanApproved does not mean the principal read this draft.
       withDraftClient();
-      const review = vi.fn().mockResolvedValue({ kind: 'send', content: draftMeta.body });
+      const review = vi.fn().mockResolvedValue({ kind: 'send' });
       const gw = makeBandGateway({ review, score: 84 });
       await gw.sendEmailDraft('d1', 'curia', draftMeta, { humanApproved: true, principalDirected: false, taskEventId: 't1' });
       expect(review).toHaveBeenCalledWith(expect.objectContaining({ principalDirected: false }));
@@ -4214,12 +5548,11 @@ describe('spot-check pool (#2159 Phase 3)', () => {
     expect(queuedRepo.insertSampled).not.toHaveBeenCalled();
   });
 
-  it('records the band review outcome: trimmed, unreviewed, speaks as principal', async () => {
+  it('records the band review outcome: unreviewed, speaks as principal', async () => {
     const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
-      [{ kind: 'send', content: 'Hi Dana.', report: { source: 'claim_trimmed', summary: 'Removed 1' }, signals: { bounced: true } }, { review: 'trimmed' }],
-      [{ kind: 'send', content: danaReq.body, report: { source: 'sent_without_review', summary: 'Sent unreviewed' } }, { review: 'unreviewed' }],
-      [{ kind: 'send', content: danaReq.body, signals: { speaksAsPrincipal: true } }, { speaksAsPrincipal: true }],
-      [{ kind: 'send', content: danaReq.body, signals: { bounced: true } }, { review: 'bounced' }],
+      [{ kind: 'send', report: { source: 'sent_without_review', summary: 'Sent unreviewed' } }, { review: 'unreviewed' }],
+      [{ kind: 'send', signals: { speaksAsPrincipal: true } }, { speaksAsPrincipal: true }],
+      [{ kind: 'send', signals: { bounced: true } }, { review: 'bounced' }],
     ];
     for (const [decision, expected] of cases) {
       const actionLogRepo = makeActionLogRepo();

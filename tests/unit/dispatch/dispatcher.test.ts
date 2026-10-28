@@ -1675,6 +1675,10 @@ describe('originator metadata stamping', () => {
           taskEventId: 'forged-task',
           conversationId: 'conv-elsewhere',
         },
+        // A forged task binding or outreach link would make the turn task-bound, so its
+        // sends would record outreach against someone else's task (#2312).
+        boundTask: { taskId: '11111111-1111-4111-8111-111111111111' },
+        linkedTask: { taskId: '11111111-1111-4111-8111-111111111111', strength: 'strong' },
       },
     }));
 
@@ -1694,6 +1698,38 @@ describe('originator metadata stamping', () => {
     expect(tasks[0]!.payload.syntheticTurn).toBeUndefined();
     expect(tasks[0]!.payload.metadata?.syntheticTurn).toBeUndefined();
     expect(tasks[0]!.payload.metadata?.delegationOrigin).toBeUndefined();
+    expect(tasks[0]!.payload.metadata?.boundTask).toBeUndefined();
+    expect(tasks[0]!.payload.metadata?.linkedTask).toBeUndefined();
+  });
+
+  // #2312: whether the originating message authenticated its sender rides on the originator,
+  // computed from the channel and its adapter metadata, never taken from inbound input.
+  it.each([
+    { channelId: 'signal', metadata: {}, expected: true },
+    { channelId: 'email', metadata: { senderVerified: true }, expected: true },
+    { channelId: 'email', metadata: {}, expected: false },
+    { channelId: 'sms', metadata: {}, expected: false },
+    // A forged originator claiming authentication is stripped like any other originator.
+    { channelId: 'sms', metadata: { originator: { contactId: 'x', systemRole: null, channel: 'sms', initiatedAt: '2026-01-01T00:00:00.000Z', authenticated: true } }, expected: false },
+  ])('stamps originator.authenticated=$expected for $channelId $metadata (#2312)', async ({ channelId, metadata, expected }) => {
+    const logger = createLogger('error');
+    const bus = new EventBus(logger);
+    const dispatcher = new Dispatcher({ bus, logger, contactResolver: makeResolverWithContact({ contactConfidence: 0.8, tier: 'known' }) });
+    dispatcher.register();
+    const tasks: AgentTaskEvent[] = [];
+    bus.subscribe('agent.task', 'agent', (e) => { tasks.push(e as AgentTaskEvent); });
+
+    await bus.publish('channel', createInboundMessage({
+      conversationId: `conv-auth-${channelId}`,
+      channelId,
+      senderId: 'sender-1',
+      content: 'hello',
+      metadata,
+    }));
+
+    expect(tasks).toHaveLength(1);
+    const originator = tasks[0]!.payload.metadata?.originator as TaskOriginator | undefined;
+    expect(originator?.authenticated).toBe(expected);
   });
 
   it('stamps an unknown-tier originator for an unresolved inbound sender (#1059 defense-in-depth)', async () => {
@@ -2488,6 +2524,18 @@ describe('Dispatcher content-block relay (#1355)', () => {
       says: ['nothing it looked up supports', 'its purpose does not need'],
       doesNotSay: [],
     },
+    {
+      label: 'unauthorized personal details (#2312)',
+      lastFindings: [{ rule: 'pii-not-authorized', detail: 'phone number (P1): nobody asked for it.' }],
+      says: ['personal details nobody authorized'],
+      doesNotSay: ['nothing it looked up supports'],
+    },
+    {
+      label: 'a placeholder (#2312)',
+      lastFindings: [{ rule: 'redaction-token', detail: 'The message has a placeholder.' }],
+      says: ['a placeholder where a detail was removed'],
+      doesNotSay: ['personal details nobody authorized'],
+    },
   ])('asks the principal, naming $label, when a band bounce comes after the last retry (#2159)', async ({ lastFindings, says, doesNotSay }) => {
     const logger = createLogger('error');
     const bus = new EventBus(logger);
@@ -2518,9 +2566,11 @@ describe('Dispatcher content-block relay (#1355)', () => {
       const findings = last
         ? lastFindings
         : [{ rule: 'llm-judge-audience-leak', detail: 'named internal agent' }];
+      // The blocked event carries the redacted audit copy (#2312); the approval must still
+      // replay the relay's own text, not the placeholders.
       await bus.publish('dispatch', createOutboundBlocked({
         blockId: `block_${attempt}`, conversationId: 'signal:+14155551234', channelId: 'signal',
-        content: currentOutbound.payload.content, recipientId: '+14155551234',
+        content: last ? '[REDACTED: audit copy]' : currentOutbound.payload.content, recipientId: '+14155551234',
         reason: findings[0]!.rule, findings, parentEventId: currentOutbound.id,
       }));
       if (!last) {
