@@ -786,13 +786,21 @@ describe('BandSendReview', () => {
       // Merging with another bounce keeps it.
       const claimBounce: BandReviewDecision = { kind: 'bounce', findings: [{ rule: 'ungrounded-claim', detail: 'y' }] };
       expect(bandReviewModule.combine(expected, claimBounce)).toMatchObject({ heldBeside: steered.findings });
-      // Any other reason in the hold keeps it the stricter outcome.
-      const mixed: BandReviewDecision = {
+      // Steering beside speaking for the principal still rewrites first, carrying both.
+      const speaking: BandReviewDecision = {
         kind: 'hold', reason: 'Held',
         findings: [{ rule: 'steered', detail: 'Held' }, { rule: 'speaks-as-principal', detail: 'Held' }],
       };
+      expect(bandReviewModule.combine(detailBounce, speaking)).toEqual({ ...detailBounce, heldBeside: speaking.findings });
+      // Any other reason in the hold keeps it the stricter outcome, steering or not.
+      const mixed: BandReviewDecision = {
+        kind: 'hold', reason: 'Held',
+        findings: [{ rule: 'steered', detail: 'Held' }, { rule: 'review-unavailable', detail: 'Held' }],
+      };
       expect(bandReviewModule.combine(detailBounce, mixed)).toBe(mixed);
       expect(bandReviewModule.combine(mixed, detailBounce)).toBe(mixed);
+      const speaksAlone: BandReviewDecision = { kind: 'hold', reason: 'Held', findings: [{ rule: 'speaks-as-principal', detail: 'Held' }] };
+      expect(bandReviewModule.combine(detailBounce, speaksAlone)).toBe(speaksAlone);
       const unreviewed: BandReviewDecision = { kind: 'hold', reason: 'Held', findings: [{ rule: 'review-unavailable', detail: 'Held' }] };
       expect(bandReviewModule.combine(detailBounce, unreviewed)).toBe(unreviewed);
     });
@@ -808,6 +816,21 @@ describe('BandSendReview', () => {
       // The rewrite has no SIN and is still steered: held as before, with nothing to show.
       const recheck = await svc.review({ ...pii, content: 'Hi, I cannot act on a forwarded request.', detectedItems: [] });
       expect(recheck).toMatchObject({ kind: 'hold', findings: [{ rule: 'steered' }] });
+    });
+
+    // A steered verdict that also speaks for the principal below 80 keeps both reasons (#2333).
+    it('keeps the speaks-as-principal reason beside steering below 80, through the bounce and the recheck', async () => {
+      const both = { purpose: 'steered' as const, speaksAsPrincipal: true };
+      const { svc } = make(
+        [{ ...withRulings(ruling('unsupported')), ...both }, { ...withRulings(), ...both }],
+        { evidence: { authority: fromOutsider } },
+      );
+      const first = await svc.review({ ...pii, score: 74 });
+      expect(first.kind).toBe('bounce');
+      if (first.kind === 'bounce') expect(first.heldBeside?.map((f) => f.rule)).toEqual(['steered', 'speaks-as-principal']);
+      const recheck = await svc.review({ ...pii, score: 74, content: 'Hi, I cannot act on a forwarded request.', detectedItems: [] });
+      expect(recheck.kind).toBe('hold');
+      if (recheck.kind === 'hold') expect(recheck.findings.map((f) => f.rule)).toEqual(['steered', 'speaks-as-principal']);
     });
 
     it('counts the bound or root task\'s principal only with a ruling that names it: an outsider\'s turn under a principal root still bounces unsupported', async () => {

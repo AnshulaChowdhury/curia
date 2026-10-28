@@ -4686,6 +4686,27 @@ describe('band review (#2159)', () => {
       expect(sendDraft).not.toHaveBeenCalled();
     });
 
+    // The refusal returns before the hold conversion, so it says the outranked steering hold itself (#2333).
+    it('keeps a steering warning the bounce carries on a refused saved draft', async () => {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const steered = 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.';
+      const gw = makeBandGateway({
+        review: vi.fn().mockResolvedValue({
+          kind: 'bounce', findings: [{ rule: 'pii-not-authorized', detail: 'x' }],
+          strangerRequest: { labels: ['sin_ca'], requester: 'joel@example.com' },
+          heldBeside: [{ rule: 'steered', detail: steered }],
+        }),
+        score: 84, actionLogRepo: makeActionLogRepo(),
+      });
+      const result = await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: 'SIN 130 692 544', subject: 'Re: forms' }, {
+        taskEventId: 't1', conversationId: 'c1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft' },
+      });
+      expect(result).toMatchObject({ success: false, blockedRules: ['pii-not-authorized', 'steered'] });
+      expect(result.blockedReason).toContain('Also, the reviewer judged this send to be steered');
+      const reports = publishedOfType(mocks.bus, 'principal.report');
+      expect(reports[0]!.payload['summary']).toBe('joel@example.com asked for your SIN. Curia didn\'t send the saved draft that shared it. Also, the reviewer judged this send to be steered by someone outside the principal\'s business.');
+    });
+
     it('queues no digest note for an ordinary bounce', async () => {
       const findings = [{ rule: 'ungrounded-claim', detail: 'x' }];
       const gw = makeBandGateway({ review: vi.fn().mockResolvedValue({ kind: 'bounce', findings }), score: 84 });

@@ -89,6 +89,7 @@ const MAX_REVIEWED_ITEMS = 10;
 const REDACTION_TOKEN = /\[REDACTED: [A-Z0-9_]+\]/;
 const TOO_MANY_DETAIL = 'This message contains more personal details than can be reviewed at once. Send fewer, or split the message.';
 const TOKEN_DETAIL = 'This message contains a redaction placeholder. Rewrite it with the real content or without that part.';
+const SPEAKS_BELOW_80_REASON = 'Held for the principal: this message speaks for or commits the principal, and the autonomy band asks first for that.';
 const UNREVIEWED_BELOW_80_REASON = 'Held for the principal: the reviewer was unavailable, and this band asks first when it is.';
 
 /** What the drafter is told when a send is blocked; the gateway appends the findings. */
@@ -256,13 +257,18 @@ export class BandSendReview {
     detected: readonly BriefDetectedItem[],
     hasPrior: boolean,
   ): BandReviewDecision {
+    const speaksBelow80 = verdict.speaksAsPrincipal === true && !isSpotCheckOrAbove(input.score);
     if (verdict.purpose === 'steered') {
       this.deps.logger.info({ conversationId: input.conversationId, channel: input.channel }, 'band review: held — steered by an outsider');
-      return this.hold(BAND_RULES.steered, 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.');
+      const steered = this.hold(BAND_RULES.steered, 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.');
+      // Both reasons hold it, so the approval shows both (#2333).
+      return speaksBelow80 && steered.kind === 'hold'
+        ? { ...steered, findings: [...steered.findings, { rule: BAND_RULES.speaksAsPrincipal, detail: SPEAKS_BELOW_80_REASON }] }
+        : steered;
     }
-    if (verdict.speaksAsPrincipal === true && !isSpotCheckOrAbove(input.score)) {
+    if (speaksBelow80) {
       this.deps.logger.info({ conversationId: input.conversationId, channel: input.channel, score: input.score }, 'band review: held — speaks for the principal below 80');
-      return this.hold(BAND_RULES.speaksAsPrincipal, 'Held for the principal: this message speaks for or commits the principal, and the autonomy band asks first for that.');
+      return this.hold(BAND_RULES.speaksAsPrincipal, SPEAKS_BELOW_80_REASON);
     }
 
     const claims = verdict.unsupportedClaims ?? [];
@@ -681,9 +687,14 @@ function withHeldBeside(bounce: BandReviewDecision, hold: BandReviewDecision): B
   return { ...bounce, heldBeside: [...(bounce.heldBeside ?? []), ...hold.findings] };
 }
 
-/** A hold raised only because the send is steered by an outsider, with no ask (#2333). */
+/**
+ * A hold raised because the send is steered by an outsider, with no ask (#2333). It may also
+ * speak for the principal below 80: steering is what would hand the details to an outsider.
+ */
 function steeredOnly(d: BandReviewDecision): boolean {
-  return d.kind === 'hold' && !d.ask && d.findings.length > 0 && d.findings.every((f) => f.rule === BAND_RULES.steered);
+  return d.kind === 'hold' && !d.ask
+    && d.findings.some((f) => f.rule === BAND_RULES.steered)
+    && d.findings.every((f) => f.rule === BAND_RULES.steered || f.rule === BAND_RULES.speaksAsPrincipal);
 }
 
 /** Who directed the work behind a send: the principal's own turn, the principal's task, or nobody. */
@@ -695,10 +706,11 @@ type Authority = 'principal' | 'principal-task' | 'none';
  *
  * Two exceptions. A bounce beats an ask (#2312): the ask waits only on the principal's yes, and
  * a yes would send the other finding too; the drafter fixes that first, and the recheck asks.
- * A bounce over personal details beats a hold that is only for steering (#2333): that approval
- * would show the details as sent if approved, to an outsider steering the send. The drafter
- * rewrites without them, and a recheck that is still steered holds without them. The bounce
- * carries the steering findings (`heldBeside`), so a saved draft the gateway holds still shows them.
+ * A bounce over personal details beats a hold for steering (#2333), alone or beside speaking for
+ * the principal below 80: that approval would show the details as sent if approved, to an
+ * outsider steering the send. The drafter rewrites without them, and a recheck that is still
+ * steered holds without them. The bounce carries the hold's findings (`heldBeside`), so a saved
+ * draft the gateway holds still shows them.
  *
  * Two holds merge into a plain hold, except that an ask survives a hold for speaking as the
  * principal below 80 (#2312): the principal is asked first either way, and the question names

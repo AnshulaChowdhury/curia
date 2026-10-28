@@ -466,6 +466,14 @@ function relayNoticeRequest(request: OutboundSendRequest, text: string, subject:
  *     detail. This preserves the existing "no sensitive content in the notification"
  *     invariant for the deterministic stage.
  */
+/**
+ * The reasons of a hold a personal-details bounce outranked (#2333), as sentences to append to a
+ * saved draft's hold or refusal, which has no rewrite to make them moot. Rule details only.
+ */
+function heldBesideNote(heldBeside: readonly FilterFinding[] | undefined): string {
+  return (heldBeside ?? []).map((f) => ` ${f.detail.replace(/^Held for the principal: /, 'Also, ')}`).join('');
+}
+
 function buildBlockReasonSummary(findings: Array<{ rule: string; detail: string }>): string {
   if (findings.length === 0) return 'Content filter (no rule detail available)';
   return findings
@@ -2260,16 +2268,18 @@ export class OutboundGateway {
     if (args.editable === false && decision.kind === 'bounce' && decision.strangerRequest) {
       const { requester, labels } = decision.strangerRequest;
       const details = describePiiLabels(labels);
+      // A steering hold the bounce outranked is still said (#2333).
+      const beside = heldBesideNote(decision.heldBeside);
       await this.queueBlockReport(
-        `${normalizeCounterparty(requester)} asked for your ${details}. Curia didn't send the saved draft that shared it.`,
+        `${normalizeCounterparty(requester)} asked for your ${details}. Curia didn't send the saved draft that shared it.${beside}`,
         options?.conversationId ?? undefined,
         options?.taskEventId ?? options?.parentEventId ?? 'system',
       );
       return {
         result: {
           success: false,
-          blockedReason: `Not sent: this saved draft shares the principal's ${details} with someone who asked for it, and nothing authorizes that. Save a version without them, or tell the principal.`,
-          blockedRules: decision.findings.map((f) => f.rule),
+          blockedReason: `Not sent: this saved draft shares the principal's ${details} with someone who asked for it, and nothing authorizes that. Save a version without them, or tell the principal.${beside}`,
+          blockedRules: [...new Set([...decision.findings, ...(decision.heldBeside ?? [])].map((f) => f.rule))],
         },
       };
     }
@@ -2281,7 +2291,7 @@ export class OutboundGateway {
       // A steering hold the bounce outranked comes along (#2333): the principal sees its warning.
       const findings = [...decision.findings, ...(decision.heldBeside ?? [])];
       const rules = [...new Set(findings.map((f) => f.rule))].join(', ');
-      const beside = (decision.heldBeside ?? []).map((f) => ` ${f.detail.replace(/^Held for the principal: /, 'Also, ')}`).join('');
+      const beside = heldBesideNote(decision.heldBeside);
       decision = {
         kind: 'hold',
         reason: `Held for the principal: a saved draft can't be rewritten in place, and the review found these problems (${rules}).${beside}`,
