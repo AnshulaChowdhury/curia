@@ -2801,3 +2801,42 @@ describe('VoiceRuntime turn-taking: hold, join, coalesce (#2240)', () => {
     expect(llm.seenMessages).toHaveLength(0);
   });
 });
+
+describe('VoiceRuntime first-token turn kind (#2271)', () => {
+  // Greetings also log round 0, so ADR-038's user-turn gate needs turnKind to
+  // leave them out: they send no tools and are the call's cold first request.
+  it('tags the greeting and user-turn first-token lines with turnKind', async () => {
+    const info = vi.fn();
+    const spyLogger: Logger = {
+      debug: vi.fn(),
+      info,
+      warn: vi.fn(),
+      error: vi.fn(),
+      fatal: vi.fn(),
+      trace: vi.fn(),
+      child: () => spyLogger,
+    } as unknown as Logger;
+    const llm = new FakeStreamProvider([replyScript('Hello there.'), replyScript('Sure thing.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), logger: spyLogger });
+
+    await runtime.startSession({
+      sessionId: 'turn-kind',
+      conversationId: 'voice:turn-kind',
+      roomName: 'voice-turn-kind',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: true,
+    });
+    await runtime.awaitIdle('turn-kind');
+
+    stt.emit({ text: 'what is on today', isFinal: true, speechFinal: true, confidence: 0.95 });
+    await vi.waitFor(() => {
+      expect(info.mock.calls.filter(([, msg]) => msg === 'voice llm first token')).toHaveLength(2);
+    });
+
+    const kinds = info.mock.calls
+      .filter(([, msg]) => msg === 'voice llm first token')
+      .map(([fields]) => (fields as { turnKind?: string }).turnKind);
+    expect(kinds).toEqual(['greeting', 'user']);
+  });
+});

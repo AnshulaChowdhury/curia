@@ -111,6 +111,11 @@ export interface VoiceTurnRunnerConfig {
   provider: LLMProvider;
   model: string;
   logger: Logger;
+  /**
+   * Logged on the first-token line. Greetings also open at round 0, so ADR-038's
+   * user-turn gate filters on this to leave them out (#2271).
+   */
+  turnKind?: 'greeting' | 'user';
   /** Optional tools available for this turn. */
   tools?: ToolDefinition[];
   /**
@@ -211,7 +216,13 @@ export class VoiceTurnRunner {
             ttftLogged = true;
             // info, not debug: this is how prod checks ADR-038's first-speech budget (#2245).
             this.log.info(
-              { streamId, model: this.config.model, llm_ttft_ms: Date.now() - turnStartedAt, round: currentRound },
+              {
+                streamId,
+                model: this.config.model,
+                turnKind: this.config.turnKind,
+                llm_ttft_ms: Date.now() - turnStartedAt,
+                round: currentRound,
+              },
               'voice llm first token',
             );
           }
