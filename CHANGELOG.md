@@ -184,6 +184,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **fastify** — bumped to 5.12.6, clearing a LOW advisory (CVE-2026-107832).
 - **sanitize-html** — bumped to 2.18.1, clearing a MEDIUM advisory (CVE-2026-113650).
 - **markdown-it** — bumped to 15.0.3, clearing a HIGH and a LOW advisory (CVE-2026-111758, CVE-2026-111766).
+- **`qs` floor** — raised to `>=6.16.2`, clearing an upstream-only LOW advisory on the resolved 6.16.1. (#2335)
 - **`body-parser` floor** — raised to `>=2.4.0`, clearing an upstream-only HIGH DoS on resolved 2.3.0. (#2260)
 - **`fast-uri` floor** — raised to `>=4.2.3`, clearing four upstream-only advisories on the resolved 4.2.1. (#2216)
 - **Archive extraction** — bombs, zip-slip, encryption and nested archives fail closed. (#2208)
