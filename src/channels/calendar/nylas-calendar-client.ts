@@ -8,6 +8,7 @@
 // any other provider connected through Nylas.
 
 import NylasDefault from 'nylas';
+import type { DestroyEventQueryParams } from 'nylas';
 import type { Logger } from '../../logger.js';
 import { ATTENDEE_RSVP_STATUS_KEYS } from './attendee-input.js';
 import type { CalendarAttendeeInput } from './attendee-input.js';
@@ -75,7 +76,7 @@ export interface NylasCalendarLike {
     destroy(params: {
       identifier: string;
       eventId: string;
-      queryParams?: Record<string, unknown>;
+      queryParams?: DestroyEventQueryParams;
     }): Promise<void>;
   };
 
@@ -524,14 +525,21 @@ export class NylasCalendarClient {
     }
   }
 
-  /** Delete an event. Pass notifyAttendees=false to suppress Nylas cancellation emails. */
+  /**
+   * Delete an event. Pass notifyAttendees=false to suppress cancellation emails.
+   *
+   * Maps to Nylas `notifyParticipants` (the SDK snake-cases it to
+   * `notify_participants`). Default (omit) notifies attendees. Only `false`
+   * sets the flag — `notify_event_creator` is not a v3 delete parameter and
+   * Nylas rejects the request.
+   */
   async deleteEvent(calendarId: string, eventId: string, notifyAttendees?: boolean): Promise<void> {
     this.log.debug({ calendarId, eventId, notifyAttendees }, 'Deleting event');
     try {
-      const queryParams: Record<string, unknown> = { calendar_id: calendarId };
+      const queryParams: DestroyEventQueryParams = { calendarId };
       // Nylas sends cancellation emails by default; only override when explicitly suppressed.
       if (notifyAttendees === false) {
-        queryParams.notify_event_creator = false;
+        queryParams.notifyParticipants = false;
       }
       await this.nylas.events.destroy({
         identifier: this.grantId,

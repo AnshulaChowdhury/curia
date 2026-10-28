@@ -541,14 +541,47 @@ describe('NylasCalendarClient', () => {
   });
 
   describe('deleteEvent', () => {
-    it('calls SDK events.destroy with eventId', async () => {
+    function destroyQueryParams(): Record<string, unknown> {
+      const call = (sdk.events.destroy as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
+        queryParams: Record<string, unknown>;
+      };
+      return call.queryParams;
+    }
+
+    it('omits notifyParticipants when notifyAttendees is omitted', async () => {
       await client.deleteEvent('cal-1', 'evt-1');
 
       expect(sdk.events.destroy).toHaveBeenCalledWith({
         identifier: 'grant-123',
         eventId: 'evt-1',
-        queryParams: { calendar_id: 'cal-1' },
+        queryParams: { calendarId: 'cal-1' },
       });
+      expect(destroyQueryParams()).not.toHaveProperty('notify_event_creator');
+    });
+
+    it('sets notifyParticipants false and never notify_event_creator when notifyAttendees is false', async () => {
+      await client.deleteEvent('cal-1', 'evt-1', false);
+
+      // The SDK snake-cases notifyParticipants to notify_participants on the wire.
+      expect(sdk.events.destroy).toHaveBeenCalledWith({
+        identifier: 'grant-123',
+        eventId: 'evt-1',
+        queryParams: { calendarId: 'cal-1', notifyParticipants: false },
+      });
+      const queryParams = destroyQueryParams();
+      expect(queryParams).not.toHaveProperty('notify_event_creator');
+      expect(queryParams).not.toHaveProperty('notifyEventCreator');
+    });
+
+    it('omits notifyParticipants when notifyAttendees is true', async () => {
+      await client.deleteEvent('cal-1', 'evt-1', true);
+
+      expect(sdk.events.destroy).toHaveBeenCalledWith({
+        identifier: 'grant-123',
+        eventId: 'evt-1',
+        queryParams: { calendarId: 'cal-1' },
+      });
+      expect(destroyQueryParams()).not.toHaveProperty('notify_event_creator');
     });
   });
 

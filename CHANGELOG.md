@@ -201,6 +201,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **task-create** — optional id inputs say to omit the field when there is none. (#2328)
 - **task-update** — string placeholder blockers are rejected; JSON null still clears one. (#2328)
 - **task-update** — a task cannot list itself as its blocker. (#2328)
+- **`calendar-delete-event`** — silent deletes pass `notifyParticipants` so Nylas accepts them. (#2329)
 - **Scenario follow-up** — the harness scans inbound text, so a clean follow-up can join. (#2018)
 - **Scenario follow-up** — sends a correction on the first tool call, or at the exit hook. (#2018)
 - **Scenario follow-up** — a turn-start drain fails the run, and the point is recorded. (#2018)
