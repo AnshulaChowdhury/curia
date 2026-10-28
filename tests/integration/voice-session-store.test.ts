@@ -4,7 +4,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
-import { VoiceSessionStore } from '../../src/channels/voice/session-store.js';
+import { VoiceSessionStore, sessionAgendaLoads } from '../../src/channels/voice/session-store.js';
+import type { AgendaSnapshot, SessionAgendaLoad } from '../../src/meetings/types.js';
 
 const { Pool } = pg;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -119,6 +120,109 @@ describeIf('VoiceSessionStore (integration)', () => {
     expect(names).not.toContain('voice_sessions_principal_contact_id_fkey');
     const fk = rows.find((row) => row.conname === 'voice_sessions_caller_contact_id_fkey');
     expect(fk?.confdeltype).toBe('n');
+  });
+
+  function snapshot(agendaId: string): AgendaSnapshot {
+    return {
+      agendaId,
+      title: 'Q3 review',
+      topics: ['Pipeline'],
+      role: 'Be brief.',
+      context: 'Board wants a status.',
+      source: 'principal',
+      sensitivity: 'internal',
+      scheduledFor: null,
+      history: [],
+    };
+  }
+
+  function load(agendaId: string, loadedAt: string): SessionAgendaLoad {
+    return { agendaId, loadedAt, snapshot: snapshot(agendaId) };
+  }
+
+  it('appendAgendaLoad appends in order and preserves other metadata keys', async () => {
+    const created = await store.create({
+      conversationId: `${PREFIX}agendas`,
+      livekitRoom: 'room-agendas',
+      metadata: { channel: 'signal', agendas: [] },
+    });
+    const first = load('11111111-1111-4111-8111-111111111111', '2026-10-28T16:00:00.000Z');
+    const second = load('22222222-2222-4222-8222-222222222222', '2026-10-28T16:05:00.000Z');
+    await store.appendAgendaLoad(created.id, first);
+    await store.appendAgendaLoad(created.id, second);
+    const fetched = await store.get(created.id);
+    expect(fetched?.metadata.channel).toBe('signal');
+    expect(sessionAgendaLoads(fetched!)).toEqual([first, second]);
+  });
+
+  it('listRecentWithAgendas returns ended and failed sessions with agendas only', async () => {
+    const since = new Date(Date.now() - 60_000);
+    const ended = await store.create({
+      conversationId: `${PREFIX}recent-ended`,
+      livekitRoom: 'room-recent-ended',
+    });
+    await store.appendAgendaLoad(ended.id, load('33333333-3333-4333-8333-333333333333', since.toISOString()));
+    await store.endSession(ended.id, 'remote_hangup');
+
+    const failed = await store.create({
+      conversationId: `${PREFIX}recent-failed`,
+      livekitRoom: 'room-recent-failed',
+    });
+    await store.appendAgendaLoad(failed.id, load('44444444-4444-4444-8444-444444444444', since.toISOString()));
+    await pool.query(
+      `UPDATE voice_sessions SET status = 'failed', end_reason = 'process_restart', ended_at = NOW() WHERE id = $1`,
+      [failed.id],
+    );
+
+    const active = await store.create({
+      conversationId: `${PREFIX}recent-active`,
+      livekitRoom: 'room-recent-active',
+    });
+    await store.appendAgendaLoad(active.id, load('55555555-5555-4555-8555-555555555555', since.toISOString()));
+    await store.updateStatus(active.id, 'active');
+
+    const bare = await store.create({
+      conversationId: `${PREFIX}recent-bare`,
+      livekitRoom: 'room-recent-bare',
+    });
+    await store.endSession(bare.id, 'remote_hangup');
+
+    const old = await store.create({
+      conversationId: `${PREFIX}recent-old`,
+      livekitRoom: 'room-recent-old',
+    });
+    await store.appendAgendaLoad(old.id, load('66666666-6666-4666-8666-666666666666', since.toISOString()));
+    await store.endSession(old.id, 'remote_hangup');
+    await pool.query(
+      `UPDATE voice_sessions SET started_at = NOW() - INTERVAL '8 days' WHERE id = $1`,
+      [old.id],
+    );
+
+    const listed = await store.listRecentWithAgendas(since);
+    const ids = listed.map((row) => row.id);
+    expect(ids).toContain(ended.id);
+    expect(ids).toContain(failed.id);
+    expect(ids).not.toContain(active.id);
+    expect(ids).not.toContain(bare.id);
+    expect(ids).not.toContain(old.id);
+  });
+
+  it('sessionAgendaLoads ignores malformed entries', async () => {
+    const created = await store.create({
+      conversationId: `${PREFIX}malformed`,
+      livekitRoom: 'room-malformed',
+      metadata: {
+        agendas: [
+          { agendaId: 'not-a-snapshot' },
+          { agendaId: '77777777-7777-4777-8777-777777777777', loadedAt: '2026-10-28T16:00:00.000Z', snapshot: { title: 'missing fields' } },
+          load('88888888-8888-4888-8888-888888888888', '2026-10-28T16:01:00.000Z'),
+        ],
+      },
+    });
+    const fetched = await store.get(created.id);
+    const loads = sessionAgendaLoads(fetched!);
+    expect(loads).toHaveLength(1);
+    expect(loads[0]?.agendaId).toBe('88888888-8888-4888-8888-888888888888');
   });
 
   it('re-applying the up migration is a no-op', async () => {

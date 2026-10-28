@@ -21,6 +21,7 @@ import {
   validateWritePath,
 } from '../../../_shared/doc-workspace.js';
 import { isUuid } from '../../../../src/util/uuid.js';
+import { isDurableDocPath } from '../../../../src/memory/durable-doc-prefixes.js';
 
 const VALID_MODES = new Set(['create', 'append', 'replace', 'section-edit']);
 
@@ -33,8 +34,11 @@ const VALID_MODES = new Set(['create', 'append', 'replace', 'section-edit']);
  */
 async function resolveAssociatedRootTaskId(
   ctx: ToolContext,
-  inputTaskId?: string,
-): Promise<{ ok: true; taskId: string | undefined } | { ok: false; error: string }> {
+  inputTaskId: string | undefined,
+  docPath: string,
+): Promise<{ ok: true; taskId: string | null | undefined } | { ok: false; error: string }> {
+  // #2322 / #2338: durable prefixes are never task-owned.
+  if (isDurableDocPath(docPath)) return { ok: true, taskId: null };
   let candidate: string | undefined;
   if (typeof inputTaskId === 'string' && inputTaskId.trim()) {
     candidate = inputTaskId.trim();
@@ -101,11 +105,13 @@ export class DocWriteHandler implements ToolHandler {
     try {
       // Root / legacy occupancy lookups live inside try so bad task_id or transient
       // DB errors return { success: false } instead of throwing (#1819 review).
-      const associated = await resolveAssociatedRootTaskId(ctx, input.task_id);
+      const associated = await resolveAssociatedRootTaskId(ctx, input.task_id, normalized);
       if (!associated.ok) {
         return { success: false, error: associated.error };
       }
       const associatedTaskId = associated.taskId;
+      // Helpers take `string | undefined`. Durable paths use explicit null on create.
+      const logTaskId = associatedTaskId ?? undefined;
 
       if (input.mode === 'create') {
         const segment = projectSlugFromPath(input.path);
@@ -114,7 +120,7 @@ export class DocWriteHandler implements ToolHandler {
           legacyFolderOccupied = await ctx.workingDocs!.projectPrefixHasLiveDocs(segment);
         }
         const projectsError = validateProjectsWritePath(input.path, {
-          boundRootTaskId: associatedTaskId,
+          boundRootTaskId: logTaskId,
           legacyFolderOccupied,
         });
         if (projectsError) {
@@ -143,7 +149,7 @@ export class DocWriteHandler implements ToolHandler {
             conversationId: input.conversation_id ?? ctx.conversationId ?? undefined,
             agentId: ctx.agentId ?? undefined,
           });
-          await appendDirectoryLog(ctx, normalized, 'create', summary, associatedTaskId);
+          await appendDirectoryLog(ctx, normalized, 'create', summary, logTaskId);
           return {
             success: true,
             data: {
@@ -172,7 +178,7 @@ export class DocWriteHandler implements ToolHandler {
           if (!result.ok) {
             return { success: true, data: mapWriteConflict(result, timezone) };
           }
-          await appendDirectoryLog(ctx, normalized, 'append', summary, associatedTaskId);
+          await appendDirectoryLog(ctx, normalized, 'append', summary, logTaskId);
           return {
             success: true,
             data: { action: 'appended', document: mapDocumentRow(result.document, timezone) },
@@ -199,7 +205,7 @@ export class DocWriteHandler implements ToolHandler {
           if (!result.ok) {
             return { success: true, data: mapWriteConflict(result, timezone) };
           }
-          await appendDirectoryLog(ctx, normalized, 'replace', summary, associatedTaskId);
+          await appendDirectoryLog(ctx, normalized, 'replace', summary, logTaskId);
           return {
             success: true,
             data: {
@@ -235,7 +241,7 @@ export class DocWriteHandler implements ToolHandler {
             normalized,
             'section-edit',
             `${summary} (${input.section.trim()})`,
-            associatedTaskId,
+            logTaskId,
           );
           return {
             success: true,

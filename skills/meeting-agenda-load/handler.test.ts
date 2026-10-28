@@ -1,0 +1,139 @@
+import { describe, expect, it } from 'vitest';
+import pino from 'pino';
+import { MeetingAgendaLoadHandler } from './handler.js';
+import { AgendaStore } from '../../src/meetings/agenda-store.js';
+import type { ToolContext } from '../../src/skills/types.js';
+import type { WorkingDocRow, WorkingDocsRepo } from '../../src/db/working-docs-repo.js';
+
+const silentLog = pino({ level: 'silent' });
+const NOW = new Date();
+
+function ctx(input: Record<string, unknown>, repo: WorkingDocsRepo | undefined, voiceSessionId?: string): ToolContext {
+  return {
+    input,
+    log: silentLog,
+    agentId: 'coordinator',
+    workingDocs: repo,
+    taskMetadata: voiceSessionId ? { voiceSessionId } : undefined,
+  } as unknown as ToolContext;
+}
+
+async function parkedRepo(overrides: { status?: string; expiresAt?: string } = {}): Promise<{
+  repo: WorkingDocsRepo;
+  agendaId: string;
+}> {
+  const docs = new Map<string, WorkingDocRow>();
+  const backing = {
+    async create(params: {
+      path: string;
+      type: string;
+      frontmatter?: Record<string, unknown>;
+      body?: string;
+      taskId?: string | null;
+    }): Promise<WorkingDocRow> {
+      const row: WorkingDocRow = {
+        id: 'doc-1',
+        path: params.path,
+        type: params.type,
+        frontmatter: params.frontmatter ?? {},
+        body: params.body ?? '',
+        version: 1,
+        sectionVersions: {},
+        byteSize: 1,
+        taskId: null,
+        conversationId: null,
+        agentId: null,
+        createdAt: NOW.toISOString(),
+        updatedAt: NOW.toISOString(),
+        archivedAt: null,
+      };
+      docs.set(params.path, row);
+      return row;
+    },
+    async read(path: string): Promise<WorkingDocRow | null> {
+      return docs.get(path) ?? null;
+    },
+    async update(path: string, params: { frontmatter?: Record<string, unknown>; expectedVersion: number }): Promise<
+      { ok: true; document: WorkingDocRow } | { ok: false; conflict: true; document: WorkingDocRow }
+    > {
+      const current = docs.get(path);
+      if (!current) throw new Error('missing');
+      if (current.version !== params.expectedVersion) {
+        return { ok: false, conflict: true, document: current };
+      }
+      const next: WorkingDocRow = {
+        ...current,
+        frontmatter: params.frontmatter ?? current.frontmatter,
+        version: current.version + 1,
+      };
+      docs.set(path, next);
+      return { ok: true, document: next };
+    },
+  };
+  const store = new AgendaStore(backing as unknown as WorkingDocsRepo, silentLog);
+  const parked = await store.park({
+    title: 'Q3 review',
+    topics: ['Pipeline'],
+    context: 'Board wants a status.',
+    source: 'principal',
+    sensitivity: 'internal',
+    expiresAt: new Date(NOW.getTime() + 7 * 24 * 60 * 60 * 1000),
+    role: 'Be brief.',
+    scheduledFor: null,
+  }, NOW);
+  if (overrides.status || overrides.expiresAt) {
+    const row = docs.get(parked.path)!;
+    row.frontmatter = {
+      ...row.frontmatter,
+      ...(overrides.status ? { status: overrides.status } : {}),
+      ...(overrides.expiresAt ? { expires_at: overrides.expiresAt } : {}),
+    };
+  }
+  return { repo: backing as unknown as WorkingDocsRepo, agendaId: parked.agendaId };
+}
+
+describe('meeting-agenda-load', () => {
+  it('locks the agenda for the voice session and returns its snapshot', async () => {
+    const { repo, agendaId } = await parkedRepo();
+    const result = await new MeetingAgendaLoadHandler().execute(ctx(
+      { agenda_id: agendaId },
+      repo,
+      'session-1',
+    ));
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const data = result.data as { agenda: { agendaId: string; title: string; history: unknown[]; context: string } };
+    expect(data.agenda.agendaId).toBe(agendaId);
+    expect(data.agenda.title).toBe('Q3 review');
+    expect(data.agenda.context).toBe('Board wants a status.');
+    expect(data.agenda.history).toEqual([]);
+  });
+
+  it('rejects outside a voice session', async () => {
+    const { repo, agendaId } = await parkedRepo();
+    const result = await new MeetingAgendaLoadHandler().execute(ctx({ agenda_id: agendaId }, repo));
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error).toBe('meeting-agenda-load is only available on a live voice call');
+  });
+
+  it('maps not_pending and expired to spoken-friendly errors', async () => {
+    const held = await parkedRepo({ status: 'in_call' });
+    const heldResult = await new MeetingAgendaLoadHandler().execute(ctx(
+      { agenda_id: held.agendaId },
+      held.repo,
+      'session-1',
+    ));
+    expect(heldResult.success).toBe(false);
+    if (!heldResult.success) expect(heldResult.error).toBe('That agenda is not available to load.');
+
+    const expired = await parkedRepo({ expiresAt: new Date(NOW.getTime() - 1000).toISOString() });
+    const expiredResult = await new MeetingAgendaLoadHandler().execute(ctx(
+      { agenda_id: expired.agendaId },
+      expired.repo,
+      'session-1',
+    ));
+    expect(expiredResult.success).toBe(false);
+    if (!expiredResult.success) expect(expiredResult.error).toBe('That agenda has expired.');
+  });
+});

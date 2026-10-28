@@ -1201,6 +1201,37 @@ describe('VoiceRuntime outbound-context bridge (#1594)', () => {
     return real;
   }
 
+  it('buildVoiceSystemPrompt output is byte-identical when agendaBlock is absent or null', () => {
+    const baseline = buildVoiceSystemPrompt({
+      audience: { liveTurn: true },
+      timeContextBlock: '## Current Date & Time\nTimezone: America/Toronto',
+    });
+    expect(buildVoiceSystemPrompt({
+      audience: { liveTurn: true },
+      timeContextBlock: '## Current Date & Time\nTimezone: America/Toronto',
+      agendaBlock: null,
+    })).toBe(baseline);
+    expect(buildVoiceSystemPrompt({
+      audience: { liveTurn: true },
+      timeContextBlock: '## Current Date & Time\nTimezone: America/Toronto',
+    })).toBe(baseline);
+  });
+
+  it('buildVoiceSystemPrompt puts agendaBlock immediately before the time block', () => {
+    const prompt = buildVoiceSystemPrompt({
+      outboundContextBlock: '[ACTIVE OUTBOUND CONTEXT]\nnote',
+      agendaBlock: '## Meeting agendas\nQ3 review',
+      timeContextBlock: '## Current Date & Time\nTimezone: America/Toronto',
+      audience: { liveTurn: true },
+    });
+    const outboundAt = prompt.indexOf('[ACTIVE OUTBOUND CONTEXT');
+    const agendaAt = prompt.indexOf('## Meeting agendas');
+    const timeAt = prompt.indexOf('## Current Date & Time');
+    expect(outboundAt).toBeGreaterThanOrEqual(0);
+    expect(agendaAt).toBeGreaterThan(outboundAt);
+    expect(timeAt).toBeGreaterThan(agendaAt);
+  });
+
   it('buildVoiceSystemPrompt appends a real formatInjectionBlock before the time block', () => {
     const real = new OutboundContextService(
       { query: async () => ({ rows: [] }) } as never,
@@ -2838,5 +2869,136 @@ describe('VoiceRuntime first-token turn kind (#2271)', () => {
       .filter(([, msg]) => msg === 'voice llm first token')
       .map(([fields]) => (fields as { turnKind?: string }).turnKind);
     expect(kinds).toEqual(['greeting', 'user']);
+  });
+});
+
+describe('VoiceRuntime agendas (#2322)', () => {
+  const agenda = {
+    agendaId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    title: 'Q3 review',
+    topics: ['Pipeline'],
+    role: null,
+    context: 'Board wants a status.',
+    source: 'principal' as const,
+    sensitivity: 'internal' as const,
+    scheduledFor: null,
+    history: [],
+  };
+
+  function systemText(messages: Message[]): string {
+    return messages
+      .filter((message) => message.role === 'system' && typeof message.content === 'string')
+      .map((message) => message.content as string)
+      .join('\n');
+  }
+
+  function storeWithAppend() {
+    const base = fakeStore();
+    const appendAgendaLoad = vi.fn(async () => undefined);
+    const store = Object.assign(base.store, { appendAgendaLoad });
+    return { store, appendAgendaLoad };
+  }
+
+  it('preloaded agenda appears in every turn\'s system prompt', async () => {
+    const llm = new FakeStreamProvider([
+      replyScript('Hello.'),
+      replyScript('Still here.'),
+    ]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(1, 1) });
+    await runtime.startSession({
+      sessionId: 's-preload',
+      conversationId: 'voice:s-preload',
+      roomName: 'voice-s-preload',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+      agendas: { loaded: [agenda], index: [] },
+    });
+    stt.emit({ text: 'let us start', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-preload');
+    stt.emit({ text: 'next', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-preload');
+    expect(llm.seenMessages.length).toBeGreaterThanOrEqual(2);
+    for (const messages of llm.seenMessages) {
+      expect(systemText(messages)).toContain('Q3 review');
+      expect(systemText(messages)).toContain('Board wants a status.');
+    }
+  });
+
+  it('a successful meeting-agenda-load result adds the agenda to the next turn\'s prompt and records the load', async () => {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'meeting-agenda-load', input: { agenda_id: agenda.agendaId } }], usage, provenance }],
+      replyScript('Loaded.'),
+      replyScript('Continuing.'),
+    ]);
+    const { store, appendAgendaLoad } = storeWithAppend();
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(1, 1),
+      store,
+      invokeTool: async () => ({ content: JSON.stringify({ agenda }) }),
+    });
+    await runtime.startSession({
+      sessionId: 's-load',
+      conversationId: 'voice:s-load',
+      roomName: 'voice-s-load',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+      agendas: {
+        loaded: [],
+        index: [{ agendaId: agenda.agendaId, title: agenda.title, scheduledFor: null }],
+      },
+    });
+    stt.emit({ text: 'use the q3 agenda', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-load');
+    stt.emit({ text: 'go on', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-load');
+
+    const first = systemText(llm.seenMessages[0] ?? []);
+    expect(first).toContain(agenda.agendaId);
+    expect(first).toContain('Ask the caller if you are unsure');
+    expect(first).not.toContain('Board wants a status.');
+
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).toContain('Board wants a status.');
+    expect(last).not.toContain('Ask the caller if you are unsure');
+    expect(appendAgendaLoad).toHaveBeenCalledOnce();
+  });
+
+  it('a failed meeting-agenda-load leaves prompt and store untouched', async () => {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'meeting-agenda-load', input: { agenda_id: agenda.agendaId } }], usage, provenance }],
+      replyScript('Cannot.'),
+      replyScript('Still queued.'),
+    ]);
+    const { store, appendAgendaLoad } = storeWithAppend();
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(1, 1),
+      store,
+      invokeTool: async () => ({ content: 'That agenda has expired.', is_error: true }),
+    });
+    await runtime.startSession({
+      sessionId: 's-load-fail',
+      conversationId: 'voice:s-load-fail',
+      roomName: 'voice-s-load-fail',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+      agendas: {
+        loaded: [],
+        index: [{ agendaId: agenda.agendaId, title: agenda.title, scheduledFor: null }],
+      },
+    });
+    stt.emit({ text: 'use the q3 agenda', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-load-fail');
+    stt.emit({ text: 'go on', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-load-fail');
+
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).toContain('Ask the caller if you are unsure');
+    expect(last).not.toContain('Board wants a status.');
+    expect(appendAgendaLoad).not.toHaveBeenCalled();
   });
 });

@@ -22,6 +22,19 @@ import {
 
 export type { AddTurnAttribution, ContactRecentHistoryQuery, ContactRecentTurn };
 
+/**
+ * One stored working-memory row for a meeting transcript (#2322).
+ * Kept on this module so the memory layer does not import meetings.
+ */
+export interface TranscriptSourceRow {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  createdAt: Date;
+  senderContactId: string | null;
+  synthetic: boolean;
+  archived: boolean;
+}
+
 export interface ConversationTurn {
   role: 'user' | 'assistant' | 'system';
   content: string;
@@ -95,6 +108,11 @@ interface StorageBackend {
   getPersonTurns(conversationId: string, agentId: string): Promise<string[]>;
   /** Delete all turns whose expires_at is in the past. Returns the number of rows deleted. */
   purgeExpired(): Promise<number>;
+  /**
+   * Every stored row for a transcript, archived included, ordered by
+   * created_at then id. Does not rewrite llm-failure markers (#2322).
+   */
+  getTranscriptRows(conversationId: string, agentId: string): Promise<TranscriptSourceRow[]>;
   /**
    * Wait for in-flight background summarization. Resolves when every pass
    * that was queued at the call has settled, or when `timeoutMs` elapses.
@@ -198,6 +216,14 @@ export class WorkingMemory {
   /** Delete all turns whose expires_at is in the past. Called by DreamEngine nightly. */
   async purgeExpired(): Promise<number> {
     return this.backend.purgeExpired();
+  }
+
+  /**
+   * Raw rows for a meeting transcript. Archived, system, and synthetic rows
+   * are included; llm-failure markers are left as stored (#2322).
+   */
+  async getTranscriptRows(conversationId: string, agentId: string): Promise<TranscriptSourceRow[]> {
+    return this.backend.getTranscriptRows(conversationId, agentId);
   }
 
   /**
@@ -502,6 +528,36 @@ class PostgresBackend implements StorageBackend {
         'working_memory: summarization drain timed out before in-flight passes finished',
       );
     }
+  }
+
+  async getTranscriptRows(conversationId: string, agentId: string): Promise<TranscriptSourceRow[]> {
+    const result = await this.pool.query<{
+      role: string;
+      content: string;
+      created_at: Date;
+      sender_contact_id: string | null;
+      synthetic: boolean;
+      archived: boolean;
+    }>(
+      `SELECT role, content, created_at, sender_contact_id, synthetic, archived
+         FROM working_memory
+        WHERE conversation_id = $1 AND agent_id = $2
+        ORDER BY created_at, id`,
+      [conversationId, agentId],
+    );
+    const rows: TranscriptSourceRow[] = [];
+    for (const row of result.rows) {
+      if (row.role !== 'user' && row.role !== 'assistant' && row.role !== 'system') continue;
+      rows.push({
+        role: row.role,
+        content: row.content,
+        createdAt: row.created_at,
+        senderContactId: row.sender_contact_id,
+        synthetic: row.synthetic,
+        archived: row.archived,
+      });
+    }
+    return rows;
   }
 
   async getPersonTurns(conversationId: string, agentId: string): Promise<string[]> {
@@ -989,6 +1045,20 @@ class InMemoryBackend implements StorageBackend {
       .reverse()
       .slice(0, PERSON_TURNS_LIMIT)
       .map((row) => row.content);
+  }
+
+  async getTranscriptRows(conversationId: string, agentId: string): Promise<TranscriptSourceRow[]> {
+    const turns = this.store.get(this.key(conversationId, agentId)) ?? [];
+    return [...turns]
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.seq - b.seq)
+      .map((row) => ({
+        role: row.role,
+        content: row.content,
+        createdAt: row.createdAt,
+        senderContactId: row.senderContactId,
+        synthetic: row.synthetic,
+        archived: row.archived,
+      }));
   }
 
   async purgeExpired(): Promise<number> {

@@ -13,6 +13,7 @@ import {
   normalizeDocPath,
   type ExtractedLink,
 } from '../memory/okf.js';
+import { DURABLE_DOC_PREFIXES } from '../memory/durable-doc-prefixes.js';
 
 const DOC_COLUMNS = `
   id, path, type, frontmatter, body, version, section_versions, byte_size,
@@ -68,7 +69,8 @@ export interface CreateWorkingDocParams {
   type: string;
   frontmatter?: Record<string, unknown>;
   body?: string;
-  taskId?: string;
+  /** Explicit `null` leaves the row unowned (durable prefixes, #2322). */
+  taskId?: string | null;
   conversationId?: string;
   agentId?: string;
 }
@@ -629,6 +631,8 @@ export class WorkingDocsRepo {
                   updated_at = now()
             WHERE archived_at IS NULL
               AND path !~ '/log\\.md$'
+              -- #2322 / #2338: durable prefixes are never task-owned.
+              AND NOT (path LIKE ANY($3::text[]))
               AND (
                 task_id = $1::uuid
                 OR path LIKE $2 ESCAPE '\\'
@@ -640,7 +644,11 @@ export class WorkingDocsRepo {
             WHERE source_path IN (SELECT path FROM archived)
          )
          SELECT COUNT(*)::text AS archived_count FROM archived`,
-        [rootTaskId, `${escapeLikePattern(pathPrefix)}%`],
+        [
+          rootTaskId,
+          `${escapeLikePattern(pathPrefix)}%`,
+          DURABLE_DOC_PREFIXES.map((prefix) => `${prefix}%`),
+        ],
       );
 
       await client.query('COMMIT');

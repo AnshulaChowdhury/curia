@@ -27,6 +27,9 @@ export const VOICE_TOOL_NAMES: readonly string[] = [
   'date-resolve',
   // Heavyweight asks leave the call (#1614). Voice-only: not a coordinator pin.
   'async-offramp',
+  // Parked agendas for this call (#2322). Voice-only: locks one agenda and
+  // the runtime renders it into the next turn's prompt.
+  'meeting-agenda-load',
   // The to-do list the principal reads and edits by voice.
   'task-list',
   'task-create',

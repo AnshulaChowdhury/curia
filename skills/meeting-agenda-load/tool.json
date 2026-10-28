@@ -1,0 +1,18 @@
+{
+  "name": "meeting-agenda-load",
+  "description": "Load a parked meeting agenda into this live call. Voice-only. Pass agenda_id from the queued list in the prompt. Returns the agenda, including anything left from earlier calls. Fails if the agenda is expired, finished, or held by another call.",
+  "version": "0.1.0",
+  "sensitivity": "normal",
+  "action_risk": "low",
+  "inputs": {
+    "agenda_id": "string (required — id of a pending agenda from the queued list)"
+  },
+  "outputs": {
+    "agenda": "object (agenda snapshot: agendaId, title, topics, role, context, source, sensitivity, scheduledFor, history)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 15000,
+  "capabilities": ["workingDocs"],
+  "allowed_callers": ["coordinator"]
+}

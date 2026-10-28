@@ -13,6 +13,8 @@ import type { VoiceRuntime } from '../../../../../src/channels/voice/voice-runti
 import type { CreateVoiceSessionInput, VoiceSessionStore } from '../../../../../src/channels/voice/session-store.js';
 import type { SignalAudioTransportOpts } from '../../../../../src/channels/voice/signal/signal-audio-transport.js';
 import { SignalCallBridge } from '../../../../../src/channels/voice/signal/signal-call-bridge.js';
+import type { AgendaStore } from '../../../../../src/meetings/agenda-store.js';
+import type { AgendaDoc } from '../../../../../src/meetings/types.js';
 
 /**
  * Subset of VoiceRuntime.startSession's params relevant to assertions —
@@ -27,6 +29,7 @@ interface FakeStartSessionCall {
   caller: { tier: string; liveTurn: boolean };
   transport: unknown;
   openingGreeting?: boolean;
+  agendas?: { loaded: unknown[]; index: unknown[] };
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +145,7 @@ interface SetupOptions {
   /** Override voiceRuntime.startSession (e.g. hang forever to exercise the setup-window race). */
   startSessionImpl?: (params: FakeStartSessionCall) => Promise<void>;
   logger?: Logger;
+  agendaStore?: AgendaStore;
 }
 
 function setup(opts: SetupOptions = {}) {
@@ -197,6 +201,7 @@ function setup(opts: SetupOptions = {}) {
     maxCallSeconds: opts.maxCallSeconds,
     channelPolicies: opts.channelPolicies ?? {},
     createTransport,
+    ...(opts.agendaStore ? { agendaStore: opts.agendaStore } : {}),
   });
 
   return { bridge, rpc, startSession, endSession, create, publish, transports, createTransport };
@@ -920,5 +925,132 @@ describe('SignalCallBridge', () => {
     const nextCallId = 98n;
     rpc.emit('callEvent', ringingEvent(nextCallId));
     await vi.waitFor(() => expect(rpc.acceptCall).toHaveBeenCalledWith(nextCallId));
+  });
+
+  describe('parked agendas (#2322)', () => {
+    const agendaId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+
+    function parkedAgenda(): AgendaDoc {
+      return {
+        path: `/meetings/agendas/${agendaId}.md`,
+        version: 1,
+        agendaId,
+        title: 'Board prep',
+        topics: ['runway'],
+        role: null,
+        context: 'Cover the runway.',
+        source: 'principal',
+        sensitivity: 'internal',
+        scheduledFor: null,
+        history: [],
+        status: 'pending',
+        expiresAt: '2026-11-04T16:00:00.000Z',
+        inCallSession: null,
+      };
+    }
+
+    function agendaStore(overrides: Partial<Pick<AgendaStore, 'cullExpired' | 'listPending' | 'lock'>> = {}): {
+      store: AgendaStore;
+      cullExpired: ReturnType<typeof vi.fn>;
+      listPending: ReturnType<typeof vi.fn>;
+      lock: ReturnType<typeof vi.fn>;
+    } {
+      const doc = parkedAgenda();
+      const cullExpired = vi.fn(overrides.cullExpired ?? (async () => 0));
+      const listPending = vi.fn(overrides.listPending ?? (async () => [doc]));
+      const lock = vi.fn(overrides.lock ?? (async () => ({ ok: true as const, agenda: doc })));
+      return { store: { cullExpired, listPending, lock } as unknown as AgendaStore, cullExpired, listPending, lock };
+    }
+
+    it('principal call passes prepared agendas to startSession and records the preload in create metadata', async () => {
+      const { store, lock } = agendaStore();
+      const { bridge, rpc, startSession, create } = setup({
+        resolveImpl: async () => resolvedSenderContext({ systemRole: 'principal', tier: 'principal' }),
+        agendaStore: store,
+      });
+      bridge.start();
+      const callId = 2322n;
+
+      rpc.emit('callEvent', ringingEvent(callId));
+      await vi.waitFor(() => expect(rpc.acceptCall).toHaveBeenCalledWith(callId));
+      rpc.emit('callEvent', connectedEvent(callId));
+      await vi.waitFor(() => expect(startSession).toHaveBeenCalledTimes(1));
+
+      expect(lock).toHaveBeenCalledTimes(1);
+      const call = startSession.mock.calls[0]![0];
+      expect(call.agendas?.loaded).toEqual([expect.objectContaining({ agendaId, title: 'Board prep' })]);
+      expect(call.agendas?.index).toEqual([]);
+      expect(create).toHaveBeenCalledWith(expect.objectContaining({
+        metadata: expect.objectContaining({
+          channel: 'signal',
+          agendas: [expect.objectContaining({ agendaId })],
+        }),
+      }));
+    });
+
+    it('non-principal caller gets no agendas', async () => {
+      const { store, cullExpired, listPending, lock } = agendaStore();
+      const { bridge, rpc, startSession, create } = setup({
+        resolveImpl: async () => resolvedSenderContext({ systemRole: null, tier: 'trusted' }),
+        agendaStore: store,
+      });
+      bridge.start();
+      const callId = 2323n;
+
+      rpc.emit('callEvent', ringingEvent(callId));
+      await vi.waitFor(() => expect(rpc.acceptCall).toHaveBeenCalledWith(callId));
+      rpc.emit('callEvent', connectedEvent(callId));
+      await vi.waitFor(() => expect(startSession).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+
+      expect(cullExpired).not.toHaveBeenCalled();
+      expect(listPending).not.toHaveBeenCalled();
+      expect(lock).not.toHaveBeenCalled();
+      expect(startSession.mock.calls[0]![0].agendas).toBeUndefined();
+      expect(create.mock.calls[0]![0].metadata).not.toHaveProperty('agendas');
+    });
+
+    it('bridge without agendaStore behaves exactly as today', async () => {
+      const { bridge, rpc, startSession, create } = setup({
+        resolveImpl: async () => resolvedSenderContext({ systemRole: 'principal', tier: 'principal' }),
+      });
+      bridge.start();
+      const callId = 2324n;
+
+      rpc.emit('callEvent', ringingEvent(callId));
+      await vi.waitFor(() => expect(rpc.acceptCall).toHaveBeenCalledWith(callId));
+      rpc.emit('callEvent', connectedEvent(callId));
+      await vi.waitFor(() => expect(startSession).toHaveBeenCalledTimes(1));
+
+      expect(create.mock.calls[0]![0].metadata).toEqual({
+        channel: 'signal',
+        callerNumber: DEFAULT_NUMBER,
+        callId: callId.toString(),
+        tier: 'principal',
+      });
+      expect(startSession.mock.calls[0]![0].agendas).toBeUndefined();
+    });
+
+    it('agenda preparation failure still starts the call free-form', async () => {
+      const { store } = agendaStore({
+        cullExpired: async () => {
+          throw new Error('db down');
+        },
+      });
+      const { bridge, rpc, startSession, create } = setup({
+        resolveImpl: async () => resolvedSenderContext({ systemRole: 'principal', tier: 'principal' }),
+        agendaStore: store,
+      });
+      bridge.start();
+      const callId = 2325n;
+
+      rpc.emit('callEvent', ringingEvent(callId));
+      await vi.waitFor(() => expect(rpc.acceptCall).toHaveBeenCalledWith(callId));
+      rpc.emit('callEvent', connectedEvent(callId));
+      await vi.waitFor(() => expect(startSession).toHaveBeenCalledTimes(1));
+
+      expect(startSession.mock.calls[0]![0].agendas).toEqual({ loaded: [], index: [] });
+      expect(create.mock.calls[0]![0].metadata).toMatchObject({ agendas: [] });
+    });
   });
 });
