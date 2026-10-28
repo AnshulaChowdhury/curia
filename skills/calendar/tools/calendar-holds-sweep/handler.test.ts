@@ -329,9 +329,9 @@ describe('CalendarHoldsSweepHandler — resilience', () => {
     const result = await handler.execute(ctx);
 
     expect(result.success).toBe(true);
-    const data = (result as { success: true; data: { scanned: number; expired: number; failed: number; calendarErrors: number } }).data;
-    expect(data.scanned).toBe(0);
-    expect(data.expired).toBe(0);
+    const data = (result as { success: true; data: Record<string, number> }).data;
+    // Every success result carries every declared output, zeroed here.
+    expect(data).toEqual({ scanned: 0, expired: 0, failed: 0, calendarErrors: 0, skippedWithAttendees: 0 });
   });
 
   it('returns success:false when nylasCalendarClient is not configured', async () => {

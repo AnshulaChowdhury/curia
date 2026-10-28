@@ -84,6 +84,7 @@ export class CalendarCreateEventHandler implements ToolHandler {
       // Failure here must never fail the booking — the event is already created.
       // The outer try/catch guards listEvents; the inner per-event try/catch ensures
       // one failing deleteEvent doesn't abort the rest of the loop.
+      const warnings: string[] = [];
       try {
         const startUnix = Math.floor(new Date(start).getTime() / 1000);
         const endUnix = Math.floor(new Date(end).getTime() / 1000);
@@ -94,7 +95,9 @@ export class CalendarCreateEventHandler implements ToolHandler {
           if (e.startTime === null || e.endTime === null) continue;  // skip malformed holds
           if (!eventsOverlap(startUnix, endUnix, e.startTime, e.endTime)) continue; // skip non-overlapping
           if (holdHasAttendees(e)) {
-            // Deleting would email its attendees a cancellation; leave it for a person.
+            // Deleting would email its attendees a cancellation; leave it for a person,
+            // and say so in the result so the caller doesn't report the slot as clean.
+            warnings.push(`Hold ${e.id} overlaps this booking but has attendees, so it was left in place to avoid emailing them a cancellation.`);
             ctx.log.warn({ holdId: e.id, bookedEventId: event.id }, 'calendar-create-event: overlapping hold has attendees, not releasing');
             continue;
           }
@@ -123,6 +126,7 @@ export class CalendarCreateEventHandler implements ToolHandler {
             endTime: toLocalIso(event.endTime, tz),
           },
           displayTimezone: tz ? formatDisplayTimezone(tz, new Date()) : null,
+          ...(warnings.length > 0 ? { warnings } : {}),
         },
       };
     } catch (err) {

@@ -155,6 +155,11 @@ describe('CalendarCreateEventHandler -- self-release holds', () => {
 
     expect(result.success).toBe(true);
     expect(deleteEvent).not.toHaveBeenCalled();
+    if (result.success) {
+      const data = result.data as { warnings?: string[] };
+      expect(data.warnings).toHaveLength(1);
+      expect(data.warnings?.[0]).toContain('hold-event-id');
+    }
   });
 
   it('returns success:true and does NOT call deleteEvent when listEvents throws (self-release failure must not fail booking)', async () => {

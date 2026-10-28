@@ -113,7 +113,7 @@ export class CalendarHoldsSweepHandler implements ToolHandler {
     // Nothing to do if the contact has no registered calendars.
     if (calendars.length === 0) {
       ctx.log.info({ contactId }, 'calendar-holds-sweep: no calendars registered, skipping');
-      return { success: true, data: { scanned: 0, expired: 0 } };
+      return { success: true, data: { scanned: 0, expired: 0, failed: 0, calendarErrors: 0, skippedWithAttendees: 0 } };
     }
 
     // Sweep counters.
