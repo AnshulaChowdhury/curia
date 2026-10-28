@@ -56,8 +56,9 @@ describe('CalendarDeleteEventHandler', () => {
     }
   });
 
-  it('names the Microsoft limit when a silent delete fails', async () => {
-    const nylasCalendarClient = { deleteEvent: vi.fn().mockRejectedValue(new Error('400 Bad Request')) };
+  it('names the Microsoft limit when a silent delete gets a 400', async () => {
+    const badRequest = Object.assign(new Error('400 Bad Request'), { statusCode: 400 });
+    const nylasCalendarClient = { deleteEvent: vi.fn().mockRejectedValue(badRequest) };
     const result = await handler.execute(makeCtx(
       { calendarId: 'cal-1', eventId: 'evt-1', notifyAttendees: false },
       { nylasCalendarClient: nylasCalendarClient as never },
@@ -67,6 +68,19 @@ describe('CalendarDeleteEventHandler', () => {
     if (!result.success) {
       expect(result.error).toContain('400 Bad Request');
       expect(result.error).toContain('Microsoft calendars reject notifyAttendees=false');
+    }
+  });
+
+  it('adds no Microsoft hint when a silent delete times out (outcome unknown)', async () => {
+    const nylasCalendarClient = { deleteEvent: vi.fn().mockRejectedValue(new Error('Nylas SDK timed out')) };
+    const result = await handler.execute(makeCtx(
+      { calendarId: 'cal-1', eventId: 'evt-1', notifyAttendees: false },
+      { nylasCalendarClient: nylasCalendarClient as never },
+    ));
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain('timed out');
+      expect(result.error).not.toContain('was not deleted');
     }
   });
 

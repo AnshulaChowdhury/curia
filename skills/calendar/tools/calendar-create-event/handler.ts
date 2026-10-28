@@ -12,7 +12,7 @@ import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skill
 import type { CreateEventInput } from '../../../../src/channels/calendar/nylas-calendar-client.js';
 import { parseWritableAttendees } from '../../../../src/channels/calendar/attendee-input.js';
 import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
-import { isHoldEvent, eventsOverlap } from '../../../../src/channels/calendar/holds.js';
+import { holdHasAttendees, isHoldEvent, eventsOverlap } from '../../../../src/channels/calendar/holds.js';
 
 export class CalendarCreateEventHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -93,10 +93,15 @@ export class CalendarCreateEventHandler implements ToolHandler {
           if (!isHoldEvent(e)) continue;             // skip real (non-hold) events
           if (e.startTime === null || e.endTime === null) continue;  // skip malformed holds
           if (!eventsOverlap(startUnix, endUnix, e.startTime, e.endTime)) continue; // skip non-overlapping
+          if (holdHasAttendees(e)) {
+            // Deleting would email its attendees a cancellation; leave it for a person.
+            ctx.log.warn({ holdId: e.id, bookedEventId: event.id }, 'calendar-create-event: overlapping hold has attendees, not releasing');
+            continue;
+          }
           // Per-event try/catch: one failing delete must not abort the rest of the loop.
           // A transient Nylas error on one hold should not prevent releasing the others.
           try {
-            await ctx.nylasCalendarClient.deleteEvent(calendarId, e.id); // no notify flag: holds have no attendees, and Microsoft rejects false
+            await ctx.nylasCalendarClient.deleteEvent(calendarId, e.id); // no notify flag: no attendees to email, and Microsoft rejects false
             ctx.log.info({ releasedHoldId: e.id, bookedEventId: event.id }, 'calendar-create-event: released overlapping hold');
           } catch (err) {
             ctx.log.warn({ err, holdId: e.id, bookedEventId: event.id }, 'calendar-create-event: failed to release overlapping hold, continuing');

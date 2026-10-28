@@ -186,6 +186,38 @@ describe('CalendarRespondToInviteHandler', () => {
     }
   });
 
+  it('leaves a matching hold with attendees in place and warns', async () => {
+    const handler = new CalendarRespondToInviteHandler();
+    const holdWithGuest = { ...makeHold('hold_a', START_UNIX, END_UNIX), participants: [{ email: 'guest@example.test', name: 'Guest', status: 'noreply' }] };
+    const deleteEvent = vi.fn().mockResolvedValue(undefined);
+    const ctx = makeCtx({
+      input: {
+        calendarId: 'cal_1',
+        eventId: 'evt_invite',
+        response: 'accept',
+        holdMatchCriteria: {
+          subject: 'Project Delta sync',
+          contactDomain: 'example.test',
+        },
+        holdSearchStart: '2026-06-01T00:00:00Z',
+        holdSearchEnd: '2026-06-30T00:00:00Z',
+      },
+    }, {
+      listEvents: vi.fn().mockResolvedValue([holdWithGuest]),
+      deleteEvent,
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(deleteEvent).not.toHaveBeenCalled();
+    if (result.success) {
+      const data = result.data as { releasedHolds: string[]; releaseWarnings: string[] };
+      expect(data.releasedHolds).toEqual([]);
+      expect(data.releaseWarnings.some((w) => w.includes('hold_a has attendees'))).toBe(true);
+    }
+  });
+
   it('releases nothing when no conversation ref can be recovered', async () => {
     const handler = new CalendarRespondToInviteHandler();
     const orphanHold = makeEvent({

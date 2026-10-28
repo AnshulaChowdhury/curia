@@ -3,6 +3,7 @@
 // Deletes a calendar event. Checks read-only flag before attempting deletion.
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
+import { isNylasBadRequest } from '../../../../src/channels/calendar/nylas-calendar-client.js';
 
 export class CalendarDeleteEventHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -40,7 +41,8 @@ export class CalendarDeleteEventHandler implements ToolHandler {
       ctx.log.error({ err, calendarId, eventId }, 'Failed to delete event');
       // Microsoft rejects notify_participants=false with a 400. Say so, rather than
       // let the agent retry silently or drop the flag and email attendees unasked.
-      const hint = notifyAttendees === false
+      // Only a 400 proves nothing changed; a timeout or 5xx leaves the outcome unknown.
+      const hint = notifyAttendees === false && isNylasBadRequest(err)
         ? ' Microsoft calendars reject notifyAttendees=false. The event was not deleted; ask the principal before retrying with attendees notified.'
         : '';
       return { success: false, error: `Failed to delete event: ${message}${hint}` };

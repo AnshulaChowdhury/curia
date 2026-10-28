@@ -1,7 +1,7 @@
 {
   "name": "calendar-holds-sweep",
   "description": "Recurring maintenance: delete tentative calendar holds (curia-hold metadata) whose slot is already in the past or whose created-at exceeds the max hold age (default 7 days). Operates only on Curia-created holds with no attendees; sends no notifications. Intended to be run on a schedule by the calendar specialist.",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "sensitivity": "normal",
   "action_risk": "low",
   "inputs": {
@@ -12,7 +12,8 @@
     "scanned": "number (curia-hold events examined)",
     "expired": "number (holds successfully deleted)",
     "failed": "number (stale holds where deleteEvent threw — e.g. revoked grant; 0 on a clean run)",
-    "calendarErrors": "number (calendars whose listEvents threw and were skipped; 0 on a clean run)"
+    "calendarErrors": "number (calendars whose listEvents threw and were skipped; 0 on a clean run)",
+    "skippedWithAttendees": "number (stale holds left in place because they have attendees, who would get a cancellation email)"
   },
   "permissions": [],
   "secrets": [],

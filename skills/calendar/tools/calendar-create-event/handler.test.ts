@@ -143,6 +143,20 @@ describe('CalendarCreateEventHandler -- self-release holds', () => {
     expect(deletedIds).not.toContain('new-event-id');
   });
 
+  it('does not release an overlapping hold that has attendees', async () => {
+    const deleteEvent = vi.fn().mockResolvedValue(undefined);
+    const holdWithGuest = { ...OVERLAPPING_HOLD, participants: [{ email: 'guest@example.test', name: 'Guest', status: 'noreply' }] };
+    const ctx = makeCtx({
+      listEvents: vi.fn().mockResolvedValue([CREATED_EVENT, holdWithGuest]),
+      deleteEvent,
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(deleteEvent).not.toHaveBeenCalled();
+  });
+
   it('returns success:true and does NOT call deleteEvent when listEvents throws (self-release failure must not fail booking)', async () => {
     const deleteEvent = vi.fn();
     const ctx = makeCtx({

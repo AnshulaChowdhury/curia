@@ -150,6 +150,27 @@ describe('CalendarHoldsSweepHandler — core sweep logic', () => {
     }
   });
 
+  it('leaves a stale hold with attendees in place and counts it', async () => {
+    const handler = new CalendarHoldsSweepHandler();
+    const pastHoldWithGuest = { ...pastHold, participants: [{ email: 'guest@example.test', name: 'Guest', status: 'noreply' }] };
+    const deleteEvent = vi.fn().mockResolvedValue(undefined);
+    const ctx = makeCtx({
+      nylasCalendarClient: {
+        listEvents: vi.fn().mockResolvedValue([pastHoldWithGuest, oldHold]),
+        deleteEvent,
+      } as unknown as ToolContext['nylasCalendarClient'],
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    const data = (result as { success: true; data: { expired: number; skippedWithAttendees: number } }).data;
+    expect(data.expired).toBe(1);
+    expect(data.skippedWithAttendees).toBe(1);
+    expect(deleteEvent).toHaveBeenCalledTimes(1);
+    expect(deleteEvent).toHaveBeenCalledWith('cal-work', 'evt-old');
+  });
+
   it('returns scanned=0, expired=0 when the calendar has no events', async () => {
     const handler = new CalendarHoldsSweepHandler();
     const ctx = makeCtx({

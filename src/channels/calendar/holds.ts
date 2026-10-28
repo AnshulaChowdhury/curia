@@ -83,6 +83,17 @@ export function isHoldEvent(e: { metadata?: Record<string, string> | null }): bo
   return e.metadata?.[CURIA_HOLD_KEY] === 'true';
 }
 
+/**
+ * Return true when a hold carries participants. Curia creates holds without
+ * attendees, but calendar-update-event can add some later. Release paths
+ * delete holds with the provider's default notify setting (Microsoft rejects
+ * notify_participants=false), so a hold with attendees would email them a
+ * cancellation. Callers skip and report these instead.
+ */
+export function holdHasAttendees(e: { participants?: readonly unknown[] | null }): boolean {
+  return (e.participants?.length ?? 0) > 0;
+}
+
 export interface HoldMatchCriteria {
   subject?: string;
   contactDomain?: string;

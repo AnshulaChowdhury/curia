@@ -23,6 +23,16 @@ import type { CalendarAttendeeInput } from './attendee-input.js';
 export type { CalendarAttendeeInput } from './attendee-input.js';
 
 /**
+ * True when `err` is a Nylas API error with HTTP 400: the request was rejected,
+ * so nothing changed. Timeouts, network errors and 5xx do not match; for those
+ * the outcome is unknown. Duck-typed on `statusCode` because the SDK is loaded
+ * through a CJS default import.
+ */
+export function isNylasBadRequest(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { statusCode?: unknown }).statusCode === 400;
+}
+
+/**
  * Minimal typed interface for the Nylas SDK calendar surface.
  * We only declare the subset we use — keeps the CJS workaround small.
  */
