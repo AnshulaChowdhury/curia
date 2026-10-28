@@ -23,6 +23,15 @@ import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skill
 import type { TaskOriginator } from '../../../../src/contacts/types.js';
 import type { TaskEscalation } from '../../../../src/agents/task-escalation.js';
 import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import {
+  BLOCKED_BY_TASK_ID_ERROR,
+  PARENT_TASK_ID_ERROR,
+  WAITING_ON_CONTACT_ID_ERROR,
+  contactNotFoundError,
+  foreignKeyReferenceError,
+  resolveOptionalId,
+  taskNotFoundError,
+} from '../../optional-ref.js';
 
 const VALID_OWNERS = new Set(['curia', 'ceo', 'external']);
 const VALID_SOURCES = new Set(['ceo', 'agent', 'scheduler', 'coordinator']);
@@ -51,13 +60,13 @@ export class TaskCreateHandler implements ToolHandler {
       title?: string;
       description?: string;
       owner?: string;
-      parent_task_id?: string;
-      blocked_by_task_id?: string;
+      parent_task_id?: string | null;
+      blocked_by_task_id?: string | null;
       priority?: number;
       due_at?: string;
       wake_at?: string;
       tags?: string[];
-      waiting_on_contact_id?: string;
+      waiting_on_contact_id?: string | null;
       waiting_on_text?: string;
       intent_anchor?: string;
       source?: string;
@@ -96,6 +105,20 @@ export class TaskCreateHandler implements ToolHandler {
     if (input.progress_note && input.progress_note.length > 5000) {
       return { success: false, error: 'progress_note must be 5000 characters or fewer' };
     }
+
+    // Optional ids are omitted when the model fills them with "null" / "none" / blank.
+    // A raw Postgres uuid error teaches the next attempt to invent an id (#2328).
+    const parentRef = resolveOptionalId('parent_task_id', input.parent_task_id, PARENT_TASK_ID_ERROR);
+    if (!parentRef.ok) return { success: false, error: parentRef.error };
+    const blockedRef = resolveOptionalId('blocked_by_task_id', input.blocked_by_task_id, BLOCKED_BY_TASK_ID_ERROR);
+    if (!blockedRef.ok) return { success: false, error: blockedRef.error };
+    const waitingRef = resolveOptionalId(
+      'waiting_on_contact_id',
+      input.waiting_on_contact_id,
+      WAITING_ON_CONTACT_ID_ERROR,
+      { contactPlaceholder: true },
+    );
+    if (!waitingRef.ok) return { success: false, error: waitingRef.error };
 
     // Optional structured escalation block (#1267) — seeded onto progress.escalation. Carried
     // as a JSON string to keep the input schema primitive. Malformed JSON is non-fatal: the
@@ -200,12 +223,25 @@ export class TaskCreateHandler implements ToolHandler {
 
     const seededProgressNote = [input.progress_note, pastDueNote].filter(Boolean).join(' ').trim() || undefined;
 
-    ctx.log.info(
-      { title: input.title, owner: input.owner ?? 'curia', owningAgentId, creatorAgentId },
-      'Creating task',
-    );
-
     try {
+      if (parentRef.id) {
+        const parent = await ctx.taskRepo.getTask(parentRef.id);
+        if (!parent) return { success: false, error: taskNotFoundError('parent_task_id', parentRef.id) };
+      }
+      if (blockedRef.id) {
+        const blocker = await ctx.taskRepo.getTask(blockedRef.id);
+        if (!blocker) return { success: false, error: taskNotFoundError('blocked_by_task_id', blockedRef.id) };
+      }
+      if (waitingRef.id && ctx.contactService) {
+        const contact = await ctx.contactService.getContact(waitingRef.id);
+        if (!contact) return { success: false, error: contactNotFoundError(waitingRef.id) };
+      }
+
+      ctx.log.info(
+        { title: input.title, owner: input.owner ?? 'curia', owningAgentId, creatorAgentId },
+        'Creating task',
+      );
+
       const task = await ctx.taskRepo.createTask({
         // owningAgentId == creatorAgentId for the default (self-routing) case;
         // a valid target_agent_id redirects ownership (and the linked wake) to it.
@@ -213,13 +249,13 @@ export class TaskCreateHandler implements ToolHandler {
         title: input.title.trim(),
         description: input.description,
         owner: (input.owner as 'curia' | 'ceo' | 'external') ?? 'curia',
-        parentTaskId: input.parent_task_id,
-        blockedByTaskId: input.blocked_by_task_id,
+        parentTaskId: parentRef.id,
+        blockedByTaskId: blockedRef.id,
         priority: input.priority,
         dueAt,
         wakeAt,
         tags: extraTags,
-        waitingOnContactId: input.waiting_on_contact_id,
+        waitingOnContactId: waitingRef.id,
         waitingOnText: input.waiting_on_text,
         intentAnchor: input.intent_anchor,
         source: derivedSource,
@@ -261,8 +297,10 @@ export class TaskCreateHandler implements ToolHandler {
         },
       };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const referenced = foreignKeyReferenceError(err);
       ctx.log.error({ err, title: input.title }, 'Failed to create task');
+      if (referenced) return { success: false, error: referenced };
+      const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: `Failed to create task: ${message}` };
     }
   }

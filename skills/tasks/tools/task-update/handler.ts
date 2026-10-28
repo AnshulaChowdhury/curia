@@ -5,8 +5,15 @@
 // Setting status='cancelled' also cancels pending wake-up jobs.
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
+import type { UpdateTaskParams } from '../../../../src/db/task-repo.js';
 import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
 import { isUuid } from '../../../../src/util/uuid.js';
+import {
+  BLOCKED_BY_TASK_ID_ERROR,
+  foreignKeyReferenceError,
+  resolveOptionalId,
+  taskNotFoundError,
+} from '../../optional-ref.js';
 
 const VALID_STATUSES = new Set(['open', 'in_progress', 'blocked', 'waiting', 'done', 'cancelled']);
 const VALID_OWNERS = new Set(['curia', 'ceo', 'external']);
@@ -69,17 +76,26 @@ export class TaskUpdateHandler implements ToolHandler {
         `Keep future notes shorter rather than re-sending the cut text.`;
       ctx.log.warn({ taskId: input.task_id, originalLength }, 'task-update: progress_note truncated');
     }
-    if (input.blocked_by_task_id !== undefined && input.blocked_by_task_id !== null) {
-      if (typeof input.blocked_by_task_id !== 'string' || !isUuid(input.blocked_by_task_id)) {
-        return { success: false, error: 'blocked_by_task_id must be a valid UUID' };
+    // JSON null clears the blocker. The string "null" (and none/undefined/blank) is
+    // the model filling an optional field, not a clear — leave the existing blocker
+    // alone. Passing the key as undefined would clear it: the repo treats
+    // `'blockedByTaskId' in updates` as "set this column" (#2328).
+    let blockerUpdate: { present: false } | { present: true; id: string | null } = { present: false };
+    if (input.blocked_by_task_id !== undefined) {
+      if (input.blocked_by_task_id === null) {
+        blockerUpdate = { present: true, id: null };
+      } else {
+        const resolved = resolveOptionalId('blocked_by_task_id', input.blocked_by_task_id, BLOCKED_BY_TASK_ID_ERROR);
+        if (!resolved.ok) return { success: false, error: resolved.error };
+        if (resolved.id !== undefined) blockerUpdate = { present: true, id: resolved.id };
       }
     }
 
-    // Require at least one field to update.
+    // Require at least one field to update. A placeholder blocker does not count.
     const hasUpdate = input.status !== undefined || input.priority !== undefined
       || input.owner !== undefined || input.due_at !== undefined
       || input.wake_at !== undefined || input.tags !== undefined
-      || input.progress_note !== undefined || input.blocked_by_task_id !== undefined;
+      || input.progress_note !== undefined || blockerUpdate.present;
 
     if (!hasUpdate) {
       return { success: false, error: 'At least one field to update must be provided' };
@@ -116,18 +132,27 @@ export class TaskUpdateHandler implements ToolHandler {
     ctx.log.info({ taskId: input.task_id, status: input.status }, 'Updating task');
 
     try {
+      if (blockerUpdate.present && blockerUpdate.id !== null) {
+        const blocker = await ctx.taskRepo.getTask(blockerUpdate.id);
+        if (!blocker) {
+          return { success: false, error: taskNotFoundError('blocked_by_task_id', blockerUpdate.id) };
+        }
+      }
+
+      const updates: UpdateTaskParams = {
+        status: input.status,
+        priority: input.priority,
+        owner: input.owner,
+        dueAt,
+        wakeAt,
+        tags: input.tags,
+        progressNote,
+      };
+      if (blockerUpdate.present) updates.blockedByTaskId = blockerUpdate.id;
+
       const updated = await ctx.taskRepo.updateTask(
         input.task_id,
-        {
-          status: input.status,
-          priority: input.priority,
-          owner: input.owner,
-          dueAt,
-          wakeAt,
-          tags: input.tags,
-          progressNote,
-          blockedByTaskId: input.blocked_by_task_id,
-        },
+        updates,
         ctx.agentId,
       );
 
@@ -154,8 +179,10 @@ export class TaskUpdateHandler implements ToolHandler {
         },
       };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const referenced = foreignKeyReferenceError(err);
       ctx.log.error({ err, taskId: input.task_id }, 'Failed to update task');
+      if (referenced) return { success: false, error: referenced };
+      const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: `Failed to update task: ${message}` };
     }
   }

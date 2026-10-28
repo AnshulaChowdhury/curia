@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import pino from 'pino';
 import { TaskUpdateHandler } from './handler.js';
+import { BLOCKED_BY_TASK_ID_ERROR } from '../../optional-ref.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { TaskRepo } from '../../../../src/db/task-repo.js';
 import type { TaskRow } from '../../../../src/db/queries/tasks.js';
@@ -269,5 +270,141 @@ describe('TaskUpdateHandler', () => {
 
     expect(result.success).toBe(false);
     expect((result as { success: false; error: string }).error).toMatch(/not found/);
+  });
+
+  // #2328: same placeholder treatment as task-create. JSON null still clears.
+  // Omitting the field must not clear: the repo writes the column whenever the key is present.
+  describe('blocked_by_task_id (#2328)', () => {
+    const placeholders = ['', ' ', 'null', 'none', 'undefined', 'NULL', 'None', ' Undefined '];
+    const blockerId = '8c4b1e2a-1111-4111-8111-111111111111';
+
+    it.each(placeholders)('leaves the blocker unchanged when given %j', async (value) => {
+      const updateTask = vi.fn().mockResolvedValue(makeTaskRow());
+      const taskRepo = makeTaskRepo({ updateTask });
+      const ctx = makeCtx({
+        input: { task_id: VALID_UUID, status: 'waiting', blocked_by_task_id: value },
+        taskRepo,
+      });
+
+      const result = await new TaskUpdateHandler().execute(ctx);
+
+      expect(result.success).toBe(true);
+      const updates = updateTask.mock.calls[0]![1] as { status?: string; blockedByTaskId?: string | null };
+      expect(updates.status).toBe('waiting');
+      expect(updates).not.toHaveProperty('blockedByTaskId');
+    });
+
+    it('does not clear the blocker when the field is omitted', async () => {
+      const updateTask = vi.fn().mockResolvedValue(makeTaskRow());
+      const taskRepo = makeTaskRepo({ updateTask });
+      const ctx = makeCtx({ input: { task_id: VALID_UUID, status: 'in_progress' }, taskRepo });
+
+      await new TaskUpdateHandler().execute(ctx);
+
+      const updates = updateTask.mock.calls[0]![1] as object;
+      expect(updates).not.toHaveProperty('blockedByTaskId');
+    });
+
+    it('clears the blocker when given JSON null', async () => {
+      const updateTask = vi.fn().mockResolvedValue(makeTaskRow());
+      const getTask = vi.fn();
+      const taskRepo = makeTaskRepo({ updateTask, getTask });
+      const ctx = makeCtx({
+        input: { task_id: VALID_UUID, blocked_by_task_id: null },
+        taskRepo,
+      });
+
+      const result = await new TaskUpdateHandler().execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(updateTask.mock.calls[0]![1].blockedByTaskId).toBeNull();
+      expect(getTask).not.toHaveBeenCalled();
+    });
+
+    it('does not treat a placeholder-only call as an update', async () => {
+      const updateTask = vi.fn();
+      const taskRepo = makeTaskRepo({ updateTask });
+      const ctx = makeCtx({
+        input: { task_id: VALID_UUID, blocked_by_task_id: 'null' },
+        taskRepo,
+      });
+
+      const result = await new TaskUpdateHandler().execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/at least one/i);
+      expect(updateTask).not.toHaveBeenCalled();
+    });
+
+    it('rejects "curia" and never calls the repo', async () => {
+      const updateTask = vi.fn();
+      const taskRepo = makeTaskRepo({ updateTask });
+      const ctx = makeCtx({
+        input: { task_id: VALID_UUID, blocked_by_task_id: 'curia' },
+        taskRepo,
+      });
+
+      const result = await new TaskUpdateHandler().execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toBe(BLOCKED_BY_TASK_ID_ERROR);
+      expect(updateTask).not.toHaveBeenCalled();
+    });
+
+    it('returns task not found for a missing blocker and does not update', async () => {
+      const updateTask = vi.fn();
+      const taskRepo = makeTaskRepo({
+        updateTask,
+        getTask: vi.fn().mockResolvedValue(null),
+      });
+      const ctx = makeCtx({
+        input: { task_id: VALID_UUID, blocked_by_task_id: blockerId },
+        taskRepo,
+      });
+
+      const result = await new TaskUpdateHandler().execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/task not found/i);
+      expect(updateTask).not.toHaveBeenCalled();
+    });
+
+    it('forwards a blocker uuid when that task exists', async () => {
+      const updateTask = vi.fn().mockResolvedValue(makeTaskRow());
+      const taskRepo = makeTaskRepo({
+        updateTask,
+        getTask: vi.fn().mockResolvedValue(makeTaskRow({ id: blockerId })),
+      });
+      const ctx = makeCtx({
+        input: { task_id: VALID_UUID, blocked_by_task_id: blockerId },
+        taskRepo,
+      });
+
+      const result = await new TaskUpdateHandler().execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(updateTask.mock.calls[0]![1].blockedByTaskId).toBe(blockerId);
+    });
+
+    it('rewrites a foreign-key failure as task not found', async () => {
+      const fk = Object.assign(
+        new Error('insert or update on table "tasks" violates foreign key constraint "tasks_blocked_by_task_id_fkey"'),
+        { code: '23503', constraint: 'tasks_blocked_by_task_id_fkey' },
+      );
+      const taskRepo = makeTaskRepo({
+        getTask: vi.fn().mockResolvedValue(makeTaskRow({ id: blockerId })),
+        updateTask: vi.fn().mockRejectedValue(fk),
+      });
+      const ctx = makeCtx({
+        input: { task_id: VALID_UUID, blocked_by_task_id: blockerId },
+        taskRepo,
+      });
+
+      const result = await new TaskUpdateHandler().execute(ctx);
+
+      const error = (result as { success: false; error: string }).error;
+      expect(error).toMatch(/task not found/i);
+      expect(error).not.toMatch(/violates foreign key/);
+    });
   });
 });

@@ -2,6 +2,11 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import pino from 'pino';
 import { TaskCreateHandler } from './handler.js';
+import {
+  BLOCKED_BY_TASK_ID_ERROR,
+  PARENT_TASK_ID_ERROR,
+  WAITING_ON_CONTACT_ID_ERROR,
+} from '../../optional-ref.js';
 import { ToolRegistry } from '../../../../src/skills/registry.js';
 import type { ToolContext, ToolManifest } from '../../../../src/skills/types.js';
 import type { TaskRepo } from '../../../../src/db/task-repo.js';
@@ -457,6 +462,155 @@ describe('TaskCreateHandler', () => {
 
     expect(result.success).toBe(false);
     expect((result as { success: false; error: string }).error).toMatch(/progress_note/);
+  });
+});
+
+// #2328: optional ids filled with "null" / "none" / blank used to hit Postgres as a
+// uuid cast, and the raw error taught the model to invent a blocker id.
+describe('optional reference ids (#2328)', () => {
+  const placeholders = ['', ' ', 'null', 'none', 'undefined', 'NULL', 'None', ' Undefined '];
+  const fields = [
+    { field: 'parent_task_id', param: 'parentTaskId', error: PARENT_TASK_ID_ERROR },
+    { field: 'blocked_by_task_id', param: 'blockedByTaskId', error: BLOCKED_BY_TASK_ID_ERROR },
+    { field: 'waiting_on_contact_id', param: 'waitingOnContactId', error: WAITING_ON_CONTACT_ID_ERROR },
+  ] as const;
+  const missingTaskId = '8c4b1e2a-0000-0000-0000-000000000000';
+  const presentTaskId = '8c4b1e2a-1111-4111-8111-111111111111';
+
+  describe.each(fields)('$field', ({ field, param, error }) => {
+    it.each(placeholders)('creates the task with %j unset', async (value) => {
+      const createTask = vi.fn().mockResolvedValue(makeTaskRow());
+      const taskRepo = makeTaskRepo({ createTask });
+      const ctx = makeCtx({ input: { title: 'Calendar reminder', [field]: value }, taskRepo });
+
+      const result = await new TaskCreateHandler().execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(createTask).toHaveBeenCalledTimes(1);
+      expect(createTask.mock.calls[0]![0][param]).toBeUndefined();
+    });
+
+    it('rejects a non-uuid such as "curia" and never calls the repo', async () => {
+      const createTask = vi.fn();
+      const taskRepo = makeTaskRepo({ createTask });
+      const ctx = makeCtx({ input: { title: 'Calendar reminder', [field]: 'curia' }, taskRepo });
+
+      const result = await new TaskCreateHandler().execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toBe(error);
+      expect(createTask).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(['parent_task_id', 'blocked_by_task_id'] as const)(
+    'returns task not found for a missing %s and does not insert',
+    async (field) => {
+      const createTask = vi.fn();
+      const taskRepo = makeTaskRepo({
+        createTask,
+        getTask: vi.fn().mockResolvedValue(null),
+      });
+      const ctx = makeCtx({ input: { title: 'Calendar reminder', [field]: missingTaskId }, taskRepo });
+
+      const result = await new TaskCreateHandler().execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/task not found/i);
+      expect((result as { success: false; error: string }).error).not.toMatch(/violates foreign key|invalid input syntax/i);
+      expect(createTask).not.toHaveBeenCalled();
+    },
+  );
+
+  it('forwards a blocker uuid when that task exists', async () => {
+    const createTask = vi.fn().mockResolvedValue(makeTaskRow());
+    const taskRepo = makeTaskRepo({
+      createTask,
+      getTask: vi.fn().mockResolvedValue(makeTaskRow({ id: presentTaskId })),
+    });
+    const ctx = makeCtx({
+      input: { title: 'Calendar reminder', blocked_by_task_id: presentTaskId },
+      taskRepo,
+    });
+
+    const result = await new TaskCreateHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(createTask.mock.calls[0]![0].blockedByTaskId).toBe(presentTaskId);
+  });
+
+  it('returns contact not found for a missing waiting_on_contact_id and does not insert', async () => {
+    const createTask = vi.fn();
+    const contactId = '22222222-2222-4222-8222-222222222222';
+    const taskRepo = makeTaskRepo({ createTask });
+    const ctx = makeCtx({
+      input: { title: 'Chase the vendor', waiting_on_contact_id: contactId },
+      taskRepo,
+      contactService: { getContact: vi.fn().mockResolvedValue(undefined) } as unknown as ToolContext['contactService'],
+    });
+
+    const result = await new TaskCreateHandler().execute(ctx);
+
+    expect(result.success).toBe(false);
+    expect((result as { success: false; error: string }).error).toMatch(/contact not found/i);
+    expect(createTask).not.toHaveBeenCalled();
+  });
+
+  it('names an unresolved contact placeholder instead of a uuid cast error', async () => {
+    const createTask = vi.fn();
+    const taskRepo = makeTaskRepo({ createTask });
+    const ctx = makeCtx({
+      input: { title: 'Chase the vendor', waiting_on_contact_id: '${principal_contact_id}' },
+      taskRepo,
+    });
+
+    const result = await new TaskCreateHandler().execute(ctx);
+
+    expect(result.success).toBe(false);
+    expect((result as { success: false; error: string }).error).toMatch(/Unresolved template placeholder/);
+    expect(createTask).not.toHaveBeenCalled();
+  });
+
+  it('rewrites a contact foreign-key failure as contact not found', async () => {
+    const contactId = '22222222-2222-4222-8222-222222222222';
+    const fk = Object.assign(
+      new Error('insert or update on table "tasks" violates foreign key constraint "tasks_waiting_on_contact_id_fkey"'),
+      { code: '23503', constraint: 'tasks_waiting_on_contact_id_fkey' },
+    );
+    const taskRepo = makeTaskRepo({ createTask: vi.fn().mockRejectedValue(fk) });
+    const ctx = makeCtx({
+      input: { title: 'Chase the vendor', waiting_on_contact_id: contactId },
+      taskRepo,
+    });
+
+    const result = await new TaskCreateHandler().execute(ctx);
+
+    expect(result.success).toBe(false);
+    const error = (result as { success: false; error: string }).error;
+    expect(error).toMatch(/contact not found/i);
+    expect(error).not.toMatch(/violates foreign key/);
+  });
+
+  it('rewrites a foreign-key failure as task not found', async () => {
+    const fk = Object.assign(
+      new Error('insert or update on table "tasks" violates foreign key constraint "tasks_blocked_by_task_id_fkey"'),
+      { code: '23503', constraint: 'tasks_blocked_by_task_id_fkey' },
+    );
+    const taskRepo = makeTaskRepo({
+      getTask: vi.fn().mockResolvedValue(makeTaskRow({ id: presentTaskId })),
+      createTask: vi.fn().mockRejectedValue(fk),
+    });
+    const ctx = makeCtx({
+      input: { title: 'Calendar reminder', blocked_by_task_id: presentTaskId },
+      taskRepo,
+    });
+
+    const result = await new TaskCreateHandler().execute(ctx);
+
+    expect(result.success).toBe(false);
+    const error = (result as { success: false; error: string }).error;
+    expect(error).toMatch(/task not found/i);
+    expect(error).not.toMatch(/violates foreign key|invalid input syntax/);
   });
 });
 
