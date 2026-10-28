@@ -1,7 +1,8 @@
 // session-agendas.ts — what a principal call starts with (#2322).
 //
-// Cull, then either lock the single due agenda or offer the pending index.
-// A store failure yields an empty session so the call still starts free-form.
+// Cull, then lock only when the single pending agenda is due. One that is not
+// due, or several pending agendas, stay an index. A store failure yields an
+// empty session so the call still starts free-form.
 
 import type { Logger } from '../logger.js';
 import type { AgendaStore } from './agenda-store.js';
@@ -31,11 +32,11 @@ export async function prepareSessionAgendas(
   try {
     await store.cullExpired(opts.now);
     const pending = await store.listPending(opts.now);
-    const due = pending.filter((doc) => isDue(doc, opts.now));
-    if (due.length !== 1) {
+    const only = pending.length === 1 ? pending[0]! : null;
+    if (!only || !isDue(only, opts.now)) {
       return { agendas: indexOf(pending), preload: null };
     }
-    const target = due[0]!;
+    const target = only;
     const locked = await store.lock(target.agendaId, opts.sessionId, opts.now);
     if (!locked.ok) {
       return { agendas: indexOf(pending), preload: null };

@@ -255,6 +255,22 @@ export class WorkingDocsRepo {
     return row ? mapRow(row) : null;
   }
 
+  /**
+   * True when any row exists at the path, including an archived one.
+   * Minutes and transcripts count as already written once, so a later
+   * recovery must not create a new live row over an archive (#2322).
+   */
+  async existsAtPath(path: string): Promise<boolean> {
+    const normalized = normalizeDocPath(path);
+    const { rows } = await this.pool.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM working_documents WHERE path = $1
+       ) AS present`,
+      [normalized],
+    );
+    return rows[0]?.present === true;
+  }
+
   async update(path: string, params: UpdateWorkingDocParams): Promise<WorkingDocWriteResult> {
     const normalized = normalizeDocPath(path);
     const current = await this.read(normalized);

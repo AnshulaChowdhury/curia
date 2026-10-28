@@ -1,10 +1,11 @@
 // recovery.ts — startup sweep for calls that died before minutes.ready (#2322).
 //
 // Rerun recent ended sessions, cull expired agendas, then release an in_call
-// agenda whose session is gone. A rerun that completed or returned the agenda
-// unused is left alone. A failed rerun is released so the agenda is not stuck.
+// agenda whose session is gone. A completed or unused rerun protects only the
+// agendas it recorded. An in_call agenda that was never recorded is released,
+// and so is every agenda from a failed rerun.
 
-import type { VoiceSessionStore } from '../channels/voice/session-store.js';
+import { sessionAgendaLoads, type VoiceSessionStore } from '../channels/voice/session-store.js';
 import type { WorkingDocsRepo } from '../db/working-docs-repo.js';
 import type { Logger } from '../logger.js';
 import { parseAgendaDoc, type AgendaStore } from './agenda-store.js';
@@ -31,7 +32,7 @@ export class MeetingPipelineRecovery {
   async sweep(now: Date): Promise<{ rerun: number; released: number }> {
     const since = new Date(now.getTime() - this.lookbackDays * DAY_MS);
     const sessions = await this.deps.sessionStore.listRecentWithAgendas(since);
-    const protectedIds = new Set<string>();
+    const protectedAgendaIds = new Set<string>();
     let rerun = 0;
     for (const session of sessions) {
       rerun += 1;
@@ -41,7 +42,9 @@ export class MeetingPipelineRecovery {
       } catch (err) {
         this.deps.logger.error({ err, sessionId: session.id }, 'meeting recovery: pipeline run rejected');
       }
-      if (outcome === 'completed' || outcome === 'returned_unused') protectedIds.add(session.id);
+      if (outcome === 'completed' || outcome === 'returned_unused') {
+        for (const load of sessionAgendaLoads(session)) protectedAgendaIds.add(load.agendaId);
+      }
     }
 
     await this.deps.agendaStore.cullExpired(now);
@@ -52,7 +55,7 @@ export class MeetingPipelineRecovery {
       if (!row.path.startsWith(AGENDA_PREFIX)) continue;
       const doc = parseAgendaDoc(row);
       if (!doc || doc.status !== 'in_call' || !doc.inCallSession) continue;
-      if (protectedIds.has(doc.inCallSession)) continue;
+      if (protectedAgendaIds.has(doc.agendaId)) continue;
       const session = await this.deps.sessionStore.get(doc.inCallSession);
       if (session && (session.status === 'active' || session.status === 'starting')) continue;
       const result = await this.deps.agendaStore.settle(doc.agendaId, doc.inCallSession, { kind: 'return' });

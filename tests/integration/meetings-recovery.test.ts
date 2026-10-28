@@ -180,6 +180,55 @@ describeIf('MeetingPipelineRecovery (integration, #2322)', () => {
     expect(agenda?.history[0]?.topics).toEqual([{ topic: 'runway', coverage: 'not_reached' }]);
   });
 
+  it('archived minutes and transcript are not rewritten', async () => {
+    const { sessionId, startedAt } = await endedCall('ARCHIVE-MARKER');
+    await publicPool.query(
+      `UPDATE voice_sessions SET status = 'ended', end_reason = 'remote_hangup', ended_at = NOW() WHERE id = $1`,
+      [sessionId],
+    );
+    await recovery.sweep(new Date());
+    const minutes = minutesPath(sessionId, startedAt, TZ);
+    const transcript = transcriptPath(sessionId);
+    expect(await repo.softDelete(minutes)).not.toBeNull();
+    expect(await repo.softDelete(transcript)).not.toBeNull();
+    expect(await repo.read(minutes)).toBeNull();
+    const promptsBefore = prompts.length;
+    await recovery.sweep(new Date());
+    expect(prompts.slice(promptsBefore).join('\n')).not.toContain('ARCHIVE-MARKER');
+    expect(await repo.read(minutes)).toBeNull();
+    expect(await repo.read(transcript)).toBeNull();
+    expect(await repo.existsAtPath(minutes)).toBe(true);
+    expect(await repo.existsAtPath(transcript)).toBe(true);
+  });
+
+  it('releases an in_call agenda the completed session never recorded', async () => {
+    const { sessionId, agendaId: recordedId } = await endedCall('RECORDED-MARKER');
+    const extra = await agendas.park({
+      title: 'Unrecorded',
+      topics: ['side'],
+      context: 'Locked but not in metadata.',
+      source: 'ad_hoc',
+      sensitivity: 'shareable',
+      expiresAt: new Date(Date.now() + 7 * DAY),
+      scheduledFor: null,
+      role: null,
+    }, new Date());
+    const locked = await agendas.lock(extra.agendaId, sessionId, new Date());
+    if (!locked.ok) throw new Error(locked.reason);
+    await publicPool.query(
+      `UPDATE voice_sessions SET status = 'ended', end_reason = 'remote_hangup', ended_at = NOW() WHERE id = $1`,
+      [sessionId],
+    );
+    await recovery.sweep(new Date());
+    const unrecorded = await agendas.get(extra.agendaId);
+    expect(unrecorded?.status).toBe('pending');
+    expect(unrecorded?.inCallSession).toBeNull();
+    expect(unrecorded?.history).toEqual([]);
+    const recorded = await agendas.get(recordedId);
+    expect(recorded?.status).toBe('pending');
+    expect(recorded?.history.length).toBeGreaterThan(0);
+  });
+
   it('orphaned in_call agenda is released', async () => {
     const sessionId = randomUUID();
     sessionIds.push(sessionId);

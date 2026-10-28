@@ -6,6 +6,7 @@
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
 import { AgendaStore } from '../../../../src/meetings/agenda-store.js';
 import { validateParkAgendaInput } from '../../../../src/meetings/agenda-validation.js';
+import { formatDisplayTimezone, toLocalIso } from '../../../../src/time/timestamp.js';
 
 export class MeetingAgendaParkHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -17,12 +18,17 @@ export class MeetingAgendaParkHandler implements ToolHandler {
     try {
       const store = new AgendaStore(ctx.workingDocs, ctx.log);
       const parked = await store.park(validated.value, new Date());
+      const tz = ctx.timezone;
+      const expiresUnix = Math.floor(Date.parse(parked.expiresAt) / 1000);
       return {
         success: true,
         data: {
           agenda_id: parked.agendaId,
           path: parked.path,
-          expires_at: parked.expiresAt,
+          expires_at: tz
+            ? (toLocalIso(Number.isFinite(expiresUnix) ? expiresUnix : null, tz) ?? parked.expiresAt)
+            : parked.expiresAt,
+          displayTimezone: tz ? formatDisplayTimezone(tz, new Date()) : null,
         },
       };
     } catch (err) {

@@ -81,6 +81,23 @@ describe('prepareSessionAgendas', () => {
     expect(result.agendas.index).toEqual([{ agendaId: doc.agendaId, title: doc.title, scheduledFor: doc.scheduledFor }]);
   });
 
+  it('one due agenda beside one that is not due stays an unlocked index', async () => {
+    const due = agenda({ agendaId: '66666666-6666-6666-6666-666666666666', title: 'Now' });
+    const later = agenda({
+      agendaId: '77777777-7777-7777-7777-777777777777',
+      title: 'Later',
+      scheduledFor: '2026-11-20T16:00:00.000Z',
+    });
+    const { store, lock } = fakeStore({ listPending: async () => [due, later] });
+
+    const result = await prepareSessionAgendas(store, { sessionId: SESSION, now: NOW, logger: createSilentLogger() });
+
+    expect(lock).not.toHaveBeenCalled();
+    expect(result.preload).toBeNull();
+    expect(result.agendas.loaded).toEqual([]);
+    expect(result.agendas.index.map((entry) => entry.agendaId)).toEqual([due.agendaId, later.agendaId]);
+  });
+
   it('several agendas go to the index unlocked', async () => {
     const first = agenda({ agendaId: '33333333-3333-3333-3333-333333333333', title: 'One' });
     const second = agenda({ agendaId: '44444444-4444-4444-4444-444444444444', title: 'Two' });

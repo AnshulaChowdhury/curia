@@ -4,6 +4,7 @@
 // disappear: voice history keeps only spoken text. The load tool's result only
 // confirms the lock; the next turn's prompt carries the agenda.
 
+import { toLocalIso } from '../time/timestamp.js';
 import type { AgendaIndexEntry, AgendaSnapshot, SessionAgendas } from './types.js';
 import { AGENDA_SENSITIVITIES, AGENDA_SOURCES } from './types.js';
 
@@ -29,9 +30,17 @@ function renderLoaded(snapshot: AgendaSnapshot): string {
   return lines.join('\n');
 }
 
-function renderIndex(entries: AgendaIndexEntry[]): string {
+function renderWhen(scheduledFor: string | null, timezone: string | undefined): string {
+  if (!scheduledFor) return 'no time set';
+  if (!timezone) return scheduledFor;
+  const unix = Date.parse(scheduledFor) / 1000;
+  if (!Number.isFinite(unix)) return scheduledFor;
+  return toLocalIso(unix, timezone) ?? scheduledFor;
+}
+
+function renderIndex(entries: AgendaIndexEntry[], timezone?: string): string {
   const lines = entries.map((entry) => {
-    const when = entry.scheduledFor ?? 'no time set';
+    const when = renderWhen(entry.scheduledFor, timezone);
     return `- ${entry.agendaId} — ${entry.title} — ${when}`;
   });
   return [
@@ -42,11 +51,11 @@ function renderIndex(entries: AgendaIndexEntry[]): string {
 }
 
 /** Null when there is nothing to say, so the prompt stays byte-identical to a call with no agendas. */
-export function formatAgendaPromptBlock(input: SessionAgendas): string | null {
+export function formatAgendaPromptBlock(input: SessionAgendas, timezone?: string): string | null {
   if (input.loaded.length === 0 && input.index.length === 0) return null;
   const sections: string[] = ['## Meeting agendas'];
   for (const snapshot of input.loaded) sections.push(renderLoaded(snapshot));
-  if (input.index.length > 0) sections.push(renderIndex(input.index));
+  if (input.index.length > 0) sections.push(renderIndex(input.index, timezone));
   return sections.join('\n\n');
 }
 

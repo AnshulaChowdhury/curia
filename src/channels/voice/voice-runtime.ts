@@ -1384,10 +1384,12 @@ export class VoiceRuntime {
     }
 
     let timeContextBlock: string | null = null;
+    let agendaTimezone: string | undefined;
     const timezone = this.config.timezone?.trim();
     if (timezone) {
       try {
         timeContextBlock = formatTimeContextBlock(timezone, new Date());
+        agendaTimezone = timezone;
       } catch (err) {
         this.log.error({ err, timezone }, 'formatTimeContextBlock failed — time context not injected into voice turn; check TIMEZONE config');
       }
@@ -1401,7 +1403,7 @@ export class VoiceRuntime {
       agendaBlock: formatAgendaPromptBlock({
         loaded: session.loadedAgendas,
         index: session.agendaIndex,
-      }),
+      }, agendaTimezone),
       audience: {
         liveTurn: session.caller.liveTurn,
         displayName: session.caller.displayName,

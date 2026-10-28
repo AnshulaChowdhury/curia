@@ -30,11 +30,12 @@ function rowFromCreate(params: {
   };
 }
 
-function makeCtx(input: Record<string, unknown>, repo?: WorkingDocsRepo): ToolContext {
+function makeCtx(input: Record<string, unknown>, repo?: WorkingDocsRepo, timezone?: string): ToolContext {
   return {
     input,
     log: silentLog,
     agentId: 'coordinator',
+    timezone,
     workingDocs: repo,
   } as unknown as ToolContext;
 }
@@ -53,12 +54,14 @@ describe('meeting-agenda-park', () => {
       topics: ['Pipeline'],
       context: 'Board wants a status.',
       source: 'coordinator',
-    }, repo));
+    }, repo, 'America/Toronto'));
     expect(result.success).toBe(true);
     if (!result.success) return;
-    const data = result.data as { agenda_id: string; path: string; expires_at: string };
+    const data = result.data as { agenda_id: string; path: string; expires_at: string; displayTimezone: string };
     expect(data.path).toBe(`/meetings/agendas/${data.agenda_id}.md`);
     expect(data.expires_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(data.expires_at).not.toMatch(/Z$/);
+    expect(data.displayTimezone).toMatch(/UTC/);
     expect(create).toHaveBeenCalledOnce();
     expect(create.mock.calls[0]![0]).toEqual(expect.objectContaining({
       path: data.path,

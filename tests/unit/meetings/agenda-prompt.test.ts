@@ -56,6 +56,19 @@ describe('formatAgendaPromptBlock', () => {
     expect(block).toContain('meeting-agenda-load');
     expect(block).toContain('Ask the caller if you are unsure');
   });
+
+  it('renders a scheduled time in the principal timezone', () => {
+    const block = formatAgendaPromptBlock({
+      loaded: [],
+      index: [{
+        agendaId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+        title: 'Friday sync',
+        scheduledFor: '2026-10-28T16:00:00.000Z',
+      }],
+    }, 'America/Toronto');
+    expect(block).toContain('2026-10-28T12:00:00.000-04:00');
+    expect(block).not.toContain('2026-10-28T16:00:00.000Z');
+  });
 });
 
 describe('parseAgendaLoadResult', () => {

@@ -116,9 +116,9 @@ export class MinutesPipeline {
       stage = 'minutes';
       const mPath = minutesPath(session.id, session.startedAt, this.deps.timezone());
       const snapshots = counted.map((load) => load.snapshot);
-      const existingMinutes = await this.deps.repo.read(mPath);
+      const minutesAlreadyWritten = await this.deps.repo.existsAtPath(mPath);
       let coverage: AgendaCoverage[] | null = null;
-      if (!existingMinutes) {
+      if (!minutesAlreadyWritten) {
         const written = await writeMinutes(this.deps.llm, {
           agendas: snapshots,
           transcriptBody: built.body,
@@ -129,6 +129,12 @@ export class MinutesPipeline {
           return 'failed';
         }
         coverage = written.coverage;
+        if (coverage === null) {
+          this.deps.logger.warn(
+            { sessionId },
+            'meeting pipeline: minutes had no parseable coverage; returning every agenda to pending',
+          );
+        }
         await this.writeIfAbsent(mPath, 'meeting-minutes', {
           session_id: session.id,
           agenda_ids: snapshots.map((agenda) => agenda.agendaId),
@@ -213,7 +219,7 @@ export class MinutesPipeline {
     frontmatter: Record<string, unknown>,
     body: string,
   ): Promise<void> {
-    if (await this.deps.repo.read(path)) return;
+    if (await this.deps.repo.existsAtPath(path)) return;
     try {
       await this.deps.repo.create({ path, type, frontmatter, body, taskId: null });
     } catch (err) {
