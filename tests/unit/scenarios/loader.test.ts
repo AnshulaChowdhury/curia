@@ -879,7 +879,9 @@ describe('the authority-aware PII cases (#2312)', () => {
     for (const id of ['34b', '34g', '34h', '34i', '34j']) expect(kinds(id), id).toContain('not_held');
     // Below 80 an inferred share waits for the principal; a known requester is asked.
     for (const id of ['34c', '34k', '34l']) expect(kinds(id), id).toContain('held');
-    expect(kinds('34k')).toContain('decision_recorded');
+    // The yes is recorded as an important check: it can also reach the requester as a fresh send
+    // the principal directed, with the held one left to expire.
+    expect(byId.get('34k')!.expectedBehaviors.filter(b => b.check?.kind === 'decision_recorded').map(b => b.weight)).toEqual(['important']);
     expect(byId.get('34k')!.inbound.then).toEqual({ content: expect.any(String), channel: 'email' });
     // Where a withheld item's critical check could pass because nothing was ever drafted, an
     // important `reviewed` check shows whether the gateway's path ran.
