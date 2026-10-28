@@ -8,7 +8,14 @@
 // any other provider connected through Nylas.
 
 import NylasDefault from 'nylas';
-import type { DestroyEventQueryParams } from 'nylas';
+import type {
+  CreateEventQueryParams,
+  DestroyEventQueryParams,
+  FindEventQueryParams,
+  ListEventQueryParams,
+  SendRsvpQueryParams,
+  UpdateEventQueryParams,
+} from 'nylas';
 import type { Logger } from '../../logger.js';
 import { ATTENDEE_RSVP_STATUS_KEYS } from './attendee-input.js';
 import type { CalendarAttendeeInput } from './attendee-input.js';
@@ -44,32 +51,32 @@ export interface NylasCalendarLike {
     // page. Needed because Nylas caps a single page at 200 events (see listEvents).
     list(params: {
       identifier: string;
-      queryParams?: Record<string, unknown>;
+      queryParams?: ListEventQueryParams;
     }): Promise<{ data: NylasRawEvent[]; nextCursor?: string }>;
 
     find(params: {
       identifier: string;
       eventId: string;
-      queryParams?: Record<string, unknown>;
+      queryParams?: FindEventQueryParams;
     }): Promise<{ data: NylasRawEvent }>;
 
     create(params: {
       identifier: string;
-      queryParams?: Record<string, unknown>;
+      queryParams?: CreateEventQueryParams;
       requestBody: Record<string, unknown>;
     }): Promise<{ data: NylasRawEvent }>;
 
     update(params: {
       identifier: string;
       eventId: string;
-      queryParams?: Record<string, unknown>;
+      queryParams?: UpdateEventQueryParams;
       requestBody: Record<string, unknown>;
     }): Promise<{ data: NylasRawEvent }>;
 
     sendRsvp(params: {
       identifier: string;
       eventId: string;
-      queryParams: Record<string, unknown>;
+      queryParams: SendRsvpQueryParams;
       requestBody: { status: NylasRsvpStatus };
     }): Promise<NylasRawRsvpResponse>;
 
@@ -323,16 +330,18 @@ export class NylasCalendarClient {
       let pageToken: string | undefined;
       let pages = 0;
       do {
+        const queryParams: ListEventQueryParams = {
+          calendarId,
+          // The SDK types these as strings; the wire value is the same unix timestamp.
+          start: String(startUnix),
+          end: String(endUnix),
+          limit: Math.min(wanted - raw.length, NYLAS_MAX_PAGE_SIZE),
+          // Omitted on the first request — Nylas treats an empty page_token as invalid.
+          ...(pageToken ? { pageToken } : {}),
+        };
         const response = await this.nylas.events.list({
           identifier: this.grantId,
-          queryParams: {
-            calendar_id: calendarId,
-            start: startUnix,
-            end: endUnix,
-            limit: Math.min(wanted - raw.length, NYLAS_MAX_PAGE_SIZE),
-            // Omitted on the first request — Nylas treats an empty page_token as invalid.
-            ...(pageToken ? { pageToken } : {}),
-          },
+          queryParams,
         });
         raw.push(...(response?.data ?? []));
         pages++;
@@ -404,7 +413,7 @@ export class NylasCalendarClient {
       const response = await this.nylas.events.find({
         identifier: this.grantId,
         eventId,
-        queryParams: { calendar_id: calendarId },
+        queryParams: { calendarId },
       });
       return this.normalizeEvent(response.data);
     } catch (err) {
@@ -442,7 +451,7 @@ export class NylasCalendarClient {
 
       const response = await this.nylas.events.create({
         identifier: this.grantId,
-        queryParams: { calendar_id: calendarId },
+        queryParams: { calendarId },
         requestBody,
       });
       return this.normalizeEvent(response.data);
@@ -455,9 +464,9 @@ export class NylasCalendarClient {
   /**
    * Update an existing event.
    *
-   * `notifyAttendees` maps to Nylas `notify_participants`. Default (omit) is
-   * provider-true: Google emails guests; Microsoft and iCloud always notify and
-   * ignore `false`. Guest-list writes replace the entire `participants` array
+   * `notifyAttendees` maps to Nylas `notifyParticipants` (wire `notify_participants`).
+   * Default (omit) is provider-true: Google emails guests; Microsoft and iCloud
+   * always notify and ignore `false`. Guest-list writes replace the entire `participants` array
    * (Nylas PUT nested-object replace) with email/name only — never RSVP status.
    */
   async updateEvent(
@@ -487,9 +496,9 @@ export class NylasCalendarClient {
       if (changes.status) requestBody.status = changes.status;
       if (typeof changes.busy === 'boolean') requestBody.busy = changes.busy;
 
-      const queryParams: Record<string, unknown> = { calendar_id: calendarId };
+      const queryParams: UpdateEventQueryParams = { calendarId };
       if (notifyAttendees !== undefined) {
-        queryParams.notify_participants = notifyAttendees;
+        queryParams.notifyParticipants = notifyAttendees;
       }
 
       const response = await this.nylas.events.update({
@@ -512,7 +521,7 @@ export class NylasCalendarClient {
       const response = await this.nylas.events.sendRsvp({
         identifier: this.grantId,
         eventId,
-        queryParams: { calendar_id: calendarId },
+        queryParams: { calendarId },
         requestBody: { status },
       });
       return {
@@ -526,12 +535,13 @@ export class NylasCalendarClient {
   }
 
   /**
-   * Delete an event. Pass notifyAttendees=false to suppress cancellation emails.
+   * Delete an event.
    *
-   * Maps to Nylas `notifyParticipants` (the SDK snake-cases it to
+   * `notifyAttendees` maps to Nylas `notifyParticipants` (wire
    * `notify_participants`). Default (omit) notifies attendees. Only `false`
-   * sets the flag — `notify_event_creator` is not a v3 delete parameter and
-   * Nylas rejects the request.
+   * sets the flag. Google honours `false`; Microsoft and iCloud ignore it and
+   * still email attendees. `notify_event_creator` is not a v3 delete parameter
+   * and Nylas rejects the request.
    */
   async deleteEvent(calendarId: string, eventId: string, notifyAttendees?: boolean): Promise<void> {
     this.log.debug({ calendarId, eventId, notifyAttendees }, 'Deleting event');

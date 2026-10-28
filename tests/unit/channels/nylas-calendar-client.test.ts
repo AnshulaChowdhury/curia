@@ -115,9 +115,9 @@ describe('NylasCalendarClient', () => {
       expect(sdk.events.list).toHaveBeenCalledWith({
         identifier: 'grant-123',
         queryParams: {
-          calendar_id: 'cal-1',
-          start: Math.floor(new Date('2026-04-01T00:00:00Z').getTime() / 1000),
-          end: Math.floor(new Date('2026-04-02T00:00:00Z').getTime() / 1000),
+          calendarId: 'cal-1',
+          start: String(Math.floor(new Date('2026-04-01T00:00:00Z').getTime() / 1000)),
+          end: String(Math.floor(new Date('2026-04-02T00:00:00Z').getTime() / 1000)),
           limit: 200,
         },
       });
@@ -490,7 +490,7 @@ describe('NylasCalendarClient', () => {
 
       expect(sdk.events.create).toHaveBeenCalledWith({
         identifier: 'grant-123',
-        queryParams: { calendar_id: 'cal-1' },
+        queryParams: { calendarId: 'cal-1' },
         requestBody: expect.objectContaining({
           title: 'Team Standup',
         }),
@@ -505,14 +505,14 @@ describe('NylasCalendarClient', () => {
       expect(sdk.events.update).toHaveBeenCalledWith({
         identifier: 'grant-123',
         eventId: 'evt-1',
-        queryParams: { calendar_id: 'cal-1' },
+        queryParams: { calendarId: 'cal-1' },
         requestBody: expect.objectContaining({
           title: 'Updated',
         }),
       });
     });
 
-    it('maps attendees to email/name only and sets notify_participants', async () => {
+    it('maps attendees to email/name only and sets notifyParticipants', async () => {
       await client.updateEvent(
         'cal-1',
         'evt-1',
@@ -523,7 +523,7 @@ describe('NylasCalendarClient', () => {
       expect(sdk.events.update).toHaveBeenCalledWith({
         identifier: 'grant-123',
         eventId: 'evt-1',
-        queryParams: { calendar_id: 'cal-1', notify_participants: false },
+        queryParams: { calendarId: 'cal-1', notifyParticipants: false },
         requestBody: {
           participants: [
             { email: 'a@example.test', name: 'A' },
@@ -541,13 +541,6 @@ describe('NylasCalendarClient', () => {
   });
 
   describe('deleteEvent', () => {
-    function destroyQueryParams(): Record<string, unknown> {
-      const call = (sdk.events.destroy as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
-        queryParams: Record<string, unknown>;
-      };
-      return call.queryParams;
-    }
-
     it('omits notifyParticipants when notifyAttendees is omitted', async () => {
       await client.deleteEvent('cal-1', 'evt-1');
 
@@ -556,21 +549,16 @@ describe('NylasCalendarClient', () => {
         eventId: 'evt-1',
         queryParams: { calendarId: 'cal-1' },
       });
-      expect(destroyQueryParams()).not.toHaveProperty('notify_event_creator');
     });
 
-    it('sets notifyParticipants false and never notify_event_creator when notifyAttendees is false', async () => {
+    it('sets notifyParticipants false when notifyAttendees is false', async () => {
       await client.deleteEvent('cal-1', 'evt-1', false);
 
-      // The SDK snake-cases notifyParticipants to notify_participants on the wire.
       expect(sdk.events.destroy).toHaveBeenCalledWith({
         identifier: 'grant-123',
         eventId: 'evt-1',
         queryParams: { calendarId: 'cal-1', notifyParticipants: false },
       });
-      const queryParams = destroyQueryParams();
-      expect(queryParams).not.toHaveProperty('notify_event_creator');
-      expect(queryParams).not.toHaveProperty('notifyEventCreator');
     });
 
     it('omits notifyParticipants when notifyAttendees is true', async () => {
@@ -581,7 +569,31 @@ describe('NylasCalendarClient', () => {
         eventId: 'evt-1',
         queryParams: { calendarId: 'cal-1' },
       });
-      expect(destroyQueryParams()).not.toHaveProperty('notify_event_creator');
+    });
+
+    it('sends notify_participants=false and calendar_id on the Nylas request URL', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ request_id: 'req_1' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+      vi.stubGlobal('fetch', fetchMock);
+      try {
+        const real = new NylasCalendarClient('test-key', 'grant-123', logger);
+        await real.deleteEvent('cal-1', 'evt-1', false);
+
+        expect(fetchMock).toHaveBeenCalledOnce();
+        const request = fetchMock.mock.calls[0]![0] as Request;
+        const url = new URL(request.url);
+        expect(request.method).toBe('DELETE');
+        expect(url.pathname).toBe('/v3/grants/grant-123/events/evt-1');
+        expect(url.searchParams.get('calendar_id')).toBe('cal-1');
+        expect(url.searchParams.get('notify_participants')).toBe('false');
+        expect(url.searchParams.has('notify_event_creator')).toBe(false);
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
   });
 
