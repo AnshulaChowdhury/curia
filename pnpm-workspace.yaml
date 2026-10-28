@@ -164,18 +164,8 @@ overrides:
   # 8.3.4 is also clean but younger than minimumReleaseAge, so this install resolves
   # 8.3.3; resolution moves up on its own once the quarantine passes.
   vite: '>=8.3.3'
-  # Two DoS advisories, both fixed in 6.16.0. The prior >=6.15.2 floor was satisfied by
-  # 6.15.3, so googleapis-common stayed on the vulnerable version:
-  #   - CVE-2026-82417 / GHSA-4mjr-xmp4-gh2g: stringify() DoS via attacker-controlled isBuffer
-  #   - CVE-2026-82562 / GHSA-x5fp-wj9c-mxmx: array-limit bypass via bracket-key comma parsing
-  # Raised off >=6.16.0, which admitted 6.16.0 itself (the resolved version). Published
-  # upstream only:
-  #   - GHSA-6pq8-jhm2-2vcw (MED, >=6.7.0 <=6.16.0): stringify() with arrayFormat 'comma'
-  #     throws on an element with a non-callable own toString (DoS)
-  # Raised off >=6.16.1 (#2335), which admitted 6.16.1 itself (the resolved version).
-  # Published upstream only:
-  #   - GHSA-w4cr-vjpx-p82q (LOW, >=6.16.0 <6.16.2): stringify() with allowEmptyArrays
-  #     does not encode empty-array keys, allowing query-string parameter injection
+  # Pulled in by googleapis-common and express (MCP SDK). 6.16.2 is the first release clear of every known
+  # advisory; the newest, GHSA-w4cr-vjpx-p82q (LOW, <6.16.2), is published upstream only.
   qs: '>=6.16.2'
   # Two MED SSRF / trust-boundary advisories, both fixed in 10.5.1. The prior >=10.1.1
   # floor was satisfied by 10.5.0, so @fastify/rate-limit and express-rate-limit (the
