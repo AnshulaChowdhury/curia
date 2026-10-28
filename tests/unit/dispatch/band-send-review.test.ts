@@ -778,8 +778,14 @@ describe('BandSendReview', () => {
     it('lets a personal-details bounce beat a hold that is only for steering, in either order', async () => {
       const detailBounce: BandReviewDecision = { kind: 'bounce', findings: [{ rule: 'pii-not-authorized', detail: 'x' }] };
       const steered: BandReviewDecision = { kind: 'hold', reason: 'Held', findings: [{ rule: 'steered', detail: 'Held' }] };
-      expect(bandReviewModule.combine(detailBounce, steered)).toBe(detailBounce);
-      expect(bandReviewModule.combine(steered, detailBounce)).toBe(detailBounce);
+      // The drafter sees only the details; the steering finding rides along for a send that can't
+      // be rewritten, which the gateway holds with both.
+      const expected = { ...detailBounce, heldBeside: steered.findings };
+      expect(bandReviewModule.combine(detailBounce, steered)).toEqual(expected);
+      expect(bandReviewModule.combine(steered, detailBounce)).toEqual(expected);
+      // Merging with another bounce keeps it.
+      const claimBounce: BandReviewDecision = { kind: 'bounce', findings: [{ rule: 'ungrounded-claim', detail: 'y' }] };
+      expect(bandReviewModule.combine(expected, claimBounce)).toMatchObject({ heldBeside: steered.findings });
       // Any other reason in the hold keeps it the stricter outcome.
       const mixed: BandReviewDecision = {
         kind: 'hold', reason: 'Held',

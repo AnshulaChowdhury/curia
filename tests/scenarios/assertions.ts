@@ -315,7 +315,7 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
     case 'held': {
       if (outcome.holds.length === 0) return miss('no approval was raised');
       const shown = (h: RecordedHold): string =>
-        [h.preamble ?? '', h.description ?? '', ...(h.extraLines ?? [])].join('\n').toLowerCase();
+        [h.preamble ?? '', h.description ?? '', ...(h.extraLines ?? []), h.message ?? ''].join('\n').toLowerCase();
       const hit = outcome.holds.find(h => (check.contains ?? []).every(s => shown(h).includes(s.toLowerCase())));
       return hit
         ? pass(`approval ${hit.approvalNumber ?? hit.shortRef} raised (${hit.toolName}, now ${hit.outcome})`)
@@ -323,7 +323,7 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
     }
     case 'not_held': {
       const shown = (h: RecordedHold): string =>
-        [h.preamble ?? '', h.description ?? '', ...(h.extraLines ?? [])].join('\n').toLowerCase();
+        [h.preamble ?? '', h.description ?? '', ...(h.extraLines ?? []), h.message ?? ''].join('\n').toLowerCase();
       const offending = outcome.holds.filter(h => (check.contains ?? []).every(s => shown(h).includes(s.toLowerCase())));
       return offending.length === 0
         ? pass(check.contains ? `no approval shows the ${termCount(check.contains)} text` : 'no approval was raised')
@@ -347,15 +347,8 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
     case 'reviewed': {
       const reviews = outcome.reviews ?? [];
       const label = check.label.toLowerCase();
-      const matching = reviews.filter(r => r.labels.some(l => l.toLowerCase() === label) && (check.outcome === undefined || r.outcome === check.outcome));
-      const hit = matching[0];
+      const hit = reviews.find(r => r.labels.some(l => l.toLowerCase() === label) && (check.outcome === undefined || r.outcome === check.outcome));
       const seen = reviews.map(r => `${r.outcome} [${r.labels.join(', ') || 'no items'}]`).join('; ') || 'no band review';
-      const what = `band review${check.outcome ? ` ${check.outcome}` : ''} on ${check.label} in a send's own text`;
-      if (check.count !== undefined) {
-        return matching.length === check.count
-          ? pass(`${matching.length} ${what}`)
-          : miss(`expected ${check.count} ${what}; got ${matching.length}. Reviews: ${seen}`);
-      }
       return hit
         ? pass(`band review ruled on ${check.label} (${hit.outcome})`)
         : miss(`no band review ruled on ${check.label}${check.outcome ? ` with outcome ${check.outcome}` : ''} in a send's own text: the path was not exercised. Reviews: ${seen}`);

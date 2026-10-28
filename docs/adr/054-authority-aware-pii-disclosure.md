@@ -65,7 +65,8 @@ redactor behaves as before and the gateway only reports what it removed.
    takes the ordinary judge-failure path without the quote, so an unreviewed quote never goes out.
    The rewrite also comes before a hold that is only for steering (#2333): that approval
    would offer the principal the details to send as written, to whoever steered the send. A
-   recheck that is still steered holds without them.
+   recheck that is still steered holds without them. A saved draft can't be rewritten, so it
+   holds, showing both reasons.
 4. **Quoted-thread exemption.** A detail that appears only in quoted text is not a
    disclosure when every non-principal recipient was already on the quoted message, which the
    gateway confirms from that message's own headers, never from the caller's word. Otherwise

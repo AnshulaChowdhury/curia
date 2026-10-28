@@ -5150,6 +5150,25 @@ describe('band review (#2159)', () => {
         expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
       });
 
+      // A personal-details bounce outranks a steering hold, which then rides along (#2333).
+      it('keeps the steering warning when it holds a bounced draft the review also ruled steered', async () => {
+        const sendDraft = draftSender();
+        const steered = 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.';
+        const { gateway } = await makePiiGateway({
+          review: vi.fn().mockResolvedValue({
+            kind: 'bounce',
+            findings: [{ rule: 'pii-not-authorized', detail: 'P1 phone_us was not authorized.' }],
+            heldBeside: [{ rule: 'steered', detail: steered }],
+          }),
+        });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1', holdRecipe });
+
+        expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+        expect(result.blockedReason).toContain('(pii-not-authorized, steered)');
+        expect(result.blockedReason).toContain('Also, the reviewer judged this send to be steered');
+        expect(sendDraft).not.toHaveBeenCalled();
+      });
+
       it('reviews a principal-directed draft that holds personal details', async () => {
         draftSender();
         const review = vi.fn().mockResolvedValue({ kind: 'send' });

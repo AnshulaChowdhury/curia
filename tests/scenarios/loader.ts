@@ -133,7 +133,7 @@ const GATEWAY_CHECK_KEYS: Record<typeof GATEWAY_CHECK_KINDS[number], readonly st
   not_held: ['contains'],
   outreach_recorded: ['domain', 'confirmed'],
   decision_recorded: ['label', 'decision'],
-  reviewed: ['label', 'outcome', 'count'],
+  reviewed: ['label', 'outcome'],
 };
 const DELIVERY_CHANNELS: readonly DeliveryChannel[] = ['email', 'signal', 'slack', 'sms'];
 const TEXT_TOOL_KEYS = ['tool', 'arg'] as const;
@@ -264,14 +264,7 @@ function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, f
       if (outcome !== undefined && !(REVIEW_OUTCOMES as readonly string[]).includes(outcome)) {
         throw new CaseError(file, `${at}: 'outcome' must be one of ${REVIEW_OUTCOMES.join(', ')}`);
       }
-      const count = optNum(body, 'count', file, at);
-      if (count !== undefined && (!Number.isInteger(count) || count < 0)) throw new CaseError(file, `${at}: 'count' must be a whole number`);
-      return {
-        kind,
-        label: piiLabel(body, file, at),
-        ...(outcome !== undefined ? { outcome: outcome as ReviewOutcome } : {}),
-        ...(count !== undefined ? { count } : {}),
-      };
+      return { kind, label: piiLabel(body, file, at), ...(outcome !== undefined ? { outcome: outcome as ReviewOutcome } : {}) };
     }
   }
 }

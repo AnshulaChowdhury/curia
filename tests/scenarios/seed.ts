@@ -1220,6 +1220,7 @@ export async function readGatewayOutcome(stack: TestModeStack, scenario: Scenari
         description: r.description,
         ...(shown ? { preamble: shown.preamble } : {}),
         ...(shown?.extraLines ? { extraLines: shown.extraLines } : {}),
+        ...(shown ? heldMessage(shown.payload) : {}),
       };
     }),
     // A seeded row counts only when the run's sends added to it.
@@ -1231,4 +1232,10 @@ export async function readGatewayOutcome(stack: TestModeStack, scenario: Scenari
     decisions: decisions.rows.map(r => ({ label: r.label, decision: r.decision })),
     reviewerFailedOpen: scope.failOpen.isTripped(),
   };
+}
+
+/** The held message's own text from an approval's display payload (#2333): subject, body, message. */
+function heldMessage(payload: Record<string, unknown>): { message?: string } {
+  const parts = ['subject', 'body', 'message'].map(k => payload[k]).filter((v): v is string => typeof v === 'string' && v.length > 0);
+  return parts.length > 0 ? { message: parts.join('\n') } : {};
 }

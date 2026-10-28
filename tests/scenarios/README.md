@@ -778,9 +778,7 @@ send's own text (body or subject; a quote's items do not count), with that `outc
 (`send`, `bounce`, `block`, `hold`) when set. It tells a run whose drafter never wrote the
 item apart from one the review stopped, so a "nothing went out" check that passes because
 nothing was ever drafted shows as not exercised. Make it `important`, not `critical`: whether
-the drafter reaches for an item is the model's choice. With `count`, it passes only when exactly that many
-reviews match: `{ label: sin_ca, outcome: hold, count: 0 }` is critical-safe, since no review
-held a send with the SIN in its own text, whatever the drafter chose. The recording gateway records each
+the drafter reaches for an item is the model's choice. The recording gateway records each
 review's labels and outcome, never the values (`recordingBandReview`,
 `src/startup/test-mode-sends.ts`).
 

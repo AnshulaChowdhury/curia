@@ -127,7 +127,7 @@ export type BehaviorCheck =
    * (body or subject, not a quoted message) this run, with that `outcome` when set: whether
    * the path a case exists for was exercised at all (#2312).
    */
-  | { kind: 'reviewed'; label: string; outcome?: ReviewOutcome; count?: number }
+  | { kind: 'reviewed'; label: string; outcome?: ReviewOutcome }
   /**
    * Passes when any alternative passes. For a behavior the platform accepts in more
    * than one shape — e.g. delegate links an entry from `outbound_entry_id` or from its
@@ -640,6 +640,11 @@ export interface RecordedHold {
   /** What the principal is shown at the top of the approval (an ask's question), when registered. */
   preamble?: string;
   extraLines?: string[];
+  /**
+   * The held message's own text as the approval shows it: subject, body or message, never the
+   * quoted thread (#2333). Approving sends it, so a check on what is offered reads it here.
+   */
+  message?: string;
 }
 
 export interface RecordedOutreach {

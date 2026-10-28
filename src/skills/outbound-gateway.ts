@@ -2278,11 +2278,14 @@ export class OutboundGateway {
     // asks for a rewrite it cannot get, and copying the principal would change its stored
     // recipients: the principal decides either way. Rule names and labels only, never values.
     if (args.editable === false && (args.detectedItems?.length ?? 0) > 0 && decision.kind === 'bounce') {
-      const rules = decision.findings.map((f) => f.rule).join(', ');
+      // A steering hold the bounce outranked comes along (#2333): the principal sees its warning.
+      const findings = [...decision.findings, ...(decision.heldBeside ?? [])];
+      const rules = [...new Set(findings.map((f) => f.rule))].join(', ');
+      const beside = (decision.heldBeside ?? []).map((f) => ` ${f.detail.replace(/^Held for the principal: /, 'Also, ')}`).join('');
       decision = {
         kind: 'hold',
-        reason: `Held for the principal: a saved draft can't be rewritten in place, and the review found these problems (${rules}).`,
-        findings: decision.findings,
+        reason: `Held for the principal: a saved draft can't be rewritten in place, and the review found these problems (${rules}).${beside}`,
+        findings,
       };
     }
 

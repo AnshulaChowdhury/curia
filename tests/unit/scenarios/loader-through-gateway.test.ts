@@ -133,10 +133,6 @@ expected_behaviors:`));
     description: the review bounced the phone
     check:
       reviewed: { label: phone_us, outcome: bounce }
-  - id: never-held
-    description: no review held the SIN
-    check:
-      reviewed: { label: sin_ca, outcome: hold, count: 0 }
   - id: own-words
     description: Curia's own words carry no SIN
     check:
@@ -147,10 +143,9 @@ expected_behaviors:`));
       delivered: { to: pat, quote_contains: ["0123"] }
   - id: no-ask
 `));
-    expect(c.expectedBehaviors.map(b => b.check).slice(-6, -1)).toEqual([
+    expect(c.expectedBehaviors.map(b => b.check).slice(-5, -1)).toEqual([
       { kind: 'reviewed', label: 'sin_ca' },
       { kind: 'reviewed', label: 'phone_us', outcome: 'bounce' },
-      { kind: 'reviewed', label: 'sin_ca', outcome: 'hold', count: 0 },
       { kind: 'delivered', to: 'pat', contains: ['692'], count: 0, ownText: true },
       { kind: 'delivered', to: 'pat', quoteContains: ['0123'] },
     ]);
@@ -174,7 +169,6 @@ expected_behaviors:`));
     ['a bad delivery channel', (s: string) => s.replace('channel: signal, to: principal', 'channel: fax, to: principal'), /'channel' must be one of/],
     ['a reviewed check without a label', (s: string) => s.replace('held: true', 'reviewed: true'), /'label' must be a non-empty string/],
     ['a reviewed check with an unknown outcome', (s: string) => s.replace('held: true', 'reviewed: { label: sin_ca, outcome: shred }'), /'outcome' must be one of send, bounce, block, hold/],
-    ['a reviewed count that is not a whole number', (s: string) => s.replace('held: true', 'reviewed: { label: sin_ca, count: 1.5 }'), /'count' must be a whole number/],
     ['delivered own_text: false', (s: string) => s.replace('count: 1 }', 'count: 1, own_text: false }'), /'own_text' is true or absent/],
     ['a decision other than yes or no', (s: string) => s.replace('decision: "yes"', 'decision: maybe'), /'decision' must be yes or no/],
     ['a gateway check that is not a mapping', (s: string) => s.replace('held: true', 'held: [SIN]'), /must be true or a mapping/],
