@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import pino from 'pino';
 import { TaskUpdateHandler } from './handler.js';
-import { BLOCKED_BY_TASK_ID_ERROR } from '../../optional-ref.js';
+import { BLOCKED_BY_TASK_ID_ERROR, SELF_BLOCK_ERROR } from '../../optional-ref.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { TaskRepo } from '../../../../src/db/task-repo.js';
 import type { TaskRow } from '../../../../src/db/queries/tasks.js';
@@ -272,13 +272,14 @@ describe('TaskUpdateHandler', () => {
     expect((result as { success: false; error: string }).error).toMatch(/not found/);
   });
 
-  // #2328: same placeholder treatment as task-create. JSON null still clears.
+  // #2328: JSON null clears. A string placeholder is an error, even beside a
+  // status change — a success that left the blocker set would look like a clear.
   // Omitting the field must not clear: the repo writes the column whenever the key is present.
   describe('blocked_by_task_id (#2328)', () => {
     const placeholders = ['', ' ', 'null', 'none', 'undefined', 'NULL', 'None', ' Undefined '];
     const blockerId = '8c4b1e2a-1111-4111-8111-111111111111';
 
-    it.each(placeholders)('leaves the blocker unchanged when given %j', async (value) => {
+    it.each(placeholders)('rejects %j even when another field is set', async (value) => {
       const updateTask = vi.fn().mockResolvedValue(makeTaskRow());
       const taskRepo = makeTaskRepo({ updateTask });
       const ctx = makeCtx({
@@ -288,10 +289,11 @@ describe('TaskUpdateHandler', () => {
 
       const result = await new TaskUpdateHandler().execute(ctx);
 
-      expect(result.success).toBe(true);
-      const updates = updateTask.mock.calls[0]![1] as { status?: string; blockedByTaskId?: string | null };
-      expect(updates.status).toBe('waiting');
-      expect(updates).not.toHaveProperty('blockedByTaskId');
+      expect(result.success).toBe(false);
+      const error = (result as { success: false; error: string }).error;
+      expect(error).toMatch(/pass JSON null to clear the blocker, or omit the field/);
+      expect(error).toContain(JSON.stringify(value.trim()));
+      expect(updateTask).not.toHaveBeenCalled();
     });
 
     it('does not clear the blocker when the field is omitted', async () => {
@@ -321,7 +323,7 @@ describe('TaskUpdateHandler', () => {
       expect(getTask).not.toHaveBeenCalled();
     });
 
-    it('does not treat a placeholder-only call as an update', async () => {
+    it('tells a placeholder-only call to pass JSON null or omit the field', async () => {
       const updateTask = vi.fn();
       const taskRepo = makeTaskRepo({ updateTask });
       const ctx = makeCtx({
@@ -332,8 +334,27 @@ describe('TaskUpdateHandler', () => {
       const result = await new TaskUpdateHandler().execute(ctx);
 
       expect(result.success).toBe(false);
-      expect((result as { success: false; error: string }).error).toMatch(/at least one/i);
+      expect((result as { success: false; error: string }).error).toBe(
+        'blocked_by_task_id: "null" is a string; pass JSON null to clear the blocker, or omit the field.',
+      );
       expect(updateTask).not.toHaveBeenCalled();
+    });
+
+    it('rejects a blocker that is the task itself and does not look it up', async () => {
+      const updateTask = vi.fn();
+      const getTask = vi.fn();
+      const taskRepo = makeTaskRepo({ updateTask, getTask });
+      const ctx = makeCtx({
+        input: { task_id: VALID_UUID, blocked_by_task_id: VALID_UUID.toUpperCase() },
+        taskRepo,
+      });
+
+      const result = await new TaskUpdateHandler().execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toBe(SELF_BLOCK_ERROR);
+      expect(updateTask).not.toHaveBeenCalled();
+      expect(getTask).not.toHaveBeenCalled();
     });
 
     it('rejects "curia" and never calls the repo', async () => {
@@ -403,7 +424,7 @@ describe('TaskUpdateHandler', () => {
       const result = await new TaskUpdateHandler().execute(ctx);
 
       const error = (result as { success: false; error: string }).error;
-      expect(error).toMatch(/task not found/i);
+      expect(error).toMatch(/blocked_by_task_id: task not found/);
       expect(error).not.toMatch(/violates foreign key/);
     });
   });

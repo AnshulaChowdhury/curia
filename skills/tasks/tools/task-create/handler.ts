@@ -116,7 +116,6 @@ export class TaskCreateHandler implements ToolHandler {
       'waiting_on_contact_id',
       input.waiting_on_contact_id,
       WAITING_ON_CONTACT_ID_ERROR,
-      { contactPlaceholder: true },
     );
     if (!waitingRef.ok) return { success: false, error: waitingRef.error };
 
@@ -224,17 +223,21 @@ export class TaskCreateHandler implements ToolHandler {
     const seededProgressNote = [input.progress_note, pastDueNote].filter(Boolean).join(' ').trim() || undefined;
 
     try {
-      if (parentRef.id) {
-        const parent = await ctx.taskRepo.getTask(parentRef.id);
-        if (!parent) return { success: false, error: taskNotFoundError('parent_task_id', parentRef.id) };
+      // The three lookups are independent. Run them together, then report the
+      // first missing row in a stable field order.
+      const [parent, blocker, contact] = await Promise.all([
+        parentRef.id ? ctx.taskRepo.getTask(parentRef.id) : null,
+        blockedRef.id ? ctx.taskRepo.getTask(blockedRef.id) : null,
+        waitingRef.id && ctx.contactService ? ctx.contactService.getContact(waitingRef.id) : undefined,
+      ]);
+      if (parentRef.id && !parent) {
+        return { success: false, error: taskNotFoundError('parent_task_id', parentRef.id) };
       }
-      if (blockedRef.id) {
-        const blocker = await ctx.taskRepo.getTask(blockedRef.id);
-        if (!blocker) return { success: false, error: taskNotFoundError('blocked_by_task_id', blockedRef.id) };
+      if (blockedRef.id && !blocker) {
+        return { success: false, error: taskNotFoundError('blocked_by_task_id', blockedRef.id) };
       }
-      if (waitingRef.id && ctx.contactService) {
-        const contact = await ctx.contactService.getContact(waitingRef.id);
-        if (!contact) return { success: false, error: contactNotFoundError(waitingRef.id) };
+      if (waitingRef.id && ctx.contactService && !contact) {
+        return { success: false, error: contactNotFoundError(waitingRef.id) };
       }
 
       ctx.log.info(
@@ -250,6 +253,9 @@ export class TaskCreateHandler implements ToolHandler {
         description: input.description,
         owner: (input.owner as 'curia' | 'ceo' | 'external') ?? 'curia',
         parentTaskId: parentRef.id,
+        // The row just loaded. createTask uses it for originator capping and
+        // does not read the parent a second time.
+        ...(parent ? { parentTask: parent } : {}),
         blockedByTaskId: blockedRef.id,
         priority: input.priority,
         dueAt,

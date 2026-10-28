@@ -539,6 +539,23 @@ describe('optional reference ids (#2328)', () => {
     expect(createTask.mock.calls[0]![0].blockedByTaskId).toBe(presentTaskId);
   });
 
+  it('passes the loaded parent row through so createTask does not read it again', async () => {
+    const parent = makeTaskRow({ id: presentTaskId });
+    const createTask = vi.fn().mockResolvedValue(makeTaskRow());
+    const getTask = vi.fn().mockResolvedValue(parent);
+    const taskRepo = makeTaskRepo({ createTask, getTask });
+    const ctx = makeCtx({
+      input: { title: 'Follow-up', parent_task_id: presentTaskId },
+      taskRepo,
+    });
+
+    const result = await new TaskCreateHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(getTask).toHaveBeenCalledTimes(1);
+    expect(createTask.mock.calls[0]![0].parentTask).toBe(parent);
+  });
+
   it('returns contact not found for a missing waiting_on_contact_id and does not insert', async () => {
     const createTask = vi.fn();
     const contactId = '22222222-2222-4222-8222-222222222222';
@@ -556,18 +573,21 @@ describe('optional reference ids (#2328)', () => {
     expect(createTask).not.toHaveBeenCalled();
   });
 
-  it('names an unresolved contact placeholder instead of a uuid cast error', async () => {
+  it('names a copied contact token without pointing at the principal', async () => {
     const createTask = vi.fn();
     const taskRepo = makeTaskRepo({ createTask });
     const ctx = makeCtx({
-      input: { title: 'Chase the vendor', waiting_on_contact_id: '${principal_contact_id}' },
+      input: { title: 'Chase the vendor', waiting_on_contact_id: '${vendor_contact_id}' },
       taskRepo,
     });
 
     const result = await new TaskCreateHandler().execute(ctx);
 
     expect(result.success).toBe(false);
-    expect((result as { success: false; error: string }).error).toMatch(/Unresolved template placeholder/);
+    const error = (result as { success: false; error: string }).error;
+    expect(error).toContain('${vendor_contact_id}');
+    expect(error).toContain('waiting_on_contact_id must be a contact UUID');
+    expect(error).not.toMatch(/principal/i);
     expect(createTask).not.toHaveBeenCalled();
   });
 
@@ -609,8 +629,30 @@ describe('optional reference ids (#2328)', () => {
 
     expect(result.success).toBe(false);
     const error = (result as { success: false; error: string }).error;
-    expect(error).toMatch(/task not found/i);
+    expect(error).toMatch(/blocked_by_task_id: task not found/);
     expect(error).not.toMatch(/violates foreign key|invalid input syntax/);
+  });
+
+  it('names the parent field when that foreign key fails', async () => {
+    const fk = Object.assign(
+      new Error('insert or update on table "tasks" violates foreign key constraint "tasks_parent_task_id_fkey"'),
+      { code: '23503', constraint: 'tasks_parent_task_id_fkey' },
+    );
+    const taskRepo = makeTaskRepo({
+      getTask: vi.fn().mockResolvedValue(makeTaskRow({ id: presentTaskId })),
+      createTask: vi.fn().mockRejectedValue(fk),
+    });
+    const ctx = makeCtx({
+      input: { title: 'Follow-up', parent_task_id: presentTaskId },
+      taskRepo,
+    });
+
+    const result = await new TaskCreateHandler().execute(ctx);
+
+    expect(result.success).toBe(false);
+    const error = (result as { success: false; error: string }).error;
+    expect(error).toMatch(/parent_task_id: task not found/);
+    expect(error).not.toMatch(/blocked_by_task_id|violates foreign key/);
   });
 });
 

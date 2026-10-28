@@ -13,7 +13,7 @@
     "wake_at": "timestamp?",
     "tags": "string[]?",
     "progress_note": "string? (over 2000 chars is truncated, not refused)",
-    "blocked_by_task_id": "string|null? (UUID of blocking task, or null to clear)"
+    "blocked_by_task_id": "string|null? (task UUID, or JSON null to clear; omit otherwise)"
   },
   "outputs": {
     "task_id": "string",

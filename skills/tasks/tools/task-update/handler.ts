@@ -10,7 +10,9 @@ import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestam
 import { isUuid } from '../../../../src/util/uuid.js';
 import {
   BLOCKED_BY_TASK_ID_ERROR,
+  SELF_BLOCK_ERROR,
   foreignKeyReferenceError,
+  placeholderBlockerError,
   resolveOptionalId,
   taskNotFoundError,
 } from '../../optional-ref.js';
@@ -77,21 +79,25 @@ export class TaskUpdateHandler implements ToolHandler {
       ctx.log.warn({ taskId: input.task_id, originalLength }, 'task-update: progress_note truncated');
     }
     // JSON null clears the blocker. The string "null" (and none/undefined/blank) is
-    // the model filling an optional field, not a clear — leave the existing blocker
-    // alone. Passing the key as undefined would clear it: the repo treats
-    // `'blockedByTaskId' in updates` as "set this column" (#2328).
+    // rejected, not ignored: a success that left the blocker set would tell the
+    // model the task is unblocked (#2328). Omitting the key is what leaves it
+    // alone — the repo writes the column whenever the key is present.
     let blockerUpdate: { present: false } | { present: true; id: string | null } = { present: false };
     if (input.blocked_by_task_id !== undefined) {
       if (input.blocked_by_task_id === null) {
         blockerUpdate = { present: true, id: null };
-      } else {
+      } else if (typeof input.blocked_by_task_id === 'string') {
+        const placeholder = placeholderBlockerError(input.blocked_by_task_id);
+        if (placeholder) return { success: false, error: placeholder };
         const resolved = resolveOptionalId('blocked_by_task_id', input.blocked_by_task_id, BLOCKED_BY_TASK_ID_ERROR);
         if (!resolved.ok) return { success: false, error: resolved.error };
         if (resolved.id !== undefined) blockerUpdate = { present: true, id: resolved.id };
+      } else {
+        return { success: false, error: BLOCKED_BY_TASK_ID_ERROR };
       }
     }
 
-    // Require at least one field to update. A placeholder blocker does not count.
+    // Require at least one field to update.
     const hasUpdate = input.status !== undefined || input.priority !== undefined
       || input.owner !== undefined || input.due_at !== undefined
       || input.wake_at !== undefined || input.tags !== undefined
@@ -133,6 +139,9 @@ export class TaskUpdateHandler implements ToolHandler {
 
     try {
       if (blockerUpdate.present && blockerUpdate.id !== null) {
+        if (blockerUpdate.id.toLowerCase() === input.task_id.toLowerCase()) {
+          return { success: false, error: SELF_BLOCK_ERROR };
+        }
         const blocker = await ctx.taskRepo.getTask(blockerUpdate.id);
         if (!blocker) {
           return { success: false, error: taskNotFoundError('blocked_by_task_id', blockerUpdate.id) };

@@ -100,8 +100,11 @@ interface AgentBudget {
 // the clear_site_data action, its domain input, the settled/redirect_chain/console_errors/cleared
 // outputs, and one line on what settled:false means (the existing challenge sentence was folded
 // into it): +238 bytes, 81,862 over 73 local tools. The budget rises by exactly that delta.
+// #2328 optional task ids say to omit a placeholder: task-create's three id inputs and
+// task-update's blocker input (+132 bytes). The coordinator had 109 bytes of slack, so its
+// budget rises by 23 to 81,885. ceo-inbox was exact, so its budget rises by 132 to 45,471.
 const AGENT_BUDGETS: AgentBudget[] = [
-  { agent: 'coordinator', alwaysOnPromptTokens: 3_200, localToolDefinitionBytes: 81_862, allowMcpPins: false, rosterTokens: 500 },
+  { agent: 'coordinator', alwaysOnPromptTokens: 3_200, localToolDefinitionBytes: 81_885, allowMcpPins: false, rosterTokens: 500 },
   // Specialists, trimmed per ADR-046 in #2025 (baseline log, final phase).
   // calendar: YAML 28,727 → 23,897 chars (~7,187 → ~5,984 tokens always-on); 24,370 bytes over 19 local tools.
   { agent: 'calendar', alwaysOnPromptTokens: 6_200, localToolDefinitionBytes: 25_000, allowMcpPins: false },
@@ -112,7 +115,9 @@ const AGENT_BUDGETS: AgentBudget[] = [
   // under the 44,800 ceiling.
   // contact-update accepts contact_id "principal" (#2226): +38 bytes, 45,339 over 45 local tools.
   // The budget rises by exactly that delta.
-  { agent: 'ceo-inbox', alwaysOnPromptTokens: 14_100, localToolDefinitionBytes: 45_339, allowMcpPins: false },
+  // #2328 optional id hints (+132 bytes, the same delta as the coordinator's schema growth):
+  // 45,471 over 45 local tools.
+  { agent: 'ceo-inbox', alwaysOnPromptTokens: 14_100, localToolDefinitionBytes: 45_471, allowMcpPins: false },
   // contacts: YAML 15,595 → 11,423 chars (~4,831 → ~3,788 tokens always-on with its SKILL.md bodies);
   // 35,311 bytes over its local tools.
   { agent: 'contacts', alwaysOnPromptTokens: 3_900, localToolDefinitionBytes: 36_400, allowMcpPins: false },
