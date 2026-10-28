@@ -59,6 +59,11 @@ export interface CreateTaskParams {
   description?: string;
   owner?: 'curia' | 'ceo' | 'external';
   parentTaskId?: string;
+  /**
+   * Parent row the caller already loaded. When its id matches `parentTaskId`,
+   * originator capping uses this row and does not read the parent again.
+   */
+  parentTask?: TaskRow | null;
   blockedByTaskId?: string;
   priority?: number;
   dueAt?: Date;
@@ -204,6 +209,7 @@ export class TaskRepo {
       description,
       owner = 'curia',
       parentTaskId,
+      parentTask,
       blockedByTaskId,
       priority = 50,
       dueAt,
@@ -230,10 +236,13 @@ export class TaskRepo {
 
     // Resolve the lineage to stamp (#1125). For a child task, cap the creating event's
     // originator to the parent's lineage so a child can never carry standing above its parent.
-    // The parent fetch is an extra round-trip on the child-creation path only (rare).
+    // Callers that already loaded the parent (task-create) pass it in; everyone else
+    // pays one read on the child-creation path only.
     let resolvedOriginator: TaskOriginator | null = originator ?? null;
     if (parentTaskId) {
-      const parent = await this.getTask(parentTaskId);
+      const parent = parentTask && parentTask.id === parentTaskId
+        ? parentTask
+        : await this.getTask(parentTaskId);
       resolvedOriginator = capOriginatorToParent(resolvedOriginator, parent?.originator ?? null);
     }
     const originatorJson = resolvedOriginator ? JSON.stringify(resolvedOriginator) : null;
