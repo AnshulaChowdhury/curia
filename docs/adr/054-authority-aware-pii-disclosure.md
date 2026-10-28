@@ -67,7 +67,8 @@ redactor behaves as before and the gateway only reports what it removed.
    the principal below 80: that approval
    would offer the principal the details to send as written, to whoever steered the send. A
    recheck that is still steered holds without them. A saved draft can't be rewritten, so it
-   holds, showing both reasons.
+   holds, showing both reasons; so does a blocked rewrite that a relayed reply or saved draft
+   holds instead.
 4. **Quoted-thread exemption.** A detail that appears only in quoted text is not a
    disclosure when every non-principal recipient was already on the quoted message, which the
    gateway confirms from that message's own headers, never from the caller's word. Otherwise

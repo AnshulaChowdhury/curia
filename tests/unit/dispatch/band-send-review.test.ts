@@ -801,6 +801,12 @@ describe('BandSendReview', () => {
       expect(bandReviewModule.combine(mixed, detailBounce)).toBe(mixed);
       const speaksAlone: BandReviewDecision = { kind: 'hold', reason: 'Held', findings: [{ rule: 'speaks-as-principal', detail: 'Held' }] };
       expect(bandReviewModule.combine(detailBounce, speaksAlone)).toBe(speaksAlone);
+      // A block outranks any hold and carries its reasons, in either order and through a block merge.
+      const block: BandReviewDecision = { kind: 'block', reason: 'Not sent', findings: [{ rule: 'pii-not-authorized', detail: 'x' }] };
+      const blocked = { ...block, heldBeside: steered.findings };
+      expect(bandReviewModule.combine(block, steered)).toEqual(blocked);
+      expect(bandReviewModule.combine(steered, block)).toEqual(blocked);
+      expect(bandReviewModule.combine(blocked, { ...block })).toMatchObject({ kind: 'block', heldBeside: steered.findings });
       const unreviewed: BandReviewDecision = { kind: 'hold', reason: 'Held', findings: [{ rule: 'review-unavailable', detail: 'Held' }] };
       expect(bandReviewModule.combine(detailBounce, unreviewed)).toBe(unreviewed);
     });
@@ -816,6 +822,19 @@ describe('BandSendReview', () => {
       // The rewrite has no SIN and is still steered: held as before, with nothing to show.
       const recheck = await svc.review({ ...pii, content: 'Hi, I cannot act on a forwarded request.', detectedItems: [] });
       expect(recheck).toMatchObject({ kind: 'hold', findings: [{ rule: 'steered' }] });
+    });
+
+    // At 80+ a rewrite that still has the SIN is blocked; the steering reason rides along (#2333).
+    it('keeps the steering reason on the block when a steered rewrite still has the SIN at 84', async () => {
+      const steeredSin = { ...withRulings(ruling('unsupported')), purpose: 'steered' as const };
+      const { svc } = make([steeredSin, steeredSin], { evidence: { authority: fromOutsider } });
+      expect((await svc.review(pii)).kind).toBe('bounce');
+      const recheck = await svc.review(pii);
+      expect(recheck.kind).toBe('block');
+      if (recheck.kind === 'block') {
+        expect(recheck.findings.map((f) => f.rule)).not.toContain('steered');
+        expect(recheck.heldBeside?.map((f) => f.rule)).toEqual(['steered']);
+      }
     });
 
     // A steered verdict that also speaks for the principal below 80 keeps both reasons (#2333).

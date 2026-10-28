@@ -161,7 +161,8 @@ export type BandReviewDecision =
   // send that can't be rewritten (a saved draft) holds with both, so its warning still shows.
   | { kind: 'bounce'; findings: FilterFinding[]; strangerRequest?: { labels: string[]; requester: string }; heldBeside?: FilterFinding[] }
   // Not sent, and not held for the principal: the drafter must rewrite it again (80+ only). The gateway converts it to a hold for a relayed reply or a saved draft.
-  | { kind: 'block'; reason: string; findings: FilterFinding[] }
+  // heldBeside: a hold this block outranked (#2333). The drafter sees only `findings`; the converted hold shows both.
+  | { kind: 'block'; reason: string; findings: FilterFinding[]; heldBeside?: FilterFinding[] }
   // ask: the hold waits only on the principal's yes to a requester (#2312).
   | { kind: 'hold'; reason: string; findings: FilterFinding[]; ask?: BandReviewAsk };
 
@@ -681,10 +682,10 @@ function rewritesDetails(d: BandReviewDecision): boolean {
   return d.kind === 'bounce' && d.findings.some((f) => f.rule === BAND_RULES.pii);
 }
 
-/** The bounce, carrying the steering hold it outranked (#2333). */
-function withHeldBeside(bounce: BandReviewDecision, hold: BandReviewDecision): BandReviewDecision {
-  if (bounce.kind !== 'bounce' || hold.kind !== 'hold') return bounce;
-  return { ...bounce, heldBeside: [...(bounce.heldBeside ?? []), ...hold.findings] };
+/** The bounce or block, carrying the reasons of the hold it outranked (#2333). */
+function withHeldBeside(winner: BandReviewDecision, hold: BandReviewDecision): BandReviewDecision {
+  if ((winner.kind !== 'bounce' && winner.kind !== 'block') || hold.kind !== 'hold') return winner;
+  return { ...winner, heldBeside: [...(winner.heldBeside ?? []), ...hold.findings] };
 }
 
 /**
@@ -722,6 +723,9 @@ export function combine(a: BandReviewDecision, b: BandReviewDecision): BandRevie
   if (b.kind === 'bounce' && a.kind === 'hold' && a.ask) return b;
   if (rewritesDetails(a) && steeredOnly(b)) return withHeldBeside(a, b);
   if (rewritesDetails(b) && steeredOnly(a)) return withHeldBeside(b, a);
+  // A block outranks a hold, but the gateway holds a block nobody can rewrite: it keeps the hold's reasons (#2333).
+  if (a.kind === 'block' && b.kind === 'hold') return withHeldBeside(a, b);
+  if (b.kind === 'block' && a.kind === 'hold') return withHeldBeside(b, a);
   if (STRICTNESS[a.kind] !== STRICTNESS[b.kind]) return STRICTNESS[a.kind] > STRICTNESS[b.kind] ? a : b;
   if (a.kind === 'send' && b.kind === 'send') {
     const report = a.report ?? b.report;
@@ -744,7 +748,10 @@ export function combine(a: BandReviewDecision, b: BandReviewDecision): BandRevie
       ...(heldBeside.length > 0 ? { heldBeside } : {}),
     };
   }
-  if (a.kind === 'block' && b.kind === 'block') return { kind: 'block', reason: a.reason, findings: [...a.findings, ...b.findings] };
+  if (a.kind === 'block' && b.kind === 'block') {
+    const heldBeside = [...(a.heldBeside ?? []), ...(b.heldBeside ?? [])];
+    return { kind: 'block', reason: a.reason, findings: [...a.findings, ...b.findings], ...(heldBeside.length > 0 ? { heldBeside } : {}) };
+  }
   if (a.kind === 'hold' && b.kind === 'hold') {
     const findings = [...a.findings, ...b.findings];
     const ask = a.ask ?? b.ask;

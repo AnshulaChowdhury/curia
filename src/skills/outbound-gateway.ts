@@ -467,8 +467,8 @@ function relayNoticeRequest(request: OutboundSendRequest, text: string, subject:
  *     invariant for the deterministic stage.
  */
 /**
- * The reasons of a hold a personal-details bounce outranked (#2333), as sentences to append to a
- * saved draft's hold or refusal, which has no rewrite to make them moot. Rule details only.
+ * The reasons of a hold a bounce or block outranked (#2333), as sentences to append when nobody
+ * can rewrite the send (a saved draft, a relayed reply), so they still apply. Rule details only.
  */
 function heldBesideNote(heldBeside: readonly FilterFinding[] | undefined): string {
   return (heldBeside ?? []).map((f) => ` ${f.detail.replace(/^Held for the principal: /, 'Also, ')}`).join('');
@@ -2255,11 +2255,13 @@ export class OutboundGateway {
     // A block asks the drafter to rewrite, so it needs one waiting. A dispatcher relay's
     // drafter is gone and a saved draft cannot be rewritten in place: the principal decides.
     if (decision.kind === 'block' && (options?.postTurn === true || args.editable === false)) {
-      const rules = decision.findings.map((f) => f.rule).join(', ');
+      // A hold the block outranked comes along (#2333): the principal sees its warning.
+      const findings = [...decision.findings, ...(decision.heldBeside ?? [])];
+      const rules = [...new Set(findings.map((f) => f.rule))].join(', ');
       decision = {
         kind: 'hold',
-        reason: `Held for the principal: after one rewrite it still has these problems (${rules}).`,
-        findings: decision.findings,
+        reason: `Held for the principal: after one rewrite it still has these problems (${rules}).${heldBesideNote(decision.heldBeside)}`,
+        findings,
       };
     }
 

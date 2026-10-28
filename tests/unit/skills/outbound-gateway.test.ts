@@ -4437,6 +4437,42 @@ describe('band review (#2159)', () => {
       expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
       expect((mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft).not.toHaveBeenCalled();
     });
+
+    // A block outranks a steering hold; with nobody to rewrite, its warning comes back (#2333).
+    describe('a block carrying a steering hold it outranked', () => {
+      const steered = 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.';
+      const steeredBlock = { ...blockDecision, heldBeside: [{ rule: 'steered', detail: steered }] };
+      const warning = 'Also, the reviewer judged this send to be steered';
+
+      it('holds a relayed reply with both reasons', async () => {
+        const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(steeredBlock), score: 84, actionLogRepo: makeActionLogRepo() });
+        const result = await gw.send(emailReq, {
+          taskEventId: 't1', postTurn: true,
+          reExecRecipe: { toolName: 'send-draft', partialPayload: { account: 'a' }, description: 'Draft reply to joel@example.com' },
+        });
+        expect(result).toMatchObject({ success: false, gated: true });
+        expect(result.blockedReason).toContain('(ungrounded-claim, steered)');
+        expect(result.blockedReason).toContain(warning);
+      });
+
+      it('holds a saved draft with both reasons', async () => {
+        (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+        const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(steeredBlock), score: 84, actionLogRepo: makeActionLogRepo() });
+        const result = await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: emailReq.body, subject: 'Forms' }, {
+          taskEventId: 't1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft to joel@example.com' },
+        });
+        expect(result).toMatchObject({ success: false, gated: true });
+        expect(result.blockedReason).toContain(warning);
+      });
+
+      it('tells a drafter who can rewrite only what to rewrite', async () => {
+        const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(steeredBlock), score: 84 });
+        const result = await gw.send(emailReq, { taskEventId: 't1' });
+        expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
+        expect(result.gated).toBeUndefined();
+        expect(result.blockedReason).not.toContain('steered');
+      });
+    });
   });
 
   it('holds a skill send through its holdRecipe', async () => {
