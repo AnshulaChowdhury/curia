@@ -460,9 +460,12 @@ reconsidered for voice.
 
 Production first speech must stay at **p50 under 1 s** (spike: ~660 ms at `none`). Above
 that, put `channels.voice.model` back to `claude-haiku-4-5` while it is still served.
-- **The gate is `llm_ttft_ms` on `round: 0` lines only** (`voice llm first token`, #2271).
-  That is the span behind the spike's ~660 ms: at `none` the model spoke first and ran its
-  tools after. The 1 s threshold is unchanged.
+- **The gate is `llm_ttft_ms` on `turnKind: user`, `round: 0` lines only** (`voice llm
+  first token`, #2271). That is the span behind the spike's ~660 ms: user turns with
+  voice's tools, where at `none` the model spoke first and ran its tools after. Greetings
+  send no tools and are the call's cold first request, so they are reported apart. The
+  1 s threshold is unchanged. The maintainer agreed this filter on #2323, before the
+  verdict below was recorded.
 - **`round` ≥ 1 lines also time the tool and a later model call.** The model opened with a
   tool call and no text. Report them beside the gate, but they are not a reason to roll
   `channels.voice.model` back.
@@ -502,10 +505,11 @@ model.
 with a `delegate` call and was barged in before any audio. It logged neither field and
 would have been a tool opener, so it is outside the gate either way. No turn failed.
 
-- **Tool turns were sorted by hand.** This image predates the `round` field, so the three
+- **Turns were sorted by hand.** This image predates the `round` and `turnKind` fields.
+  Greetings were the first token after each `Voice session runtime started`. The three
   tool turns were identified from the log order: their `voice.ttfa_ms` (the filler) landed
   before `voice llm first token`. They ran 3197, 4078 and 8975 ms. Later checks filter on
-  `round: 0`.
+  `turnKind: user` and `round: 0`.
 - **On tool turns `voice.ttfa_ms` times the filler.** The "one moment" line goes through the
   same speech path, so it is the first audio. That is what the caller hears, so the field
   stays as is.
