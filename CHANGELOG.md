@@ -80,7 +80,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
-- **Voice latency on Haiku 5.5** — prod first-token p50 954 ms passes ADR-038's 1 s budget; first-token log names its round. (#2271)
+- **Voice latency on Haiku 5.5** — prod user-turn p50 954 ms passes ADR-038's 1 s budget; first-token log names its round. (#2271)
 - **Small-cap model check** — boot refuses fast-tier, judge or voice models that cannot turn thinking off. (#2224)
 - **Small-cap calls on the fast tier** — the drift detector and every `infraLlm.extract` call moved off the standard tier. (#2224)
 - **`infraLlm.extract` (public API, additive)** — optional `tier: 'fast' | 'standard'`; defaults to standard. (#2191)
