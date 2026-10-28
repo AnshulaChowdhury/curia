@@ -167,6 +167,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Digest tools** — tasks an outside contact started can't read or acknowledge the principal's digest. (#1320)
 - **Judgment elevation** — email senders become known only on SPF/DKIM/DMARC-verified mail. (#2227)
 - **Contact-visible outbound context** — contacts see only their own entries, one-to-one, on authenticated channels; their wakes likewise. (#2261)
+- **zod** — override floor set to 4.6.6, clearing a HIGH DoS advisory (CVE-2023-54404).
 
 ### Fixed
 
