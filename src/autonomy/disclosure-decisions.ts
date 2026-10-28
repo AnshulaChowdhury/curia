@@ -37,6 +37,8 @@ export interface DisclosureAsk {
   outreachId?: string;
   /** The task the ask's authority came from, as its question names it. Display only. */
   taskTitle?: string;
+  /** The requester's contact record name, beside their address in the question. Display only. */
+  requesterName?: string;
 }
 
 export interface DisclosureDecisionRow {
@@ -70,8 +72,10 @@ const MAX_NAMED_COUNTERPARTIES = 5;
  * stores, so a delivery after a restart asks the same question. Every other recipient a yes
  * covers is named (up to five, then a count); addresses are shown bare, never a display name.
  */
-export function askPreamble(ask: { labels: readonly string[]; requester: string; counterparties: readonly string[]; taskTitle?: string }): string {
+export function askPreamble(ask: { labels: readonly string[]; requester: string; counterparties: readonly string[]; taskTitle?: string; requesterName?: string }): string {
   const requester = normalizeCounterparty(ask.requester);
+  const name = ask.requesterName ? displayName(ask.requesterName) : undefined;
+  const who = name ? `${name} (${requester})` : requester;
   const others = [...new Set(ask.counterparties.map(normalizeCounterparty))].filter((c) => c !== requester);
   const named = others.slice(0, MAX_NAMED_COUNTERPARTIES);
   const more = others.length - named.length;
@@ -79,7 +83,19 @@ export function askPreamble(ask: { labels: readonly string[]; requester: string;
     ? ` The message also goes to ${named.join(', ')}${more > 0 ? ` and ${more} more` : ''}, and a yes covers them too.`
     : '';
   const forTask = ask.taskTitle ? ` for "${ask.taskTitle}"` : '';
-  return `${requester} is asking for your ${describePiiLabels(ask.labels)}${forTask}.${alsoTo} Share it? Reply yes to send the message below as written, or no to keep it private.`;
+  return `${who} is asking for your ${describePiiLabels(ask.labels)}${forTask}.${alsoTo} Share it? Reply yes to send the message below as written, or no to keep it private.`;
+}
+
+const DISPLAY_NAME_MAX = 60;
+
+/**
+ * A contact name as an ask shows it (#2312): one line, no quotes or angle brackets, at most 60
+ * characters. Empty when nothing is left. The name is display only: decisions stay keyed by
+ * the address beside it.
+ */
+export function displayName(raw: string): string {
+  const name = raw.replace(/[\s<>"]+/g, ' ').trim();
+  return name.length > DISPLAY_NAME_MAX ? `${name.slice(0, DISPLAY_NAME_MAX - 1).trimEnd()}…` : name;
 }
 
 /** A recipient identifier as decisions are keyed: the last `<addr>` of a display-name form, trimmed and lowercased. */
@@ -102,7 +118,7 @@ function nonEmptyStrings(v: unknown): string[] | null {
  */
 export function readDisclosureAsk(raw: unknown): DisclosureAsk | null {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const { conversationId, counterparties, labels, requester, outreachId, taskTitle } = raw as Record<string, unknown>;
+  const { conversationId, counterparties, labels, requester, outreachId, taskTitle, requesterName } = raw as Record<string, unknown>;
   const cps = nonEmptyStrings(counterparties);
   const ls = nonEmptyStrings(labels);
   if (!isNonEmptyString(conversationId) || !cps || !ls || !isNonEmptyString(requester)) return null;
@@ -115,6 +131,7 @@ export function readDisclosureAsk(raw: unknown): DisclosureAsk | null {
     ...(outreachId !== undefined ? { outreachId } : {}),
     // Display only, so a malformed title is dropped rather than failing the ask.
     ...(isNonEmptyString(taskTitle) ? { taskTitle } : {}),
+    ...(isNonEmptyString(requesterName) && displayName(requesterName) ? { requesterName: displayName(requesterName) } : {}),
   };
 }
 

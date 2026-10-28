@@ -4542,6 +4542,24 @@ describe('band review (#2159)', () => {
         .toBe(`joel@example.com is asking for your SIN for "Book physio". The message also goes to ops@example.com, sam@example.com, and a yes covers them too. ${tail}`);
       const many = ['joel@example.com', ...Array.from({ length: 7 }, (_, i) => `cc${i}@example.com`)];
       expect(askPreamble({ ...ask, counterparties: many })).toContain('cc0@example.com, cc1@example.com, cc2@example.com, cc3@example.com, cc4@example.com and 2 more');
+      // The contact's name beside the address, so the principal knows who is asking (#2312).
+      expect(askPreamble({ ...ask, requesterName: 'Joel Fry' })).toBe(`Joel Fry (joel@example.com) is asking for your SIN. ${tail}`);
+    });
+
+    it('names the requester by their contact record in the stored ask, unless the name is the address', async () => {
+      const resolve = (name: string) => vi.mocked(mocks.contactService.resolveByChannelIdentity).mockResolvedValue(
+        { contactId: 'c-joel', displayName: name, role: null, tier: 'known', kind: 'person', kgNodeId: null, verified: true } as never,
+      );
+      const hold = () => vi.fn().mockResolvedValue(askHold({ labels: ['phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'] }));
+      resolve('Joel "the" <Fry>\nSmith');
+      const named = makeActionLogRepo();
+      await makeBandGateway({ review: hold(), score: 84, actionLogRepo: named }).send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      // One line, no quotes or angle brackets: display only, the address stays the key.
+      expect(vi.mocked(named.insert).mock.calls[0]![0].disclosureAsk).toMatchObject({ requester: 'joel@example.com', requesterName: 'Joel the Fry Smith' });
+      resolve('Joel@Example.com');
+      const bare = makeActionLogRepo();
+      await makeBandGateway({ review: hold(), score: 84, actionLogRepo: bare }).send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      expect(vi.mocked(bare.insert).mock.calls[0]![0].disclosureAsk).not.toHaveProperty('requesterName');
     });
 
     // A relayed reply's agent is gone: the coordinator wake must say this is an ask.

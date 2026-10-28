@@ -41,6 +41,12 @@ describe('readDisclosureAsk', () => {
     });
   });
 
+  it('keeps a requester name as display text only, and drops a malformed one', () => {
+    expect(readDisclosureAsk({ ...ASK, requesterName: ' Dana\n<Whitfield> ' })).toEqual({ ...ASK, requesterName: 'Dana Whitfield' });
+    expect(readDisclosureAsk({ ...ASK, requesterName: 7 })).toEqual(ASK);
+    expect(readDisclosureAsk({ ...ASK, requesterName: '<>' })).toEqual(ASK);
+  });
+
   it('reads null, and anything malformed, as no ask', () => {
     const bad: unknown[] = [
       null, undefined, 'x', [], {},

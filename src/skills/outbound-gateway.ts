@@ -64,7 +64,7 @@ import {
   BAND_RULES, describePiiLabels, type BandReviewAsk, type BandReviewReport, type BandReviewSignals, type BandSendReview,
 } from '../dispatch/band-send-review.js';
 import type { OutboundNotificationPayload } from '../bus/events.js';
-import { askPreamble, normalizeCounterparty, type DisclosureAsk } from '../autonomy/disclosure-decisions.js';
+import { askPreamble, displayName, normalizeCounterparty, type DisclosureAsk } from '../autonomy/disclosure-decisions.js';
 import { markdownToHtml } from '../format/markdown-to-html.js';
 import { bodyEndsWithSignature, emailSignatureHtml, emailSignatureText, stripModelSignOff } from '../channels/email/signature.js';
 import type { AgentPersona } from './types.js';
@@ -1037,6 +1037,8 @@ export class OutboundGateway {
     let recipientTierUnresolved = false;
     let recipientContactId: string | undefined;
     let recipientIdentityVerified = false;
+    // The contact record's name, for an ask's wording only (#2312).
+    let recipientName: string | undefined;
     try {
       const contact = await this.contactService.resolveByChannelIdentity(request.channel, recipientId);
       if (contact !== null) {
@@ -1053,6 +1055,7 @@ export class OutboundGateway {
         recipientTier = contact.tier;
         recipientContactId = contact.contactId;
         recipientIdentityVerified = contact.verified === true;
+        recipientName = contact.displayName;
       }
     } catch (err) {
       // DB or service error — log at warn and proceed.
@@ -1524,6 +1527,7 @@ export class OutboundGateway {
         recipientTier,
         recipientTiers,
         ...(Object.keys(recipientContactIds).length > 0 ? { recipientContactIds } : {}),
+        ...(recipientName ? { requester: { id: recipientId, name: recipientName } } : {}),
         ...(sendSubject !== undefined ? { subject: sendSubject } : {}),
         options,
       });
@@ -2182,6 +2186,8 @@ export class OutboundGateway {
     recipientContactIds?: Readonly<Record<string, string>>;
     /** The email subject as it will be sent: the review scans it for redaction tokens. */
     subject?: string;
+    /** The primary recipient and their contact record's name: an ask names them (#2312). Display only. */
+    requester?: { id: string; name: string };
     options: {
       taskEventId?: string;
       conversationId?: string | null;
@@ -2369,7 +2375,7 @@ export class OutboundGateway {
         { taskEventId: options.taskEventId, conversationId: options.conversationId, postTurn: options.postTurn },
         ask ? [] : [`Held by the send review: ${decision.reason}`],
         ask ? askPreamble(ask) : undefined,
-        ask ? this.disclosureAskFor(ask, options.conversationId) : undefined,
+        ask ? this.disclosureAskFor(ask, options.conversationId, args.requester) : undefined,
         ask,
       );
       if (!raised) await reportUnapprovedHold('the approval row could not be written');
@@ -2398,7 +2404,18 @@ export class OutboundGateway {
    * applies to. Without a conversation there is no thread to remember it for: the question is
    * still asked, but the answer decides this one send only.
    */
-  private disclosureAskFor(ask: BandReviewAsk, conversationId: string | null | undefined): DisclosureAsk | undefined {
+  /**
+   * The requester's name for an ask's wording (#2312): only when it is the primary recipient's
+   * own (the ask's requester), and only when it says more than the address (an auto-created
+   * contact is often named by it).
+   */
+  private requesterNameFor(ask: BandReviewAsk, named: { id: string; name: string } | undefined): { requesterName?: string } {
+    if (!named || normalizeCounterparty(named.id) !== normalizeCounterparty(ask.requester)) return {};
+    const name = displayName(named.name);
+    return name && name.toLowerCase() !== normalizeCounterparty(ask.requester) ? { requesterName: name } : {};
+  }
+
+  private disclosureAskFor(ask: BandReviewAsk, conversationId: string | null | undefined, named?: { id: string; name: string }): DisclosureAsk | undefined {
     if (!conversationId || ask.counterparties.length === 0) {
       this.log.warn({ labels: ask.labels, hasConversation: Boolean(conversationId) }, 'outbound-gateway: a personal-data ask has no thread or recipient to remember the answer for');
       return undefined;
@@ -2410,6 +2427,7 @@ export class OutboundGateway {
       requester: normalizeCounterparty(ask.requester),
       ...(ask.outreachId ? { outreachId: ask.outreachId } : {}),
       ...(ask.taskTitle ? { taskTitle: ask.taskTitle } : {}),
+      ...this.requesterNameFor(ask, named),
     };
   }
 
@@ -3696,6 +3714,7 @@ export class OutboundGateway {
     let recipientTierUnresolvedForDraft = false;
     let recipientContactIdForDraft: string | undefined;
     let recipientVerifiedForDraft = false;
+    let recipientNameForDraft: string | undefined;
     try {
       const contact = await this.contactService.resolveByChannelIdentity('email', recipientEmail);
       if (contact !== null) {
@@ -3710,6 +3729,7 @@ export class OutboundGateway {
         recipientTierForDraft = contact.tier;
         recipientContactIdForDraft = contact.contactId; // hoisted for outbound.delivered audit
         recipientVerifiedForDraft = contact.verified === true;
+        recipientNameForDraft = contact.displayName;
       }
     } catch (err) {
       // Fail-open on DB errors — log at warn so anomalies are visible, but don't
@@ -3951,6 +3971,7 @@ export class OutboundGateway {
         recipientTier: recipientTierForDraft,
         recipientTiers: draftTiers,
         ...(Object.keys(draftContactIds).length > 0 ? { recipientContactIds: draftContactIds } : {}),
+        ...(recipientNameForDraft ? { requester: { id: recipientEmail, name: recipientNameForDraft } } : {}),
         subject: draftMeta.subject,
         options,
         editable: false,
