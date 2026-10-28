@@ -192,8 +192,11 @@ Voice emits structured pino fields for latency debugging:
   hears. Logged at `info` as `voice time-to-first-audio`.
 - `voice.stt_final_ms` — STT final transcript latency.
 - `llm_ttft_ms` — turn start to first text delta, after any tool rounds before it. Logged
-  at `info` as `voice llm first token`, with `model`. ADR-038's first-speech budget is
-  on this field, because its spike measured the same span; `voice.ttfa_ms` adds TTS
+  at `info` as `voice llm first token`, with `model`, `turnKind` (`greeting` or `user`)
+  and `round` (the round that produced the text). ADR-038's first-speech budget is on
+  **`turnKind: user`, `round: 0` lines only**, the span its spike measured. Greetings
+  send no tools and are reported apart. A `round` ≥ 1 line also times a tool and a later model call. Report it
+  beside the gate, but it is not a reason to change the model. `voice.ttfa_ms` adds TTS
   and prompt assembly, which a model change does not move.
 - `voice.tts_first_byte_ms` — TTS time to first audio frame.
 - `voice.barge_in_stop_ms` — time to stop assistant audio after barge-in.

@@ -918,6 +918,8 @@ export class VoiceRuntime {
   private async runAssistantTurn(
     session: ActiveSession,
     opts: {
+      /** Tags the first-token line so ADR-038's user-turn gate can drop greetings (#2271). */
+      turnKind: 'greeting' | 'user';
       ttfaLogKey: 'voice.ttfa_ms' | 'voice.greeting_ttfa_ms';
       ttfaLogMessage: string;
       failureLogMessage: string;
@@ -1065,6 +1067,7 @@ export class VoiceRuntime {
         provider: this.config.llm,
         model: this.config.model,
         logger: this.log,
+        turnKind: opts.turnKind,
         tools,
         invokeTool,
         onFiller,
@@ -1129,6 +1132,7 @@ export class VoiceRuntime {
    */
   private async runGreetingTurn(session: ActiveSession): Promise<void> {
     await this.runAssistantTurn(session, {
+      turnKind: 'greeting',
       ttfaLogKey: 'voice.greeting_ttfa_ms',
       ttfaLogMessage: 'voice greeting time-to-first-audio',
       failureLogMessage: 'voice greeting turn failed',
@@ -1644,6 +1648,7 @@ export class VoiceRuntime {
     this.trimSessionHistory(session);
 
     await this.runAssistantTurn(session, {
+      turnKind: 'user',
       ttfaLogKey: 'voice.ttfa_ms',
       ttfaLogMessage: 'voice time-to-first-audio',
       failureLogMessage: 'voice turn failed',

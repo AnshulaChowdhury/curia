@@ -460,8 +460,18 @@ reconsidered for voice.
 
 Production first speech must stay at **p50 under 1 s** (spike: ~660 ms at `none`). Above
 that, put `channels.voice.model` back to `claude-haiku-4-5` while it is still served.
-- **Measured on `llm_ttft_ms`** (`voice llm first token`): turn start to first text delta,
-  the span the spike measured, so the two are comparable.
+- **The gate is `llm_ttft_ms` on `turnKind: user`, `round: 0` lines only** (`voice llm
+  first token`, #2271). That is the span behind the spike's ~660 ms: user turns with
+  voice's tools, where at `none` the model spoke first and ran its tools after. Greetings
+  send no tools and are the call's cold first request, so they are reported apart. The
+  1 s threshold is unchanged. The maintainer agreed this filter on #2323, before the
+  verdict below was recorded.
+- **`round` ≥ 1 lines also time the tool and a later model call.** The model opened with a
+  tool call and no text. Report them beside the gate, but they are not a reason to roll
+  `channels.voice.model` back.
+- **The unfiltered field is not the comparable span.** Across all rounds, `llm_ttft_ms`
+  measures turn start to first text after any tool rounds, which the spike's `none` arm
+  did not have.
 - **`voice.ttfa_ms` is recorded beside it** (`voice time-to-first-audio`). It is what the
   caller hears: prompt assembly, the model, sentence chunking and TTS. Its gap over
   `llm_ttft_ms` is not the model's, so it is not the gate. A large gap is a reason to look
@@ -473,4 +483,45 @@ that, put `channels.voice.model` back to `claude-haiku-4-5` while it is still se
 Measured after curia-deploy moved `channels.voice.model` (startup log `Voice runtime
 constructed` naming `claude-haiku-5-5`), over at least 5 calls:
 
-_Pending deploy: fill in calls, `llm_ttft_ms` and `voice.ttfa_ms` p50 / p90, and the date._
+**2026-10-27, image `edge` at `b72aacc`** (includes #2263, #2265 and #2266). Startup log
+names `claude-haiku-5-5`. 5 calls: 5 greetings and 15 user turns. Of the user turns, 11
+spoke first, 3 opened with a tool (two `async-offramp` handoffs and one other) and 1 logged
+no first token (below).
+
+| Field | Turns | n | p50 | p90 |
+|---|---|---|---|---|
+| `llm_ttft_ms` (gate) | text-first user turns | 11 | **954 ms** | 1534 ms |
+| `llm_ttft_ms` | greetings (no tools sent, cold first request) | 5 | 955 ms | 1393 ms |
+| `llm_ttft_ms` | text-first, greetings + user turns | 16 | 954 ms | 1489 ms |
+| `llm_ttft_ms` | all, tool openers included | 19 | 1031 ms | 3373 ms |
+| `voice.ttfa_ms` | user turns | 14 | 1484 ms | 3154 ms |
+
+**Verdict: pass, narrowly.** Text-first user turns: p50 954 ms against the 1 s budget, well
+above the spike's ~660 ms. Two slow turns would flip it, so the next check should take more
+calls. The model stays. The all-turns 1031 ms is context: the gap is the tool, not the
+model.
+
+**Turns with no `voice llm first token` line: 1 of 15.** At 12:05:58 a user turn opened
+with a `delegate` call and was barged in before any audio. It logged neither field and
+would have been a tool opener, so it is outside the gate either way. No turn failed.
+
+- **Turns were sorted by hand.** This image predates the `round` and `turnKind` fields.
+  Greetings were the first token after each `Voice session runtime started`. The three
+  tool turns were identified from the log order: their `voice.ttfa_ms` (the filler) landed
+  before `voice llm first token`. They ran 3197, 4078 and 8975 ms. Later checks filter on
+  `turnKind: user` and `round: 0`.
+- **On tool turns `voice.ttfa_ms` times the filler.** The "one moment" line goes through the
+  same speech path, so it is the first audio. That is what the caller hears, so the field
+  stays as is.
+- **Only turns that streamed text are counted.** A turn that errors before its first token,
+  or never streams text, logs no `voice llm first token` line, so a slow failure does not
+  show up in the gate.
+- **The two clocks start at different points.** `voice.ttfa_ms` starts inside
+  `runAssistantTurn`, after mark-active (and, for a greeting, the history load), before
+  the system prompt is built. `llm_ttft_ms` starts later, in `VoiceTurnRunner.runTurn`,
+  after prompt build, message assembly and tool wiring.
+- **Neither field covers the delay before the turn.** Before `runAssistantTurn`: Deepgram endpointing (400 ms), the turn hold
+  (`turnHoldMs`, 600 ms default; it fires `flushPendingUtterance` before the turn is
+  queued, so it is outside `voice.ttfa_ms`), any wait behind a turn still running, the
+  `inbound.message` audit publish, the history read and the user-row write. Inline
+  summarization is no longer on this path (#2266).
