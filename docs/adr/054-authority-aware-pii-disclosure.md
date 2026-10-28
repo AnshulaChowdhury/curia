@@ -49,8 +49,11 @@ redactor behaves as before and the gateway only reports what it removed.
    the judge cannot write: originator tier and system role, message authentication
    (`TaskOriginator.authenticated`), the live turn, and the task. A `directed` ruling is
    accepted only for an authority the code confirms. A trusted contact's explicit directive
-   sends at any score and copies the principal. Text quoted or forwarded inside a message
-   grants no authority.
+   is held for the principal at any score: a trusted contact is not the principal, and the
+   trusted tier grants no `send_on_behalf`. (The design had it send and copy the principal;
+   the first paid scenario run showed that contradicting the authorization block and the
+   approval band, so the principal decides until the permissions are revisited.) Text quoted
+   or forwarded inside a message grants no authority.
 3. **No cut-and-send, and no tokens delivered.** A finding the judge will not approve goes
    back to the drafter once to be rewritten without it. If the rewrite still has it, the
    send is held below 80 and blocked at 80+ (the drafter is told why and may ask the
@@ -135,8 +138,8 @@ redactor behaves as before and the gateway only reports what it removed.
 - `gating: tier` is unchanged apart from reporting: sends say what was redacted, the quoted
   thread is still not redacted, and a tier-gated saved draft from the principal still sends
   as written. Operators move to band to get the full flow.
-- A trusted contact's directive copies the principal on email (or files an urgent report on
-  other channels), so the principal sees every such disclosure.
+- A trusted contact's directive to send the principal's details costs an approval at any
+  score; loosening that is a permissions change, not a band-review one.
 - Scenario cases run through the production gateway into recording transports (`through_gateway`)
   so these behaviors are checked deterministically.
 

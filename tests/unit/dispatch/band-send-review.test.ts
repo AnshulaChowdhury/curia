@@ -574,20 +574,28 @@ describe('BandSendReview', () => {
       expect((await svc.review(pii)).kind).toBe('bounce');
     });
 
-    it('sends a trusted contact\'s directed item at 74 and copies the principal', async () => {
-      const { svc, contactTier } = make([withRulings(ruling('directed'))], {
-        evidence: { authority: fromTrusted }, contactTier: async () => 'trusted',
-      });
-      await expect(svc.review({ ...pii, score: 74 })).resolves.toEqual({ kind: 'send', signals: {}, copyPrincipal: { labels: ['sin_ca'] } });
-      expect(contactTier).toHaveBeenCalledWith('c-trusted');
+    // A trusted contact is not the principal, and their tier grants no send_on_behalf: the
+    // principal approves the disclosure, at any score (#2312). Held, not an ask: the recipient
+    // did not ask, the trusted contact did.
+    it('holds a trusted contact\'s directed item for the principal at any score', async () => {
+      for (const score of [74, 84, 95]) {
+        const { svc, contactTier } = make([withRulings(ruling('directed'))], {
+          evidence: { authority: fromTrusted }, contactTier: async () => 'trusted',
+        });
+        const d = await svc.review({ ...pii, score, recipientTier: 'known' });
+        expect(d).toMatchObject({ kind: 'hold', reason: expect.stringContaining('a trusted contact asked for the principal\'s personal details (sin_ca)') });
+        expect(d).not.toHaveProperty('ask');
+        expect(contactTier).toHaveBeenCalledWith('c-trusted');
+      }
     });
 
     // Review Focus 5 (#2312): the drafting turn's own trusted originator directed it, so the
     // principal's root task does not demote the directive to "inferred".
-    it('keeps a trusted contact\'s directive on the copy path inside a principal-rooted task', async () => {
+    it('holds a trusted contact\'s directive inside a principal-rooted task too, even at 80+', async () => {
       const rooted: SendAuthority = { ...fromTrusted, rootTask: { taskId: 't-root', title: 'Set up the clinic', description: null, originator: principal } };
       const { svc, contactTier } = make([withRulings(ruling('directed'))], { evidence: { authority: rooted }, contactTier: async () => 'trusted' });
-      await expect(svc.review({ ...pii, score: 74 })).resolves.toEqual({ kind: 'send', signals: {}, copyPrincipal: { labels: ['sin_ca'] } });
+      // The task's authority alone would send an inferred item at 84; the trusted directive holds.
+      expect((await svc.review({ ...pii, score: 84 })).kind).toBe('hold');
       expect(contactTier).toHaveBeenCalledWith('c-trusted');
       // An inferred item under the same authority still takes the task path: held below 80.
       const inferred = make([withRulings(ruling('inferred'))], { evidence: { authority: rooted }, contactTier: async () => 'trusted' });
@@ -597,13 +605,13 @@ describe('BandSendReview', () => {
       expect((await demoted.svc.review({ ...pii, score: 74 })).kind).toBe('hold');
     });
 
-    it('lists each copied label once', async () => {
+    it('names each held label once', async () => {
       const P3: BriefDetectedItem = { ...P1, id: 'P3', text: '046 454 287' };
       const { svc } = make([withRulings(ruling('directed'), ruling('directed', false, 'P3'))], {
         evidence: { authority: fromTrusted }, contactTier: async () => 'trusted',
       });
       const d = await svc.review({ ...pii, detectedItems: [P1, P3] });
-      expect(d).toMatchObject({ kind: 'send', copyPrincipal: { labels: ['sin_ca'] } });
+      expect(d).toMatchObject({ kind: 'hold', reason: expect.stringContaining('personal details (sin_ca)') });
     });
 
     it('gives no trusted authority to a contact demoted since, or whose tier cannot be read', async () => {
@@ -763,11 +771,6 @@ describe('BandSendReview', () => {
       const recheck = make([{ ...withRulings(ruling('unsupported', true)), unsupportedClaims: [CLAIM] }, withRulings(ruling('unsupported', true))], { evidence: { authority: fromOutsider } });
       await recheck.svc.review({ ...pii, content: `${content} ${CLAIM}`, recipientTier: 'known' });
       expect(await recheck.svc.review({ ...pii, recipientTier: 'known' })).toMatchObject({ kind: 'hold', ask: { labels: ['sin_ca'] } });
-    });
-
-    it('keeps the other rules\' signals beside the principal copy', async () => {
-      const { svc } = make([{ ...withRulings(ruling('directed')), speaksAsPrincipal: true }], { evidence: { authority: fromTrusted }, contactTier: async () => 'trusted' });
-      await expect(svc.review(pii)).resolves.toEqual({ kind: 'send', signals: { speaksAsPrincipal: true }, copyPrincipal: { labels: ['sin_ca'] } });
     });
 
     it('counts the bound or root task\'s principal only with a ruling that names it: an outsider\'s turn under a principal root still bounces unsupported', async () => {

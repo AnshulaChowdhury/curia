@@ -30,7 +30,7 @@
 //               so is a strong reply-to-task link to a task the principal directed. Through
 //               a task or a link only, a directed ruling counts as inferred.
 //   trusted   — the originator was stamped trusted, is trusted now, and authenticated
-//   directed  + principal → send          directed + trusted → send, copy the principal
+//   directed  + principal → send          directed + trusted → hold for the principal (any score)
 //   inferred  + principal → send at 80+, hold below
 //   anything else is unsupported: requested, with every non-principal recipient askable (known
 //   or trusted, or covered by a link, strong or weak, to a task the principal directed) → hold
@@ -152,9 +152,8 @@ export type BandReviewSignals = { speaksAsPrincipal?: boolean; bounced?: boolean
 export type BandReviewAsk = { labels: string[]; requester: string; counterparties: string[]; taskTitle?: string; outreachId?: string };
 
 export type BandReviewDecision =
-  // copyPrincipal: a trusted contact directed these items out; the principal is copied (#2312).
   // dropQuote: only the quoted message's details stopped it; it goes without the quote (#2312).
-  | { kind: 'send'; report?: BandReviewReport; signals?: BandReviewSignals; copyPrincipal?: { labels: string[] }; dropQuote?: { labels: string[] } }
+  | { kind: 'send'; report?: BandReviewReport; signals?: BandReviewSignals; dropQuote?: { labels: string[] } }
   // strangerRequest: a recipient nobody can ask about requested these items; the digest is told (#2312).
   | { kind: 'bounce'; findings: FilterFinding[]; strangerRequest?: { labels: string[]; requester: string } }
   // Not sent, and not held for the principal: the drafter must rewrite it again (80+ only). The gateway converts it to a hold for a relayed reply or a saved draft.
@@ -322,7 +321,6 @@ export class BandSendReview {
     });
     const toRewrite: FilterFinding[] = [];
     const holds: FilterFinding[] = [];
-    const copy = new Set<string>();
     // The held items an ask covers, and whether anything else was held (then no ask).
     const askLabels = new Set<string>();
     let heldOtherwise = false;
@@ -343,6 +341,7 @@ export class BandSendReview {
       const askFirst = new Set<string>();
       const inferredBelow80 = new Set<string>();
       const taskDirectedBelow80 = new Set<string>();
+      const trustedDirected = new Set<string>();
       for (const item of items) {
         // rulesOnEach() guaranteed one ruling per item.
         const r = byId.get(item.id)!;
@@ -351,9 +350,11 @@ export class BandSendReview {
         const answer = said(item.label);
         if (answer === 'no') { declined.add(item.label); continue; }
         if (answer === 'yes') { saidYes.add(item.label); continue; }
-        // The drafting turn's own trusted originator directed it: the copy path, even inside a
-        // task the principal set (that task's authority would only count it as inferred).
-        if (r.basis === 'directed' && trusted) { copy.add(item.label); continue; }
+        // The drafting turn's own trusted originator directed it: held for the principal at any
+        // score. A trusted contact is not the principal, and their tier grants no
+        // send_on_behalf (config/role-defaults.yaml), so the principal approves the disclosure.
+        // Not an ask: the recipient did not ask, the trusted contact did.
+        if (r.basis === 'directed' && trusted) { trustedDirected.add(item.label); heldOtherwise = true; continue; }
         // Held below 80 for the principal: an ask when it is their task and an askable recipient
         // requested it. Under the principal's own turn nobody is asking: an ordinary hold.
         const heldForTask = (set: Set<string>) => {
@@ -398,12 +399,15 @@ export class BandSendReview {
       if (askFirst.size > 0) {
         holds.push({ rule: BAND_RULES.pii, detail: `Held for the principal: the recipient asked for personal details (${[...askFirst].join(', ')}) that nothing authorizes sharing yet.` });
       }
+      if (trustedDirected.size > 0) {
+        holds.push({ rule: BAND_RULES.pii, detail: `Held for the principal: a trusted contact asked for the principal's personal details (${[...trustedDirected].join(', ')}) to be sent, and the principal approves sending them to anyone else.` });
+      }
       // Ids, labels and counts only: the judge's reasons and the items' text can echo the data.
       this.deps.logger.info(
         {
           conversationId: input.conversationId, channel: input.channel, items: items.length, authority: who, trustedOriginator: trusted,
           ...(authority?.linkedTask ? { linkStrength: authority.linkedTask.strength, linkCovers } : {}),
-          unsupported: [...unsupported], askFirst: [...askFirst], inferredBelow80: [...inferredBelow80], taskDirectedBelow80: [...taskDirectedBelow80], copyPrincipal: [...copy],
+          unsupported: [...unsupported], askFirst: [...askFirst], inferredBelow80: [...inferredBelow80], taskDirectedBelow80: [...taskDirectedBelow80], trustedDirected: [...trustedDirected],
           principalDeclined: [...declined], principalSaidYes: [...saidYes],
         },
         'band review: disclosure rulings applied',
@@ -437,7 +441,7 @@ export class BandSendReview {
       }
       return { kind: 'hold', reason: holds[0]!.detail, findings: holds };
     }
-    return { kind: 'send', ...(copy.size > 0 ? { copyPrincipal: { labels: [...copy] } } : {}) };
+    return { kind: 'send' };
   }
 
   /** The judge failed with items or a placeholder present: nothing is authorized. */
@@ -491,8 +495,8 @@ export class BandSendReview {
    *
    * `trusted` is separate, since it is about the drafting turn rather than a task: its
    * originator's stamped tier and tier now are both trusted, and their message authenticated
-   * them. A directed ruling then takes the copy path even under the principal's task (#2312).
-   * Never for the principal's own turn, which needs no copy. A failed tier read is not trusted.
+   * them. A directed ruling is then held for the principal at any score, even under the
+   * principal's task (#2312). Never for the principal's own turn. A failed tier read is not trusted.
    */
   private async authorityOf(
     a: SendAuthority | undefined,
@@ -680,13 +684,11 @@ export function combine(a: BandReviewDecision, b: BandReviewDecision): BandRevie
   if (a.kind === 'send' && b.kind === 'send') {
     const report = a.report ?? b.report;
     const signals = a.signals || b.signals ? { ...a.signals, ...b.signals } : undefined;
-    const labels = [...new Set([...(a.copyPrincipal?.labels ?? []), ...(b.copyPrincipal?.labels ?? [])])];
     const dropped = [...new Set([...(a.dropQuote?.labels ?? []), ...(b.dropQuote?.labels ?? [])])];
     return {
       kind: 'send',
       ...(report ? { report } : {}),
       ...(signals ? { signals } : {}),
-      ...(labels.length > 0 ? { copyPrincipal: { labels } } : {}),
       ...(a.dropQuote || b.dropQuote ? { dropQuote: { labels: dropped } } : {}),
     };
   }

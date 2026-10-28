@@ -4942,86 +4942,6 @@ describe('band review (#2159)', () => {
       expect(String(blocked[0]!.payload['content'])).toContain('[REDACTED: PHONE_US]');
     });
 
-    it('copies the principal on an email the review copies them on', async () => {
-      const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us'] } });
-      const { gateway } = await makePiiGateway({ review });
-      const result = await gateway.send({ ...phoneReq, cc: ['amy@example.com'] }, { taskEventId: 't1' });
-
-      expect(result.success).toBe(true);
-      expect(sentEmail().cc).toEqual([{ email: 'amy@example.com' }, { email: 'principal@example.com' }]);
-      expect(publishedOfType(mocks.bus, 'principal.report')).toHaveLength(0);
-    });
-
-    it('does not copy the principal twice when they are already a recipient', async () => {
-      const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us'] } });
-      const { gateway } = await makePiiGateway({ review });
-      await gateway.send({ ...phoneReq, cc: ['Principal@Example.com'] }, { taskEventId: 't1' });
-
-      expect(sentEmail().cc).toEqual([{ email: 'Principal@Example.com' }]);
-    });
-
-    it('tells the principal now, without the value, on a Signal send the review copies them on', async () => {
-      const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us', 'email'] } });
-      const { gateway, signalClient } = await makePiiGateway({ review, withSignal: true });
-      const result = await gateway.send({ channel: 'signal', recipient: '+15555552222', message: phoneBody }, { taskEventId: 't1' });
-
-      expect(result.success).toBe(true);
-      expect(JSON.stringify(signalClient.send.mock.calls)).toContain(phone);
-      const reports = publishedOfType(mocks.bus, 'principal.report');
-      expect(reports).toHaveLength(1);
-      expect(reports[0]!.payload).toEqual({
-        summary: 'Sent your phone_us, email to +15555552222 at your trusted contact\'s request.',
-        urgency: 'now',
-        source: 'agent',
-      });
-      expect(JSON.stringify(reports[0])).not.toContain('555-1234');
-      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
-      expect(delivered).toHaveLength(1);
-      expect(String(delivered[0]!.payload['content'])).toBe('Call me on [REDACTED: PHONE_US] tomorrow.');
-    });
-
-    it('tells the principal instead when there is no verified principal email to copy', async () => {
-      const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us'] } });
-      const { gateway } = await makePiiGateway({ review, principalIdentities: [makePrincipalIdentity('+15555551111', 'signal')] });
-      const result = await gateway.send(phoneReq, { taskEventId: 't1' });
-
-      expect(result.success).toBe(true);
-      expect(sentEmail().cc).toBeUndefined();
-      const reports = publishedOfType(mocks.bus, 'principal.report');
-      expect(reports).toHaveLength(1);
-      expect(reports[0]!.payload).toMatchObject({
-        summary: 'Sent your phone_us to joel@example.com at your trusted contact\'s request.', urgency: 'now', source: 'agent',
-      });
-    });
-
-    it('keeps the added CC on a queued email, and its flushed audit event redacted', async () => {
-      const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us'] } });
-      let ready = false;
-      const enqueue = vi.fn().mockResolvedValue({ id: 'q-1' });
-      const outboundQueue = {
-        enqueue,
-        listPending: vi.fn().mockImplementation(async () => [{
-          id: 'q-1', channel: 'email', recipient: 'joel@example.com', payload: enqueue.mock.calls[0]![0],
-          enqueuedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
-        }]),
-        deleteByIds: vi.fn().mockResolvedValue(undefined),
-      } as unknown as OutboundQueueRepo;
-      const { gateway } = await makePiiGateway({ review, outboundQueue, emailReady: () => ready });
-
-      const result = await gateway.send(phoneReq, { taskEventId: 't1' });
-      expect(result.queued).toBe(true);
-      const queued = enqueue.mock.calls[0]![0] as { cc?: string[]; body: string };
-      expect(queued.cc).toEqual(['principal@example.com']);
-      expect(queued.body).toContain(phone);
-
-      ready = true;
-      await gateway.flushChannel('email');
-      expect(sentEmail().cc).toEqual([{ email: 'principal@example.com' }]);
-      const delivered = publishedOfType(mocks.bus, 'outbound.delivered');
-      expect(delivered).toHaveLength(1);
-      expect(String(delivered[0]!.payload['content'])).not.toContain('555-1234');
-    });
-
     it('redacts the flushed audit event of a band-queued row even after a switch to tier gating', async () => {
       const review = vi.fn().mockResolvedValue({ kind: 'send' });
       const enqueue = vi.fn().mockResolvedValue({ id: 'q-1' });
@@ -5185,18 +5105,6 @@ describe('band review (#2159)', () => {
         expect(result.blockedReason).not.toContain('555-1234');
         expect(sendDraft).not.toHaveBeenCalled();
         expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
-      });
-
-      it('holds a draft the review would copy the principal on: its recipients cannot change', async () => {
-        const sendDraft = draftSender();
-        const review = vi.fn().mockResolvedValue({ kind: 'send', copyPrincipal: { labels: ['phone_us'] } });
-        const { gateway } = await makePiiGateway({ review });
-        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1', holdRecipe });
-
-        expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
-        expect(result.blockedReason).toContain('phone_us');
-        expect(result.blockedReason).not.toContain('555-1234');
-        expect(sendDraft).not.toHaveBeenCalled();
       });
 
       it('reviews a principal-directed draft that holds personal details', async () => {

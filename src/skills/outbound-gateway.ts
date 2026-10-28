@@ -1503,7 +1503,6 @@ export class OutboundGateway {
     // exact message), and for the principal alone (nobody else reads it).
     let bandReport: BandReviewReport | undefined;
     let bandSignals: BandReviewSignals | undefined;
-    let copyPrincipal: { labels: string[] } | undefined;
     // The review would stop the send only for the quote's details: it goes without the quote.
     let dropQuote = false;
     if (bandReviewRuns) {
@@ -1531,7 +1530,6 @@ export class OutboundGateway {
       if (outcome.result) return outcome.result;
       bandReport = outcome.report;
       bandSignals = outcome.signals;
-      copyPrincipal = outcome.copyPrincipal;
       dropQuote = outcome.dropQuote !== undefined;
     }
 
@@ -1598,8 +1596,6 @@ export class OutboundGateway {
         const fromName = options.recipientDisplayName?.trim();
         if (fromName) toSend.recipientDisplayName = fromName;
       }
-      // The review let a trusted contact's request send the principal's details: copy them.
-      const principalCopied = copyPrincipal ? this.ccPrincipal(toSend) : false;
       const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchEmail(toSend));
       if (result.success && !result.queued) {
         // A To copied from Curia's own message has not written to us (#2273).
@@ -1642,8 +1638,6 @@ export class OutboundGateway {
         }
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
-      // No verified address to copy: the principal is told instead.
-      if (copyPrincipal && !principalCopied && result.success) await this.reportPrincipalCopy(copyPrincipal, sampleArgs.recipientLabel, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
       // toSend.body, not redactedBody: signEmail may have dropped the model's sign-off.
       return this.withRedactions(result, appliedRedactions, toSend.body, toSend.subject);
@@ -1669,7 +1663,6 @@ export class OutboundGateway {
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
-      if (copyPrincipal && result.success) await this.reportPrincipalCopy(copyPrincipal, sampleArgs.recipientLabel, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
       return this.withRedactions(result, appliedRedactions, sendBody);
     }
@@ -1693,7 +1686,6 @@ export class OutboundGateway {
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
-      if (copyPrincipal && result.success) await this.reportPrincipalCopy(copyPrincipal, sampleArgs.recipientLabel, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
       return this.withRedactions(result, appliedRedactions, sendBody);
     }
@@ -1724,7 +1716,6 @@ export class OutboundGateway {
         if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
       if (bandReport && result.success) await this.publishBandReport(bandReport, options);
-      if (copyPrincipal && result.success) await this.reportPrincipalCopy(copyPrincipal, sampleArgs.recipientLabel, options);
       if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
       return this.withRedactions(result, appliedRedactions, sendBody);
     }
@@ -1757,46 +1748,6 @@ export class OutboundGateway {
     } catch (err) {
       this.log.warn({ err, channel }, 'outbound-gateway: PII redactor threw building an audit copy — scrubbing it instead');
       return scrubPii(text);
-    }
-  }
-
-  /**
-   * Add the principal's verified email to an email's CC, unless they are already a recipient
-   * (#2312). Returns false when there is no verified address to add. Any verified mailbox meets
-   * the obligation (a copy reaches the principal), so the first one is used.
-   */
-  private ccPrincipal(toSend: EmailSendRequest): boolean {
-    const principal = this.principalIdentities.find((i) => i.channel === 'email' && i.verified && i.status === 'active')?.channelIdentifier;
-    if (!principal) {
-      this.log.warn('outbound-gateway: no verified principal email to copy — telling the principal instead');
-      return false;
-    }
-    const present = [...emailToAddresses(toSend), ...(toSend.cc ?? [])]
-      .some((addr) => addr.toLowerCase() === principal.toLowerCase());
-    if (!present) toSend.cc = [...(toSend.cc ?? []), principal];
-    return true;
-  }
-
-  /**
-   * Tell the principal now that a trusted contact's request sent their details (#2312), on a
-   * send they could not be copied on. Labels only, never the values. Never throws.
-   */
-  private async reportPrincipalCopy(
-    copy: { labels: string[] },
-    recipient: string,
-    options: { taskEventId?: string; parentEventId?: string; conversationId?: string | null } | undefined,
-  ): Promise<void> {
-    try {
-      await this.bus.publish('dispatch', createPrincipalReport({
-        summary: `Sent your ${copy.labels.join(', ')} to ${recipient} at your trusted contact's request.`,
-        urgency: 'now',
-        source: 'agent',
-        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
-        parentEventId: options?.taskEventId ?? options?.parentEventId ?? 'system',
-        sourceLayer: 'dispatch',
-      }));
-    } catch (err) {
-      this.log.error({ err, labels: copy.labels }, 'outbound-gateway: could not tell the principal a trusted contact\'s request sent their details');
     }
   }
 
@@ -2243,11 +2194,11 @@ export class OutboundGateway {
     } | undefined;
     /**
      * False for a saved draft: its drafter cannot rewrite it, so a block holds instead, and so
-     * do a bounce and a principal copy when it holds personal data (#2312).
+     * does a bounce when it holds personal data (#2312).
      */
     editable?: boolean;
   }): Promise<{
-    result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals; copyPrincipal?: { labels: string[] };
+    result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals;
     dropQuote?: { labels: string[] };
   }> {
     const { request, content, recipients, principalRecipients, options } = args;
@@ -2318,10 +2269,6 @@ export class OutboundGateway {
         reason: `Held for the principal: a saved draft can't be rewritten in place, and the review found these problems (${rules}).`,
         findings: decision.findings,
       };
-    } else if (args.editable === false && decision.kind === 'send' && decision.copyPrincipal) {
-      const labels = decision.copyPrincipal.labels.join(', ');
-      const reason = `Held for the principal: a trusted contact's request would send their ${labels}, and a saved draft can't be changed to copy them.`;
-      decision = { kind: 'hold', reason, findings: [{ rule: BAND_RULES.pii, detail: reason }] };
     }
 
     if (decision.kind === 'send') {
@@ -2331,7 +2278,6 @@ export class OutboundGateway {
       return {
         ...(decision.report ? { report: decision.report } : {}),
         ...(decision.signals ? { signals: decision.signals } : {}),
-        ...(decision.copyPrincipal ? { copyPrincipal: decision.copyPrincipal } : {}),
         ...(decision.dropQuote ? { dropQuote: decision.dropQuote } : {}),
       };
     }
