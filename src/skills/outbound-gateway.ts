@@ -4336,6 +4336,23 @@ export class OutboundGateway {
    * normal operation — the scope guards against any data inconsistency.
    * When absent, the match is by short_ref + outcome alone (backwards compatibility).
    */
+  /**
+   * Delete a Nylas draft created for a held send. Unknown accounts fail rather
+   * than deleting from a different mailbox. A missing draft (404) is success.
+   */
+  async deleteMailboxDraft(accountId: string | undefined, draftId: string): Promise<void> {
+    const client = this.getNylasClient(accountId);
+    if (!client) {
+      const available = [...this.nylasClients.keys()];
+      throw new Error(
+        accountId
+          ? `No mailbox for account '${accountId}' (available: ${available.join(', ') || 'none'})`
+          : 'Email client not configured',
+      );
+    }
+    await client.deleteDraft(draftId);
+  }
+
   async linkGatedAction(
     actionRef: string,
     taskEventId: string | undefined,

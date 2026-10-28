@@ -1,10 +1,8 @@
-// ActivityFeed — "what's been happening?": what Curia did in the last 24 hours,
-// one line per job (GET /api/activity?from=<now-24h>&limit=20, #2251). Each item
-// is already in words ("drafted a reply to John Doe"); the card adds the time in
-// the principal's timezone (earlier days under a day row), a muted agent name, and a link to the job or a replay
-// of the conversation.
+// ActivityFeed — what Curia did in the last 24 hours, one line per job
+// (GET /api/activity?from=<now-24h>&limit=50). The list scrolls inside the
+// card so a long day does not grow the page. On a phone the scroll area is capped.
 
-import { Fragment } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { Link } from '@tanstack/react-router';
 import {
   activityHref,
@@ -33,11 +31,28 @@ function Headline({ item }: { item: ActivityItem }) {
 
 export function ActivityFeed() {
   const { data, error, loading, retry } = useAsyncData(fetchActivity);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [overflows, setOverflows] = useState(false);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const check = () => setOverflows(el.scrollHeight > el.clientHeight + 1);
+    check();
+    const observer = new ResizeObserver(check);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [data]);
+
+  const countLabel = data
+    ? `24h · ${data.items.length}${data.hasMore ? '+' : ''}`
+    : null;
 
   return (
-    <article className="dash-card">
+    <article className="dash-card dash-activity-card">
       <div className="dash-card-head">
         <span className="dash-card-title">Recent activity</span>
+        {countLabel && <span className="dash-activity-range">{countLabel}</span>}
       </div>
 
       {loading && !data && !error && <div className="dash-card-quiet">Loading…</div>}
@@ -55,41 +70,44 @@ export function ActivityFeed() {
       )}
 
       {data && data.items.length > 0 && (
-        <div className="dash-activity">
-          {groupActivityByDay(data.items, data.timezone).map(group => (
-            <Fragment key={group.key}>
-              {group.label && <div className="dash-activity-day">{group.label}</div>}
-              {group.items.map(item => {
-                const note = autonomyNote(item);
-                return (
-                  <div key={item.id} className={`dash-activity-item ${item.outcome === 'success' ? '' : item.outcome}`}>
-                    <span className="dash-activity-time">{formatActivityTime(item.ts, data.timezone)}</span>
-                    <div className="dash-activity-text">
-                      <Headline item={item} />
-                      <span className="dash-activity-meta">
-                        {agentLabel(item.actor)}{note ? ` · ${note}` : ''}
-                        {item.outcome === 'partial' && <span className="dash-activity-partial"> · partly failed</span>}
-                      </span>
-                      {item.details.length > 0 && (
-                        <ul className="dash-activity-details">
-                          {item.details.map((d, i) => (
-                            <li key={i} className={`dash-activity-detail ${d.startsWith("couldn't") ? 'failed' : ''}`}>{d}</li>
-                          ))}
-                        </ul>
-                      )}
+        <div className="dash-activity-scroll" ref={scrollRef}>
+          <div className="dash-activity">
+            {groupActivityByDay(data.items, data.timezone).map(group => (
+              <Fragment key={group.key}>
+                {group.label && <div className="dash-activity-day">{group.label}</div>}
+                {group.items.map(item => {
+                  const note = autonomyNote(item);
+                  return (
+                    <div key={item.id} className={`dash-activity-item ${item.outcome === 'success' ? '' : item.outcome}`}>
+                      <span className="dash-activity-time">{formatActivityTime(item.ts, data.timezone)}</span>
+                      <div className="dash-activity-text">
+                        <Headline item={item} />
+                        <span className="dash-activity-meta">
+                          {agentLabel(item.actor)}{note ? ` · ${note}` : ''}
+                          {item.outcome === 'partial' && <span className="dash-activity-partial"> · partly failed</span>}
+                        </span>
+                        {item.details.length > 0 && (
+                          <ul className="dash-activity-details">
+                            {item.details.map((d, i) => (
+                              <li key={i} className={`dash-activity-detail ${d.startsWith("couldn't") ? 'failed' : ''}`}>{d}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                );
-              })}
-            </Fragment>
-          ))}
-          {data.hasMore && (
-            <div className="dash-card-quiet dash-activity-more">
-              Showing the latest {data.items.length}. <a href="/antfarm/">Replay the full day in the Ant Farm</a>.
-            </div>
-          )}
+                  );
+                })}
+              </Fragment>
+            ))}
+            {data.hasMore && (
+              <div className="dash-card-quiet dash-activity-more">
+                Showing the latest {data.items.length}. <a href="/antfarm/">Replay the full day in the Ant Farm</a>.
+              </div>
+            )}
+          </div>
         </div>
       )}
+      {overflows && <div className="dash-activity-fade" aria-hidden="true" />}
     </article>
   );
 }

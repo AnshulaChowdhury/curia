@@ -1,0 +1,86 @@
+// Four value tiles. One stats request feeds all of them. A failure renders an
+// em dash and an error — never a zero that would look like a quiet week.
+
+import { useEffect } from 'react';
+import {
+  fetchStats,
+  formatCountDelta,
+  formatHoursDelta,
+  formatTimeSaved,
+  hoursFromActions,
+} from './dashboard-utils.js';
+import { useAsyncData } from './useAsyncData.js';
+
+interface BigNumbersProps {
+  onHandled: (count: number | null) => void;
+  onTimezone: (zone: string) => void;
+}
+
+function Sparkline({ values }: { values: number[] }) {
+  const max = Math.max(...values, 1);
+  const width = 100;
+  const height = 18;
+  const points = values.map((value, index) => {
+    const x = values.length === 1 ? 0 : (index / (values.length - 1)) * width;
+    const y = height - (value / max) * (height - 2) - 1;
+    return `${x},${y}`;
+  }).join(' ');
+  return (
+    <svg className="dash-spark" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden="true">
+      <polyline fill="none" stroke="var(--app-destructive)" strokeWidth="1.5" points={points} vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
+export function BigNumbers({ onHandled, onTimezone }: BigNumbersProps) {
+  const { data, error, loading, retry } = useAsyncData(fetchStats);
+
+  useEffect(() => {
+    if (error || !data) {
+      onHandled(null);
+      return;
+    }
+    onHandled(data.handledSinceYesterday);
+    onTimezone(data.timezone);
+  }, [data, error, onHandled, onTimezone]);
+
+  const hours = data ? hoursFromActions(data.successfulActions.current, data.minutesPerAction) : 0;
+  const prevHours = data ? hoursFromActions(data.successfulActions.previous, data.minutesPerAction) : 0;
+  const hoursDelta = data ? formatHoursDelta(hours, prevHours) : null;
+  const doneDelta = data ? formatCountDelta(data.done.current, data.done.previous) : null;
+
+  return (
+    <div className="dash-nums-wrap">
+      <div className="dash-nums">
+        <article className="dash-card dash-num">
+          <div className="dash-card-title">Time saved · 7d</div>
+          <div className="dash-num-value">{data ? formatTimeSaved(data.successfulActions.current, data.minutesPerAction) : (loading && !error ? '…' : '—')}</div>
+          {hoursDelta && <div className={`dash-delta ${hoursDelta.direction}`}>{hoursDelta.text}</div>}
+          {data && <div className="dash-num-foot">rough estimate · ~{data.minutesPerAction} min per action</div>}
+        </article>
+        <article className="dash-card dash-num">
+          <div className="dash-card-title">Done for you · 7d</div>
+          <div className="dash-num-value">{data ? data.done.current.toLocaleString('en-US') : (loading && !error ? '…' : '—')}</div>
+          {doneDelta && <div className={`dash-delta ${doneDelta.direction}`}>{doneDelta.text}</div>}
+        </article>
+        <article className="dash-card dash-num">
+          <div className="dash-card-title">People known</div>
+          <div className="dash-num-value">{data ? data.contacts.total.toLocaleString('en-US') : (loading && !error ? '…' : '—')}</div>
+          {data && <div className="dash-num-foot">+{data.contacts.newThisWeek.toLocaleString('en-US')} this week</div>}
+        </article>
+        <article className="dash-card dash-num">
+          <div className="dash-card-title">Hiccups · 7d</div>
+          <div className="dash-num-value">{data ? data.hiccups.current.toLocaleString('en-US') : (loading && !error ? '…' : '—')}</div>
+          {data && data.hiccups.byDay.length > 0 && <Sparkline values={data.hiccups.byDay} />}
+        </article>
+      </div>
+      {error && (
+        <div className="dash-alert danger">
+          <div className="dash-alert-title">These numbers are unavailable</div>
+          <div className="dash-alert-body">{error}</div>
+          <button type="button" className="btn btn-secondary btn-sm" onClick={retry}>Retry</button>
+        </div>
+      )}
+    </div>
+  );
+}

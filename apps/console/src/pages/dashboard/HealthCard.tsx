@@ -4,8 +4,10 @@
 // branch lives in fetchHealth). Per-check pills reuse the existing .status-pill
 // classes; nested mcp.* checks are flattened into their own pills.
 
+import { Link } from '@tanstack/react-router';
 import {
   fetchHealth,
+  fetchSetupGaps,
   flattenHealthChecks,
   healthCheckPillClass,
   healthStatusMeta,
@@ -15,6 +17,8 @@ import { useAsyncData, TONE_COLOR } from './useAsyncData.js';
 
 export function HealthCard() {
   const { data, error, loading, retry } = useAsyncData(fetchHealth);
+  // Setup is its own request: a registry failure must not hide the health lights.
+  const setup = useAsyncData(fetchSetupGaps);
 
   return (
     <article className="dash-card">
@@ -53,6 +57,18 @@ export function HealthCard() {
           </>
         );
       })()}
+
+      {setup.error && (
+        <div className="dash-card-quiet">
+          Setup status unavailable.{' '}
+          <button type="button" className="dash-text-btn" onClick={setup.retry}>Retry</button>
+        </div>
+      )}
+      {setup.data && setup.data.length > 0 && (
+        <Link to="/channels" className="dash-setup-line">
+          Setup · {setup.data.map((gap) => gap.title).join(' · ')}
+        </Link>
+      )}
     </article>
   );
 }

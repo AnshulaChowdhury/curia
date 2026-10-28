@@ -154,6 +154,8 @@ export const RESOLVED_BY = {
   principal: 'principal',
   /** An agent called a resolve tool on its own reading of the conversation. */
   coordinator: 'coordinator',
+  /** The principal acted in the console (Waiting on you). Same signal as `principal`. */
+  console: 'console',
   /** Expiry sweep or gate rejection. */
   system: 'system',
 } as const;

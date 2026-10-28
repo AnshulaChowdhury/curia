@@ -26,6 +26,7 @@ import { AGENT_NAME_RULE, isAgentName } from '../../../agents/agent-name.js';
 import { isUuid } from '../../../util/uuid.js';
 import { validateTaskErrorBudget } from '../../../tasks/task-error-budget.js';
 import type { NodeMergeApi } from '../../../kg-merge/service.js';
+import type { TaskRepo } from '../../../db/task-repo.js';
 import { DEFAULT_CANDIDATES, MAX_CANDIDATES } from '../../../kg-merge/service.js';
 import { parseResolutions } from '../../../kg-merge/resolve.js';
 import {
@@ -56,6 +57,11 @@ export interface KnowledgeGraphRouteOptions {
   // Optional so callers that never mount the merge (tests) need not build one; when absent
   // those two routes answer 503.
   nodeMergeService?: NodeMergeApi;
+  /**
+   * Status changes go through TaskRepo so wake-ups, child tasks and outreach
+   * are reconciled. Absent only in tests that never change a task's status.
+   */
+  taskRepo?: Pick<TaskRepo, 'updateTask'>;
 }
 
 // Channel identifier used when the KG web app dispatches messages to the agent layer.
@@ -125,7 +131,7 @@ export async function knowledgeGraphRoutes(
   app: FastifyInstance,
   options: KnowledgeGraphRouteOptions,
 ): Promise<void> {
-  const { pool, logger, webAppBootstrapSecret, secureCookies, bus, eventRouter, contactService, sessions, nodeMergeService } = options;
+  const { pool, logger, webAppBootstrapSecret, secureCookies, bus, eventRouter, contactService, sessions, nodeMergeService, taskRepo } = options;
   // sessions is managed by HttpAdapter — no local Map creation needed here.
 
   // POST /auth — exchanges the bootstrap secret for an HttpOnly session cookie.
@@ -844,6 +850,24 @@ export async function knowledgeGraphRoutes(
         : row.conversation_id;
     if (conversationId && !isUuid(conversationId)) {
       return reply.status(400).send({ error: 'Invalid conversationId: must be a valid UUID.' });
+    }
+
+    // Status transitions must go through TaskRepo: a direct UPDATE skips wake-up
+    // cancellation, child reconciliation and outreach close (#2340).
+    if (typeof body.status === 'string' && body.status !== row.status) {
+      if (!taskRepo) {
+        logger.error({ taskId: id }, 'kg: PATCH status change requested but TaskRepo is not wired');
+        return reply.status(503).send({ error: 'Task status updates are unavailable.' });
+      }
+      try {
+        const transitioned = await taskRepo.updateTask(id, { status: body.status }, 'console');
+        if (!transitioned) return reply.status(404).send({ error: 'Task not found.' });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : '';
+        if (message.includes('terminal state')) return reply.status(400).send({ error: message });
+        logger.error({ err, taskId: id }, 'kg: PATCH status change via TaskRepo failed');
+        return reply.status(500).send({ error: 'Failed to update task.' });
+      }
     }
 
     try {

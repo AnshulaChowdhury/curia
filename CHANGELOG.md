@@ -18,6 +18,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Agenda-driven calls** — principal calls start from parked agendas; Curia can switch agendas mid-call. (#2322)
 - **Meeting minutes** — calls with an agenda produce a transcript, minutes and one follow-up report. (#2322)
 - **Bus events** — `minutes.ready` and `minutes.pipeline_failed`, system-only. (#2322)
+- **Principal home** — waiting items, a work histogram, and value tiles replace the operator view. (#2340)
 - **Ant Farm video-call design** — design doc for replacing the Phaser office with a call view. (#2127)
 - **Turn lanes** — per-conversation lock and injection config, on in the shipped file. (#2018)
 - **Turn lane wiring** — a coordinator conversation has one holder. (#2018)
@@ -207,6 +208,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 - **Scenario tool calls** — approval-wake and `then` turns' tool calls are recorded once, not twice. (#2333)
 - **PII scenarios 34a, 34h, 34i** — stub the inbox specialist, ask Curia to send, and check held SINs precisely. (#2333)
+- **Task status route** — status changes cancel wake-ups and close related outreach. (#2340)
 - **task-create** — placeholder ids are omitted, and a missing task is reported as not found. (#2328)
 - **task-create** — optional id inputs say to omit the field when there is none. (#2328)
 - **task-update** — string placeholder blockers are rejected; JSON null still clears one. (#2328)

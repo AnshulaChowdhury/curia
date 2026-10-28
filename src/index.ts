@@ -160,6 +160,7 @@ import { ReactionApprovalMapper } from './autonomy/reaction-approval-mapper.js';
 import { DEFAULT_REACTION_INTENTS } from './autonomy/reaction-intent.js';
 import { AutonomyScoringPass } from './autonomy/scoring-pass.js';
 import { ActivityService } from './activity/activity-service.js';
+import { BriefingService } from './dashboard/briefing-service.js';
 import { ActivitySummarizer } from './activity/summarizer.js';
 import type { ScoringPassConfig } from './autonomy/scoring-pass.js';
 import { BrowserService } from './browser/browser-service.js';
@@ -3361,6 +3362,23 @@ async function main(): Promise<void> {
     modelRouting: modelRoutingConfig,
   });
 
+  const briefingGateway = outboundGateway;
+  const briefingService = new BriefingService({
+    pool,
+    auditLogRepo,
+    actionLogRepo,
+    taskRepo,
+    contactService,
+    executionLayer,
+    disclosureDecisions,
+    deleteMailboxDraft: briefingGateway
+      ? (account, draftId) => briefingGateway.deleteMailboxDraft(account, draftId)
+      : undefined,
+    bus,
+    officeTimezone: config.timezone,
+    logger,
+  });
+
   const httpAdapter = new HttpAdapter({
     bus,
     logger,
@@ -3395,6 +3413,8 @@ async function main(): Promise<void> {
     healthService,
     auditLogRepo,
     activityFeed: activityService,
+    briefing: briefingService,
+    taskRepo,
     smsWebhookBridge,
     memoryRetention,
     // Console Memory → Documents (#1821, #1822).

@@ -41,6 +41,7 @@ describe('bypassesBearerAuth', () => {
   it.each([
     '/api/health',
     '/api/activity',
+    '/api/dashboard/waiting',
     '/api/jobs',
     '/api/jobs/:jobId',
     '/api/antfarm/timeline',

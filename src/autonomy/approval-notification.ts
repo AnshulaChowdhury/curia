@@ -21,6 +21,10 @@ import { detectPii } from '../pii/scrubber.js';
 export const MAX_DETAIL_FIELD_LENGTH = 500;
 export const MAX_DETAIL_TOTAL_LENGTH = 2000;
 
+/** Refusal when an undelivered approval would send personal details (#2312). */
+export const UNSHOWN_PERSONAL_DETAILS_ERROR =
+  'The principal hasn\'t been shown this approval yet, and it contains personal details. Deliver it with deliver-approval first, then ask again.';
+
 // ---------------------------------------------------------------------------
 // Field allowlists — extend alongside VERB_RULES in approval-trigger.ts
 // ---------------------------------------------------------------------------
