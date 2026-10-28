@@ -80,13 +80,16 @@ export const THROUGH_GATEWAY_SEND_TOOLS: ReadonlySet<string> = new Set([
 
 /**
  * What runs for real in a through-gateway case: the sends, and the approval tools that act on
- * what they hold. deliver-approval sends the approval to the principal (recorded too);
+ * what they hold. list-pending-actions lists the run's own approvals, so a principal's later
+ * "yes" can be matched to the one a send raised (the default stub always said there were none);
+ * deliver-approval sends the approval to the principal (recorded too);
  * approve-action and deny-action resolve it on a later live principal turn (the execution
  * layer's elevated gate still applies) and replay or refuse the send. Their action log is
  * narrowed to the run's own rows (seed.ts: scopedActionLog).
  */
 export const THROUGH_GATEWAY_TOOLS: ReadonlySet<string> = new Set([
   ...THROUGH_GATEWAY_SEND_TOOLS,
+  'list-pending-actions',
   'deliver-approval',
   'approve-action',
   'deny-action',

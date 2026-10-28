@@ -4553,9 +4553,16 @@ describe('band review (#2159)', () => {
       const hold = () => vi.fn().mockResolvedValue(askHold({ labels: ['phone_us'], requester: 'joel@example.com', counterparties: ['joel@example.com'] }));
       resolve('Joel "the" <Fry>\nSmith');
       const named = makeActionLogRepo();
-      await makeBandGateway({ review: hold(), score: 84, actionLogRepo: named }).send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
+      const registerDisplay = vi.fn();
+      const namedGw = makeBandGateway({ review: hold(), score: 84, actionLogRepo: named });
+      namedGw.setApprovalDelivery({ registerDisplay } as never);
+      await namedGw.send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });
       // One line, no quotes or angle brackets: display only, the address stays the key.
       expect(vi.mocked(named.insert).mock.calls[0]![0].disclosureAsk).toMatchObject({ requester: 'joel@example.com', requesterName: 'Joel the Fry Smith' });
+      // The question raised with the hold names them too, not only a re-delivery of it.
+      expect(registerDisplay).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        preamble: expect.stringContaining('Joel the Fry Smith (joel@example.com) is asking for your phone number'),
+      }));
       resolve('Joel@Example.com');
       const bare = makeActionLogRepo();
       await makeBandGateway({ review: hold(), score: 84, actionLogRepo: bare }).send(emailReq, { taskEventId: 't1', conversationId: 'c1', holdRecipe });

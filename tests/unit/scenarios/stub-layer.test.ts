@@ -619,6 +619,7 @@ describe('through-gateway runs (#2312)', () => {
       ['deliver-approval', 'none', ['approvalDelivery']],
       ['list-pending-actions', 'none', ['actionLogRepo']],
       ['calendar-create-event', 'high', []],
+      ['contact-merge', 'low', []],
     ] as const) {
       registry.register({ ...manifest(name, risk), capabilities: [...caps] }, {
         execute: async (ctx) => {
@@ -655,12 +656,15 @@ describe('through-gateway runs (#2312)', () => {
       .toEqual({ success: true, data: 'real email-send' });
     expect(await layer.invoke('calendar-create-event', {}, undefined, coordinatorCall))
       .toEqual({ success: true, data: { stubbed: true } });
-    // Not a send or approval tool: refused as in any run.
-    expect((await layer.invoke('list-pending-actions', {}, undefined, coordinatorCall)).success).toBe(false);
+    // The run's own approvals are listed for real, so a later "yes" can find the one it means.
+    expect(await layer.invoke('list-pending-actions', {}, undefined, coordinatorCall))
+      .toEqual({ success: true, data: 'real list-pending-actions' });
+    // Not a send or approval tool, and no stub: refused as in any run.
+    expect((await layer.invoke('contact-merge', {}, undefined, coordinatorCall)).success).toBe(false);
     // On the review layer, not the one agents call.
-    expect(executed.map(e => [e.name, e.layer])).toEqual([['email-send', 'review']]);
+    expect(executed.map(e => [e.name, e.layer])).toEqual([['email-send', 'review'], ['list-pending-actions', 'review']]);
     expect(controller.endRun('scenario-1').map(c => [c.toolName, c.disposition])).toEqual([
-      ['email-send', 'passthrough'], ['calendar-create-event', 'stubbed'], ['list-pending-actions', 'refused'],
+      ['email-send', 'passthrough'], ['calendar-create-event', 'stubbed'], ['list-pending-actions', 'passthrough'], ['contact-merge', 'refused'],
     ]);
   });
 
@@ -699,11 +703,12 @@ describe('mustStub with through_gateway (#2312)', () => {
       registry.register({ ...manifest(name, risk), capabilities: [...caps] }, { execute: async () => ({ success: true, data: null }) });
     }
     const gw = { throughGateway: true };
-    for (const tool of ['email-send', 'email-reply', 'signal-send', 'sms-send', 'slack-send', 'send-draft', 'deliver-approval', 'approve-action', 'deny-action']) {
+    // list-pending-actions too: a stub saying "none pending" hid the approval a send raised from
+    // the principal's later "yes" (#2312). It reads the run-scoped action log (scopedActionLog).
+    for (const tool of ['email-send', 'email-reply', 'signal-send', 'sms-send', 'slack-send', 'send-draft', 'list-pending-actions', 'deliver-approval', 'approve-action', 'deny-action']) {
       expect(mustStub(tool, registry, new Set(), new Set(), gw), tool).toBe(false);
       expect(mustStub(tool, registry), `${tool} without through_gateway`).toBe(true);
     }
-    expect(mustStub('list-pending-actions', registry, new Set(), new Set(), gw)).toBe(true);
     expect(mustStub('email-draft-save', registry, new Set(), new Set(), gw)).toBe(true);
     // The review layer serves them, whatever the layer agents call lacks.
     expect(mustStub('approve-action', registry, new Set(['approve-action']), new Set(), gw)).toBe(false);

@@ -2369,13 +2369,15 @@ export class OutboundGateway {
     if (recipe && options?.taskEventId) {
       // An ask leads with the question; the personal-details line and the draft follow (#2312).
       const ask = decision.ask;
+      // The question is worded from the stored ask, so it names the requester as a re-delivery does.
+      const stored = ask ? this.disclosureAskFor(ask, options.conversationId, args.requester) : undefined;
       const raised = await this.raiseSendApproval(
         request,
         recipe,
         { taskEventId: options.taskEventId, conversationId: options.conversationId, postTurn: options.postTurn },
         ask ? [] : [`Held by the send review: ${decision.reason}`],
-        ask ? askPreamble(ask) : undefined,
-        ask ? this.disclosureAskFor(ask, options.conversationId, args.requester) : undefined,
+        ask ? askPreamble({ ...ask, ...this.requesterNameFor(ask, args.requester) }) : undefined,
+        stored,
         ask,
       );
       if (!raised) await reportUnapprovedHold('the approval row could not be written');
