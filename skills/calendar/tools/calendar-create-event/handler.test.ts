@@ -135,7 +135,7 @@ describe('CalendarCreateEventHandler -- self-release holds', () => {
 
     // Only the hold is deleted — exactly once, with notifyAttendees=false
     expect(deleteEvent).toHaveBeenCalledTimes(1);
-    expect(deleteEvent).toHaveBeenCalledWith('cal-work', 'hold-event-id', false);
+    expect(deleteEvent).toHaveBeenCalledWith('cal-work', 'hold-event-id');
 
     // The real meeting and the new event are never deleted
     const deletedIds = deleteEvent.mock.calls.map((c: unknown[]) => c[1]);

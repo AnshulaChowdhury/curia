@@ -96,7 +96,7 @@ export class CalendarCreateEventHandler implements ToolHandler {
           // Per-event try/catch: one failing delete must not abort the rest of the loop.
           // A transient Nylas error on one hold should not prevent releasing the others.
           try {
-            await ctx.nylasCalendarClient.deleteEvent(calendarId, e.id, false); // notifyAttendees=false — holds have no attendees
+            await ctx.nylasCalendarClient.deleteEvent(calendarId, e.id); // no notify flag: holds have no attendees, and Microsoft rejects false
             ctx.log.info({ releasedHoldId: e.id, bookedEventId: event.id }, 'calendar-create-event: released overlapping hold');
           } catch (err) {
             ctx.log.warn({ err, holdId: e.id, bookedEventId: event.id }, 'calendar-create-event: failed to release overlapping hold, continuing');

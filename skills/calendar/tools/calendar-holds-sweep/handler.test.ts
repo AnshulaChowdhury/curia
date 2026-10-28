@@ -137,16 +137,16 @@ describe('CalendarHoldsSweepHandler — core sweep logic', () => {
     expect(deletedIds).not.toContain('evt-real');
   });
 
-  it('passes notifyAttendees=false to deleteEvent (no cancellation emails)', async () => {
+  it('omits notifyAttendees on deleteEvent (holds have no attendees; Microsoft rejects false)', async () => {
     const handler = new CalendarHoldsSweepHandler();
     const ctx = makeCtx();
 
     await handler.execute(ctx);
 
     const deleteEvent = ctx.nylasCalendarClient!.deleteEvent as ReturnType<typeof vi.fn>;
-    for (const call of deleteEvent.mock.calls as [string, string, boolean][]) {
-      // Third argument must be false — we never notify for holds
-      expect(call[2]).toBe(false);
+    expect(deleteEvent).toHaveBeenCalled();
+    for (const call of deleteEvent.mock.calls as unknown[][]) {
+      expect(call).toHaveLength(2);
     }
   });
 
@@ -372,6 +372,6 @@ describe('CalendarHoldsSweepHandler — resilience', () => {
     expect(data.calendarErrors).toBe(1);
     // No per-event delete failures
     expect(data.failed).toBe(0);
-    expect(ctx.nylasCalendarClient!.deleteEvent).toHaveBeenCalledWith('cal-personal', 'evt-past', false);
+    expect(ctx.nylasCalendarClient!.deleteEvent).toHaveBeenCalledWith('cal-personal', 'evt-past');
   });
 });

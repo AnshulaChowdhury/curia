@@ -173,7 +173,8 @@ export class CalendarRespondToInviteHandler implements ToolHandler {
     const releaseWarnings: string[] = [];
     for (const hold of matches) {
       try {
-        await ctx.nylasCalendarClient.deleteEvent(calendarId, hold.id, false);
+        // No notify flag: holds have no attendees, and Microsoft rejects false.
+        await ctx.nylasCalendarClient.deleteEvent(calendarId, hold.id);
         releasedHolds.push(hold.id);
         ctx.log.info(
           { calendarId, holdId: hold.id },

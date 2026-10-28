@@ -180,7 +180,7 @@ describe('CalendarRespondToInviteHandler', () => {
 
     expect(result.success).toBe(true);
     expect(deleteEvent).toHaveBeenCalledTimes(1);
-    expect(deleteEvent).toHaveBeenCalledWith('cal_1', 'hold_a', false);
+    expect(deleteEvent).toHaveBeenCalledWith('cal_1', 'hold_a');
     if (result.success) {
       expect((result.data as { releasedHolds: string[] }).releasedHolds).toEqual(['hold_a']);
     }

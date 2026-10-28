@@ -98,7 +98,7 @@ export class CalendarUpdateEventHandler implements ToolHandler {
       }
       if (notifyAttendees === false) {
         warnings.push(
-          'notifyAttendees=false is honoured by Google Calendar; Microsoft and iCloud ignore it and still email attendees.',
+          'notifyAttendees=false is honoured by Google Calendar; iCloud ignores it and still emails attendees.',
         );
       }
 
@@ -121,7 +121,12 @@ export class CalendarUpdateEventHandler implements ToolHandler {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       ctx.log.error({ err, calendarId, eventId }, 'Failed to update event');
-      return { success: false, error: `Failed to update event: ${message}` };
+      // Microsoft rejects notify_participants=false with a 400. Say so, rather than
+      // let the agent retry silently or drop the flag and email attendees unasked.
+      const hint = notifyAttendees === false
+        ? ' Microsoft calendars reject notifyAttendees=false. The event was not changed; ask the principal before retrying with attendees notified.'
+        : '';
+      return { success: false, error: `Failed to update event: ${message}${hint}` };
     }
   }
 }

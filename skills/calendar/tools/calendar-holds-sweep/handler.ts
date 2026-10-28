@@ -156,10 +156,10 @@ export class CalendarHoldsSweepHandler implements ToolHandler {
 
         // Stale hold — attempt deletion.
         // Per-event try/catch: one failure must not abort the rest of the sweep.
-        // Holds are internal-only (no attendees), so notifyAttendees=false suppresses
-        // any Nylas cancellation email logic.
+        // Holds have no attendees, so the default delete emails nobody. Omit
+        // notifyAttendees: Microsoft rejects notify_participants=false with a 400.
         try {
-          await ctx.nylasCalendarClient.deleteEvent(calId, event.id, false);
+          await ctx.nylasCalendarClient.deleteEvent(calId, event.id);
           expired++;
           ctx.log.info({ calId, eventId: event.id }, 'calendar-holds-sweep: deleted stale hold');
         } catch (err) {

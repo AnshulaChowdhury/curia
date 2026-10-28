@@ -465,8 +465,8 @@ export class NylasCalendarClient {
    * Update an existing event.
    *
    * `notifyAttendees` maps to Nylas `notifyParticipants` (wire `notify_participants`).
-   * Default (omit) is provider-true: Google emails guests; Microsoft and iCloud
-   * always notify and ignore `false`. Guest-list writes replace the entire `participants` array
+   * Default (omit) is provider-true. Google and EWS honour `false`; Microsoft
+   * rejects it with a 400; iCloud ignores it and still emails. Guest-list writes replace the entire `participants` array
    * (Nylas PUT nested-object replace) with email/name only — never RSVP status.
    */
   async updateEvent(
@@ -539,9 +539,11 @@ export class NylasCalendarClient {
    *
    * `notifyAttendees` maps to Nylas `notifyParticipants` (wire
    * `notify_participants`). Default (omit) notifies attendees. Only `false`
-   * sets the flag. Google honours `false`; Microsoft and iCloud ignore it and
-   * still email attendees. `notify_event_creator` is not a v3 delete parameter
-   * and Nylas rejects the request.
+   * sets the flag. Google and EWS honour `false`; Microsoft rejects it with a
+   * 400, so the delete fails; iCloud ignores it and still emails attendees.
+   * Callers deleting attendee-less events (holds) should omit the flag so the
+   * delete works on every provider. `notify_event_creator` is not a v3 delete
+   * parameter and Nylas rejects the request.
    */
   async deleteEvent(calendarId: string, eventId: string, notifyAttendees?: boolean): Promise<void> {
     this.log.debug({ calendarId, eventId, notifyAttendees }, 'Deleting event');
