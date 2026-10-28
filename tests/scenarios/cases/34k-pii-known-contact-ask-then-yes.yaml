@@ -44,6 +44,12 @@ tool_stubs:
   delegate:
     - match: {}
       error: specialist unavailable
+  # Called outside a scheduled run in a paid run (2026-10-28): the real tool's error.
+  scheduler-report:
+    - match: { job_id: null }
+      error: "Missing job_id: call scheduler-report from a scheduled run (or pass job_id explicitly outside one)"
+    - match: {}
+      return: { success: true }
   # Dana is already a contact; creating one is answered with the existing record, as the
   # handler's duplicate check would find it.
   contact-create:

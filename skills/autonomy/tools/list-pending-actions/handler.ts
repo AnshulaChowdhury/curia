@@ -14,6 +14,7 @@
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
 import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import { askPreamble } from '../../../../src/autonomy/disclosure-decisions.js';
 
 export class ListPendingActionsHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -31,6 +32,9 @@ export class ListPendingActionsHandler implements ToolHandler {
         number: row.approvalNumber,
         short_ref: row.shortRef,
         description: row.description,
+        // A personal-data ask (#2312): the question the principal was sent, naming who asked
+        // and for what, so their "yes, share it with Dana" can be matched to this approval.
+        ...(row.disclosureAsk ? { question: askPreamble(row.disclosureAsk) } : {}),
         skill_name: row.toolName,
         created_at: toLocalIso(Math.floor(row.createdAt.getTime() / 1000), tz),
         expires_at: row.expiresAt ? toLocalIso(Math.floor(row.expiresAt.getTime() / 1000), tz) : null,

@@ -107,6 +107,23 @@ describe('ListPendingActionsHandler', () => {
     expect(data.pending[1]).toMatchObject({ number: null, short_ref: 'b4e8d23c' });
   });
 
+  it('shows a personal-data ask\'s question, naming who asked, so a later yes can be matched (#2312)', async () => {
+    const now = new Date();
+    const repo = makeMockRepo({
+      findAllPending: vi.fn().mockResolvedValue([
+        {
+          id: 1, shortRef: 'c5f9e34d', approvalNumber: 1, description: 'Reply to +15195550177 on signal', toolName: 'dispatcher-relay', createdAt: now, expiresAt: now,
+          disclosureAsk: { conversationId: 'c1', counterparties: ['+15195550177'], labels: ['email'], requester: '+15195550177', requesterName: 'Dana Whitfield' },
+        },
+        { id: 2, shortRef: 'd6a0f45e', approvalNumber: 2, description: 'Create calendar event: Lunch', toolName: 'calendar-create-event', createdAt: now, expiresAt: now },
+      ]),
+    });
+    const result = await new ListPendingActionsHandler().execute(makeCtx({ actionLogRepo: repo }));
+    const data = (result as { success: true; data: unknown }).data as { pending: Array<Record<string, unknown>> };
+    expect(data.pending[0]!['question']).toMatch(/^Dana Whitfield \(\+15195550177\) is asking for your email address\./);
+    expect(data.pending[1]).not.toHaveProperty('question');
+  });
+
   it('returns ToolResult error when findAllPending throws', async () => {
     const repo = makeMockRepo({
       findAllPending: vi.fn().mockRejectedValue(new Error('DB connection lost')),
