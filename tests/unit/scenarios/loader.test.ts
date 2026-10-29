@@ -252,6 +252,37 @@ describe('loadScenarioCase', () => {
     expect(() => loadScenarioCase(write('bad-backlog.yaml', body))).toThrow(error);
   });
 
+  it('loads seed.pinned: documents by normalized path, settings by key, failing reads (#2339)', () => {
+    const body = VALID.replace('seed:\n', [
+      'seed:',
+      '  pinned:',
+      '    docs:',
+      '      /shared/./inbox/rules.md: "## Board mail"',
+      '    configs:',
+      `      ceo_inbox/decision_tagging: '{"enabled": true}'`,
+      '    unavailable: [/shared/calendar/rules.md, debrief/config]',
+      '',
+    ].join('\n'));
+    const c = loadScenarioCase(write('pinned.yaml', body));
+    expect(c.seed.pinned.docs).toEqual(new Map([['/shared/inbox/rules.md', '## Board mail']]));
+    expect(c.seed.pinned.configs).toEqual(new Map([['ceo_inbox/decision_tagging', '{"enabled": true}']]));
+    expect(c.seed.pinned.unavailable).toEqual(new Set(['/shared/calendar/rules.md', 'debrief/config']));
+
+    const none = loadScenarioCase(write('none.yaml', VALID)).seed.pinned;
+    expect([none.docs.size, none.configs.size, none.unavailable.size]).toEqual([0, 0, 0]);
+  });
+
+  it.each([
+    ['a document outside /shared/', 'docs: { /projects/x/rules.md: "x" }', /under \/shared\//],
+    ['a key without a namespace', 'configs: { decision_tagging: "x" }', /namespace/],
+    ['a non-string value', 'configs: { a/b: 3 }', /must be a string/],
+    ['a document both seeded and failing', 'docs: { /shared/a.md: "x" }\n    unavailable: [/shared/a.md]', /more than once|duplicate/i],
+    ['an unknown key', 'archived: []', /unknown key\(s\) archived/],
+  ])('rejects seed.pinned with %s', (_label, block, error) => {
+    const body = VALID.replace('seed:\n', `seed:\n  pinned:\n    ${block}\n`);
+    expect(() => loadScenarioCase(write('bad-pinned.yaml', body))).toThrow(error);
+  });
+
   it('parses seed.verifications and resolves {{verification:key}} (#2017)', () => {
     const body = VALID
       .replace('seed:\n', [

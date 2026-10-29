@@ -97,7 +97,7 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-14T16:53:34.402Z"
     },
-    "calendar rule edit rewrites the whole array": {
+    "calendar rule edit changes one section": {
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",

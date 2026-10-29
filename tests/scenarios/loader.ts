@@ -7,6 +7,8 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import * as path from 'node:path';
 import * as yaml from 'js-yaml';
 import { hasBacklog, type PrincipalBacklogCounts } from '../../src/agents/prompts/backlog-line.js';
+import { parsePinnedContext } from '../../src/agents/pinned-context.js';
+import { normalizeDocPath } from '../../src/memory/okf.js';
 import { isKnownPiiLabel } from '../../src/pii/scrubber.js';
 import { registrableDomain } from '../../src/verification/domain.js';
 import { hasDatePlaceholders, resolveDatePlaceholders } from '../shared/date-placeholders.js';
@@ -35,6 +37,7 @@ import {
   type SeedContact,
   type SeedOutboundEntry,
   type SeedOutreach,
+  type SeedPinned,
   type SeedPrincipalIdentity,
   type SeedTask,
   type SeedVerification,
@@ -76,7 +79,8 @@ function onlyKeys(raw: Raw, allowed: readonly string[], file: string, where: str
 }
 
 const CASE_KEYS = ['name', 'description', 'tags', 'agent', 'delegation', 'release_gate', 'runs', 'timeout_seconds', 'known_failure', 'stub_sets', 'live_search', 'seed', 'inbound', 'tool_stubs', 'expected_behaviors', 'failure_modes', 'identity', 'autonomy', 'through_gateway'] as const;
-const SEED_KEYS = ['contacts', 'outbound_context', 'bullpen', 'backlog', 'verifications', 'principal_identities', 'tasks', 'outreach'] as const;
+const SEED_KEYS = ['contacts', 'outbound_context', 'bullpen', 'backlog', 'verifications', 'principal_identities', 'tasks', 'outreach', 'pinned'] as const;
+const PINNED_KEYS = ['docs', 'configs', 'unavailable'] as const;
 const TASK_KEYS = ['key', 'title', 'intent', 'originator', 'agent'] as const;
 const OUTREACH_KEYS = ['key', 'task', 'via', 'org_name', 'domains', 'addresses', 'contacts', 'summary', 'confirmed'] as const;
 const OUTREACH_VIAS: readonly SeedOutreach['via'][] = ['email', 'web_form', 'signal', 'sms', 'slack', 'phone', 'other'];
@@ -664,6 +668,42 @@ function parseOutreach(raw: Raw, file: string): SeedOutreach[] {
   });
 }
 
+/**
+ * `seed.pinned` (#2339): `docs` maps a `/shared/` path to its text, `configs` maps
+ * `<namespace>/<key>` to its value, and `unavailable` lists entries whose read fails.
+ * Paths and keys are checked with the same rules as an agent's pinned_context.
+ */
+function parsePinned(raw: Raw, file: string): SeedPinned {
+  const pinned: SeedPinned = { docs: new Map(), configs: new Map(), unavailable: new Set() };
+  if (raw['pinned'] === undefined) return pinned;
+  const block = mapping(raw, 'pinned', file, 'seed');
+  onlyKeys(block, PINNED_KEYS, file, 'seed.pinned');
+  const values = (key: 'docs' | 'configs'): Array<[string, string]> => {
+    if (block[key] === undefined) return [];
+    const m = mapping(block, key, file, 'seed.pinned');
+    return Object.entries(m).map(([name, value]) => {
+      if (typeof value !== 'string') throw new CaseError(file, `seed.pinned.${key}: '${name}' must be a string`);
+      return [name, value];
+    });
+  };
+  const docs = values('docs');
+  const configs = values('configs');
+  const unavailable = strList(block, 'unavailable', file, 'seed.pinned');
+  const docNames = [...docs.map(([name]) => name), ...unavailable.filter(name => name.startsWith('/'))];
+  const configNames = [...configs.map(([name]) => name), ...unavailable.filter(name => !name.startsWith('/'))];
+  try {
+    parsePinnedContext({ docs: docNames, configs: configNames }, 'scenario seed');
+  } catch (err) {
+    throw new CaseError(file, `seed.pinned: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  // Keyed as the reader asks: a document by its normalized path, a setting as written.
+  const name = (raw: string): string => (raw.startsWith('/') ? normalizeDocPath(raw) : raw);
+  for (const [path, text] of docs) pinned.docs.set(name(path), text);
+  for (const [key, value] of configs) pinned.configs.set(key, value);
+  for (const entry of unavailable) pinned.unavailable.add(name(entry));
+  return pinned;
+}
+
 /** `seed.backlog`: each count a whole number, absent ones zero, at least one positive. */
 function parseBacklog(raw: Raw, file: string): PrincipalBacklogCounts | undefined {
   if (raw['backlog'] === undefined) return undefined;
@@ -974,6 +1014,7 @@ export function loadScenarioCase(file: string, options: LoadOptions = {}): Scena
     principalIdentities: parsePrincipalIdentities(seedRaw, file),
     tasks: parseTasks(seedRaw, file),
     outreach: parseOutreach(seedRaw, file),
+    pinned: parsePinned(seedRaw, file),
     ...(backlog && { backlog }),
   };
 
