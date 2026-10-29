@@ -404,12 +404,15 @@ jobs:
         if: steps.meta.outputs.tags != ''
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
+      # Retried as a whole command (#2369): a Rekor upload that times out but
+      # lands makes cosign's own retry hit a 409 and fail the publish after a
+      # good push. A fresh `cosign sign` uses new keys and cannot conflict.
       - name: Sign the pushed image by digest
         if: steps.meta.outputs.tags != ''
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+        run: bash docker/sign-image.sh
 
   # Turn a failed publish into an active notification (#1699).
   #

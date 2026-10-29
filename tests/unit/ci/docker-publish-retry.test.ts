@@ -71,6 +71,18 @@ describe('docker-publish retry wiring (#1864)', () => {
     expect(notify.needs).toEqual(['resolve', 'build']);
   });
 
+  // #2369: a Rekor 409 after a timed-out upload failed the publish twice in one
+  // day. The retry must stay inside the sign step for the same reason as above.
+  it('signs through the retrying script, inside the step', () => {
+    const sign = build.steps.find((candidate) => candidate.run?.includes('sign-image.sh'));
+    expect(sign?.run).toBe('bash docker/sign-image.sh');
+    expect(sign?.['continue-on-error']).toBeUndefined();
+    expect(build.steps.some((candidate) => /^\s*cosign sign\b/m.test(candidate.run ?? ''))).toBe(false);
+    const script = readFileSync(join(ROOT, 'docker/sign-image.sh'), 'utf8');
+    expect(script).toContain('SIGN_RETRY_ATTEMPTS:-3');
+    expect(script).toContain('cosign sign --yes "${IMAGE}@${DIGEST}"');
+  });
+
   it('caps the outer retry at three attempts and refuses an unclassified failure', () => {
     const retry = readFileSync(join(ROOT, 'docker/buildx-retry.sh'), 'utf8');
     expect(retry).toContain('BUILDX_RETRY_ATTEMPTS:-3');

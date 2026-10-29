@@ -214,6 +214,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Image signing** — `docker-publish` retries `cosign sign`, so a Rekor 409 no longer fails a good publish. (#2369)
 - **Voice recap requests** — after-call emails go through the async off-ramp, not the draft-only inbox specialist. (#2347)
 - **Minutes follow-up** — the wake now carries the minutes path, so the coordinator stops searching for it. (#2347)
 - **Scenario tool calls** — approval-wake and `then` turns' tool calls are recorded once, not twice. (#2333)
