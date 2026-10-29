@@ -22,6 +22,7 @@ import {
   type BehaviorWeight,
   type DelegationMode,
   type DeliveryChannel,
+  type DeliveryTurn,
   type ExpectedBehavior,
   type ReviewOutcome,
   type IdentityFixture,
@@ -127,7 +128,7 @@ const CHECK_KEYS: Record<string, readonly string[]> = {
   any_of: ['any_of'],
 };
 const GATEWAY_CHECK_KEYS: Record<typeof GATEWAY_CHECK_KINDS[number], readonly string[]> = {
-  delivered: ['channel', 'to', 'cc_includes', 'contains', 'excludes', 'count', 'own_text', 'quote_contains'],
+  delivered: ['channel', 'to', 'cc_includes', 'contains', 'excludes', 'count', 'own_text', 'quote_contains', 'turn'],
   not_delivered: ['to'],
   held: ['contains'],
   not_held: ['contains'],
@@ -228,8 +229,11 @@ function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, f
       const ownText = optBool(body, 'own_text', file, at);
       if (ownText === false) throw new CaseError(file, `${at}: 'own_text' is true or absent`);
       const quoteContains = strList(body, 'quote_contains', file, at);
+      const turn = optStr(body, 'turn', file, at);
+      if (turn !== undefined && turn !== 'first' && turn !== 'then') throw new CaseError(file, `${at}: 'turn' must be first or then`);
       return {
         kind,
+        ...(turn !== undefined ? { turn: turn as DeliveryTurn } : {}),
         ...(channel !== undefined ? { channel: channel as DeliveryChannel } : {}),
         ...(to !== undefined ? { to } : {}),
         ...(cc !== undefined ? { ccIncludes: cc } : {}),
@@ -1272,6 +1276,14 @@ function validateReferences(scenario: ScenarioCase, file: string): void {
   }
 
   const follow = scenario.inbound.followup;
+  // A delivery's turn is recorded only around an inbound.then (#2333).
+  if (!scenario.inbound.then) {
+    for (const b of scenario.expectedBehaviors) {
+      if ((b.check ? leafChecks(b.check) : []).some(c => c.kind === 'delivered' && c.turn !== undefined)) {
+        throw new CaseError(file, `behavior '${b.id}': a delivered check's 'turn' needs inbound.then`);
+      }
+    }
+  }
   if (scenario.inbound.then && toSpecialist) {
     throw new CaseError(file, `inbound.then is a principal turn to the coordinator; a case for '${scenario.agent}' cannot take one`);
   }

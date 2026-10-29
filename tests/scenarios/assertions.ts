@@ -284,7 +284,8 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
       const text = (d: RecordedDelivery): string =>
         `${d.subject ?? ''}\n${check.ownText ? d.ownBody ?? d.body : d.body}`.toLowerCase();
       const matching = delivered.filter(d =>
-        (check.channel === undefined || d.channel === check.channel)
+        (check.turn === undefined || d.turn === check.turn)
+        && (check.channel === undefined || d.channel === check.channel)
         && (check.to === undefined || names(check.to, d.to, d.toNames))
         && (check.ccIncludes === undefined || names(check.ccIncludes, d.cc, d.ccNames))
         && (check.contains ?? []).every(s => text(d).includes(s.toLowerCase()))
@@ -301,6 +302,7 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
         contains: termCount(check.contains), excludes: termCount(check.excludes),
         ...(check.ownText ? { own_text: true } : {}),
         ...(check.quoteContains ? { quote_contains: termCount(check.quoteContains) } : {}),
+        ...(check.turn ? { turn: check.turn } : {}),
       });
       return ok
         ? pass(`${matching.length} delivery(ies) matching ${wanted}`)

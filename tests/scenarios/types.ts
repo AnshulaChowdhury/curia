@@ -102,7 +102,7 @@ export type BehaviorCheck =
    * only (subject and the body above a quoted message), so the sender's own quoted words do
    * not count as something Curia sent them.
    */
-  | { kind: 'delivered'; channel?: DeliveryChannel; to?: string; ccIncludes?: string; contains?: string[]; excludes?: string[]; count?: number; ownText?: boolean; quoteContains?: string[] }
+  | { kind: 'delivered'; channel?: DeliveryChannel; to?: string; ccIncludes?: string; contains?: string[]; excludes?: string[]; count?: number; ownText?: boolean; quoteContains?: string[]; turn?: DeliveryTurn }
   /** Nothing was delivered this run, or nothing to `to` when it is set. */
   | { kind: 'not_delivered'; to?: string }
   /**
@@ -618,8 +618,13 @@ export interface GatewayOutcome {
   reviewerFailedOpen: boolean;
 }
 
+/** Which principal-facing turn a delivery happened in (#2333): before `inbound.then`, or in or after it. */
+export type DeliveryTurn = 'first' | 'then';
+
 export interface RecordedDelivery {
   channel: DeliveryChannel;
+  /** Set on a case with `inbound.then`: whether it went out before that turn began. */
+  turn?: DeliveryTurn;
   /** `draft`: created, not delivered. */
   kind: 'send' | 'draft';
   to: string[];

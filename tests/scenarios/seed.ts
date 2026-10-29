@@ -80,6 +80,8 @@ export class SeedScope {
   readonly principalWroteTo = new Set<string>();
   /** What the run says is waiting on the principal (`seed.backlog`); none when unset. */
   backlog: PrincipalBacklogCounts | undefined;
+  /** How many deliveries the run had when its `inbound.then` turn began (#2333); unset without one. */
+  thenStartsAt: number | undefined;
   /**
    * The run's own conversation (harness.ts sets it when the run begins). With
    * specialistConversations, the conversations whose approvals, outreach and decisions are
@@ -129,6 +131,7 @@ export class SeedScope {
     this.aliveSessions.clear();
     this.principalWroteTo.clear();
     this.backlog = undefined;
+    this.thenStartsAt = undefined;
     this.rootConversation = undefined;
     this.throughGateway = false;
     this.threadMessages.clear();
@@ -1206,8 +1209,9 @@ export async function readGatewayOutcome(stack: TestModeStack, scenario: Scenari
 
   const same = (a: string[], b: string[]): boolean => a.length === b.length && [...a].sort().every((v, i) => v === [...b].sort()[i]);
   return {
-    deliveries: scope.deliveries.map(d => ({
+    deliveries: scope.deliveries.map((d, i) => ({
       channel: d.channel,
+      ...(scope.thenStartsAt !== undefined ? { turn: i < scope.thenStartsAt ? 'first' as const : 'then' as const } : {}),
       kind: d.kind,
       to: d.to,
       cc: d.cc,

@@ -4067,6 +4067,7 @@ export class OutboundGateway {
       // Never the raw values (#2312): the redacted copy, an approved draft's included.
       content: redactedBody,
       messageId: sentMessage.id,
+      ...(sentMessage.threadId ? { threadId: sentMessage.threadId } : {}),
       conversationId: options?.conversationId,
       taskEventId: options?.taskEventId,
       parentEventId: options?.parentEventId,
@@ -4089,7 +4090,8 @@ export class OutboundGateway {
     }
     if (bandReport) await this.publishBandReport(bandReport, options);
 
-    return { success: true, messageId: sentMessage.id };
+    // The thread, as send() returns it (#2333): one delivery contract for both.
+    return { success: true, messageId: sentMessage.id, ...(sentMessage.threadId ? { threadId: sentMessage.threadId } : {}) };
   }
 
   /**

@@ -804,6 +804,8 @@ export async function createScenarioHarness(
       ? `email:${approvalThread ?? `scenario-then-${randomUUID()}`}`
       : `scenario-then-${randomUUID()}`;
     scope.followOnConversations.add(conversationId);
+    // The turn boundary (#2333): a delivery before it went out before the principal answered.
+    scope.thenStartsAt = scope.deliveries.length;
     outcomeGate.hold(conversationId);
     controller.attach(rootConversationId, conversationId);
     const waiter = capture.waitFor(conversationId, timeoutMs, COORDINATOR);
@@ -1213,6 +1215,16 @@ export async function createScenarioHarness(
           // The first turn has replied; let its publish (and anything it set off) finish, so the
           // principal's next message is a turn of its own, as it would be in production.
           await settleWithin(delivery, timeoutMs);
+          // And its approval wakes (#2333): the principal answers an approval the wake delivered,
+          // and what the first turn sent, a holding note included, falls before the turn boundary.
+          await settleWithin((async () => {
+            let settled = 0;
+            while (settled < scope.wakeTurns.length) {
+              const snapshot = [...scope.wakeTurns];
+              await Promise.all(snapshot);
+              settled = snapshot.length;
+            }
+          })(), timeoutMs);
           const then = await runPrincipalTurn(scenario, inbound.then, runConversationId, scope, timeoutMs);
           thenOutcome = then.outcome;
           await settleWithin(then.delivery, timeoutMs);

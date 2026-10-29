@@ -773,6 +773,13 @@ to split off), so it fails closed only for `count: 0` checks: a quoted term then
 the case. For a positive check (`count` of 1 or more) it can match quoted text, so don't rely
 on it to prove the reply itself said something.
 
+On a case with `inbound.then`, each delivery records its turn: `first` before the principal's
+next turn began, `then` from it on. `turn` narrows a `delivered` check to one (#2333), so
+"nothing carrying the address reaches Dana before Avery answers" is
+`delivered: { to: dana, contains: ["@example.test"], count: 0, turn: first }`: without it, a
+detail leaked on the first turn and approved again on the second passes every other check.
+The loader rejects `turn` on a case without `inbound.then`.
+
 The `label` of `reviewed` and `decision_recorded` must be a detection label: a built-in
 pattern name (`phone_us`, `sin_ca`, `email`, ...) or `extra_N` for the operator's Nth extra
 pattern. The loader rejects any other, so a typo can't make a check pass or fail silently.

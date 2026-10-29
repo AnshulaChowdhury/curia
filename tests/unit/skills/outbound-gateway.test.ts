@@ -5210,6 +5210,16 @@ describe('band review (#2159)', () => {
         expect(publishedOfType(mocks.bus, 'outbound.pii_redacted')).toHaveLength(0);
       });
 
+      // One delivery contract with send() (#2333): the sent message's thread.
+      it('returns and publishes the sent draft\'s thread', async () => {
+        const sendDraft = draftSender();
+        sendDraft.mockResolvedValue({ id: 'sent-1', threadId: 'thread-1' });
+        const { gateway } = await makePiiGateway({ review: vi.fn().mockResolvedValue({ kind: 'send' }) });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1' });
+        expect(result).toMatchObject({ success: true, messageId: 'sent-1', threadId: 'thread-1' });
+        expect(publishedOfType(mocks.bus, 'outbound.delivered')[0]!.payload).toMatchObject({ messageId: 'sent-1', threadId: 'thread-1' });
+      });
+
       it('holds a draft the review bounces: it cannot be rewritten in place', async () => {
         const sendDraft = draftSender();
         const findings = [{ rule: 'pii-not-authorized', detail: 'P1 phone_us was not authorized.' }];
