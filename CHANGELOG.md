@@ -211,7 +211,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Approval review** — held sends show their content, and discard finds the owning mailbox. (#2340)
 - **Console approve** — the re-run records the principal as the web originator. (#2340)
 - **Work histogram** — a busy fortnight no longer takes the stats cards down. (#2340)
-- **Hiccups** — hidden tool failures no longer count on the tile or the histogram. (#2340)
+- **Hiccups** — undescribed and hidden tool failures no longer count. (#2340)
 - **Waiting list** — undoing one dismissal stays available while another is pending. (#2340)
 - **Task status route** — status changes cancel wake-ups and close related outreach. (#2340)
 - **task-create** — placeholder ids are omitted, and a missing task is reported as not found. (#2328)

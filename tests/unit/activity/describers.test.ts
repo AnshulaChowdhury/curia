@@ -7,6 +7,7 @@ import {
   hasDescriber,
   hiddenToolNames,
   isVisibleTool,
+  visibleToolNames,
   researchKind,
   type DescribeContext,
   type ToolCall,
@@ -46,6 +47,19 @@ describe('hiddenToolNames', () => {
     expect(hidden).toContain('delegate');
     expect(hidden).not.toContain('email-archive');
     expect(hidden).not.toContain('email-send');
+  });
+});
+
+describe('visibleToolNames', () => {
+  it('is the set the feed classifies, so undescribed tools stay out', () => {
+    const visible = visibleToolNames();
+    expect(visible).toContain('email-archive');
+    expect(visible).toContain('email-send');
+    expect(visible).not.toContain('extract-facts');
+    expect(visible).not.toContain('web-search');
+    expect(visible).not.toContain('contact-lookup');
+    expect(isVisibleTool('contact-lookup')).toBe(false);
+    expect(isVisibleTool('email-archive')).toBe(true);
   });
 });
 

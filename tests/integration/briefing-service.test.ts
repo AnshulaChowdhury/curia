@@ -190,6 +190,20 @@ describeIf('briefing service against Postgres', () => {
         outcome: 'failure',
         payload: { result: { success: false } },
       });
+      // contact-lookup has no describer, so the feed treats it as hidden too.
+      const lookupFail = await seedAudit(client, {
+        timestamp: new Date(now.getTime() - 90 * 60_000 + 5000),
+        eventType: 'tool.invoke',
+        parentEventId: quietRoot,
+        payload: { toolName: 'contact-lookup' },
+      });
+      await seedAudit(client, {
+        timestamp: new Date(now.getTime() - 90 * 60_000 + 6000),
+        eventType: 'tool.result',
+        parentEventId: lookupFail,
+        outcome: 'failure',
+        payload: { result: { success: false } },
+      });
 
       // An outcome other than failure/error/denied falls back to the payload.
       const fallbackRoot = await seedAudit(client, {
