@@ -77,6 +77,7 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 | [053](053-turn-lanes-and-mid-turn-injection.md) | Turn lanes and mid-turn injection — one coordinator turn at a time per human conversation; only a live follow-up from that turn's resolved contact may join it; synthetic wakes wait (#2018; amended 2026-10-26) | Accepted |
 | [054](054-authority-aware-pii-disclosure.md) | Authority-aware PII disclosure — the band judge rules on each personal detail, code computes who authorized it, no cut-and-send, outreach links and asks instead of refusals (#2312) | Accepted |
 | [055](055-phone-app-as-an-installable-pwa.md) | Phone app as an installable PWA — HTTPS-only with a stated fallback; QR-paired per-device sessions with 90-day sliding expiry; one server-owned web thread; web push as a principal-only `web` channel that agents choose, with code enforcing availability and dead-subscription fallback (#2341) | Accepted |
+| [056](056-pinned-context.md) | Agents declare the documents and settings they work from (`pinned_context`) — `/shared/` documents and single config keys injected fresh every turn; declaring a `/shared/` path is the permission to write it; `/shared/` is durable by prefix (#2338) | Accepted |
 
 ## Adding new ADRs
 

@@ -20,6 +20,7 @@ import type { AgentConfig } from '../agents/runtime.js';
 import type { SystemPromptSources } from '../agents/system-prompt.js';
 import type { AgentYamlConfig } from '../agents/loader.js';
 import { interpolateRuntimeContext } from '../agents/loader.js';
+import { parsePinnedContext, pinnedDocPaths, type PinnedContextReader } from '../agents/pinned-context.js';
 import type { AgentRegistry } from '../agents/agent-registry.js';
 import type { LLMProvider, LLMUsage, ToolDefinition } from '../agents/llm/provider.js';
 import type { ModelRouter, Tier } from '../agents/llm/model-router.js';
@@ -81,6 +82,7 @@ export function registerAgentRoster(agentRegistry: AgentRegistry, agentConfigs: 
       delegateWhen: agentConfig.delegate_when,
       displayName: agentConfig.display_name,
       expectedDurationSeconds: agentConfig.expected_duration_seconds,
+      pinnedDocPaths: pinnedDocPaths(parsePinnedContext(agentConfig.pinned_context, agentConfig.name)),
     });
   }
 }
@@ -214,6 +216,7 @@ export type SystemPromptSourceContext = Pick<
   | 'agentContactId'
   | 'verification'
   | 'browserSessionAlive'
+  | 'pinnedContextReader'
 >;
 
 /**
@@ -236,6 +239,7 @@ export const SYSTEM_PROMPT_SOURCE_CONTEXT_KEYS = [
   'agentContactId',
   'verification',
   'browserSessionAlive',
+  'pinnedContextReader',
 ] as const satisfies readonly (keyof SystemPromptSourceContext)[];
 
 type UnlistedSourceContextKey = Exclude<
@@ -305,6 +309,10 @@ export function resolveSystemPromptSources(
     // code emails; no other agent is told a sign-in is in flight.
     verification: isCoordinator || agentConfig.name === 'ceo-inbox' ? ctx.verification : undefined,
     browserSessionAlive: isCoordinator || agentConfig.name === 'ceo-inbox' ? ctx.browserSessionAlive : undefined,
+    // Declared `/shared/` documents and config keys, read fresh every turn (#2338).
+    // Any agent may declare them; an agent with none gets no block.
+    pinnedContext: parsePinnedContext(agentConfig.pinned_context, agentConfig.name),
+    pinnedContextReader: ctx.pinnedContextReader,
     // Map YAML snake_case to AgentConfig camelCase, defaulting omitted fields.
     errorBudget: agentConfig.error_budget ? {
       maxTurns: agentConfig.error_budget.max_turns ?? DEFAULT_ERROR_BUDGET.maxTurns,
@@ -343,6 +351,9 @@ export interface AgentAssemblyContext {
   verification?: VerificationRuntime;
   /** True while a browser session id is live. Absent when no browser service runs. */
   browserSessionAlive?: (sessionId: string) => boolean;
+  /** Reads for the per-turn `## Pinned context` block (#2338). Absent: a declared
+   *  entry renders as unavailable. */
+  pinnedContextReader?: PinnedContextReader;
   defaultDelegateTimeoutMs?: number;
   lateDelivery: { enabled?: boolean; ttlMinutes: number; sweepIntervalMinutes: number };
   bullpenService?: BullpenService;

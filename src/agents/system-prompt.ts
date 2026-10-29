@@ -40,6 +40,7 @@ import {
   type VerificationView,
 } from './prompts/verification-block.js';
 import { formatTurnBudgetBlock } from './turn-budget.js';
+import { renderPinnedContextBlock, type PinnedContextReader } from './pinned-context.js';
 import type { AgentConfig } from './runtime.js';
 
 /**
@@ -64,7 +65,16 @@ export type SystemPromptSources = Pick<
   | 'errorBudget'
   | 'verification'
   | 'browserSessionAlive'
+  | 'pinnedContext'
+  | 'pinnedContextReader'
 >;
+
+/** Stands in when no reader is wired: every declared entry renders as unavailable. */
+const UNWIRED_PINNED_CONTEXT_READER: PinnedContextReader = {
+  warnChars: Number.POSITIVE_INFINITY,
+  readDoc: () => Promise.reject(new Error('pinned context reader not wired')),
+  readConfig: () => Promise.reject(new Error('pinned context reader not wired')),
+};
 
 /**
  * The max-turns value the runtime enforces for this agent. The turn budget block
@@ -80,7 +90,7 @@ export function resolveMaxTurns(errorBudget: AgentConfig['errorBudget']): number
  * Order (do not change without updating the tests that pin it):
  *   identity → security → ## Your Contact Details → ## Who you serve (with
  *   ### Principal Contact Details) → YAML body → ## Available Specialists →
- *   autonomy → live sign-in verifications (coordinator, ceo-inbox) → date guardrail
+ *   ## Pinned context → autonomy → live sign-in verifications (coordinator, ceo-inbox) → date guardrail
  *   (coordinator) → time → turn budget
  *
  * Specialists get no identity or security block, so theirs starts at
@@ -183,6 +193,20 @@ export async function buildBaseSystemPrompt(
   // API-editable, strip newlines here (as the ### Principal Contact Details block does).
   if (sources.availableSpecialists) {
     prompt += '\n\n## Available Specialists\n' + sources.availableSpecialists;
+  }
+
+  // Declared `/shared/` documents and config keys (#2338), read fresh every turn so a
+  // console edit applies on the next turn. After the body, which refers to them, and
+  // ahead of the per-turn blocks: they change rarely, so they stay in the cached
+  // prefix. renderPinnedContextBlock never throws — a failed read renders as
+  // unavailable inside the block.
+  if (sources.pinnedContext && sources.pinnedContext.length > 0) {
+    const block = await renderPinnedContextBlock(
+      sources.pinnedContext,
+      sources.pinnedContextReader ?? UNWIRED_PINNED_CONTEXT_READER,
+      { agentId, logger },
+    );
+    if (block) prompt += '\n\n' + block;
   }
 
   // Load the current autonomy config and append its behavioral block. Per-task (not

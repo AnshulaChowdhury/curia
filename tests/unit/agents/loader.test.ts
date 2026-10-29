@@ -168,6 +168,35 @@ error_budget:
     fs.rmSync(tempDir, { recursive: true });
   });
 
+  it('accepts pinned_context and fails the load on a bad entry, naming the agent (#2338)', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'curia-test-'));
+    const write = (entries: string): string => {
+      const filePath = path.join(tempDir, 'pinned.yaml');
+      fs.writeFileSync(filePath, `
+name: pinned-agent
+model:
+  tier: standard
+system_prompt: "Test agent"
+pinned_context:
+${entries}
+`);
+      return filePath;
+    };
+    try {
+      const config = loadAgentConfig(write('  - doc: /shared/inbox/rules.md\n  - config: ceo_inbox/decision_tagging'));
+      expect(config.pinned_context).toEqual([
+        { doc: '/shared/inbox/rules.md' },
+        { config: 'ceo_inbox/decision_tagging' },
+      ]);
+      expect(() => loadAgentConfig(write('  - doc: /projects/x/rules.md')))
+        .toThrow(/agent 'pinned-agent'.*under \/shared\//);
+      expect(() => loadAgentConfig(write('  - config: ceo_inbox')))
+        .toThrow(/agent 'pinned-agent'.*exactly one `\/`/);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true });
+    }
+  });
+
   it('parses schedule entry with agent_id field', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'curia-test-'));
     const yamlContent = `

@@ -65,6 +65,10 @@ pinned_skills:                 # skill bundles always available (expanded to mem
   - documents                  # doc-* + Document Workspace instructions
   - scheduler-create
 
+pinned_context:                # documents and settings shown on every turn (see below)
+  - doc: /shared/expenses/rules.md
+  - config: expenses/currency
+
 allow_discovery: true          # if true, agent can search tools at runtime
                                # and request tools not in pinned_skills
                                # "normal" sensitivity tools auto-approve; "elevated" ones
@@ -207,7 +211,8 @@ coordinator, `writing_config` for an essay editor). Bake it into your system pro
 config-store { action: "store", namespace: "writing_config", key: "writing_guide_url", value: "https://..." }
 ```
 
-**Retrieve** (agent does this at the start of each run):
+**Retrieve** (agent does this at the start of each run, unless the key is declared in
+`pinned_context`, below):
 ```
 config-store { action: "retrieve", namespace: "writing_config", key: "writing_guide_url" }
 # → { found: true, value: "https://..." }
@@ -228,6 +233,42 @@ structured findings from your specialist; let the coordinator decide how to pres
 
 If your specialist runs on a schedule and needs to send output, use `agent_id: coordinator`
 in the schedule block (see the schedule section below).
+
+### `pinned_context` (optional)
+
+Documents and config-store keys that are part of how the agent works. The runtime reads
+each one fresh on every turn and renders it into the system prompt under
+`## Pinned context`, after the YAML body. The agent needs no "load your settings first"
+step, and a console edit applies on its next turn. See
+[ADR-056](../adr/056-pinned-context.md).
+
+```yaml
+pinned_context:
+  - doc: /shared/expenses/rules.md      # an OKF document under /shared/
+  - config: expenses/currency           # one config-store key: <namespace>/<key>
+```
+
+- **`doc:`** must be a path under `/shared/`. Declaring it is the permission to write it:
+  `doc-write` refuses a `/shared/` path the calling agent does not declare. Several agents
+  may declare the same document to share it; `expected_version` /
+  `expected_section_version` handle simultaneous edits. `/shared/` documents are durable:
+  never task-owned, never archived with a project. Use one when a setting outgrows
+  config-store's 2000-character cap or the agent edits it a piece at a time. Have the
+  document state its own format in its frontmatter or a short top section, so every
+  declaring agent follows one format and no prompt restates it. Pin `documents` so the
+  agent can write it.
+- **`config:`** names exactly one key. Whole namespaces are not supported, because they mix
+  principal settings with runtime state. Config entries are shown only; writes still go
+  through `config-store`.
+
+A document or key that does not exist yet renders as not yet created. A failed read
+renders as unavailable and logs a warning; it is never silently left out. An item over
+`documentWorkspace.pinnedContextWarnChars` (default 16000) logs a warning each turn and is
+still injected in full. A malformed entry, a `doc:` outside `/shared/`, or a `config:`
+without exactly one `/` fails the agent's load.
+
+Everything declared here is sent on every turn, so keep it to what the agent needs on most
+turns. Read anything rarer on demand.
 
 ### `expected_duration_seconds` (optional)
 

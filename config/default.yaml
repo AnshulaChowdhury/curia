@@ -130,6 +130,9 @@ documentWorkspace:
   # Largest document (serialized OKF bytes) the console Documents page edits in place.
   # Bigger documents are read-only there: download, edit offline, re-import. 1024–4194304.
   consoleEditMaxBytes: 65536
+  # An agent's `pinned_context` document or config value longer than this many characters
+  # logs a warning each turn it is injected (#2338). It is still injected in full.
+  pinnedContextWarnChars: 16000
   # When a planned parent completes, promote its curated deliverable into the KG via
   # extract-facts / extract-relationships, then archive the project's workspace docs.
   # Per-task override: error_budget.kg_promotion: false skips promotion for that task.

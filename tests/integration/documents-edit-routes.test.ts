@@ -203,6 +203,23 @@ describeIf('console Documents editing (integration)', () => {
       expect(auditActions()).toEqual(['create']);
     });
 
+    it('creates and saves a /shared/ document, which has no agent write guard here (#2338)', async () => {
+      const created = await call('POST', '/api/documents/doc', {
+        path: '/shared/inbox/rules.md',
+        content: emitOkfDocument({ type: 'agent-settings', body: '## Board mail\n' }),
+      });
+      expect(created.status).toBe(201);
+      const saved = await call('PUT', '/api/documents/doc', {
+        path: '/shared/inbox/rules.md',
+        content: emitOkfDocument({ type: 'agent-settings', body: '## Board mail\n- Status: paused\n' }),
+        expectedVersion: 1,
+      });
+      expect(saved.status).toBe(200);
+      const row = (await repo.read('/shared/inbox/rules.md'))!;
+      expect(row.body).toBe('## Board mail\n- Status: paused\n');
+      expect(row.taskId).toBeNull();
+    });
+
     it('rejects an existing live path', async () => {
       await repo.create({ path: '/projects/new/notes.md', type: 'reference', body: 'mine\n' });
       const res = await call('POST', '/api/documents/doc', {

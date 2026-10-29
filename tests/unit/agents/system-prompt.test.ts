@@ -183,3 +183,41 @@ describe('buildBaseSystemPrompt own contact numbers', () => {
     expect(await contactBlock({})).toBeNull();
   });
 });
+
+describe('buildBaseSystemPrompt pinned context (#2338)', () => {
+  const pinnedContext = [{ kind: 'doc' as const, path: '/shared/inbox/rules.md' }];
+  const pinnedContextReader = {
+    warnChars: 16_000,
+    readDoc: vi.fn(async () => ({ version: 3, content: '## Board mail' })),
+    readConfig: vi.fn(async () => null),
+  };
+
+  it('renders the block after the body and specialist roster, before autonomy', async () => {
+    const autonomyService = {
+      getConfig: vi.fn(async () => ({ score: 75, band: 'approval-required', updatedAt: NOW, updatedBy: 'x' })),
+    } as unknown as SystemPromptSources['autonomyService'];
+    const prompt = await buildBaseSystemPrompt(
+      sources('ceo-inbox', [], { pinnedContext, pinnedContextReader, availableSpecialists: '- @x', autonomyService }),
+      { now: NOW, logger },
+    );
+    const body = prompt.indexOf('Body.');
+    const roster = prompt.indexOf('## Available Specialists');
+    const pinned = prompt.indexOf('## Pinned context');
+    const autonomy = prompt.indexOf('## Autonomy Level');
+    expect(body).toBeGreaterThanOrEqual(0);
+    expect(roster).toBeGreaterThan(body);
+    expect(pinned).toBeGreaterThan(roster);
+    expect(autonomy).toBeGreaterThan(pinned);
+    expect(prompt).toContain('### Document /shared/inbox/rules.md (version 3)');
+  });
+
+  it('renders nothing for an agent that declares nothing', async () => {
+    const prompt = await buildBaseSystemPrompt(sources('contacts', [], { pinnedContextReader }), { now: NOW, logger });
+    expect(prompt).not.toContain('## Pinned context');
+  });
+
+  it('renders declared entries as unavailable when no reader is wired', async () => {
+    const prompt = await buildBaseSystemPrompt(sources('ceo-inbox', [], { pinnedContext }), { now: NOW, logger });
+    expect(prompt).toContain('### Document /shared/inbox/rules.md\n_Unavailable this turn');
+  });
+});
