@@ -31,6 +31,17 @@ inbound:
     channel: email
 tool_stubs:
   delegate:
+    # The work address goes out as a send of its own, so Curia may look Dana up first: a run
+    # with only "specialist unavailable" could not find her and sent nothing (2026-10-28).
+    - match: { agent: contacts }
+      return:
+        agent: contacts
+        response: |
+          Dana Whitfield is a known contact (Riverside gala committee). Her verified Signal number is +15195550177.
+
+          <resolved_entities>
+            <contact name="Dana Whitfield" id="{{contact:dana}}"/>
+          </resolved_entities>
     - match: {}
       error: specialist unavailable
   scheduler-report:

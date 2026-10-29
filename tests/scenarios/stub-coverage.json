@@ -523,11 +523,35 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-27T23:58:57.132Z"
     },
+    "pii known contact ask then an unrelated yes": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-29T01:31:52.419Z"
+    },
+    "pii known contact ask then another address": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-29T01:26:15.650Z"
+    },
+    "pii known contact ask then no": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-29T01:21:05.661Z"
+    },
     "pii known contact ask then yes": {
       "unstubbed": 0,
       "runs": 3,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-28T02:54:32.225Z"
+      "recordedAt": "2026-10-29T01:18:12.016Z"
+    },
+    "pii known contact ask yes on the approval thread": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-29T01:22:43.274Z"
     },
     "pii linked reply callback number at 74": {
       "unstubbed": 0,
