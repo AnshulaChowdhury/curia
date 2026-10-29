@@ -7,8 +7,11 @@ import {
   hiccupsOver,
   localDayKey,
   localMidnight,
+  approvalNeedsDraft,
+  approvalReviewSummary,
   mailboxDraftRef,
   shapeHistogram,
+  shapeHistogramFromCounts,
   type ProjectedJob,
 } from '../../../src/dashboard/briefing.js';
 
@@ -114,6 +117,41 @@ describe('shapeHistogram', () => {
     expect(saturday).toMatchObject({ label: 'Sa', weekend: true, today: false });
     expect(sunday).toMatchObject({ label: 'Su', weekend: true });
     expect(model.days.filter((day) => day.today).map((day) => day.key)).toEqual(['2026-10-28']);
+  });
+});
+
+describe('approval review', () => {
+  it('includes the message the approval would send', () => {
+    const summary = approvalReviewSummary({
+      description: 'Reply to vendor',
+      toolName: 'email-send',
+      payload: { to: 'ada@example.com', subject: 'Renewal', body: 'Please find the terms attached.' },
+    });
+    expect(summary).toContain('Reply to vendor');
+    expect(summary).toContain('To: ada@example.com');
+    expect(summary).toContain('Subject: Renewal');
+    expect(summary).toContain('Body: Please find the terms attached.');
+  });
+
+  it('asks for a mailbox read when a send-draft stored only an id', () => {
+    expect(approvalNeedsDraft('send-draft', { draft_id: 'd1' })).toBe(true);
+    expect(approvalNeedsDraft('send-draft', { draft_id: 'd1', to: 'ada@example.com', body: 'Hi' })).toBe(false);
+    expect(approvalNeedsDraft('email-send', { draft_id: 'd1' })).toBe(false);
+  });
+});
+
+describe('shapeHistogramFromCounts', () => {
+  it('adds the count instead of one row, and keeps hiccups equal to the bars', () => {
+    const now = new Date('2026-10-28T15:00:00.000Z');
+    const model = shapeHistogramFromCounts(
+      [{ day: '2026-10-28', actor: 'ceo-inbox', outcome: 'failed', n: 3 }],
+      now,
+      TORONTO,
+    );
+    const today = model.days[13]!;
+    expect(today).toMatchObject({ total: 3, hiccups: 3 });
+    expect(today.byOutcome.failed).toBe(3);
+    expect(model.days.slice(-7).reduce((sum, day) => sum + day.hiccups, 0)).toBe(3);
   });
 });
 

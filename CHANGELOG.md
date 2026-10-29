@@ -208,6 +208,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 - **Scenario tool calls** — approval-wake and `then` turns' tool calls are recorded once, not twice. (#2333)
 - **PII scenarios 34a, 34h, 34i** — stub the inbox specialist, ask Curia to send, and check held SINs precisely. (#2333)
+- **Approval review** — held sends show their content, and discard finds the owning mailbox. (#2340)
+- **Console approve** — the re-run records the principal as the web originator. (#2340)
+- **Work histogram** — a busy fortnight no longer takes the stats cards down. (#2340)
+- **Waiting list** — undoing one dismissal stays available while another is pending. (#2340)
 - **Task status route** — status changes cancel wake-ups and close related outreach. (#2340)
 - **task-create** — placeholder ids are omitted, and a missing task is reported as not found. (#2328)
 - **task-create** — optional id inputs say to omit the field when there is none. (#2328)

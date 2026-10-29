@@ -1,20 +1,24 @@
 // Waiting on you — overdue tasks and held approvals (#2340).
 //
 // Dismiss and Mark done wait UNDO_WINDOW_MS before they hit the server, so Undo
-// reverses them by cancelling the commit. Approve runs immediately and cannot
-// be undone. A failed card stays an error: it never becomes "all caught up".
+// reverses them by cancelling the commit. One toast covers every change still
+// inside that window; approving does not replace it. Approve runs immediately
+// and cannot be undone. A failed card stays an error: it never becomes "all caught up".
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ACT_DONE_MS,
   caughtUpDetail,
+  fetchApprovalPreview,
   fetchWaiting,
   heldMeta,
   orderWaitingItems,
   overdueMeta,
+  pendingUndoMessage,
   postDashboard,
   scheduleUndoCommit,
   showCaughtUp,
+  type PendingUndoKind,
   type UndoCommit,
   type WaitingApproval,
   type WaitingRow,
@@ -27,14 +31,30 @@ interface WaitingOnYouProps {
   onTimezone: (zone: string) => void;
 }
 
-interface ToastState {
+interface Notice {
   key: string;
   message: string;
-  onUndo?: () => void;
+}
+
+interface PendingChange {
+  handle: UndoCommit;
+  kind: PendingUndoKind;
+}
+
+interface DraftPreview {
+  id: number;
+  status: 'loading' | 'ready' | 'error';
+  summary: string;
+  canApprove: boolean;
+  blockReason: string | null;
 }
 
 function rowKey(row: WaitingRow): string {
   return row.kind === 'task' ? `task:${row.id}` : `approval:${row.id}`;
+}
+
+function isAbort(err: unknown): boolean {
+  return err instanceof DOMException && err.name === 'AbortError';
 }
 
 export function WaitingOnYou({ onVisibleCount, onTimezone }: WaitingOnYouProps) {
@@ -42,11 +62,13 @@ export function WaitingOnYou({ onVisibleCount, onTimezone }: WaitingOnYouProps) 
   const [hidden, setHidden] = useState<Set<string>>(() => new Set());
   const [done, setDone] = useState<Set<string>>(() => new Set());
   const [reviewId, setReviewId] = useState<number | null>(null);
+  const [preview, setPreview] = useState<DraftPreview | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [extraCleared, setExtraCleared] = useState(0);
-  const [toast, setToast] = useState<ToastState | null>(null);
+  const [undoMessage, setUndoMessage] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
 
-  const pending = useRef(new Map<string, UndoCommit>());
+  const pending = useRef(new Map<string, PendingChange>());
   const hideTimers = useRef(new Map<string, number>());
   const mounted = useRef(true);
 
@@ -60,7 +82,7 @@ export function WaitingOnYou({ onVisibleCount, onTimezone }: WaitingOnYouProps) 
     const timers = hideTimers.current;
     const commits = pending.current;
     const flush = () => {
-      for (const commit of commits.values()) commit.flush();
+      for (const change of commits.values()) change.handle.flush();
       commits.clear();
     };
     window.addEventListener('pagehide', flush);
@@ -79,6 +101,7 @@ export function WaitingOnYou({ onVisibleCount, onTimezone }: WaitingOnYouProps) 
     setDone(new Set());
     setExtraCleared(0);
     setReviewId(null);
+    setPreview(null);
   }, [data]);
 
   useEffect(() => {
@@ -95,10 +118,37 @@ export function WaitingOnYou({ onVisibleCount, onTimezone }: WaitingOnYouProps) 
   }, [data, error, visible.length, onVisibleCount, onTimezone]);
 
   useEffect(() => {
-    if (!toast || toast.onUndo) return;
-    const timer = window.setTimeout(() => setToast(null), 4_000);
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 4_000);
     return () => window.clearTimeout(timer);
-  }, [toast]);
+  }, [notice]);
+
+  useEffect(() => {
+    if (reviewId === null || !data) return;
+    const row = data.approvals.find((item) => item.id === reviewId);
+    if (!row?.needsDraft) {
+      setPreview(null);
+      return;
+    }
+    const ac = new AbortController();
+    setPreview({ id: reviewId, status: 'loading', summary: '', canApprove: false, blockReason: null });
+    void fetchApprovalPreview(reviewId, ac.signal).then(
+      (result) => {
+        if (ac.signal.aborted) return;
+        setPreview({ id: reviewId, status: 'ready', ...result });
+      },
+      (err: unknown) => {
+        if (ac.signal.aborted || isAbort(err)) return;
+        const message = err instanceof Error ? err.message : 'Could not load this draft';
+        setPreview({ id: reviewId, status: 'error', summary: message, canApprove: false, blockReason: message });
+      },
+    );
+    return () => ac.abort();
+  }, [reviewId, data]);
+
+  function refreshUndo() {
+    setUndoMessage(pendingUndoMessage([...pending.current.values()].map((change) => change.kind)));
+  }
 
   function unhide(key: string) {
     const timer = hideTimers.current.get(key);
@@ -118,45 +168,47 @@ export function WaitingOnYou({ onVisibleCount, onTimezone }: WaitingOnYouProps) 
     });
   }
 
-  function armUndo(key: string, path: string, message: string) {
+  function undoAll() {
+    const entries = [...pending.current.entries()];
+    for (const [, change] of entries) change.handle.cancel();
+    pending.current.clear();
+    for (const [key] of entries) unhide(key);
+    setExtraCleared((n) => Math.max(0, n - entries.length));
+    setUndoMessage(null);
+  }
+
+  function armUndo(key: string, path: string, kind: PendingUndoKind) {
     setExtraCleared((n) => n + 1);
     const handle = scheduleUndoCommit(() => {
       pending.current.delete(key);
-      if (mounted.current) setToast((current) => (current?.key === key ? null : current));
+      if (mounted.current) refreshUndo();
       void postDashboard(path).catch((err: unknown) => {
+        // A navigation away inside the window still commits. Log the failure:
+        // the row comes back on the next visit with no toast to explain it.
+        console.error('dashboard: pending change failed to save', err);
         if (!mounted.current) return;
         unhide(key);
         setExtraCleared((n) => Math.max(0, n - 1));
         const text = err instanceof Error ? err.message : 'Could not save that change';
-        setToast({ key: `${key}:err`, message: text });
+        setNotice({ key: `${key}:err`, message: text });
       });
     });
-    pending.current.set(key, handle);
-    setToast({
-      key,
-      message,
-      onUndo: () => {
-        handle.cancel();
-        pending.current.delete(key);
-        unhide(key);
-        setExtraCleared((n) => Math.max(0, n - 1));
-        setToast(null);
-      },
-    });
+    pending.current.set(key, { handle, kind });
+    refreshUndo();
   }
 
   function dismiss(key: string, path: string) {
     if (pending.current.has(key) || hidden.has(key)) return;
     setHidden((prev) => new Set(prev).add(key));
     setReviewId(null);
-    armUndo(key, path, 'Dismissed');
+    armUndo(key, path, 'dismissed');
   }
 
   function markDone(row: WaitingTask) {
     const key = `task:${row.id}`;
     if (pending.current.has(key)) return;
     setDone((prev) => new Set(prev).add(key));
-    armUndo(key, `/api/dashboard/tasks/${encodeURIComponent(row.id)}/done`, 'Marked done');
+    armUndo(key, `/api/dashboard/tasks/${encodeURIComponent(row.id)}/done`, 'marked done');
     const timer = window.setTimeout(() => {
       hideTimers.current.delete(key);
       if (!mounted.current || !pending.current.has(key)) return;
@@ -170,17 +222,17 @@ export function WaitingOnYou({ onVisibleCount, onTimezone }: WaitingOnYouProps) 
     if (busyKey) return;
     setBusyKey(key);
     try {
-      const body = await postDashboard(`/api/dashboard/approvals/${row.id}/approve`);
+      const body = await postDashboard(`/api/dashboard/approvals/${row.id}/approve`, { shown: true });
       setHidden((prev) => new Set(prev).add(key));
       setExtraCleared((n) => n + 1);
       setReviewId(null);
       const sent = body['sent'] === true;
-      setToast({
+      setNotice({
         key,
         message: sent ? 'Approved & sent' : "Approved, but it didn't go out.",
       });
     } catch (err: unknown) {
-      setToast({ key, message: err instanceof Error ? err.message : 'Could not approve' });
+      setNotice({ key, message: err instanceof Error ? err.message : 'Could not approve' });
     } finally {
       setBusyKey(null);
     }
@@ -236,6 +288,18 @@ export function WaitingOnYou({ onVisibleCount, onTimezone }: WaitingOnYouProps) 
           ? overdueMeta(row.dueAt, now, data.timezone)
           : heldMeta(row.createdAt, now, row.toolName === 'send-draft');
         const dot = row.kind === 'task' ? 'var(--app-destructive)' : 'var(--app-amber)';
+        const draft = row.kind === 'approval' && row.needsDraft ? preview : null;
+        const draftForRow = draft && draft.id === row.id ? draft : null;
+        const reviewText = row.kind === 'approval'
+          ? (row.needsDraft
+            ? (draftForRow?.status === 'ready' || draftForRow?.status === 'error'
+              ? draftForRow.summary
+              : 'Loading the draft…')
+            : (row.summary || 'Held for your approval.'))
+          : '';
+        const canApprove = row.kind === 'approval' && (
+          row.needsDraft ? draftForRow?.status === 'ready' && draftForRow.canApprove : true
+        );
         return (
           <div key={key} className={`dash-wait-item${striking ? ' done' : ''}`}>
             <span className="dash-wait-dot" style={{ background: dot }} />
@@ -244,12 +308,15 @@ export function WaitingOnYou({ onVisibleCount, onTimezone }: WaitingOnYouProps) 
               <div className="dash-wait-meta">{meta}</div>
               {row.kind === 'approval' && reviewId === row.id && (
                 <div className="dash-review">
-                  <p>{row.summary || 'Held for your approval.'}</p>
+                  <p>{reviewText}</p>
+                  {row.needsDraft && draftForRow && !draftForRow.canApprove && draftForRow.status !== 'loading' && (
+                    <a href="/chat">Open in chat</a>
+                  )}
                   <div className="dash-review-actions">
                     <button
                       type="button"
                       className="btn btn-primary btn-sm"
-                      disabled={busyKey === key}
+                      disabled={busyKey === key || !canApprove}
                       onClick={() => void approve(row)}
                     >
                       Approve
@@ -304,11 +371,18 @@ export function WaitingOnYou({ onVisibleCount, onTimezone }: WaitingOnYouProps) 
         );
       })}
 
-      {toast && (
-        <div className="dash-toast" role="status">
-          <span>{toast.message}</span>
-          {toast.onUndo && (
-            <button type="button" onClick={toast.onUndo}>Undo</button>
+      {(undoMessage || notice) && (
+        <div className="dash-toasts">
+          {undoMessage && (
+            <div className="dash-toast" role="status">
+              <span>{undoMessage}</span>
+              <button type="button" onClick={undoAll}>Undo</button>
+            </div>
+          )}
+          {notice && (
+            <div className="dash-toast" role="status">
+              <span>{notice.message}</span>
+            </div>
           )}
         </div>
       )}

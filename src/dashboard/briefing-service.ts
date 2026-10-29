@@ -4,38 +4,44 @@
 // reports unavailable) so the card can show an error instead of a false zero.
 
 import type { Pool } from 'pg';
-import type { AuditLogRepo } from '../audit/audit-log-repo.js';
-import { projectActivity } from '../activity/projection.js';
 import { OPEN_TASK_STATUSES } from '../agents/prompts/backlog-line.js';
 import type { ActionLogRepo } from '../autonomy/action-log-repo.js';
 import type { DisclosureDecisionRecorder } from '../autonomy/disclosure-decisions.js';
 import type { EventBus } from '../bus/bus.js';
 import type { ContactService } from '../contacts/contact-service.js';
-import type { TaskRepo } from '../db/task-repo.js';
+import { TaskTerminalStateError, type TaskRepo } from '../db/task-repo.js';
 import type { Logger } from '../logger.js';
 import type { ExecutionLayer } from '../skills/execution.js';
 import {
-  AGGREGATE_MAX_PAGES,
-  AGGREGATE_PAGE_ROOTS,
+  AGGREGATE_CACHE_MS,
   BULLPEN_IN_FLIGHT_MS,
   HISTOGRAM_DAYS,
   MINUTES_PER_SUCCESSFUL_ACTION,
   STATS_WINDOW_DAYS,
   addCalendarDays,
+  approvalNeedsDraft,
   approvalReviewSummary,
-  countJobs,
   hiccupsOver,
   isValidTimeZone,
   localDayKey,
   localMidnight,
-  shapeHistogram,
+  shapeHistogramFromCounts,
+  type HistogramCount,
   type HistogramModel,
-  type ProjectedJob,
+  type JobOutcome,
 } from './briefing.js';
-import { approveFromConsole, denyFromConsole, type ApprovalOutcome } from './console-approval.js';
+import {
+  approveFromConsole,
+  denyFromConsole,
+  reviewFromConsole,
+  type ApprovalOutcome,
+  type ApprovalReview,
+  type HeldDraftView,
+} from './console-approval.js';
 
 const CLEARED_BY = ['principal', 'console', 'ceo'];
-const DONE_OUTCOMES = new Set(['success', 'partial'] as const);
+const DONE_OUTCOMES: readonly JobOutcome[] = ['success', 'partial'];
+const ALL_OUTCOMES: readonly JobOutcome[] = ['success', 'partial', 'failed'];
 
 export interface WaitingTask {
   id: string;
@@ -49,6 +55,8 @@ export interface WaitingApproval {
   createdAt: string;
   toolName: string;
   summary: string;
+  /** True when Approve must wait for the mailbox draft to be loaded. */
+  needsDraft: boolean;
 }
 
 export interface WaitingResponse {
@@ -78,19 +86,25 @@ export interface BullpenResponse {
 
 export interface BriefingDeps {
   pool: Pool;
-  auditLogRepo: Pick<AuditLogRepo, 'findActivityJobs'>;
   actionLogRepo: Pick<ActionLogRepo, 'findAllPending' | 'findById' | 'resolveRow' | 'rejectStaleApproval' | 'insert'>;
   taskRepo: Pick<TaskRepo, 'listTasks' | 'updateTask'>;
   contactService: Pick<ContactService, 'findContactBySystemRole'>;
   executionLayer?: Pick<ExecutionLayer, 'invoke' | 'confirmPinnedSendResolution'>;
   disclosureDecisions?: Pick<DisclosureDecisionRecorder, 'recordForApproval'>;
   deleteMailboxDraft?: (account: string | undefined, draftId: string) => Promise<void>;
+  loadHeldDraft?: (account: string | undefined, draftId: string) => Promise<HeldDraftView | null>;
   bus?: Pick<EventBus, 'publish'>;
   officeTimezone: string;
   logger: Logger;
 }
 
+/** Delegated work can finish after the window's end. Matches audit-log-repo's tail. */
+const DELEGATION_TAIL_MS = 6 * 60 * 60 * 1000;
+const MAX_DELEGATION_DEPTH = 10;
+
 export class BriefingService {
+  private modelCache: { key: string; expires: number; pending: Promise<HistogramModel> } | null = null;
+
   constructor(private readonly deps: BriefingDeps) {}
 
   async waiting(now: Date = new Date()): Promise<WaitingResponse> {
@@ -123,13 +137,16 @@ export class BriefingService {
       ),
     ]);
 
-    const waitingTasks: WaitingTask[] = tasks
-      .filter((task): task is typeof task & { dueAt: string } => typeof task.dueAt === 'string')
-      .map((task) => ({
+    const waitingTasks: WaitingTask[] = tasks.flatMap((task) => {
+      // node-pg returns timestamptz as a Date. The list type says string.
+      const dueAt = asIso(task.dueAt);
+      if (!dueAt) return [];
+      return [{
         id: task.id,
         title: task.title.trim() || task.intentAnchor,
-        dueAt: task.dueAt,
-      }))
+        dueAt,
+      }];
+    })
       .sort((a, b) => a.dueAt.localeCompare(b.dueAt));
 
     const waitingApprovals: WaitingApproval[] = approvals
@@ -139,6 +156,7 @@ export class BriefingService {
         createdAt: row.createdAt.toISOString(),
         toolName: row.toolName,
         summary: approvalReviewSummary(row),
+        needsDraft: approvalNeedsDraft(row.toolName, row.payload),
       }))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
@@ -153,10 +171,10 @@ export class BriefingService {
 
   async stats(now: Date = new Date()): Promise<StatsResponse> {
     const timezone = await this.timeZone();
-    const { jobs, model } = await this.aggregate(now, timezone);
-    const last7 = new Set(model.days.slice(-STATS_WINDOW_DAYS).map((day) => day.key));
-    const prev7 = new Set(model.days.slice(0, HISTOGRAM_DAYS - STATS_WINDOW_DAYS).map((day) => day.key));
-    const sinceYesterday = new Set(model.days.slice(-2).map((day) => day.key));
+    const model = await this.cachedModel(now, timezone);
+    const last7 = model.days.slice(-STATS_WINDOW_DAYS);
+    const prev7 = model.days.slice(0, HISTOGRAM_DAYS - STATS_WINDOW_DAYS);
+    const sinceYesterday = model.days.slice(-2);
     const currentStart = localMidnight(model.days[HISTOGRAM_DAYS - STATS_WINDOW_DAYS]!.key, timezone);
     const previousStart = localMidnight(model.days[0]!.key, timezone);
 
@@ -170,21 +188,21 @@ export class BriefingService {
       minutesPerAction: MINUTES_PER_SUCCESSFUL_ACTION,
       successfulActions: actions,
       done: {
-        current: countJobs(jobs, last7, timezone, DONE_OUTCOMES),
-        previous: countJobs(jobs, prev7, timezone, DONE_OUTCOMES),
+        current: outcomeTotal(last7, DONE_OUTCOMES),
+        previous: outcomeTotal(prev7, DONE_OUTCOMES),
       },
       contacts,
       hiccups: {
         current: hiccupsOver(model, STATS_WINDOW_DAYS),
         byDay: model.days.map((day) => day.hiccups),
       },
-      handledSinceYesterday: countJobs(jobs, sinceYesterday, timezone),
+      handledSinceYesterday: outcomeTotal(sinceYesterday, ALL_OUTCOMES),
     };
   }
 
   async histogram(now: Date = new Date()): Promise<HistogramModel & { timezone: string }> {
     const timezone = await this.timeZone();
-    const { model } = await this.aggregate(now, timezone);
+    const model = await this.cachedModel(now, timezone);
     return { timezone, ...model };
   }
 
@@ -224,62 +242,73 @@ export class BriefingService {
       if (!updated) return { ok: false, status: 404, error: 'Task not found.' };
       return { ok: true, sent: false };
     } catch (err) {
-      const message = err instanceof Error ? err.message : '';
-      if (message.includes('terminal state')) return { ok: false, status: 400, error: message };
+      if (err instanceof TaskTerminalStateError) return { ok: false, status: 400, error: err.message };
       this.deps.logger.error({ err, taskId: id }, 'briefing: task status update failed');
       return { ok: false, status: 500, error: 'Failed to update task.' };
     }
   }
 
-  async approve(id: number): Promise<ApprovalOutcome> {
-    return this.resolveApproval(id, 'approve');
+  async preview(id: number): Promise<{ ok: true } & ApprovalReview | { ok: false; status: number; error: string }> {
+    const row = await this.deps.actionLogRepo.findById(id);
+    if (!row) return { ok: false, status: 404, error: 'Approval not found.' };
+    const review = await reviewFromConsole(row, this.deps);
+    return { ok: true, ...review };
+  }
+
+  async approve(id: number, shown = false): Promise<ApprovalOutcome> {
+    return this.resolveApproval(id, 'approve', shown);
   }
 
   async deny(id: number): Promise<ApprovalOutcome> {
     return this.resolveApproval(id, 'deny');
   }
 
-  private async resolveApproval(id: number, action: 'approve' | 'deny'): Promise<ApprovalOutcome> {
+  private async resolveApproval(id: number, action: 'approve' | 'deny', shown = false): Promise<ApprovalOutcome> {
     const row = await this.deps.actionLogRepo.findById(id);
     if (!row) return { ok: false, status: 404, error: 'Approval not found.' };
     const principalContactId = await this.principalId();
     const deps = { ...this.deps, principalContactId };
-    return action === 'approve' ? approveFromConsole(row, deps) : denyFromConsole(row, deps);
+    return action === 'approve' ? approveFromConsole(row, deps, new Date(), { shown }) : denyFromConsole(row, deps);
   }
 
-  private async aggregate(now: Date, timezone: string): Promise<{ jobs: ProjectedJob[]; model: HistogramModel }> {
-    const from = localMidnight(
-      addCalendarDays(localDayKey(now, timezone), -(HISTOGRAM_DAYS - 1)),
-      timezone,
+  /**
+   * One grouped read of the 14-day window, shared by stats and the histogram.
+   * Outcome follows the activity feed's success / partial / failed rule on tool
+   * results and a failed reply. Jobs the feed hides (plumbing-only calls) still
+   * count here, so a busy fortnight cannot 500 the cards by running out of pages.
+   */
+  private cachedModel(now: Date, timezone: string): Promise<HistogramModel> {
+    const today = localDayKey(now, timezone);
+    const from = localMidnight(addCalendarDays(today, -(HISTOGRAM_DAYS - 1)), timezone);
+    const key = `${timezone}|${from.toISOString()}|${today}`;
+    const hit = this.modelCache;
+    if (hit && hit.key === key && hit.expires > Date.now()) return hit.pending;
+    const pending = this.loadModel(from, now, timezone);
+    this.modelCache = { key, expires: Date.now() + AGGREGATE_CACHE_MS, pending };
+    pending.catch(() => {
+      if (this.modelCache?.pending === pending) this.modelCache = null;
+    });
+    return pending;
+  }
+
+  private async loadModel(from: Date, to: Date, timezone: string): Promise<HistogramModel> {
+    const result = await this.deps.pool.query<{ day: string; actor: string; outcome: string; n: number }>(
+      HISTOGRAM_SQL,
+      [from, to, new Date(to.getTime() + DELEGATION_TAIL_MS), timezone, MAX_DELEGATION_DEPTH],
     );
-    const jobs = await this.loadJobs(from, now, timezone);
-    return { jobs, model: shapeHistogram(jobs, now, timezone) };
-  }
-
-  private async loadJobs(from: Date, to: Date, timezone: string): Promise<ProjectedJob[]> {
-    const jobs: ProjectedJob[] = [];
-    let before: { timestamp: Date; id: string } | undefined;
-    for (let page = 0; page < AGGREGATE_MAX_PAGES; page++) {
-      const result = await this.deps.auditLogRepo.findActivityJobs({
-        from,
-        to,
-        limit: AGGREGATE_PAGE_ROOTS,
-        ...(before ? { before } : {}),
+    const counts: HistogramCount[] = [];
+    for (const row of result.rows) {
+      if (row.outcome !== 'success' && row.outcome !== 'partial' && row.outcome !== 'failed') continue;
+      const n = Number(row.n);
+      if (!Number.isFinite(n) || typeof row.day !== 'string') continue;
+      counts.push({
+        day: row.day,
+        actor: typeof row.actor === 'string' ? row.actor : 'agent',
+        outcome: row.outcome,
+        n,
       });
-      const items = projectActivity(result, {
-        timezone,
-        name: () => null,
-        jobLabel: () => null,
-        autonomyRows: [],
-      });
-      for (const item of items) {
-        jobs.push({ ts: item.ts, actor: item.actor, outcome: item.outcome });
-      }
-      if (!result.hasMore || !result.nextCursor) return jobs;
-      before = result.nextCursor;
     }
-    this.deps.logger.error({ from, to, pages: AGGREGATE_MAX_PAGES }, 'briefing: activity aggregate truncated');
-    throw new Error('activity window exceeded the aggregate page bound');
+    return shapeHistogramFromCounts(counts, to, timezone);
   }
 
   private async actionCounts(
@@ -345,3 +374,106 @@ export class BriefingService {
     }
   }
 }
+
+function asIso(value: unknown): string | null {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString();
+  if (typeof value === 'string' && value.length > 0) return value;
+  return null;
+}
+
+function outcomeTotal(days: HistogramModel['days'], outcomes: readonly JobOutcome[]): number {
+  let n = 0;
+  for (const day of days) {
+    for (const outcome of outcomes) n += day.byOutcome[outcome];
+  }
+  return n;
+}
+
+/**
+ * One row per local day, actor and outcome for root jobs in [$1, $2).
+ * Delegated tasks fold into their root, up to $5 levels, and may finish as late as $3.
+ * A tool result is a success only when its outcome says so (or a legacy payload does).
+ * Anything else recorded against the invoke is a failure. A failed root reply with no
+ * successful call is a failure; mixed with successes it is partial.
+ */
+const HISTOGRAM_SQL = `
+WITH RECURSIVE chain AS (
+  SELECT
+    id,
+    id AS root_id,
+    timestamp AS root_ts,
+    COALESCE(NULLIF(payload->>'agentId', ''), NULLIF(source_id, ''), 'agent') AS actor,
+    0 AS depth
+  FROM audit_log
+  WHERE event_type = 'agent.task'
+    AND timestamp >= $1
+    AND timestamp < $2
+    AND (payload->'metadata'->'delegationOrigin'->>'taskEventId') IS NULL
+  UNION ALL
+  SELECT
+    child.id,
+    chain.root_id,
+    chain.root_ts,
+    chain.actor,
+    chain.depth + 1
+  FROM audit_log child
+  JOIN chain ON (child.payload->'metadata'->'delegationOrigin'->>'taskEventId') = chain.id::text
+  WHERE child.event_type = 'agent.task'
+    AND child.timestamp >= $1
+    AND child.timestamp < $3
+    AND chain.depth < $5::int
+),
+roots AS (
+  SELECT root_id, root_ts, actor
+  FROM chain
+  WHERE depth = 0
+),
+results AS (
+  SELECT
+    c.root_id,
+    CASE
+      WHEN r.outcome = 'success'
+        OR (r.outcome IS NULL AND r.payload->'result'->>'success' = 'true')
+      THEN 'ok'
+      ELSE 'bad'
+    END AS kind
+  FROM audit_log r
+  JOIN audit_log i ON r.parent_event_id = i.id::text
+  JOIN chain c ON i.parent_event_id = c.id::text
+  WHERE r.event_type = ANY(ARRAY['tool.result', 'skill.result']::text[])
+    AND i.event_type = ANY(ARRAY['tool.invoke', 'skill.invoke']::text[])
+),
+responses AS (
+  SELECT c.root_id, bool_or(COALESCE(a.payload->>'isError', '') = 'true') AS failed
+  FROM audit_log a
+  JOIN chain c ON a.parent_event_id = c.id::text AND c.depth = 0
+  WHERE a.event_type = 'agent.response'
+  GROUP BY c.root_id
+),
+classified AS (
+  SELECT
+    roots.root_ts,
+    roots.actor,
+    CASE
+      WHEN COALESCE(ok.n, 0) > 0 AND COALESCE(bad.n, 0) > 0 THEN 'partial'
+      WHEN COALESCE(bad.n, 0) > 0 THEN 'failed'
+      WHEN COALESCE(resp.failed, false) AND COALESCE(ok.n, 0) > 0 THEN 'partial'
+      WHEN COALESCE(resp.failed, false) THEN 'failed'
+      ELSE 'success'
+    END AS outcome
+  FROM roots
+  LEFT JOIN (
+    SELECT root_id, count(*)::int AS n FROM results WHERE kind = 'ok' GROUP BY root_id
+  ) ok ON ok.root_id = roots.root_id
+  LEFT JOIN (
+    SELECT root_id, count(*)::int AS n FROM results WHERE kind = 'bad' GROUP BY root_id
+  ) bad ON bad.root_id = roots.root_id
+  LEFT JOIN responses resp ON resp.root_id = roots.root_id
+)
+SELECT
+  to_char(root_ts AT TIME ZONE $4, 'YYYY-MM-DD') AS day,
+  actor,
+  outcome,
+  count(*)::int AS n
+FROM classified
+GROUP BY 1, 2, 3`;

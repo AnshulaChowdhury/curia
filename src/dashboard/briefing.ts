@@ -1,4 +1,6 @@
 // briefing.ts — pure calendar math and histogram shaping for the principal home (#2340).
+
+import { buildApprovalDetails } from '../autonomy/approval-notification.js';
 //
 // Day boundaries are the principal's timezone, including across DST: a local
 // calendar date is never skipped or repeated. Counts that the console compares
@@ -17,10 +19,8 @@ export const AGENT_SERIES_LIMIT = 6;
 /** agent.task roots older than this are not "working right now". */
 export const BULLPEN_IN_FLIGHT_MS = 20 * 60 * 1000;
 
-/** Roots read per page while aggregating a window. Under audit-log-repo's MAX_LIMIT. */
-export const AGGREGATE_PAGE_ROOTS = 200;
-/** Pages before the aggregate refuses, so a partial count is never shown as complete. */
-export const AGGREGATE_MAX_PAGES = 15;
+/** How long stats and the histogram share one aggregate. Short enough that a new day shows up. */
+export const AGGREGATE_CACHE_MS = 45_000;
 
 export type JobOutcome = 'success' | 'partial' | 'failed';
 
@@ -119,6 +119,27 @@ export function dayLabel(key: string, todayKey: string): { label: string; weeken
   return { label: today ? 'Today' : info.short, weekend: info.weekend, today };
 }
 
+export interface HistogramCount {
+  /** Local YYYY-MM-DD. */
+  day: string;
+  actor: string;
+  outcome: JobOutcome;
+  n: number;
+}
+
+function emptyHistogramMaps(keys: string[]): {
+  byDayAgent: Map<string, Map<string, number>>;
+  byDayOutcome: Map<string, Record<JobOutcome, number>>;
+} {
+  const byDayAgent = new Map<string, Map<string, number>>();
+  const byDayOutcome = new Map<string, Record<JobOutcome, number>>();
+  for (const key of keys) {
+    byDayAgent.set(key, new Map());
+    byDayOutcome.set(key, { success: 0, partial: 0, failed: 0 });
+  }
+  return { byDayAgent, byDayOutcome };
+}
+
 /**
  * 14 local days ending today, stacked by agent and by outcome.
  * Agents beyond {@link AGENT_SERIES_LIMIT} fold into "other", ranked by volume.
@@ -127,24 +148,58 @@ export function shapeHistogram(jobs: ProjectedJob[], now: Date, timeZone: string
   const todayKey = localDayKey(now, timeZone);
   const keys = dayKeysEnding(todayKey, HISTOGRAM_DAYS);
   const keySet = new Set(keys);
-  const byDayAgent = new Map<string, Map<string, number>>();
-  const byDayOutcome = new Map<string, Record<JobOutcome, number>>();
-  for (const key of keys) {
-    byDayAgent.set(key, new Map());
-    byDayOutcome.set(key, { success: 0, partial: 0, failed: 0 });
-  }
+  const { byDayAgent, byDayOutcome } = emptyHistogramMaps(keys);
   const agentTotals = new Map<string, number>();
   for (const job of jobs) {
     const key = localDayKey(new Date(job.ts), timeZone);
     if (!keySet.has(key)) continue;
-    const outcomes = byDayOutcome.get(key)!;
-    const agents = byDayAgent.get(key)!;
-    outcomes[job.outcome] += 1;
-    const actor = job.actor.length > 0 ? job.actor : 'agent';
-    agents.set(actor, (agents.get(actor) ?? 0) + 1);
-    agentTotals.set(actor, (agentTotals.get(actor) ?? 0) + 1);
+    addHistogramCount(byDayAgent, byDayOutcome, agentTotals, key, job.actor, job.outcome, 1);
   }
+  return finishHistogram(keys, todayKey, byDayAgent, byDayOutcome, agentTotals);
+}
 
+/** Same bars as {@link shapeHistogram}, from day × actor × outcome totals. */
+export function shapeHistogramFromCounts(
+  counts: readonly HistogramCount[],
+  now: Date,
+  timeZone: string,
+): HistogramModel {
+  const todayKey = localDayKey(now, timeZone);
+  const keys = dayKeysEnding(todayKey, HISTOGRAM_DAYS);
+  const keySet = new Set(keys);
+  const { byDayAgent, byDayOutcome } = emptyHistogramMaps(keys);
+  const agentTotals = new Map<string, number>();
+  for (const count of counts) {
+    if (!keySet.has(count.day) || count.n <= 0) continue;
+    addHistogramCount(byDayAgent, byDayOutcome, agentTotals, count.day, count.actor, count.outcome, count.n);
+  }
+  return finishHistogram(keys, todayKey, byDayAgent, byDayOutcome, agentTotals);
+}
+
+function addHistogramCount(
+  byDayAgent: Map<string, Map<string, number>>,
+  byDayOutcome: Map<string, Record<JobOutcome, number>>,
+  agentTotals: Map<string, number>,
+  key: string,
+  actorName: string,
+  outcome: JobOutcome,
+  n: number,
+): void {
+  const outcomes = byDayOutcome.get(key)!;
+  const agents = byDayAgent.get(key)!;
+  outcomes[outcome] += n;
+  const actor = actorName.length > 0 ? actorName : 'agent';
+  agents.set(actor, (agents.get(actor) ?? 0) + n);
+  agentTotals.set(actor, (agentTotals.get(actor) ?? 0) + n);
+}
+
+function finishHistogram(
+  keys: string[],
+  todayKey: string,
+  byDayAgent: Map<string, Map<string, number>>,
+  byDayOutcome: Map<string, Record<JobOutcome, number>>,
+  agentTotals: Map<string, number>,
+): HistogramModel {
   const ranked = [...agentTotals.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const collapse = ranked.length > AGENT_SERIES_LIMIT;
   const named = (collapse ? ranked.slice(0, AGENT_SERIES_LIMIT) : ranked).map(([name]) => name);
@@ -197,9 +252,10 @@ export function countJobs(
   return n;
 }
 
-const SUMMARY_KEYS = ['subject', 'to', 'account', 'accountId'] as const;
-
-/** Review text for a held approval. Message bodies stay out of the console. */
+/**
+ * Review text for a held approval. The same field list and length caps as the
+ * chat notification, including the message body and any personal-details line.
+ */
 export function approvalReviewSummary(input: {
   description: string | null;
   toolName: string;
@@ -208,20 +264,32 @@ export function approvalReviewSummary(input: {
   const lines: string[] = [];
   const description = input.description?.trim();
   if (description) lines.push(description);
-  lines.push(input.toolName);
-  const payload = input.payload ?? {};
-  for (const key of SUMMARY_KEYS) {
-    const value = payload[key];
-    if (typeof value === 'string' && value.trim().length > 0 && value.length <= 200) {
-      lines.push(`${key}: ${value.trim()}`);
-    }
-  }
+  const details = input.payload ? buildApprovalDetails(input.toolName, input.payload) : '';
+  if (details) lines.push(details);
+  else lines.push(input.toolName);
   return lines.join('\n');
 }
 
 /**
+ * A send-draft whose stored payload has an id but no recipient or body.
+ * The review has to load the draft before Approve is safe.
+ */
+export function approvalNeedsDraft(
+  toolName: string,
+  payload: Record<string, unknown> | null,
+): boolean {
+  if (!mailboxDraftRef(toolName, payload)) return false;
+  const body = payload ?? {};
+  return !['to', 'subject', 'body'].some((key) => {
+    const value = body[key];
+    return typeof value === 'string' && value.trim().length > 0;
+  });
+}
+
+/**
  * A mailbox draft linked onto a held `send-draft` approval.
- * `account` is the email-account name the gateway stored; absent means the primary mailbox.
+ * `account` is the email-account name the gateway stored. Absent means the
+ * owning mailbox is not known and has to be found.
  */
 export function mailboxDraftRef(
   toolName: string,

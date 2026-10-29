@@ -26,7 +26,7 @@ import { AGENT_NAME_RULE, isAgentName } from '../../../agents/agent-name.js';
 import { isUuid } from '../../../util/uuid.js';
 import { validateTaskErrorBudget } from '../../../tasks/task-error-budget.js';
 import type { NodeMergeApi } from '../../../kg-merge/service.js';
-import type { TaskRepo } from '../../../db/task-repo.js';
+import { TaskTerminalStateError, type TaskRepo } from '../../../db/task-repo.js';
 import { DEFAULT_CANDIDATES, MAX_CANDIDATES } from '../../../kg-merge/service.js';
 import { parseResolutions } from '../../../kg-merge/resolve.js';
 import {
@@ -863,11 +863,13 @@ export async function knowledgeGraphRoutes(
         const transitioned = await taskRepo.updateTask(id, { status: body.status }, 'console');
         if (!transitioned) return reply.status(404).send({ error: 'Task not found.' });
       } catch (err) {
-        const message = err instanceof Error ? err.message : '';
-        if (message.includes('terminal state')) return reply.status(400).send({ error: message });
+        if (err instanceof TaskTerminalStateError) return reply.status(400).send({ error: err.message });
         logger.error({ err, taskId: id }, 'kg: PATCH status change via TaskRepo failed');
         return reply.status(500).send({ error: 'Failed to update task.' });
       }
+      // updateTask commits the status, and its wake and outreach side effects,
+      // before the column UPDATE below. If that UPDATE fails the client gets 500
+      // and the status change has already landed.
     }
 
     try {

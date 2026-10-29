@@ -19,6 +19,10 @@ export interface DashboardRouteOptions {
 
 const RATE = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
 
+function shownFlag(body: unknown): boolean {
+  return typeof body === 'object' && body !== null && (body as { shown?: unknown }).shown === true;
+}
+
 function parseApprovalId(raw: string): number | null {
   if (!/^\d+$/.test(raw)) return null;
   const id = Number(raw);
@@ -78,6 +82,25 @@ export async function dashboardRoutes(app: FastifyInstance, options: DashboardRo
     return taskStatus(request, reply, 'cancelled');
   });
 
+  app.get('/api/dashboard/approvals/:id/preview', RATE, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+    const { id: raw } = request.params as { id: string };
+    const id = parseApprovalId(raw);
+    if (id === null) return reply.status(400).send({ error: 'Invalid approval id.' });
+    try {
+      const result = await briefing.preview(id);
+      if (!result.ok) return reply.status(result.status).send({ error: result.error });
+      return reply.send({
+        summary: result.summary,
+        canApprove: result.canApprove,
+        blockReason: result.blockReason,
+      });
+    } catch (err) {
+      logger.error({ err, approvalId: id }, 'dashboard: approval preview failed');
+      return reply.status(500).send({ error: 'Failed to load the approval.' });
+    }
+  });
+
   app.post('/api/dashboard/approvals/:id/approve', RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     return approval(request, reply, 'approve');
@@ -106,15 +129,16 @@ export async function dashboardRoutes(app: FastifyInstance, options: DashboardRo
   }
 
   async function approval(
-    request: { params: unknown },
+    request: { params: unknown; body?: unknown },
     reply: { status: (code: number) => { send: (body: unknown) => unknown }; send: (body: unknown) => unknown },
     action: 'approve' | 'deny',
   ) {
     const { id: raw } = request.params as { id: string };
     const id = parseApprovalId(raw);
     if (id === null) return reply.status(400).send({ error: 'Invalid approval id.' });
+    const shown = action === 'approve' && shownFlag(request.body);
     try {
-      const result = action === 'approve' ? await briefing.approve(id) : await briefing.deny(id);
+      const result = action === 'approve' ? await briefing.approve(id, shown) : await briefing.deny(id);
       if (!result.ok) return reply.status(result.status).send({ error: result.error });
       return reply.send({ ok: true, sent: result.sent });
     } catch (err) {

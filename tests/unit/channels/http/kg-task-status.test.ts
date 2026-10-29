@@ -3,6 +3,7 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { knowledgeGraphRoutes } from '../../../../src/channels/http/routes/kg.js';
+import { TaskTerminalStateError } from '../../../../src/db/task-repo.js';
 import type { ContactService } from '../../../../src/contacts/contact-service.js';
 import type { EventBus } from '../../../../src/bus/bus.js';
 import type { EventRouter } from '../../../../src/channels/http/event-router.js';
@@ -77,6 +78,38 @@ describe('PATCH /api/kg/tasks/:id status', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(updateTask).toHaveBeenCalledWith(TASK_ID, { status: 'cancelled' }, 'console');
+  });
+
+  it('returns 400 for a typed terminal-state error and 500 for other failures', async () => {
+    const updateTask = vi.fn().mockRejectedValue(new TaskTerminalStateError('done'));
+    app = Fastify();
+    await app.register(knowledgeGraphRoutes, {
+      pool: pool(),
+      logger: createSilentLogger(),
+      webAppBootstrapSecret: SECRET,
+      secureCookies: false,
+      bus: {} as EventBus,
+      eventRouter: {} as EventRouter,
+      contactService: {} as ContactService,
+      sessions: new Map(),
+      taskRepo: { updateTask },
+    });
+    const terminal = await app.inject({
+      method: 'PATCH',
+      url: `/api/kg/tasks/${TASK_ID}`,
+      headers: AUTH,
+      payload: { status: 'cancelled' },
+    });
+    expect(terminal.statusCode).toBe(400);
+
+    updateTask.mockRejectedValue(new Error("Cannot transition task from 'done' — it is a terminal state."));
+    const unmatched = await app.inject({
+      method: 'PATCH',
+      url: `/api/kg/tasks/${TASK_ID}`,
+      headers: AUTH,
+      payload: { status: 'cancelled' },
+    });
+    expect(unmatched.statusCode).toBe(500);
   });
 
   it('refuses a status change when TaskRepo is not wired', async () => {

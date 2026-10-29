@@ -24,6 +24,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { NylasClient, NylasMessage, NylasFolder, ListMessagesOptions, SendEmailOptions, AttachmentContent } from '../channels/email/nylas-client.js';
+import { deleteHeldDraft, findHeldDraft } from '../channels/email/held-draft.js';
 import { quoteParticipants } from './_shared/reply-quote.js';
 import { readAttachmentFiles, MAX_ATTACHMENT_BYTES, type OutboundAttachmentInput } from './_shared/read-attachments.js';
 import type { EmailRecipientSource, EmailSendRequest } from '../channels/email/outbound-request.js';
@@ -4327,6 +4328,51 @@ export class OutboundGateway {
   }
 
   /**
+   * Delete a Nylas draft created for a held send.
+   * A named account is deleted directly; a 404 there means the draft is already gone.
+   * With no account, the draft is found across every mailbox and deleted from the
+   * one that holds it. Unknown accounts fail rather than deleting somewhere else.
+   */
+  async deleteMailboxDraft(accountId: string | undefined, draftId: string): Promise<void> {
+    await deleteHeldDraft(draftId, accountId, {
+      listAccountIds: () => this.listAccountIds(),
+      getDraft: (account, id) => this.getEmailDraft(id, account),
+      deleteDraft: async (account, id) => {
+        const client = this.getNylasClient(account);
+        if (!client) {
+          const available = [...this.nylasClients.keys()];
+          throw new Error(
+            `No mailbox for account '${account}' (available: ${available.join(', ') || 'none'})`,
+          );
+        }
+        await client.deleteDraft(id);
+      },
+    });
+  }
+
+  /**
+   * Read a held send-draft so the principal can see recipients and body before approving.
+   * Null when every searched mailbox has no such draft.
+   */
+  async readHeldDraft(
+    accountId: string | undefined,
+    draftId: string,
+  ): Promise<{ account: string; to: string; cc: string; subject: string; body: string } | null> {
+    const found = await findHeldDraft(draftId, accountId, {
+      listAccountIds: () => this.listAccountIds(),
+      getDraft: (account, id) => this.getEmailDraft(id, account),
+    });
+    if (!found) return null;
+    return {
+      account: found.account,
+      to: formatDraftAddresses(found.draft.to),
+      cc: formatDraftAddresses(found.draft.cc),
+      subject: found.draft.subject,
+      body: found.draft.body,
+    };
+  }
+
+  /**
    * Link a draft (or other fallback result) to a gated action_log row.
    * Called by channel adapters after they create their fallback artifact.
    * No-op when actionLogRepo is not wired or actionRef doesn't match a pending row.
@@ -4336,23 +4382,6 @@ export class OutboundGateway {
    * normal operation — the scope guards against any data inconsistency.
    * When absent, the match is by short_ref + outcome alone (backwards compatibility).
    */
-  /**
-   * Delete a Nylas draft created for a held send. Unknown accounts fail rather
-   * than deleting from a different mailbox. A missing draft (404) is success.
-   */
-  async deleteMailboxDraft(accountId: string | undefined, draftId: string): Promise<void> {
-    const client = this.getNylasClient(accountId);
-    if (!client) {
-      const available = [...this.nylasClients.keys()];
-      throw new Error(
-        accountId
-          ? `No mailbox for account '${accountId}' (available: ${available.join(', ') || 'none'})`
-          : 'Email client not configured',
-      );
-    }
-    await client.deleteDraft(draftId);
-  }
-
   async linkGatedAction(
     actionRef: string,
     taskEventId: string | undefined,
@@ -4685,4 +4714,11 @@ export class OutboundGateway {
       return { success: false, blockedReason: `Send failed: ${message}`, queueable };
     }
   }
+}
+
+function formatDraftAddresses(people: Array<{ name?: string; email: string }> | undefined): string {
+  if (!people || people.length === 0) return '';
+  return people
+    .map((person) => (person.name ? `${person.name} (${person.email})` : person.email))
+    .join(', ');
 }

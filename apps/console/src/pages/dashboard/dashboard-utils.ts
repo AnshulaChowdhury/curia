@@ -475,6 +475,8 @@ export interface WaitingApproval {
   createdAt: string;
   toolName: string;
   summary: string;
+  /** The stored payload has a draft id and no recipient or body yet. */
+  needsDraft?: boolean;
 }
 
 export type WaitingRow =
@@ -490,6 +492,39 @@ export function orderWaitingItems(tasks: WaitingTask[], approvals: WaitingApprov
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     .map((approval) => ({ ...approval, kind: 'approval' }));
   return [...taskRows, ...approvalRows];
+}
+
+export type PendingUndoKind = 'dismissed' | 'marked done';
+
+/**
+ * One toast covers every change still inside the undo window.
+ * A single change keeps its own verb. Several read "N changes", and the Undo
+ * button on that toast cancels all of them.
+ */
+export function pendingUndoMessage(pending: readonly PendingUndoKind[]): string | null {
+  if (pending.length === 0) return null;
+  if (pending.length === 1) return pending[0] === 'dismissed' ? 'Dismissed' : 'Marked done';
+  return `${pending.length} changes`;
+}
+
+export interface ApprovalPreview {
+  summary: string;
+  canApprove: boolean;
+  blockReason: string | null;
+}
+
+export async function fetchApprovalPreview(id: number, signal?: AbortSignal): Promise<ApprovalPreview> {
+  const data = await fetchJson<Record<string, unknown>>(`/api/dashboard/approvals/${id}/preview`, signal);
+  const summary = data['summary'];
+  if (typeof summary !== 'string' || typeof data['canApprove'] !== 'boolean') {
+    throw new Error('/api/dashboard/approvals/preview returned an unexpected response');
+  }
+  const blockReason = data['blockReason'];
+  return {
+    summary,
+    canApprove: data['canApprove'],
+    blockReason: typeof blockReason === 'string' ? blockReason : null,
+  };
 }
 
 export interface UndoCommit {
@@ -657,8 +692,17 @@ export async function fetchBullpen(signal?: AbortSignal): Promise<BullpenData> {
 }
 
 /** POST that survives a refresh inside the undo window (`keepalive`). Returns the JSON body. */
-export async function postDashboard(path: string): Promise<Record<string, unknown>> {
-  const res = await apiFetch(path, { method: 'POST', keepalive: true });
+export async function postDashboard(
+  path: string,
+  payload?: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const res = await apiFetch(path, {
+    method: 'POST',
+    keepalive: true,
+    ...(payload
+      ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) }
+      : {}),
+  });
   if (!res.ok) throw new Error(await readErrorMessage(res));
   const ct = res.headers.get('content-type') ?? '';
   if (!ct.includes('application/json')) return {};

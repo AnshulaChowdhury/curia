@@ -69,6 +69,7 @@ const SKILL_DETAIL_FIELDS: Array<{ test: (name: string) => boolean; fields: Deta
       { key: 'draft_id', label: 'Draft' },
       // partialPayload at gate time may omit draft_id; merge live send fields below.
       { key: 'to', label: 'To' },
+      { key: 'cc', label: 'CC' },
       { key: 'subject', label: 'Subject' },
       { key: 'body', label: 'Body' },
     ],

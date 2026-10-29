@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { dashboardRoutes } from '../../../../src/channels/http/routes/dashboard.js';
 import { BriefingService, type BriefingDeps } from '../../../../src/dashboard/briefing-service.js';
+import { TaskTerminalStateError } from '../../../../src/db/task-repo.js';
 import { createSilentLogger } from '../../../../src/logger.js';
 
 const SECRET = 'dashboard-secret';
@@ -13,7 +14,6 @@ let app: FastifyInstance | undefined;
 function briefing(overrides: Partial<BriefingDeps> = {}): BriefingService {
   const deps: BriefingDeps = {
     pool: { query: vi.fn().mockResolvedValue({ rows: [{ n: 0 }] }) } as unknown as BriefingDeps['pool'],
-    auditLogRepo: { findActivityJobs: vi.fn() },
     actionLogRepo: {
       findAllPending: vi.fn().mockResolvedValue([]),
       findById: vi.fn(),
@@ -52,7 +52,13 @@ describe('dashboard routes', () => {
     const updateTask = vi.fn();
     const service = briefing({ taskRepo: { listTasks: vi.fn(), updateTask } });
     const server = await build(service);
-    for (const url of ['/api/dashboard/waiting', '/api/dashboard/stats', '/api/dashboard/histogram', '/api/dashboard/bullpen']) {
+    for (const url of [
+      '/api/dashboard/waiting',
+      '/api/dashboard/stats',
+      '/api/dashboard/histogram',
+      '/api/dashboard/bullpen',
+      '/api/dashboard/approvals/1/preview',
+    ]) {
       const res = await server.inject({ method: 'GET', url });
       expect(res.statusCode).toBe(401);
     }
@@ -104,6 +110,43 @@ describe('dashboard routes', () => {
     const res = await server.inject({ method: 'GET', url: '/api/dashboard/waiting', headers: AUTH });
     expect(res.statusCode).toBe(500);
     expect(JSON.parse(res.body)).toEqual({ error: 'Failed to load what is waiting on you' });
+  });
+
+  it('forwards the review flag when the principal approves', async () => {
+    const service = briefing();
+    const approve = vi.spyOn(service, 'approve').mockResolvedValue({ ok: true, sent: true });
+    const server = await build(service);
+    const res = await server.inject({
+      method: 'POST',
+      url: '/api/dashboard/approvals/4/approve',
+      headers: { ...AUTH, 'content-type': 'application/json' },
+      payload: { shown: true },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(approve).toHaveBeenCalledWith(4, true);
+  });
+
+  it('maps a terminal task to 400 and leaves other failures as 500', async () => {
+    const terminal = briefing({
+      taskRepo: { listTasks: vi.fn(), updateTask: vi.fn().mockRejectedValue(new TaskTerminalStateError('done')) },
+    });
+    const terminalRes = await (await build(terminal)).inject({
+      method: 'POST',
+      url: `/api/dashboard/tasks/${TASK_ID}/done`,
+      headers: AUTH,
+    });
+    expect(terminalRes.statusCode).toBe(400);
+
+    await app?.close();
+    const other = briefing({
+      taskRepo: { listTasks: vi.fn(), updateTask: vi.fn().mockRejectedValue(new Error('terminal state in a log line')) },
+    });
+    const otherRes = await (await build(other)).inject({
+      method: 'POST',
+      url: `/api/dashboard/tasks/${TASK_ID}/done`,
+      headers: AUTH,
+    });
+    expect(otherRes.statusCode).toBe(500);
   });
 
   it('does not report the bullpen as zero when the count query fails', async () => {

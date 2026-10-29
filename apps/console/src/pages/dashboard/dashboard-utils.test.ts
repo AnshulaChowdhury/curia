@@ -24,6 +24,7 @@ import {
   overdueMeta,
   heldMeta,
   orderWaitingItems,
+  pendingUndoMessage,
   scheduleUndoCommit,
   UNDO_WINDOW_MS,
   histogramDateLabel,
@@ -442,6 +443,15 @@ describe('scheduleUndoCommit', () => {
     handle.cancel();
     vi.advanceTimersByTime(UNDO_WINDOW_MS);
     expect(commit).toHaveBeenCalledOnce();
+  });
+});
+
+describe('pendingUndoMessage', () => {
+  it('keeps a single change in its own words and folds the rest into one undo', () => {
+    expect(pendingUndoMessage([])).toBeNull();
+    expect(pendingUndoMessage(['dismissed'])).toBe('Dismissed');
+    expect(pendingUndoMessage(['marked done'])).toBe('Marked done');
+    expect(pendingUndoMessage(['dismissed', 'marked done'])).toBe('2 changes');
   });
 });
 

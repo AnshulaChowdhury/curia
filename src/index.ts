@@ -3365,7 +3365,6 @@ async function main(): Promise<void> {
   const briefingGateway = outboundGateway;
   const briefingService = new BriefingService({
     pool,
-    auditLogRepo,
     actionLogRepo,
     taskRepo,
     contactService,
@@ -3373,6 +3372,9 @@ async function main(): Promise<void> {
     disclosureDecisions,
     deleteMailboxDraft: briefingGateway
       ? (account, draftId) => briefingGateway.deleteMailboxDraft(account, draftId)
+      : undefined,
+    loadHeldDraft: briefingGateway
+      ? (account, draftId) => briefingGateway.readHeldDraft(account, draftId)
       : undefined,
     bus,
     officeTimezone: config.timezone,

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ActionLogRow } from '../../../src/autonomy/action-log-types.js';
 import { RESOLVED_BY } from '../../../src/autonomy/action-log-types.js';
 import { approveFromConsole, denyFromConsole, type ConsoleApprovalDeps } from '../../../src/dashboard/console-approval.js';
+import type { DisclosureAsk } from '../../../src/autonomy/disclosure-decisions.js';
 import { createSilentLogger } from '../../../src/logger.js';
 
 function row(overrides: Partial<ActionLogRow> = {}): ActionLogRow {
@@ -72,6 +73,13 @@ describe('denyFromConsole', () => {
     expect(d.deleteMailboxDraft).toHaveBeenCalledWith('ops', 'draft-1');
   });
 
+  it('forwards an omitted account so the deleter can search every mailbox', async () => {
+    const d = deps();
+    const result = await denyFromConsole(row({ payload: { draft_id: 'draft-9' } }), d);
+    expect(result).toEqual({ ok: true, sent: false });
+    expect(d.deleteMailboxDraft).toHaveBeenCalledWith(undefined, 'draft-9');
+  });
+
   it('leaves the row pending when the draft delete fails', async () => {
     const d = deps({
       deleteMailboxDraft: vi.fn(async () => {
@@ -98,7 +106,62 @@ describe('approveFromConsole', () => {
       'email-send',
       { subject: 'Hi' },
       { contactId: 'principal-1', role: 'ceo', channel: 'web' },
-      expect.objectContaining({ humanApproved: true, taskEventId: row().taskId }),
+      expect.objectContaining({
+        humanApproved: true,
+        taskEventId: row().taskId,
+        taskMetadata: {
+          originator: expect.objectContaining({ contactId: 'principal-1', channel: 'web', systemRole: 'principal' }),
+        },
+      }),
+    );
+  });
+
+  it('tells the principal to review, and approves once the console has shown the item', async () => {
+    const ask: DisclosureAsk = {
+      conversationId: 'conv',
+      counterparties: ['ada@example.com'],
+      labels: ['email'],
+      requester: 'ada@example.com',
+    };
+    const held = row({
+      toolName: 'email-send',
+      payload: { to: 'ada@example.com', subject: 'Hi', body: 'Hello' },
+      notificationSentAt: null,
+      disclosureAsk: ask,
+    });
+    const hidden = await approveFromConsole(held, deps());
+    expect(hidden.ok).toBe(false);
+    if (!hidden.ok) {
+      expect(hidden.status).toBe(409);
+      expect(hidden.error).toMatch(/Review this item/);
+      expect(hidden.error).not.toMatch(/deliver-approval/);
+    }
+    const shown = await approveFromConsole(held, deps(), new Date(), { shown: true });
+    expect(shown).toEqual({ ok: true, sent: true });
+  });
+
+  it('will not approve a send-draft until the mailbox copy is loaded, and still runs the original payload', async () => {
+    const bare = row({ payload: { draft_id: 'draft-1' }, notificationSentAt: new Date() });
+    const missing = await approveFromConsole(bare, deps(), new Date(), { shown: true });
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) expect(missing.error).toMatch(/could not be loaded/);
+
+    const d = deps({
+      loadHeldDraft: async () => ({
+        account: 'personal',
+        to: 'ada@example.com',
+        cc: '',
+        subject: 'Board notes',
+        body: 'See you Thursday.',
+      }),
+    });
+    const result = await approveFromConsole(bare, d, new Date(), { shown: true });
+    expect(result).toEqual({ ok: true, sent: true });
+    expect(d.executionLayer!.invoke).toHaveBeenCalledWith(
+      'send-draft',
+      { draft_id: 'draft-1' },
+      expect.anything(),
+      expect.objectContaining({ humanApproved: true }),
     );
   });
 
