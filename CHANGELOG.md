@@ -97,6 +97,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Principal-only sends** — a message to the principal alone skips autonomy gates A and B (spec 14). (#2337)
 - **Approval answers** — principal turns list approvals they were shown, so a yes or no finds its approval. (#2333)
 - **Approval emails** — a reply on an approval email's thread is marked as answering that approval. (#2333)
 - **Hold sweep** — first post-deploy run deletes stale holds within ±14 days; older ones remain. (#2329)

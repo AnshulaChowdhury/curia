@@ -2691,6 +2691,227 @@ describe('autonomy gates', () => {
       expect(description.description).toContain('Initiating sender: "(unknown)"');
       expect(description.description).toContain('Resolved recipients: "(not resolved)"');
     });
+
+    // -- Principal-only send bypasses gates A and B (#2337) ----------------------------------
+
+    describe('principal-only send bypasses gates A and B (#2337)', () => {
+      function makeLayer(
+        score: number,
+        extras?: { outboundGateway?: OutboundGateway; contactService?: ContactService | null },
+      ) {
+        const registry = new ToolRegistry();
+        const publish = vi.fn().mockResolvedValue(undefined);
+        const layer = new ExecutionLayer(registry, logger, {
+          autonomyService: makeAutonomyService(score),
+          bus: { publish } as unknown as EventBus,
+          principalIdentities: TEST_PRINCIPAL_IDENTITIES,
+          outboundGateway: extras?.outboundGateway,
+          selfEmails: ['curia@example.com'],
+          // null: no contact service, so references cannot be resolved before the gates.
+          contactService: extras?.contactService === null
+            ? undefined
+            : extras?.contactService ?? makeReferenceContacts(),
+        });
+        return { registry, layer, publish };
+      }
+
+      function roleMeta(systemRole: 'system' | 'agent' | 'principal') {
+        return {
+          taskMetadata: {
+            originator: {
+              contactId: systemRole === 'principal' ? 'principal-1' : 'curia',
+              systemRole,
+              channel: 'internal',
+              initiatedAt: new Date().toISOString(),
+            },
+          },
+        };
+      }
+
+      const blockedEvents = (publish: ReturnType<typeof vi.fn>) =>
+        publish.mock.calls.filter(([, event]) => (event as { type: string }).type === 'autonomy.tool_blocked');
+
+      it.each([
+        [55, 'system', 'email-send', { to: 'principal', subject: 'Report', body: 'Done.' }],
+        [65, 'system', 'email-send', { to: 'principal', subject: 'Report', body: 'Done.' }],
+        [55, 'agent', 'signal-send', { recipient: 'principal', message: 'Done.' }],
+        [65, 'agent', 'signal-send', { recipient: 'principal', message: 'Done.' }],
+      ] as const)('score %i, %s originator: %s to the principal alone runs', async (score, role, tool, input) => {
+        const { registry, layer, publish } = makeLayer(score);
+        const handler = makeHandler('ok');
+        registry.register(makeRiskyManifest(tool, 'medium'), handler);
+
+        const result = await layer.invoke(tool, { ...input }, undefined, roleMeta(role));
+
+        expect(result.success).toBe(true);
+        expect(handler.execute).toHaveBeenCalledOnce();
+        expect(blockedEvents(publish)).toHaveLength(0);
+      });
+
+      it('two of the principal\'s own addresses still count as the principal alone', async () => {
+        const { registry, layer } = makeLayer(55);
+        const handler = makeHandler('ok');
+        registry.register(makeRiskyManifest('email-send', 'medium'), handler);
+
+        const result = await layer.invoke(
+          'email-send',
+          { to: 'principal', cc: 'principal', subject: 'Report', body: 'Done.' },
+          undefined,
+          roleMeta('system'),
+        );
+
+        expect(result.success).toBe(true);
+      });
+
+      it('a known external originator\'s send to the principal alone runs below 70 (Gate C allows it too)', async () => {
+        const { registry, layer } = makeLayer(65);
+        const handler = makeHandler('ok');
+        registry.register(makeRiskyManifest('email-send', 'medium'), handler);
+
+        const result = await layer.invoke(
+          'email-send',
+          { to: 'principal', subject: 'Heads-up', body: 'Alice wrote.' },
+          undefined,
+          originatorMeta('known'),
+        );
+
+        expect(result.success).toBe(true);
+        expect(handler.execute).toHaveBeenCalledOnce();
+      });
+
+      it.each([
+        ['a third party in to', { to: `principal, ${BOB_REF}`, subject: 'x', body: 'y' }],
+        ['a third party in cc', { to: 'principal', cc: BOB_REF, subject: 'x', body: 'y' }],
+        ['any bcc', { to: 'principal', bcc: 'principal', subject: 'x', body: 'y' }],
+      ])('still gated below 60 and below 70 with %s', async (_label, input) => {
+        for (const score of [55, 65]) {
+          const { registry, layer, publish } = makeLayer(score);
+          const handler = makeHandler('should not run');
+          registry.register(makeRiskyManifest('email-send', 'medium'), handler);
+
+          const result = await layer.invoke('email-send', { ...input }, undefined, roleMeta('system'));
+
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error).toContain(`autonomy score is ${score}`);
+          expect(handler.execute).not.toHaveBeenCalled();
+          expect(blockedEvents(publish)).toHaveLength(1);
+        }
+      });
+
+      it('still gated when the "principal" reference cannot be resolved (no contact service)', async () => {
+        const { registry, layer } = makeLayer(65, { contactService: null });
+        const handler = makeHandler('should not run');
+        registry.register(makeRiskyManifest('email-send', 'medium'), handler);
+
+        const result = await layer.invoke(
+          'email-send',
+          { to: 'principal', subject: 'x', body: 'y' },
+          undefined,
+          roleMeta('system'),
+        );
+
+        expect(result.success).toBe(false);
+        expect(handler.execute).not.toHaveBeenCalled();
+      });
+
+      it('email-reply on a thread with only the principal runs, and the handler reuses the gate\'s fetch', async () => {
+        const gateway = makeEmailGateway({
+          from: [{ email: 'ceo@example.com' }],
+          to: [{ email: 'curia@example.com' }],
+        });
+        const { registry, layer } = makeLayer(55, { outboundGateway: gateway });
+        const handler: ToolHandler = {
+          execute: vi.fn(async (ctx: ToolContext) => {
+            await ctx.outboundGateway!.getEmailMessage('msg-1');
+            return { success: true as const, data: 'ok' };
+          }),
+        };
+        registry.register(
+          { ...makeRiskyManifest('email-reply', 'medium'), capabilities: ['outboundGateway'] },
+          handler,
+        );
+
+        const result = await layer.invoke(
+          'email-reply',
+          { reply_to_message_id: 'msg-1', body: 'Done.' },
+          undefined,
+          roleMeta('system'),
+        );
+
+        expect(result.success).toBe(true);
+        expect(gateway.getEmailMessage).toHaveBeenCalledOnce();
+      });
+
+      it.each([
+        ['a third party on to', { to: [{ email: 'curia@example.com' }, { email: 'bob@example.com' }] }],
+        ['a third party on cc', { to: [{ email: 'curia@example.com' }], cc: [{ email: 'bob@example.com' }] }],
+      ])('email-reply is still gated with %s of the thread', async (_label, participants) => {
+        const gateway = makeEmailGateway({ from: [{ email: 'ceo@example.com' }], ...participants });
+        const { registry, layer } = makeLayer(65, { outboundGateway: gateway });
+        const handler = makeHandler('should not run');
+        registry.register(makeRiskyManifest('email-reply', 'medium'), handler);
+
+        const result = await layer.invoke(
+          'email-reply',
+          { reply_to_message_id: 'msg-1', body: 'Done.' },
+          undefined,
+          roleMeta('system'),
+        );
+
+        expect(result.success).toBe(false);
+        expect(handler.execute).not.toHaveBeenCalled();
+      });
+
+      it('email-reply is still gated when the thread cannot be fetched', async () => {
+        const gateway = makeEmailGateway({ from: [{ email: 'ceo@example.com' }], fail: true });
+        const { registry, layer } = makeLayer(65, { outboundGateway: gateway });
+        const handler = makeHandler('should not run');
+        registry.register(makeRiskyManifest('email-reply', 'medium'), handler);
+
+        const result = await layer.invoke(
+          'email-reply',
+          { reply_to_message_id: 'msg-1', body: 'Done.' },
+          undefined,
+          roleMeta('system'),
+        );
+
+        expect(result.success).toBe(false);
+        expect(handler.execute).not.toHaveBeenCalled();
+      });
+
+      it('looks up nothing when the score already clears gates A and B', async () => {
+        const gateway = makeEmailGateway({ from: [{ email: 'ceo@example.com' }] });
+        const { registry, layer } = makeLayer(75, { outboundGateway: gateway });
+        registry.register(makeRiskyManifest('email-reply', 'medium'), makeHandler('ok'));
+
+        const result = await layer.invoke(
+          'email-reply',
+          { reply_to_message_id: 'msg-1', body: 'Done.' },
+          undefined,
+          roleMeta('system'),
+        );
+
+        expect(result.success).toBe(true);
+        expect(gateway.getEmailMessage).not.toHaveBeenCalled();
+      });
+
+      it('a principal-originated task is unchanged: it bypasses by lineage, third party or not', async () => {
+        const { registry, layer, publish } = makeLayer(55);
+        const handler = makeHandler('ok');
+        registry.register(makeRiskyManifest('email-send', 'medium'), handler);
+
+        const result = await layer.invoke(
+          'email-send',
+          { to: BOB_REF, subject: 'x', body: 'y' },
+          undefined,
+          roleMeta('principal'),
+        );
+
+        expect(result.success).toBe(true);
+        expect(handler.execute).toHaveBeenCalledOnce();
+        expect(blockedEvents(publish)).toHaveLength(0);
+      });
+    });
   });
 
   // ---------------------------------------------------------------------------

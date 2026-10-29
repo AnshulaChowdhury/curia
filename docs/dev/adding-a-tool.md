@@ -130,7 +130,7 @@ A raw integer (0–100) may be used for precision when the named levels are too 
 
 **Status:** `action_risk` is validated at load time and enforced at runtime. Skills whose action_risk exceeds the current autonomy score are blocked with an advisory failure.
 
-**How gating works:** When an agent calls a skill, the execution layer compares the skill's minimum required autonomy score against the live global score from `autonomy_config`. If the score is too low, the invocation returns an advisory failure (no throw, same `{ success: false, error }` shape as any other failure) and an `autonomy.tool_blocked` audit event is emitted. The autonomy score is principal-controlled via the `set-autonomy` skill. See `docs/specs/14-autonomy-engine.md` for the full spec.
+**How gating works:** When an agent calls a skill, the execution layer compares the skill's minimum required autonomy score against the live global score from `autonomy_config`. If the score is too low, the invocation returns an advisory failure (no throw, same `{ success: false, error }` shape as any other failure) and an `autonomy.tool_blocked` audit event is emitted. Two things skip this check: a task the principal started, and a send whose recipients are all the verified principal (`email-send`, `email-reply`, `signal-send`, `sms-send`, `slack-send`; #2337). A new send skill gets the second only when its channel registers a Gate C carve-out for it. The autonomy score is principal-controlled via the `set-autonomy` skill. See `docs/specs/14-autonomy-engine.md` for the full spec.
 
 #### Woken and derived tasks: the bypass ladder
 

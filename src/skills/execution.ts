@@ -1210,6 +1210,35 @@ export class ExecutionLayer {
   }
 
   /**
+   * Whether a send's recipient set is exclusively the verified principal, for the gates A/B
+   * bypass (#2337). Uses the same recipients Gate C would judge: references swapped for the
+   * addresses resolved before the gates, and email-reply's thread participants fetched
+   * through the per-invoke cache the handler reuses. Every doubt is false (the gates apply):
+   * a skill with no carve-out, an unmodeled recipient field, an unresolved reference, or a
+   * failed or malformed email-reply lookup. Input errors are not reported here; Gate C or the
+   * skill reports them as before.
+   */
+  private async isPrincipalOnlySend(
+    toolName: string,
+    input: Record<string, unknown>,
+    sendRecipients: ReadonlyMap<string, string> | undefined,
+    skillLogger: Logger,
+    fetchMessage?: (
+      messageId: string,
+      accountId?: string,
+    ) => ReturnType<OutboundGateway['getEmailMessage']>,
+  ): Promise<boolean> {
+    if (this.principalIdentities.length === 0) return false;
+    const resolved = await this.resolveGateCRecipients(toolName, input, skillLogger, fetchMessage);
+    if (resolved.resolutionFailed || resolved.recipients === null) return false;
+    const normalized = this.substituteResolvedRecipients(resolved.recipients, sendRecipients);
+    if (!normalized.ok) return false;
+    return resolvePrincipalIsSoleRecipientFromSkillInput(
+      toolName, input, this.principalIdentities, normalized.recipients,
+    );
+  }
+
+  /**
    * Collect initiating-sender identifiers on `channel` only: the inbound senderId
    * when the originator arrived on this channel, plus verified active identities
    * on this channel. Never includes contactId, unverified, defunct, bounced, or
@@ -2008,9 +2037,28 @@ export class ExecutionLayer {
             'autonomy gate: skipped — task originated by principal',
           );
         } else {
+          // Principal-only send bypass (#2337): a send whose recipients are all the verified
+          // principal skips gates A and B, whoever started the task. Messaging the principal is
+          // how a restricted Curia reports or asks for help; the gateway already exempts these
+          // sends from its own score gate, and the relay budget caps their volume. Checked only
+          // when A or B would block, so a send above the threshold pays no extra lookup. Gate C
+          // still runs below.
+          const requiredScore = AutonomyService.minScoreForActionRisk(manifest.action_risk);
+          const gateABWouldBlock =
+            (currentScore < 60 && manifest.action_risk !== 'none') || currentScore < requiredScore;
+          const principalOnlySend = gateABWouldBlock && await this.isPrincipalOnlySend(
+            toolName, input, sendRecipients, skillLogger, fetchMessageForGateC,
+          );
+          if (principalOnlySend) {
+            skillLogger.info(
+              { toolName, currentScore, requiredScore, agentId: options?.agentId, taskEventId: options?.taskEventId },
+              'autonomy gate: gates A and B skipped — recipient set is exclusively the verified principal (#2337)',
+            );
+          }
+
           // Gate A: Full restriction — score < 60 blocks all non-read skills.
           // action_risk: 'none' is exempt (reads, retrieval, summarisation).
-          if (currentScore < 60 && manifest.action_risk !== 'none') {
+          if (!principalOnlySend && currentScore < 60 && manifest.action_risk !== 'none') {
             skillLogger.info(
               { toolName, currentScore, actionRisk: manifest.action_risk },
               'autonomy gate: skill blocked — agent is in restricted mode (score < 60)',
@@ -2042,8 +2090,7 @@ export class ExecutionLayer {
           // action_risk: 'none' skills fall through Gate A above and reach Gate B.
           // minScoreForActionRisk('none') returns 0, so Gate B is always a no-op for reads.
           // Gate B: Per-skill action_risk threshold.
-          const requiredScore = AutonomyService.minScoreForActionRisk(manifest.action_risk);
-          if (currentScore < requiredScore) {
+          if (!principalOnlySend && currentScore < requiredScore) {
             skillLogger.info(
               { toolName, currentScore, requiredScore, actionRisk: manifest.action_risk },
               'autonomy gate: skill blocked — score below action_risk threshold',

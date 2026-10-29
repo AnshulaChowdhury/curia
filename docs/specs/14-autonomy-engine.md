@@ -170,7 +170,7 @@ Named labels map to minimum score thresholds:
 |---|---|---|
 | `none` | 0 | Read-only, no side effects |
 | `low` | 60 | Internal state writes (memory, contacts) |
-| `medium` | 70 | Outbound communications |
+| `medium` | 70 | Outbound communications (a send to the principal alone is exempt, see [Principal-only send bypass](#principal-only-send-bypass)) |
 | `high` | 80 | Calendar writes, commitments on behalf of CEO |
 | `critical` | 90 | Financial / destructive / irreversible actions |
 
@@ -184,7 +184,7 @@ A raw integer (0–100) may be used for precision (e.g. `75` for a skill that sh
 |---|---|---|
 | Read / retrieve / summarize | `none` | No external effect — always safe |
 | Internal state writes (memory, contacts) | `low` | Affects future behavior but reversible |
-| Outbound communications | `medium` | External effect; CEO should have visibility |
+| Outbound communications | `medium` | Reaches people outside Curia. A send to the principal alone skips the score gates |
 | Calendar writes / commitments | `high` | Creates real-world commitments |
 | Financial / destructive / irreversible | `critical` | Never fully autonomous |
 
@@ -207,7 +207,7 @@ Phase 2 enforces three hard gates:
 | Condition | Gate |
 |---|---|
 | `score < skill.action_risk_floor` | Skill invocation returns advisory failure — no throw, same `{ success: false }` shape |
-| `score < 70` | `OutboundGateway.send()` blocks direct outbound dispatch; draft creation remains available as the intended fallback |
+| `score < 70` | `OutboundGateway.send()` blocks direct outbound dispatch, except a send to the principal alone; draft creation remains available as the intended fallback |
 | `score >= 90` | Elevated skills callable without per-action CEO confirmation |
 
 The `OutboundGateway` (see [15-outbound-safety.md](15-outbound-safety.md)) is already the natural choke point — adding an autonomy check there requires no architectural change.
@@ -219,6 +219,18 @@ When a task is **principal-originated** (initiated by a direct CEO message, as d
 Implementation: the execution layer calls `isPrincipalOriginated()` before evaluating autonomy gates. If the task traces back to a principal message, the gates are logged but not enforced. Bypasses are written to the audit log at `info` level for operator visibility.
 
 Scope: principal bypass applies to Gates A and B only. It uses task **lineage** (`isPrincipalOriginated` on effective standing) — a woken principal-lineage task can inherit it via the ladder at high trust. This is deliberately a *different* notion of "principal" from the elevated-skill gate (`sensitivity: 'elevated'`), which requires a **live principal turn** and is never bypassed or inherited (#1126). Acting *within* CEO-authorized work (a `normal` skill) can reasonably be inherited at high trust; *exercising authority* (an `elevated` skill) needs the human now. See [03-tools-and-execution.md](03-tools-and-execution.md) and ADR-017.
+
+### Principal-only send bypass
+
+A send whose recipients are **all the verified principal** also skips Gates A and B, whoever started the task (#2337). The principal bypass above asks *who started the task*; this one asks *who the message goes to*. Messaging the principal is the safest thing an autonomous task can do, and it is how a restricted Curia reports back or asks for help. Without it, a system- or agent-originated report below 70 became an approval request asking the principal to approve a message to themselves.
+
+- **Which sends.** The send skills with a Gate C carve-out (`email-send`, `email-reply`, `signal-send`, `sms-send`, `slack-send`). The test is the #1301 recipient check (`resolvePrincipalIsSoleRecipientFromSkillInput`) on the recipients Gate C would judge: references replaced by the addresses resolved before the gates, and for `email-reply` the thread's To and CC with Curia's own mailboxes left out. Two of the principal's own addresses still count. Any third party, any `bcc`, an unmodeled recipient field, a reference that can't be resolved, or a thread that can't be fetched keeps the gates on.
+- **Only when it matters.** The check runs only when Gate A or B would block, so a send above the threshold costs nothing extra.
+- **Gate C still runs.** For an outside originator the #1301 carve-out allows a principal-only send there too.
+- **Why it is safe.** The gateway already lets a send to the principal alone past its own score gate, and does not send it to the band review. The relay budget caps how often an outside contact can make Curia message the principal. A report whose only recipient is the principal is never a disclosure (see *Personal details* below).
+- **Logged** at `info` (`gates A and B skipped — recipient set is exclusively the verified principal`), like the lineage bypass.
+
+`deliver-approval` stays `action_risk: none`. It takes no recipient input (it always messages the principal, on a channel chosen from the principal's preferences), so the recipient check has nothing to read. It is a system path that has to work at any score.
 
 ### Approval delivery and expiry
 
@@ -294,7 +306,7 @@ Effective standing is also what handlers see: `ctx.taskMetadata` carries the pos
 | Draft | 60–69 | Principal confirms | Drafts | Drafts | Digest, plus the asks |
 | Restricted | <60 | Proposes only | Drafts only | Drafts only | Digest |
 
-At every band an outsider steering Curia means the action is held, the integrity rules block, and the fact check runs whenever Curia speaks as the principal. Gates A and B are unchanged and apply on top.
+At every band an outsider steering Curia means the action is held, the integrity rules block, and the fact check runs whenever Curia speaks as the principal. Gates A and B are unchanged and apply on top. The table covers messages to other people: at every band, a send to the principal alone goes out (see [Principal-only send bypass](#principal-only-send-bypass)).
 
 ### Gate C under band (`runBandGateC`, `src/skills/execution.ts`)
 
