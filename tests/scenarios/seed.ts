@@ -19,7 +19,7 @@ import {
   type RecordedReply,
   type SubjectClearResult,
 } from '../../src/dispatch/outbound-context.js';
-import type { PrincipalBacklogSource } from '../../src/dispatch/principal-backlog.js';
+import { readAwaitingAnswers, type PrincipalBacklogSource } from '../../src/dispatch/principal-backlog.js';
 import type { BullpenService } from '../../src/memory/bullpen.js';
 import type { TestModeStack } from '../../src/startup/test-mode-stack.js';
 import { registrableDomain } from '../../src/verification/domain.js';
@@ -449,11 +449,20 @@ const NO_BACKLOG: PrincipalBacklogCounts = { decayWarnings: 0, pendingApprovals:
  * calling run's `seed.backlog` rather than the shared database. Production's counts span
  * every row, so a real one would hand each run whatever the instance and the other runs
  * hold. The SQL has its own test (tests/integration/principal-backlog.test.ts); a case
- * stubs the list tools to show what its counts promise.
+ * stubs the list tools to show what its counts promise. The approvals awaiting an answer
+ * (#2333) are the exception: production's read, narrowed to the run's own conversations,
+ * so a held send the run raised is listed as it would be.
  */
-export function scopedPrincipalBacklog(currentScope: CurrentScope): PrincipalBacklogSource {
+export function scopedPrincipalBacklog(currentScope: CurrentScope, actionLogRepo?: Pick<ActionLogRepo, 'findAwaitingAnswer'>): PrincipalBacklogSource {
   return {
     counts: async (): Promise<PrincipalBacklogCounts> => currentScope()?.backlog ?? NO_BACKLOG,
+    // Production's read (#2333), over the calling run's conversations only.
+    ...(actionLogRepo ? {
+      awaitingAnswers: async (options: { replyThreadId?: string }) => {
+        const scope = currentScope();
+        return scope ? readAwaitingAnswers(actionLogRepo, { ...options, conversationIds: runConversations(scope) }) : [];
+      },
+    } : {}),
   };
 }
 

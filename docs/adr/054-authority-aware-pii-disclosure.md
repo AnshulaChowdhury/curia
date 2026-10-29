@@ -97,6 +97,9 @@ redactor behaves as before and the gateway only reports what it removed.
    `approve-action` / `deny-action`) is stored in `disclosure_decisions` per conversation,
    counterparty and label: a yes authorizes that label to that counterparty on that thread, a
    no turns later asks there into bounces, and the principal's newest explicit live word wins.
+   A text answer is matched by the coordinator, which sees the approvals the principal was
+   shown listed on their turn, the one replied to on its email thread marked (#2333); code
+   never resolves an approval from text.
 7. **Approvals are informed.** An approval display lists every personal detail (label and
    value) so an approved replay goes out intact; `approve-action` refuses an approval the
    principal was never shown when it carries personal details, and records a yes only for a

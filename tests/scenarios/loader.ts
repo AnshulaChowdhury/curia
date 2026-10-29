@@ -92,7 +92,7 @@ const RESUME_KEYS = ['agent', 'original_task', 'context'] as const;
 const REPLY_KEYS = ['from', 'content'] as const;
 const THREAD_KEYS = ['key', 'topic', 'creator', 'participants', 'content', 'mentions'] as const;
 const INBOUND_KEYS = ['from', 'channel', 'content', 'thread', 'author', 'requester', 'email', 'task', 'followup', 'then'] as const;
-const THEN_KEYS = ['content', 'channel'] as const;
+const THEN_KEYS = ['content', 'channel', 'reply_to_approval'] as const;
 const FOLLOWUP_KEYS = ['after', 'from', 'content', 'channel'] as const;
 /** A follow-up held this long still releases the first tool, so a flag-off run can finish. */
 const FOLLOWUP_MAX_DELAY_MS = 120_000;
@@ -754,7 +754,11 @@ function parseThen(raw: unknown, file: string): ScenarioPrincipalTurn {
   if (PRINCIPAL_LOCAL_CHANNELS.includes(channel)) {
     throw new CaseError(file, `inbound.then.channel must be a channel the principal has a verified identity on (not '${channel}')`);
   }
-  return { content: str(raw, 'content', file, 'inbound.then'), channel };
+  const replyToApproval = optBool(raw, 'reply_to_approval', file, 'inbound.then');
+  if (replyToApproval !== undefined && channel !== 'email') {
+    throw new CaseError(file, `inbound.then.reply_to_approval needs channel: email (a reply on the approval email's thread)`);
+  }
+  return { content: str(raw, 'content', file, 'inbound.then'), channel, ...(replyToApproval === true ? { replyToApproval: true } : {}) };
 }
 
 function parseFollowup(raw: unknown, file: string, inboundFrom: string): ScenarioFollowup {

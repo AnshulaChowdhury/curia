@@ -162,6 +162,25 @@ describe('ApprovalDelivery.deliver', () => {
     expect(repo.bindDeliveryMessage).not.toHaveBeenCalled();
   });
 
+  // A reply on the approval email's thread is marked as answering it (#2333).
+  it('binds the approval email\'s thread, never its message, for a reply to be matched', async () => {
+    const { delivery, repo } = makeDelivery({ sendResult: { success: true, messageId: 'nylas-msg-1', threadId: 'nylas-thread-1' } as never });
+    await expect(delivery.deliver('abcd1234', 'email')).resolves.toEqual({ delivered: true, channel: 'email' });
+    expect(repo.bindDeliveryMessage).toHaveBeenCalledTimes(1);
+    expect(repo.bindDeliveryMessage).toHaveBeenCalledWith(42, 'email-thread', 'nylas-thread-1');
+  });
+
+  it('binds no thread for a queued email, and still delivers when the binding fails', async () => {
+    const queued = makeDelivery({ sendResult: { success: true, messageId: 'queue-row-9', threadId: 't', queued: true } as never });
+    await expect(queued.delivery.deliver('abcd1234', 'email')).resolves.toEqual({ delivered: true, channel: 'email' });
+    expect(queued.repo.bindDeliveryMessage).not.toHaveBeenCalled();
+
+    const failing = makeDelivery({ sendResult: { success: true, messageId: 'm', threadId: 't' } as never });
+    failing.repo.bindDeliveryMessage.mockRejectedValue(new Error('db down'));
+    await expect(failing.delivery.deliver('abcd1234', 'email')).resolves.toEqual({ delivered: true, channel: 'email' });
+    expect(failing.repo.releaseNotification).not.toHaveBeenCalled();
+  });
+
   // #2159 Phase 3: a numbered approval is shown and answered by its number.
   it('emails a numbered approval with "Approval <n>" and a reply-by-number call to action', async () => {
     const { delivery, send } = makeDelivery({ row: makeRow({ approvalNumber: 3 }), sendResult: { success: true } });

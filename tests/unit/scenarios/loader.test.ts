@@ -861,13 +861,13 @@ describe('the authority-aware PII cases (#2312)', () => {
 
   it('load, each through the gateway under its own band-gating fixture', () => {
     const ids = (list: ScenarioCase[]): string[] => list.map(c => path.basename(c.sourceFile).slice(0, 3)).sort();
-    expect(ids(pii)).toEqual(['34a', '34b', '34c', '34d', '34e', '34f', '34g', '34h', '34i', '34j', '34k', '34l', '34m']);
+    expect(ids(pii)).toEqual(['34a', '34b', '34c', '34d', '34e', '34f', '34g', '34h', '34i', '34j', '34k', '34l', '34m', '34n', '34o', '34p', '34q']);
     for (const c of pii) {
       expect(c.throughGateway, c.name).toBe(true);
       expect(c.autonomy?.gating, c.name).toBe('band');
       expect(c.releaseGate, c.name).toBe(true);
     }
-    expect(ids(pii.filter(c => c.autonomy?.score === 74))).toEqual(['34c', '34f', '34k']);
+    expect(ids(pii.filter(c => c.autonomy?.score === 74))).toEqual(['34c', '34f', '34k', '34n', '34o', '34p', '34q']);
     expect(ids(pii.filter(c => c.autonomy?.score === 84))).toEqual(['34a', '34b', '34d', '34e', '34g', '34h', '34i', '34j', '34l', '34m']);
   });
 
@@ -878,7 +878,10 @@ describe('the authority-aware PII cases (#2312)', () => {
     // A stranger, a forwarded claim or a volunteered number never pages the principal.
     for (const id of ['34b', '34g', '34h', '34i', '34j']) expect(kinds(id), id).toContain('not_held');
     // Below 80 an inferred share waits for the principal; a known requester is asked.
-    for (const id of ['34c', '34k', '34l']) expect(kinds(id), id).toContain('held');
+    for (const id of ['34c', '34k', '34l', '34n', '34o', '34p', '34q']) expect(kinds(id), id).toContain('held');
+    // The answers to 34k's ask (#2333): each a principal email turn; 34o's on the approval's thread.
+    for (const id of ['34n', '34o', '34p', '34q']) expect(byId.get(id)!.inbound.then?.channel, id).toBe('email');
+    expect(byId.get('34o')!.inbound.then?.replyToApproval).toBe(true);
     // The yes is recorded as an important check: it can also reach the requester as a fresh send
     // the principal directed, with the held one left to expire.
     expect(byId.get('34k')!.expectedBehaviors.filter(b => b.check?.kind === 'decision_recorded').map(b => b.weight)).toEqual(['important']);

@@ -123,6 +123,7 @@ export class ApprovalDelivery {
     }
 
     let messageId: string | undefined;
+    let threadId: string | undefined;
     let queued = false;
     let failure: string | undefined;
     try {
@@ -132,6 +133,7 @@ export class ApprovalDelivery {
       const result = await this.deps.outboundGateway.send(request, { isSystemNotification: true, skipNotificationOnBlock: true });
       if (result.success) {
         messageId = result.messageId;
+        threadId = result.threadId;
         // Durably queued while the transport is down (#1380): it goes out on reconnect, so
         // the claim stands. messageId is then a queue row id, not the provider's, so it is
         // not bound; the reaction mapper binds the real message from its "Approval <n>" (or,
@@ -156,8 +158,16 @@ export class ApprovalDelivery {
       return { delivered: false, reason: 'send_failed', available: remaining };
     }
 
+    // A principal's reply on the approval email's thread is marked as answering it (#2333).
+    if (threadId && !queued && channel === 'email') {
+      try {
+        await actionLogRepo.bindDeliveryMessage(row.id, 'email-thread', threadId);
+      } catch (err) {
+        logger.warn({ err, rowId: row.id }, 'approval-delivery: delivered, but the email thread binding failed — a reply is not marked as answering it');
+      }
+    }
     // A reaction on the delivered message resolves the approval (#1479). Email is answered
-    // by reply, so it has nothing to bind.
+    // by reply, so it has no message to bind.
     if (messageId && !queued && (channel === 'signal' || channel === 'slack')) {
       try {
         await actionLogRepo.bindDeliveryMessage(row.id, channel, messageId);

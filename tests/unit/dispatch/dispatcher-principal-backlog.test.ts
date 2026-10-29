@@ -87,3 +87,66 @@ describe('Dispatcher principal backlog (prompt trim PR 7)', () => {
     );
   });
 });
+
+// The approvals the principal may be answering (#2333).
+describe('Dispatcher awaiting answers (#2333)', () => {
+  const ask = { number: 1, shortRef: 'abcd1234', description: 'Reply to Dana on signal', question: 'Dana is asking for your email address. Share it?' };
+  const none = { decayWarnings: 0, pendingApprovals: 1, principalTasks: 0 };
+
+  function harness(principal: boolean, awaiting: (o: { replyThreadId?: string }) => Promise<typeof ask[]>) {
+    const logger = createLogger('error');
+    const errorSpy = vi.spyOn(logger, 'error');
+    const bus = new EventBus(logger);
+    const tasks: AgentTaskEvent[] = [];
+    const source = { counts: vi.fn(async () => none), awaitingAnswers: vi.fn(awaiting) } satisfies PrincipalBacklogSource;
+    new Dispatcher({ bus, logger, contactResolver: resolverFor(principal), principalBacklog: source }).register();
+    bus.subscribe('agent.task', 'agent', (e) => {
+      tasks.push(e as AgentTaskEvent);
+    });
+    return { tasks, source, errorSpy, bus };
+  }
+
+  it('lists them on a principal turn, passing the email thread the message is on', async () => {
+    const { tasks, source, bus } = harness(true, async () => [ask]);
+    await bus.publish('channel', createInboundMessage({
+      conversationId: 'email:thread-9',
+      channelId: 'email',
+      senderId: 'principal@example.com',
+      content: 'Yes, share it with Dana.',
+      metadata: { nylasThreadId: 'thread-9' },
+    }));
+    expect(source.awaitingAnswers).toHaveBeenCalledWith({ replyThreadId: 'thread-9' });
+    expect(tasks[0]!.payload.awaitingAnswers).toEqual([ask]);
+    expect(tasks[0]!.payload.content).toContain('Yes, share it with Dana.');
+  });
+
+  it('passes no thread off email, and sets nothing when none are waiting', async () => {
+    const { tasks, source, bus } = harness(true, async () => []);
+    await bus.publish('channel', createInboundMessage({
+      conversationId: 'signal:+15551234567', channelId: 'signal', senderId: '+15551234567', content: 'yes',
+    }));
+    expect(source.awaitingAnswers).toHaveBeenCalledWith({});
+    expect(tasks[0]!.payload).not.toHaveProperty('awaitingAnswers');
+  });
+
+  it('never reads them on a turn from anyone else', async () => {
+    const { tasks, source, bus } = harness(false, async () => [ask]);
+    await bus.publish('channel', createInboundMessage({
+      conversationId: 'signal:+15551234567', channelId: 'signal', senderId: '+15551234567', content: 'yes',
+    }));
+    expect(source.awaitingAnswers).not.toHaveBeenCalled();
+    expect(tasks[0]!.payload).not.toHaveProperty('awaitingAnswers');
+  });
+
+  it('routes the turn without them when the read fails, and logs it', async () => {
+    const { tasks, errorSpy, bus } = harness(true, async () => {
+      throw new Error('connection reset');
+    });
+    await bus.publish('channel', createInboundMessage({
+      conversationId: 'signal:+15551234567', channelId: 'signal', senderId: '+15551234567', content: 'yes',
+    }));
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]!.payload).not.toHaveProperty('awaitingAnswers');
+    expect(errorSpy).toHaveBeenCalledWith(expect.objectContaining({ err: expect.any(Error) }), expect.stringContaining('awaiting'));
+  });
+});

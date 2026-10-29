@@ -33,6 +33,7 @@
 // the run's conversation, and approve-action on a later live principal turn (a `followup`)
 // acts only on the run's own. readGatewayOutcome reads all of it before cleanup removes it.
 import { randomUUID } from 'node:crypto';
+import { ActionLogRepo } from '../../src/autonomy/action-log-repo.js';
 import { createAgentDiscuss, createAgentTask, createInboundMessage, type AgentTaskEvent, type InjectionDrainPoint } from '../../src/bus/events.js';
 import { stampOriginator } from '../../src/contacts/stamp-originator.js';
 import {
@@ -546,7 +547,7 @@ export async function createScenarioHarness(
     trustScorerWeights: stack.trustScoring.weights,
     confidencePipeline: stack.trustScoring.confidencePipeline,
     outboundContextService: scopedOutbound,
-    principalBacklog: scopedPrincipalBacklog(currentScope),
+    principalBacklog: scopedPrincipalBacklog(currentScope, new ActionLogRepo(stack.pool, logger)),
     verification: stack.verification,
     turnLanes: stack.turnLanes,
     selfEmail: SCENARIO_CURIA_EMAIL,
@@ -797,7 +798,11 @@ export async function createScenarioHarness(
   ): Promise<{ outcome: TurnOutcome; delivery: Promise<void> }> {
     const sender = await resolveSender({ ...scenario, inbound: { ...scenario.inbound, from: 'principal', channel: turn.channel } }, stack);
     if (typeof sender !== 'object' || !('channelId' in sender)) throw new Error('unreachable: inbound.then sender is not a channel sender');
-    const conversationId = sender.channelId === 'email' ? `email:scenario-then-${randomUUID()}` : `scenario-then-${randomUUID()}`;
+    // A reply on the approval email's thread (#2333) joins that thread, as Nylas threads it.
+    const approvalThread = turn.replyToApproval ? await approvalEmailThread(scope) : undefined;
+    const conversationId = sender.channelId === 'email'
+      ? `email:${approvalThread ?? `scenario-then-${randomUUID()}`}`
+      : `scenario-then-${randomUUID()}`;
     scope.followOnConversations.add(conversationId);
     outcomeGate.hold(conversationId);
     controller.attach(rootConversationId, conversationId);
@@ -815,13 +820,33 @@ export async function createScenarioHarness(
       channelId: sender.channelId,
       senderId: sender.senderId,
       content: turn.content,
-      ...(sender.channelId === 'email' ? { metadata: emailMetadata(sender.senderId, principalEmail, undefined, messageId) } : {}),
+      // nylasThreadId as the email adapter sets it (message-converter.ts).
+      ...(sender.channelId === 'email'
+        ? { metadata: { ...emailMetadata(sender.senderId, principalEmail, undefined, messageId), nylasThreadId: conversationId.slice('email:'.length) } }
+        : {}),
       ...(sender.channelId === 'signal' ? { metadata: { isGroup: false } } : {}),
       ...(sender.channelId === 'slack' ? { metadata: { isDm: true } } : {}),
     }));
     delivery.catch((err: unknown) => capture.fail(conversationId, err));
     trackDelivery(delivery, conversationId);
     return { outcome: await waiter, delivery };
+  }
+
+  /**
+   * The thread of the newest approval email the run delivered to the principal (#2333), from
+   * the binding approval delivery wrote. None is an error: the case's reply has nothing to be on.
+   */
+  async function approvalEmailThread(scope: SeedScope): Promise<string> {
+    const result = await stack.pool.query<{ message_id: string }>(
+      `SELECT b.message_id FROM approval_message_bindings b
+         JOIN autonomy_action_log a ON a.id = b.action_log_id
+        WHERE b.channel = 'email-thread' AND a.conversation_id = ANY($1::text[])
+        ORDER BY b.id DESC LIMIT 1`,
+      [runConversations(scope)],
+    );
+    const thread = result.rows[0]?.message_id;
+    if (!thread) throw new Error('inbound.then.reply_to_approval: the run delivered no approval email to reply on');
+    return thread;
   }
 
   async function runOnce(

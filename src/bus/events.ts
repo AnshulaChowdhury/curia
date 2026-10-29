@@ -116,6 +116,13 @@ export interface AgentTaskPayload {
    * never part of `content`. Absent means nothing is waiting, or the count failed.
    */
   principalBacklog?: import('../agents/prompts/backlog-line.js').PrincipalBacklogCounts;
+  /**
+   * The approvals the principal has been shown and not answered (#2333): set by the
+   * dispatcher on a live principal turn when there are any, newest first, the one replied
+   * to on its email thread marked. The runtime renders them with the turn guidance
+   * (src/agents/prompts/awaiting-answers.ts); never part of `content`.
+   */
+  awaitingAnswers?: import('../agents/prompts/awaiting-answers.js').AwaitingAnswer[];
 }
 
 /** Coarse failure reason propagated on agent.response when isError is true.

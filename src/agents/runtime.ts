@@ -39,6 +39,7 @@ import { stripOutboundContextPreamble } from '../dispatch/outbound-context.js';
 import { parseTurnGuidanceKeys, renderTurnGuidance, verificationCodeReceivedLines } from './prompts/turn-guidance.js';
 import { turnLengthReminder } from '../identity/length.js';
 import { parsePrincipalBacklog, renderBacklogLine } from './prompts/backlog-line.js';
+import { parseAwaitingAnswers, renderAwaitingAnswers } from './prompts/awaiting-answers.js';
 import { renderSenderFacts, renderSenderLine, UNRESOLVED_SENDER_HEAD } from './prompts/sender-line.js';
 import { classifySkillError, formatTaskError } from '../errors/classify.js';
 import { DEFAULT_ERROR_BUDGET, type AgentError, type ErrorBudget } from '../errors/types.js';
@@ -616,9 +617,12 @@ export class AgentRuntime {
     const named = turnGuidanceKeys.includes('verification-code-received')
       ? { 'verification-code-received': await this.verificationCodeReceivedLines(taskEvent.payload.conversationId) }
       : undefined;
+    // The approvals the principal may be answering (#2333) lead the closing lines.
+    const awaiting = renderAwaitingAnswers(parseAwaitingAnswers(taskEvent.payload.awaitingAnswers));
+    const backlogLine = backlog ? renderBacklogLine(backlog) : null;
     const turnGuidance = renderTurnGuidance(
       turnGuidanceKeys,
-      backlog ? renderBacklogLine(backlog) : null,
+      [awaiting, backlogLine].filter((line): line is string => line !== null).join('\n\n') || null,
       this.lengthReminder(taskEvent),
       named,
     );

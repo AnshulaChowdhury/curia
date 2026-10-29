@@ -484,6 +484,21 @@ describe('OutboundGateway', () => {
     expect(delivered!.parentEventId).toBe('outbound-msg-1');
   });
 
+  // Approval delivery binds it, so a reply on the thread is matched to the approval (#2333).
+  it('returns the sent email\'s thread', async () => {
+    (mocks.nylasClient.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'msg-9', threadId: 'thread-9' });
+    const gateway = new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+      logger: mocks.logger,
+    });
+    const result = await gateway.send(baseRequest, { isSystemNotification: true });
+    expect(result).toMatchObject({ success: true, messageId: 'msg-9', threadId: 'thread-9' });
+  });
+
   // ------------------------------------------------------------------
   // No-reply / automated recipient guard (#1302)
   // ------------------------------------------------------------------

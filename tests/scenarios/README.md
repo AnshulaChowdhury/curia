@@ -720,7 +720,11 @@ Approving is elevated, so it needs a live principal turn. Two ways to give one:
   conversation filed under the run: same stubs, its calls listed with the run's, its rows the
   run's and cleaned with them. This is how a hold raised on a third party's turn is approved
   within the run. The checks read the run after this turn has settled; its reply is
-  `then.reply` in the results.
+  `then.reply` in the results. With `reply_to_approval: true` (email only, #2333) the turn is
+  a reply on the thread of the approval email the run delivered to the principal, read from
+  the `email-thread` binding approval delivery wrote; a run that delivered none errors. The
+  approvals the principal's turn lists (`awaitingAnswers`) are production's read over the
+  run's own conversations.
 
 ```yaml
 inbound:

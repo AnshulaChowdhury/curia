@@ -93,6 +93,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Approval answers** — principal turns list approvals they were shown, so a yes or no finds its approval. (#2333)
+- **Approval emails** — a reply on an approval email's thread is marked as answering that approval. (#2333)
 - **Hold sweep** — first post-deploy run deletes stale holds within ±14 days; older ones remain. (#2329)
 - **Voice latency on Haiku 5.5** — prod user-turn p50 954 ms passes ADR-038's 1 s budget; first-token log adds `round`, `turnKind`. (#2271)
 - **Band send review** — flagged text is rewritten, never cut; findings that survive block at 80+. (#2312)

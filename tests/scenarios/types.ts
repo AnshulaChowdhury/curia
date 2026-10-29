@@ -369,6 +369,11 @@ export interface ScenarioPrincipalTurn {
   content: string;
   /** A channel the principal has a verified identity on (seed one with principal_identities). */
   channel: string;
+  /**
+   * Email only (#2333): the turn is a reply on the thread of the approval email the run
+   * delivered to the principal, as Nylas threads a reply, instead of a fresh email.
+   */
+  replyToApproval?: boolean;
 }
 
 /** When the harness publishes `ScenarioInbound.followup`. */

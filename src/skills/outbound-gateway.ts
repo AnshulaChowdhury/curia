@@ -149,6 +149,8 @@ function emailProvenanceFromPayload(payload: EmailSendRequest): {
 export interface OutboundSendResult {
   success: boolean;
   messageId?: string;
+  /** The provider's thread for a sent email (#2333): a reply to it arrives on this thread. */
+  threadId?: string;
   /** Human-readable reason when success is false */
   blockedReason?: string;
   /**
@@ -4483,7 +4485,7 @@ export class OutboundGateway {
         'outbound-gateway: message sent successfully',
       );
 
-      return { success: true, messageId: sent.id };
+      return { success: true, messageId: sent.id, ...(sent.threadId ? { threadId: sent.threadId } : {}) };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error(

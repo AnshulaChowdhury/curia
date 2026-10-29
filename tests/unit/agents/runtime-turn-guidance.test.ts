@@ -4,6 +4,7 @@
 // reach the system string (that would split the cached prefix per trigger) or working
 // memory (a long conversation would hold one copy per earlier turn).
 
+import { renderAwaitingAnswers } from '../../../src/agents/prompts/awaiting-answers.js';
 import { describe, expect, it, vi } from 'vitest';
 import { AgentRuntime } from '../../../src/agents/runtime.js';
 import type { LLMProvider, Message } from '../../../src/agents/llm/provider.js';
@@ -37,6 +38,7 @@ async function runTurn(payload: {
   content: string;
   turnGuidance?: unknown;
   principalBacklog?: unknown;
+  awaitingAnswers?: unknown;
   channelId?: string;
   toolAllowlist?: string[];
   /** The office identity's Detail setting; absent means the agent has no identity service. */
@@ -76,6 +78,9 @@ async function runTurn(payload: {
     }),
     ...(payload.principalBacklog !== undefined && {
       principalBacklog: payload.principalBacklog as Parameters<typeof createAgentTask>[0]['principalBacklog'],
+    }),
+    ...(payload.awaitingAnswers !== undefined && {
+      awaitingAnswers: payload.awaitingAnswers as Parameters<typeof createAgentTask>[0]['awaitingAnswers'],
     }),
     parentEventId: 'parent-guidance',
   }));
@@ -121,6 +126,22 @@ describe('AgentRuntime turn guidance (#1959)', () => {
     expect(messages[messages.length - 1]!.content)
       .toBe(`${renderTurnGuidance(['principal-reply-shaped'], renderBacklogLine(counts))}\n\nBook Friday.`);
     expect(history[0]).toEqual({ role: 'user', content: 'Book Friday.' });
+  });
+
+  it('lists the approvals awaiting an answer ahead of the backlog line, kept out of working memory (#2333)', async () => {
+    const counts = { decayWarnings: 0, pendingApprovals: 1, principalTasks: 0 };
+    const awaiting = [{ number: 1, shortRef: 'abcd1234', description: 'Reply to Dana on signal', question: 'Share it?', repliedTo: true }];
+    const { messages, history } = await runTurn({ content: 'Yes, share it.', principalBacklog: counts, awaitingAnswers: awaiting });
+    expect(messages[messages.length - 1]!.content)
+      .toBe(`${renderTurnGuidance([], `${renderAwaitingAnswers(awaiting)}\n\n${renderBacklogLine(counts)}`)}\n\nYes, share it.`);
+    expect(history[0]).toEqual({ role: 'user', content: 'Yes, share it.' });
+  });
+
+  it('drops a malformed or empty awaiting-answers list', async () => {
+    for (const awaitingAnswers of ['nope', [], [{ shortRef: 'x' }]]) {
+      const { messages } = await runTurn({ content: 'Hello', awaitingAnswers });
+      expect(messages[messages.length - 1]!.content).toBe('Hello');
+    }
   });
 
   it('drops a malformed or empty backlog', async () => {

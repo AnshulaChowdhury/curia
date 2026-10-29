@@ -35,6 +35,7 @@ import { inboundIsOneToOne, inboundSenderAuthenticated } from './outbound-entry-
 import type { AcquaintanceEvidence } from '../contacts/principal-acquaintance.js';
 import { hasBookingPageLink, inboundTurnGuidance, looksLikeForward, looksLikeMakeRoom, looksLikeSpotCheckReply, parseSpotCheckVerdicts, spotCheckCandidateText } from './turn-guidance-triggers.js';
 import { hasBacklog, type PrincipalBacklogCounts } from '../agents/prompts/backlog-line.js';
+import type { AwaitingAnswer } from '../agents/prompts/awaiting-answers.js';
 import type { PrincipalBacklogSource } from './principal-backlog.js';
 import { rewriteLlmFailureTurns } from '../memory/llm-failure-turn.js';
 import {
@@ -1326,6 +1327,22 @@ export class Dispatcher {
         );
       }
     }
+    // The approvals the principal may be answering (#2333), with the one whose approval email
+    // this message replies on marked. Best-effort too: without it the coordinator can still
+    // call list-pending-actions.
+    let awaitingAnswers: AwaitingAnswer[] | undefined;
+    if (this.principalBacklog?.awaitingAnswers && liveTurn) {
+      const thread = payload.channelId === 'email' ? payload.metadata?.['nylasThreadId'] : undefined;
+      try {
+        const list = await this.principalBacklog.awaitingAnswers(typeof thread === 'string' && thread !== '' ? { replyThreadId: thread } : {});
+        if (list.length > 0) awaitingAnswers = list;
+      } catch (err) {
+        this.logger.error(
+          { err, channelId: payload.channelId, conversationId: payload.conversationId },
+          'Failed to read the approvals awaiting the principal\'s answer — proceeding without them',
+        );
+      }
+    }
 
     const lanes = this.turnLanes;
     if (lanes?.enabled) {
@@ -1383,6 +1400,7 @@ export class Dispatcher {
       content: taskContent,
       ...(turnGuidance.length > 0 && { turnGuidance }),
       ...(principalBacklog && { principalBacklog }),
+      ...(awaitingAnswers && { awaitingAnswers }),
       senderContext,
       messageTrustScore,
       // SECURITY: always strip ceoInitiated (legacy) and originator from channel-supplied
