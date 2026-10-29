@@ -3002,3 +3002,71 @@ describe('VoiceRuntime agendas (#2322)', () => {
     expect(appendAgendaLoad).not.toHaveBeenCalled();
   });
 });
+
+describe('VoiceRuntime meeting notes (#2347)', () => {
+  function systemText(messages: Message[]): string {
+    return messages
+      .filter((message) => message.role === 'system' && typeof message.content === 'string')
+      .map((message) => message.content as string)
+      .join('\n');
+  }
+
+  // The handler writes the mark; the runtime only reads its (audited) result.
+  async function callWithNotes(toolResult: { content: string; is_error?: boolean }) {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'meeting-notes-start', input: { recap: true } }], usage, provenance }],
+      replyScript('Sure.'),
+      replyScript('Go on.'),
+    ]);
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(1, 1),
+      invokeTool: async () => toolResult,
+    });
+    await runtime.startSession({
+      sessionId: 's-notes',
+      conversationId: 'voice:s-notes',
+      roomName: 'voice-s-notes',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'keep notes and send me a recap', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-notes');
+    stt.emit({ text: 'first item', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-notes');
+    return llm;
+  }
+
+  it('restates a recap in every later turn\'s prompt after a successful result', async () => {
+    const llm = await callWithNotes({ content: JSON.stringify({ notes_on: true, recap: true }) });
+    expect(systemText(llm.seenMessages[0] ?? [])).not.toContain('## Meeting notes');
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).toContain('## Meeting notes');
+    expect(last).toContain('Do not hand the recap off');
+  });
+
+  it('restates notes without a recap when none was asked for', async () => {
+    const llm = await callWithNotes({ content: JSON.stringify({ notes_on: true, recap: false }) });
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).toContain('A recap goes out only if an agenda topic');
+  });
+
+  it('leaves notes off after a failed result', async () => {
+    const llm = await callWithNotes({ content: 'Notes could not be started for this call.', is_error: true });
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).not.toContain('## Meeting notes');
+  });
+
+  // #2347: one recap, one path. The delegation sentence must agree with the
+  // meeting-notes-start and async-offramp descriptions on the turn that chooses.
+  it('names meeting-notes-start for the recap and async-offramp for other after-call sends', () => {
+    const prompt = buildVoiceSystemPrompt({
+      specialistRoster: '- @ceo-inbox: the principal\'s inbox',
+      audience: { liveTurn: true },
+    });
+    expect(prompt).toContain('reading the principal\'s inbox');
+    expect(prompt).toContain('A recap of this call is meeting-notes-start.');
+    expect(prompt).toContain('such as links or research results, goes to async-offramp, not a specialist');
+  });
+});

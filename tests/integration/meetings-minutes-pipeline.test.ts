@@ -112,6 +112,8 @@ describeIf('MinutesPipeline (integration, #2322)', () => {
       logger,
       pool: publicPool,
       hasActiveWake: async (taskId) => activeWakes.has(taskId),
+      appOrigin: 'https://office.example',
+      httpPort: 3000,
     }).start();
   });
 
@@ -211,7 +213,7 @@ describeIf('MinutesPipeline (integration, #2322)', () => {
     expect(await agendas.get(agendaId)).toBeNull();
   });
 
-  it('caller silent after load returns the agenda without minutes', async () => {
+  async function lateLoadCall(spokeBefore: boolean): Promise<{ sessionId: string; agendaId: string; startedAt: Date }> {
     const sessionId = randomUUID();
     sessionIds.push(sessionId);
     const parked = await agendas.park({
@@ -236,19 +238,41 @@ describeIf('MinutesPipeline (integration, #2322)', () => {
       loadedAt: new Date(session.startedAt.getTime() + 60_000).toISOString(),
       snapshot: agendaSnapshot(locked.agenda),
     });
-    await memory.addTurn(`meetings-2322:${sessionId}`, 'coordinator', { role: 'user', content: 'Before the load.' }, {
-      createdAt: session.startedAt,
-    });
+    if (spokeBefore) {
+      await memory.addTurn(`meetings-2322:${sessionId}`, 'coordinator', { role: 'user', content: 'Move my brief to 8:45, and pull up the board agenda.' }, {
+        createdAt: session.startedAt,
+      });
+    }
     await publicPool.query(
       `UPDATE voice_sessions SET end_reason = 'remote_hangup', ended_at = NOW() WHERE id = $1`,
       [sessionId],
     );
+    return { sessionId, agendaId: parked.agendaId, startedAt: session.startedAt };
+  }
+
+  it('caller who never spoke returns the agenda without minutes', async () => {
+    const { sessionId, agendaId, startedAt } = await lateLoadCall(false);
     expect(await pipeline.run(sessionId)).toBe('returned_unused');
-    expect(await repo.read(minutesPath(sessionId, session.startedAt, TZ))).toBeNull();
-    const agenda = await agendas.get(parked.agendaId);
+    expect(await repo.read(minutesPath(sessionId, startedAt, TZ))).toBeNull();
+    const agenda = await agendas.get(agendaId);
     expect(agenda?.status).toBe('pending');
     expect(agenda?.history).toEqual([]);
   });
+
+  // #2347: an instruction spoken before a last-moment load still needs the
+  // follow-up task, and only minutes start it. The agenda still returns to pending.
+  it('caller who spoke only before a late load still gets minutes', async () => {
+    coverage = 'not_reached';
+    llmOk = true;
+    const { sessionId, agendaId, startedAt } = await lateLoadCall(true);
+    expect(await pipeline.run(sessionId)).toBe('completed');
+    expect(await repo.read(minutesPath(sessionId, startedAt, TZ))).not.toBeNull();
+    expect(ready.filter((event) => event.payload.sessionId === sessionId)).toHaveLength(1);
+    const agenda = await agendas.get(agendaId);
+    expect(agenda?.status).toBe('pending');
+    expect(agenda?.history[0]?.topics).toEqual([{ topic: 'runway', coverage: 'not_reached' }]);
+  });
+
 
   it('minutes LLM failure publishes minutes.pipeline_failed and leaves the agenda in_call', async () => {
     llmOk = false;

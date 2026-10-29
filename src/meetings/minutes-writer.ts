@@ -10,6 +10,20 @@ import type { AgendaCoverage, AgendaSnapshot, TopicCoverage } from './types.js';
 import { TOPIC_COVERAGE } from './types.js';
 
 export function buildMinutesPrompt(input: { agendas: AgendaSnapshot[]; transcriptBody: string }): string {
+  if (input.agendas.length === 0) {
+    // The caller asked for notes on a call with no agenda (#2347).
+    return [
+      'Write meeting minutes from the transcript below. No agenda was set.',
+      'Use one section per topic the caller raised. For each say what was discussed, what was decided, and what was asked for.',
+      'Keep open questions as they were said. Attribute who said or committed to what.',
+      'End with one fenced json block and nothing after it:',
+      '```json',
+      '{"coverage":[]}',
+      '```',
+      'Transcript:',
+      encodeUntrustedJson(input.transcriptBody),
+    ].join('\n');
+  }
   return [
     'Write meeting minutes from the transcript and the agendas below.',
     'Use one section per agenda. For each topic say what was discussed, what was decided, and the coverage: covered, partial, or not_reached.',

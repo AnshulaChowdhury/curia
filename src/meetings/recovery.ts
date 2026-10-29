@@ -1,7 +1,7 @@
 // recovery.ts — startup sweep for calls that died before minutes.ready (#2322).
 //
-// Rerun recent ended sessions, cull expired agendas, then release an in_call
-// agenda whose session is gone. A completed or unused rerun protects only the
+// Rerun recent ended sessions that loaded an agenda or asked for notes (#2347),
+// cull expired agendas, then release an in_call agenda whose session is gone. A completed or unused rerun protects only the
 // holds it recorded, keyed by that session and agenda. The same agenda held by
 // a later session is released, as is a hold that was never recorded.
 
@@ -31,7 +31,7 @@ export class MeetingPipelineRecovery {
 
   async sweep(now: Date): Promise<{ rerun: number; released: number }> {
     const since = new Date(now.getTime() - this.lookbackDays * DAY_MS);
-    const sessions = await this.deps.sessionStore.listRecentWithAgendas(since);
+    const sessions = await this.deps.sessionStore.listRecentForMinutes(since);
     const protectedHolds = new Set<string>();
     let rerun = 0;
     for (const session of sessions) {

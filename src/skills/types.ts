@@ -58,7 +58,8 @@ export interface ToolManifest {
    *  schedulerService, entityMemory, nylasCalendarClient, autonomyService,
    *  executiveProfileService, officeIdentityService, browserService, bullpenService, toolSearch,
    *  actionLogRepo, auditLogRepo, executionLayer, confidencePipeline, tempFileStore, infraLlm, outboundContext,
-   *  taskRepo, workingDocs, secretCapture, secretResolver, userSecretIndex, taskOutreach, disclosureDecisions.
+   *  taskRepo, workingDocs, secretCapture, secretResolver, userSecretIndex, taskOutreach, disclosureDecisions,
+   *  voiceSessions.
    *
    *  Services NOT listed here (contactService, entityContextAssembler, agentPersona)
    *  are universal — available to every skill without declaration. */
@@ -289,6 +290,10 @@ export interface ToolContext {
   /** Working document repo — available to skills declaring 'workingDocs' in capabilities.
    *  OKF-serialized document workspace backed by Postgres (#1208). */
   workingDocs?: import('../db/working-docs-repo.js').WorkingDocsRepo;
+  /** Voice session store, narrowed to the notes mark (#2347) — available to skills declaring
+   *  'voiceSessions'. meeting-notes-start writes the mark itself so the audited tool result
+   *  says whether the call is really marked. */
+  voiceSessions?: Pick<import('../channels/voice/session-store.js').VoiceSessionStore, 'markNotesRequested'>;
   /** Execution layer — available to skills declaring 'executionLayer' in capabilities.
    *  Allows re-invocation of skills with humanApproved bypass. Only approve-action (#428)
    *  should declare this capability; it is sensitivity: "elevated" (principal-only). */

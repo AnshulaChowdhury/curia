@@ -543,6 +543,8 @@ interface MinutesReadyPayload {
   conversationId: string;
   sources: Array<'principal' | 'routine' | 'coordinator' | 'ad_hoc'>;
   sensitivity: 'internal' | 'confidential' | 'shareable';
+  /** Whether the follow-up sends a recap, and why (#2347). See MinutesRecap in src/meetings/types.ts. */
+  recap: 'requested' | 'topic_covered' | 'not_earned' | 'unknown';
 }
 
 // minutes.pipeline_failed — a transcript, minutes, settle, or structuring step failed (#2322).

@@ -33,14 +33,14 @@ function spokenLockError(reason: Extract<AgendaLockResult, { ok: false }>['reaso
     case 'expired':
       return 'That agenda has expired.';
     case 'not_pending':
-      return 'That agenda is not available to load.';
+      return 'That agenda is not available right now.';
     case 'not_found':
       return 'I cannot find that agenda.';
     case 'conflict':
       return 'That agenda is already in use on another call.';
     default: {
       const neverReason: never = reason;
-      return `Could not load that agenda (${neverReason}).`;
+      return `Could not open that agenda (${neverReason}).`;
     }
   }
 }

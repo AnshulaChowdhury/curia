@@ -15,12 +15,16 @@ import type { TaskRepo } from '../db/task-repo.js';
 import type { Logger } from '../logger.js';
 import type { SchedulerService } from '../scheduler/scheduler-service.js';
 import {
+  documentConsoleUrl,
+  hasMinutesTaskNote,
   isTerminalMinutesTask,
   MINUTES_STRUCTURING_SKILL,
   minutesTaskNeedsRepair,
+  minutesTaskNote,
   withMinutesTaskLock,
 } from './minutes-task.js';
 import type { MinutesPipeline } from './minutes-pipeline.js';
+import type { MinutesRecap } from './types.js';
 
 export class MeetingSessionEndedSubscriber {
   constructor(private readonly opts: { bus: EventBus; pipeline: MinutesPipeline; logger: Logger }) {}
@@ -46,6 +50,9 @@ export class MinutesReadySubscriber {
     pool: Pool;
     /** Pending or running wake. Do not infer this from nextWakeAt. */
     hasActiveWake: (taskId: string) => Promise<boolean>;
+    /** Office origin for the minutes link (config.appOrigin); localhost on httpPort when unset. */
+    appOrigin: string | undefined;
+    httpPort: number;
   }) {}
 
   start(): void {
@@ -60,6 +67,7 @@ export class MinutesReadySubscriber {
     sessionId: string;
     sources: Array<'principal' | 'routine' | 'coordinator' | 'ad_hoc'>;
     sensitivity: 'internal' | 'confidential' | 'shareable';
+    recap: MinutesRecap;
   }): Promise<void> {
     const tag = `meeting-minutes:${payload.sessionId}`;
     try {
@@ -73,7 +81,14 @@ export class MinutesReadySubscriber {
         if (reusable.length === 0 && existing.length > 0) return;
 
         const originator = makeSystemOriginator();
-        const task = reusable[0] ?? await this.opts.taskRepo.createTask({
+        const minutesUrl = documentConsoleUrl(this.opts.appOrigin, this.opts.httpPort, payload.minutesRef);
+        const note = minutesTaskNote({ minutesRef: payload.minutesRef, minutesUrl, recap: payload.recap });
+        const reused = reusable[0];
+        // A task created before #2347 has no note, so its wake would not see the path.
+        if (reused && !hasMinutesTaskNote(reused.progress, payload.minutesRef)) {
+          await this.opts.taskRepo.updateTask(reused.id, { progressNote: note });
+        }
+        const task = reused ?? await this.opts.taskRepo.createTask({
           agentId: 'coordinator',
           owner: 'curia',
           source: 'scheduler',
@@ -84,6 +99,8 @@ export class MinutesReadySubscriber {
             `sources: ${payload.sources.join(', ')}`,
             `sensitivity: ${payload.sensitivity}`,
           ].join('\n'),
+          // The wake shows progress, not the description (#2347).
+          progressNote: note,
           tags: [tag],
           originator,
         });

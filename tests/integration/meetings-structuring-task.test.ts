@@ -42,6 +42,8 @@ describeIf('MinutesReadySubscriber (integration, #2322)', () => {
       logger,
       pool,
       hasActiveWake: async (taskId) => activeWakes.has(taskId),
+      appOrigin: 'https://office.example',
+      httpPort: 3000,
     }).start();
   });
 
@@ -57,6 +59,7 @@ describeIf('MinutesReadySubscriber (integration, #2322)', () => {
       conversationId: `voice:${SESSION}`,
       sources: ['principal' as const],
       sensitivity: 'internal' as const,
+      recap: 'topic_covered' as const,
     };
     await bus.publish('system', createMinutesReady(payload));
     await bus.publish('system', createMinutesReady(payload));
@@ -70,6 +73,11 @@ describeIf('MinutesReadySubscriber (integration, #2322)', () => {
     expect(task.createdBy).toBe('meetings');
     expect(task.title).toBe('Follow up on meeting minutes');
     expect(task.description).toContain(payload.minutesRef);
+    // The wake carries progress, not the description (#2347).
+    const notes = (task.progress as { notes?: Array<{ note: string }> }).notes ?? [];
+    expect(notes[0]?.note).toContain(payload.minutesRef);
+    expect(notes[0]?.note).toContain(`https://office.example/documents?path=${encodeURIComponent(payload.minutesRef)}`);
+    expect(notes[0]?.note).toContain('Recap: send one. At least one agenda topic was covered.');
     expect(task.originator?.systemRole).toBe('system');
     expect(readActiveSkillNames(task.progress)).toEqual(['meeting-minutes-structuring']);
     expect(wakes).toHaveLength(1);
