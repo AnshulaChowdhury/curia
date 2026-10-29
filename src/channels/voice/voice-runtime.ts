@@ -36,6 +36,8 @@ import { DATE_RESOLVE_GUARDRAIL } from '../../agents/prompts/date-resolve-guardr
 import { VOICE_ASYNC_OFFRAMP_GUIDANCE } from '../../agents/prompts/voice-async-offramp.js';
 import { TurnDateResolveTracker } from '../../agents/delegate-brief-date-validation.js';
 import type { WorkingMemory } from '../../memory/working-memory.js';
+import { formatAgendaPromptBlock, parseAgendaLoadResult } from '../../meetings/agenda-prompt.js';
+import type { AgendaIndexEntry, AgendaSnapshot, SessionAgendaLoad, SessionAgendas } from '../../meetings/types.js';
 import { historyForLlm, LLM_FAILURE_TURN_CONTENT } from '../../memory/llm-failure-turn.js';
 import {
   CONTACT_RECENT_HISTORY_MAX_TURNS,
@@ -300,6 +302,12 @@ export function buildVoiceSystemPrompt(parts: {
   /** Pre-formatted "## Current Date & Time" block; omitted when null/empty. */
   timeContextBlock?: string | null;
   /**
+   * Loaded and queued agendas for this call (#2322). Omitted or null keeps the
+   * prompt byte-identical to a call with no agendas. Sits immediately before
+   * the time block so the static prefix stays cacheable.
+   */
+  agendaBlock?: string | null;
+  /**
    * Resolved audience for the voice addendum. Required so a missing audience
    * cannot silently default to principal framing (#1598).
    */
@@ -324,6 +332,7 @@ export function buildVoiceSystemPrompt(parts: {
   // Dynamic suffix: outbound context then time. Time stays last so the static
   // prefix (+ identity/roster) remains provider-cacheable across turns.
   if (parts.outboundContextBlock) sections.push(parts.outboundContextBlock);
+  if (parts.agendaBlock) sections.push(parts.agendaBlock);
   if (parts.timeContextBlock) sections.push(parts.timeContextBlock);
   return sections.join('\n\n');
 }
@@ -476,6 +485,11 @@ interface StartVoiceSessionParams {
    * media path lifecycle (e.g. SignalCallBridge / signal-cli tunnel).
    */
   transport?: AudioTransport;
+  /**
+   * Agendas prepared for this call (#2322). Absent on console calls and on
+   * any call that did not go through agenda preparation.
+   */
+  agendas?: SessionAgendas;
 }
 
 interface CarriedUtterance {
@@ -536,6 +550,10 @@ interface ActiveSession {
    * lifecycle (e.g. the LiveKit room is not this runtime's to delete).
    */
   externalTransport: boolean;
+  /** Agendas locked into this call, rendered into every later turn's prompt. */
+  loadedAgendas: AgendaSnapshot[];
+  /** Pending agendas offered but not yet loaded. */
+  agendaIndex: AgendaIndexEntry[];
 }
 
 export class VoiceRuntime {
@@ -647,6 +665,8 @@ export class VoiceRuntime {
         ending: false,
         consecutiveTtsFailures: 0,
         externalTransport: params.transport !== undefined,
+        loadedAgendas: [...(params.agendas?.loaded ?? [])],
+        agendaIndex: [...(params.agendas?.index ?? [])],
       };
       this.sessions.set(params.sessionId, session);
 
@@ -1039,6 +1059,9 @@ export class VoiceRuntime {
             if (call.name === 'date-resolve') {
               turnDateResolveTracker.recordFromJsonContent(result.content, result.is_error);
             }
+            if (call.name === 'meeting-agenda-load') {
+              await this.noteMeetingAgendaLoad(session, result);
+            }
             return result;
           }
           : this.config.invokeTool
@@ -1053,6 +1076,9 @@ export class VoiceRuntime {
               });
               if (call.name === 'date-resolve') {
                 turnDateResolveTracker.recordFromJsonContent(result.content, result.is_error);
+              }
+              if (call.name === 'meeting-agenda-load') {
+                await this.noteMeetingAgendaLoad(session, result);
               }
               return result;
             }
@@ -1358,10 +1384,12 @@ export class VoiceRuntime {
     }
 
     let timeContextBlock: string | null = null;
+    let agendaTimezone: string | undefined;
     const timezone = this.config.timezone?.trim();
     if (timezone) {
       try {
         timeContextBlock = formatTimeContextBlock(timezone, new Date());
+        agendaTimezone = timezone;
       } catch (err) {
         this.log.error({ err, timezone }, 'formatTimeContextBlock failed — time context not injected into voice turn; check TIMEZONE config');
       }
@@ -1372,11 +1400,46 @@ export class VoiceRuntime {
       specialistRoster,
       outboundContextBlock,
       timeContextBlock,
+      agendaBlock: formatAgendaPromptBlock({
+        loaded: session.loadedAgendas,
+        index: session.agendaIndex,
+      }, agendaTimezone),
       audience: {
         liveTurn: session.caller.liveTurn,
         displayName: session.caller.displayName,
       },
     });
+  }
+
+  /**
+   * A successful meeting-agenda-load joins the session's prompt state and is
+   * appended to voice_sessions metadata. A store failure is logged and does
+   * not fail the turn — the startup sweep can still settle an in_call agenda.
+   */
+  private async noteMeetingAgendaLoad(
+    session: ActiveSession,
+    result: { content: string; is_error?: boolean },
+  ): Promise<void> {
+    if (result.is_error) return;
+    const snapshot = parseAgendaLoadResult(result.content);
+    if (!snapshot) return;
+    if (!session.loadedAgendas.some((agenda) => agenda.agendaId === snapshot.agendaId)) {
+      session.loadedAgendas.push(snapshot);
+    }
+    session.agendaIndex = session.agendaIndex.filter((entry) => entry.agendaId !== snapshot.agendaId);
+    const load: SessionAgendaLoad = {
+      agendaId: snapshot.agendaId,
+      loadedAt: new Date().toISOString(),
+      snapshot,
+    };
+    try {
+      await this.config.sessionStore.appendAgendaLoad(session.sessionId, load);
+    } catch (err) {
+      this.log.warn(
+        { err, sessionId: session.sessionId, agendaId: snapshot.agendaId },
+        'failed to record agenda load; startup sweep can recover the in_call agenda',
+      );
+    }
   }
 
   /**

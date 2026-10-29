@@ -109,7 +109,11 @@ describe('smallCapThinkingViolations (#2224)', () => {
 // 3,000 tokens reasoning on a 1,000-token extract-facts call and returned no text, and
 // #2191 saw the same at the 4,000 default. So every extract runs on fast. A call that
 // must stay on standard goes here, with its reason (file path → number of calls).
-const STANDARD_TIER_EXTRACTS: Readonly<Record<string, number>> = {};
+const STANDARD_TIER_EXTRACTS: Readonly<Record<string, number>> = {
+  // Meeting minutes are the document, not a short verdict. The 8,000-token cap is
+  // the minutes themselves (#2322). Fast stays the tier for small structured extracts.
+  'src/meetings/minutes-writer.ts': 1,
+};
 
 const REPO = join(import.meta.dirname, '../../../..');
 

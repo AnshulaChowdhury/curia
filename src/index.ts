@@ -106,6 +106,10 @@ import { DeepgramSttProvider, CartesiaTtsProvider, SpeechMediaService } from './
 import { LiveKitRoomSession } from './channels/voice/livekit/room-session.js';
 import { deleteVoiceRoom, listVoiceRooms } from './channels/voice/livekit/token.js';
 import { SignalCallBridge } from './channels/voice/signal/signal-call-bridge.js';
+import { AgendaStore } from './meetings/agenda-store.js';
+import { MinutesPipeline } from './meetings/minutes-pipeline.js';
+import { MeetingPipelineRecovery } from './meetings/recovery.js';
+import { MeetingSessionEndedSubscriber, MinutesReadySubscriber } from './meetings/subscribers.js';
 import { loadAuthConfig } from './contacts/config-loader.js';
 import { AuthorizationService } from './contacts/authorization.js';
 import type { OutboundContentFilter } from './dispatch/outbound-filter.js';
@@ -200,6 +204,7 @@ import {
   type AssembledAgent,
 } from './startup/agent-assembly.js';
 import { BacklogHeartbeat } from './scheduler/backlog-heartbeat.js';
+import { taskHasPendingWake } from './agents/resumable-continuation.js';
 import { ResumableContinuationSubscriber } from './agents/resumable-continuation-subscriber.js';
 import { LateDelegationSubscriber } from './agents/late-delegation-subscriber.js';
 import {
@@ -1645,6 +1650,8 @@ async function main(): Promise<void> {
 
   // TaskRepo — used by task-create, task-list, task-update, task-complete skills.
   const workingDocsRepo = new WorkingDocsRepo(pool, logger);
+  // #2322: parked agendas and the post-call pipeline share this store.
+  const agendaStore = new AgendaStore(workingDocsRepo, logger);
   // Who Curia contacted for a task (#2312): tools write it, and a task's rows close when it ends.
   const taskOutreachRepo = new TaskOutreachRepo(pool);
   // The principal's own company is never an outreach org domain, on either side (#2312).
@@ -2214,6 +2221,7 @@ async function main(): Promise<void> {
         contactResolver,
         voiceRuntime: voiceRuntimeRef,
         sessionStore: voiceSessionStore,
+        agendaStore,
         pulseServer: config.signalPulseSocketPath,
         maxCallSeconds: config.signalVoiceMaxCallSeconds,
         channelPolicies: authConfig!.channelPolicies,
@@ -2995,6 +3003,7 @@ async function main(): Promise<void> {
   planFrontierSubscriber.start();
 
 
+  let meetingRecovery: MeetingPipelineRecovery | undefined;
   if (workingDocsRepo) {
     const deliverableKgPromotionSubscriber = new DeliverableKgPromotionSubscriber({
       bus,
@@ -3005,6 +3014,36 @@ async function main(): Promise<void> {
       logger,
     });
     deliverableKgPromotionSubscriber.start();
+
+    const minutesPipeline = new MinutesPipeline({
+      sessionStore: voiceSessionStore,
+      workingMemory: memory,
+      repo: workingDocsRepo,
+      agendaStore,
+      llm: infraLlmService.scoped({ toolName: 'meeting-minutes' }),
+      taskRepo,
+      contactService,
+      bus,
+      timezone: () => principalContact?.timezone ?? config.timezone,
+      hasActiveWake: (taskId) => taskHasPendingWake(pool, taskId),
+      logger,
+    });
+    new MeetingSessionEndedSubscriber({ bus, pipeline: minutesPipeline, logger }).start();
+    new MinutesReadySubscriber({
+      bus,
+      taskRepo,
+      schedulerService,
+      logger,
+      pool,
+      hasActiveWake: (taskId) => taskHasPendingWake(pool, taskId),
+    }).start();
+    meetingRecovery = new MeetingPipelineRecovery({
+      sessionStore: voiceSessionStore,
+      agendaStore,
+      repo: workingDocsRepo,
+      pipeline: minutesPipeline,
+      logger,
+    });
   }
 
   // Deferred-delegation routing is registered with the scheduler below, after
@@ -3273,6 +3312,14 @@ async function main(): Promise<void> {
     bus, executionLayer, pool, logger, authConfig?.channelPolicies, verificationRuntime,
   );
   checkpointProcessor.register();
+
+  // Recover calls that died before minutes.ready. Fire-and-forget so boot
+  // does not wait on the minutes model (#2322).
+  if (meetingRecovery) {
+    void meetingRecovery.sweep(new Date()).catch((err: unknown) => {
+      logger.error({ err }, 'meeting pipeline: startup sweep failed');
+    });
+  }
 
   // BullpenDispatcher — routes agent.discuss → agent.task for inter-agent Bullpen discussions.
   // The origin-turn lookup shares the late-delivery flag with the running claim

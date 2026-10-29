@@ -94,6 +94,53 @@ describe('DocWriteHandler', () => {
     expect(repo.create).toHaveBeenCalled();
   });
 
+  it('does not stamp a task_id on a /meetings/ path, and still stamps project paths', async () => {
+    const rootId = '00000000-0000-4000-8000-000000000001';
+    const childId = '00000000-0000-4000-8000-000000000002';
+    const create = vi.fn().mockResolvedValue(makeDoc());
+    const repo = makeRepo({
+      read: vi.fn().mockResolvedValue(null),
+      create,
+    });
+    const taskRepo = {
+      resolveProjectRootTaskId: vi.fn(async () => rootId),
+    };
+
+    const meetings = makeCtx({
+      path: '/meetings/agendas/a.md',
+      mode: 'create',
+      type: 'meeting-agenda',
+      body: 'context',
+    }, repo);
+    (meetings as { taskMetadata?: Record<string, unknown> }).taskMetadata = {
+      boundTask: { taskId: childId },
+    };
+    (meetings as { taskRepo?: typeof taskRepo }).taskRepo = taskRepo;
+    expect((await new DocWriteHandler().execute(meetings)).success).toBe(true);
+    const meetingsCreate = create.mock.calls.find(
+      (call: unknown[]) => (call[0] as { path?: string }).path === '/meetings/agendas/a.md',
+    );
+    expect(meetingsCreate).toBeDefined();
+    expect((meetingsCreate![0] as { taskId?: string | null }).taskId).toBeNull();
+
+    const project = makeCtx({
+      path: '/projects/p/a.md',
+      mode: 'create',
+      type: 'note',
+      body: 'hello',
+    }, repo);
+    (project as { taskMetadata?: Record<string, unknown> }).taskMetadata = {
+      boundTask: { taskId: childId },
+    };
+    (project as { taskRepo?: typeof taskRepo }).taskRepo = taskRepo;
+    expect((await new DocWriteHandler().execute(project)).success).toBe(true);
+    const projectCreate = create.mock.calls.find(
+      (call: unknown[]) => (call[0] as { path?: string }).path === '/projects/p/a.md',
+    );
+    expect(projectCreate).toBeDefined();
+    expect((projectCreate![0] as { taskId?: string | null }).taskId).toBe(rootId);
+  });
+
   it('auto-stamps the project-root task_id when a subtask is bound', async () => {
     const rootId = '00000000-0000-4000-8000-000000000001';
     const childId = '00000000-0000-4000-8000-000000000002';

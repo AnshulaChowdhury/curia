@@ -22,7 +22,8 @@ const SOURCES = {
  * coordinator's 81,624 over 73. Small headroom for description edits; a new tool needs
  * the evidence voice-tools.ts asks for, and a raise here.
  */
-const VOICE_TOOL_DEFINITION_BYTES_BUDGET = 13_000;
+// #2322 added meeting-agenda-load (voice-only, same standing as async-offramp).
+const VOICE_TOOL_DEFINITION_BYTES_BUDGET = 15_000;
 
 function catalog(): ToolRegistry {
   const registry = new ToolRegistry('America/Toronto');
@@ -54,11 +55,17 @@ describe('VOICE_TOOL_NAMES', () => {
     expect(VOICE_TOOL_NAMES).not.toContain('skill-activate');
   });
 
-  it('is a subset of what the coordinator can do, plus the voice-only off-ramp', () => {
+  it('includes meeting-agenda-load (#2322)', () => {
+    expect(VOICE_TOOL_NAMES).toContain('meeting-agenda-load');
+  });
+
+  it('is a subset of what the coordinator can do, plus the voice-only tools', () => {
     const coordinatorTools = new Set(measureAgentContext('coordinator', SOURCES).localToolNames);
-    // async-offramp hands work TO the coordinator, so the coordinator must not carry it.
+    // These hand work TO the coordinator or lock call state, so the coordinator must not carry them.
+    const voiceOnly = new Set(['async-offramp', 'meeting-agenda-load']);
     expect(coordinatorTools.has('async-offramp')).toBe(false);
-    const beyondCoordinator = VOICE_TOOL_NAMES.filter(name => name !== 'async-offramp' && !coordinatorTools.has(name));
+    expect(coordinatorTools.has('meeting-agenda-load')).toBe(false);
+    const beyondCoordinator = VOICE_TOOL_NAMES.filter(name => !voiceOnly.has(name) && !coordinatorTools.has(name));
     expect(beyondCoordinator).toEqual([]);
   });
 

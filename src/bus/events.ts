@@ -535,6 +535,24 @@ interface ActivitySummaryPayload {
   summary: string;
 }
 
+// minutes.ready — the meetings pipeline finished a call's transcript and minutes (#2322).
+// System publishes and subscribes only. The structuring subscriber creates one coordinator task.
+interface MinutesReadyPayload {
+  minutesRef: string;
+  sessionId: string;
+  conversationId: string;
+  sources: Array<'principal' | 'routine' | 'coordinator' | 'ad_hoc'>;
+  sensitivity: 'internal' | 'confidential' | 'shareable';
+}
+
+// minutes.pipeline_failed — a transcript, minutes, settle, or structuring step failed (#2322).
+// Publishing is the audit trail. Agendas stay recoverable by the startup sweep.
+interface MinutesPipelineFailedPayload {
+  sessionId: string;
+  stage: 'transcript' | 'minutes' | 'settle' | 'structuring';
+  error: string;
+}
+
 // kg.nodes_merged — published by NodeMergeService after the principal merges two
 // knowledge-graph nodes from the console (#2233). Committed state only: the publish runs
 // after COMMIT. This is an audit record of what the merge decided, not an undo log: the
@@ -1532,6 +1550,18 @@ export interface ActivitySummaryEvent extends BaseEvent {
   payload: ActivitySummaryPayload;
 }
 
+export interface MinutesReadyEvent extends BaseEvent {
+  type: 'minutes.ready';
+  sourceLayer: 'system';
+  payload: MinutesReadyPayload;
+}
+
+export interface MinutesPipelineFailedEvent extends BaseEvent {
+  type: 'minutes.pipeline_failed';
+  sourceLayer: 'system';
+  payload: MinutesPipelineFailedPayload;
+}
+
 export interface KgNodesMergedEvent extends BaseEvent {
   type: 'kg.nodes_merged';
   sourceLayer: 'system';
@@ -2088,6 +2118,8 @@ export type BusEvent =
   | DocumentConsoleActionEvent // System: principal edited the document store from the console (#1822)
   | KgNodesMergedEvent       // Console: two knowledge-graph nodes merged (#2233)
   | ActivitySummaryEvent     // System: one-line summary of a finished conversational job (#2251)
+  | MinutesReadyEvent        // System: a call's minutes are written (#2322)
+  | MinutesPipelineFailedEvent // System: meeting transcript, minutes, settle, or structuring failed (#2322)
   | ConversationCheckpointEvent // Checkpoint pipeline: Dispatch fires after inactivity window
   | CheckpointExtractionSkippedEvent // Checkpoint pipeline: KG extraction skipped for trust policy (#1290)
   | LlmCallEvent             // Spec 10: LLM API call provenance (model, tokens, cost, hashes)
@@ -3049,6 +3081,26 @@ export function createActivitySummary(
     sourceLayer: 'system',
     payload: rest,
     parentEventId,
+  };
+}
+
+export function createMinutesReady(payload: MinutesReadyPayload): MinutesReadyEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'minutes.ready',
+    sourceLayer: 'system',
+    payload,
+  };
+}
+
+export function createMinutesPipelineFailed(payload: MinutesPipelineFailedPayload): MinutesPipelineFailedEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'minutes.pipeline_failed',
+    sourceLayer: 'system',
+    payload,
   };
 }
 

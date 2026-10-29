@@ -269,4 +269,22 @@ describe('Bus Permissions', () => {
       expect(canSubscribe(layer, 'activity.summary')).toBe(false);
     }
   });
+
+  it('allows only the system layer to publish and subscribe to minutes.ready (#2322)', () => {
+    expect(canPublish('system', 'minutes.ready')).toBe(true);
+    expect(canSubscribe('system', 'minutes.ready')).toBe(true);
+    for (const layer of ['channel', 'dispatch', 'agent', 'execution'] as const) {
+      expect(canPublish(layer, 'minutes.ready')).toBe(false);
+      expect(canSubscribe(layer, 'minutes.ready')).toBe(false);
+    }
+  });
+
+  it('allows only the system layer to publish and subscribe to minutes.pipeline_failed (#2322)', () => {
+    expect(canPublish('system', 'minutes.pipeline_failed')).toBe(true);
+    expect(canSubscribe('system', 'minutes.pipeline_failed')).toBe(true);
+    for (const layer of ['channel', 'dispatch', 'agent', 'execution'] as const) {
+      expect(canPublish(layer, 'minutes.pipeline_failed')).toBe(false);
+      expect(canSubscribe(layer, 'minutes.pipeline_failed')).toBe(false);
+    }
+  });
 });
