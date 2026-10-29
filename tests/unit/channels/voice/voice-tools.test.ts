@@ -23,6 +23,7 @@ const SOURCES = {
  * the evidence voice-tools.ts asks for, and a raise here.
  */
 // #2322 added meeting-agenda-load (voice-only, same standing as async-offramp).
+// #2347 added meeting-notes-start (452 bytes; 13,795 total).
 const VOICE_TOOL_DEFINITION_BYTES_BUDGET = 15_000;
 
 function catalog(): ToolRegistry {
@@ -55,16 +56,21 @@ describe('VOICE_TOOL_NAMES', () => {
     expect(VOICE_TOOL_NAMES).not.toContain('skill-activate');
   });
 
-  it('includes meeting-agenda-load (#2322)', () => {
+  it('includes meeting-agenda-load (#2322) and meeting-notes-start (#2347)', () => {
     expect(VOICE_TOOL_NAMES).toContain('meeting-agenda-load');
+    expect(VOICE_TOOL_NAMES).toContain('meeting-notes-start');
+  });
+
+  // A spoken turn cannot finish a send inside the round cap; the recap leaves the call (#2347).
+  it('leaves out email-send', () => {
+    expect(VOICE_TOOL_NAMES).not.toContain('email-send');
   });
 
   it('is a subset of what the coordinator can do, plus the voice-only tools', () => {
     const coordinatorTools = new Set(measureAgentContext('coordinator', SOURCES).localToolNames);
     // These hand work TO the coordinator or lock call state, so the coordinator must not carry them.
-    const voiceOnly = new Set(['async-offramp', 'meeting-agenda-load']);
-    expect(coordinatorTools.has('async-offramp')).toBe(false);
-    expect(coordinatorTools.has('meeting-agenda-load')).toBe(false);
+    const voiceOnly = new Set(['async-offramp', 'meeting-agenda-load', 'meeting-notes-start']);
+    for (const name of voiceOnly) expect(coordinatorTools.has(name)).toBe(false);
     const beyondCoordinator = VOICE_TOOL_NAMES.filter(name => !voiceOnly.has(name) && !coordinatorTools.has(name));
     expect(beyondCoordinator).toEqual([]);
   });

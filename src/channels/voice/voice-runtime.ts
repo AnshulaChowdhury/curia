@@ -255,11 +255,17 @@ export const VOICE_TOOL_RESULT_POLICY =
  * the principal's inbox) are reached via the delegate tool, so those domains
  * were effectively unreachable from voice (#1551). Included only when a
  * specialist roster is available from the bridge.
+ *
+ * "The principal's inbox" used to cover sending too, so a request to email the
+ * principal a recap went to the inbox specialist, which only drafts. Its refusal
+ * reached the caller as "the email tool refused" (#2347).
  */
 export const VOICE_DELEGATION_GUIDANCE =
   'Many requests are handled by delegating to a specialist with the delegate tool: ' +
-  'calendar and scheduling, contacts and people lookups, research, and the ' +
-  'principal\'s inbox all belong to the specialists listed below. When a request ' +
+  'calendar and scheduling, contacts and people lookups, research, and reading the ' +
+  'principal\'s inbox all belong to the specialists listed below. Something to email ' +
+  'or message after the call, such as a recap or links for the principal, goes to ' +
+  'async-offramp, not a specialist. When a request ' +
   'falls in a specialist\'s domain, delegate rather than answering from memory or ' +
   'guessing. Resolve pronouns before delegating: "my calendar" spoken by the ' +
   'principal means the principal\'s calendar. Fold the specialist\'s result into ' +
@@ -554,6 +560,8 @@ interface ActiveSession {
   loadedAgendas: AgendaSnapshot[];
   /** Pending agendas offered but not yet loaded. */
   agendaIndex: AgendaIndexEntry[];
+  /** The caller asked for notes (#2347); restated in every later turn's prompt. */
+  notesOn: boolean;
 }
 
 export class VoiceRuntime {
@@ -667,6 +675,7 @@ export class VoiceRuntime {
         externalTransport: params.transport !== undefined,
         loadedAgendas: [...(params.agendas?.loaded ?? [])],
         agendaIndex: [...(params.agendas?.index ?? [])],
+        notesOn: false,
       };
       this.sessions.set(params.sessionId, session);
 
@@ -1062,6 +1071,9 @@ export class VoiceRuntime {
             if (call.name === 'meeting-agenda-load') {
               await this.noteMeetingAgendaLoad(session, result);
             }
+            if (call.name === 'meeting-notes-start') {
+              return this.noteMeetingNotesStart(session, result);
+            }
             return result;
           }
           : this.config.invokeTool
@@ -1079,6 +1091,9 @@ export class VoiceRuntime {
               }
               if (call.name === 'meeting-agenda-load') {
                 await this.noteMeetingAgendaLoad(session, result);
+              }
+              if (call.name === 'meeting-notes-start') {
+                return this.noteMeetingNotesStart(session, result);
               }
               return result;
             }
@@ -1403,6 +1418,7 @@ export class VoiceRuntime {
       agendaBlock: formatAgendaPromptBlock({
         loaded: session.loadedAgendas,
         index: session.agendaIndex,
+        notesOn: session.notesOn,
       }, agendaTimezone),
       audience: {
         liveTurn: session.caller.liveTurn,
@@ -1440,6 +1456,27 @@ export class VoiceRuntime {
         'failed to record agenda load; startup sweep can recover the in_call agenda',
       );
     }
+  }
+
+  /**
+   * A successful meeting-notes-start marks the session for the minutes pipeline
+   * (#2347). Unlike an agenda load, nothing else can recover a lost mark, so a
+   * failed write becomes the tool's error: the caller hears that notes are not
+   * on instead of a promise of a recap that will never be sent.
+   */
+  private async noteMeetingNotesStart(
+    session: ActiveSession,
+    result: { content: string; is_error?: boolean },
+  ): Promise<{ content: string; is_error?: boolean }> {
+    if (result.is_error) return result;
+    try {
+      await this.config.sessionStore.markNotesRequested(session.sessionId, new Date());
+    } catch (err) {
+      this.log.error({ err, sessionId: session.sessionId }, 'failed to record notes request; no recap will follow this call');
+      return { content: 'Notes could not be started for this call.', is_error: true };
+    }
+    session.notesOn = true;
+    return result;
   }
 
   /**

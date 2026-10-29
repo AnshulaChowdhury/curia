@@ -82,6 +82,7 @@ describe('MinutesReadySubscriber', () => {
     conversationId: 'voice:sess',
     sources: ['principal' as const],
     sensitivity: 'internal' as const,
+    recap: 'not_earned' as const,
   };
 
   function start(opts: {
@@ -91,6 +92,7 @@ describe('MinutesReadySubscriber', () => {
   }) {
     const failed: string[] = [];
     const created: string[] = [];
+    const createParams: Array<{ progressNote?: string }> = [];
     const skills: string[] = [];
     const wakes: string[] = [];
     const bus = new EventBus(createSilentLogger());
@@ -99,7 +101,8 @@ describe('MinutesReadySubscriber', () => {
     });
     const taskRepo = {
       listTasks: async () => opts.tasks,
-      createTask: async () => {
+      createTask: async (params: { progressNote?: string }) => {
+        createParams.push(params);
         const createdTask = task({ id: 'created-1' });
         opts.tasks.push(createdTask);
         created.push(createdTask.id);
@@ -124,8 +127,10 @@ describe('MinutesReadySubscriber', () => {
       logger: createSilentLogger(),
       pool: fakePool(),
       hasActiveWake: opts.hasActiveWake ?? (async () => false),
+      appOrigin: 'https://office.example',
+      httpPort: 3000,
     }).start();
-    return { bus, failed, created, skills, wakes };
+    return { bus, failed, created, createParams, skills, wakes };
   }
 
   it('restores the skill and enqueues one wake for an existing open task', async () => {
@@ -164,6 +169,19 @@ describe('MinutesReadySubscriber', () => {
     expect(created).toEqual([]);
     expect(skills).toEqual([]);
     expect(wakes).toEqual([]);
+  });
+
+  // #2347: the wake shows progress, not the description, so the path, the office
+  // link and the send decision ride in the first progress note.
+  it('seeds the new task with the minutes path, office link and recap decision', async () => {
+    const { bus, created, createParams } = start({ tasks: [] });
+    await bus.publish('system', createMinutesReady(payload));
+    expect(created).toEqual(['created-1']);
+    expect(createParams[0]?.progressNote).toBe([
+      'Minutes for this call (read with doc-read): /meetings/minutes/2026-10-28-sess.md',
+      'Link that opens them in the office: https://office.example/documents?path=%2Fmeetings%2Fminutes%2F2026-10-28-sess.md',
+      'Recap: not earned. No agenda topic was covered and nobody asked for a recap.',
+    ].join('\n'));
   });
 
   it('treats a unique-violation as success when an active wake is already there', async () => {

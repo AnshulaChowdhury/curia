@@ -58,6 +58,7 @@ tools:
   - delegate
   - async-offramp
   - meeting-agenda-load
+  - meeting-notes-start
   - file-parse
   - archive-extract
   - request-clarification

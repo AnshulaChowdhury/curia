@@ -59,6 +59,13 @@ export interface AgendaCoverage {
   topics: TopicCoverageEntry[];
 }
 
+/**
+ * Whether a call's follow-up sends the principal a recap, and why (#2347).
+ * `unknown` means coverage could not be read (minutes written by an earlier
+ * run, or no parseable coverage), so the follow-up judges from the minutes.
+ */
+export type MinutesRecap = 'requested' | 'topic_covered' | 'not_earned' | 'unknown';
+
 export interface ParkAgendaInput {
   title: string;
   topics: string[];

@@ -3002,3 +3002,75 @@ describe('VoiceRuntime agendas (#2322)', () => {
     expect(appendAgendaLoad).not.toHaveBeenCalled();
   });
 });
+
+describe('VoiceRuntime meeting notes (#2347)', () => {
+  function systemText(messages: Message[]): string {
+    return messages
+      .filter((message) => message.role === 'system' && typeof message.content === 'string')
+      .map((message) => message.content as string)
+      .join('\n');
+  }
+
+  function toolResultText(messages: Message[]): string {
+    return JSON.stringify(messages.filter((message) => message.role !== 'system'));
+  }
+
+  async function callWithNotes(markNotesRequested: () => Promise<void>) {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'meeting-notes-start', input: {} }], usage, provenance }],
+      replyScript('Sure.'),
+      replyScript('Go on.'),
+    ]);
+    const base = fakeStore();
+    const mark = vi.fn(markNotesRequested);
+    const store = Object.assign(base.store, { markNotesRequested: mark });
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(1, 1),
+      store,
+      invokeTool: async () => ({ content: JSON.stringify({ notes_on: true }) }),
+    });
+    await runtime.startSession({
+      sessionId: 's-notes',
+      conversationId: 'voice:s-notes',
+      roomName: 'voice-s-notes',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'keep notes and send me a recap', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-notes');
+    stt.emit({ text: 'first item', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-notes');
+    return { llm, mark };
+  }
+
+  it('marks the session and restates notes in every later turn\'s prompt', async () => {
+    const { llm, mark } = await callWithNotes(async () => undefined);
+    expect(mark).toHaveBeenCalledOnce();
+    expect(systemText(llm.seenMessages[0] ?? [])).not.toContain('## Meeting notes');
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).toContain('## Meeting notes');
+    expect(last).toContain('Do not hand the recap off');
+  });
+
+  // #2347: a recap to the principal went to the inbox specialist, which only drafts.
+  it('routes after-call sends to async-offramp, not the inbox specialist', () => {
+    const prompt = buildVoiceSystemPrompt({
+      specialistRoster: '- @ceo-inbox: the principal\'s inbox',
+      audience: { liveTurn: true },
+    });
+    expect(prompt).toContain('reading the principal\'s inbox');
+    expect(prompt).toContain('goes to async-offramp, not a specialist');
+  });
+
+  it('a failed mark becomes the tool error and leaves notes off', async () => {
+    const { llm, mark } = await callWithNotes(async () => {
+      throw new Error('db down');
+    });
+    expect(mark).toHaveBeenCalledOnce();
+    expect(toolResultText(llm.seenMessages[1] ?? [])).toContain('Notes could not be started for this call.');
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).not.toContain('## Meeting notes');
+  });
+});

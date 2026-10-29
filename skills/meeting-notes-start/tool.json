@@ -1,0 +1,16 @@
+{
+  "name": "meeting-notes-start",
+  "description": "Start notes for this live call. Call it when the caller asks you to keep notes, track the topics, take minutes, or send a recap afterwards, even with no agenda. Voice-only. When the call ends, minutes are written and the recap goes to the principal. Do not also hand the recap off with async-offramp or delegate. Calling it twice is harmless.",
+  "version": "0.1.0",
+  "sensitivity": "normal",
+  "action_risk": "low",
+  "inputs": {},
+  "outputs": {
+    "notes_on": "boolean (true once the call is marked for minutes and a recap)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 15000,
+  "capabilities": [],
+  "allowed_callers": ["coordinator"]
+}

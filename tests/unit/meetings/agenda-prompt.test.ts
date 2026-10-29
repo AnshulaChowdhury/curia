@@ -58,6 +58,25 @@ describe('formatAgendaPromptBlock', () => {
     expect(block).toContain('Ask the caller if you are unsure');
   });
 
+  // #2347: the caller heard "loading the agenda". The block may name the tool and
+  // quote the banned words, but no instruction may use them as the spoken verb.
+  it('never uses load as the verb outside the tool name and the quoted ban', () => {
+    const block = formatAgendaPromptBlock({
+      loaded: [snapshot()],
+      index: [{ agendaId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', title: 'Friday sync', scheduledFor: null }],
+    }) ?? '';
+    expect(block).toContain('let me pull that up');
+    const prose = block.replaceAll('meeting-agenda-load', '').replace(/"load(ing)?"/g, '');
+    expect(prose).not.toMatch(/\bload(s|ed|ing)?\b/i);
+  });
+
+  it('renders the notes block alone when notes are on and no agenda exists', () => {
+    const block = formatAgendaPromptBlock({ loaded: [], index: [], notesOn: true });
+    expect(block).toContain('## Meeting notes');
+    expect(block).toContain('Do not hand the recap off');
+    expect(block).not.toContain('## Meeting agendas');
+  });
+
   it('renders a scheduled time in the principal timezone', () => {
     const block = formatAgendaPromptBlock({
       loaded: [],

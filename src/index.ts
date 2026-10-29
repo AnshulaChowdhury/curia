@@ -3037,6 +3037,8 @@ async function main(): Promise<void> {
       logger,
       pool,
       hasActiveWake: (taskId) => taskHasPendingWake(pool, taskId),
+      appOrigin: config.appOrigin,
+      httpPort: config.httpPort,
     }).start();
     meetingRecovery = new MeetingPipelineRecovery({
       sessionStore: voiceSessionStore,

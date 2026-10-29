@@ -30,7 +30,20 @@ describe('meeting-minutes-structuring', () => {
     expect('error' in result).toBe(false);
     if ('error' in result) return;
     expect(result.tools).toEqual([]);
-    expect(result.instructions).toContain('explicitly directed');
+    expect(result.instructions).toContain('**directed** a change');
     expect(result.instructions).toContain('email-draft-save');
+  });
+
+  // #2347: the first dry run mailed the raw path, a "Curia's idea" label, and a
+  // report after calls that covered nothing, because the playbook asked for all three.
+  it('reads its inputs from the progress note and sends only when the call earned it', () => {
+    const raw = readFileSync(new URL('../../../skills/meeting-minutes-structuring/SKILL.md', import.meta.url), 'utf8');
+    const { instructions } = parseSkillMd(raw, 'meeting-minutes-structuring/SKILL.md');
+    expect(instructions).toContain('first progress note');
+    expect(instructions).toContain('**Not earned.**');
+    expect(instructions).toContain('Otherwise send nothing.');
+    expect(instructions).toContain('Never paste the storage path.');
+    expect(instructions).not.toMatch(/always send/i);
+    expect(instructions).not.toContain('include the minutes path');
   });
 });

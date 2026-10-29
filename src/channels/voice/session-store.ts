@@ -114,17 +114,41 @@ export class VoiceSessionStore {
   }
 
   /**
-   * Ended or failed sessions since `since` that recorded at least one agenda
-   * load. Used by the startup sweep.
+   * Record that the caller asked for notes (#2347). The first request wins, so
+   * asking twice keeps the original time. A missing session throws so the caller
+   * can tell the caller the notes are not on.
    */
-  async listRecentWithAgendas(since: Date): Promise<VoiceSessionRecord[]> {
+  async markNotesRequested(id: string, requestedAt: Date): Promise<void> {
+    const result = await this.pool.query(
+      `UPDATE voice_sessions
+         SET metadata = jsonb_set(
+           COALESCE(metadata, '{}'::jsonb),
+           '{notes}',
+           COALESCE(metadata->'notes', $2::jsonb)
+         )
+       WHERE id = $1`,
+      [id, JSON.stringify({ requestedAt: requestedAt.toISOString() })],
+    );
+    if ((result.rowCount ?? 0) === 0) {
+      throw new Error(`voice session ${id} not found for notes request`);
+    }
+  }
+
+  /**
+   * Ended or failed sessions since `since` that recorded an agenda load or a
+   * notes request. Used by the startup sweep.
+   */
+  async listRecentForMinutes(since: Date): Promise<VoiceSessionRecord[]> {
     const result = await this.pool.query<VoiceSessionRow>(
       `SELECT id, conversation_id, livekit_room, caller_contact_id, status, started_at, ended_at, end_reason, metadata
          FROM voice_sessions
         WHERE status IN ('ended', 'failed')
           AND started_at >= $1
-          AND jsonb_typeof(COALESCE(metadata->'agendas', '[]'::jsonb)) = 'array'
-          AND jsonb_array_length(COALESCE(metadata->'agendas', '[]'::jsonb)) > 0
+          AND (
+            (jsonb_typeof(COALESCE(metadata->'agendas', '[]'::jsonb)) = 'array'
+              AND jsonb_array_length(COALESCE(metadata->'agendas', '[]'::jsonb)) > 0)
+            OR jsonb_typeof(metadata->'notes') = 'object'
+          )
         ORDER BY started_at ASC`,
       [since],
     );
@@ -182,6 +206,14 @@ export function sessionAgendaLoads(record: VoiceSessionRecord): SessionAgendaLoa
     loads.push({ agendaId: row.agendaId, loadedAt: row.loadedAt, snapshot: row.snapshot });
   }
   return loads;
+}
+
+/** Read `metadata.notes`. Null when the caller never asked for notes or the entry is malformed. */
+export function sessionNotesRequest(record: VoiceSessionRecord): { requestedAt: string } | null {
+  const raw = record.metadata.notes;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const requestedAt = (raw as Record<string, unknown>).requestedAt;
+  return typeof requestedAt === 'string' ? { requestedAt } : null;
 }
 
 function requireSingleRow(rows: VoiceSessionRow[]): VoiceSessionRow {

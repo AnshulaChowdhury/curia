@@ -1,4 +1,5 @@
 // minutes-pipeline.ts — transcript, minutes, and agenda settlement when a call ends (#2322).
+// A call runs it when it loaded an agenda or the caller asked for notes (#2347).
 //
 // Each step is idempotent. A second run finds the docs already written. Minutes
 // that already exist have unknown coverage, so a not-yet-settled agenda returns
@@ -8,7 +9,7 @@ import { DateTime } from 'luxon';
 import type { EventBus } from '../bus/bus.js';
 import { createMinutesPipelineFailed, createMinutesReady } from '../bus/events.js';
 import type { VoiceSessionRecord, VoiceSessionStore } from '../channels/voice/session-store.js';
-import { sessionAgendaLoads } from '../channels/voice/session-store.js';
+import { sessionAgendaLoads, sessionNotesRequest } from '../channels/voice/session-store.js';
 import type { ContactService } from '../contacts/contact-service.js';
 import type { WorkingDocsRepo } from '../db/working-docs-repo.js';
 import type { TaskRepo } from '../db/task-repo.js';
@@ -19,7 +20,7 @@ import type { AgendaStore } from './agenda-store.js';
 import { isTerminalMinutesTask, minutesTaskNeedsRepair } from './minutes-task.js';
 import { writeMinutes } from './minutes-writer.js';
 import { buildTranscriptDoc, callerSpokeAfter, transcriptPath } from './transcript.js';
-import type { AgendaCoverage, AgendaSensitivity, AgendaSnapshot, SessionAgendaLoad } from './types.js';
+import type { AgendaCoverage, AgendaSensitivity, AgendaSnapshot, MinutesRecap, SessionAgendaLoad } from './types.js';
 import { SENSITIVITY_RANK } from './types.js';
 
 export type MinutesPipelineOutcome = 'skipped' | 'returned_unused' | 'completed' | 'failed';
@@ -75,6 +76,22 @@ function everyTopicCovered(coverage: AgendaCoverage | undefined): boolean {
   return !!coverage && coverage.topics.length > 0 && coverage.topics.every((topic) => topic.coverage === 'covered');
 }
 
+/**
+ * A call earns a recap when the caller asked for one or the agenda was used
+ * (#2347). Length is not the test: a long working call can need nothing beyond
+ * the work it started, and a short one that directs a change gets a
+ * confirmation from the follow-up task, not a recap.
+ */
+export function recapDecision(input: {
+  notesRequested: boolean;
+  coverage: AgendaCoverage[] | null;
+}): MinutesRecap {
+  if (input.notesRequested) return 'requested';
+  if (input.coverage === null) return 'unknown';
+  const used = input.coverage.some((agenda) => agenda.topics.some((topic) => topic.coverage !== 'not_reached'));
+  return used ? 'topic_covered' : 'not_earned';
+}
+
 export class MinutesPipeline {
   private readonly inFlight = new Set<string>();
 
@@ -98,11 +115,13 @@ export class MinutesPipeline {
     const session = await this.deps.sessionStore.get(sessionId);
     if (!session) return 'skipped';
     const loads = sessionAgendaLoads(session);
-    if (loads.length === 0) return 'skipped';
+    // A caller who asked for notes gets minutes with or without an agenda (#2347).
+    const notesRequested = sessionNotesRequest(session) !== null;
+    if (loads.length === 0 && !notesRequested) return 'skipped';
 
     const rows = await this.deps.workingMemory.getTranscriptRows(session.conversationId, 'coordinator');
     const counted = loads.filter((load) => callerSpokeAfter(rows, new Date(load.loadedAt)));
-    if (counted.length === 0) {
+    if (counted.length === 0 && !notesRequested) {
       for (const load of loads) {
         await this.deps.agendaStore.settle(load.agendaId, sessionId, { kind: 'return' });
       }
@@ -172,6 +191,7 @@ export class MinutesPipeline {
           conversationId: session.conversationId,
           sources: uniqueSources(snapshots),
           sensitivity: strictest(snapshots),
+          recap: recapDecision({ notesRequested, coverage }),
         }));
       }
       return 'completed';

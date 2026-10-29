@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import pino from 'pino';
 import { MeetingAgendaLoadHandler } from './handler.js';
 import { AgendaStore } from '../../src/meetings/agenda-store.js';
@@ -169,7 +171,7 @@ describe('meeting-agenda-load', () => {
       'session-1',
     ));
     expect(heldResult.success).toBe(false);
-    if (!heldResult.success) expect(heldResult.error).toBe('That agenda is not available to load.');
+    if (!heldResult.success) expect(heldResult.error).toBe('That agenda is not available right now.');
 
     const expired = await parkedRepo({ expiresAt: new Date(NOW.getTime() - 1000).toISOString() });
     const expiredResult = await new MeetingAgendaLoadHandler().execute(ctx(
@@ -179,5 +181,15 @@ describe('meeting-agenda-load', () => {
     ));
     expect(expiredResult.success).toBe(false);
     if (!expiredResult.success) expect(expiredResult.error).toBe('That agenda has expired.');
+  });
+
+  // #2347: the model speaks the tool's own words. The registered name stays.
+  it('keeps its name and describes itself without the word load', () => {
+    const manifest = JSON.parse(
+      readFileSync(join(import.meta.dirname, 'tool.json'), 'utf8'),
+    ) as { name: string; description: string };
+    expect(manifest.name).toBe('meeting-agenda-load');
+    expect(manifest.description).not.toMatch(/\bload(s|ed|ing)?\b/i);
+    expect(manifest.description).toContain('pulling it up');
   });
 });
