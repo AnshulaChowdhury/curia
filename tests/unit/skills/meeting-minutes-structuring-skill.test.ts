@@ -39,11 +39,15 @@ describe('meeting-minutes-structuring', () => {
   it('reads its inputs from the progress note and sends only when the call earned it', () => {
     const raw = readFileSync(new URL('../../../skills/meeting-minutes-structuring/SKILL.md', import.meta.url), 'utf8');
     const { instructions } = parseSkillMd(raw, 'meeting-minutes-structuring/SKILL.md');
-    expect(instructions).toContain('first progress note');
+    expect(instructions).toContain('The progress note that starts "Minutes for this call"');
     expect(instructions).toContain('**Not earned.**');
-    expect(instructions).toContain('Otherwise send nothing.');
+    expect(instructions).toContain('If nothing was directed, send nothing.');
+    // The send instruction applies only to what the cases above decided to send.
+    expect(instructions).toContain('Whatever you send is one message to the recipient `principal`');
+    expect(instructions).not.toMatch(/^Send to the recipient/m);
     expect(instructions).toContain('Never paste the storage path.');
     expect(instructions).not.toMatch(/always send/i);
     expect(instructions).not.toContain('include the minutes path');
+    expect(instructions).toContain('Do not label items "directed" or "Curia\'s idea".');
   });
 });

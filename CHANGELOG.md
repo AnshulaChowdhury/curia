@@ -18,7 +18,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Agenda-driven calls** — principal calls start from parked agendas; Curia can switch agendas mid-call. (#2322)
 - **Meeting minutes** — calls with an agenda produce a transcript, minutes and one follow-up report. (#2322)
 - **Bus events** — `minutes.ready` and `minutes.pipeline_failed`, system-only. (#2322)
-- **`meeting-notes-start`** — asking for notes on a call with no agenda now yields minutes and a recap. (#2347)
+- **`meeting-notes-start`** — notes on a call with no agenda yield minutes; a recap when the caller asks. (#2347)
 - **Principal home** — waiting items, a work histogram, and value tiles replace the operator view. (#2340)
 - **Ant Farm video-call design** — design doc for replacing the Phaser office with a call view. (#2127)
 - **Turn lanes** — per-conversation lock and injection config, on in the shipped file. (#2018)

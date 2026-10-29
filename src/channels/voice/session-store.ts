@@ -114,24 +114,32 @@ export class VoiceSessionStore {
   }
 
   /**
-   * Record that the caller asked for notes (#2347). The first request wins, so
-   * asking twice keeps the original time. A missing session throws so the caller
-   * can tell the caller the notes are not on.
+   * Record that the caller asked for notes, and whether they want a recap (#2347).
+   * The first request's time is kept, and a recap once asked for stays asked for.
+   *
+   * Only a live session takes the mark. endSession's update and this one serialize
+   * on the row, so the mark either commits before the session ends (and the
+   * pipeline, which runs after the end, sees it) or finds the session ended and
+   * throws. A mark can never land after the pipeline has read the session.
    */
-  async markNotesRequested(id: string, requestedAt: Date): Promise<void> {
-    const result = await this.pool.query(
+  async markNotesRequested(id: string, requestedAt: Date, recap: boolean): Promise<{ requestedAt: string; recap: boolean }> {
+    const result = await this.pool.query<{ notes: { requestedAt: string; recap: boolean } }>(
       `UPDATE voice_sessions
          SET metadata = jsonb_set(
            COALESCE(metadata, '{}'::jsonb),
            '{notes}',
-           COALESCE(metadata->'notes', $2::jsonb)
+           jsonb_build_object(
+             'requestedAt', COALESCE(metadata->'notes'->>'requestedAt', $2::text),
+             'recap', COALESCE((metadata->'notes'->>'recap')::boolean, false) OR $3::boolean
+           )
          )
-       WHERE id = $1`,
-      [id, JSON.stringify({ requestedAt: requestedAt.toISOString() })],
+       WHERE id = $1 AND status IN ('starting', 'active')
+       RETURNING metadata->'notes' AS notes`,
+      [id, requestedAt.toISOString(), recap],
     );
-    if ((result.rowCount ?? 0) === 0) {
-      throw new Error(`voice session ${id} not found for notes request`);
-    }
+    const row = result.rows[0];
+    if (!row) throw new Error(`voice session ${id} is not live; notes not started`);
+    return row.notes;
   }
 
   /**
@@ -209,11 +217,11 @@ export function sessionAgendaLoads(record: VoiceSessionRecord): SessionAgendaLoa
 }
 
 /** Read `metadata.notes`. Null when the caller never asked for notes or the entry is malformed. */
-export function sessionNotesRequest(record: VoiceSessionRecord): { requestedAt: string } | null {
+export function sessionNotesRequest(record: VoiceSessionRecord): { requestedAt: string; recap: boolean } | null {
   const raw = record.metadata.notes;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const requestedAt = (raw as Record<string, unknown>).requestedAt;
-  return typeof requestedAt === 'string' ? { requestedAt } : null;
+  const { requestedAt, recap } = raw as Record<string, unknown>;
+  return typeof requestedAt === 'string' ? { requestedAt, recap: recap === true } : null;
 }
 
 function requireSingleRow(rows: VoiceSessionRow[]): VoiceSessionRow {

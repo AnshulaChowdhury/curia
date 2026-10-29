@@ -39,21 +39,21 @@ describe('recapDecision', () => {
   const untouched = [{ agendaId: AGENDA_ID, topics: q4.topics.map((topic) => ({ topic, coverage: 'not_reached' as const })) }];
 
   it('sends nothing for a loaded agenda nobody used (the 10:32 and 10:39 calls)', () => {
-    expect(recapDecision({ notesRequested: false, coverage: untouched })).toBe('not_earned');
+    expect(recapDecision({ recapRequested: false, coverage: untouched })).toBe('not_earned');
   });
 
   it('sends a recap once any topic is covered, even partly', () => {
     const partly = [{ agendaId: AGENDA_ID, topics: [{ topic: 'What to drop', coverage: 'partial' as const }] }];
-    expect(recapDecision({ notesRequested: false, coverage: partly })).toBe('topic_covered');
+    expect(recapDecision({ recapRequested: false, coverage: partly })).toBe('topic_covered');
   });
 
   it('sends a recap when the caller asked, whatever the coverage', () => {
-    expect(recapDecision({ notesRequested: true, coverage: untouched })).toBe('requested');
-    expect(recapDecision({ notesRequested: true, coverage: null })).toBe('requested');
+    expect(recapDecision({ recapRequested: true, coverage: untouched })).toBe('requested');
+    expect(recapDecision({ recapRequested: true, coverage: null })).toBe('requested');
   });
 
   it('leaves the call to the follow-up when coverage is unreadable', () => {
-    expect(recapDecision({ notesRequested: false, coverage: null })).toBe('unknown');
+    expect(recapDecision({ recapRequested: false, coverage: null })).toBe('unknown');
   });
 });
 
@@ -124,13 +124,39 @@ describe('MinutesPipeline recap and notes', () => {
     expect(readyRecap(published)).toBe('not_earned');
   });
 
-  it('writes minutes for a notes request with no agenda and marks the recap requested', async () => {
-    const record = session({ notes: { requestedAt: STARTED.toISOString() } });
+  it('writes minutes for a recap request with no agenda and marks the recap requested', async () => {
+    const record = session({ notes: { requestedAt: STARTED.toISOString(), recap: true } });
     const { instance, published, extract, created } = pipeline(record, fence([]));
     expect(await instance.run(SESSION_ID)).toBe('completed');
     expect(extract.mock.calls[0]?.[0]).toContain('No agenda was set.');
     expect(created).toContain(`/meetings/minutes/2026-10-29-${SESSION_ID}.md`);
     expect(readyRecap(published)).toBe('requested');
+  });
+
+  // "Take notes" is not "send me a recap": minutes, but no recap unless a topic was covered.
+  it('writes minutes for a notes-only request and marks the recap not earned', async () => {
+    const record = session({ notes: { requestedAt: STARTED.toISOString(), recap: false } });
+    const { instance, published, created } = pipeline(record, fence([]));
+    expect(await instance.run(SESSION_ID)).toBe('completed');
+    expect(created).toContain(`/meetings/minutes/2026-10-29-${SESSION_ID}.md`);
+    expect(readyRecap(published)).toBe('not_earned');
+  });
+
+  // An agenda opened on the last utterance has no caller row after it. With notes
+  // on, the minutes must still be written against it, not "No agenda was set".
+  it('keeps a late-opened agenda in the minutes when notes are on', async () => {
+    const lateLoad = new Date(STARTED.getTime() + 40_000).toISOString();
+    const record = session({
+      notes: { requestedAt: STARTED.toISOString(), recap: false },
+      agendas: [{ agendaId: AGENDA_ID, loadedAt: lateLoad, snapshot: q4 }],
+    });
+    const { instance, extract } = pipeline(record, fence([
+      { agendaId: AGENDA_ID, topics: q4.topics.map((topic) => ({ topic, coverage: 'not_reached' })) },
+    ]));
+    expect(await instance.run(SESSION_ID)).toBe('completed');
+    const prompt = extract.mock.calls[0]?.[0] ?? '';
+    expect(prompt).not.toContain('No agenda was set.');
+    expect(prompt).toContain('Q4 priorities');
   });
 
   it('skips a call with neither an agenda nor a notes request', async () => {

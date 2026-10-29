@@ -3011,24 +3011,17 @@ describe('VoiceRuntime meeting notes (#2347)', () => {
       .join('\n');
   }
 
-  function toolResultText(messages: Message[]): string {
-    return JSON.stringify(messages.filter((message) => message.role !== 'system'));
-  }
-
-  async function callWithNotes(markNotesRequested: () => Promise<void>) {
+  // The handler writes the mark; the runtime only reads its (audited) result.
+  async function callWithNotes(toolResult: { content: string; is_error?: boolean }) {
     const llm = new FakeStreamProvider([
-      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'meeting-notes-start', input: {} }], usage, provenance }],
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'meeting-notes-start', input: { recap: true } }], usage, provenance }],
       replyScript('Sure.'),
       replyScript('Go on.'),
     ]);
-    const base = fakeStore();
-    const mark = vi.fn(markNotesRequested);
-    const store = Object.assign(base.store, { markNotesRequested: mark });
     const { runtime, stt } = makeRuntime({
       llm,
       tts: new SlowTtsProvider(1, 1),
-      store,
-      invokeTool: async () => ({ content: JSON.stringify({ notes_on: true }) }),
+      invokeTool: async () => toolResult,
     });
     await runtime.startSession({
       sessionId: 's-notes',
@@ -3042,35 +3035,38 @@ describe('VoiceRuntime meeting notes (#2347)', () => {
     await runtime.awaitIdle('s-notes');
     stt.emit({ text: 'first item', isFinal: true, speechFinal: true });
     await runtime.awaitIdle('s-notes');
-    return { llm, mark };
+    return llm;
   }
 
-  it('marks the session and restates notes in every later turn\'s prompt', async () => {
-    const { llm, mark } = await callWithNotes(async () => undefined);
-    expect(mark).toHaveBeenCalledOnce();
+  it('restates a recap in every later turn\'s prompt after a successful result', async () => {
+    const llm = await callWithNotes({ content: JSON.stringify({ notes_on: true, recap: true }) });
     expect(systemText(llm.seenMessages[0] ?? [])).not.toContain('## Meeting notes');
     const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
     expect(last).toContain('## Meeting notes');
     expect(last).toContain('Do not hand the recap off');
   });
 
-  // #2347: a recap to the principal went to the inbox specialist, which only drafts.
-  it('routes after-call sends to async-offramp, not the inbox specialist', () => {
+  it('restates notes without a recap when none was asked for', async () => {
+    const llm = await callWithNotes({ content: JSON.stringify({ notes_on: true, recap: false }) });
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).toContain('No recap will be sent unless the caller asks for one');
+  });
+
+  it('leaves notes off after a failed result', async () => {
+    const llm = await callWithNotes({ content: 'Notes could not be started for this call.', is_error: true });
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).not.toContain('## Meeting notes');
+  });
+
+  // #2347: one recap, one path. The delegation sentence must agree with the
+  // meeting-notes-start and async-offramp descriptions on the turn that chooses.
+  it('names meeting-notes-start for the recap and async-offramp for other after-call sends', () => {
     const prompt = buildVoiceSystemPrompt({
       specialistRoster: '- @ceo-inbox: the principal\'s inbox',
       audience: { liveTurn: true },
     });
     expect(prompt).toContain('reading the principal\'s inbox');
-    expect(prompt).toContain('goes to async-offramp, not a specialist');
-  });
-
-  it('a failed mark becomes the tool error and leaves notes off', async () => {
-    const { llm, mark } = await callWithNotes(async () => {
-      throw new Error('db down');
-    });
-    expect(mark).toHaveBeenCalledOnce();
-    expect(toolResultText(llm.seenMessages[1] ?? [])).toContain('Notes could not be started for this call.');
-    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
-    expect(last).not.toContain('## Meeting notes');
+    expect(prompt).toContain('A recap of this call is meeting-notes-start.');
+    expect(prompt).toContain('such as links or research results, goes to async-offramp, not a specialist');
   });
 });

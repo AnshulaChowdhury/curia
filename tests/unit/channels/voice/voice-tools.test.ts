@@ -66,6 +66,15 @@ describe('VOICE_TOOL_NAMES', () => {
     expect(VOICE_TOOL_NAMES).not.toContain('email-send');
   });
 
+  // Both tools are on every turn. If both claimed the recap, one ask could send two emails (#2347).
+  it('gives the recap of this call to meeting-notes-start alone', () => {
+    const offramp = registry.get('async-offramp')!.manifest.description;
+    const notes = registry.get('meeting-notes-start')!.manifest.description;
+    expect(offramp).toContain('A recap of this call is meeting-notes-start, not this tool.');
+    expect(offramp).not.toMatch(/summary for the principal/i);
+    expect(notes).toContain('do not also hand it off with async-offramp or delegate');
+  });
+
   it('is a subset of what the coordinator can do, plus the voice-only tools', () => {
     const coordinatorTools = new Set(measureAgentContext('coordinator', SOURCES).localToolNames);
     // These hand work TO the coordinator or lock call state, so the coordinator must not carry them.

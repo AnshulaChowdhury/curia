@@ -258,14 +258,16 @@ export const VOICE_TOOL_RESULT_POLICY =
  *
  * "The principal's inbox" used to cover sending too, so a request to email the
  * principal a recap went to the inbox specialist, which only drafts. Its refusal
- * reached the caller as "the email tool refused" (#2347).
+ * reached the caller as "the email tool refused" (#2347). The recap of the call
+ * itself belongs to meeting-notes-start; this sentence must agree with that
+ * tool's and async-offramp's descriptions on the turn the model chooses.
  */
 export const VOICE_DELEGATION_GUIDANCE =
   'Many requests are handled by delegating to a specialist with the delegate tool: ' +
   'calendar and scheduling, contacts and people lookups, research, and reading the ' +
-  'principal\'s inbox all belong to the specialists listed below. Something to email ' +
-  'or message after the call, such as a recap or links for the principal, goes to ' +
-  'async-offramp, not a specialist. When a request ' +
+  'principal\'s inbox all belong to the specialists listed below. A recap of this ' +
+  'call is meeting-notes-start. Anything else to email or message after the call, ' +
+  'such as links or research results, goes to async-offramp, not a specialist. When a request ' +
   'falls in a specialist\'s domain, delegate rather than answering from memory or ' +
   'guessing. Resolve pronouns before delegating: "my calendar" spoken by the ' +
   'principal means the principal\'s calendar. Fold the specialist\'s result into ' +
@@ -560,8 +562,8 @@ interface ActiveSession {
   loadedAgendas: AgendaSnapshot[];
   /** Pending agendas offered but not yet loaded. */
   agendaIndex: AgendaIndexEntry[];
-  /** The caller asked for notes (#2347); restated in every later turn's prompt. */
-  notesOn: boolean;
+  /** Notes the caller asked for (#2347), from meeting-notes-start's result; restated in every later turn's prompt. */
+  notes: { recap: boolean } | null;
 }
 
 export class VoiceRuntime {
@@ -675,7 +677,7 @@ export class VoiceRuntime {
         externalTransport: params.transport !== undefined,
         loadedAgendas: [...(params.agendas?.loaded ?? [])],
         agendaIndex: [...(params.agendas?.index ?? [])],
-        notesOn: false,
+        notes: null,
       };
       this.sessions.set(params.sessionId, session);
 
@@ -1072,7 +1074,7 @@ export class VoiceRuntime {
               await this.noteMeetingAgendaLoad(session, result);
             }
             if (call.name === 'meeting-notes-start') {
-              return this.noteMeetingNotesStart(session, result);
+              this.noteMeetingNotesStart(session, result);
             }
             return result;
           }
@@ -1093,7 +1095,7 @@ export class VoiceRuntime {
                 await this.noteMeetingAgendaLoad(session, result);
               }
               if (call.name === 'meeting-notes-start') {
-                return this.noteMeetingNotesStart(session, result);
+                this.noteMeetingNotesStart(session, result);
               }
               return result;
             }
@@ -1418,7 +1420,7 @@ export class VoiceRuntime {
       agendaBlock: formatAgendaPromptBlock({
         loaded: session.loadedAgendas,
         index: session.agendaIndex,
-        notesOn: session.notesOn,
+        notes: session.notes,
       }, agendaTimezone),
       audience: {
         liveTurn: session.caller.liveTurn,
@@ -1459,24 +1461,21 @@ export class VoiceRuntime {
   }
 
   /**
-   * A successful meeting-notes-start marks the session for the minutes pipeline
-   * (#2347). Unlike an agenda load, nothing else can recover a lost mark, so a
-   * failed write becomes the tool's error: the caller hears that notes are not
-   * on instead of a promise of a recap that will never be sent.
+   * meeting-notes-start writes the session mark itself (#2347), so its audited
+   * result is the truth. A successful result joins the session's prompt state;
+   * an error or an unreadable result leaves notes off.
    */
-  private async noteMeetingNotesStart(
+  private noteMeetingNotesStart(
     session: ActiveSession,
     result: { content: string; is_error?: boolean },
-  ): Promise<{ content: string; is_error?: boolean }> {
-    if (result.is_error) return result;
+  ): void {
+    if (result.is_error) return;
     try {
-      await this.config.sessionStore.markNotesRequested(session.sessionId, new Date());
+      const parsed = JSON.parse(result.content) as { notes_on?: unknown; recap?: unknown };
+      if (parsed.notes_on === true) session.notes = { recap: parsed.recap === true };
     } catch (err) {
-      this.log.error({ err, sessionId: session.sessionId }, 'failed to record notes request; no recap will follow this call');
-      return { content: 'Notes could not be started for this call.', is_error: true };
+      this.log.warn({ err, sessionId: session.sessionId }, 'meeting-notes-start result was not JSON; notes stay off in the prompt');
     }
-    session.notesOn = true;
-    return result;
   }
 
   /**

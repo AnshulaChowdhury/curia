@@ -71,10 +71,17 @@ describe('formatAgendaPromptBlock', () => {
   });
 
   it('renders the notes block alone when notes are on and no agenda exists', () => {
-    const block = formatAgendaPromptBlock({ loaded: [], index: [], notesOn: true });
+    const block = formatAgendaPromptBlock({ loaded: [], index: [], notes: { recap: true } });
     expect(block).toContain('## Meeting notes');
     expect(block).toContain('Do not hand the recap off');
     expect(block).not.toContain('## Meeting agendas');
+  });
+
+  it('tells a notes-only call that no recap goes out unless asked', () => {
+    const block = formatAgendaPromptBlock({ loaded: [], index: [], notes: { recap: false } });
+    expect(block).toContain('No recap will be sent unless the caller asks for one');
+    expect(block).toContain('meeting-notes-start again with recap true');
+    expect(block).not.toContain('Do not hand the recap off');
   });
 
   it('renders a scheduled time in the principal timezone', () => {

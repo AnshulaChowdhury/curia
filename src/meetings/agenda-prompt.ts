@@ -57,19 +57,24 @@ const SPOKEN_AGENDA_WORDS =
   + 'The words "load" and "loading" belong to the tool. Never say them to the caller.';
 
 // Tool results do not survive in voice history, so the notes flag is restated every turn (#2347).
-const NOTES_ON_BLOCK = [
-  '## Meeting notes',
-  'Notes are on for this call. When it ends, the minutes are written and the recap goes to the principal.',
-  'Do not hand the recap off with async-offramp or delegate. Tell the caller it will arrive after the call.',
-].join('\n');
+function notesBlock(recap: boolean): string {
+  return [
+    '## Meeting notes',
+    recap
+      ? 'Notes are on for this call. When it ends, the minutes are written and the recap goes to the principal. '
+        + 'Do not hand the recap off with async-offramp or delegate. Tell the caller it will arrive after the call.'
+      : 'Notes are on for this call. When it ends, the minutes are written. No recap will be sent unless the caller '
+        + 'asks for one; if they do, call meeting-notes-start again with recap true.',
+  ].join('\n');
+}
 
 /** Null when there is nothing to say, so the prompt stays byte-identical to a call with no agendas. */
 export function formatAgendaPromptBlock(
-  input: SessionAgendas & { notesOn?: boolean },
+  input: SessionAgendas & { notes?: { recap: boolean } | null },
   timezone?: string,
 ): string | null {
   const hasAgendas = input.loaded.length > 0 || input.index.length > 0;
-  if (!hasAgendas && !input.notesOn) return null;
+  if (!hasAgendas && !input.notes) return null;
   const sections: string[] = [];
   if (hasAgendas) {
     sections.push(
@@ -80,7 +85,7 @@ export function formatAgendaPromptBlock(
     for (const snapshot of input.loaded) sections.push(renderLoaded(snapshot));
     if (input.index.length > 0) sections.push(renderIndex(input.index, timezone));
   }
-  if (input.notesOn) sections.push(NOTES_ON_BLOCK);
+  if (input.notes) sections.push(notesBlock(input.notes.recap));
   return sections.join('\n\n');
 }
 

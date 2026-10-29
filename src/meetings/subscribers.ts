@@ -16,6 +16,7 @@ import type { Logger } from '../logger.js';
 import type { SchedulerService } from '../scheduler/scheduler-service.js';
 import {
   documentConsoleUrl,
+  hasMinutesTaskNote,
   isTerminalMinutesTask,
   MINUTES_STRUCTURING_SKILL,
   minutesTaskNeedsRepair,
@@ -81,7 +82,13 @@ export class MinutesReadySubscriber {
 
         const originator = makeSystemOriginator();
         const minutesUrl = documentConsoleUrl(this.opts.appOrigin, this.opts.httpPort, payload.minutesRef);
-        const task = reusable[0] ?? await this.opts.taskRepo.createTask({
+        const note = minutesTaskNote({ minutesRef: payload.minutesRef, minutesUrl, recap: payload.recap });
+        const reused = reusable[0];
+        // A task created before #2347 has no note, so its wake would not see the path.
+        if (reused && !hasMinutesTaskNote(reused.progress, payload.minutesRef)) {
+          await this.opts.taskRepo.updateTask(reused.id, { progressNote: note });
+        }
+        const task = reused ?? await this.opts.taskRepo.createTask({
           agentId: 'coordinator',
           owner: 'curia',
           source: 'scheduler',
@@ -93,7 +100,7 @@ export class MinutesReadySubscriber {
             `sensitivity: ${payload.sensitivity}`,
           ].join('\n'),
           // The wake shows progress, not the description (#2347).
-          progressNote: minutesTaskNote({ minutesRef: payload.minutesRef, minutesUrl, recap: payload.recap }),
+          progressNote: note,
           tags: [tag],
           originator,
         });

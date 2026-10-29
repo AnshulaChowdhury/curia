@@ -80,13 +80,14 @@ function everyTopicCovered(coverage: AgendaCoverage | undefined): boolean {
  * A call earns a recap when the caller asked for one or the agenda was used
  * (#2347). Length is not the test: a long working call can need nothing beyond
  * the work it started, and a short one that directs a change gets a
- * confirmation from the follow-up task, not a recap.
+ * confirmation from the follow-up task, not a recap. A notes-only mark (no
+ * recap asked for) gets minutes and falls through to coverage like any call.
  */
 export function recapDecision(input: {
-  notesRequested: boolean;
+  recapRequested: boolean;
   coverage: AgendaCoverage[] | null;
 }): MinutesRecap {
-  if (input.notesRequested) return 'requested';
+  if (input.recapRequested) return 'requested';
   if (input.coverage === null) return 'unknown';
   const used = input.coverage.some((agenda) => agenda.topics.some((topic) => topic.coverage !== 'not_reached'));
   return used ? 'topic_covered' : 'not_earned';
@@ -116,12 +117,16 @@ export class MinutesPipeline {
     if (!session) return 'skipped';
     const loads = sessionAgendaLoads(session);
     // A caller who asked for notes gets minutes with or without an agenda (#2347).
-    const notesRequested = sessionNotesRequest(session) !== null;
-    if (loads.length === 0 && !notesRequested) return 'skipped';
+    const notes = sessionNotesRequest(session);
+    if (loads.length === 0 && !notes) return 'skipped';
 
     const rows = await this.deps.workingMemory.getTranscriptRows(session.conversationId, 'coordinator');
-    const counted = loads.filter((load) => callerSpokeAfter(rows, new Date(load.loadedAt)));
-    if (counted.length === 0 && !notesRequested) {
+    // With notes on, every opened agenda belongs in the minutes, including one
+    // opened on the last utterance with nothing spoken after it.
+    const counted = notes
+      ? loads
+      : loads.filter((load) => callerSpokeAfter(rows, new Date(load.loadedAt)));
+    if (counted.length === 0 && !notes) {
       for (const load of loads) {
         await this.deps.agendaStore.settle(load.agendaId, sessionId, { kind: 'return' });
       }
@@ -191,7 +196,7 @@ export class MinutesPipeline {
           conversationId: session.conversationId,
           sources: uniqueSources(snapshots),
           sensitivity: strictest(snapshots),
-          recap: recapDecision({ notesRequested, coverage }),
+          recap: recapDecision({ recapRequested: notes?.recap ?? false, coverage }),
         }));
       }
       return 'completed';

@@ -191,7 +191,7 @@ describeIf('VoiceSessionStore (integration)', () => {
       conversationId: `${PREFIX}recent-notes`,
       livekitRoom: 'room-recent-notes',
     });
-    await store.markNotesRequested(notes.id, new Date());
+    await store.markNotesRequested(notes.id, new Date(), false);
     await store.endSession(notes.id, 'remote_hangup');
 
     const old = await store.create({
@@ -215,24 +215,35 @@ describeIf('VoiceSessionStore (integration)', () => {
     expect(ids).not.toContain(old.id);
   });
 
-  it('markNotesRequested keeps the first request and other metadata keys (#2347)', async () => {
+  it('markNotesRequested keeps the first time and other metadata keys, and a recap only turns on (#2347)', async () => {
     const created = await store.create({
       conversationId: `${PREFIX}notes`,
       livekitRoom: 'room-notes',
       metadata: { channel: 'signal' },
     });
+    await store.updateStatus(created.id, 'active');
     expect(sessionNotesRequest(created)).toBeNull();
-    await store.markNotesRequested(created.id, new Date('2026-10-29T15:46:00.000Z'));
-    await store.markNotesRequested(created.id, new Date('2026-10-29T15:49:00.000Z'));
+    expect(await store.markNotesRequested(created.id, new Date('2026-10-29T15:46:00.000Z'), false))
+      .toEqual({ requestedAt: '2026-10-29T15:46:00.000Z', recap: false });
+    expect(await store.markNotesRequested(created.id, new Date('2026-10-29T15:49:00.000Z'), true))
+      .toEqual({ requestedAt: '2026-10-29T15:46:00.000Z', recap: true });
+    await store.markNotesRequested(created.id, new Date('2026-10-29T15:50:00.000Z'), false);
     const fetched = await store.get(created.id);
     expect(fetched?.metadata.channel).toBe('signal');
-    expect(sessionNotesRequest(fetched!)).toEqual({ requestedAt: '2026-10-29T15:46:00.000Z' });
+    expect(sessionNotesRequest(fetched!)).toEqual({ requestedAt: '2026-10-29T15:46:00.000Z', recap: true });
   });
 
-  it('markNotesRequested throws for a missing session', async () => {
-    await expect(store.markNotesRequested('99999999-9999-4999-8999-999999999999', new Date()))
-      .rejects.toThrow('not found for notes request');
+  // A mark that lands after the session ended would never be read: the pipeline
+  // already ran on voice.session.ended. Refusing it keeps the caller honest.
+  it('markNotesRequested refuses an ended or missing session', async () => {
+    const created = await store.create({ conversationId: `${PREFIX}notes-ended`, livekitRoom: 'room-notes-ended' });
+    await store.endSession(created.id, 'remote_hangup');
+    await expect(store.markNotesRequested(created.id, new Date(), true)).rejects.toThrow('is not live');
+    expect(sessionNotesRequest((await store.get(created.id))!)).toBeNull();
+    await expect(store.markNotesRequested('99999999-9999-4999-8999-999999999999', new Date(), true))
+      .rejects.toThrow('is not live');
   });
+
 
   it('sessionAgendaLoads ignores malformed entries', async () => {
     const created = await store.create({
