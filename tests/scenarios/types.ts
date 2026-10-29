@@ -470,8 +470,8 @@ export interface ScenarioCase {
     tasks: SeedTask[];
     /** Outreach rows (#2312). */
     outreach: SeedOutreach[];
-    /** Pinned-context documents and settings (#2339). Empty maps when the case sets none. */
-    pinned: SeedPinned;
+    /** Pinned-context documents and settings (#2339). Absent: every entry reads as unset. */
+    pinned?: SeedPinned;
     /**
      * What is waiting on the principal on this run's principal turn (prompt trim PR 7):
      * the counts the Dispatcher's backlog line reports. Absent means nothing is waiting.

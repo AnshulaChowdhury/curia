@@ -264,12 +264,10 @@ describe('loadScenarioCase', () => {
       '',
     ].join('\n'));
     const c = loadScenarioCase(write('pinned.yaml', body));
-    expect(c.seed.pinned.docs).toEqual(new Map([['/shared/inbox/rules.md', '## Board mail']]));
-    expect(c.seed.pinned.configs).toEqual(new Map([['ceo_inbox/decision_tagging', '{"enabled": true}']]));
-    expect(c.seed.pinned.unavailable).toEqual(new Set(['/shared/calendar/rules.md', 'debrief/config']));
-
-    const none = loadScenarioCase(write('none.yaml', VALID)).seed.pinned;
-    expect([none.docs.size, none.configs.size, none.unavailable.size]).toEqual([0, 0, 0]);
+    expect(c.seed.pinned?.docs).toEqual(new Map([['/shared/inbox/rules.md', '## Board mail']]));
+    expect(c.seed.pinned?.configs).toEqual(new Map([['ceo_inbox/decision_tagging', '{"enabled": true}']]));
+    expect(c.seed.pinned?.unavailable).toEqual(new Set(['/shared/calendar/rules.md', 'debrief/config']));
+    expect(loadScenarioCase(write('none.yaml', VALID)).seed).not.toHaveProperty('pinned');
   });
 
   it.each([

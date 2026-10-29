@@ -673,9 +673,9 @@ function parseOutreach(raw: Raw, file: string): SeedOutreach[] {
  * `<namespace>/<key>` to its value, and `unavailable` lists entries whose read fails.
  * Paths and keys are checked with the same rules as an agent's pinned_context.
  */
-function parsePinned(raw: Raw, file: string): SeedPinned {
+function parsePinned(raw: Raw, file: string): SeedPinned | undefined {
+  if (raw['pinned'] === undefined) return undefined;
   const pinned: SeedPinned = { docs: new Map(), configs: new Map(), unavailable: new Set() };
-  if (raw['pinned'] === undefined) return pinned;
   const block = mapping(raw, 'pinned', file, 'seed');
   onlyKeys(block, PINNED_KEYS, file, 'seed.pinned');
   const values = (key: 'docs' | 'configs'): Array<[string, string]> => {
@@ -1006,6 +1006,7 @@ export function loadScenarioCase(file: string, options: LoadOptions = {}): Scena
   if (!isObject(seedRaw)) throw new CaseError(file, `'seed' must be a mapping`);
   onlyKeys(seedRaw, SEED_KEYS, file, 'seed');
   const backlog = parseBacklog(seedRaw, file);
+  const pinned = parsePinned(seedRaw, file);
   const seed = {
     contacts: parseContacts(seedRaw, file),
     outboundContext: parseOutbound(seedRaw, file),
@@ -1014,7 +1015,7 @@ export function loadScenarioCase(file: string, options: LoadOptions = {}): Scena
     principalIdentities: parsePrincipalIdentities(seedRaw, file),
     tasks: parseTasks(seedRaw, file),
     outreach: parseOutreach(seedRaw, file),
-    pinned: parsePinned(seedRaw, file),
+    ...(pinned && { pinned }),
     ...(backlog && { backlog }),
   };
 
