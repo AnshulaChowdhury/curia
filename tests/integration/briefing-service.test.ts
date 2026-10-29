@@ -32,7 +32,11 @@ describeIf('briefing service against Postgres', () => {
   it('counts seeded tasks, approvals, jobs and contacts in the principal window', async () => {
     const client = await pool.connect();
     try {
-      await client.query('BEGIN');
+      // REPEATABLE READ pins one snapshot for the whole test. The assertions are
+      // deltas against a baseline, and some counts are global (open curia-owned
+      // tasks, all contacts). Under READ COMMITTED a concurrent test file that
+      // commits one between the baseline and the re-read breaks the delta (#2369).
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
       const now = await emptyFortnight(client);
       const today = localDayKey(now, 'UTC');
       const yesterday = addCalendarDays(today, -1);
