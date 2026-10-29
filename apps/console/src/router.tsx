@@ -9,6 +9,7 @@ import {
 import LoginPage from './pages/LoginPage';
 import { getSessionInfo } from './api';
 import { clampWizardStep } from './pages/wizard-utils';
+import { noteResolvedPath } from './pages/chat/ask-handoff';
 
 // Route components are lazy-loaded so Vite produces separate chunks per route.
 const DashboardPage = lazy(() => import('./pages/DashboardPage'));
@@ -303,6 +304,9 @@ const routeTree = rootRoute.addChildren([
 ]);
 
 export const router = createRouter({ routeTree });
+
+// Drop a pending Ask Curia question once the principal lands anywhere but /chat (#2351).
+router.subscribe('onResolved', ({ toLocation }) => noteResolvedPath(toLocation.pathname));
 
 // Register router type for full type-safety on useNavigate, Link, etc.
 declare module '@tanstack/react-router' {

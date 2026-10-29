@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { StrictMode, act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { handOffQuestion, takeHandedOffQuestion, useHandedOffQuestion } from './ask-handoff.js';
+import { handOffQuestion, noteResolvedPath, takeHandedOffQuestion, useHandedOffQuestion } from './ask-handoff.js';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -55,6 +55,22 @@ describe('Ask Curia handoff (#2351)', () => {
     handOffQuestion('Same question');
     await openChat(send);
     expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it('drops a question once a non-chat location resolves first', async () => {
+    const send = vi.fn(async () => {});
+    handOffQuestion('Abandoned');
+    noteResolvedPath('/tasks');
+    await openChat(send);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('keeps the question when /chat is the location that resolves', async () => {
+    const send = vi.fn(async () => {});
+    handOffQuestion('Delivered');
+    noteResolvedPath('/chat');
+    await openChat(send);
+    expect(send).toHaveBeenCalledWith('Delivered');
   });
 
   it('does not resend when the chat page is opened again without a new ask', async () => {
