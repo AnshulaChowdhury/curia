@@ -98,6 +98,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Principal-only sends** — a message to the principal alone skips autonomy gates A and B (spec 14). (#2337)
 - **ceo-inbox triage** — runs hourly instead of every 15 minutes, cutting scheduled triage runs to a quarter.
 - **ceo-inbox delegate wait** — raised from 300s to 563s to fit observed p99 run length. (#1915)
 - **Meeting recaps** — sent only when the caller asked or an agenda topic was covered. (#2347)

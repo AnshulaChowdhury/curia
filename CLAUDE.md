@@ -163,7 +163,7 @@ When adding a new skill, declare its action risk in `tool.json`. This field is *
 Values by capability class:
 - `"none"` — reads, retrieval, summarization (no external effect; min score 0)
 - `"low"` — internal state writes, memory, contacts (min score 60)
-- `"medium"` — outbound communications (min score 70)
+- `"medium"` — outbound communications (min score 70; a send to the principal alone is exempt, #2337)
 - `"high"` — calendar writes, commitments on behalf of CEO (min score 80)
 - `"critical"` — financial / destructive / irreversible actions (min score 90)
 
