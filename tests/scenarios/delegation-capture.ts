@@ -58,22 +58,26 @@ export interface DelegationCapture {
 /**
  * `rootOf` maps a conversation to its open run (the stub layer's view). `onLate` is called
  * when a specialist conversation whose run already ended finishes a turn: what it wrote
- * after the run's cleanup must be removed again.
+ * after the run's cleanup must be removed again. `isOwnTurn` names the run's follow-on
+ * conversations (an approval wake, an `inbound.then` turn): filed under the run, but the
+ * case agent's own turns, which turn capture records. Their calls are numbered, not kept.
  */
 export function createDelegationCapture(
   bus: EventBus,
   rootOf: (conversationId: string) => string | undefined,
   onLate: (conversationId: string) => void = () => {},
+  isOwnTurn: (conversationId: string) => boolean = () => false,
 ): DelegationCapture {
   const traces = new Map<string, OpenTrace>();
   /** Specialist conversations of runs that have ended, kept so a late finish is noticed. */
   const ended = new Set<string>();
   let seq = 0;
 
-  /** The open trace a specialist conversation belongs to; undefined for a run's own conversation. */
+  /** The open trace a specialist conversation belongs to; undefined for a run's own conversations. */
   const specialistTrace = (conversationId: string): OpenTrace | undefined => {
     const root = rootOf(conversationId);
-    return root !== undefined && root !== conversationId ? traces.get(root) : undefined;
+    if (root === undefined || root === conversationId || isOwnTurn(conversationId)) return undefined;
+    return traces.get(root);
   };
 
   const on = (type: BusEvent['type'], handler: (event: BusEvent) => void): void => {
@@ -103,7 +107,8 @@ export function createDelegationCapture(
     if (!trace) return;
     const n = ++seq;
     trace.seqByInvoke.set(event.id, n);
-    if (root === payload.conversationId) return; // the coordinator's: turn capture has it
+    // The coordinator's, or a follow-on turn's: turn capture has it.
+    if (root === payload.conversationId || isOwnTurn(payload.conversationId)) return;
     trace.callIndex.set(event.id, trace.calls.length);
     trace.calls.push({ agentId: payload.agentId, name: payload.toolName, input: payload.input, invokeEventId: event.id, seq: n });
   });
@@ -175,12 +180,13 @@ export function createDelegationCapture(
  * made. Without specialists, the case agent's order.
  */
 export function inRunOrder(
-  coordinatorCalls: ObservedToolCall[],
+  coordinatorCalls: Array<ObservedToolCall & { agentId?: string }>,
   trace: Pick<DelegationTrace, 'seqByInvoke' | 'calls'> | undefined,
   agentId: string = COORDINATOR,
 ): Array<ObservedToolCall & { agentId: string }> {
-  const own = coordinatorCalls.map(c => ({ ...c, agentId }));
-  if (!trace || trace.calls.length === 0) return own;
+  // A call already tagged (a follow-on turn's, the coordinator's) keeps its agent.
+  const own = coordinatorCalls.map(c => ({ ...c, agentId: c.agentId ?? agentId }));
+  if (!trace) return own;
   const seqOf = (c: ObservedToolCall): number =>
     (c.invokeEventId ? trace.seqByInvoke.get(c.invokeEventId) : undefined) ?? Number.MAX_SAFE_INTEGER;
   const specialists = trace.calls.map(({ seq: _seq, ...call }) => call);

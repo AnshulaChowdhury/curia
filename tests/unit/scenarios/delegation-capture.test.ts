@@ -87,6 +87,31 @@ describe('createDelegationCapture', () => {
     expect(capture.end(ROOT).delegations).toEqual([]);
   });
 
+  it('numbers a follow-on turn\'s calls but records neither them nor its task as a specialist\'s', async () => {
+    const bus = new EventBus(createLogger('error'));
+    const WAKE = 'approval-wake-1';
+    // An approval wake (or `inbound.then` turn) is filed under the run, as the stub layer does.
+    const capture = createDelegationCapture(bus, conv => ([ROOT, WAKE].includes(conv) ? ROOT : undefined), () => {}, conv => conv === WAKE);
+    capture.begin(ROOT);
+    const first = createToolInvoke({ agentId: 'coordinator', conversationId: ROOT, toolName: 'memory-query', input: {}, taskEventId: 't', parentEventId: 't' });
+    await bus.publish('agent', first);
+    await bus.publish('dispatch', createAgentTask({ agentId: 'coordinator', conversationId: WAKE, channelId: 'internal', senderId: 'system', content: 'deliver it', parentEventId: 'w' }));
+    const wake = createToolInvoke({ agentId: 'coordinator', conversationId: WAKE, toolName: 'deliver-approval', input: {}, taskEventId: 'w', parentEventId: 'w' });
+    await bus.publish('agent', wake);
+
+    const trace = capture.end(ROOT);
+    // Turn capture records the wake's calls; kept here too, they were counted twice (#2333 gate).
+    expect(trace.calls).toEqual([]);
+    expect(trace.delegations).toEqual([]);
+    expect(trace.seqByInvoke.get(first.id)).toBeLessThan(trace.seqByInvoke.get(wake.id)!);
+    // Handed back by turn capture, they sort into run order whatever order they arrive in.
+    const ordered = inRunOrder([
+      { name: 'deliver-approval', input: {}, invokeEventId: wake.id, agentId: 'coordinator' },
+      { name: 'memory-query', input: {}, invokeEventId: first.id },
+    ], trace);
+    expect(ordered.map(c => `${c.agentId}:${c.name}`)).toEqual(['coordinator:memory-query', 'coordinator:deliver-approval']);
+  });
+
   it('reports a specialist that finishes after its run ended, for another cleanup', async () => {
     const { bus, capture, open, late } = setup();
     capture.begin(ROOT);
