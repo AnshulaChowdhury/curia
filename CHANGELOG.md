@@ -98,6 +98,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **ceo-inbox triage** — runs hourly instead of every 15 minutes, cutting scheduled triage runs to a quarter.
+- **ceo-inbox delegate wait** — raised from 300s to 563s to fit observed p99 run length. (#1915)
 - **Meeting recaps** — sent only when the caller asked or an agenda topic was covered. (#2347)
 - **Recap wording** — first-person recap for casual calls; formal calls link the minutes in the office. (#2347)
 - **Agenda speech** — Curia pulls up an agenda on a call; it never says "loading". (#2347)
