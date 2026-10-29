@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
+import { handOffQuestion } from '../chat/ask-handoff.js';
 
 export function AskCuria() {
   const [text, setText] = useState('');
@@ -14,7 +15,8 @@ export function AskCuria() {
         event.preventDefault();
         const q = text.trim();
         if (!q) return;
-        void navigate({ to: '/chat', search: { q, t: String(Date.now()) } });
+        handOffQuestion(q);
+        void navigate({ to: '/chat' });
       }}
     >
       <div className="dash-card-title">Ask Curia</div>

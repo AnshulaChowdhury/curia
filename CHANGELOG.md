@@ -183,6 +183,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Security
 
+- **Console chat links** — a `/chat?q=` link no longer sends a message as the principal. (#2351)
 - **Band review** — a steered reply carrying unsupported personal details is rewritten, not held showing them. (#2333)
 - **Blocked contacts on CC** — email sends and drafts refuse a blocked contact anywhere on To or CC. (#2273)
 - **Principal-addressed email** — autonomy and identity gates still run when anyone besides the principal receives it. (#2273)
