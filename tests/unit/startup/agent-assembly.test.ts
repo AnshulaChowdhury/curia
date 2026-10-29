@@ -381,7 +381,7 @@ describe('resolveSystemPromptSources', () => {
   it('gives any agent its parsed pinned_context and the shared reader (#2338)', () => {
     const configs = [
       coordinatorYaml(),
-      specialistYaml({ pinned_context: [{ doc: 'shared/inbox/rules.md' }, { config: 'ceo_inbox/decision_tagging' }] }),
+      specialistYaml({ pinned_context: { docs: 'shared/inbox/rules.md', configs: ['ceo_inbox/decision_tagging'] } }),
     ];
     const pinnedContextReader = {} as unknown as PinnedContextReader;
     const ctx = { ...buildContext(textProvider(), configs), pinnedContextReader };
@@ -398,10 +398,10 @@ describe('resolveSystemPromptSources', () => {
     const registry = new AgentRegistry();
     registerAgentRoster(registry, [
       coordinatorYaml(),
-      specialistYaml({ pinned_context: [{ doc: '/shared/a.md' }, { config: 'ns/k' }] }),
+      specialistYaml({ pinned_context: { docs: ['/shared/a.md', '/shared/b.md'], configs: 'ns/k' } }),
     ]);
     expect(registry.get('coordinator')?.pinnedDocPaths).toEqual([]);
-    expect(registry.get(specialistYaml().name)?.pinnedDocPaths).toEqual(['/shared/a.md']);
+    expect(registry.get(specialistYaml().name)?.pinnedDocPaths).toEqual(['/shared/a.md', '/shared/b.md']);
   });
 
   it('reads the roster only through specialistSummary, so a snapshot adapter is enough', () => {

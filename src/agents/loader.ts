@@ -44,9 +44,9 @@ export interface AgentYamlConfig {
   pinned_skills?: string[];
   /**
    * `/shared/` documents and config-store keys rendered into every turn's
-   * `## Pinned context` block (#2338, ADR-056). Each entry is `{ doc: <path> }` or
-   * `{ config: <namespace>/<key> }`. loadAgentConfig validates it; read it through
-   * parsePinnedContext().
+   * `## Pinned context` block (#2338, ADR-056). A mapping with optional `docs` and
+   * `configs`, each a string or a list of strings / `{ path|key, description }`.
+   * loadAgentConfig validates it; read it through parsePinnedContext().
    */
   pinned_context?: unknown;
   allow_discovery?: boolean;

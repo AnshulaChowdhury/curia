@@ -66,8 +66,8 @@ pinned_skills:                 # skill bundles always available (expanded to mem
   - scheduler-create
 
 pinned_context:                # documents and settings shown on every turn (see below)
-  - doc: /shared/expenses/rules.md
-  - config: expenses/currency
+  docs: /shared/expenses/rules.md
+  configs: expenses/currency
 
 allow_discovery: true          # if true, agent can search tools at runtime
                                # and request tools not in pinned_skills
@@ -244,11 +244,22 @@ step, and a console edit applies on its next turn. See
 
 ```yaml
 pinned_context:
-  - doc: /shared/expenses/rules.md      # an OKF document under /shared/
-  - config: expenses/currency           # one config-store key: <namespace>/<key>
+  docs:                                 # OKF documents under /shared/: a string or a list
+    - /shared/expenses/rules.md
+    - path: /shared/expenses/budgets.md
+      description: Monthly budget per category, agreed with the principal.
+  configs:                              # config-store keys, <namespace>/<key>: a string or a list
+    - expenses/currency
+    - key: expenses/last_statement_id
+      description: ID of the last statement processed. If missing, start from the newest.
 ```
 
-- **`doc:`** must be a `.md` path under `/shared/`. Declaring it is the permission to write it:
+Each list item is a string, or a mapping with `path` / `key` and an optional one-line
+`description` (300 characters at most). The description is shown under the item's
+heading whether or not it exists yet, so write what it is for and what a missing value
+means.
+
+- **`docs`** must be `.md` paths under `/shared/`. Declaring it is the permission to write it:
   `doc-write` refuses a `/shared/` path the calling agent does not declare. Several agents
   may declare the same document to share it; `expected_version` /
   `expected_section_version` handle simultaneous edits. `/shared/` documents are durable:
@@ -257,16 +268,17 @@ pinned_context:
   document state its own format in its frontmatter or a short top section, so every
   declaring agent follows one format and no prompt restates it. Pin `documents` so the
   agent can write it.
-- **`config:`** names exactly one key. Whole namespaces are not supported, because they mix
+- **`configs`** each name exactly one key. Whole namespaces are not supported, because they mix
   principal settings with runtime state. Config entries are shown only; writes still go
   through `config-store`.
 
-A document or key that does not exist yet renders as not yet created. A document the
-principal archived renders as archived, and `doc-write` will not recreate it. A failed read
+A document or key that does not exist yet renders as not yet created; one that exists but
+is blank renders as blank. A document the principal archived renders as archived, and
+`doc-write` will not recreate it. A failed read
 renders as unavailable and logs a warning; it is never silently left out. An item over
 `documentWorkspace.pinnedContextWarnChars` (default 16000) logs a warning each turn and is
-still injected in full. A malformed entry, a `doc:` outside `/shared/`, or a `config:`
-without exactly one `/` fails the agent's load.
+still injected in full. A malformed entry, a doc outside `/shared/`, or a config without
+exactly one `/` fails the agent's load.
 
 Everything declared here is sent on every turn, so keep it to what the agent needs on most
 turns. Read anything rarer on demand.

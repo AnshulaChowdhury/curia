@@ -183,15 +183,25 @@ ${entries}
       return filePath;
     };
     try {
-      const config = loadAgentConfig(write('  - doc: /shared/inbox/rules.md\n  - config: ceo_inbox/decision_tagging'));
-      expect(config.pinned_context).toEqual([
-        { doc: '/shared/inbox/rules.md' },
-        { config: 'ceo_inbox/decision_tagging' },
-      ]);
-      expect(() => loadAgentConfig(write('  - doc: /projects/x/rules.md')))
+      const config = loadAgentConfig(write([
+        '  docs:',
+        '    - /shared/inbox/rules.md',
+        '    - path: /shared/priorities.md',
+        '      description: The principal\'s highest priorities.',
+        '  configs: ceo_inbox/decision_tagging',
+      ].join('\n')));
+      expect(config.pinned_context).toEqual({
+        docs: ['/shared/inbox/rules.md', { path: '/shared/priorities.md', description: "The principal's highest priorities." }],
+        configs: 'ceo_inbox/decision_tagging',
+      });
+      // A bare `docs:` with nothing under it is an empty list, not an error.
+      expect(() => loadAgentConfig(write('  docs:'))).not.toThrow();
+      expect(() => loadAgentConfig(write('  docs: /projects/x/rules.md')))
         .toThrow(/agent 'pinned-agent'.*under \/shared\//);
-      expect(() => loadAgentConfig(write('  - config: ceo_inbox')))
+      expect(() => loadAgentConfig(write('  configs: ceo_inbox')))
         .toThrow(/agent 'pinned-agent'.*exactly one `\/`/);
+      expect(() => loadAgentConfig(write('  - doc: /shared/inbox/rules.md')))
+        .toThrow(/agent 'pinned-agent'.*must be a mapping/);
     } finally {
       fs.rmSync(tempDir, { recursive: true });
     }

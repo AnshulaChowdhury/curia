@@ -39,9 +39,32 @@ Alternatives considered:
 
 ## Decision
 
-An agent YAML may declare `pinned_context`: a list of entries, each exactly one of
-`doc: <path>` (an OKF document under `/shared/`) or `config: <namespace>/<key>` (one
-config-store key). "Pinned" parallels `pinned_skills`: always present for this agent.
+An agent YAML may declare `pinned_context`, a mapping with two optional lists. "Pinned"
+parallels `pinned_skills`: always present for this agent.
+
+```yaml
+pinned_context:
+  docs:                                   # a string, or a list of any length
+    - /shared/inbox/rules.md
+    - path: /shared/priorities.md
+      description: The principal's highest priorities, learned by asking them.
+  configs:                                # a string, or a list of any length
+    - ceo_inbox/decision_tagging
+    - key: ceo_inbox/watermark
+      description: ID of the last message processed. If missing, start from the newest.
+```
+
+- **`docs`** are OKF documents under `/shared/`. **`configs`** are single config-store keys,
+  `<namespace>/<key>`. Docs and configs are separate lists because they differ in where
+  they live, who may write them, and what "missing" means. An agent may declare as many
+  of each as it needs.
+- **Descriptions are optional.** A list item is either a bare string or a mapping with
+  `path` (docs) or `key` (configs) and a one-line `description` (300 characters at most).
+  The description renders under the item's heading in every state, so a document or key
+  that does not exist yet still says what it is for and what its absence means. It is
+  also the declaration a diagnostics or setup check can read without loading the content.
+  It's `configs`, not `settings`, because a key may be runtime state such as a watermark
+  rather than a principal setting (#940).
 
 - **Injection.** On every turn `buildBaseSystemPrompt` renders a `## Pinned context` block
   after the YAML body and specialist roster, before the per-turn blocks (autonomy, time).
@@ -68,9 +91,14 @@ config-store key). "Pinned" parallels `pinned_skills`: always present for this a
 - **Size is warned, not truncated.** An item longer than
   `documentWorkspace.pinnedContextWarnChars` (default 16000) logs a warning each turn and
   is injected in full. A truncated settings document would be worse than a large one.
-- **Validated at load.** A malformed entry, a `doc:` outside `/shared/` (after path
-  normalization), a reserved leaf (`index.md`, `log.md`), a `doc:` not ending in `.md`
-  (the console edits only `.md`), a `config:` without exactly one `/`, or a duplicate fails the agent's load with an error naming the agent and the entry.
+- **Missing and blank are states, not errors.** An empty or absent list is no entries.
+  A document that exists with no content and a config key set to a blank value each
+  render as such. The renderer never throws: any read that fails or returns something
+  malformed renders that one entry as unavailable.
+- **Validated at load.** A malformed entry or unknown key, a doc outside `/shared/` (after
+  path normalization), a reserved leaf (`index.md`, `log.md`), a doc not ending in `.md`
+  (the console edits only `.md`), a config without exactly one `/`, a blank or over-long
+  description, or a duplicate fails the agent's load with an error naming the agent and the entry.
 - **Self-describing documents.** Each `/shared/` document states its own format in its
   frontmatter or a short top section, so every declaring agent follows one format and no
   declaring prompt restates it.

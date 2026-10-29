@@ -10,8 +10,8 @@
 //     fails the load with an error naming the agent and the entry.
 //   - createPinnedContextReader(): the per-turn reads, from the document
 //     workspace and config-store.
-//   - renderPinnedContextBlock(): the block itself. Never throws; a failed read
-//     renders as unavailable instead of being dropped.
+//   - renderPinnedContextBlock(): the block itself. Never throws; a missing or
+//     blank item renders as such, and a failed read as unavailable.
 
 import type { Logger } from '../logger.js';
 import type { WorkingDocsRepo } from '../db/working-docs-repo.js';
@@ -22,20 +22,32 @@ import { normalizeDocPath } from '../memory/okf.js';
 import { RESERVED_LEAF_NAMES } from './document-workspace.js';
 
 export type PinnedContextEntry =
-  | { kind: 'doc'; path: string }
-  | { kind: 'config'; namespace: string; key: string };
+  | { kind: 'doc'; path: string; description?: string }
+  | { kind: 'config'; namespace: string; key: string; description?: string };
 
 /** Same caps config-store applies on write, so a declared key is one it can hold. */
 const MAX_CONFIG_NAMESPACE_LENGTH = 100;
 const MAX_CONFIG_KEY_LENGTH = 200;
+/** A description is one or two sentences, sent every turn; keep it short. */
+export const MAX_PINNED_DESCRIPTION_LENGTH = 300;
 
 /** Default `documentWorkspace.pinnedContextWarnChars`: warn, never truncate, above this. */
 export const DEFAULT_PINNED_CONTEXT_WARN_CHARS = 16_000;
 
 /**
- * Validate and normalize an agent's `pinned_context`. Returns [] when the field is
- * absent. Throws on a malformed entry, a `doc:` path outside `/shared/`, a
- * `config:` entry without exactly one `/`, or a duplicate.
+ * Validate and normalize an agent's `pinned_context`:
+ *
+ *   pinned_context:
+ *     docs:                              # a string, or a list
+ *       - /shared/inbox/rules.md
+ *       - path: /shared/priorities.md
+ *         description: The principal's priorities, learned by asking them.
+ *     configs: ceo_inbox/decision_tagging  # a string, or a list
+ *
+ * A list item is a string or a mapping with `path` (docs) / `key` (configs) and an
+ * optional `description`. Returns [] when the field, or both lists, are absent or
+ * empty. Throws on anything else malformed, a doc outside `/shared/`, a config
+ * without exactly one `/`, or a duplicate. Docs come first, in declared order.
  */
 export function parsePinnedContext(raw: unknown, agentName: string): PinnedContextEntry[] {
   if (raw === undefined || raw === null) return [];
@@ -43,65 +55,97 @@ export function parsePinnedContext(raw: unknown, agentName: string): PinnedConte
     const shown = entry === undefined ? '' : ` (entry: ${JSON.stringify(entry)})`;
     throw new Error(`Invalid pinned_context in agent '${agentName}': ${detail}${shown}`);
   };
-  if (!Array.isArray(raw)) fail('must be a list of `doc:` or `config:` entries');
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    fail('must be a mapping with `docs` and/or `configs`');
+  }
+  const section = raw as Record<string, unknown>;
+  const unknownKeys = Object.keys(section).filter((k) => k !== 'docs' && k !== 'configs');
+  if (unknownKeys.length > 0) {
+    fail(`unknown key(s) ${unknownKeys.map((k) => `\`${k}\``).join(', ')} — use \`docs\` and \`configs\``);
+  }
+
+  // A string or a list; null (a bare `docs:`) means none.
+  const listOf = (name: 'docs' | 'configs'): unknown[] => {
+    const value = section[name];
+    if (value === undefined || value === null) return [];
+    if (typeof value === 'string') return [value];
+    if (Array.isArray(value)) return value;
+    return fail(`\`${name}\` must be a string or a list`, value);
+  };
+
+  // One item: a string, or a mapping with the id field and an optional description.
+  const readItem = (name: 'docs' | 'configs', item: unknown): { id: string; description?: string } => {
+    const idField = name === 'docs' ? 'path' : 'key';
+    let id: unknown = item;
+    let description: unknown;
+    if (item !== null && typeof item === 'object' && !Array.isArray(item)) {
+      const fields = item as Record<string, unknown>;
+      const extra = Object.keys(fields).filter((k) => k !== idField && k !== 'description');
+      if (extra.length > 0) fail(`a \`${name}\` item has only \`${idField}\` and \`description\``, item);
+      id = fields[idField];
+      description = fields.description;
+    }
+    if (typeof id !== 'string' || id.trim() === '') {
+      fail(`each \`${name}\` item must be a non-empty string or have a non-empty \`${idField}\``, item);
+    }
+    if (description === undefined || description === null) return { id: (id as string).trim() };
+    if (typeof description !== 'string' || description.trim() === '') {
+      fail('`description` must be a non-empty string', item);
+    }
+    const text = (description as string).trim().replace(/\s+/g, ' ');
+    if (text.length > MAX_PINNED_DESCRIPTION_LENGTH) {
+      fail(`\`description\` must be ${MAX_PINNED_DESCRIPTION_LENGTH} characters or fewer`, item);
+    }
+    return { id: (id as string).trim(), description: text };
+  };
 
   const entries: PinnedContextEntry[] = [];
   const seen = new Set<string>();
-  for (const item of raw as unknown[]) {
-    if (item === null || typeof item !== 'object' || Array.isArray(item)) {
-      fail('each entry must be a mapping with exactly one of `doc` or `config`', item);
-    }
-    const keys = Object.keys(item as Record<string, unknown>);
-    if (keys.length !== 1 || (keys[0] !== 'doc' && keys[0] !== 'config')) {
-      fail('each entry must have exactly one of `doc` or `config`', item);
-    }
-    const kind = keys[0] as 'doc' | 'config';
-    const value = (item as Record<string, unknown>)[kind];
-    if (typeof value !== 'string' || value.trim() === '') {
-      fail(`\`${kind}\` must be a non-empty string`, item);
-    }
-    const text = (value as string).trim();
-
-    let entry: PinnedContextEntry;
-    if (kind === 'doc') {
-      // Normalize first so `..` cannot climb out of /shared/ and the declared path
-      // matches what doc-write compares against.
-      const path = normalizeDocPath(text);
-      if (!path.startsWith(SHARED_DOC_PREFIX) || path.length === SHARED_DOC_PREFIX.length) {
-        fail(`\`doc\` path must be a document under ${SHARED_DOC_PREFIX}`, item);
-      }
-      const leaf = path.split('/').pop() ?? '';
-      if (RESERVED_LEAF_NAMES.has(leaf)) {
-        fail(`\`doc\` path cannot be the reserved file ${leaf}`, item);
-      }
-      // The console edits only `.md` paths; a declared document must stay editable there.
-      if (!leaf.endsWith('.md')) {
-        fail('`doc` path must end in .md so the principal can edit it in the console', item);
-      }
-      entry = { kind: 'doc', path };
-    } else {
-      // Whole namespaces are deliberately unsupported: they mix principal settings
-      // with agent runtime state (#940).
-      const parts = text.split('/');
-      if (parts.length !== 2 || !parts[0]!.trim() || !parts[1]!.trim()) {
-        fail('`config` must be `<namespace>/<key>` with exactly one `/`', item);
-      }
-      const namespace = parts[0]!.trim();
-      const key = parts[1]!.trim();
-      if (namespace.length > MAX_CONFIG_NAMESPACE_LENGTH || key.length > MAX_CONFIG_KEY_LENGTH) {
-        fail(
-          `\`config\` namespace must be ${MAX_CONFIG_NAMESPACE_LENGTH} characters or fewer and key ${MAX_CONFIG_KEY_LENGTH} or fewer`,
-          item,
-        );
-      }
-      entry = { kind: 'config', namespace, key };
-    }
-
-    const id = pinnedEntryLabel(entry);
-    if (seen.has(id)) fail(`duplicate entry ${id}`, item);
-    seen.add(id);
+  const add = (entry: PinnedContextEntry, item: unknown): void => {
+    const label = pinnedEntryLabel(entry);
+    if (seen.has(label)) fail(`duplicate entry ${label}`, item);
+    seen.add(label);
     entries.push(entry);
+  };
+
+  for (const item of listOf('docs')) {
+    const { id, description } = readItem('docs', item);
+    // Normalize first so `..` cannot climb out of /shared/ and the declared path
+    // matches what doc-write compares against.
+    const path = normalizeDocPath(id);
+    if (!path.startsWith(SHARED_DOC_PREFIX) || path.length === SHARED_DOC_PREFIX.length) {
+      fail(`a \`docs\` path must be a document under ${SHARED_DOC_PREFIX}`, item);
+    }
+    const leaf = path.split('/').pop() ?? '';
+    if (RESERVED_LEAF_NAMES.has(leaf)) {
+      fail(`a \`docs\` path cannot be the reserved file ${leaf}`, item);
+    }
+    // The console edits only `.md` paths; a declared document must stay editable there.
+    if (!leaf.endsWith('.md')) {
+      fail('a `docs` path must end in .md so the principal can edit it in the console', item);
+    }
+    add({ kind: 'doc', path, ...(description ? { description } : {}) }, item);
   }
+
+  for (const item of listOf('configs')) {
+    const { id, description } = readItem('configs', item);
+    // Whole namespaces are deliberately unsupported: they mix principal settings
+    // with agent runtime state (#940).
+    const parts = id.split('/');
+    if (parts.length !== 2 || !parts[0]!.trim() || !parts[1]!.trim()) {
+      fail('a `configs` key must be `<namespace>/<key>` with exactly one `/`', item);
+    }
+    const namespace = parts[0]!.trim();
+    const key = parts[1]!.trim();
+    if (namespace.length > MAX_CONFIG_NAMESPACE_LENGTH || key.length > MAX_CONFIG_KEY_LENGTH) {
+      fail(
+        `a \`configs\` namespace must be ${MAX_CONFIG_NAMESPACE_LENGTH} characters or fewer and key ${MAX_CONFIG_KEY_LENGTH} or fewer`,
+        item,
+      );
+    }
+    add({ kind: 'config', namespace, key, ...(description ? { description } : {}) }, item);
+  }
+
   return entries;
 }
 
@@ -182,14 +226,22 @@ const NOT_YET_CREATED_DOC =
   '_Not yet created._ Create it with `doc-write` mode `create` when you first need to write it.';
 const ARCHIVED_DOC =
   '_Archived by the principal._ Do not recreate it; the principal can restore it in the console.';
+const EMPTY_DOC = '_Exists, but has no content yet._';
 const NOT_YET_SET_CONFIG = '_Not set yet._';
+const BLANK_CONFIG = '_Set, but blank._';
 const UNAVAILABLE =
   '_Unavailable this turn: the read failed._ Do not treat it as empty, and do not create or overwrite it this turn.';
 
+/** Heading plus the declared description, if any, so a missing item still says what it is for. */
+function header(heading: string, description: string | undefined): string {
+  return description ? `${heading}\nPurpose: ${description}` : heading;
+}
+
 /**
  * Render `## Pinned context` for the declared entries, read fresh now. Returns
- * null when nothing is declared. Never throws: a failed read renders as
- * unavailable and logs a warning.
+ * null when nothing is declared. Never throws: a missing, archived or blank item
+ * renders as such, and a failed or malformed read renders as unavailable and logs
+ * a warning.
  */
 export async function renderPinnedContextBlock(
   entries: readonly PinnedContextEntry[],
@@ -208,29 +260,41 @@ export async function renderPinnedContextBlock(
     }
   };
 
-  const sections = await Promise.all(entries.map(async (entry): Promise<string> => {
-    const label = pinnedEntryLabel(entry);
-    if (entry.kind === 'doc') {
-      try {
-        const doc = await reader.readDoc(entry.path);
-        if (!doc) return `### Document ${entry.path}\n${NOT_YET_CREATED_DOC}`;
-        if (doc.status === 'archived') return `### Document ${entry.path}\n${ARCHIVED_DOC}`;
-        warnIfLarge(label, doc.content.length);
-        return `### Document ${entry.path} (version ${doc.version})\n${fenced(doc.content)}`;
-      } catch (err) {
-        logger.warn({ err, agentId, entry: label }, 'pinned_context: document read failed — rendered as unavailable');
-        return `### Document ${entry.path}\n${UNAVAILABLE}`;
-      }
+  const renderDoc = async (entry: Extract<PinnedContextEntry, { kind: 'doc' }>): Promise<string> => {
+    const heading = `### Document ${entry.path}`;
+    const doc = await reader.readDoc(entry.path);
+    if (doc === null || doc === undefined) return `${header(heading, entry.description)}\n${NOT_YET_CREATED_DOC}`;
+    if (doc.status === 'archived') return `${header(heading, entry.description)}\n${ARCHIVED_DOC}`;
+    if (doc.status !== 'live' || typeof doc.content !== 'string' || !Number.isInteger(doc.version)) {
+      throw new Error('reader returned a malformed document');
     }
-    const name = `${entry.namespace}/${entry.key}`;
+    const versioned = header(`${heading} (version ${doc.version})`, entry.description);
+    if (doc.content.trim() === '') return `${versioned}\n${EMPTY_DOC}`;
+    warnIfLarge(pinnedEntryLabel(entry), doc.content.length);
+    return `${versioned}\n${fenced(doc.content)}`;
+  };
+
+  const renderConfig = async (entry: Extract<PinnedContextEntry, { kind: 'config' }>): Promise<string> => {
+    const heading = header(`### Config ${entry.namespace}/${entry.key}`, entry.description);
+    const value = await reader.readConfig(entry.namespace, entry.key);
+    if (value === null || value === undefined) return `${heading}\n${NOT_YET_SET_CONFIG}`;
+    if (typeof value !== 'string') throw new Error('reader returned a non-string config value');
+    if (value.trim() === '') return `${heading}\n${BLANK_CONFIG}`;
+    warnIfLarge(pinnedEntryLabel(entry), value.length);
+    return `${heading}\n${fenced(value)}`;
+  };
+
+  // Each entry renders on its own, so one bad read never costs the others.
+  const sections = await Promise.all(entries.map(async (entry): Promise<string> => {
     try {
-      const value = await reader.readConfig(entry.namespace, entry.key);
-      if (value === null) return `### Config ${name}\n${NOT_YET_SET_CONFIG}`;
-      warnIfLarge(label, value.length);
-      return `### Config ${name}\n${fenced(value)}`;
+      return entry.kind === 'doc' ? await renderDoc(entry) : await renderConfig(entry);
     } catch (err) {
-      logger.warn({ err, agentId, entry: label }, 'pinned_context: config read failed — rendered as unavailable');
-      return `### Config ${name}\n${UNAVAILABLE}`;
+      logger.warn(
+        { err, agentId, entry: pinnedEntryLabel(entry) },
+        'pinned_context: read failed — rendered as unavailable',
+      );
+      const heading = entry.kind === 'doc' ? `### Document ${entry.path}` : `### Config ${entry.namespace}/${entry.key}`;
+      return `${header(heading, entry.description)}\n${UNAVAILABLE}`;
     }
   }));
 
