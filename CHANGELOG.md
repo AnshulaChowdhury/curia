@@ -205,6 +205,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Scenario tool calls** — approval-wake and `then` turns' tool calls are recorded once, not twice. (#2333)
 - **PII scenarios 34a, 34h, 34i** — stub the inbox specialist, ask Curia to send, and check held SINs precisely. (#2333)
 - **task-create** — placeholder ids are omitted, and a missing task is reported as not found. (#2328)
 - **task-create** — optional id inputs say to omit the field when there is none. (#2328)

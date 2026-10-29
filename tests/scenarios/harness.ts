@@ -520,6 +520,8 @@ export async function createScenarioHarness(
             process.stderr.write(`  [WARN] late cleanup failed for ${conversationId}: ${err instanceof Error ? err.message : String(err)}\n`);
           });
         },
+        // Approval wakes and `inbound.then` turns: the coordinator's own, not a specialist's.
+        (conversationId) => currentScope()?.followOnConversations.has(conversationId) === true,
       );
     },
   });
@@ -1258,7 +1260,9 @@ export async function createScenarioHarness(
         process.stderr.write(`  [WARN] ${state.label}: a turn was still running ${CANCEL_SETTLE_MS / 1000}s after the run ended; its later spend is counted outside any run\n`);
       }
 
-      const merged = mergeCalls([...inRunOrder(outcome.calls, trace, agent), ...wakeCalls, ...(thenOutcome?.calls ?? [])], stubbedCalls);
+      // Wake and `then` turns are the coordinator's (both are captured for it), in run order.
+      const followOnCalls = [...wakeCalls, ...(thenOutcome?.calls ?? [])].map(c => ({ ...c, agentId: COORDINATOR }));
+      const merged = mergeCalls(inRunOrder([...outcome.calls, ...followOnCalls], trace, agent), stubbedCalls);
       // Read after the run's turns settled, before cleanup removes the rows (#2312).
       const gateway = scenario.throughGateway ? await readGatewayOutcome(stack, scenario, seeded, scope) : undefined;
       // A scoped view failing means the case ran without its premise (no block, no thread).
