@@ -209,7 +209,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Scenario tool calls** — approval-wake and `then` turns' tool calls are recorded once, not twice. (#2333)
 - **PII scenarios 34a, 34h, 34i** — stub the inbox specialist, ask Curia to send, and check held SINs precisely. (#2333)
 - **Approval review** — held sends show their content, and discard finds the owning mailbox. (#2340)
-- **Approval review** — a draft missing its recipient is loaded before approve. (#2340)
+- **Approval review** — a draft missing its recipient is loaded before approval. (#2340)
 - **Waiting list** — the first item no longer keeps a border under the heading. (#2340)
 - **Console approve** — the re-run records the principal as the web originator. (#2340)
 - **Work histogram** — a busy fortnight no longer takes the stats cards down. (#2340)
