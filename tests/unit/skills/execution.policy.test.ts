@@ -2697,14 +2697,18 @@ describe('autonomy gates', () => {
     describe('principal-only send bypasses gates A and B (#2337)', () => {
       function makeLayer(
         score: number,
-        extras?: { outboundGateway?: OutboundGateway; contactService?: ContactService | null },
+        extras?: {
+          outboundGateway?: OutboundGateway;
+          contactService?: ContactService | null;
+          principalIdentities?: readonly ChannelIdentity[];
+        },
       ) {
         const registry = new ToolRegistry();
         const publish = vi.fn().mockResolvedValue(undefined);
         const layer = new ExecutionLayer(registry, logger, {
           autonomyService: makeAutonomyService(score),
           bus: { publish } as unknown as EventBus,
-          principalIdentities: TEST_PRINCIPAL_IDENTITIES,
+          principalIdentities: extras?.principalIdentities ?? TEST_PRINCIPAL_IDENTITIES,
           outboundGateway: extras?.outboundGateway,
           selfEmails: ['curia@example.com'],
           // null: no contact service, so references cannot be resolved before the gates.
@@ -2748,19 +2752,36 @@ describe('autonomy gates', () => {
         expect(blockedEvents(publish)).toHaveLength(0);
       });
 
-      it('two of the principal\'s own addresses still count as the principal alone', async () => {
-        const { registry, layer } = makeLayer(55);
+      it('two distinct principal addresses (work + personal) still count as the principal alone (#2312)', async () => {
+        const labelled = (id: string, channelIdentifier: string, label: string): ChannelIdentity => ({
+          ...TEST_PRINCIPAL_IDENTITIES[0]!, id, channelIdentifier, label,
+        });
+        const identities: ChannelIdentity[] = [
+          labelled('id-work', 'ceo@work.example.com', 'work'),
+          labelled('id-personal', 'ceo@home.example.com', 'personal'),
+        ];
+        const contactService = {
+          getContactWithIdentities: vi.fn(async (id: string) => (id === 'principal-1'
+            ? {
+                contact: { id, displayName: 'Principal', primaryEmail: 'ceo@work.example.com', primaryPhone: null },
+                identities,
+              }
+            : undefined)),
+          getIdentitiesForContact: vi.fn().mockResolvedValue([]),
+        } as unknown as ContactService;
+        const { registry, layer } = makeLayer(55, { contactService, principalIdentities: identities });
         const handler = makeHandler('ok');
         registry.register(makeRiskyManifest('email-send', 'medium'), handler);
 
         const result = await layer.invoke(
           'email-send',
-          { to: 'principal', cc: 'principal', subject: 'Report', body: 'Done.' },
+          { to: 'principal#work', cc: 'principal#personal', subject: 'Report', body: 'Done.' },
           undefined,
           roleMeta('system'),
         );
 
         expect(result.success).toBe(true);
+        expect(handler.execute).toHaveBeenCalledOnce();
       });
 
       it('a known external originator\'s send to the principal alone runs below 70 (Gate C allows it too)', async () => {
@@ -2777,6 +2798,38 @@ describe('autonomy gates', () => {
 
         expect(result.success).toBe(true);
         expect(handler.execute).toHaveBeenCalledOnce();
+      });
+
+      // Gates A/B used to return before Gate C, so these lock that skipping A/B leaves Gate C
+      // in force: the error is the tier gate's, not the score gate's.
+      it.each([
+        ['unknown', originatorMeta('unknown').taskMetadata, "tier ('unknown')"],
+        ['blocked', originatorMeta('blocked').taskMetadata, "tier ('blocked')"],
+        [
+          'missing (#1059)',
+          { originator: { contactId: 'contact-abc', systemRole: null, channel: 'email', initiatedAt: new Date().toISOString() } },
+          "tier ('unresolved')",
+        ],
+      ])('an outside originator with tier %s is still held by Gate C below 60 and below 70', async (_tier, taskMetadata, tierError) => {
+        for (const score of [55, 65]) {
+          const { registry, layer } = makeLayer(score);
+          const handler = makeHandler('should not run');
+          registry.register(makeRiskyManifest('email-send', 'medium'), handler);
+
+          const result = await layer.invoke(
+            'email-send',
+            { to: 'principal', subject: 'Heads-up', body: 'Someone wrote.' },
+            undefined,
+            { taskMetadata },
+          );
+
+          expect(result.success).toBe(false);
+          if (!result.success) {
+            expect(result.error).toContain(tierError);
+            expect(result.error).not.toContain('autonomy score is');
+          }
+          expect(handler.execute).not.toHaveBeenCalled();
+        }
       });
 
       it.each([
@@ -2860,6 +2913,52 @@ describe('autonomy gates', () => {
 
         expect(result.success).toBe(false);
         expect(handler.execute).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['a raw third-party address', 'bob@example.com'],
+        ['a third-party contact id', BOB_REF],
+      ])('email-reply on a principal-only thread is still gated with an explicit cc of %s', async (_label, cc) => {
+        const gateway = makeEmailGateway({
+          from: [{ email: 'ceo@example.com' }],
+          to: [{ email: 'curia@example.com' }],
+        });
+        for (const score of [55, 65]) {
+          const { registry, layer } = makeLayer(score, { outboundGateway: gateway });
+          const handler = makeHandler('should not run');
+          registry.register(makeRiskyManifest('email-reply', 'medium'), handler);
+
+          const result = await layer.invoke(
+            'email-reply',
+            { reply_to_message_id: 'msg-1', body: 'Done.', cc },
+            undefined,
+            roleMeta('system'),
+          );
+
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error).toContain(`autonomy score is ${score}`);
+          expect(handler.execute).not.toHaveBeenCalled();
+        }
+      });
+
+      it('email-reply on a principal-only thread with cc "principal" runs', async () => {
+        const gateway = makeEmailGateway({
+          from: [{ email: 'ceo@example.com' }],
+          to: [{ email: 'curia@example.com' }],
+        });
+        const { registry, layer } = makeLayer(55, { outboundGateway: gateway });
+        const handler = makeHandler('ok');
+        registry.register(makeRiskyManifest('email-reply', 'medium'), handler);
+
+        const result = await layer.invoke(
+          'email-reply',
+          { reply_to_message_id: 'msg-1', body: 'Done.', cc: 'principal' },
+          undefined,
+          roleMeta('system'),
+        );
+
+        expect(result.success).toBe(true);
+        expect(handler.execute).toHaveBeenCalledOnce();
       });
 
       it('email-reply is still gated when the thread cannot be fetched', async () => {

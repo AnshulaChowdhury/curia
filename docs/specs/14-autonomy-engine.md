@@ -226,8 +226,8 @@ A send whose recipients are **all the verified principal** also skips Gates A an
 
 - **Which sends.** The send skills with a Gate C carve-out (`email-send`, `email-reply`, `signal-send`, `sms-send`, `slack-send`). The test is the #1301 recipient check (`resolvePrincipalIsSoleRecipientFromSkillInput`) on the recipients Gate C would judge: references replaced by the addresses resolved before the gates, and for `email-reply` the thread's To and CC with Curia's own mailboxes left out. Two of the principal's own addresses still count. Any third party, any `bcc`, an unmodeled recipient field, a reference that can't be resolved, or a thread that can't be fetched keeps the gates on.
 - **Only when it matters.** The check runs only when Gate A or B would block, so a send above the threshold costs nothing extra.
-- **Gate C still runs.** For an outside originator the #1301 carve-out allows a principal-only send there too.
-- **Why it is safe.** The gateway already lets a send to the principal alone past its own score gate, and does not send it to the band review. The relay budget caps how often an outside contact can make Curia message the principal. A report whose only recipient is the principal is never a disclosure (see *Personal details* below).
+- **Gate C still runs, and can still hold the send.** For an outside originator under `tier` gating, the #1301 carve-out allows a principal-only send only from a `known` contact or above. An `unknown` or `blocked` originator still escalates. An outside originator with no tier recorded still fails closed (#1059), under both `tier` and `band`. Under `band`, Gate C passes every other send on to the gateway. System and agent tasks skip Gate C.
+- **Why it is safe.** The gateway already lets a send to the principal alone past its own score gate, and does not send it to the band review. The relay budget caps how often an outside contact can make Curia message the principal. Emails with attachments are not counted (see [Relay budget](#relay-budget-relaybudget-srcautonomyrelay-budgetts-1320)). A report whose only recipient is the principal is never a disclosure (see *Personal details* below).
 - **Logged** at `info` (`gates A and B skipped — recipient set is exclusively the verified principal`), like the lineage bypass.
 
 `deliver-approval` stays `action_risk: none`. It takes no recipient input (it always messages the principal, on a channel chosen from the principal's preferences), so the recipient check has nothing to read. It is a system path that has to work at any score.
@@ -306,7 +306,7 @@ Effective standing is also what handlers see: `ctx.taskMetadata` carries the pos
 | Draft | 60–69 | Principal confirms | Drafts | Drafts | Digest, plus the asks |
 | Restricted | <60 | Proposes only | Drafts only | Drafts only | Digest |
 
-At every band an outsider steering Curia means the action is held, the integrity rules block, and the fact check runs whenever Curia speaks as the principal. Gates A and B are unchanged and apply on top. The table covers messages to other people: at every band, a send to the principal alone goes out (see [Principal-only send bypass](#principal-only-send-bypass)).
+At every band an outsider steering Curia means the action is held, the integrity rules block, and the fact check runs whenever Curia speaks as the principal. For sends to other people, Gates A and B are unchanged and apply on top. A send to the principal alone skips them at every band (see [Principal-only send bypass](#principal-only-send-bypass)), though Gate C can still hold it.
 
 ### Gate C under band (`runBandGateC`, `src/skills/execution.ts`)
 
