@@ -18,6 +18,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`doc-write` `section-delete`** — removes one `##` section and its heading; a missing section errors. (#2339)
 - **`migrate:standing-rules`** — one-off script moves inbox and calendar rule arrays into `/shared/` documents. (#2339)
 - **Scenario `seed.pinned`** — cases seed the documents and settings agents read through `pinned_context`. (#2339)
+- **`inspect-prompts` pinned values** — snapshot carries every declared `pinned_context` entry for curia-deploy's eval harness. (#2339)
 - **`pinned_context`** — **public API:** agent YAML field injecting declared `/shared/` documents and config keys every turn. (#2338)
 - **`/shared/` documents** — durable, never archived with a project; only declaring agents can write them. (#2338)
 - **ADR-056** — `pinned_context`: declaration is write permission; `/shared/` is durable by prefix. (#2338)
