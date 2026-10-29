@@ -89,6 +89,7 @@ const MAX_REVIEWED_ITEMS = 10;
 const REDACTION_TOKEN = /\[REDACTED: [A-Z0-9_]+\]/;
 const TOO_MANY_DETAIL = 'This message contains more personal details than can be reviewed at once. Send fewer, or split the message.';
 const TOKEN_DETAIL = 'This message contains a redaction placeholder. Rewrite it with the real content or without that part.';
+const SPEAKS_BELOW_80_REASON = 'Held for the principal: this message speaks for or commits the principal, and the autonomy band asks first for that.';
 const UNREVIEWED_BELOW_80_REASON = 'Held for the principal: the reviewer was unavailable, and this band asks first when it is.';
 
 /** What the drafter is told when a send is blocked; the gateway appends the findings. */
@@ -156,9 +157,12 @@ export type BandReviewDecision =
   // dropQuote: only the quoted message's details stopped it; it goes without the quote (#2312).
   | { kind: 'send'; report?: BandReviewReport; signals?: BandReviewSignals; dropQuote?: { labels: string[] } }
   // strangerRequest: a recipient nobody can ask about requested these items; the digest is told (#2312).
-  | { kind: 'bounce'; findings: FilterFinding[]; strangerRequest?: { labels: string[]; requester: string } }
+  // heldBeside: a steering hold this bounce outranked (#2333). The drafter sees only `findings`; a
+  // send that can't be rewritten (a saved draft) holds with both, so its warning still shows.
+  | { kind: 'bounce'; findings: FilterFinding[]; strangerRequest?: { labels: string[]; requester: string }; heldBeside?: FilterFinding[] }
   // Not sent, and not held for the principal: the drafter must rewrite it again (80+ only). The gateway converts it to a hold for a relayed reply or a saved draft.
-  | { kind: 'block'; reason: string; findings: FilterFinding[] }
+  // heldBeside: a hold this block outranked (#2333). The drafter sees only `findings`; the converted hold shows both.
+  | { kind: 'block'; reason: string; findings: FilterFinding[]; heldBeside?: FilterFinding[] }
   // ask: the hold waits only on the principal's yes to a requester (#2312).
   | { kind: 'hold'; reason: string; findings: FilterFinding[]; ask?: BandReviewAsk };
 
@@ -254,13 +258,18 @@ export class BandSendReview {
     detected: readonly BriefDetectedItem[],
     hasPrior: boolean,
   ): BandReviewDecision {
+    const speaksBelow80 = verdict.speaksAsPrincipal === true && !isSpotCheckOrAbove(input.score);
     if (verdict.purpose === 'steered') {
       this.deps.logger.info({ conversationId: input.conversationId, channel: input.channel }, 'band review: held — steered by an outsider');
-      return this.hold(BAND_RULES.steered, 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.');
+      const steered = this.hold(BAND_RULES.steered, 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.');
+      // Both reasons hold it, so the approval shows both (#2333).
+      return speaksBelow80 && steered.kind === 'hold'
+        ? { ...steered, findings: [...steered.findings, { rule: BAND_RULES.speaksAsPrincipal, detail: SPEAKS_BELOW_80_REASON }] }
+        : steered;
     }
-    if (verdict.speaksAsPrincipal === true && !isSpotCheckOrAbove(input.score)) {
+    if (speaksBelow80) {
       this.deps.logger.info({ conversationId: input.conversationId, channel: input.channel, score: input.score }, 'band review: held — speaks for the principal below 80');
-      return this.hold(BAND_RULES.speaksAsPrincipal, 'Held for the principal: this message speaks for or commits the principal, and the autonomy band asks first for that.');
+      return this.hold(BAND_RULES.speaksAsPrincipal, SPEAKS_BELOW_80_REASON);
     }
 
     const claims = verdict.unsupportedClaims ?? [];
@@ -668,6 +677,27 @@ export class BandSendReview {
 
 const STRICTNESS: Record<BandReviewDecision['kind'], number> = { send: 0, bounce: 1, hold: 2, block: 3 };
 
+/** A bounce with a personal-details finding: the drafter must rewrite without an item (#2333). */
+function rewritesDetails(d: BandReviewDecision): boolean {
+  return d.kind === 'bounce' && d.findings.some((f) => f.rule === BAND_RULES.pii);
+}
+
+/** The bounce or block, carrying the reasons of the hold it outranked (#2333). */
+function withHeldBeside(winner: BandReviewDecision, hold: BandReviewDecision): BandReviewDecision {
+  if ((winner.kind !== 'bounce' && winner.kind !== 'block') || hold.kind !== 'hold') return winner;
+  return { ...winner, heldBeside: [...(winner.heldBeside ?? []), ...hold.findings] };
+}
+
+/**
+ * A hold raised because the send is steered by an outsider, with no ask (#2333). It may also
+ * speak for the principal below 80: steering is what would hand the details to an outsider.
+ */
+function steeredOnly(d: BandReviewDecision): boolean {
+  return d.kind === 'hold' && !d.ask
+    && d.findings.some((f) => f.rule === BAND_RULES.steered)
+    && d.findings.every((f) => f.rule === BAND_RULES.steered || f.rule === BAND_RULES.speaksAsPrincipal);
+}
+
 /** Who directed the work behind a send: the principal's own turn, the principal's task, or nobody. */
 type Authority = 'principal' | 'principal-task' | 'none';
 
@@ -675,8 +705,13 @@ type Authority = 'principal' | 'principal-task' | 'none';
  * The strictest of two outcomes: block > hold > bounce > send. Equal outcomes merge, so the
  * drafter or the principal sees every rule that fired; the first one's reason leads.
  *
- * One exception (#2312): a bounce beats an ask. The ask waits only on the principal's yes, and
+ * Two exceptions. A bounce beats an ask (#2312): the ask waits only on the principal's yes, and
  * a yes would send the other finding too; the drafter fixes that first, and the recheck asks.
+ * A bounce over personal details beats a hold for steering (#2333), alone or beside speaking for
+ * the principal below 80: that approval would show the details as sent if approved, to an
+ * outsider steering the send. The drafter rewrites without them, and a recheck that is still
+ * steered holds without them. The bounce carries the hold's findings (`heldBeside`), so a saved
+ * draft the gateway holds still shows them.
  *
  * Two holds merge into a plain hold, except that an ask survives a hold for speaking as the
  * principal below 80 (#2312): the principal is asked first either way, and the question names
@@ -686,6 +721,11 @@ type Authority = 'principal' | 'principal-task' | 'none';
 export function combine(a: BandReviewDecision, b: BandReviewDecision): BandReviewDecision {
   if (a.kind === 'bounce' && b.kind === 'hold' && b.ask) return a;
   if (b.kind === 'bounce' && a.kind === 'hold' && a.ask) return b;
+  if (rewritesDetails(a) && steeredOnly(b)) return withHeldBeside(a, b);
+  if (rewritesDetails(b) && steeredOnly(a)) return withHeldBeside(b, a);
+  // A block outranks a hold, but the gateway holds a block nobody can rewrite: it keeps the hold's reasons (#2333).
+  if (a.kind === 'block' && b.kind === 'hold') return withHeldBeside(a, b);
+  if (b.kind === 'block' && a.kind === 'hold') return withHeldBeside(b, a);
   if (STRICTNESS[a.kind] !== STRICTNESS[b.kind]) return STRICTNESS[a.kind] > STRICTNESS[b.kind] ? a : b;
   if (a.kind === 'send' && b.kind === 'send') {
     const report = a.report ?? b.report;
@@ -700,9 +740,18 @@ export function combine(a: BandReviewDecision, b: BandReviewDecision): BandRevie
   }
   if (a.kind === 'bounce' && b.kind === 'bounce') {
     const strangerRequest = a.strangerRequest ?? b.strangerRequest;
-    return { kind: 'bounce', findings: [...a.findings, ...b.findings], ...(strangerRequest ? { strangerRequest } : {}) };
+    const heldBeside = [...(a.heldBeside ?? []), ...(b.heldBeside ?? [])];
+    return {
+      kind: 'bounce',
+      findings: [...a.findings, ...b.findings],
+      ...(strangerRequest ? { strangerRequest } : {}),
+      ...(heldBeside.length > 0 ? { heldBeside } : {}),
+    };
   }
-  if (a.kind === 'block' && b.kind === 'block') return { kind: 'block', reason: a.reason, findings: [...a.findings, ...b.findings] };
+  if (a.kind === 'block' && b.kind === 'block') {
+    const heldBeside = [...(a.heldBeside ?? []), ...(b.heldBeside ?? [])];
+    return { kind: 'block', reason: a.reason, findings: [...a.findings, ...b.findings], ...(heldBeside.length > 0 ? { heldBeside } : {}) };
+  }
   if (a.kind === 'hold' && b.kind === 'hold') {
     const findings = [...a.findings, ...b.findings];
     const ask = a.ask ?? b.ask;

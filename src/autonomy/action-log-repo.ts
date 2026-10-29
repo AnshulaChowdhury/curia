@@ -508,6 +508,35 @@ export class ActionLogRepo {
   }
 
   /**
+   * The pending, unexpired approvals the principal has been shown (#2333), newest first:
+   * what a principal turn may be answering. `replyThreadId` marks the one whose approval
+   * email that thread is (an `email-thread` binding). `conversationIds` narrows the read to
+   * those conversations (the scenario harness's per-run scope); production omits it.
+   */
+  async findAwaitingAnswer(options: {
+    limit: number;
+    replyThreadId?: string;
+    conversationIds?: readonly string[];
+  }): Promise<Array<ActionLogRow & { repliedTo: boolean }>> {
+    const result = await this.pool.query(
+      `SELECT a.*,
+              EXISTS (
+                SELECT 1 FROM approval_message_bindings b
+                 WHERE b.action_log_id = a.id AND b.channel = 'email-thread' AND b.message_id = $2
+              ) AS replied_to
+         FROM autonomy_action_log a
+        WHERE a.outcome = 'pending_approval'
+          AND a.expires_at > now()
+          AND a.notification_sent_at IS NOT NULL
+          AND ($3::text[] IS NULL OR a.conversation_id = ANY($3::text[]))
+        ORDER BY replied_to DESC, a.created_at DESC
+        LIMIT $1`,
+      [options.limit, options.replyThreadId ?? null, options.conversationIds ? [...options.conversationIds] : null],
+    );
+    return result.rows.map((row) => ({ ...mapRow(row), repliedTo: row.replied_to === true }));
+  }
+
+  /**
    * Return all pending_approval rows that have passed their expiry time.
    * These are the inverse of findAllPending() — rows where expires_at <= now().
    * Used by ApprovalExpirySweep (src/autonomy/approval-expiry-sweep.ts) to transition stale requests.

@@ -63,6 +63,12 @@ redactor behaves as before and the gateway only reports what it removed.
    the message's own items fail closed, never open: the draft bounces (held below 80, which
    holds every unreviewed send). Items only in a quoted message follow decision 4: the send
    takes the ordinary judge-failure path without the quote, so an unreviewed quote never goes out.
+   The rewrite also comes before a hold for steering (#2333), alone or beside speaking for
+   the principal below 80: that approval
+   would offer the principal the details to send as written, to whoever steered the send. A
+   recheck that is still steered holds without them. A saved draft can't be rewritten, so it
+   holds, showing both reasons; so does a blocked rewrite that a relayed reply or saved draft
+   holds instead.
 4. **Quoted-thread exemption.** A detail that appears only in quoted text is not a
    disclosure when every non-principal recipient was already on the quoted message, which the
    gateway confirms from that message's own headers, never from the caller's word. Otherwise
@@ -91,6 +97,9 @@ redactor behaves as before and the gateway only reports what it removed.
    `approve-action` / `deny-action`) is stored in `disclosure_decisions` per conversation,
    counterparty and label: a yes authorizes that label to that counterparty on that thread, a
    no turns later asks there into bounces, and the principal's newest explicit live word wins.
+   A text answer is matched by the coordinator, which sees the approvals the principal was
+   shown listed on their turn, the one replied to on its email thread marked (#2333); code
+   never resolves an approval from text.
 7. **Approvals are informed.** An approval display lists every personal detail (label and
    value) so an approved replay goes out intact; `approve-action` refuses an approval the
    principal was never shown when it carries personal details, and records a yes only for a

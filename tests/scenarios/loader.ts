@@ -22,6 +22,7 @@ import {
   type BehaviorWeight,
   type DelegationMode,
   type DeliveryChannel,
+  type DeliveryTurn,
   type ExpectedBehavior,
   type ReviewOutcome,
   type IdentityFixture,
@@ -92,7 +93,7 @@ const RESUME_KEYS = ['agent', 'original_task', 'context'] as const;
 const REPLY_KEYS = ['from', 'content'] as const;
 const THREAD_KEYS = ['key', 'topic', 'creator', 'participants', 'content', 'mentions'] as const;
 const INBOUND_KEYS = ['from', 'channel', 'content', 'thread', 'author', 'requester', 'email', 'task', 'followup', 'then'] as const;
-const THEN_KEYS = ['content', 'channel'] as const;
+const THEN_KEYS = ['content', 'channel', 'reply_to_approval'] as const;
 const FOLLOWUP_KEYS = ['after', 'from', 'content', 'channel'] as const;
 /** A follow-up held this long still releases the first tool, so a flag-off run can finish. */
 const FOLLOWUP_MAX_DELAY_MS = 120_000;
@@ -127,7 +128,7 @@ const CHECK_KEYS: Record<string, readonly string[]> = {
   any_of: ['any_of'],
 };
 const GATEWAY_CHECK_KEYS: Record<typeof GATEWAY_CHECK_KINDS[number], readonly string[]> = {
-  delivered: ['channel', 'to', 'cc_includes', 'contains', 'excludes', 'count', 'own_text', 'quote_contains'],
+  delivered: ['channel', 'to', 'cc_includes', 'contains', 'excludes', 'count', 'own_text', 'quote_contains', 'turn'],
   not_delivered: ['to'],
   held: ['contains'],
   not_held: ['contains'],
@@ -228,8 +229,11 @@ function parseGatewayCheck(kind: typeof GATEWAY_CHECK_KINDS[number], raw: Raw, f
       const ownText = optBool(body, 'own_text', file, at);
       if (ownText === false) throw new CaseError(file, `${at}: 'own_text' is true or absent`);
       const quoteContains = strList(body, 'quote_contains', file, at);
+      const turn = optStr(body, 'turn', file, at);
+      if (turn !== undefined && turn !== 'first' && turn !== 'then') throw new CaseError(file, `${at}: 'turn' must be first or then`);
       return {
         kind,
+        ...(turn !== undefined ? { turn: turn as DeliveryTurn } : {}),
         ...(channel !== undefined ? { channel: channel as DeliveryChannel } : {}),
         ...(to !== undefined ? { to } : {}),
         ...(cc !== undefined ? { ccIncludes: cc } : {}),
@@ -754,7 +758,11 @@ function parseThen(raw: unknown, file: string): ScenarioPrincipalTurn {
   if (PRINCIPAL_LOCAL_CHANNELS.includes(channel)) {
     throw new CaseError(file, `inbound.then.channel must be a channel the principal has a verified identity on (not '${channel}')`);
   }
-  return { content: str(raw, 'content', file, 'inbound.then'), channel };
+  const replyToApproval = optBool(raw, 'reply_to_approval', file, 'inbound.then');
+  if (replyToApproval !== undefined && channel !== 'email') {
+    throw new CaseError(file, `inbound.then.reply_to_approval needs channel: email (a reply on the approval email's thread)`);
+  }
+  return { content: str(raw, 'content', file, 'inbound.then'), channel, ...(replyToApproval === true ? { replyToApproval: true } : {}) };
 }
 
 function parseFollowup(raw: unknown, file: string, inboundFrom: string): ScenarioFollowup {
@@ -1268,6 +1276,14 @@ function validateReferences(scenario: ScenarioCase, file: string): void {
   }
 
   const follow = scenario.inbound.followup;
+  // A delivery's turn is recorded only around an inbound.then (#2333).
+  if (!scenario.inbound.then) {
+    for (const b of scenario.expectedBehaviors) {
+      if ((b.check ? leafChecks(b.check) : []).some(c => c.kind === 'delivered' && c.turn !== undefined)) {
+        throw new CaseError(file, `behavior '${b.id}': a delivered check's 'turn' needs inbound.then`);
+      }
+    }
+  }
   if (scenario.inbound.then && toSpecialist) {
     throw new CaseError(file, `inbound.then is a principal turn to the coordinator; a case for '${scenario.agent}' cannot take one`);
   }

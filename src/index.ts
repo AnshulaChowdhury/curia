@@ -3102,7 +3102,7 @@ async function main(): Promise<void> {
           contacts: contactService,
         }
       : undefined,
-    principalBacklog: createPrincipalBacklogSource(pool),
+    principalBacklog: createPrincipalBacklogSource(pool, actionLogRepo),
     verification: verificationRuntime,
     turnLanes,
     // A non-principal email that replies to Curia's outreach arrives linked to its task

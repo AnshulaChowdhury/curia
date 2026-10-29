@@ -19,7 +19,7 @@ import {
   type RecordedReply,
   type SubjectClearResult,
 } from '../../src/dispatch/outbound-context.js';
-import type { PrincipalBacklogSource } from '../../src/dispatch/principal-backlog.js';
+import { readAwaitingAnswers, type PrincipalBacklogSource } from '../../src/dispatch/principal-backlog.js';
 import type { BullpenService } from '../../src/memory/bullpen.js';
 import type { TestModeStack } from '../../src/startup/test-mode-stack.js';
 import { registrableDomain } from '../../src/verification/domain.js';
@@ -80,6 +80,8 @@ export class SeedScope {
   readonly principalWroteTo = new Set<string>();
   /** What the run says is waiting on the principal (`seed.backlog`); none when unset. */
   backlog: PrincipalBacklogCounts | undefined;
+  /** How many deliveries the run had when its `inbound.then` turn began (#2333); unset without one. */
+  thenStartsAt: number | undefined;
   /**
    * The run's own conversation (harness.ts sets it when the run begins). With
    * specialistConversations, the conversations whose approvals, outreach and decisions are
@@ -129,6 +131,7 @@ export class SeedScope {
     this.aliveSessions.clear();
     this.principalWroteTo.clear();
     this.backlog = undefined;
+    this.thenStartsAt = undefined;
     this.rootConversation = undefined;
     this.throughGateway = false;
     this.threadMessages.clear();
@@ -449,11 +452,20 @@ const NO_BACKLOG: PrincipalBacklogCounts = { decayWarnings: 0, pendingApprovals:
  * calling run's `seed.backlog` rather than the shared database. Production's counts span
  * every row, so a real one would hand each run whatever the instance and the other runs
  * hold. The SQL has its own test (tests/integration/principal-backlog.test.ts); a case
- * stubs the list tools to show what its counts promise.
+ * stubs the list tools to show what its counts promise. The approvals awaiting an answer
+ * (#2333) are the exception: production's read, narrowed to the run's own conversations,
+ * so a held send the run raised is listed as it would be.
  */
-export function scopedPrincipalBacklog(currentScope: CurrentScope): PrincipalBacklogSource {
+export function scopedPrincipalBacklog(currentScope: CurrentScope, actionLogRepo?: Pick<ActionLogRepo, 'findAwaitingAnswer'>): PrincipalBacklogSource {
   return {
     counts: async (): Promise<PrincipalBacklogCounts> => currentScope()?.backlog ?? NO_BACKLOG,
+    // Production's read (#2333), over the calling run's conversations only.
+    ...(actionLogRepo ? {
+      awaitingAnswers: async (options: { replyThreadId?: string }) => {
+        const scope = currentScope();
+        return scope ? readAwaitingAnswers(actionLogRepo, { ...options, conversationIds: runConversations(scope) }) : [];
+      },
+    } : {}),
   };
 }
 
@@ -1197,8 +1209,9 @@ export async function readGatewayOutcome(stack: TestModeStack, scenario: Scenari
 
   const same = (a: string[], b: string[]): boolean => a.length === b.length && [...a].sort().every((v, i) => v === [...b].sort()[i]);
   return {
-    deliveries: scope.deliveries.map(d => ({
+    deliveries: scope.deliveries.map((d, i) => ({
       channel: d.channel,
+      ...(scope.thenStartsAt !== undefined ? { turn: i < scope.thenStartsAt ? 'first' as const : 'then' as const } : {}),
       kind: d.kind,
       to: d.to,
       cc: d.cc,
@@ -1220,6 +1233,7 @@ export async function readGatewayOutcome(stack: TestModeStack, scenario: Scenari
         description: r.description,
         ...(shown ? { preamble: shown.preamble } : {}),
         ...(shown?.extraLines ? { extraLines: shown.extraLines } : {}),
+        ...(shown ? heldMessage(shown.payload) : {}),
       };
     }),
     // A seeded row counts only when the run's sends added to it.
@@ -1231,4 +1245,10 @@ export async function readGatewayOutcome(stack: TestModeStack, scenario: Scenari
     decisions: decisions.rows.map(r => ({ label: r.label, decision: r.decision })),
     reviewerFailedOpen: scope.failOpen.isTripped(),
   };
+}
+
+/** The held message's own text from an approval's display payload (#2333): subject, body, message. */
+function heldMessage(payload: Record<string, unknown>): { message?: string } {
+  const parts = ['subject', 'body', 'message'].map(k => payload[k]).filter((v): v is string => typeof v === 'string' && v.length > 0);
+  return parts.length > 0 ? { message: parts.join('\n') } : {};
 }

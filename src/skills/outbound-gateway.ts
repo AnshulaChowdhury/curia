@@ -149,6 +149,8 @@ function emailProvenanceFromPayload(payload: EmailSendRequest): {
 export interface OutboundSendResult {
   success: boolean;
   messageId?: string;
+  /** The provider's thread for a sent email (#2333): a reply to it arrives on this thread. */
+  threadId?: string;
   /** Human-readable reason when success is false */
   blockedReason?: string;
   /**
@@ -466,6 +468,14 @@ function relayNoticeRequest(request: OutboundSendRequest, text: string, subject:
  *     detail. This preserves the existing "no sensitive content in the notification"
  *     invariant for the deterministic stage.
  */
+/**
+ * The reasons of a hold a bounce or block outranked (#2333), as sentences to append when nobody
+ * can rewrite the send (a saved draft, a relayed reply), so they still apply. Rule details only.
+ */
+function heldBesideNote(heldBeside: readonly FilterFinding[] | undefined): string {
+  return (heldBeside ?? []).map((f) => ` ${f.detail.replace(/^Held for the principal: /, 'Also, ')}`).join('');
+}
+
 function buildBlockReasonSummary(findings: Array<{ rule: string; detail: string }>): string {
   if (findings.length === 0) return 'Content filter (no rule detail available)';
   return findings
@@ -1630,6 +1640,7 @@ export class OutboundGateway {
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
+          ...(result.threadId ? { threadId: result.threadId } : {}),
           parentEventId: options?.parentEventId,
           ...disclosed,
           ...(exportAuditItems && exportAuditItems.length > 0
@@ -1963,6 +1974,8 @@ export class OutboundGateway {
           recipientId: row.recipient,
           content,
           messageId: result.messageId,
+          // A queued approval email binds its thread from this (#2333): reaction-approval-mapper.
+          ...(result.threadId ? { threadId: result.threadId } : {}),
         });
         flushed += 1;
       }
@@ -2247,11 +2260,13 @@ export class OutboundGateway {
     // A block asks the drafter to rewrite, so it needs one waiting. A dispatcher relay's
     // drafter is gone and a saved draft cannot be rewritten in place: the principal decides.
     if (decision.kind === 'block' && (options?.postTurn === true || args.editable === false)) {
-      const rules = decision.findings.map((f) => f.rule).join(', ');
+      // A hold the block outranked comes along (#2333): the principal sees its warning.
+      const findings = [...decision.findings, ...(decision.heldBeside ?? [])];
+      const rules = [...new Set(findings.map((f) => f.rule))].join(', ');
       decision = {
         kind: 'hold',
-        reason: `Held for the principal: after one rewrite it still has these problems (${rules}).`,
-        findings: decision.findings,
+        reason: `Held for the principal: after one rewrite it still has these problems (${rules}).${heldBesideNote(decision.heldBeside)}`,
+        findings,
       };
     }
 
@@ -2260,16 +2275,18 @@ export class OutboundGateway {
     if (args.editable === false && decision.kind === 'bounce' && decision.strangerRequest) {
       const { requester, labels } = decision.strangerRequest;
       const details = describePiiLabels(labels);
+      // A steering hold the bounce outranked is still said (#2333).
+      const beside = heldBesideNote(decision.heldBeside);
       await this.queueBlockReport(
-        `${normalizeCounterparty(requester)} asked for your ${details}. Curia didn't send the saved draft that shared it.`,
+        `${normalizeCounterparty(requester)} asked for your ${details}. Curia didn't send the saved draft that shared it.${beside}`,
         options?.conversationId ?? undefined,
         options?.taskEventId ?? options?.parentEventId ?? 'system',
       );
       return {
         result: {
           success: false,
-          blockedReason: `Not sent: this saved draft shares the principal's ${details} with someone who asked for it, and nothing authorizes that. Save a version without them, or tell the principal.`,
-          blockedRules: decision.findings.map((f) => f.rule),
+          blockedReason: `Not sent: this saved draft shares the principal's ${details} with someone who asked for it, and nothing authorizes that. Save a version without them, or tell the principal.${beside}`,
+          blockedRules: [...new Set([...decision.findings, ...(decision.heldBeside ?? [])].map((f) => f.rule))],
         },
       };
     }
@@ -2278,11 +2295,14 @@ export class OutboundGateway {
     // asks for a rewrite it cannot get, and copying the principal would change its stored
     // recipients: the principal decides either way. Rule names and labels only, never values.
     if (args.editable === false && (args.detectedItems?.length ?? 0) > 0 && decision.kind === 'bounce') {
-      const rules = decision.findings.map((f) => f.rule).join(', ');
+      // A steering hold the bounce outranked comes along (#2333): the principal sees its warning.
+      const findings = [...decision.findings, ...(decision.heldBeside ?? [])];
+      const rules = [...new Set(findings.map((f) => f.rule))].join(', ');
+      const beside = heldBesideNote(decision.heldBeside);
       decision = {
         kind: 'hold',
-        reason: `Held for the principal: a saved draft can't be rewritten in place, and the review found these problems (${rules}).`,
-        findings: decision.findings,
+        reason: `Held for the principal: a saved draft can't be rewritten in place, and the review found these problems (${rules}).${beside}`,
+        findings,
       };
     }
 
@@ -2690,6 +2710,7 @@ export class OutboundGateway {
     conversationId?: string;
     taskEventId?: string;
     messageId?: string;
+    threadId?: string;
     parentEventId?: string;
     exportAudit?: {
       destination: string;
@@ -4046,6 +4067,7 @@ export class OutboundGateway {
       // Never the raw values (#2312): the redacted copy, an approved draft's included.
       content: redactedBody,
       messageId: sentMessage.id,
+      ...(sentMessage.threadId ? { threadId: sentMessage.threadId } : {}),
       conversationId: options?.conversationId,
       taskEventId: options?.taskEventId,
       parentEventId: options?.parentEventId,
@@ -4068,7 +4090,8 @@ export class OutboundGateway {
     }
     if (bandReport) await this.publishBandReport(bandReport, options);
 
-    return { success: true, messageId: sentMessage.id };
+    // The thread, as send() returns it (#2333): one delivery contract for both.
+    return { success: true, messageId: sentMessage.id, ...(sentMessage.threadId ? { threadId: sentMessage.threadId } : {}) };
   }
 
   /**
@@ -4468,7 +4491,7 @@ export class OutboundGateway {
         'outbound-gateway: message sent successfully',
       );
 
-      return { success: true, messageId: sent.id };
+      return { success: true, messageId: sent.id, ...(sent.threadId ? { threadId: sent.threadId } : {}) };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error(

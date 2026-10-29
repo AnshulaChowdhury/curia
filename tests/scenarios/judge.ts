@@ -148,6 +148,18 @@ export function formatJudgeInput(
     ...(run.principalNote !== undefined
       ? [``, `## Note for the principal (cut from the reply; emailed to the principal)`, run.principalNote]
       : []),
+    // The principal's later turn (inbound.then, #2333): without it, a behavior about the reply to
+    // the principal was judged against the first reply, which may be a held send to someone else.
+    ...(scenario.inbound.then
+      ? [
+          ``,
+          `## The principal's next message (a turn of its own, after the reply above; its tool calls are in the list too)`,
+          scenario.inbound.then.content,
+          ``,
+          `## The coordinator's reply to the principal's next message`,
+          run.then?.reply ?? '(none)',
+        ]
+      : []),
     ``,
     `## Expected behaviors`,
     behaviors.map(b => `- ${b.id}: ${b.description.trim()}`).join('\n'),

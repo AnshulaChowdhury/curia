@@ -116,6 +116,13 @@ export interface AgentTaskPayload {
    * never part of `content`. Absent means nothing is waiting, or the count failed.
    */
   principalBacklog?: import('../agents/prompts/backlog-line.js').PrincipalBacklogCounts;
+  /**
+   * The approvals the principal has been shown and not answered (#2333): set by the
+   * dispatcher on a live principal turn when there are any, newest first, the one replied
+   * to on its email thread marked. The runtime renders them with the turn guidance
+   * (src/agents/prompts/awaiting-answers.ts); never part of `content`.
+   */
+  awaitingAnswers?: import('../agents/prompts/awaiting-answers.js').AwaitingAnswer[];
 }
 
 /** Coarse failure reason propagated on agent.response when isError is true.
@@ -264,6 +271,8 @@ interface OutboundDeliveredPayload {
   /** Provider message ID — Nylas message ID for email, Slack `ts`, or
    *  signal-cli send timestamp (stringified) for Signal. */
   messageId?: string;
+  /** Email only: the provider thread the message went out on (#2333), which a reply joins. */
+  threadId?: string;
   /** Bulk-export audit fields (#201) — populated when attachments leave the system. */
   exportAudit?: {
     destination: string;

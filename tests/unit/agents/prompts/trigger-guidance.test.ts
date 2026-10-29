@@ -12,6 +12,7 @@ import {
 } from '../../../../src/agents/prompts/turn-guidance.js';
 import { inboundTurnGuidance } from '../../../../src/dispatch/turn-guidance-triggers.js';
 import { BACKLOG_INSTRUCTION_LINES, PRINCIPAL_TASK_ANSWER_LINES, renderBacklogLine } from '../../../../src/agents/prompts/backlog-line.js';
+import { AWAITING_ANSWER_HEADER, AWAITING_ANSWER_LINES } from '../../../../src/agents/prompts/awaiting-answers.js';
 import { BULLPEN_REPLY_RULE } from '../../../../src/agents/prompts/bullpen-reply-rule.js';
 import {
   CLARIFICATION_NEXT_STEP_LINES,
@@ -219,6 +220,8 @@ describe('prompt-exfiltration markers cover the moved guidance', () => {
     ['delegate contacts-failure next_step', DELEGATE_FAILURE_NEXT_STEP_LINES['contacts']!.join('\n')],
     ['backlog line instruction', BACKLOG_INSTRUCTION_LINES.join('\n')],
     ['backlog line principal-task answer', PRINCIPAL_TASK_ANSWER_LINES.join('\n')],
+    ['awaiting answers header (#2333)', AWAITING_ANSWER_HEADER],
+    ['awaiting answers instruction (#2333)', AWAITING_ANSWER_LINES.join('\n')],
     ['bullpen reply rule', BULLPEN_REPLY_RULE],
     ['daily debrief recap', DAILY_DEBRIEF_RECAP_LINES.join('\n')],
     ['weekly debrief recap', WEEKLY_DEBRIEF_RECAP_LINES.join('\n')],

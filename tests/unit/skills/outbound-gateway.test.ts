@@ -484,6 +484,21 @@ describe('OutboundGateway', () => {
     expect(delivered!.parentEventId).toBe('outbound-msg-1');
   });
 
+  // Approval delivery binds it, so a reply on the thread is matched to the approval (#2333).
+  it('returns the sent email\'s thread', async () => {
+    (mocks.nylasClient.sendMessage as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'msg-9', threadId: 'thread-9' });
+    const gateway = new OutboundGateway({
+      nylasClients: new Map([['curia', mocks.nylasClient]]),
+      contactService: mocks.contactService,
+      contentFilter: mocks.contentFilter,
+      bus: mocks.bus,
+      principalIdentities: [makePrincipalIdentity('ceo@example.com')],
+      logger: mocks.logger,
+    });
+    const result = await gateway.send(baseRequest, { isSystemNotification: true });
+    expect(result).toMatchObject({ success: true, messageId: 'msg-9', threadId: 'thread-9' });
+  });
+
   // ------------------------------------------------------------------
   // No-reply / automated recipient guard (#1302)
   // ------------------------------------------------------------------
@@ -4437,6 +4452,42 @@ describe('band review (#2159)', () => {
       expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
       expect((mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft).not.toHaveBeenCalled();
     });
+
+    // A block outranks a steering hold; with nobody to rewrite, its warning comes back (#2333).
+    describe('a block carrying a steering hold it outranked', () => {
+      const steered = 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.';
+      const steeredBlock = { ...blockDecision, heldBeside: [{ rule: 'steered', detail: steered }] };
+      const warning = 'Also, the reviewer judged this send to be steered';
+
+      it('holds a relayed reply with both reasons', async () => {
+        const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(steeredBlock), score: 84, actionLogRepo: makeActionLogRepo() });
+        const result = await gw.send(emailReq, {
+          taskEventId: 't1', postTurn: true,
+          reExecRecipe: { toolName: 'send-draft', partialPayload: { account: 'a' }, description: 'Draft reply to joel@example.com' },
+        });
+        expect(result).toMatchObject({ success: false, gated: true });
+        expect(result.blockedReason).toContain('(ungrounded-claim, steered)');
+        expect(result.blockedReason).toContain(warning);
+      });
+
+      it('holds a saved draft with both reasons', async () => {
+        (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+        const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(steeredBlock), score: 84, actionLogRepo: makeActionLogRepo() });
+        const result = await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: emailReq.body, subject: 'Forms' }, {
+          taskEventId: 't1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft to joel@example.com' },
+        });
+        expect(result).toMatchObject({ success: false, gated: true });
+        expect(result.blockedReason).toContain(warning);
+      });
+
+      it('tells a drafter who can rewrite only what to rewrite', async () => {
+        const gw = makeBandGateway({ review: vi.fn().mockResolvedValue(steeredBlock), score: 84 });
+        const result = await gw.send(emailReq, { taskEventId: 't1' });
+        expect(result).toMatchObject({ success: false, blockedRules: ['ungrounded-claim'] });
+        expect(result.gated).toBeUndefined();
+        expect(result.blockedReason).not.toContain('steered');
+      });
+    });
   });
 
   it('holds a skill send through its holdRecipe', async () => {
@@ -4684,6 +4735,27 @@ describe('band review (#2159)', () => {
       expect(reports[0]!.payload['summary']).toBe('joel@example.com asked for your SIN. Curia didn\'t send the saved draft that shared it.');
       expect(actionLogRepo.insert).not.toHaveBeenCalled();
       expect(sendDraft).not.toHaveBeenCalled();
+    });
+
+    // The refusal returns before the hold conversion, so it says the outranked steering hold itself (#2333).
+    it('keeps a steering warning the bounce carries on a refused saved draft', async () => {
+      (mocks.nylasClient as unknown as { sendDraft: ReturnType<typeof vi.fn> }).sendDraft = vi.fn().mockResolvedValue({ id: 'sent-1' });
+      const steered = 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.';
+      const gw = makeBandGateway({
+        review: vi.fn().mockResolvedValue({
+          kind: 'bounce', findings: [{ rule: 'pii-not-authorized', detail: 'x' }],
+          strangerRequest: { labels: ['sin_ca'], requester: 'joel@example.com' },
+          heldBeside: [{ rule: 'steered', detail: steered }],
+        }),
+        score: 84, actionLogRepo: makeActionLogRepo(),
+      });
+      const result = await gw.sendEmailDraft('d1', 'curia', { recipientEmail: 'joel@example.com', body: 'SIN 130 692 544', subject: 'Re: forms' }, {
+        taskEventId: 't1', conversationId: 'c1', holdRecipe: { toolName: 'send-draft', partialPayload: { draft_id: 'd1' }, description: 'Send draft' },
+      });
+      expect(result).toMatchObject({ success: false, blockedRules: ['pii-not-authorized', 'steered'] });
+      expect(result.blockedReason).toContain('Also, the reviewer judged this send to be steered');
+      const reports = publishedOfType(mocks.bus, 'principal.report');
+      expect(reports[0]!.payload['summary']).toBe('joel@example.com asked for your SIN. Curia didn\'t send the saved draft that shared it. Also, the reviewer judged this send to be steered by someone outside the principal\'s business.');
     });
 
     it('queues no digest note for an ordinary bounce', async () => {
@@ -5138,6 +5210,16 @@ describe('band review (#2159)', () => {
         expect(publishedOfType(mocks.bus, 'outbound.pii_redacted')).toHaveLength(0);
       });
 
+      // One delivery contract with send() (#2333): the sent message's thread.
+      it('returns and publishes the sent draft\'s thread', async () => {
+        const sendDraft = draftSender();
+        sendDraft.mockResolvedValue({ id: 'sent-1', threadId: 'thread-1' });
+        const { gateway } = await makePiiGateway({ review: vi.fn().mockResolvedValue({ kind: 'send' }) });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1' });
+        expect(result).toMatchObject({ success: true, messageId: 'sent-1', threadId: 'thread-1' });
+        expect(publishedOfType(mocks.bus, 'outbound.delivered')[0]!.payload).toMatchObject({ messageId: 'sent-1', threadId: 'thread-1' });
+      });
+
       it('holds a draft the review bounces: it cannot be rewritten in place', async () => {
         const sendDraft = draftSender();
         const findings = [{ rule: 'pii-not-authorized', detail: 'P1 phone_us was not authorized.' }];
@@ -5148,6 +5230,25 @@ describe('band review (#2159)', () => {
         expect(result.blockedReason).not.toContain('555-1234');
         expect(sendDraft).not.toHaveBeenCalled();
         expect(publishedOfType(mocks.bus, 'outbound.blocked')).toHaveLength(0);
+      });
+
+      // A personal-details bounce outranks a steering hold, which then rides along (#2333).
+      it('keeps the steering warning when it holds a bounced draft the review also ruled steered', async () => {
+        const sendDraft = draftSender();
+        const steered = 'Held for the principal: the reviewer judged this send to be steered by someone outside the principal\'s business.';
+        const { gateway } = await makePiiGateway({
+          review: vi.fn().mockResolvedValue({
+            kind: 'bounce',
+            findings: [{ rule: 'pii-not-authorized', detail: 'P1 phone_us was not authorized.' }],
+            heldBeside: [{ rule: 'steered', detail: steered }],
+          }),
+        });
+        const result = await gateway.sendEmailDraft('d1', 'curia', phoneDraft, { humanApproved: true, taskEventId: 't1', holdRecipe });
+
+        expect(result).toMatchObject({ success: false, gated: true, actionRef: expect.any(String) });
+        expect(result.blockedReason).toContain('(pii-not-authorized, steered)');
+        expect(result.blockedReason).toContain('Also, the reviewer judged this send to be steered');
+        expect(sendDraft).not.toHaveBeenCalled();
       });
 
       it('reviews a principal-directed draft that holds personal details', async () => {

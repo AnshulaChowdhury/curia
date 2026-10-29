@@ -102,7 +102,7 @@ export type BehaviorCheck =
    * only (subject and the body above a quoted message), so the sender's own quoted words do
    * not count as something Curia sent them.
    */
-  | { kind: 'delivered'; channel?: DeliveryChannel; to?: string; ccIncludes?: string; contains?: string[]; excludes?: string[]; count?: number; ownText?: boolean; quoteContains?: string[] }
+  | { kind: 'delivered'; channel?: DeliveryChannel; to?: string; ccIncludes?: string; contains?: string[]; excludes?: string[]; count?: number; ownText?: boolean; quoteContains?: string[]; turn?: DeliveryTurn }
   /** Nothing was delivered this run, or nothing to `to` when it is set. */
   | { kind: 'not_delivered'; to?: string }
   /**
@@ -369,6 +369,11 @@ export interface ScenarioPrincipalTurn {
   content: string;
   /** A channel the principal has a verified identity on (seed one with principal_identities). */
   channel: string;
+  /**
+   * Email only (#2333): the turn is a reply on the thread of the approval email the run
+   * delivered to the principal, as Nylas threads a reply, instead of a fresh email.
+   */
+  replyToApproval?: boolean;
 }
 
 /** When the harness publishes `ScenarioInbound.followup`. */
@@ -613,8 +618,13 @@ export interface GatewayOutcome {
   reviewerFailedOpen: boolean;
 }
 
+/** Which principal-facing turn a delivery happened in (#2333): before `inbound.then`, or in or after it. */
+export type DeliveryTurn = 'first' | 'then';
+
 export interface RecordedDelivery {
   channel: DeliveryChannel;
+  /** Set on a case with `inbound.then`: whether it went out before that turn began. */
+  turn?: DeliveryTurn;
   /** `draft`: created, not delivered. */
   kind: 'send' | 'draft';
   to: string[];
@@ -640,6 +650,11 @@ export interface RecordedHold {
   /** What the principal is shown at the top of the approval (an ask's question), when registered. */
   preamble?: string;
   extraLines?: string[];
+  /**
+   * The held message's own text as the approval shows it: subject, body or message, never the
+   * quoted thread (#2333). Approving sends it, so a check on what is offered reads it here.
+   */
+  message?: string;
 }
 
 export interface RecordedOutreach {

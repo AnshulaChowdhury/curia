@@ -284,7 +284,8 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
       const text = (d: RecordedDelivery): string =>
         `${d.subject ?? ''}\n${check.ownText ? d.ownBody ?? d.body : d.body}`.toLowerCase();
       const matching = delivered.filter(d =>
-        (check.channel === undefined || d.channel === check.channel)
+        (check.turn === undefined || d.turn === check.turn)
+        && (check.channel === undefined || d.channel === check.channel)
         && (check.to === undefined || names(check.to, d.to, d.toNames))
         && (check.ccIncludes === undefined || names(check.ccIncludes, d.cc, d.ccNames))
         && (check.contains ?? []).every(s => text(d).includes(s.toLowerCase()))
@@ -301,6 +302,7 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
         contains: termCount(check.contains), excludes: termCount(check.excludes),
         ...(check.ownText ? { own_text: true } : {}),
         ...(check.quoteContains ? { quote_contains: termCount(check.quoteContains) } : {}),
+        ...(check.turn ? { turn: check.turn } : {}),
       });
       return ok
         ? pass(`${matching.length} delivery(ies) matching ${wanted}`)
@@ -315,7 +317,7 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
     case 'held': {
       if (outcome.holds.length === 0) return miss('no approval was raised');
       const shown = (h: RecordedHold): string =>
-        [h.preamble ?? '', h.description ?? '', ...(h.extraLines ?? [])].join('\n').toLowerCase();
+        [h.preamble ?? '', h.description ?? '', ...(h.extraLines ?? []), h.message ?? ''].join('\n').toLowerCase();
       const hit = outcome.holds.find(h => (check.contains ?? []).every(s => shown(h).includes(s.toLowerCase())));
       return hit
         ? pass(`approval ${hit.approvalNumber ?? hit.shortRef} raised (${hit.toolName}, now ${hit.outcome})`)
@@ -323,7 +325,7 @@ function evaluateGatewayCheck(check: GatewayCheck, run: ScenarioRun): RunRating 
     }
     case 'not_held': {
       const shown = (h: RecordedHold): string =>
-        [h.preamble ?? '', h.description ?? '', ...(h.extraLines ?? [])].join('\n').toLowerCase();
+        [h.preamble ?? '', h.description ?? '', ...(h.extraLines ?? []), h.message ?? ''].join('\n').toLowerCase();
       const offending = outcome.holds.filter(h => (check.contains ?? []).every(s => shown(h).includes(s.toLowerCase())));
       return offending.length === 0
         ? pass(check.contains ? `no approval shows the ${termCount(check.contains)} text` : 'no approval was raised')

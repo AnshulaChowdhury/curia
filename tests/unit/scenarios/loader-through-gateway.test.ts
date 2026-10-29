@@ -151,6 +151,16 @@ expected_behaviors:`));
     ]);
   });
 
+  it('reads a delivered check\'s turn on a case with inbound.then (#2333)', () => {
+    const c = load(CASE.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { content: yes, channel: signal }\n').replace('count: 1 }', 'count: 1, turn: then }'));
+    expect(c.expectedBehaviors.map(b => b.check).find(k => k?.kind === 'delivered' && k.turn !== undefined)).toMatchObject({ turn: 'then' });
+  });
+
+  it('reads inbound.then.reply_to_approval on an email turn (#2333)', () => {
+    const c = load(CASE.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { content: "Yes, share it.", channel: email, reply_to_approval: true }\n'));
+    expect(c.inbound.then).toEqual({ content: 'Yes, share it.', channel: 'email', replyToApproval: true });
+  });
+
   it('accepts third-party fixtures under any .test name', () => {
     const c = load(CASE.replaceAll('vendor.example.test', 'vendorco.test').replace('[Vendor.example.test]', '[vendorco.test]'));
     expect(c.seed.contacts[0]!.identifier).toBe('pat@vendorco.test');
@@ -159,6 +169,9 @@ expected_behaviors:`));
 
   it.each([
     ['inbound.then on a console channel', (s: string) => s.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { content: approve, channel: cli }\n'), /verified identity/],
+    ['inbound.then.reply_to_approval off email', (s: string) => s.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { content: yes, channel: signal, reply_to_approval: true }\n'), /needs channel: email/],
+    ['a delivered turn without inbound.then', (s: string) => s.replace('count: 1 }', 'count: 1, turn: first }'), /'turn' needs inbound.then/],
+    ['a delivered turn that is not first or then', (s: string) => s.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { content: yes, channel: signal }\n').replace('count: 1 }', 'count: 1, turn: later }'), /'turn' must be first or then/],
     ['inbound.then without content', (s: string) => s.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { channel: signal }\n'), /'content' must be a non-empty string/],
     ['an unknown inbound.then key', (s: string) => s.replace('    sender_verified: true\n', '    sender_verified: true\n  then: { content: x, from: pat }\n'), /unknown key/],
     ['a contact on a real domain', (s: string) => s.replace('pat@vendor.example.test', 'pat@vendor.com'), /under a .test name/],

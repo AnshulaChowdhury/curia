@@ -720,7 +720,11 @@ Approving is elevated, so it needs a live principal turn. Two ways to give one:
   conversation filed under the run: same stubs, its calls listed with the run's, its rows the
   run's and cleaned with them. This is how a hold raised on a third party's turn is approved
   within the run. The checks read the run after this turn has settled; its reply is
-  `then.reply` in the results.
+  `then.reply` in the results. With `reply_to_approval: true` (email only, #2333) the turn is
+  a reply on the thread of the approval email the run delivered to the principal, read from
+  the `email-thread` binding approval delivery wrote; a run that delivered none errors. The
+  approvals the principal's turn lists (`awaitingAnswers`) are production's read over the
+  run's own conversations.
 
 ```yaml
 inbound:
@@ -768,6 +772,13 @@ send Pat the SIN Pat wrote to it" is `delivered: { to: pat, contains: [SIN], cou
 to split off), so it fails closed only for `count: 0` checks: a quoted term then counts against
 the case. For a positive check (`count` of 1 or more) it can match quoted text, so don't rely
 on it to prove the reply itself said something.
+
+On a case with `inbound.then`, each delivery records its turn: `first` before the principal's
+next turn began, `then` from it on. `turn` narrows a `delivered` check to one (#2333), so
+"nothing carrying the address reaches Dana before Avery answers" is
+`delivered: { to: dana, contains: ["@example.test"], count: 0, turn: first }`: without it, a
+detail leaked on the first turn and approved again on the second passes every other check.
+The loader rejects `turn` on a case without `inbound.then`.
 
 The `label` of `reviewed` and `decision_recorded` must be a detection label: a built-in
 pattern name (`phone_us`, `sin_ca`, `email`, ...) or `extra_N` for the operator's Nth extra

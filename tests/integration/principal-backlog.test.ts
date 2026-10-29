@@ -15,7 +15,7 @@ import { OPEN_TASK_STATUSES } from '../../src/agents/prompts/backlog-line.js';
 import { ActionLogRepo } from '../../src/autonomy/action-log-repo.js';
 import type { EventBus } from '../../src/bus/bus.js';
 import { TaskRepo } from '../../src/db/task-repo.js';
-import { createPrincipalBacklogSource } from '../../src/dispatch/principal-backlog.js';
+import { createPrincipalBacklogSource, readAwaitingAnswers } from '../../src/dispatch/principal-backlog.js';
 import { EmbeddingService } from '../../src/memory/embedding.js';
 import { KnowledgeGraphStore } from '../../src/memory/knowledge-graph.js';
 import { requireCuriaTestDatabase } from './require-test-db.js';
@@ -123,5 +123,44 @@ describeIf('principal backlog counts (prompt trim PR 7)', () => {
       pendingApprovals: before.pendingApprovals + 1,
       principalTasks: before.principalTasks + OPEN_TASK_STATUSES.length,
     });
+  });
+
+  // The approvals a principal turn may be answering (#2333): pending, unexpired, shown.
+  it('lists the pending approvals the principal was shown, the one replied to on its thread first', async () => {
+    const conversationId = `principal-backlog-awaiting-${randomUUID()}`;
+    const insert = async (opts: { expiresInMs?: number; outcome?: 'pending_approval' | 'approved'; shown?: boolean; description: string; ask?: boolean }): Promise<number> => {
+      const id = await actions.insert({
+        taskId,
+        conversationId,
+        toolName: 'signal-send',
+        actionRisk: 'medium',
+        outcome: opts.outcome ?? 'pending_approval',
+        shortRef: randomUUID().replace(/-/g, '').slice(0, 8),
+        expiresAt: new Date(Date.now() + (opts.expiresInMs ?? 60 * 60 * 1000)),
+        description: opts.description,
+        ...(opts.ask ? { disclosureAsk: { conversationId, labels: ['email'], requester: '+15195550177', counterparties: ['+15195550177'], requesterName: 'Dana Whitfield' } } : {}),
+      });
+      if (opts.shown !== false) await actions.claimNotification(id);
+      return id;
+    };
+    const older = await insert({ description: `${PREFIX} older`, ask: true });
+    await insert({ description: `${PREFIX} newer` });
+    // Near misses: never shown, expired, resolved.
+    await insert({ description: `${PREFIX} unshown`, shown: false });
+    await insert({ description: `${PREFIX} expired`, expiresInMs: -60 * 1000 });
+    await insert({ description: `${PREFIX} approved`, outcome: 'approved' });
+    await actions.bindDeliveryMessage(older, 'email-thread', `thread-${conversationId}`);
+
+    const source = createPrincipalBacklogSource(pool, actions);
+    const plain = await readAwaitingAnswers(actions, { conversationIds: [conversationId] });
+    expect(plain.map((a) => a.description)).toEqual([`${PREFIX} newer`, `${PREFIX} older`]);
+    expect(plain[1]!.question).toContain('Dana Whitfield (+15195550177) is asking for your email address');
+    expect(plain.some((a) => a.repliedTo)).toBe(false);
+
+    const replied = await readAwaitingAnswers(actions, { conversationIds: [conversationId], replyThreadId: `thread-${conversationId}` });
+    expect(replied.map((a) => [a.description, a.repliedTo === true])).toEqual([[`${PREFIX} older`, true], [`${PREFIX} newer`, false]]);
+    // Production's source reads every conversation: it holds these too.
+    const all = await source.awaitingAnswers!({ replyThreadId: `thread-${conversationId}` });
+    expect(all[0]).toMatchObject({ description: `${PREFIX} older`, repliedTo: true });
   });
 });
