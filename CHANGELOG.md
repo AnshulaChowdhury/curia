@@ -90,6 +90,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Scenario gateway checks** — cases assert delivered, held, not-held, reviewed, outreach and decision outcomes. (#2312)
 - **Scenario `inbound.then`** — a case sends the principal a second message after the first turn replies. (#2312)
 - **ADR-054** — authority-aware PII disclosure: the judge rules per item; code decides who authorized. (#2312)
+- **ADR-055** — phone app as an installable PWA: QR-paired device sessions, sliding expiry, web push channel. (#2341)
 
 ### Changed
 
