@@ -3049,7 +3049,7 @@ describe('VoiceRuntime meeting notes (#2347)', () => {
   it('restates notes without a recap when none was asked for', async () => {
     const llm = await callWithNotes({ content: JSON.stringify({ notes_on: true, recap: false }) });
     const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
-    expect(last).toContain('No recap will be sent unless the caller asks for one');
+    expect(last).toContain('A recap goes out only if an agenda topic');
   });
 
   it('leaves notes off after a failed result', async () => {

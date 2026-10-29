@@ -121,11 +121,12 @@ export class MinutesPipeline {
     if (loads.length === 0 && !notes) return 'skipped';
 
     const rows = await this.deps.workingMemory.getTranscriptRows(session.conversationId, 'coordinator');
-    // With notes on, every opened agenda belongs in the minutes, including one
-    // opened on the last utterance with nothing spoken after it.
-    const counted = notes
-      ? loads
-      : loads.filter((load) => callerSpokeAfter(rows, new Date(load.loadedAt)));
+    // Every opened agenda belongs in the minutes once the caller said anything,
+    // including one opened on the last utterance (#2347). Spoken instructions
+    // before that load still need the follow-up task, which only minutes start.
+    // A call where the caller never spoke returns its agendas unused.
+    const callerSpoke = callerSpokeAfter(rows, new Date(0));
+    const counted = notes || callerSpoke ? loads : [];
     if (counted.length === 0 && !notes) {
       for (const load of loads) {
         await this.deps.agendaStore.settle(load.agendaId, sessionId, { kind: 'return' });

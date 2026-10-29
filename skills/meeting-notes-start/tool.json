@@ -5,11 +5,11 @@
   "sensitivity": "normal",
   "action_risk": "low",
   "inputs": {
-    "recap": "boolean (required — true if the caller asked for a recap or summary of this call after it ends; false for notes or minutes only)"
+    "recap": "boolean (required — true if the caller asked for a recap or summary of this call after it ends; false if they asked only for notes or minutes)"
   },
   "outputs": {
     "notes_on": "boolean (true once the call is marked for minutes)",
-    "recap": "boolean (true when a recap of this call will be sent)"
+    "recap": "boolean (true once the caller has asked for a recap; a covered agenda topic can still earn one when false)"
   },
   "permissions": [],
   "secrets": [],

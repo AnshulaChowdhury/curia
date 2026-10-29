@@ -79,7 +79,7 @@ describe('formatAgendaPromptBlock', () => {
 
   it('tells a notes-only call that no recap goes out unless asked', () => {
     const block = formatAgendaPromptBlock({ loaded: [], index: [], notes: { recap: false } });
-    expect(block).toContain('No recap will be sent unless the caller asks for one');
+    expect(block).toContain('A recap goes out only if an agenda topic');
     expect(block).toContain('meeting-notes-start again with recap true');
     expect(block).not.toContain('Do not hand the recap off');
   });

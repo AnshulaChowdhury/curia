@@ -63,8 +63,8 @@ function notesBlock(recap: boolean): string {
     recap
       ? 'Notes are on for this call. When it ends, the minutes are written and the recap goes to the principal. '
         + 'Do not hand the recap off with async-offramp or delegate. Tell the caller it will arrive after the call.'
-      : 'Notes are on for this call. When it ends, the minutes are written. No recap will be sent unless the caller '
-        + 'asks for one; if they do, call meeting-notes-start again with recap true.',
+      : 'Notes are on for this call. When it ends, the minutes are written. A recap goes out only if an agenda topic '
+        + 'is covered or the caller asks for one; if they ask, call meeting-notes-start again with recap true.',
   ].join('\n');
 }
 
