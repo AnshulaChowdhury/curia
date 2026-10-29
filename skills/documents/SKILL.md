@@ -23,8 +23,8 @@ You have an OKF document workspace: markdown files addressed by path, used throu
 Each directory has reserved `index.md` (navigation catalog) and `log.md` (append-only
 change history). Before you create a new `/projects/` folder, call `doc-place`: it
 prefers extending a document or adding to an existing folder, and names a new folder with
-a readable kebab-case slug. Shared folders are fine — path is organisational; ownership
-is `task_id`.
+a readable kebab-case slug. Tasks may share a project folder; a project document's owner
+is its `task_id`, not its path.
 
 **Shared documents.** `/shared/…` documents are durable and shown under `## Pinned
 context`; only an agent that declares one can write it. Follow the format it states at
