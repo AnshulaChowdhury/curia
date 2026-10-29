@@ -164,6 +164,15 @@ export class DocWriteHandler implements ToolHandler {
           if (existing) {
             return { success: false, error: `Document already exists at ${normalized} — use append, replace, or section-edit` };
           }
+          // read() skips archived rows, and the live-path index is partial, so a create
+          // here would put a new live row over an archived /shared/ document and block
+          // the principal's restore (path_in_use). Same rule as /meetings/ (#2322).
+          if (isSharedDocPath(normalized) && await repo.existsAtPath(normalized)) {
+            return {
+              success: false,
+              error: `${normalized} was archived by the principal. Do not recreate it; the principal can restore it in the console.`,
+            };
+          }
           const created = await repo.create({
             path: normalized,
             type: input.type.trim(),

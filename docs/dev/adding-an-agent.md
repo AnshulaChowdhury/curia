@@ -248,7 +248,7 @@ pinned_context:
   - config: expenses/currency           # one config-store key: <namespace>/<key>
 ```
 
-- **`doc:`** must be a path under `/shared/`. Declaring it is the permission to write it:
+- **`doc:`** must be a `.md` path under `/shared/`. Declaring it is the permission to write it:
   `doc-write` refuses a `/shared/` path the calling agent does not declare. Several agents
   may declare the same document to share it; `expected_version` /
   `expected_section_version` handle simultaneous edits. `/shared/` documents are durable:
@@ -261,7 +261,8 @@ pinned_context:
   principal settings with runtime state. Config entries are shown only; writes still go
   through `config-store`.
 
-A document or key that does not exist yet renders as not yet created. A failed read
+A document or key that does not exist yet renders as not yet created. A document the
+principal archived renders as archived, and `doc-write` will not recreate it. A failed read
 renders as unavailable and logs a warning; it is never silently left out. An item over
 `documentWorkspace.pinnedContextWarnChars` (default 16000) logs a warning each turn and is
 still injected in full. A malformed entry, a `doc:` outside `/shared/`, or a `config:`

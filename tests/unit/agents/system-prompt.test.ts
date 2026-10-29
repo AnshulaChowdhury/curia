@@ -188,7 +188,7 @@ describe('buildBaseSystemPrompt pinned context (#2338)', () => {
   const pinnedContext = [{ kind: 'doc' as const, path: '/shared/inbox/rules.md' }];
   const pinnedContextReader = {
     warnChars: 16_000,
-    readDoc: vi.fn(async () => ({ version: 3, content: '## Board mail' })),
+    readDoc: vi.fn(async () => ({ status: 'live' as const, version: 3, content: '## Board mail' })),
     readConfig: vi.fn(async () => null),
   };
 

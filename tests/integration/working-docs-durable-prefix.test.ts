@@ -7,6 +7,7 @@ import { createIsolatedWorkingDocsStore, type IsolatedWorkingDocsStore } from '.
 import { AgentRegistry } from '../../src/agents/agent-registry.js';
 import type { ToolContext } from '../../src/skills/types.js';
 import { DocWriteHandler } from '../../skills/documents/tools/doc-write/handler.js';
+import { createPinnedContextReader, renderPinnedContextBlock } from '../../src/agents/pinned-context.js';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const describeIf = DATABASE_URL ? describe : describe.skip;
@@ -82,5 +83,40 @@ describeIf('working docs durable prefix (#2322)', () => {
 
     await repo.archiveProjectWorkspaceDocs(rootTaskId);
     expect(await repo.read('/shared/wake/rules.md')).not.toBeNull();
+  });
+
+  it('an archived /shared/ doc is not recreated by doc-write and is not shown as not yet created', async () => {
+    const path = '/shared/archived/rules.md';
+    const registry = new AgentRegistry();
+    registry.register('ceo-inbox', { role: 'specialist', description: 'inbox', pinnedDocPaths: [path] });
+    const ctx = (input: Record<string, unknown>) => ({
+      input,
+      log: createSilentLogger(),
+      timezone: 'UTC',
+      agentId: 'ceo-inbox',
+      agentRegistry: registry,
+      workingDocs: repo,
+    } as unknown as ToolContext);
+
+    expect((await new DocWriteHandler().execute(ctx({ path, mode: 'create', type: 'agent-settings', body: '## Original' }))).success)
+      .toBe(true);
+    const original = (await repo.read(path))!;
+    expect((await repo.softDeleteAtVersion(path, original.version))?.ok).toBe(true);
+
+    const reader = createPinnedContextReader({ workingDocsRepo: repo, logger: createSilentLogger() });
+    const block = await renderPinnedContextBlock([{ kind: 'doc', path }], reader, {
+      agentId: 'ceo-inbox',
+      logger: createSilentLogger(),
+    });
+    expect(block).toContain('_Archived by the principal._');
+    expect(block).not.toContain('Not yet created');
+
+    const recreate = await new DocWriteHandler().execute(ctx({ path, mode: 'create', type: 'agent-settings', body: '## New' }));
+    expect(recreate.success).toBe(false);
+    expect(await repo.read(path)).toBeNull();
+
+    // The principal can still restore the original.
+    expect((await repo.restore(original.id)).ok).toBe(true);
+    expect((await repo.read(path))?.body).toBe('## Original');
   });
 });

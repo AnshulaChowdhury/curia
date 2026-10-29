@@ -39,6 +39,7 @@ function makeRepo(overrides: Partial<WorkingDocsRepo> = {}): WorkingDocsRepo {
     update: vi.fn(),
     editSection: vi.fn(),
     projectPrefixHasLiveDocs: vi.fn().mockResolvedValue(false),
+    existsAtPath: vi.fn().mockResolvedValue(false),
     ...overrides,
   } as unknown as WorkingDocsRepo;
 }
@@ -477,6 +478,21 @@ describe('DocWriteHandler', () => {
         expect(result.success, agentId).toBe(true);
         expect((create.mock.calls[0]![0] as { taskId?: string | null }).taskId).toBeNull();
       }
+    });
+
+    it('refuses to create over an archived /shared/ document, even for a declaring agent', async () => {
+      const create = vi.fn();
+      const repo = makeRepo({
+        read: vi.fn().mockResolvedValue(null),
+        existsAtPath: vi.fn().mockResolvedValue(true),
+        create,
+      });
+      const result = await new DocWriteHandler().execute(sharedCtx('ceo-inbox', {
+        path: SHARED, mode: 'create', type: 'agent-settings', body: 'x',
+      }, repo));
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/archived by the principal.*restore it in the console/);
+      expect(create).not.toHaveBeenCalled();
     });
 
     it('allows a principal-approved re-execution, which carries no agent', async () => {

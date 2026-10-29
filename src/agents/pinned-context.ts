@@ -74,6 +74,10 @@ export function parsePinnedContext(raw: unknown, agentName: string): PinnedConte
       if (RESERVED_LEAF_NAMES.has(leaf)) {
         fail(`\`doc\` path cannot be the reserved file ${leaf}`, item);
       }
+      // The console edits only `.md` paths; a declared document must stay editable there.
+      if (!leaf.endsWith('.md')) {
+        fail('`doc` path must end in .md so the principal can edit it in the console', item);
+      }
       entry = { kind: 'doc', path };
     } else {
       // Whole namespaces are deliberately unsupported: they mix principal settings
@@ -111,12 +115,21 @@ function pinnedEntryLabel(entry: PinnedContextEntry): string {
 }
 
 /**
+ * A pinned document's state: live (serialized as OKF markdown, frontmatter + body,
+ * with its version), archived (a row exists but none is live), or null when no row
+ * has ever existed at the path.
+ */
+export type PinnedDocRead =
+  | { status: 'live'; version: number; content: string }
+  | { status: 'archived' }
+  | null;
+
+/**
  * Per-turn reads for the block. Both return null for "does not exist yet" and
  * throw when the read itself failed, so the two render differently.
  */
 export interface PinnedContextReader {
-  /** The document serialized as OKF markdown (frontmatter + body), with its version. */
-  readDoc(path: string): Promise<{ version: number; content: string } | null>;
+  readDoc(path: string): Promise<PinnedDocRead>;
   readConfig(namespace: string, key: string): Promise<string | null>;
   /** An injected item longer than this logs a warning. It is still injected in full. */
   warnChars: number;
@@ -139,7 +152,10 @@ export function createPinnedContextReader(deps: {
     async readDoc(path) {
       if (!deps.workingDocsRepo) throw new Error('document workspace not configured');
       const doc = await deps.workingDocsRepo.read(path);
-      return doc ? { version: doc.version, content: deps.workingDocsRepo.toOkf(doc) } : null;
+      if (doc) return { status: 'live', version: doc.version, content: deps.workingDocsRepo.toOkf(doc) };
+      // read() skips archived rows. An archived document is not a missing one: telling
+      // the agent to create it would put a live row over the principal's archive.
+      return (await deps.workingDocsRepo.existsAtPath(path)) ? { status: 'archived' } : null;
     },
     async readConfig(namespace, key) {
       if (!configStore) throw new Error('knowledge graph not configured');
@@ -164,6 +180,8 @@ function fenced(text: string): string {
 
 const NOT_YET_CREATED_DOC =
   '_Not yet created._ Create it with `doc-write` mode `create` when you first need to write it.';
+const ARCHIVED_DOC =
+  '_Archived by the principal._ Do not recreate it; the principal can restore it in the console.';
 const NOT_YET_SET_CONFIG = '_Not set yet._';
 const UNAVAILABLE =
   '_Unavailable this turn: the read failed._ Do not treat it as empty, and do not create or overwrite it this turn.';
@@ -196,6 +214,7 @@ export async function renderPinnedContextBlock(
       try {
         const doc = await reader.readDoc(entry.path);
         if (!doc) return `### Document ${entry.path}\n${NOT_YET_CREATED_DOC}`;
+        if (doc.status === 'archived') return `### Document ${entry.path}\n${ARCHIVED_DOC}`;
         warnIfLarge(label, doc.content.length);
         return `### Document ${entry.path} (version ${doc.version})\n${fenced(doc.content)}`;
       } catch (err) {

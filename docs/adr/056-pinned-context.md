@@ -51,7 +51,8 @@ config-store key). "Pinned" parallels `pinned_skills`: always present for this a
 - **Missing vs failed.** A document or key that doesn't exist yet renders as not yet
   created, so the agent knows to create it. A failed read renders as unavailable and logs a
   warning, and the agent is told not to create or overwrite it that turn. A failed read is
-  never silently left out.
+  never silently left out. A document the principal archived renders as archived, and
+  `doc-write` refuses to `create` over it, so the console restore stays possible.
 - **Declaration is write permission.** `doc-write` writes a `/shared/` path only for an
   agent that declares it. Every declaring agent may write; concurrent edits are handled by
   `expected_version` / `expected_section_version`. The console doesn't go through
@@ -68,8 +69,8 @@ config-store key). "Pinned" parallels `pinned_skills`: always present for this a
   `documentWorkspace.pinnedContextWarnChars` (default 16000) logs a warning each turn and
   is injected in full. A truncated settings document would be worse than a large one.
 - **Validated at load.** A malformed entry, a `doc:` outside `/shared/` (after path
-  normalization), a reserved leaf (`index.md`, `log.md`), a `config:` without exactly one
-  `/`, or a duplicate fails the agent's load with an error naming the agent and the entry.
+  normalization), a reserved leaf (`index.md`, `log.md`), a `doc:` not ending in `.md`
+  (the console edits only `.md`), a `config:` without exactly one `/`, or a duplicate fails the agent's load with an error naming the agent and the entry.
 - **Self-describing documents.** Each `/shared/` document states its own format in its
   frontmatter or a short top section, so every declaring agent follows one format and no
   declaring prompt restates it.

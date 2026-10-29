@@ -48,6 +48,7 @@ describe('parsePinnedContext', () => {
     ['a doc that climbs out of /shared/', [{ doc: '/shared/../projects/a.md' }], /under \/shared\//],
     ['the /shared/ folder itself', [{ doc: '/shared/' }], /under \/shared\//],
     ['a reserved leaf', [{ doc: '/shared/log.md' }], /reserved file log\.md/],
+    ['a doc without .md', [{ doc: '/shared/inbox/rules' }], /must end in \.md/],
     ['a whole namespace', [{ config: 'ceo_inbox' }], /exactly one `\/`/],
     ['two slashes', [{ config: 'a/b/c' }], /exactly one `\/`/],
     ['an empty key', [{ config: 'ceo_inbox/' }], /exactly one `\/`/],
@@ -73,7 +74,7 @@ describe('renderPinnedContextBlock', () => {
   it('renders each doc with its path, version and full content, and each config value', async () => {
     const content = '---\ntype: agent-settings\n---\n## Board mail\n- Do: label BOARD';
     const block = await renderPinnedContextBlock(entries, reader({
-      readDoc: vi.fn(async () => ({ version: 7, content })),
+      readDoc: vi.fn(async () => ({ status: 'live' as const, version: 7, content })),
       readConfig: vi.fn(async () => 'on'),
     }), { agentId: 'a', logger: silent });
     expect(block).toContain('## Pinned context');
@@ -84,7 +85,7 @@ describe('renderPinnedContextBlock', () => {
 
   it('reads fresh on every call', async () => {
     let version = 1;
-    const r = reader({ readDoc: vi.fn(async () => ({ version, content: `v${version}` })) });
+    const r = reader({ readDoc: vi.fn(async () => ({ status: 'live' as const, version, content: `v${version}` })) });
     const opts = { agentId: 'a', logger: silent };
     expect(await renderPinnedContextBlock(entries, r, opts)).toContain('(version 1)');
     version = 2;
@@ -95,6 +96,14 @@ describe('renderPinnedContextBlock', () => {
     const block = await renderPinnedContextBlock(entries, reader(), { agentId: 'a', logger: silent });
     expect(block).toContain('### Document /shared/inbox/rules.md\n_Not yet created._');
     expect(block).toContain('### Config ceo_inbox/decision_tagging\n_Not set yet._');
+  });
+
+  it('renders an archived doc as archived, never as not yet created', async () => {
+    const block = await renderPinnedContextBlock(entries.slice(0, 1), reader({
+      readDoc: vi.fn(async () => ({ status: 'archived' as const })),
+    }), { agentId: 'a', logger: silent });
+    expect(block).toContain('### Document /shared/inbox/rules.md\n_Archived by the principal._ Do not recreate it');
+    expect(block).not.toContain('Not yet created');
   });
 
   it('renders a failed read as unavailable and logs a warning for each', async () => {
@@ -117,7 +126,7 @@ describe('renderPinnedContextBlock', () => {
     const content = 'x'.repeat(50);
     const block = await renderPinnedContextBlock(entries.slice(0, 1), reader({
       warnChars: 10,
-      readDoc: vi.fn(async () => ({ version: 1, content })),
+      readDoc: vi.fn(async () => ({ status: 'live' as const, version: 1, content })),
     }), { agentId: 'a', logger });
     expect(block).toContain(content);
     expect(warn).toHaveBeenCalledTimes(1);
@@ -127,22 +136,25 @@ describe('renderPinnedContextBlock', () => {
   it('fences a document that contains its own code fence', async () => {
     const content = 'Rule\n```\ncode\n```';
     const block = await renderPinnedContextBlock(entries.slice(0, 1), reader({
-      readDoc: vi.fn(async () => ({ version: 1, content })),
+      readDoc: vi.fn(async () => ({ status: 'live' as const, version: 1, content })),
     }), { agentId: 'a', logger: silent });
     expect(block).toContain(`\`\`\`\`\n${content}\n\`\`\`\``);
   });
 });
 
 describe('createPinnedContextReader', () => {
-  it('serializes a document as OKF with its version, and returns null when missing', async () => {
+  it('serializes a live document as OKF with its version, and tells archived from never written', async () => {
     const row = { version: 4 };
     const repo = {
       read: vi.fn(async (path: string) => (path === '/shared/a.md' ? row : null)),
+      existsAtPath: vi.fn(async (path: string) => path === '/shared/archived.md'),
       toOkf: vi.fn(() => '---\ntype: agent-settings\n---\nbody'),
     } as unknown as WorkingDocsRepo;
     const r = createPinnedContextReader({ workingDocsRepo: repo, logger: silent });
     expect(r.warnChars).toBe(DEFAULT_PINNED_CONTEXT_WARN_CHARS);
-    expect(await r.readDoc('/shared/a.md')).toEqual({ version: 4, content: '---\ntype: agent-settings\n---\nbody' });
+    expect(await r.readDoc('/shared/a.md'))
+      .toEqual({ status: 'live', version: 4, content: '---\ntype: agent-settings\n---\nbody' });
+    expect(await r.readDoc('/shared/archived.md')).toEqual({ status: 'archived' });
     expect(await r.readDoc('/shared/b.md')).toBeNull();
   });
 
