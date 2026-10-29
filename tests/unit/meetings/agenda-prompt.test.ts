@@ -36,6 +36,7 @@ describe('formatAgendaPromptBlock', () => {
       })],
       index: [],
     });
+    expect(block).toContain('background material from parked sources');
     expect(block).toContain('Q3 review');
     expect(block).toContain('1. Pipeline');
     expect(block).toContain('2. Hiring');

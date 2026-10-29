@@ -401,12 +401,14 @@ export class SignalCallBridge {
     // CONNECTED guard); removed in the finally.
     this.connecting.add(ev.callId);
     let rowCreated = false;
+    // Hoisted so a create failure can release a lock taken before the row exists.
+    let prepared: Awaited<ReturnType<typeof prepareSessionAgendas>> | null = null;
     try {
       // Prepare before the row exists so the lock records this session id.
       // A failure returns empty agendas and the call still starts free-form.
       // Non-principal callers and a bridge with no store skip this entirely,
       // so their metadata stays exactly as it was before agendas existed.
-      const prepared = this.config.agendaStore && caller.systemRole === 'principal'
+      prepared = this.config.agendaStore && caller.systemRole === 'principal'
         ? await prepareSessionAgendas(this.config.agendaStore, {
             sessionId,
             now: new Date(),
@@ -530,6 +532,17 @@ export class SignalCallBridge {
           await this.config.voiceRuntime.endSession(sessionId, 'runtime_start_failed');
         } catch (endErr) {
           this.log.error({ err: endErr, sessionId }, 'endSession failed after session start failure');
+        }
+      } else if (prepared?.preload && this.config.agendaStore) {
+        // The lock happened before the row existed, so no session-ended event
+        // will settle it. Release it now or the next call cannot see it.
+        try {
+          await this.config.agendaStore.settle(prepared.preload.agendaId, sessionId, { kind: 'return' });
+        } catch (settleErr) {
+          this.log.error(
+            { err: settleErr, sessionId, agendaId: prepared.preload.agendaId },
+            'meeting agenda: failed to release preload after session setup failed',
+          );
         }
       }
     } finally {

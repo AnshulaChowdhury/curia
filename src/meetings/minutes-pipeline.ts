@@ -16,6 +16,7 @@ import type { Logger } from '../logger.js';
 import type { WorkingMemory } from '../memory/working-memory.js';
 import type { InfraLlm } from '../skills/infra-llm.js';
 import type { AgendaStore } from './agenda-store.js';
+import { isTerminalMinutesTask, minutesTaskNeedsRepair } from './minutes-task.js';
 import { writeMinutes } from './minutes-writer.js';
 import { buildTranscriptDoc, callerSpokeAfter, transcriptPath } from './transcript.js';
 import type { AgendaCoverage, AgendaSensitivity, AgendaSnapshot, SessionAgendaLoad } from './types.js';
@@ -35,6 +36,8 @@ export interface MinutesPipelineDeps {
   contactService: ContactService;
   bus: EventBus;
   timezone: () => string;
+  /** Pending or running wake for a task. A running wake with no deferred time still counts. */
+  hasActiveWake: (taskId: string) => Promise<boolean>;
   logger: Logger;
 }
 
@@ -151,7 +154,18 @@ export class MinutesPipeline {
       stage = 'structuring';
       const tag = `meeting-minutes:${session.id}`;
       const existing = await this.deps.taskRepo.listTasks({ tag });
-      if (existing.length === 0) {
+      let publishReady = existing.length === 0;
+      if (!publishReady) {
+        for (const task of existing) {
+          if (isTerminalMinutesTask(task.status)) continue;
+          const active = await this.deps.hasActiveWake(task.id);
+          if (minutesTaskNeedsRepair(task, active)) {
+            publishReady = true;
+            break;
+          }
+        }
+      }
+      if (publishReady) {
         await this.deps.bus.publish('system', createMinutesReady({
           minutesRef: mPath,
           sessionId: session.id,

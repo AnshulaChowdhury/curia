@@ -4,6 +4,8 @@ description: >
   Turn one call's minutes into tasks and a single report to the principal. Read the minutes, act only on what was directed, and label every action.
 ---
 
+# Meeting Minutes Structuring
+
 This task follows one call. The minutes path is the `minutesRef` in the task description. Read it with `doc-read`. Do not ask the principal to paste the minutes.
 
 Three rows, applied to each thing the minutes record:

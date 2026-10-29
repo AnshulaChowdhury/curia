@@ -204,6 +204,7 @@ import {
   type AssembledAgent,
 } from './startup/agent-assembly.js';
 import { BacklogHeartbeat } from './scheduler/backlog-heartbeat.js';
+import { taskHasPendingWake } from './agents/resumable-continuation.js';
 import { ResumableContinuationSubscriber } from './agents/resumable-continuation-subscriber.js';
 import { LateDelegationSubscriber } from './agents/late-delegation-subscriber.js';
 import {
@@ -3024,10 +3025,18 @@ async function main(): Promise<void> {
       contactService,
       bus,
       timezone: () => principalContact?.timezone ?? config.timezone,
+      hasActiveWake: (taskId) => taskHasPendingWake(pool, taskId),
       logger,
     });
     new MeetingSessionEndedSubscriber({ bus, pipeline: minutesPipeline, logger }).start();
-    new MinutesReadySubscriber({ bus, taskRepo, schedulerService, logger }).start();
+    new MinutesReadySubscriber({
+      bus,
+      taskRepo,
+      schedulerService,
+      logger,
+      pool,
+      hasActiveWake: (taskId) => taskHasPendingWake(pool, taskId),
+    }).start();
     meetingRecovery = new MeetingPipelineRecovery({
       sessionStore: voiceSessionStore,
       agendaStore,

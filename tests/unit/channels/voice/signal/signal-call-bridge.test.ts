@@ -949,17 +949,25 @@ describe('SignalCallBridge', () => {
       };
     }
 
-    function agendaStore(overrides: Partial<Pick<AgendaStore, 'cullExpired' | 'listPending' | 'lock'>> = {}): {
+    function agendaStore(overrides: Partial<Pick<AgendaStore, 'cullExpired' | 'listPending' | 'lock' | 'settle'>> = {}): {
       store: AgendaStore;
       cullExpired: ReturnType<typeof vi.fn>;
       listPending: ReturnType<typeof vi.fn>;
       lock: ReturnType<typeof vi.fn>;
+      settle: ReturnType<typeof vi.fn>;
     } {
       const doc = parkedAgenda();
       const cullExpired = vi.fn(overrides.cullExpired ?? (async () => 0));
       const listPending = vi.fn(overrides.listPending ?? (async () => [doc]));
       const lock = vi.fn(overrides.lock ?? (async () => ({ ok: true as const, agenda: doc })));
-      return { store: { cullExpired, listPending, lock } as unknown as AgendaStore, cullExpired, listPending, lock };
+      const settle = vi.fn(overrides.settle ?? (async () => 'settled' as const));
+      return {
+        store: { cullExpired, listPending, lock, settle } as unknown as AgendaStore,
+        cullExpired,
+        listPending,
+        lock,
+        settle,
+      };
     }
 
     it('principal call passes prepared agendas to startSession and records the preload in create metadata', async () => {
@@ -1051,6 +1059,29 @@ describe('SignalCallBridge', () => {
 
       expect(startSession.mock.calls[0]![0].agendas).toEqual({ loaded: [], index: [] });
       expect(create.mock.calls[0]![0].metadata).toMatchObject({ agendas: [] });
+    });
+
+    it('releases a preloaded agenda when session create fails', async () => {
+      const { store, lock, settle } = agendaStore();
+      const { bridge, rpc, startSession, endSession } = setup({
+        resolveImpl: async () => resolvedSenderContext({ systemRole: 'principal', tier: 'principal' }),
+        agendaStore: store,
+        createImpl: async () => {
+          throw new Error('db down');
+        },
+      });
+      bridge.start();
+      const callId = 2326n;
+
+      rpc.emit('callEvent', ringingEvent(callId));
+      await vi.waitFor(() => expect(rpc.acceptCall).toHaveBeenCalledWith(callId));
+      rpc.emit('callEvent', connectedEvent(callId));
+      await vi.waitFor(() => expect(rpc.hangupCall).toHaveBeenCalledWith(callId));
+
+      expect(lock).toHaveBeenCalledTimes(1);
+      expect(settle).toHaveBeenCalledWith(agendaId, lock.mock.calls[0]![1], { kind: 'return' });
+      expect(startSession).not.toHaveBeenCalled();
+      expect(endSession).not.toHaveBeenCalled();
     });
   });
 });

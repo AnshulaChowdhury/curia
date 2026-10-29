@@ -38,6 +38,7 @@ describeIf('MeetingPipelineRecovery (integration, #2322)', () => {
   let ready: MinutesReadyEvent[];
   const prompts: string[] = [];
   const sessionIds: string[] = [];
+  const activeWakes = new Set<string>();
 
   beforeAll(async () => {
     publicPool = new pg.Pool({ connectionString: DATABASE_URL });
@@ -84,10 +85,23 @@ describeIf('MeetingPipelineRecovery (integration, #2322)', () => {
       contactService: { getContact: async () => undefined } as unknown as ContactService,
       bus,
       timezone: () => TZ,
+      hasActiveWake: async (taskId) => activeWakes.has(taskId),
       logger,
     });
-    const scheduler = { enqueueTaskWake: async () => ({ jobId: 'wake-1' }) } as unknown as SchedulerService;
-    new MinutesReadySubscriber({ bus, taskRepo: tasks, schedulerService: scheduler, logger }).start();
+    const scheduler = {
+      enqueueTaskWake: async (params: { taskId: string }) => {
+        activeWakes.add(params.taskId);
+        return { jobId: 'wake-1' };
+      },
+    } as unknown as SchedulerService;
+    new MinutesReadySubscriber({
+      bus,
+      taskRepo: tasks,
+      schedulerService: scheduler,
+      logger,
+      pool: publicPool,
+      hasActiveWake: async (taskId) => activeWakes.has(taskId),
+    }).start();
     recovery = new MeetingPipelineRecovery({
       sessionStore: sessions,
       agendaStore: agendas,

@@ -7,7 +7,9 @@ import { EventBus } from '../../src/bus/bus.js';
 import type { MinutesReadyEvent } from '../../src/bus/events.js';
 import { VoiceSessionStore } from '../../src/channels/voice/session-store.js';
 import type { ContactService } from '../../src/contacts/contact-service.js';
+import { replaceActiveSkillsBlock, readActiveSkillNames } from '../../src/db/active-skills-progress.js';
 import { TaskRepo } from '../../src/db/task-repo.js';
+import { makeSystemOriginator } from '../../src/contacts/principal.js';
 import { WorkingDocsRepo } from '../../src/db/working-docs-repo.js';
 import { createLogger } from '../../src/logger.js';
 import { WorkingMemory } from '../../src/memory/working-memory.js';
@@ -50,6 +52,7 @@ describeIf('MinutesPipeline (integration, #2322)', () => {
   let coverage: 'covered' | 'partial' | 'not_reached' = 'covered';
   let llmOk = true;
   const sessionIds: string[] = [];
+  const activeWakes = new Set<string>();
 
   beforeAll(async () => {
     publicPool = new pg.Pool({ connectionString: DATABASE_URL });
@@ -93,10 +96,23 @@ describeIf('MinutesPipeline (integration, #2322)', () => {
       contactService: { getContact: async () => undefined } as unknown as ContactService,
       bus,
       timezone: () => TZ,
+      hasActiveWake: async (taskId) => activeWakes.has(taskId),
       logger,
     });
-    const scheduler = { enqueueTaskWake: async () => ({ jobId: 'wake-1' }) } as unknown as SchedulerService;
-    new MinutesReadySubscriber({ bus, taskRepo: tasks, schedulerService: scheduler, logger }).start();
+    const scheduler = {
+      enqueueTaskWake: async (params: { taskId: string }) => {
+        activeWakes.add(params.taskId);
+        return { jobId: 'wake-1' };
+      },
+    } as unknown as SchedulerService;
+    new MinutesReadySubscriber({
+      bus,
+      taskRepo: tasks,
+      schedulerService: scheduler,
+      logger,
+      pool: publicPool,
+      hasActiveWake: async (taskId) => activeWakes.has(taskId),
+    }).start();
   });
 
   afterAll(async () => {
@@ -244,6 +260,50 @@ describeIf('MinutesPipeline (integration, #2322)', () => {
     expect(agenda?.status).toBe('in_call');
     const session = await sessions.get(sessionId);
     expect(await repo.read(minutesPath(sessionId, session!.startedAt, TZ))).toBeNull();
+  });
+
+  it('republishes minutes.ready for a tagged task that cannot run yet', async () => {
+    coverage = 'partial';
+    llmOk = true;
+    const { sessionId } = await spokenCall();
+    const created = await tasks.createTask({
+      agentId: 'coordinator',
+      owner: 'curia',
+      source: 'scheduler',
+      createdBy: 'meetings',
+      title: 'Follow up on meeting minutes',
+      tags: [`meeting-minutes:${sessionId}`],
+      originator: makeSystemOriginator(),
+    });
+    expect(await pipeline.run(sessionId)).toBe('completed');
+    expect(ready.filter((event) => event.payload.sessionId === sessionId)).toHaveLength(1);
+    const listed = await tasks.listTasks({ tag: `meeting-minutes:${sessionId}` });
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.id).toBe(created.id);
+    expect(readActiveSkillNames(listed[0]!.progress)).toEqual(['meeting-minutes-structuring']);
+  });
+
+  it('does not republish when the tagged task already has the skill and a wake', async () => {
+    coverage = 'partial';
+    llmOk = true;
+    const { sessionId } = await spokenCall();
+    const created = await tasks.createTask({
+      agentId: 'coordinator',
+      owner: 'curia',
+      source: 'scheduler',
+      createdBy: 'meetings',
+      title: 'Follow up on meeting minutes',
+      tags: [`meeting-minutes:${sessionId}`],
+      originator: makeSystemOriginator(),
+    });
+    const written = await tasks.setActiveSkillsBlock(
+      created.id,
+      replaceActiveSkillsBlock(['meeting-minutes-structuring']),
+    );
+    expect('ok' in written && written.ok === false).toBe(false);
+    activeWakes.add(created.id);
+    expect(await pipeline.run(sessionId)).toBe('completed');
+    expect(ready.filter((event) => event.payload.sessionId === sessionId)).toHaveLength(0);
   });
 
   it('session without agenda loads is skipped', async () => {

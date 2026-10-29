@@ -71,6 +71,7 @@ describe('MinutesPipeline coverage', () => {
       contactService: { getContact: async () => undefined } as unknown as ContactService,
       bus: { publish: async () => {} } as unknown as EventBus,
       timezone: () => 'America/Toronto',
+      hasActiveWake: async () => false,
       logger: { warn, error: vi.fn(), info: vi.fn(), debug: vi.fn() } as unknown as Logger,
     });
 

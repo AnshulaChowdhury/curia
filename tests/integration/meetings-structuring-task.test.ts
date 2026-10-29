@@ -19,6 +19,7 @@ describeIf('MinutesReadySubscriber (integration, #2322)', () => {
   let tasks: TaskRepo;
   let bus: EventBus;
   const wakes: Array<{ taskId: string; agentId: string; createdBy?: string; originator?: { systemRole?: string } | null }> = [];
+  const activeWakes = new Set<string>();
 
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: DATABASE_URL });
@@ -30,10 +31,18 @@ describeIf('MinutesReadySubscriber (integration, #2322)', () => {
     const scheduler = {
       enqueueTaskWake: vi.fn(async (params: { taskId: string; agentId: string; createdBy?: string; originator?: { systemRole?: string } | null }) => {
         wakes.push(params);
+        activeWakes.add(params.taskId);
         return { jobId: 'wake-1' };
       }),
     } as unknown as SchedulerService;
-    new MinutesReadySubscriber({ bus, taskRepo: tasks, schedulerService: scheduler, logger }).start();
+    new MinutesReadySubscriber({
+      bus,
+      taskRepo: tasks,
+      schedulerService: scheduler,
+      logger,
+      pool,
+      hasActiveWake: async (taskId) => activeWakes.has(taskId),
+    }).start();
   });
 
   afterAll(async () => {
