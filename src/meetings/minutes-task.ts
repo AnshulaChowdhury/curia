@@ -33,14 +33,21 @@ export function minutesTaskNeedsRepair(
  */
 export async function withMinutesTaskLock<T>(pool: Pool, tag: string, fn: () => Promise<T>): Promise<T> {
   const client = await pool.connect();
+  // Set when the unlock fails. Releasing with an error destroys the connection,
+  // so the server drops the session-level lock instead of handing it back to the pool.
+  let unlockError: Error | undefined;
   try {
     await client.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [tag]);
     try {
       return await fn();
     } finally {
-      await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [tag]);
+      try {
+        await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [tag]);
+      } catch (err) {
+        unlockError = err instanceof Error ? err : new Error(String(err));
+      }
     }
   } finally {
-    client.release();
+    client.release(unlockError);
   }
 }
