@@ -59,6 +59,7 @@ describeIf('MeetingPipelineRecovery (integration, #2322)', () => {
       classify: async () => ({ ok: true, text: '' }),
       extract: async (prompt) => {
         prompts.push(prompt);
+        if (prompt.includes('FAIL-RERUN')) return { ok: false, error: 'model down' };
         const id = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.exec(prompt)?.[0] ?? '';
         return {
           ok: true,
@@ -227,6 +228,42 @@ describeIf('MeetingPipelineRecovery (integration, #2322)', () => {
     const recorded = await agendas.get(recordedId);
     expect(recorded?.status).toBe('pending');
     expect(recorded?.history.length).toBeGreaterThan(0);
+  });
+
+  it('releases an agenda a failed later session holds after an earlier session recorded it', async () => {
+    const { sessionId: completedId, agendaId } = await endedCall('EARLIER-MARKER');
+    await publicPool.query(
+      `UPDATE voice_sessions SET status = 'ended', end_reason = 'remote_hangup', ended_at = NOW() WHERE id = $1`,
+      [completedId],
+    );
+    await recovery.sweep(new Date());
+    expect((await agendas.get(agendaId))?.status).toBe('pending');
+
+    const failedId = randomUUID();
+    sessionIds.push(failedId);
+    const failedSession = await sessions.create({
+      id: failedId,
+      conversationId: `meetings-2322:${failedId}`,
+      livekitRoom: `meetings-2322:${failedId}`,
+    });
+    const locked = await agendas.lock(agendaId, failedId, new Date());
+    if (!locked.ok) throw new Error(locked.reason);
+    await sessions.appendAgendaLoad(failedId, {
+      agendaId,
+      loadedAt: failedSession.startedAt.toISOString(),
+      snapshot: agendaSnapshot(locked.agenda),
+    });
+    await memory.addTurn(`meetings-2322:${failedId}`, 'coordinator', { role: 'user', content: 'FAIL-RERUN' }, {
+      createdAt: new Date(failedSession.startedAt.getTime() + 1000),
+    });
+    await publicPool.query(
+      `UPDATE voice_sessions SET status = 'failed', end_reason = 'process_restart', ended_at = NOW() WHERE id = $1`,
+      [failedId],
+    );
+    await recovery.sweep(new Date());
+    const released = await agendas.get(agendaId);
+    expect(released?.status).toBe('pending');
+    expect(released?.inCallSession).toBeNull();
   });
 
   it('orphaned in_call agenda is released', async () => {

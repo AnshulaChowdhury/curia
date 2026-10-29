@@ -2,8 +2,8 @@
 //
 // Rerun recent ended sessions, cull expired agendas, then release an in_call
 // agenda whose session is gone. A completed or unused rerun protects only the
-// agendas it recorded. An in_call agenda that was never recorded is released,
-// and so is every agenda from a failed rerun.
+// holds it recorded, keyed by that session and agenda. The same agenda held by
+// a later session is released, as is a hold that was never recorded.
 
 import { sessionAgendaLoads, type VoiceSessionStore } from '../channels/voice/session-store.js';
 import type { WorkingDocsRepo } from '../db/working-docs-repo.js';
@@ -32,7 +32,7 @@ export class MeetingPipelineRecovery {
   async sweep(now: Date): Promise<{ rerun: number; released: number }> {
     const since = new Date(now.getTime() - this.lookbackDays * DAY_MS);
     const sessions = await this.deps.sessionStore.listRecentWithAgendas(since);
-    const protectedAgendaIds = new Set<string>();
+    const protectedHolds = new Set<string>();
     let rerun = 0;
     for (const session of sessions) {
       rerun += 1;
@@ -43,7 +43,9 @@ export class MeetingPipelineRecovery {
         this.deps.logger.error({ err, sessionId: session.id }, 'meeting recovery: pipeline run rejected');
       }
       if (outcome === 'completed' || outcome === 'returned_unused') {
-        for (const load of sessionAgendaLoads(session)) protectedAgendaIds.add(load.agendaId);
+        for (const load of sessionAgendaLoads(session)) {
+          protectedHolds.add(`${session.id}:${load.agendaId}`);
+        }
       }
     }
 
@@ -55,7 +57,7 @@ export class MeetingPipelineRecovery {
       if (!row.path.startsWith(AGENDA_PREFIX)) continue;
       const doc = parseAgendaDoc(row);
       if (!doc || doc.status !== 'in_call' || !doc.inCallSession) continue;
-      if (protectedAgendaIds.has(doc.agendaId)) continue;
+      if (protectedHolds.has(`${doc.inCallSession}:${doc.agendaId}`)) continue;
       const session = await this.deps.sessionStore.get(doc.inCallSession);
       if (session && (session.status === 'active' || session.status === 'starting')) continue;
       const result = await this.deps.agendaStore.settle(doc.agendaId, doc.inCallSession, { kind: 'return' });

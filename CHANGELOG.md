@@ -206,9 +206,6 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Fixed
 
 - **PII scenarios 34a, 34h, 34i** — stub the inbox specialist, ask Curia to send, and check held SINs precisely. (#2333)
-- **Call agendas** — a future agenda is not loaded when another agenda is also waiting. (#2322)
-- **Meeting minutes** — archived minutes and transcripts are left in place on recovery. (#2322)
-- **Agenda times** — parked expiry and queued call times use the principal's timezone. (#2322)
 - **task-create** — placeholder ids are omitted, and a missing task is reported as not found. (#2328)
 - **task-create** — optional id inputs say to omit the field when there is none. (#2328)
 - **task-update** — string placeholder blockers are rejected; JSON null still clears one. (#2328)

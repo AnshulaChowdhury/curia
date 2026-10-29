@@ -2,25 +2,33 @@ import { describe, expect, it } from 'vitest';
 import pino from 'pino';
 import { MeetingAgendaLoadHandler } from './handler.js';
 import { AgendaStore } from '../../src/meetings/agenda-store.js';
+import { parseAgendaLoadResult } from '../../src/meetings/agenda-prompt.js';
 import type { ToolContext } from '../../src/skills/types.js';
 import type { WorkingDocRow, WorkingDocsRepo } from '../../src/db/working-docs-repo.js';
 
 const silentLog = pino({ level: 'silent' });
 const NOW = new Date();
 
-function ctx(input: Record<string, unknown>, repo: WorkingDocsRepo | undefined, voiceSessionId?: string): ToolContext {
+function ctx(
+  input: Record<string, unknown>,
+  repo: WorkingDocsRepo | undefined,
+  voiceSessionId?: string,
+  timezone?: string,
+): ToolContext {
   return {
     input,
     log: silentLog,
     agentId: 'coordinator',
+    timezone,
     workingDocs: repo,
     taskMetadata: voiceSessionId ? { voiceSessionId } : undefined,
   } as unknown as ToolContext;
 }
 
-async function parkedRepo(overrides: { status?: string; expiresAt?: string } = {}): Promise<{
+async function parkedRepo(overrides: { status?: string; expiresAt?: string; scheduledFor?: Date } = {}): Promise<{
   repo: WorkingDocsRepo;
   agendaId: string;
+  store: AgendaStore;
 }> {
   const docs = new Map<string, WorkingDocRow>();
   const backing = {
@@ -79,7 +87,7 @@ async function parkedRepo(overrides: { status?: string; expiresAt?: string } = {
     sensitivity: 'internal',
     expiresAt: new Date(NOW.getTime() + 7 * 24 * 60 * 60 * 1000),
     role: 'Be brief.',
-    scheduledFor: null,
+    scheduledFor: overrides.scheduledFor ?? null,
   }, NOW);
   if (overrides.status || overrides.expiresAt) {
     const row = docs.get(parked.path)!;
@@ -89,7 +97,7 @@ async function parkedRepo(overrides: { status?: string; expiresAt?: string } = {
       ...(overrides.expiresAt ? { expires_at: overrides.expiresAt } : {}),
     };
   }
-  return { repo: backing as unknown as WorkingDocsRepo, agendaId: parked.agendaId };
+  return { repo: backing as unknown as WorkingDocsRepo, agendaId: parked.agendaId, store };
 }
 
 describe('meeting-agenda-load', () => {
@@ -107,6 +115,42 @@ describe('meeting-agenda-load', () => {
     expect(data.agenda.title).toBe('Q3 review');
     expect(data.agenda.context).toBe('Board wants a status.');
     expect(data.agenda.history).toEqual([]);
+  });
+
+  it('returns scheduledFor and history dates in the caller timezone', async () => {
+    const { repo, agendaId, store } = await parkedRepo({
+      scheduledFor: new Date('2026-10-28T16:00:00.000Z'),
+    });
+    const locked = await store.lock(agendaId, 'earlier-session', NOW);
+    expect(locked.ok).toBe(true);
+    expect(await store.settle(agendaId, 'earlier-session', {
+      kind: 'return',
+      history: {
+        sessionId: 'earlier-session',
+        date: '2026-10-21T18:00:00.000Z',
+        topics: [{ topic: 'Pipeline', coverage: 'partial' }],
+      },
+    })).toBe('settled');
+
+    const result = await new MeetingAgendaLoadHandler().execute(ctx(
+      { agenda_id: agendaId },
+      repo,
+      'session-2',
+      'America/Toronto',
+    ));
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const data = result.data as {
+      agenda: { scheduledFor: string; history: Array<{ date: string }> };
+      displayTimezone: string;
+    };
+    expect(data.agenda.scheduledFor).toBe('2026-10-28T12:00:00.000-04:00');
+    expect(data.agenda.history[0]?.date).toBe('2026-10-21T14:00:00.000-04:00');
+    expect(data.displayTimezone).toMatch(/UTC-04:00/);
+    expect(parseAgendaLoadResult(JSON.stringify({ agenda: data.agenda }))).toMatchObject({
+      scheduledFor: '2026-10-28T12:00:00.000-04:00',
+      history: [expect.objectContaining({ date: '2026-10-21T14:00:00.000-04:00' })],
+    });
   });
 
   it('rejects outside a voice session', async () => {

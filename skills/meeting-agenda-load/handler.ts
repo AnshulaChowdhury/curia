@@ -6,8 +6,27 @@
 // consume it — settlement after the call decides that.
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
-import { AgendaStore, type AgendaLockResult } from '../../src/meetings/agenda-store.js';
-import { agendaSnapshot } from '../../src/meetings/agenda-store.js';
+import { AgendaStore, agendaSnapshot, type AgendaLockResult } from '../../src/meetings/agenda-store.js';
+import type { AgendaSnapshot } from '../../src/meetings/types.js';
+import { formatDisplayTimezone, toLocalIso } from '../../src/time/timestamp.js';
+
+function displayIso(iso: string | null, timezone: string | undefined): string | null {
+  if (iso === null || !timezone) return iso;
+  const unix = Date.parse(iso) / 1000;
+  if (!Number.isFinite(unix)) return iso;
+  return toLocalIso(unix, timezone) ?? iso;
+}
+
+function snapshotForCaller(snapshot: AgendaSnapshot, timezone: string | undefined): AgendaSnapshot {
+  return {
+    ...snapshot,
+    scheduledFor: displayIso(snapshot.scheduledFor, timezone),
+    history: snapshot.history.map((entry) => ({
+      ...entry,
+      date: displayIso(entry.date, timezone) ?? entry.date,
+    })),
+  };
+}
 
 function spokenLockError(reason: Extract<AgendaLockResult, { ok: false }>['reason']): string {
   switch (reason) {
@@ -41,7 +60,14 @@ export class MeetingAgendaLoadHandler implements ToolHandler {
       const store = new AgendaStore(ctx.workingDocs, ctx.log);
       const locked = await store.lock(agendaId, sessionId, new Date());
       if (!locked.ok) return { success: false, error: spokenLockError(locked.reason) };
-      return { success: true, data: { agenda: agendaSnapshot(locked.agenda) } };
+      const tz = ctx.timezone;
+      return {
+        success: true,
+        data: {
+          agenda: snapshotForCaller(agendaSnapshot(locked.agenda), tz),
+          displayTimezone: tz ? formatDisplayTimezone(tz, new Date()) : null,
+        },
+      };
     } catch (err) {
       ctx.log.error({ err, agendaId }, 'meeting-agenda-load failed');
       return { success: false, error: err instanceof Error ? err.message : String(err) };
