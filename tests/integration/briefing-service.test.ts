@@ -115,7 +115,7 @@ describeIf('briefing service against Postgres', () => {
         timestamp: new Date(now.getTime() - 2 * 3_600_000 + 1000),
         eventType: 'tool.invoke',
         parentEventId: partialRoot,
-        payload: { toolName: 'web-search' },
+        payload: { toolName: 'email-archive' },
       });
       await seedAudit(client, {
         timestamp: new Date(now.getTime() - 2 * 3_600_000 + 2000),
@@ -133,14 +133,15 @@ describeIf('briefing service against Postgres', () => {
         timestamp: new Date(now.getTime() - 2 * 3_600_000 + 4000),
         eventType: 'tool.invoke',
         parentEventId: delegated,
-        payload: { toolName: 'web-search' },
+        payload: { toolName: 'email-send' },
       });
+      // denied stays a failure even when the legacy payload says the call worked.
       await seedAudit(client, {
         timestamp: new Date(now.getTime() - 2 * 3_600_000 + 5000),
         eventType: 'tool.result',
         parentEventId: delegatedInvoke,
-        outcome: 'failure',
-        payload: { result: { success: false } },
+        outcome: 'denied',
+        payload: { result: { success: true } },
       });
 
       const replyRoot = await seedAudit(client, {
@@ -153,6 +154,61 @@ describeIf('briefing service against Postgres', () => {
         eventType: 'agent.response',
         parentEventId: replyRoot,
         payload: { isError: true },
+      });
+
+      // A failed hidden call beside a visible success is still a success.
+      const quietRoot = await seedAudit(client, {
+        timestamp: new Date(now.getTime() - 90 * 60_000),
+        eventType: 'agent.task',
+        payload: { agentId: 'contacts' },
+      });
+      const quietInvoke = await seedAudit(client, {
+        timestamp: new Date(now.getTime() - 90 * 60_000 + 1000),
+        eventType: 'tool.invoke',
+        parentEventId: quietRoot,
+        payload: { toolName: 'email-archive' },
+      });
+      await seedAudit(client, {
+        timestamp: new Date(now.getTime() - 90 * 60_000 + 2000),
+        eventType: 'tool.result',
+        parentEventId: quietInvoke,
+        outcome: 'success',
+        payload: { result: { success: true } },
+      });
+      const hiddenInvoke = await seedAudit(client, {
+        timestamp: new Date(now.getTime() - 90 * 60_000 + 3000),
+        eventType: 'tool.invoke',
+        parentEventId: quietRoot,
+        targetType: 'skill',
+        targetId: 'extract-facts',
+        payload: { toolName: 'extract-facts' },
+      });
+      await seedAudit(client, {
+        timestamp: new Date(now.getTime() - 90 * 60_000 + 4000),
+        eventType: 'tool.result',
+        parentEventId: hiddenInvoke,
+        outcome: 'failure',
+        payload: { result: { success: false } },
+      });
+
+      // An outcome other than failure/error/denied falls back to the payload.
+      const fallbackRoot = await seedAudit(client, {
+        timestamp: new Date(now.getTime() - 4 * 3_600_000),
+        eventType: 'agent.task',
+        payload: { agentId: 'digest' },
+      });
+      const fallbackInvoke = await seedAudit(client, {
+        timestamp: new Date(now.getTime() - 4 * 3_600_000 + 1000),
+        eventType: 'tool.invoke',
+        parentEventId: fallbackRoot,
+        payload: { toolName: 'email-archive' },
+      });
+      await seedAudit(client, {
+        timestamp: new Date(now.getTime() - 4 * 3_600_000 + 2000),
+        eventType: 'tool.result',
+        parentEventId: fallbackInvoke,
+        outcome: 'skipped',
+        payload: { result: { success: true } },
       });
 
       await seedAudit(client, {
@@ -198,13 +254,14 @@ describeIf('briefing service against Postgres', () => {
 
       const todayBar = histogram.days.find((day) => day.key === today);
       const yesterdayBar = histogram.days.find((day) => day.key === yesterday);
-      expect(todayBar).toMatchObject({ total: 3, hiccups: 2 });
+      expect(todayBar).toMatchObject({ total: 5, hiccups: 2 });
       expect(todayBar?.byAgent['coordinator']).toBe(1);
       expect(todayBar?.byAgent['research']).toBe(1);
-      expect(todayBar?.byOutcome).toMatchObject({ success: 1, partial: 1, failed: 1 });
+      expect(todayBar?.byAgent['contacts']).toBe(1);
+      expect(todayBar?.byOutcome).toMatchObject({ success: 3, partial: 1, failed: 1 });
       expect(yesterdayBar).toMatchObject({ total: 1, hiccups: 1 });
-      expect(stats.done.current).toBe(2);
-      expect(stats.handledSinceYesterday).toBe(4);
+      expect(stats.done.current).toBe(4);
+      expect(stats.handledSinceYesterday).toBe(6);
 
       const bullpen = await service.bullpen(now);
       expect(bullpen).toEqual({ available: true, count: 1, agents: ['coordinator'] });
@@ -238,13 +295,24 @@ async function seedAudit(
     payload: Record<string, unknown>;
     parentEventId?: string;
     outcome?: string;
+    targetType?: string;
+    targetId?: string;
   },
 ): Promise<string> {
   const id = randomUUID();
   await client.query(
-    `INSERT INTO audit_log (id, timestamp, event_type, source_layer, source_id, payload, parent_event_id, outcome)
-     VALUES ($1, $2, $3, 'test-briefing', 'coordinator', $4::jsonb, $5, $6)`,
-    [id, opts.timestamp, opts.eventType, JSON.stringify(opts.payload), opts.parentEventId ?? null, opts.outcome ?? null],
+    `INSERT INTO audit_log (id, timestamp, event_type, source_layer, source_id, payload, parent_event_id, outcome, target_type, target_id)
+     VALUES ($1, $2, $3, 'test-briefing', 'coordinator', $4::jsonb, $5, $6, $7, $8)`,
+    [
+      id,
+      opts.timestamp,
+      opts.eventType,
+      JSON.stringify(opts.payload),
+      opts.parentEventId ?? null,
+      opts.outcome ?? null,
+      opts.targetType ?? null,
+      opts.targetId ?? null,
+    ],
   );
   return id;
 }

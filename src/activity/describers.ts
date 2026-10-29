@@ -597,6 +597,16 @@ export function isVisibleTool(toolName: string): boolean {
   return d !== undefined && d.prominence !== 'hidden';
 }
 
+/**
+ * Tools the activity feed skips before it classifies a job.
+ * The histogram uses this list so a failed hidden call cannot become a hiccup.
+ */
+export function hiddenToolNames(): readonly string[] {
+  return Object.entries(DESCRIBERS)
+    .filter(([, describer]) => describer.prominence === 'hidden')
+    .map(([name]) => name);
+}
+
 /** Research kind of a web tool, or undefined. */
 export function researchKind(toolName: string): ResearchKind | undefined {
   return lookup(toolName)?.research;

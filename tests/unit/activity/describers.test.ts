@@ -5,6 +5,7 @@ import {
   describerRefs,
   formatTally,
   hasDescriber,
+  hiddenToolNames,
   isVisibleTool,
   researchKind,
   type DescribeContext,
@@ -34,6 +35,17 @@ describe('describer coverage', () => {
     }
     // Add an entry to src/activity/describers.ts for each tool listed here.
     expect(missing).toEqual([]);
+  });
+});
+
+describe('hiddenToolNames', () => {
+  it('lists plumbing the feed skips and leaves visible tools out', () => {
+    const hidden = hiddenToolNames();
+    expect(hidden).toContain('extract-facts');
+    expect(hidden).toContain('web-search');
+    expect(hidden).toContain('delegate');
+    expect(hidden).not.toContain('email-archive');
+    expect(hidden).not.toContain('email-send');
   });
 });
 

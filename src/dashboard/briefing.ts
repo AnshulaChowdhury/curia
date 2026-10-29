@@ -1,11 +1,11 @@
 // briefing.ts — pure calendar math and histogram shaping for the principal home (#2340).
-
-import { buildApprovalDetails } from '../autonomy/approval-notification.js';
 //
 // Day boundaries are the principal's timezone, including across DST: a local
 // calendar date is never skipped or repeated. Counts that the console compares
 // (hiccups tile vs histogram, done-for-you vs the same jobs) are derived from
 // one shaped model so they cannot drift.
+
+import { buildApprovalDetails } from '../autonomy/approval-notification.js';
 
 /** Successful tool/skill invocations count as this many minutes each. One place, on purpose. */
 export const MINUTES_PER_SUCCESSFUL_ACTION = 1;

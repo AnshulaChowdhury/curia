@@ -4,6 +4,7 @@
 // reports unavailable) so the card can show an error instead of a false zero.
 
 import type { Pool } from 'pg';
+import { hiddenToolNames } from '../activity/describers.js';
 import { OPEN_TASK_STATUSES } from '../agents/prompts/backlog-line.js';
 import type { ActionLogRepo } from '../autonomy/action-log-repo.js';
 import type { DisclosureDecisionRecorder } from '../autonomy/disclosure-decisions.js';
@@ -273,9 +274,9 @@ export class BriefingService {
 
   /**
    * One grouped read of the 14-day window, shared by stats and the histogram.
-   * Outcome follows the activity feed's success / partial / failed rule on tool
-   * results and a failed reply. Jobs the feed hides (plumbing-only calls) still
-   * count here, so a busy fortnight cannot 500 the cards by running out of pages.
+   * Outcome follows the activity feed: hidden tools are skipped, and only
+   * failure, error and denied are hard failures. A job the feed drops entirely
+   * (plumbing only, no visible call and no error reply) still counts as success.
    */
   private cachedModel(now: Date, timezone: string): Promise<HistogramModel> {
     const today = localDayKey(now, timezone);
@@ -294,7 +295,7 @@ export class BriefingService {
   private async loadModel(from: Date, to: Date, timezone: string): Promise<HistogramModel> {
     const result = await this.deps.pool.query<{ day: string; actor: string; outcome: string; n: number }>(
       HISTOGRAM_SQL,
-      [from, to, new Date(to.getTime() + DELEGATION_TAIL_MS), timezone, MAX_DELEGATION_DEPTH],
+      [from, to, new Date(to.getTime() + DELEGATION_TAIL_MS), timezone, MAX_DELEGATION_DEPTH, hiddenToolNames()],
     );
     const counts: HistogramCount[] = [];
     for (const row of result.rows) {
@@ -392,9 +393,13 @@ function outcomeTotal(days: HistogramModel['days'], outcomes: readonly JobOutcom
 /**
  * One row per local day, actor and outcome for root jobs in [$1, $2).
  * Delegated tasks fold into their root, up to $5 levels, and may finish as late as $3.
- * A tool result is a success only when its outcome says so (or a legacy payload does).
- * Anything else recorded against the invoke is a failure. A failed root reply with no
- * successful call is a failure; mixed with successes it is partial.
+ * A call counts only when the feed would classify it. The tool name is read the
+ * same way as readAuditToolName (invoke first, then the result; target_id only
+ * when target_type is skill). Hidden tools ($6, from the describer table) and
+ * unnamed calls are left out. Success is outcome 'success', or any other outcome
+ * except failure, error and denied when payload.result.success is true. Those
+ * three are failures even if the payload says otherwise. A failed root reply
+ * with no successful visible call is a failure; mixed with successes it is partial.
  */
 const HISTOGRAM_SQL = `
 WITH RECURSIVE chain AS (
@@ -432,9 +437,9 @@ results AS (
   SELECT
     c.root_id,
     CASE
-      WHEN r.outcome = 'success'
-        OR (r.outcome IS NULL AND r.payload->'result'->>'success' = 'true')
-      THEN 'ok'
+      WHEN r.outcome = 'success' THEN 'ok'
+      WHEN r.outcome IN ('failure', 'error', 'denied') THEN 'bad'
+      WHEN r.payload->'result'->>'success' = 'true' THEN 'ok'
       ELSE 'bad'
     END AS kind
   FROM audit_log r
@@ -442,6 +447,26 @@ results AS (
   JOIN chain c ON i.parent_event_id = c.id::text
   WHERE r.event_type = ANY(ARRAY['tool.result', 'skill.result']::text[])
     AND i.event_type = ANY(ARRAY['tool.invoke', 'skill.invoke']::text[])
+    AND COALESCE(
+      CASE
+        WHEN i.target_type = 'skill'
+          AND i.target_id IS NOT NULL
+          AND i.target_id <> ''
+          AND i.target_id <> '[EXTRACTION_FAILED]'
+        THEN i.target_id
+      END,
+      i.payload->>'toolName',
+      i.payload->>'skillName',
+      CASE
+        WHEN r.target_type = 'skill'
+          AND r.target_id IS NOT NULL
+          AND r.target_id <> ''
+          AND r.target_id <> '[EXTRACTION_FAILED]'
+        THEN r.target_id
+      END,
+      r.payload->>'toolName',
+      r.payload->>'skillName'
+    ) <> ALL($6::text[])
 ),
 responses AS (
   SELECT c.root_id, bool_or(COALESCE(a.payload->>'isError', '') = 'true') AS failed
