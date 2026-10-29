@@ -606,6 +606,6 @@ Any thrown error in steps 3–6 publishes `minutes.pipeline_failed` with that st
 
 ## Known limitations, carried from the issue
 
-- **The report can be held below autonomy 70.** The structuring task's report send goes through autonomy gates A and B, because it isn't principal-originated. #2337 tracks exempting principal-only sends. Don't change the gates here.
+- ~~**The report can be held below autonomy 70.**~~ Resolved by #2337: the report goes to `principal` alone, and a send to the principal alone now skips gates A and B whoever started the task. The structuring task's other actions are still gated.
 - **No fact extraction from voice calls.** Voice calls get no checkpoint fact extraction (`src/dispatch/dispatcher.ts:568`). That's unchanged.
 - **Console calls get no agendas.** The console voice path (`src/channels/voice/voice-adapter.ts:142`) does not prepare agendas in this slice. To add it later, call `prepareSessionAgendas` there.
