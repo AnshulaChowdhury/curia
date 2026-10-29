@@ -18,6 +18,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Agenda-driven calls** — principal calls start from parked agendas; Curia can switch agendas mid-call. (#2322)
 - **Meeting minutes** — calls with an agenda produce a transcript, minutes and one follow-up report. (#2322)
 - **Bus events** — `minutes.ready` and `minutes.pipeline_failed`, system-only. (#2322)
+- **`meeting-notes-start`** — notes on a call with no agenda yield minutes; a recap when the caller asks. (#2347)
 - **Principal home** — waiting items, a work histogram, and value tiles replace the operator view. (#2340)
 - **Ant Farm video-call design** — design doc for replacing the Phaser office with a call view. (#2127)
 - **Turn lanes** — per-conversation lock and injection config, on in the shipped file. (#2018)
@@ -98,6 +99,12 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Changed
 
 - **Principal-only sends** — a message to the principal alone skips autonomy gates A and B (spec 14). (#2337)
+- **ceo-inbox triage** — runs hourly instead of every 15 minutes, cutting scheduled triage runs to a quarter.
+- **ceo-inbox delegate wait** — raised from 300s to 563s to fit observed p99 run length. (#1915)
+- **Meeting recaps** — sent only when the caller asked or an agenda topic was covered. (#2347)
+- **Recap wording** — first-person recap for casual calls; formal calls link the minutes in the office. (#2347)
+- **Agenda speech** — Curia pulls up an agenda on a call; it never says "loading". (#2347)
+- **`minutes.ready`** — **public API:** payload gains `recap`, the follow-up's send decision. (#2347)
 - **Approval answers** — principal turns list approvals they were shown, so a yes or no finds its approval. (#2333)
 - **Approval emails** — a reply on an approval email's thread is marked as answering that approval. (#2333)
 - **Hold sweep** — first post-deploy run deletes stale holds within ±14 days; older ones remain. (#2329)
@@ -208,6 +215,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Voice recap requests** — after-call emails go through the async off-ramp, not the draft-only inbox specialist. (#2347)
+- **Minutes follow-up** — the wake now carries the minutes path, so the coordinator stops searching for it. (#2347)
 - **Scenario tool calls** — approval-wake and `then` turns' tool calls are recorded once, not twice. (#2333)
 - **PII scenarios 34a, 34h, 34i** — stub the inbox specialist, ask Curia to send, and check held SINs precisely. (#2333)
 - **Approval review** — held sends show their content, and discard finds the owning mailbox. (#2340)

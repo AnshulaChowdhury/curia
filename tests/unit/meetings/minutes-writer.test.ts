@@ -17,6 +17,17 @@ const agenda: AgendaSnapshot = {
 };
 
 describe('minutes writer', () => {
+  it('organises minutes by topic raised when no agenda was set (#2347)', () => {
+    const prompt = buildMinutesPrompt({ agendas: [], transcriptBody: '**Joseph:** Keep notes.' });
+    expect(prompt).toContain('No agenda was set.');
+    expect(prompt).toContain('{"coverage":[]}');
+    expect(prompt).not.toContain('Agendas:');
+    expect(parseMinutesOutput('## Essays\nTwo links.\n\n```json\n{"coverage":[]}\n```', [])).toEqual({
+      markdown: '## Essays\nTwo links.',
+      coverage: [],
+    });
+  });
+
   it('parses markdown and coverage from a well-formed response', () => {
     const parsed = parseMinutesOutput(
       [

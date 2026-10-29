@@ -88,14 +88,18 @@ export function formatJobRecurrence(job: JobRow): string {
   return 'Unknown schedule';
 }
 
+/** The office console's origin: APP_ORIGIN, or localhost on the HTTP port in dev. */
+export function consoleOrigin(appOrigin: string | undefined, httpPort: number): string {
+  return (appOrigin?.trim() ? appOrigin : `http://localhost:${httpPort}`).replace(/\/+$/, '');
+}
+
 /** Build a console deep-link URL for a scheduled job. */
 export function buildJobConsoleUrl(
   appOrigin: string | undefined,
   httpPort: number,
   jobId: string,
 ): string {
-  const origin = (appOrigin?.trim() ? appOrigin : `http://localhost:${httpPort}`).replace(/\/+$/, '');
-  return `${origin}/jobs/${jobId}`;
+  return `${consoleOrigin(appOrigin, httpPort)}/jobs/${jobId}`;
 }
 
 export interface JobNotificationContext {

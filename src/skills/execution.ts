@@ -313,6 +313,8 @@ export class ExecutionLayer {
   private diagnosticsRepo?: import('../diagnostics/diagnostics-repo.js').DiagnosticsRepo;
   private taskRepo?: import('../db/task-repo.js').TaskRepo;
   private workingDocsRepo?: import('../db/working-docs-repo.js').WorkingDocsRepo;
+  /** Backs the 'voiceSessions' capability (#2347). */
+  private voiceSessions?: Pick<import('../channels/voice/session-store.js').VoiceSessionStore, 'markNotesRequested'>;
   private confidencePipeline?: import('../contacts/confidence-pipeline.js').ConfidencePipeline;
   private tempFileStore?: TempFileStore;
   private readonly infraLlmService?: InfraLlmService;
@@ -395,6 +397,8 @@ export class ExecutionLayer {
     diagnosticsRepo?: import('../diagnostics/diagnostics-repo.js').DiagnosticsRepo;
     taskRepo?: import('../db/task-repo.js').TaskRepo;
     workingDocsRepo?: import('../db/working-docs-repo.js').WorkingDocsRepo;
+    /** Backs the 'voiceSessions' capability (#2347). */
+    voiceSessions?: Pick<import('../channels/voice/session-store.js').VoiceSessionStore, 'markNotesRequested'>;
     confidencePipeline?: import('../contacts/confidence-pipeline.js').ConfidencePipeline;
     tempFileStore?: TempFileStore;
     infraLlmService?: InfraLlmService;
@@ -455,6 +459,7 @@ export class ExecutionLayer {
     this.diagnosticsRepo = options?.diagnosticsRepo;
     this.taskRepo = options?.taskRepo;
     this.workingDocsRepo = options?.workingDocsRepo;
+    this.voiceSessions = options?.voiceSessions;
     this.confidencePipeline = options?.confidencePipeline;
     this.tempFileStore = options?.tempFileStore;
     this.infraLlmService = options?.infraLlmService;
@@ -511,6 +516,7 @@ export class ExecutionLayer {
       diagnosticsRepo: this.diagnosticsRepo,
       taskRepo: this.taskRepo,
       workingDocs: this.workingDocsRepo,
+      voiceSessions: this.voiceSessions,
       confidencePipeline: this.confidencePipeline,
       // tempFileStore is handled as a special case in the injection loop (writeTempFile closure).
       // Listed here so the missing-cap guard knows it's configured when this.tempFileStore is set.

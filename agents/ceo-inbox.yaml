@@ -1,9 +1,9 @@
 name: ceo-inbox
-version: "0.23.0"
+version: "0.23.1"
 role: specialist
 description: >
   Manages the principal's personal email inbox. Handles standing-rule management,
-  inbox queries, and composing new draft emails when delegated. On its 15-minute
+  inbox queries, and composing new draft emails when delegated. On its hourly
   schedule, drains the inbox in fixed-size batches (self-continuing until empty),
   triaging each unread message into one of six categories: 🚨 Urgent, ✅ Handled,
   ✍️ Drafted, 📌 Seen, ✔️ Cleared, or ⚠️ Stuck. Archives or marks-read processed
@@ -15,9 +15,10 @@ description: >
 model:
   tier: standard
 
-# Delegate-wait hint (#1857). Clean-baseline p99 before 2026-09-20 was 280s
-# (n=140). 240s plus 25% headroom is 300s, under the 895s clamp (ADR-044).
-expected_duration_seconds: 240
+# Delegate-wait hint (#1857, #1915). Delegated-run p99 was 406s over
+# 2026-09-26..10-21 and 449s over 2026-10-22..29, both past the old 300s wait.
+# 450s plus 25% headroom is 563s, under the 895s clamp (ADR-044).
+expected_duration_seconds: 450
 
 inject_specialists: true
 
@@ -50,12 +51,12 @@ error_budget:
   max_cost_usd: 0.50
 
 schedule:
-  - cron: "*/15 6-23 * * *"  # restricted to 6am–11pm local time; dead hours don't justify the cost
+  - cron: "0 6-23 * * *"  # hourly, 6am–11pm local time; dead hours don't justify the cost
     task: >
       Check the principal's inbox for unread messages. Triage one batch using the
       protocol below, then self-continue (Step 6) if more unread remain.
       If there are no unread messages, exit immediately without any output.
-  - cron: "0 7 * * *"  # daily sent-observe — keep out of the 15-min triage loop
+  - cron: "0 7 * * *"  # daily sent-observe — keep out of the hourly triage loop
     task: >
       Run ceo-inbox-sent-observe, then task-completion-from-sent: poll Sent since
       the watermark, match drafts and open owner=ceo tasks, append evidence,
@@ -78,7 +79,7 @@ system_prompt: |
 
   You operate in distinct modes depending on how you were invoked:
 
-  **Scheduled mode** (default — 15-minute cron trigger, 6am–11pm):
+  **Scheduled mode** (default — hourly cron trigger, 6am–11pm):
   If you received a scheduled task like "Check the principal's inbox for unread
   messages", execute the full triage protocol below.
   **Autonomy band:** when an Autonomy block is present in your prompt, let a
@@ -321,7 +322,7 @@ system_prompt: |
   ---
 
   You are the principal inbox triage agent. You monitor the principal's personal email
-  inbox every 15 minutes (6am–11pm local time) and process unread messages
+  inbox every hour (6am–11pm local time) and process unread messages
   autonomously.
 
   You do not send mail. You create drafts for the principal to review, archive
@@ -889,7 +890,7 @@ system_prompt: |
      Then schedule the next batch:
      - If the current local time is within operating hours (6am–11pm), aim the
        wake ~90 seconds out so the next batch runs promptly instead of waiting for
-       the 15-minute cron. If OUTSIDE operating hours, aim `wake_at` at the next
+       the hourly cron. If OUTSIDE operating hours, aim `wake_at` at the next
        morning's start of hours instead (do not drain overnight).
      - If a drain task already exists, call task-update on it: status
        'in_progress', a short progress note (e.g. "batch done, more queued"), and
@@ -900,7 +901,7 @@ system_prompt: |
        NOT pass target_agent_id — it stays self-owned.
      - Never create a second drain task when one already exists. If
        task-list/task-create/task-update fails, log it and continue; the
-       15-minute cron is the backstop, so the drain still completes, just slower.
+       hourly cron is the backstop, so the drain still completes, just slower.
   2. **No more unread** (`has_more` was false): the inbox is drained. Complete any
      open drain cycle so it does not linger or keep re-waking:
      - Call task-list with status 'open,in_progress' and tag 'inbox-drain', and

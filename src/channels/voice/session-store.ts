@@ -114,17 +114,49 @@ export class VoiceSessionStore {
   }
 
   /**
-   * Ended or failed sessions since `since` that recorded at least one agenda
-   * load. Used by the startup sweep.
+   * Record that the caller asked for notes, and whether they want a recap (#2347).
+   * The first request's time is kept, and a recap once asked for stays asked for.
+   *
+   * Only a live session takes the mark. endSession's update and this one serialize
+   * on the row, so the mark either commits before the session ends (and the
+   * pipeline, which runs after the end, sees it) or finds the session ended and
+   * throws. A mark can never land after the pipeline has read the session.
    */
-  async listRecentWithAgendas(since: Date): Promise<VoiceSessionRecord[]> {
+  async markNotesRequested(id: string, requestedAt: Date, recap: boolean): Promise<{ requestedAt: string; recap: boolean }> {
+    const result = await this.pool.query<{ notes: { requestedAt: string; recap: boolean } }>(
+      `UPDATE voice_sessions
+         SET metadata = jsonb_set(
+           COALESCE(metadata, '{}'::jsonb),
+           '{notes}',
+           jsonb_build_object(
+             'requestedAt', COALESCE(metadata->'notes'->>'requestedAt', $2::text),
+             'recap', COALESCE((metadata->'notes'->>'recap')::boolean, false) OR $3::boolean
+           )
+         )
+       WHERE id = $1 AND status IN ('starting', 'active')
+       RETURNING metadata->'notes' AS notes`,
+      [id, requestedAt.toISOString(), recap],
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error(`voice session ${id} is not live; notes not started`);
+    return row.notes;
+  }
+
+  /**
+   * Ended or failed sessions since `since` that recorded an agenda load or a
+   * notes request. Used by the startup sweep.
+   */
+  async listRecentForMinutes(since: Date): Promise<VoiceSessionRecord[]> {
     const result = await this.pool.query<VoiceSessionRow>(
       `SELECT id, conversation_id, livekit_room, caller_contact_id, status, started_at, ended_at, end_reason, metadata
          FROM voice_sessions
         WHERE status IN ('ended', 'failed')
           AND started_at >= $1
-          AND jsonb_typeof(COALESCE(metadata->'agendas', '[]'::jsonb)) = 'array'
-          AND jsonb_array_length(COALESCE(metadata->'agendas', '[]'::jsonb)) > 0
+          AND (
+            (jsonb_typeof(COALESCE(metadata->'agendas', '[]'::jsonb)) = 'array'
+              AND jsonb_array_length(COALESCE(metadata->'agendas', '[]'::jsonb)) > 0)
+            OR jsonb_typeof(metadata->'notes') = 'object'
+          )
         ORDER BY started_at ASC`,
       [since],
     );
@@ -182,6 +214,14 @@ export function sessionAgendaLoads(record: VoiceSessionRecord): SessionAgendaLoa
     loads.push({ agendaId: row.agendaId, loadedAt: row.loadedAt, snapshot: row.snapshot });
   }
   return loads;
+}
+
+/** Read `metadata.notes`. Null when the caller never asked for notes or the entry is malformed. */
+export function sessionNotesRequest(record: VoiceSessionRecord): { requestedAt: string; recap: boolean } | null {
+  const raw = record.metadata.notes;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const { requestedAt, recap } = raw as Record<string, unknown>;
+  return typeof requestedAt === 'string' ? { requestedAt, recap: recap === true } : null;
 }
 
 function requireSingleRow(rows: VoiceSessionRow[]): VoiceSessionRow {
