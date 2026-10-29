@@ -168,6 +168,45 @@ error_budget:
     fs.rmSync(tempDir, { recursive: true });
   });
 
+  it('accepts pinned_context and fails the load on a bad entry, naming the agent (#2338)', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'curia-test-'));
+    const write = (entries: string): string => {
+      const filePath = path.join(tempDir, 'pinned.yaml');
+      fs.writeFileSync(filePath, `
+name: pinned-agent
+model:
+  tier: standard
+system_prompt: "Test agent"
+pinned_context:
+${entries}
+`);
+      return filePath;
+    };
+    try {
+      const config = loadAgentConfig(write([
+        '  docs:',
+        '    - /shared/inbox/rules.md',
+        '    - path: /shared/priorities.md',
+        '      description: The principal\'s highest priorities.',
+        '  configs: ceo_inbox/decision_tagging',
+      ].join('\n')));
+      expect(config.pinned_context).toEqual({
+        docs: ['/shared/inbox/rules.md', { path: '/shared/priorities.md', description: "The principal's highest priorities." }],
+        configs: 'ceo_inbox/decision_tagging',
+      });
+      // A bare `docs:` with nothing under it is an empty list, not an error.
+      expect(() => loadAgentConfig(write('  docs:'))).not.toThrow();
+      expect(() => loadAgentConfig(write('  docs: /projects/x/rules.md')))
+        .toThrow(/agent 'pinned-agent'.*under \/shared\//);
+      expect(() => loadAgentConfig(write('  configs: ceo_inbox')))
+        .toThrow(/agent 'pinned-agent'.*exactly one `\/`/);
+      expect(() => loadAgentConfig(write('  - doc: /shared/inbox/rules.md')))
+        .toThrow(/agent 'pinned-agent'.*must be a mapping/);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true });
+    }
+  });
+
   it('parses schedule entry with agent_id field', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'curia-test-'));
     const yamlContent = `

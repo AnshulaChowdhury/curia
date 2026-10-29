@@ -183,3 +183,66 @@ describe('buildBaseSystemPrompt own contact numbers', () => {
     expect(await contactBlock({})).toBeNull();
   });
 });
+
+describe('buildBaseSystemPrompt pinned context (#2338)', () => {
+  const pinnedContext = [{ kind: 'doc' as const, path: '/shared/inbox/rules.md' }];
+  const pinnedContextReader = {
+    warnChars: 16_000,
+    readDoc: vi.fn(async () => ({ status: 'live' as const, version: 3, content: '## Board mail' })),
+    readConfig: vi.fn(async () => null),
+  };
+
+  it('renders the block after the body and specialist roster, before autonomy', async () => {
+    const autonomyService = {
+      getConfig: vi.fn(async () => ({ score: 75, band: 'approval-required', updatedAt: NOW, updatedBy: 'x' })),
+    } as unknown as SystemPromptSources['autonomyService'];
+    const prompt = await buildBaseSystemPrompt(
+      sources('ceo-inbox', [], { pinnedContext, pinnedContextReader, availableSpecialists: '- @x', autonomyService }),
+      { now: NOW, logger },
+    );
+    const body = prompt.indexOf('Body.');
+    const roster = prompt.indexOf('## Available Specialists');
+    const pinned = prompt.indexOf('## Pinned context');
+    const autonomy = prompt.indexOf('## Autonomy Level');
+    expect(body).toBeGreaterThanOrEqual(0);
+    expect(roster).toBeGreaterThan(body);
+    expect(pinned).toBeGreaterThan(roster);
+    expect(autonomy).toBeGreaterThan(pinned);
+    expect(prompt).toContain('### Document /shared/inbox/rules.md (version 3)');
+  });
+
+  it('renders nothing for an agent that declares nothing', async () => {
+    const prompt = await buildBaseSystemPrompt(sources('contacts', [], { pinnedContextReader }), { now: NOW, logger });
+    expect(prompt).not.toContain('## Pinned context');
+  });
+
+  it('renders declared entries as unavailable when no reader is wired', async () => {
+    const prompt = await buildBaseSystemPrompt(sources('ceo-inbox', [], { pinnedContext }), { now: NOW, logger });
+    expect(prompt).toContain('### Document /shared/inbox/rules.md\n_Unavailable this turn');
+  });
+
+  it('builds the whole prompt when every declared entry is missing or every read fails', async () => {
+    const many = [
+      { kind: 'doc' as const, path: '/shared/a.md', description: 'A.' },
+      { kind: 'doc' as const, path: '/shared/b.md' },
+      { kind: 'config' as const, namespace: 'n', key: 'k', description: 'If missing, default to null.' },
+    ];
+    const missing = { warnChars: 16_000, readDoc: vi.fn(async () => null), readConfig: vi.fn(async () => null) };
+    const failing = {
+      warnChars: 16_000,
+      readDoc: vi.fn(async () => { throw new Error('db down'); }),
+      readConfig: vi.fn(async () => { throw new Error('kg down'); }),
+    };
+    // 'throw' mode fails the render on any block error, so this also proves nothing escapes.
+    for (const opts of [{ now: NOW, logger }, { now: NOW, logger, onBlockError: 'throw' as const }]) {
+      const absent = await buildBaseSystemPrompt(sources('ceo-inbox', [], { pinnedContext: many, pinnedContextReader: missing }), opts);
+      expect(absent.match(/_Not yet created\._/g)).toHaveLength(2);
+      expect(absent).toContain('### Config n/k\nPurpose: If missing, default to null.\n_Not set yet._');
+      expect(absent).toContain('## Turn budget');
+
+      const down = await buildBaseSystemPrompt(sources('ceo-inbox', [], { pinnedContext: many, pinnedContextReader: failing }), opts);
+      expect(down.match(/_Unavailable this turn/g)).toHaveLength(3);
+      expect(down).toContain('## Turn budget');
+    }
+  });
+});

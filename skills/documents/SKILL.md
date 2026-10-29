@@ -3,7 +3,7 @@ name: documents
 description: >
   OKF document workspace — doc-read/list/write/search/place for mutable working state
   addressed by path. Pin alongside tasks for resumable project documents.
-version: "0.2.3"
+version: "0.3.0"
 document_workspace: true
 tools:
   - doc-read
@@ -15,23 +15,25 @@ tools:
 
 ## Document Workspace
 
-You have an OKF document workspace — a filesystem of markdown concept-files addressed
-by path. Use your `doc-*` skills to read, list, write, search, and place documents in it.
+You have an OKF document workspace: markdown files addressed by path, used through your
+`doc-*` skills.
 
 **Paths.** Documents live at paths like `/projects/<slug>/brief.md` or
-`/scratch/<conversation-id>/outline.md`. Directories are path prefixes — `doc-list` on
-a prefix is like `ls` on a folder. Each directory has reserved `index.md` (navigation
-catalog) and `log.md` (append-only change history). Before you create a new `/projects/`
-folder, call `doc-place`: it prefers extending a document or adding to an existing folder,
-and names a new folder with a readable kebab-case slug. Shared folders are fine — path is
-organisational; ownership is `task_id`.
+`/scratch/<conversation-id>/outline.md`. `doc-list` on a path prefix lists that folder.
+Each directory has reserved `index.md` (navigation catalog) and `log.md` (append-only
+change history). Before you create a new `/projects/` folder, call `doc-place`: it
+prefers extending a document or adding to an existing folder, and names a new folder with
+a readable kebab-case slug. Tasks may share a project folder; a project document's owner
+is its `task_id`, not its path.
 
-**Writes.** `doc-write` creates, appends, replaces, or section-edits at a path and
-appends a `log.md` entry in that directory. Re-read with `doc-read` after writes that
-need the latest `expected_version`. On conflict, merge from the returned document and
-retry with the new version.
+**Shared documents.** `/shared/…` documents are durable and shown under `## Pinned
+context`; only an agent that declares one can write it. Follow the format it states at
+its top.
+
+**Writes.** Re-read with `doc-read` when you need the latest `expected_version`. On
+conflict, merge from the returned document and retry with the new version.
 
 **Conventions.** YAML frontmatter requires `type`; `title`, `tags`, and `timestamp` are
 conventional. Link between documents with markdown path links or `[[wikilinks]]`.
-Distill durable conclusions to the knowledge graph via `memory-store` / `extract-facts`
-when a project completes — the workspace is for mutable working state, not validated facts.
+The workspace is mutable working state: when a project completes, distill durable
+conclusions to the knowledge graph via `memory-store` / `extract-facts`.

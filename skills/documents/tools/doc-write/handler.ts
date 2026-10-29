@@ -21,9 +21,29 @@ import {
   validateWritePath,
 } from '../../../_shared/doc-workspace.js';
 import { isUuid } from '../../../../src/util/uuid.js';
-import { isDurableDocPath } from '../../../../src/memory/durable-doc-prefixes.js';
+import { isDurableDocPath, isSharedDocPath } from '../../../../src/memory/durable-doc-prefixes.js';
 
 const VALID_MODES = new Set(['create', 'append', 'replace', 'section-edit']);
+
+/**
+ * `/shared/` write guard (#2338): declaring a path in `pinned_context` is the
+ * permission to write it. Every declaring agent may write; nobody else may, and a
+ * call with no agent (or no roster to check) is refused. Two writers bypass it:
+ * the console, which does not go through doc-write, and a principal-approved
+ * re-execution (ADR-018), which carries no agentId and is the principal's own
+ * decision. Returns an error, or null to allow.
+ */
+function sharedPathWriteError(ctx: ToolContext, normalizedPath: string): string | null {
+  if (!isSharedDocPath(normalizedPath)) return null;
+  if (ctx.humanApproved) return null;
+  const declared = ctx.agentId ? ctx.agentRegistry?.get(ctx.agentId)?.pinnedDocPaths : undefined;
+  if (declared?.includes(normalizedPath)) return null;
+  ctx.log.warn(
+    { path: normalizedPath, agentId: ctx.agentId ?? null },
+    'doc-write: refused /shared/ write from an agent that does not declare the path',
+  );
+  return `${normalizedPath} is a shared document, and only an agent that declares it in pinned_context can write it. Leave it unchanged; the principal can edit it in the console.`;
+}
 
 /**
  * Ownership stamp for archival / prefix resolution is the *project root* task id
@@ -99,6 +119,10 @@ export class DocWriteHandler implements ToolHandler {
 
     const timezone = ctx.timezone ?? 'UTC';
     const normalized = normalizeDocPath(input.path);
+    const sharedError = sharedPathWriteError(ctx, normalized);
+    if (sharedError) {
+      return { success: false, error: sharedError };
+    }
     const summary = typeof input.summary === 'string' ? input.summary : `${input.mode} ${normalized}`;
     const ttlWarning = ttlDaysFrontmatterWarning(normalized, input.frontmatter);
 
@@ -139,6 +163,15 @@ export class DocWriteHandler implements ToolHandler {
           const existing = await repo.read(normalized);
           if (existing) {
             return { success: false, error: `Document already exists at ${normalized} — use append, replace, or section-edit` };
+          }
+          // read() skips archived rows, and the live-path index is partial, so a create
+          // here would put a new live row over an archived /shared/ document and block
+          // the principal's restore (path_in_use). Same rule as /meetings/ (#2322).
+          if (isSharedDocPath(normalized) && await repo.existsAtPath(normalized)) {
+            return {
+              success: false,
+              error: `${normalized} was archived by the principal. Do not recreate it; the principal can restore it in the console.`,
+            };
           }
           const created = await repo.create({
             path: normalized,

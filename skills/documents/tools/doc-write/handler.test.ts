@@ -3,6 +3,7 @@ import pino from 'pino';
 import { DocWriteHandler } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { WorkingDocsRepo, WorkingDocRow } from '../../../../src/db/working-docs-repo.js';
+import { AgentRegistry } from '../../../../src/agents/agent-registry.js';
 
 const silentLog = pino({ level: 'silent' });
 
@@ -38,6 +39,7 @@ function makeRepo(overrides: Partial<WorkingDocsRepo> = {}): WorkingDocsRepo {
     update: vi.fn(),
     editSection: vi.fn(),
     projectPrefixHasLiveDocs: vi.fn().mockResolvedValue(false),
+    existsAtPath: vi.fn().mockResolvedValue(false),
     ...overrides,
   } as unknown as WorkingDocsRepo;
 }
@@ -406,5 +408,100 @@ describe('DocWriteHandler', () => {
       expect(data.conflict).toBe(true);
       expect(data.version).toBe(3);
     }
+  });
+
+  describe('/shared/ write guard (#2338)', () => {
+    const SHARED = '/shared/inbox/rules.md';
+
+    function roster(): AgentRegistry {
+      const registry = new AgentRegistry();
+      registry.register('ceo-inbox', { role: 'specialist', description: 'inbox', pinnedDocPaths: [SHARED] });
+      registry.register('editor', { role: 'specialist', description: 'editor', pinnedDocPaths: [SHARED] });
+      registry.register('coordinator', { role: 'coordinator', description: 'coord', pinnedDocPaths: [] });
+      return registry;
+    }
+
+    function sharedCtx(agentId: string | undefined, input: Record<string, unknown>, repo: WorkingDocsRepo): ToolContext {
+      const ctx = makeCtx(input, repo) as unknown as Record<string, unknown>;
+      ctx.agentId = agentId;
+      ctx.agentRegistry = roster();
+      return ctx as unknown as ToolContext;
+    }
+
+    it('rejects an agent that does not declare the path, without touching the repo', async () => {
+      const repo = makeRepo();
+      const result = await new DocWriteHandler().execute(sharedCtx('coordinator', {
+        path: SHARED, mode: 'create', type: 'agent-settings', body: 'x',
+      }, repo));
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/pinned_context/);
+      expect(repo.read).not.toHaveBeenCalled();
+      expect(repo.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects an undeclared path under /shared/ even for an agent that declares another', async () => {
+      const repo = makeRepo();
+      const result = await new DocWriteHandler().execute(sharedCtx('ceo-inbox', {
+        path: '/shared/calendar/rules.md', mode: 'create', type: 'agent-settings', body: 'x',
+      }, repo));
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a path that normalizes into a declared /shared/ document only when undeclared', async () => {
+      const repo = makeRepo();
+      const result = await new DocWriteHandler().execute(sharedCtx('coordinator', {
+        path: '/projects/../shared/inbox/rules.md', mode: 'create', type: 'agent-settings', body: 'x',
+      }, repo));
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a call with no agent or no roster', async () => {
+      const noAgent = await new DocWriteHandler().execute(sharedCtx(undefined, {
+        path: SHARED, mode: 'create', type: 'agent-settings', body: 'x',
+      }, makeRepo()));
+      expect(noAgent.success).toBe(false);
+
+      const ctx = makeCtx({ path: SHARED, mode: 'create', type: 'agent-settings', body: 'x' }, makeRepo());
+      (ctx as { agentId?: string }).agentId = 'ceo-inbox';
+      expect((await new DocWriteHandler().execute(ctx)).success).toBe(false);
+    });
+
+    it('lets every declaring agent write, and never stamps a task_id', async () => {
+      const childId = '00000000-0000-4000-8000-000000000002';
+      for (const agentId of ['ceo-inbox', 'editor']) {
+        const create = vi.fn().mockResolvedValue(makeDoc({ path: SHARED }));
+        const repo = makeRepo({ read: vi.fn().mockResolvedValue(null), create });
+        const ctx = sharedCtx(agentId, { path: SHARED, mode: 'create', type: 'agent-settings', body: '## A' }, repo);
+        (ctx as { taskMetadata?: Record<string, unknown> }).taskMetadata = { boundTask: { taskId: childId } };
+        (ctx as { taskRepo?: unknown }).taskRepo = { resolveProjectRootTaskId: vi.fn(async () => childId) };
+        const result = await new DocWriteHandler().execute(ctx);
+        expect(result.success, agentId).toBe(true);
+        expect((create.mock.calls[0]![0] as { taskId?: string | null }).taskId).toBeNull();
+      }
+    });
+
+    it('refuses to create over an archived /shared/ document, even for a declaring agent', async () => {
+      const create = vi.fn();
+      const repo = makeRepo({
+        read: vi.fn().mockResolvedValue(null),
+        existsAtPath: vi.fn().mockResolvedValue(true),
+        create,
+      });
+      const result = await new DocWriteHandler().execute(sharedCtx('ceo-inbox', {
+        path: SHARED, mode: 'create', type: 'agent-settings', body: 'x',
+      }, repo));
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/archived by the principal.*restore it in the console/);
+      expect(create).not.toHaveBeenCalled();
+    });
+
+    it('allows a principal-approved re-execution, which carries no agent', async () => {
+      const create = vi.fn().mockResolvedValue(makeDoc({ path: SHARED }));
+      const repo = makeRepo({ read: vi.fn().mockResolvedValue(null), create });
+      const ctx = sharedCtx(undefined, { path: SHARED, mode: 'create', type: 'agent-settings', body: 'x' }, repo);
+      (ctx as { humanApproved?: boolean }).humanApproved = true;
+      expect((await new DocWriteHandler().execute(ctx)).success).toBe(true);
+      expect(create).toHaveBeenCalled();
+    });
   });
 });

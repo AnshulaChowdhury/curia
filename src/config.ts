@@ -660,6 +660,11 @@ export interface YamlConfig {
      * Default: 65536 (64 KiB).
      */
     consoleEditMaxBytes?: number;
+    /**
+     * Characters above which an injected `pinned_context` item logs a warning (#2338).
+     * Never truncates. Default: 16000.
+     */
+    pinnedContextWarnChars?: number;
     /** KG promotion when a planned parent completes (#1241). */
     kgPromotion?: {
       enabled?: boolean;
@@ -1432,6 +1437,15 @@ export function loadYamlConfig(configDir: string): YamlConfig {
       if (!Number.isInteger(cap) || cap < 1024 || cap > MAX_CONSOLE_EDIT_BYTES) {
         throw new Error(
           `documentWorkspace.consoleEditMaxBytes must be an integer from 1024 to ${MAX_CONSOLE_EDIT_BYTES}, got: ${String(cap)}`,
+        );
+      }
+    }
+
+    if (documentWorkspace.pinnedContextWarnChars !== undefined) {
+      const warnChars = documentWorkspace.pinnedContextWarnChars;
+      if (!Number.isInteger(warnChars) || warnChars < 1) {
+        throw new Error(
+          `documentWorkspace.pinnedContextWarnChars must be a positive integer, got: ${String(warnChars)}`,
         );
       }
     }

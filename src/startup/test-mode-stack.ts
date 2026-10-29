@@ -95,6 +95,8 @@ import { AuditLogRepo } from '../audit/audit-log-repo.js';
 import { AgentRuntime } from '../agents/runtime.js';
 import { AgentRegistry } from '../agents/agent-registry.js';
 import { discoverAgentManifests, type AgentYamlConfig } from '../agents/loader.js';
+import { createPinnedContextReader } from '../agents/pinned-context.js';
+import { WorkingDocsRepo } from '../db/working-docs-repo.js';
 import { AnthropicProvider } from '../agents/llm/anthropic.js';
 import { OpenRouterProvider } from '../agents/llm/openrouter.js';
 import { BedrockProvider } from '../agents/llm/bedrock.js';
@@ -1470,6 +1472,14 @@ export async function createTestModeStack(options: TestModeStackOptions = {}): P
       // The per-turn sign-in verification block (#2017), same gating as production.
       verification,
       browserSessionAlive: options.browserSessionAlive,
+      // Reads only, so it creates no deferred work: the same per-turn block production
+      // renders (#2338). Writes still have no repo here (see header).
+      pinnedContextReader: createPinnedContextReader({
+        workingDocsRepo: new WorkingDocsRepo(pool, logger),
+        entityMemory,
+        logger,
+        warnChars: yamlConfig.documentWorkspace?.pinnedContextWarnChars,
+      }),
       defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs,
       lateDelivery: {
         enabled: lateDelivery.enabled,

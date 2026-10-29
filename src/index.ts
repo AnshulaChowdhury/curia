@@ -43,6 +43,7 @@ import { TurnLanes } from './dispatch/turn-lanes.js';
 import { createPrincipalBacklogSource } from './dispatch/principal-backlog.js';
 import { CliAdapter } from './channels/cli/cli-adapter.js';
 import { discoverAgentManifests } from './agents/loader.js';
+import { createPinnedContextReader } from './agents/pinned-context.js';
 import type { AgentYamlConfig, AgentDiscovery } from './agents/loader.js';
 import { ModelRouter } from './agents/llm/model-router.js';
 import { smallCapModelSlots, smallCapThinkingViolations, voiceModelSlot } from './agents/llm/small-cap-models.js';
@@ -2808,6 +2809,13 @@ async function main(): Promise<void> {
     browserSessionAlive: assemblyBrowserService
       ? (sessionId: string) => assemblyBrowserService.getSession(sessionId) !== undefined
       : undefined,
+    // Declared /shared/ documents and config keys, read fresh every turn (#2338).
+    pinnedContextReader: createPinnedContextReader({
+      workingDocsRepo,
+      entityMemory,
+      logger,
+      warnChars: yamlConfig.documentWorkspace?.pinnedContextWarnChars,
+    }),
     defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs,
     lateDelivery: {
       enabled: lateDeliveryConfig.enabled,

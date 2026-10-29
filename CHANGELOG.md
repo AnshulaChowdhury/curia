@@ -15,6 +15,9 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **`pinned_context`** — **public API:** agent YAML field injecting declared `/shared/` documents and config keys every turn. (#2338)
+- **`/shared/` documents** — durable, never archived with a project; only declaring agents can write them. (#2338)
+- **ADR-056** — `pinned_context`: declaration is write permission; `/shared/` is durable by prefix. (#2338)
 - **Agenda-driven calls** — principal calls start from parked agendas; Curia can switch agendas mid-call. (#2322)
 - **Meeting minutes** — calls with an agenda produce a transcript, minutes and one follow-up report. (#2322)
 - **Bus events** — `minutes.ready` and `minutes.pipeline_failed`, system-only. (#2322)

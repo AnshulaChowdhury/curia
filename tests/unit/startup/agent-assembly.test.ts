@@ -27,6 +27,7 @@ import type { ChannelIdentity } from '../../../src/contacts/types.js';
 import type { OfficeIdentityService } from '../../../src/identity/service.js';
 import { createLogger } from '../../../src/logger.js';
 import type { VerificationRuntime } from '../../../src/verification/index.js';
+import type { PinnedContextReader } from '../../../src/agents/pinned-context.js';
 import type { ExecutionLayer } from '../../../src/skills/execution.js';
 import { ToolRegistry } from '../../../src/skills/registry.js';
 import { SkillRegistry } from '../../../src/skills/skill-registry.js';
@@ -317,6 +318,7 @@ describe('resolveSystemPromptSources', () => {
     'agentId', 'systemPrompt', 'officeIdentityService', 'securityContextBlock', 'availableSpecialists',
     'autonomyService', 'timezone', 'channelAccounts', 'agentContactId', 'principalIdentities',
     'principalPrimaryEmail', 'principalProfile', 'errorBudget', 'verification', 'browserSessionAlive',
+    'pinnedContext', 'pinnedContextReader',
   ] as const;
 
   it('is exactly the prompt half of the runtime config assembleAgent builds', () => {
@@ -374,6 +376,32 @@ describe('resolveSystemPromptSources', () => {
     expect(sourcesFor(configs[1]!).browserSessionAlive).toBeUndefined();
     expect(sourcesFor(configs[2]!).verification).toBe(verification);
     expect(sourcesFor(configs[2]!).browserSessionAlive).toBe(browserSessionAlive);
+  });
+
+  it('gives any agent its parsed pinned_context and the shared reader (#2338)', () => {
+    const configs = [
+      coordinatorYaml(),
+      specialistYaml({ pinned_context: { docs: 'shared/inbox/rules.md', configs: ['ceo_inbox/decision_tagging'] } }),
+    ];
+    const pinnedContextReader = {} as unknown as PinnedContextReader;
+    const ctx = { ...buildContext(textProvider(), configs), pinnedContextReader };
+    expect(resolveSystemPromptSources(configs[0]!, 'body', ctx).pinnedContext).toEqual([]);
+    const sources = resolveSystemPromptSources(configs[1]!, 'body', ctx);
+    expect(sources.pinnedContext).toEqual([
+      { kind: 'doc', path: '/shared/inbox/rules.md' },
+      { kind: 'config', namespace: 'ceo_inbox', key: 'decision_tagging' },
+    ]);
+    expect(sources.pinnedContextReader).toBe(pinnedContextReader);
+  });
+
+  it('records declared /shared/ paths on the roster entry for the doc-write guard (#2338)', () => {
+    const registry = new AgentRegistry();
+    registerAgentRoster(registry, [
+      coordinatorYaml(),
+      specialistYaml({ pinned_context: { docs: ['/shared/a.md', '/shared/b.md'], configs: 'ns/k' } }),
+    ]);
+    expect(registry.get('coordinator')?.pinnedDocPaths).toEqual([]);
+    expect(registry.get(specialistYaml().name)?.pinnedDocPaths).toEqual(['/shared/a.md', '/shared/b.md']);
   });
 
   it('reads the roster only through specialistSummary, so a snapshot adapter is enough', () => {

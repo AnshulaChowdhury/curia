@@ -23,6 +23,9 @@ export interface AgentRegistryEntry {
    *  model emitted (#1797). Used only when the scheduler supplied no expectedDurationSeconds.
    *  See issue #387. */
   expectedDurationSeconds?: number;
+  /** The `/shared/` documents this agent declares in `pinned_context` (#2338). doc-write
+   *  lets an agent write a `/shared/` path only when it is listed here. */
+  pinnedDocPaths?: readonly string[];
 }
 
 export class AgentRegistry {

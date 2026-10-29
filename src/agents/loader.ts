@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import * as yaml from 'js-yaml';
 import { AGENT_NAME_RULE, isAgentName } from './agent-name.js';
 import { isUuid } from '../util/uuid.js';
+import { parsePinnedContext } from './pinned-context.js';
 
 /**
  * Shape of an agent YAML config file.
@@ -41,6 +42,13 @@ export interface AgentYamlConfig {
   };
   system_prompt: string;
   pinned_skills?: string[];
+  /**
+   * `/shared/` documents and config-store keys rendered into every turn's
+   * `## Pinned context` block (#2338, ADR-056). A mapping with optional `docs` and
+   * `configs`, each a string or a list of strings / `{ path|key, description }`.
+   * loadAgentConfig validates it; read it through parsePinnedContext().
+   */
+  pinned_context?: unknown;
   allow_discovery?: boolean;
   schedule?: Array<{
     cron: string;
@@ -115,6 +123,10 @@ export function loadAgentConfig(filePath: string): AgentYamlConfig {
   if (delegateWhen !== undefined && (typeof delegateWhen !== 'string' || delegateWhen.trim() === '')) {
     throw new Error(`Invalid delegate_when in ${filePath}: must be a non-empty string`);
   }
+
+  // A bad declaration fails the load here rather than rendering a broken block or
+  // granting write access to the wrong path later.
+  parsePinnedContext(config.pinned_context, name);
 
   // Interpolate ${persona.*} placeholders in the system prompt.
   // persona.display_name, tone, and signature are prompt text only. The
