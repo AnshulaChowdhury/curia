@@ -30,6 +30,9 @@ export const VOICE_TOOL_NAMES: readonly string[] = [
   // Parked agendas for this call (#2322). Voice-only: locks one agenda and
   // the runtime renders it into the next turn's prompt.
   'meeting-agenda-load',
+  // "Keep notes and send me a recap" with no agenda (#2347; asked on the
+  // 2026-10-29 call). Voice-only: marks the session for the minutes pipeline.
+  'meeting-notes-start',
   // The to-do list the principal reads and edits by voice.
   'task-list',
   'task-create',

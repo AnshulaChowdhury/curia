@@ -49,6 +49,7 @@ export const VALID_CAPABILITIES: ReadonlySet<string> = new Set([
   'infraLlm', 'outboundContext', 'taskRepo', 'workingDocs', 'secretCapture', 'secretResolver',
   'userSecretIndex',
   'diagnosticsRepo', 'sensitivityClassifier', 'verification', 'taskOutreach', 'disclosureDecisions',
+  'voiceSessions',
 ]);
 
 /** One discovered on-disk skill: lenient parse for the registry UI + reconciliation.

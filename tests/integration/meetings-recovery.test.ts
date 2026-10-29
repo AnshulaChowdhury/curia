@@ -101,6 +101,8 @@ describeIf('MeetingPipelineRecovery (integration, #2322)', () => {
       logger,
       pool: publicPool,
       hasActiveWake: async (taskId) => activeWakes.has(taskId),
+      appOrigin: 'https://office.example',
+      httpPort: 3000,
     }).start();
     recovery = new MeetingPipelineRecovery({
       sessionStore: sessions,
