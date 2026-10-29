@@ -1640,6 +1640,7 @@ export class OutboundGateway {
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
+          ...(result.threadId ? { threadId: result.threadId } : {}),
           parentEventId: options?.parentEventId,
           ...disclosed,
           ...(exportAuditItems && exportAuditItems.length > 0
@@ -1973,6 +1974,8 @@ export class OutboundGateway {
           recipientId: row.recipient,
           content,
           messageId: result.messageId,
+          // A queued approval email binds its thread from this (#2333): reaction-approval-mapper.
+          ...(result.threadId ? { threadId: result.threadId } : {}),
         });
         flushed += 1;
       }
@@ -2707,6 +2710,7 @@ export class OutboundGateway {
     conversationId?: string;
     taskEventId?: string;
     messageId?: string;
+    threadId?: string;
     parentEventId?: string;
     exportAudit?: {
       destination: string;

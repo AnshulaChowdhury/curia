@@ -271,6 +271,8 @@ interface OutboundDeliveredPayload {
   /** Provider message ID — Nylas message ID for email, Slack `ts`, or
    *  signal-cli send timestamp (stringified) for Signal. */
   messageId?: string;
+  /** Email only: the provider thread the message went out on (#2333), which a reply joins. */
+  threadId?: string;
   /** Bulk-export audit fields (#201) — populated when attachments leave the system. */
   exportAudit?: {
     destination: string;

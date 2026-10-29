@@ -114,6 +114,7 @@ describe('ReactionApprovalMapper', () => {
       principalIdentities: [
         makePrincipal('slack', 'U_CEO'),
         makePrincipal('signal', '+15551234567'),
+        makePrincipal('email', 'ceo@example.com'),
       ],
     });
   });
@@ -449,6 +450,32 @@ describe('ReactionApprovalMapper', () => {
     expect(actionLogRepo.findPendingByApprovalNumber).toHaveBeenCalledWith(3);
     expect(actionLogRepo.findPendingByShortRef).not.toHaveBeenCalled();
     expect(actionLogRepo.bindDeliveryMessage).toHaveBeenCalledWith(77, 'signal', 'sig-1');
+  });
+
+  // A queued approval email is bound from its delivery, thread included (#2333).
+  it('binds a delivered approval email\'s thread beside its message', async () => {
+    actionLogRepo.findPendingByApprovalNumber.mockResolvedValue(makeRow({ id: 78, approvalNumber: 4, expiresAt: RENDERED_EXPIRY }));
+    await mapper.handleDelivered(createOutboundDelivered({
+      channel: 'email',
+      recipientId: 'ceo@example.com',
+      content: 'Dana is asking for your email address. Share it?\n\nApproval 4\nExpires: 2026-07-02T00:00:00.000Z',
+      messageId: 'nylas-msg-4',
+      threadId: 'nylas-thread-4',
+    }));
+    expect(actionLogRepo.bindDeliveryMessage).toHaveBeenCalledWith(78, 'email', 'nylas-msg-4');
+    expect(actionLogRepo.bindDeliveryMessage).toHaveBeenCalledWith(78, 'email-thread', 'nylas-thread-4');
+  });
+
+  it('binds no thread for a delivery that is not an approval to the principal', async () => {
+    actionLogRepo.findPendingByApprovalNumber.mockResolvedValue(makeRow({ id: 78, approvalNumber: 4, expiresAt: RENDERED_EXPIRY }));
+    await mapper.handleDelivered(createOutboundDelivered({
+      channel: 'email', recipientId: 'dana@example.com',
+      content: 'Approval 4\nExpires: 2026-07-02T00:00:00.000Z', messageId: 'm', threadId: 't',
+    }));
+    await mapper.handleDelivered(createOutboundDelivered({
+      channel: 'email', recipientId: 'ceo@example.com', content: 'See you Friday.', messageId: 'm2', threadId: 't2',
+    }));
+    expect(actionLogRepo.bindDeliveryMessage).not.toHaveBeenCalled();
   });
 
   it('does not bind when no live approval carries the number', async () => {

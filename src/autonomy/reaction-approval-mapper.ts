@@ -195,7 +195,7 @@ export class ReactionApprovalMapper {
 
   /** @internal exported for tests */
   async handleDelivered(event: OutboundDeliveredEvent): Promise<void> {
-    const { channel, messageId, content, recipientId } = event.payload;
+    const { channel, messageId, content, recipientId, threadId } = event.payload;
     if (!messageId || !content) return;
 
     // Approvals are delivered only to the principal's own identities. A notification-shaped
@@ -269,8 +269,11 @@ export class ReactionApprovalMapper {
       }
 
       await this.actionLogRepo.bindDeliveryMessage(row.id, channel, messageId);
+      // An approval email's thread, so a reply there is marked as answering it (#2333). This is
+      // the path a queued email takes: approval delivery binds only a direct send's thread.
+      if (channel === 'email' && threadId) await this.actionLogRepo.bindDeliveryMessage(row.id, 'email-thread', threadId);
       this.log.info(
-        { actionLogId: row.id, shortRef: row.shortRef, approvalNumber: row.approvalNumber, channel, messageId },
+        { actionLogId: row.id, shortRef: row.shortRef, approvalNumber: row.approvalNumber, channel, messageId, ...(threadId ? { threadId } : {}) },
         'reaction-approval: bound delivered message to pending approval',
       );
     } catch (err) {
