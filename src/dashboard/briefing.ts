@@ -271,8 +271,9 @@ export function approvalReviewSummary(input: {
 }
 
 /**
- * A send-draft whose stored payload has an id but no recipient or body.
- * The review has to load the draft before Approve is safe.
+ * A send-draft that still needs a mailbox read before Approve.
+ * Both the recipient and the body must already be on the payload. A held row
+ * often stores subject and body and leaves To on the draft.
  */
 export function approvalNeedsDraft(
   toolName: string,
@@ -280,10 +281,11 @@ export function approvalNeedsDraft(
 ): boolean {
   if (!mailboxDraftRef(toolName, payload)) return false;
   const body = payload ?? {};
-  return !['to', 'subject', 'body'].some((key) => {
+  const present = (key: string): boolean => {
     const value = body[key];
     return typeof value === 'string' && value.trim().length > 0;
-  });
+  };
+  return !(present('to') && present('body'));
 }
 
 /**

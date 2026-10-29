@@ -10,6 +10,7 @@ import { BriefingService } from '../../src/dashboard/briefing-service.js';
 import { HISTOGRAM_DAYS, addCalendarDays, localDayKey, localMidnight } from '../../src/dashboard/briefing.js';
 import { TaskRepo } from '../../src/db/task-repo.js';
 import { createSilentLogger } from '../../src/logger.js';
+import { requireCuriaTestDatabase } from './require-test-db.js';
 
 const { Pool } = pg;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -19,8 +20,9 @@ describeIf('briefing service against Postgres', () => {
   let pool: pg.Pool;
   const logger = createSilentLogger();
 
-  beforeAll(() => {
+  beforeAll(async () => {
     pool = new Pool({ connectionString: DATABASE_URL });
+    await requireCuriaTestDatabase(pool);
   });
 
   afterAll(async () => {

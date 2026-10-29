@@ -614,7 +614,7 @@ a.dash-activity-headline:hover { text-decoration: underline; }
   padding: 8px 4px;
   border-top: 1px solid var(--app-border-soft);
 }
-.dash-wait-item:first-of-type { border-top: none; }
+.dash-card-head + .dash-wait-item { border-top: none; }
 .dash-wait-item.done {
   background: color-mix(in srgb, var(--app-green) 14%, transparent);
   border-radius: 6px;

@@ -135,6 +135,9 @@ describe('approval review', () => {
 
   it('asks for a mailbox read when a send-draft stored only an id', () => {
     expect(approvalNeedsDraft('send-draft', { draft_id: 'd1' })).toBe(true);
+    expect(approvalNeedsDraft('send-draft', { draft_id: 'd1', subject: 'Renewal', body: 'Hi' })).toBe(true);
+    expect(approvalNeedsDraft('send-draft', { draft_id: 'd1', to: 'ada@example.com' })).toBe(true);
+    expect(approvalNeedsDraft('send-draft', { draft_id: 'd1', to: '  ', body: 'Hi' })).toBe(true);
     expect(approvalNeedsDraft('send-draft', { draft_id: 'd1', to: 'ada@example.com', body: 'Hi' })).toBe(false);
     expect(approvalNeedsDraft('email-send', { draft_id: 'd1' })).toBe(false);
   });
