@@ -530,10 +530,10 @@
       "recordedAt": "2026-10-29T01:31:52.419Z"
     },
     "pii known contact ask then another address": {
-      "unstubbed": 0,
+      "unstubbed": 2,
       "runs": 3,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-29T01:26:15.650Z"
+      "recordedAt": "2026-10-29T01:39:07.355Z"
     },
     "pii known contact ask then no": {
       "unstubbed": 0,
