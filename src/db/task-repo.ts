@@ -54,6 +54,16 @@ const TASK_COLUMNS = `
 
 // -- Public types --
 
+/** A status change away from done or cancelled. Callers match the class, not the message. */
+export class TaskTerminalStateError extends Error {
+  readonly status: string;
+  constructor(status: string) {
+    super(`Cannot transition task from '${status}' — it is a terminal state.`);
+    this.name = 'TaskTerminalStateError';
+    this.status = status;
+  }
+}
+
 export interface CreateTaskParams {
   agentId: string;
   title: string;
@@ -575,9 +585,7 @@ export class TaskRepo {
     // Enforce terminal-state guard.
     if (updates.status && updates.status !== current.status) {
       if (TERMINAL_STATUSES.has(current.status)) {
-        throw new Error(
-          `Cannot transition task from '${current.status}' — it is a terminal state.`,
-        );
+        throw new TaskTerminalStateError(current.status);
       }
     }
 

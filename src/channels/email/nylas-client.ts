@@ -99,6 +99,12 @@ interface NylasLike {
       identifier: string;
       draftId: string;
     }): Promise<NylasResponse<NylasSdkMessage>>;
+
+    /** Remove a draft. A 404 means it is already gone. */
+    destroy(params: {
+      identifier: string;
+      draftId: string;
+    }): Promise<unknown>;
   };
   folders: {
     list(params: {
@@ -544,6 +550,23 @@ export class NylasClient {
       return this.normalizeMessage(response.data);
     } catch (err) {
       this.log.error({ err, grantId: this.grantId, draftId }, 'Nylas sendDraft failed');
+      throw err;
+    }
+  }
+
+  /**
+   * Delete a mailbox draft. A 404 is success: the draft is already gone, so a
+   * discarded approval cannot send it. Any other failure is rethrown.
+   */
+  async deleteDraft(draftId: string): Promise<void> {
+    try {
+      await this.nylas.drafts.destroy({ identifier: this.grantId, draftId });
+    } catch (err) {
+      if (nylasStatus(err) === 404) {
+        this.log.info({ draftId }, 'Nylas deleteDraft: draft already gone');
+        return;
+      }
+      this.log.error({ err, grantId: this.grantId, draftId }, 'Nylas deleteDraft failed');
       throw err;
     }
   }

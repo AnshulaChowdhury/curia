@@ -34,6 +34,7 @@ import { agentRoutes } from './routes/agents.js';
 import { jobRoutes } from './routes/jobs.js';
 import { antfarmRoutes } from './routes/antfarm.js';
 import { activityRoutes } from './routes/activity.js';
+import { dashboardRoutes } from './routes/dashboard.js';
 import { antfarmStaticRoutes } from './routes/antfarm-static.js';
 import { antfarmAssetsRoutes } from './routes/antfarm-assets.js';
 import { messageRoutes } from './routes/messages.js';
@@ -155,6 +156,10 @@ export interface HttpAdapterConfig {
   auditLogRepo?: AuditLogRepo;
   /** Backs GET /api/activity, the console home's job-level feed (#2251). */
   activityFeed?: import('../../activity/activity-service.js').ActivityFeedSource;
+  /** Backs the principal home: waiting items, stats, histogram, bullpen (#2340). */
+  briefing?: import('../../dashboard/briefing-service.js').BriefingService;
+  /** Status changes on PATCH /api/kg/tasks/:id go through TaskRepo (#2340). */
+  taskRepo?: import('../../db/task-repo.js').TaskRepo;
   /**
    * Telnyx SMS webhook bridge — HttpAdapter mounts POST /api/webhooks/telnyx/sms
    * and delegates to the handler installed by SmsAdapter.start() (ADR-036).
@@ -393,6 +398,15 @@ export class HttpAdapter implements Channel {
       });
     }
 
+    if (webAppBootstrapSecret && this.config.briefing) {
+      await this.app.register(dashboardRoutes, {
+        briefing: this.config.briefing,
+        webAppBootstrapSecret,
+        sessions,
+        logger,
+      });
+    }
+
     // Licensed Ant Farm art — auth-gated so LimeZu sheets are never world-downloadable.
     // Independent of auditLogRepo: art serving does not need the timeline data source.
     await this.app.register(antfarmAssetsRoutes, {
@@ -595,6 +609,7 @@ export class HttpAdapter implements Channel {
         contactService: this.config.contactService,
         sessions,
         nodeMergeService: this.config.nodeMergeService,
+        taskRepo: this.config.taskRepo,
       });
     }
 

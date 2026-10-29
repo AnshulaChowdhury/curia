@@ -597,6 +597,23 @@ export function isVisibleTool(toolName: string): boolean {
   return d !== undefined && d.prominence !== 'hidden';
 }
 
+/** Tools marked hidden. The feed also skips tools with no describer. */
+export function hiddenToolNames(): readonly string[] {
+  return Object.entries(DESCRIBERS)
+    .filter(([, describer]) => describer.prominence === 'hidden')
+    .map(([name]) => name);
+}
+
+/**
+ * Tools the activity feed classifies: described, and not hidden.
+ * The histogram counts only these, so an undescribed read cannot become a hiccup.
+ */
+export function visibleToolNames(): readonly string[] {
+  return Object.entries(DESCRIBERS)
+    .filter(([, describer]) => describer.prominence !== 'hidden')
+    .map(([name]) => name);
+}
+
 /** Research kind of a web tool, or undefined. */
 export function researchKind(toolName: string): ResearchKind | undefined {
   return lookup(toolName)?.research;

@@ -53,6 +53,7 @@ const SELF_AUTHED_API_PREFIXES = [
   '/api/jobs',
   '/api/antfarm',
   '/api/activity',
+  '/api/dashboard',
   '/api/autonomy',
   '/api/memory',
   '/api/documents',

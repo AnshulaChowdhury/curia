@@ -16,11 +16,9 @@ import { parseApprovalRefInput } from '../../../_shared/approval-ref.js';
 import { STALE_SEND_APPROVAL_ERROR } from '../../../../src/skills/_shared/recipient-reference.js';
 import { createHumanDecision } from '../../../../src/bus/events.js';
 import type { TaskOriginator } from '../../../../src/contacts/types.js';
-import { hasPersonalDetails } from '../../../../src/autonomy/approval-notification.js';
+import { hasPersonalDetails, UNSHOWN_PERSONAL_DETAILS_ERROR } from '../../../../src/autonomy/approval-notification.js';
 
-/** The refusal when an undelivered approval would send personal details (#2312). */
-export const UNSHOWN_PERSONAL_DETAILS_ERROR =
-  'The principal hasn\'t been shown this approval yet, and it contains personal details. Deliver it with deliver-approval first, then ask again.';
+export { UNSHOWN_PERSONAL_DETAILS_ERROR };
 
 export class ApproveActionHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {

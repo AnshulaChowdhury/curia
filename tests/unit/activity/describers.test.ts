@@ -5,7 +5,9 @@ import {
   describerRefs,
   formatTally,
   hasDescriber,
+  hiddenToolNames,
   isVisibleTool,
+  visibleToolNames,
   researchKind,
   type DescribeContext,
   type ToolCall,
@@ -34,6 +36,30 @@ describe('describer coverage', () => {
     }
     // Add an entry to src/activity/describers.ts for each tool listed here.
     expect(missing).toEqual([]);
+  });
+});
+
+describe('hiddenToolNames', () => {
+  it('lists plumbing the feed skips and leaves visible tools out', () => {
+    const hidden = hiddenToolNames();
+    expect(hidden).toContain('extract-facts');
+    expect(hidden).toContain('web-search');
+    expect(hidden).toContain('delegate');
+    expect(hidden).not.toContain('email-archive');
+    expect(hidden).not.toContain('email-send');
+  });
+});
+
+describe('visibleToolNames', () => {
+  it('is the set the feed classifies, so undescribed tools stay out', () => {
+    const visible = visibleToolNames();
+    expect(visible).toContain('email-archive');
+    expect(visible).toContain('email-send');
+    expect(visible).not.toContain('extract-facts');
+    expect(visible).not.toContain('web-search');
+    expect(visible).not.toContain('contact-lookup');
+    expect(isVisibleTool('contact-lookup')).toBe(false);
+    expect(isVisibleTool('email-archive')).toBe(true);
   });
 });
 

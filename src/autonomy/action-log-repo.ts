@@ -507,6 +507,16 @@ export class ActionLogRepo {
     return result.rows.map(mapRow);
   }
 
+  /** One row by id, including resolved and expired rows. Null when it does not exist. */
+  async findById(id: number): Promise<ActionLogRow | null> {
+    const result = await this.pool.query(
+      `SELECT * FROM autonomy_action_log WHERE id = $1`,
+      [id],
+    );
+    const row = result.rows[0];
+    return row ? mapRow(row) : null;
+  }
+
   /**
    * The pending, unexpired approvals the principal has been shown (#2333), newest first:
    * what a principal turn may be answering. `replyThreadId` marks the one whose approval

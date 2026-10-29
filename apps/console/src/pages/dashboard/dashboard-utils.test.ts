@@ -6,14 +6,29 @@ import {
   healthStatusMeta,
   isHealthResponse,
   fetchHealth,
-  fetchAttention,
+  fetchSetupGaps,
+  setupGaps,
   fetchActivity,
-  aggregateAttention,
   activityHref,
   agentLabel,
   formatActivityTime,
   groupActivityByDay,
   getGreeting,
+  greetingSubtitle,
+  showCaughtUp,
+  caughtUpDetail,
+  formatTimeSaved,
+  formatCountDelta,
+  formatHoursDelta,
+  hoursFromActions,
+  overdueMeta,
+  heldMeta,
+  orderWaitingItems,
+  pendingUndoMessage,
+  scheduleUndoCommit,
+  UNDO_WINDOW_MS,
+  histogramDateLabel,
+  agentColor,
 } from './dashboard-utils.js';
 
 // Minimal fetch mock mirroring api.test.ts — returns a Response-like object.
@@ -151,82 +166,48 @@ describe('fetchHealth — 503-as-data branch', () => {
   });
 });
 
-describe('aggregateAttention', () => {
-  it('returns an empty list when nothing needs attention', () => {
-    expect(
-      aggregateAttention({
-        failedJobs: [],
-        suspendedJobs: [],
-        channels: [
-          { name: 'http', state: 'enabled', isToggleable: false },
-          { name: 'slack', state: 'enabled', isToggleable: true },
-          { name: 'signal', state: 'uninstalled', isToggleable: true }, // not started ≠ attention
-        ],
-        emailAccounts: [{ name: 'ops', selfEmail: 'ops@example.com', hasGrant: true }],
-      }),
-    ).toEqual([]);
+describe('setupGaps', () => {
+  it('returns an empty list when setup is finished', () => {
+    expect(setupGaps({
+      channels: [
+        { name: 'http', state: 'enabled', isToggleable: false },
+        { name: 'slack', state: 'enabled', isToggleable: true },
+        { name: 'signal', state: 'uninstalled', isToggleable: true },
+      ],
+      emailAccounts: [{ name: 'ops', selfEmail: 'ops@example.com', hasGrant: true }],
+    })).toEqual([]);
   });
 
-  it('aggregates failed + suspended jobs, disconnected channels, and missing grants', () => {
-    const items = aggregateAttention({
-      failedJobs: [
-        { id: '1', agentId: 'digest.weekly', status: 'failed' },
-        { id: '2', agentId: 'crm.sync', status: 'failed' },
-      ],
-      suspendedJobs: [{ id: '3', agentId: 'contract.review', status: 'suspended' }],
+  it('lists channels that are installed but not enabled, and grants that are missing', () => {
+    expect(setupGaps({
       channels: [
-        { name: 'slack', state: 'installed', isToggleable: true }, // configured, not enabled
-        { name: 'signal', state: 'uninstalled', isToggleable: true }, // ignored
+        { name: 'slack', state: 'installed', isToggleable: true },
+        { name: 'signal', state: 'uninstalled', isToggleable: true },
       ],
       emailAccounts: [{ name: 'ops', selfEmail: 'ops@example.com', hasGrant: false }],
-    });
-
-    expect(items).toEqual([
-      { key: 'jobs-failed', title: '2 jobs failed', detail: 'digest.weekly · crm.sync', tone: 'danger', to: '/jobs' },
-      { key: 'jobs-suspended', title: '1 job suspended', detail: 'contract.review', tone: 'warn', to: '/jobs' },
-      { key: 'channel-slack', title: 'slack channel not enabled', detail: 'Configured but not enabled', tone: 'warn', to: '/channels' },
-      { key: 'email-ops', title: 'ops@example.com missing grant', detail: 'No mail grant connected', tone: 'danger', to: '/channels' },
+    })).toEqual([
+      { key: 'channel-slack', title: 'slack channel not enabled' },
+      { key: 'email-ops', title: 'ops@example.com missing grant' },
     ]);
-  });
-
-  it('singularises the job count and truncates a long agent list', () => {
-    const failed = aggregateAttention({
-      failedJobs: [
-        { id: '1', agentId: 'a', status: 'failed' },
-        { id: '2', agentId: 'b', status: 'failed' },
-        { id: '3', agentId: 'c', status: 'failed' },
-        { id: '4', agentId: 'd', status: 'failed' },
-      ],
-      suspendedJobs: [],
-      channels: [],
-      emailAccounts: [],
-    });
-    expect(failed[0]?.title).toBe('4 jobs failed');
-    expect(failed[0]?.detail).toBe('a · b · c +1 more');
   });
 });
 
-describe('fetchAttention', () => {
-  it('aggregates across the four endpoints on the happy path', async () => {
+describe('fetchSetupGaps', () => {
+  it('reads channels and email accounts', async () => {
     vi.stubGlobal('fetch', mockFetchByUrl({
-      '/api/jobs?status=failed': { body: { jobs: [{ id: '1', agentId: 'crm.sync', status: 'failed' }] } },
-      '/api/jobs?status=suspended': { body: { jobs: [] } },
       '/api/registry/channels': { body: { channels: [{ name: 'slack', state: 'installed', isToggleable: true }] } },
       '/api/registry/email-accounts': { body: { accounts: [{ name: 'ops', selfEmail: 'ops@x.com', hasGrant: true }] } },
     }));
-    const items = await fetchAttention();
-    expect(items.map(i => i.key)).toEqual(['jobs-failed', 'channel-slack']);
+    const items = await fetchSetupGaps();
+    expect(items.map(i => i.key)).toEqual(['channel-slack']);
   });
 
   it('throws (not a false all-clear) when a 200 response is missing its array', async () => {
-    // A broken jobs endpoint returning `{}` must surface an error, never read as clean.
     vi.stubGlobal('fetch', mockFetchByUrl({
-      '/api/jobs?status=failed': { body: {} }, // no `jobs` array
-      '/api/jobs?status=suspended': { body: { jobs: [] } },
-      '/api/registry/channels': { body: { channels: [] } },
+      '/api/registry/channels': { body: {} },
       '/api/registry/email-accounts': { body: { accounts: [] } },
     }));
-    await expect(fetchAttention()).rejects.toThrow(/unexpected response/);
+    await expect(fetchSetupGaps()).rejects.toThrow(/unexpected response/);
   });
 });
 
@@ -249,7 +230,7 @@ describe('fetchActivity', () => {
     expect((await fetchActivity()).hasMore).toBe(true);
   });
 
-  it('asks /api/activity for the last 24h, 20 items', async () => {
+  it('asks /api/activity for the last 24h, 50 items', async () => {
     const fetchMock = mockFetch(200, { items: [], timezone: 'UTC' });
     vi.stubGlobal('fetch', fetchMock);
     const before = Date.now() - 24 * 60 * 60 * 1000;
@@ -258,7 +239,7 @@ describe('fetchActivity', () => {
     const url = String(fetchMock.mock.calls[0]![0]);
     expect(url).toMatch(/^\/api\/activity\?/);
     const params = new URL(url, 'http://test').searchParams;
-    expect(params.get('limit')).toBe('20');
+    expect(params.get('limit')).toBe('50');
     const fromMs = Date.parse(params.get('from')!);
     expect(fromMs).toBeGreaterThanOrEqual(before - 1000);
     expect(fromMs).toBeLessThanOrEqual(after + 1000);
@@ -355,5 +336,135 @@ describe('getGreeting', () => {
     expect(getGreeting(17)).toBe('Good afternoon');
     expect(getGreeting(18)).toBe('Good evening');
     expect(getGreeting(23)).toBe('Good evening');
+  });
+});
+
+describe('greetingSubtitle', () => {
+  it('never reads a missing count as zero', () => {
+    expect(greetingSubtitle(null, 4)).toBe('Curia handled 4 things since yesterday.');
+    expect(greetingSubtitle(null, 4)).not.toMatch(/Nothing is waiting/);
+    expect(greetingSubtitle(2, null)).toBe('2 things are waiting on you.');
+  });
+
+  it('matches the empty and occupied sentences, including the singular', () => {
+    expect(greetingSubtitle(0, 41)).toBe('Nothing is waiting on you. Curia handled 41 things since yesterday.');
+    expect(greetingSubtitle(2, 41)).toBe('2 things are waiting on you. Curia handled 41 things since yesterday.');
+    expect(greetingSubtitle(1, 1)).toBe('1 thing is waiting on you. Curia handled 1 thing since yesterday.');
+  });
+});
+
+describe('showCaughtUp', () => {
+  it('is true only for a loaded, error-free empty list', () => {
+    expect(showCaughtUp({ loaded: true, error: null, count: 0 })).toBe(true);
+    expect(showCaughtUp({ loaded: false, error: null, count: 0 })).toBe(false);
+    expect(showCaughtUp({ loaded: true, error: 'down', count: 0 })).toBe(false);
+    expect(showCaughtUp({ loaded: true, error: null, count: 2 })).toBe(false);
+  });
+});
+
+describe('caughtUpDetail', () => {
+  it('omits the cleared clause at zero and keeps it otherwise', () => {
+    expect(caughtUpDetail(0, 4)).toBe('Curia is handling 4 things');
+    expect(caughtUpDetail(2, 4)).toBe('2 cleared today · Curia is handling 4 things');
+    expect(caughtUpDetail(1, 1)).toBe('1 cleared today · Curia is handling 1 thing');
+  });
+});
+
+describe('briefing number formatting', () => {
+  it('formats time saved, hour deltas, and count deltas', () => {
+    expect(formatTimeSaved(216, 1)).toBe('≈3.6h');
+    expect(hoursFromActions(216, 1)).toBeCloseTo(3.6);
+    expect(formatHoursDelta(3.6, 3)).toEqual({ direction: 'up', text: '▲ 0.6h vs last wk' });
+    expect(formatCountDelta(214, 181)).toEqual({ direction: 'up', text: '▲ 18%' });
+    expect(formatCountDelta(4, 0)).toEqual({ direction: 'up', text: '▲ new' });
+  });
+});
+
+describe('waiting row copy and order', () => {
+  const now = new Date('2026-10-28T15:00:00.000Z');
+
+  it('describes an overdue task in the principal timezone', () => {
+    expect(overdueMeta('2026-10-26T15:00:00.000Z', now, 'America/Toronto'))
+      .toBe('Your task · due Mon, 2 days overdue');
+  });
+
+  it('labels a held draft differently from another approval', () => {
+    const created = new Date(now.getTime() - 5 * 3_600_000).toISOString();
+    expect(heldMeta(created, now, true)).toBe('Draft held for approval · 5h');
+    expect(heldMeta(created, now, false)).toBe('Held for approval · 5h');
+  });
+
+  it('puts the most overdue task first, then the oldest approval', () => {
+    const rows = orderWaitingItems(
+      [
+        { id: 'later', title: 'Later', dueAt: '2026-10-27T00:00:00.000Z' },
+        { id: 'earlier', title: 'Earlier', dueAt: '2026-10-20T00:00:00.000Z' },
+      ],
+      [
+        { id: 2, title: 'Newer', createdAt: '2026-10-28T00:00:00.000Z', toolName: 'send-draft', summary: '' },
+        { id: 1, title: 'Older', createdAt: '2026-10-01T00:00:00.000Z', toolName: 'calendar', summary: '' },
+      ],
+    );
+    expect(rows.map((row) => row.id)).toEqual(['earlier', 'later', 1, 2]);
+    expect(rows.map((row) => row.kind)).toEqual(['task', 'task', 'approval', 'approval']);
+  });
+});
+
+describe('scheduleUndoCommit', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('commits at the undo window and not a millisecond earlier', () => {
+    vi.useFakeTimers();
+    const commit = vi.fn();
+    scheduleUndoCommit(commit, UNDO_WINDOW_MS);
+    vi.advanceTimersByTime(UNDO_WINDOW_MS - 1);
+    expect(commit).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(commit).toHaveBeenCalledOnce();
+  });
+
+  it('cancel prevents the commit', () => {
+    vi.useFakeTimers();
+    const commit = vi.fn();
+    const handle = scheduleUndoCommit(commit, UNDO_WINDOW_MS);
+    vi.advanceTimersByTime(UNDO_WINDOW_MS - 1);
+    handle.cancel();
+    vi.advanceTimersByTime(UNDO_WINDOW_MS);
+    expect(commit).not.toHaveBeenCalled();
+  });
+
+  it('flush commits immediately and a later cancel is a no-op', () => {
+    vi.useFakeTimers();
+    const commit = vi.fn();
+    const handle = scheduleUndoCommit(commit, UNDO_WINDOW_MS);
+    vi.advanceTimersByTime(1_000);
+    handle.flush();
+    expect(commit).toHaveBeenCalledOnce();
+    handle.cancel();
+    vi.advanceTimersByTime(UNDO_WINDOW_MS);
+    expect(commit).toHaveBeenCalledOnce();
+  });
+});
+
+describe('pendingUndoMessage', () => {
+  it('keeps a single change in its own words and folds the rest into one undo', () => {
+    expect(pendingUndoMessage([])).toBeNull();
+    expect(pendingUndoMessage(['dismissed'])).toBe('Dismissed');
+    expect(pendingUndoMessage(['marked done'])).toBe('Marked done');
+    expect(pendingUndoMessage(['dismissed', 'marked done'])).toBe('2 changes');
+  });
+});
+
+describe('histogramDateLabel and agentColor', () => {
+  it('labels a day from its calendar key, and today as so-far', () => {
+    expect(histogramDateLabel('2026-10-21', false)).toBe('Wed, Oct 21');
+    expect(histogramDateLabel('2026-10-28', true)).toBe('Today (so far)');
+  });
+
+  it('keeps a stable color for a name, and mutes the other bucket', () => {
+    const agents = ['research', 'inbox', 'calendar', 'other'];
+    expect(agentColor('other', agents)).toBe('var(--app-fg-subtle)');
+    expect(agentColor('inbox', agents)).toBe(agentColor('inbox', ['calendar', 'other', 'research', 'inbox']));
+    expect(agentColor('calendar', agents)).not.toBe(agentColor('inbox', agents));
   });
 });

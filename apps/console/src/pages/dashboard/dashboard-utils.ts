@@ -115,14 +115,9 @@ export async function fetchHealth(signal?: AbortSignal): Promise<HealthResponse>
   throw new Error(`health check failed: HTTP ${res.status}`);
 }
 
-// ── Attention (jobs + channels + email accounts) ──────────────────────────────
-
-// Minimal mirror of the Job shape (src/scheduler; GET /api/jobs).
-export interface DashboardJob {
-  id: string;
-  agentId: string;
-  status: string;
-}
+// ── Setup gaps (channels + email grants the operator still has to finish) ────
+// Failed jobs used to live here too. They are not the principal's to unblock,
+// so they stay in Recent Activity (red) and off this list (#2340).
 
 // Mirror of ChannelEntry (src/registry/channel-registry-types.ts; GET /api/registry/channels).
 export interface DashboardChannel {
@@ -138,87 +133,28 @@ export interface DashboardEmailAccount {
   hasGrant: boolean;
 }
 
-export type AttentionTone = 'warn' | 'danger';
-// Deep-link targets are constrained to real routes so <Link to> stays type-safe.
-export type AttentionTarget = '/jobs' | '/channels';
-
-export interface AttentionItem {
+export interface SetupGap {
   key: string;
   title: string;
-  detail: string;
-  tone: AttentionTone;
-  to: AttentionTarget;
 }
 
-// Distinct agent ids, joined for a compact detail line. Caps at 3 to avoid an
-// unbounded line, appending "+N more" when truncated.
-function summariseAgents(jobs: DashboardJob[]): string {
-  const ids = [...new Set(jobs.map(j => j.agentId))];
-  if (ids.length <= 3) return ids.join(' · ');
-  return `${ids.slice(0, 3).join(' · ')} +${ids.length - 3} more`;
-}
-
-// Aggregate the four attention sources into a flat, deep-linkable list.
-// Empty result → the card renders its green "nothing needs your attention" state.
-//
-// Channels: we flag toggleable channels that are INSTALLED but not enabled —
-// a half-finished setup the operator can complete with one click. Uninstalled
-// optional channels are "not started", not "needs attention"; flagging them
-// would make a fresh install never reach the clean state.
-export function aggregateAttention(input: {
-  failedJobs: DashboardJob[];
-  suspendedJobs: DashboardJob[];
+// Channels installed but not enabled, and email accounts with no grant.
+// Uninstalled optional channels are "not started", not a gap.
+export function setupGaps(input: {
   channels: DashboardChannel[];
   emailAccounts: DashboardEmailAccount[];
-}): AttentionItem[] {
-  const items: AttentionItem[] = [];
-
-  if (input.failedJobs.length > 0) {
-    const n = input.failedJobs.length;
-    items.push({
-      key: 'jobs-failed',
-      title: `${n} job${n === 1 ? '' : 's'} failed`,
-      detail: summariseAgents(input.failedJobs) || 'last run failed',
-      tone: 'danger',
-      to: '/jobs',
-    });
-  }
-
-  if (input.suspendedJobs.length > 0) {
-    const n = input.suspendedJobs.length;
-    items.push({
-      key: 'jobs-suspended',
-      title: `${n} job${n === 1 ? '' : 's'} suspended`,
-      detail: summariseAgents(input.suspendedJobs) || 'awaiting action',
-      tone: 'warn',
-      to: '/jobs',
-    });
-  }
-
+}): SetupGap[] {
+  const items: SetupGap[] = [];
   for (const ch of input.channels) {
     if (ch.isToggleable && ch.state === 'installed') {
-      items.push({
-        key: `channel-${ch.name}`,
-        title: `${ch.name} channel not enabled`,
-        detail: 'Configured but not enabled',
-        tone: 'warn',
-        to: '/channels',
-      });
+      items.push({ key: `channel-${ch.name}`, title: `${ch.name} channel not enabled` });
     }
   }
-
   for (const acct of input.emailAccounts) {
     if (!acct.hasGrant) {
-      items.push({
-        key: `email-${acct.name}`,
-        title: `${acct.selfEmail || acct.name} missing grant`,
-        detail: 'No mail grant connected',
-        tone: 'danger',
-        to: '/channels',
-      });
+      items.push({ key: `email-${acct.name}`, title: `${acct.selfEmail || acct.name} missing grant` });
     }
   }
-
   return items;
 }
 
@@ -257,18 +193,13 @@ function requireArray<T>(value: unknown, label: string): T[] {
   return value as T[];
 }
 
-// Fetch all four attention sources concurrently, then aggregate. A failure in
-// any one rejects the whole card (scoped to this card only, never the page).
-export async function fetchAttention(signal?: AbortSignal): Promise<AttentionItem[]> {
-  const [failed, suspended, channels, emails] = await Promise.all([
-    fetchJson<{ jobs: DashboardJob[] }>('/api/jobs?status=failed', signal),
-    fetchJson<{ jobs: DashboardJob[] }>('/api/jobs?status=suspended', signal),
+// Setup gaps for the health card. A missing array is an error, never "no gaps".
+export async function fetchSetupGaps(signal?: AbortSignal): Promise<SetupGap[]> {
+  const [channels, emails] = await Promise.all([
     fetchJson<{ channels: DashboardChannel[] }>('/api/registry/channels', signal),
     fetchJson<{ accounts: DashboardEmailAccount[] }>('/api/registry/email-accounts', signal),
   ]);
-  return aggregateAttention({
-    failedJobs: requireArray<DashboardJob>(failed.jobs, '/api/jobs?status=failed'),
-    suspendedJobs: requireArray<DashboardJob>(suspended.jobs, '/api/jobs?status=suspended'),
+  return setupGaps({
     channels: requireArray<DashboardChannel>(channels.channels, '/api/registry/channels'),
     emailAccounts: requireArray<DashboardEmailAccount>(emails.accounts, '/api/registry/email-accounts'),
   });
@@ -304,10 +235,13 @@ export interface ActivityFeedData {
 // Lookback window for the home Recent Activity card.
 const ACTIVITY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
-// GET /api/activity?from=<now-24h>&limit=20 → newest first.
+// The column scrolls, so the card can hold more than the old fixed 20 (#2340).
+const ACTIVITY_LIMIT = '50';
+
+// GET /api/activity?from=<now-24h>&limit=50 → newest first.
 export async function fetchActivity(signal?: AbortSignal): Promise<ActivityFeedData> {
   const from = new Date(Date.now() - ACTIVITY_LOOKBACK_MS).toISOString();
-  const params = new URLSearchParams({ from, limit: '20' });
+  const params = new URLSearchParams({ from, limit: ACTIVITY_LIMIT });
   const data = await fetchJson<{ items?: ActivityItem[]; hasMore?: unknown; timezone?: unknown }>(
     `/api/activity?${params.toString()}`,
     signal,
@@ -393,4 +327,416 @@ export function getGreeting(hour: number): string {
   if (hour < 12) return 'Good morning';
   if (hour < 18) return 'Good afternoon';
   return 'Good evening';
+}
+
+/** Hour 0–23 in an IANA zone. A bad zone name falls back to the runtime's local hour. */
+export function hourInTimeZone(date: Date, timeZone: string): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hour: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(date);
+    const raw = Number(parts.find((p) => p.type === 'hour')?.value);
+    if (!Number.isFinite(raw)) return date.getHours();
+    return raw === 24 ? 0 : raw;
+  } catch {
+    return date.getHours();
+  }
+}
+
+// ── Principal home: copy, numbers, undo (#2340) ──────────────────────────────
+
+export const UNDO_WINDOW_MS = 5_000;
+export const ACT_DONE_MS = 650;
+
+/**
+ * Subtitle under the greeting. A null count is "not loaded" — never rendered
+ * as zero, so a failed card cannot say the plate is clear or that nothing was done.
+ */
+export function greetingSubtitle(waiting: number | null, handled: number | null): string {
+  const parts: string[] = [];
+  if (waiting !== null) {
+    parts.push(waiting === 0
+      ? 'Nothing is waiting on you.'
+      : `${waiting} ${waiting === 1 ? 'thing is' : 'things are'} waiting on you.`);
+  }
+  if (handled !== null) {
+    parts.push(`Curia handled ${handled} ${handled === 1 ? 'thing' : 'things'} since yesterday.`);
+  }
+  return parts.join(' ');
+}
+
+/** True only for a loaded, error-free empty list. */
+export function showCaughtUp(input: { loaded: boolean; error: string | null; count: number }): boolean {
+  return input.loaded && input.error === null && input.count === 0;
+}
+
+/** Detail after "All caught up". The cleared clause is omitted at zero. */
+export function caughtUpDetail(clearedToday: number, curiaHandling: number): string {
+  const handling = `Curia is handling ${curiaHandling} ${curiaHandling === 1 ? 'thing' : 'things'}`;
+  if (clearedToday <= 0) return handling;
+  return `${clearedToday} cleared today · ${handling}`;
+}
+
+export function formatTimeSaved(actions: number, minutesPerAction: number): string {
+  const hours = (actions * minutesPerAction) / 60;
+  return `≈${(Math.round(hours * 10) / 10).toFixed(1)}h`;
+}
+
+export interface SignedDelta {
+  direction: 'up' | 'down' | 'flat';
+  text: string;
+}
+
+export function formatCountDelta(current: number, previous: number): SignedDelta {
+  if (previous === 0 && current === 0) return { direction: 'flat', text: '0%' };
+  if (previous === 0) return { direction: 'up', text: '▲ new' };
+  const pct = Math.round(((current - previous) / previous) * 100);
+  if (pct === 0) return { direction: 'flat', text: '0%' };
+  if (pct > 0) return { direction: 'up', text: `▲ ${pct}%` };
+  return { direction: 'down', text: `▼ ${Math.abs(pct)}%` };
+}
+
+export function formatHoursDelta(currentHours: number, previousHours: number): SignedDelta {
+  const diff = currentHours - previousHours;
+  const rounded = Math.round(Math.abs(diff) * 10) / 10;
+  if (rounded === 0) return { direction: 'flat', text: '0h vs last wk' };
+  const direction = diff > 0 ? 'up' : 'down';
+  const arrow = diff > 0 ? '▲' : '▼';
+  return { direction, text: `${arrow} ${rounded.toFixed(1)}h vs last wk` };
+}
+
+export function hoursFromActions(actions: number, minutesPerAction: number): number {
+  return (actions * minutesPerAction) / 60;
+}
+
+function localDayKey(date: Date, timeZone: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(date);
+    const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((p) => p.type === type)?.value ?? '';
+    return `${get('year')}-${get('month')}-${get('day')}`;
+  } catch {
+    return date.toISOString().slice(0, 10);
+  }
+}
+
+function calendarDaysBetween(earlierKey: string, laterKey: string): number {
+  const [y1, m1, d1] = earlierKey.split('-').map(Number) as [number, number, number];
+  const [y2, m2, d2] = laterKey.split('-').map(Number) as [number, number, number];
+  const a = Date.UTC(y1, m1 - 1, d1);
+  const b = Date.UTC(y2, m2 - 1, d2);
+  return Math.round((b - a) / 86_400_000);
+}
+
+export function overdueMeta(dueAtIso: string, now: Date, timeZone: string): string {
+  const due = new Date(dueAtIso);
+  let day = 'due';
+  try {
+    day = due.toLocaleDateString('en-US', { weekday: 'short', timeZone });
+  } catch {
+    day = due.toLocaleDateString('en-US', { weekday: 'short' });
+  }
+  const overdueDays = calendarDaysBetween(localDayKey(due, timeZone), localDayKey(now, timeZone));
+  if (overdueDays >= 1) {
+    return `Your task · due ${day}, ${overdueDays} ${overdueDays === 1 ? 'day' : 'days'} overdue`;
+  }
+  const hours = Math.max(1, Math.round((now.getTime() - due.getTime()) / 3_600_000));
+  return `Your task · due ${day}, ${hours}h overdue`;
+}
+
+export function heldMeta(createdAtIso: string, now: Date, draft: boolean): string {
+  const ms = Math.max(0, now.getTime() - new Date(createdAtIso).getTime());
+  const hours = Math.floor(ms / 3_600_000);
+  const label = draft ? 'Draft held for approval' : 'Held for approval';
+  if (hours < 1) {
+    const mins = Math.max(1, Math.round(ms / 60_000));
+    return `${label} · ${mins}m`;
+  }
+  if (hours < 48) return `${label} · ${hours}h`;
+  const days = Math.round(hours / 24);
+  return `${label} · ${days}d`;
+}
+
+export interface WaitingTask {
+  id: string;
+  title: string;
+  dueAt: string;
+}
+
+export interface WaitingApproval {
+  id: number;
+  title: string;
+  createdAt: string;
+  toolName: string;
+  summary: string;
+  /** The stored payload has a draft id and no recipient or body yet. */
+  needsDraft?: boolean;
+}
+
+export type WaitingRow =
+  | (WaitingTask & { kind: 'task' })
+  | (WaitingApproval & { kind: 'approval' });
+
+/** Overdue tasks first (most overdue at the top), then held approvals, oldest first. */
+export function orderWaitingItems(tasks: WaitingTask[], approvals: WaitingApproval[]): WaitingRow[] {
+  const taskRows: WaitingRow[] = [...tasks]
+    .sort((a, b) => a.dueAt.localeCompare(b.dueAt))
+    .map((task) => ({ ...task, kind: 'task' }));
+  const approvalRows: WaitingRow[] = [...approvals]
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+    .map((approval) => ({ ...approval, kind: 'approval' }));
+  return [...taskRows, ...approvalRows];
+}
+
+export type PendingUndoKind = 'dismissed' | 'marked done';
+
+/**
+ * One toast covers every change still inside the undo window.
+ * A single change keeps its own verb. Several read "N changes", and the Undo
+ * button on that toast cancels all of them.
+ */
+export function pendingUndoMessage(pending: readonly PendingUndoKind[]): string | null {
+  if (pending.length === 0) return null;
+  if (pending.length === 1) return pending[0] === 'dismissed' ? 'Dismissed' : 'Marked done';
+  return `${pending.length} changes`;
+}
+
+export interface ApprovalPreview {
+  summary: string;
+  canApprove: boolean;
+  blockReason: string | null;
+}
+
+export async function fetchApprovalPreview(id: number, signal?: AbortSignal): Promise<ApprovalPreview> {
+  const data = await fetchJson<Record<string, unknown>>(`/api/dashboard/approvals/${id}/preview`, signal);
+  const summary = data['summary'];
+  if (typeof summary !== 'string' || typeof data['canApprove'] !== 'boolean') {
+    throw new Error('/api/dashboard/approvals/preview returned an unexpected response');
+  }
+  const blockReason = data['blockReason'];
+  return {
+    summary,
+    canApprove: data['canApprove'],
+    blockReason: typeof blockReason === 'string' ? blockReason : null,
+  };
+}
+
+export interface UndoCommit {
+  /** Drop the pending commit. The server is not contacted. */
+  cancel: () => void;
+  /** Commit now. Used when the page is going away inside the undo window. */
+  flush: () => void;
+}
+
+export function scheduleUndoCommit(commit: () => void, delayMs: number = UNDO_WINDOW_MS): UndoCommit {
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    commit();
+  }, delayMs);
+  return {
+    cancel() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+    },
+    flush() {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      commit();
+    },
+  };
+}
+
+export interface WaitingData {
+  timezone: string;
+  tasks: WaitingTask[];
+  approvals: WaitingApproval[];
+  clearedToday: number;
+  curiaHandling: number;
+}
+
+export interface StatsData {
+  timezone: string;
+  minutesPerAction: number;
+  successfulActions: { current: number; previous: number };
+  done: { current: number; previous: number };
+  contacts: { total: number; newThisWeek: number };
+  hiccups: { current: number; byDay: number[] };
+  handledSinceYesterday: number;
+}
+
+export interface HistogramDay {
+  key: string;
+  label: string;
+  weekend: boolean;
+  today: boolean;
+  total: number;
+  hiccups: number;
+  byAgent: Record<string, number>;
+  byOutcome: { success: number; partial: number; failed: number };
+}
+
+export interface HistogramData {
+  timezone: string;
+  days: HistogramDay[];
+  agents: string[];
+  average: number;
+  max: number;
+}
+
+export interface BullpenData {
+  available: boolean;
+  count: number;
+  agents: string[];
+}
+
+function requireNumber(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(`${label} returned an unexpected response`);
+  }
+  return value;
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) throw new Error(`${label} returned an unexpected response`);
+  return value as Record<string, unknown>;
+}
+
+export async function fetchWaiting(signal?: AbortSignal): Promise<WaitingData> {
+  const data = await fetchJson<Record<string, unknown>>('/api/dashboard/waiting', signal);
+  const tasks = requireArray<WaitingTask>(data['tasks'], '/api/dashboard/waiting tasks');
+  const approvals = requireArray<WaitingApproval>(data['approvals'], '/api/dashboard/waiting approvals');
+  const timezone = data['timezone'];
+  if (typeof timezone !== 'string' || timezone.length === 0) {
+    throw new Error('/api/dashboard/waiting returned an unexpected response');
+  }
+  return {
+    timezone,
+    tasks,
+    approvals,
+    clearedToday: requireNumber(data['clearedToday'], '/api/dashboard/waiting'),
+    curiaHandling: requireNumber(data['curiaHandling'], '/api/dashboard/waiting'),
+  };
+}
+
+export async function fetchStats(signal?: AbortSignal): Promise<StatsData> {
+  const data = await fetchJson<Record<string, unknown>>('/api/dashboard/stats', signal);
+  const actions = requireRecord(data['successfulActions'], '/api/dashboard/stats actions');
+  const done = requireRecord(data['done'], '/api/dashboard/stats done');
+  const contacts = requireRecord(data['contacts'], '/api/dashboard/stats contacts');
+  const hiccups = requireRecord(data['hiccups'], '/api/dashboard/stats hiccups');
+  const byDay = requireArray<number>(hiccups['byDay'], '/api/dashboard/stats hiccups');
+  if (byDay.some((n) => typeof n !== 'number')) {
+    throw new Error('/api/dashboard/stats hiccups returned an unexpected response');
+  }
+  const timezone = data['timezone'];
+  if (typeof timezone !== 'string' || timezone.length === 0) {
+    throw new Error('/api/dashboard/stats returned an unexpected response');
+  }
+  return {
+    timezone,
+    minutesPerAction: requireNumber(data['minutesPerAction'], '/api/dashboard/stats'),
+    successfulActions: {
+      current: requireNumber(actions['current'], '/api/dashboard/stats actions'),
+      previous: requireNumber(actions['previous'], '/api/dashboard/stats actions'),
+    },
+    done: {
+      current: requireNumber(done['current'], '/api/dashboard/stats done'),
+      previous: requireNumber(done['previous'], '/api/dashboard/stats done'),
+    },
+    contacts: {
+      total: requireNumber(contacts['total'], '/api/dashboard/stats contacts'),
+      newThisWeek: requireNumber(contacts['newThisWeek'], '/api/dashboard/stats contacts'),
+    },
+    hiccups: { current: requireNumber(hiccups['current'], '/api/dashboard/stats hiccups'), byDay },
+    handledSinceYesterday: requireNumber(data['handledSinceYesterday'], '/api/dashboard/stats'),
+  };
+}
+
+export async function fetchHistogram(signal?: AbortSignal): Promise<HistogramData> {
+  const data = await fetchJson<Record<string, unknown>>('/api/dashboard/histogram', signal);
+  const days = requireArray<HistogramDay>(data['days'], '/api/dashboard/histogram');
+  const agents = requireArray<string>(data['agents'], '/api/dashboard/histogram');
+  const timezone = data['timezone'];
+  if (typeof timezone !== 'string' || days.length === 0) {
+    throw new Error('/api/dashboard/histogram returned an unexpected response');
+  }
+  return {
+    timezone,
+    days,
+    agents,
+    average: requireNumber(data['average'], '/api/dashboard/histogram'),
+    max: requireNumber(data['max'], '/api/dashboard/histogram'),
+  };
+}
+
+export async function fetchBullpen(signal?: AbortSignal): Promise<BullpenData> {
+  const data = await fetchJson<Record<string, unknown>>('/api/dashboard/bullpen', signal);
+  if (typeof data['available'] !== 'boolean') {
+    throw new Error('/api/dashboard/bullpen returned an unexpected response');
+  }
+  return {
+    available: data['available'],
+    count: requireNumber(data['count'], '/api/dashboard/bullpen'),
+    agents: requireArray<string>(data['agents'], '/api/dashboard/bullpen'),
+  };
+}
+
+/** POST that survives a refresh inside the undo window (`keepalive`). Returns the JSON body. */
+export async function postDashboard(
+  path: string,
+  payload?: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const res = await apiFetch(path, {
+    method: 'POST',
+    keepalive: true,
+    ...(payload
+      ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) }
+      : {}),
+  });
+  if (!res.ok) throw new Error(await readErrorMessage(res));
+  const ct = res.headers.get('content-type') ?? '';
+  if (!ct.includes('application/json')) return {};
+  const body = (await res.json()) as unknown;
+  if (typeof body !== 'object' || body === null) return {};
+  return body as Record<string, unknown>;
+}
+
+const AGENT_COLORS = [
+  'var(--app-teal)',
+  'var(--app-blue)',
+  'var(--app-amber)',
+  'var(--app-violet)',
+  'var(--app-green)',
+  'var(--app-blue-soft)',
+];
+
+/** Stable for a given set of agents: alphabetical order, "other" always muted. */
+export function agentColor(name: string, agents: readonly string[]): string {
+  if (name === 'other') return 'var(--app-fg-subtle)';
+  const named = agents.filter((agent) => agent !== 'other').slice().sort();
+  const index = Math.max(0, named.indexOf(name));
+  return AGENT_COLORS[index % AGENT_COLORS.length] ?? AGENT_COLORS[0]!;
+}
+
+export const OUTCOME_COLORS: Record<'success' | 'partial' | 'failed', string> = {
+  success: 'var(--app-teal)',
+  partial: 'var(--app-amber)',
+  failed: 'var(--app-destructive)',
+};
+
+export function histogramDateLabel(key: string, today: boolean): string {
+  if (today) return 'Today (so far)';
+  const [y, m, d] = key.split('-').map(Number) as [number, number, number];
+  const noon = new Date(Date.UTC(y, m - 1, d, 12));
+  return noon.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' });
 }
