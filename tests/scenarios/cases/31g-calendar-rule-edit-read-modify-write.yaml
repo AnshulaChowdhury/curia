@@ -58,6 +58,13 @@ expected_behaviors:
       called: doc-write
       with: { mode: section-edit, path: /shared/calendar/rules.md }
       contains: { section: "Meeting length", content: "30" }
+  - id: only_one_section_edit
+    weight: important
+    description: Edits no other rule's section (one section-edit on the document in all).
+    check:
+      called: doc-write
+      with: { mode: section-edit, path: /shared/calendar/rules.md }
+      max: 1
   - id: no_whole_document_rewrite
     weight: critical
     description: Does not rewrite the whole document.
