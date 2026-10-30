@@ -30,7 +30,7 @@
   - `FORCED_ATTEMPT_RESERVE_MS = 60_000`
   - `FORCED_REASONING_TAIL_CHARS = 16_000`
   - `WATCHDOG_REQUEST_TIMEOUT_MS = 600_000`. Shared with OpenRouter via `LLM_REQUEST_TIMEOUT_MS` in `request-timeout.ts` (not imported from a concrete provider).
-- **Reasoning is counted in tokens:** one per `reasoning_delta`, never by character count.
+- **Reasoning is estimated in tokens:** `estimateReasoningTokens(deltas, chars)` = the higher of the `reasoning_delta` count and `ceil(chars / 3)` (`REASONING_CHARS_PER_TOKEN_ESTIMATE`). Revised 2026-10-29: counting deltas alone could never fire on CoreWeave (about 2.6 tokens per delta); keep both terms.
 - **At most one forced attempt per call.** The watched attempt is the only one that streams. The forced attempt goes through `inner.chat()` with that provider's normal retries.
 - **Turns stay non-cancellable.** `deadlineAt` only sets when the watchdog fires; it never aborts a call or a turn.
 - **The forced message is a `user`-role `Message`** whose text opens with the exact line `[Runtime note from Curia, not from the principal]`.
