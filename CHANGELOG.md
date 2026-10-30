@@ -224,6 +224,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **ceo-inbox decision tagging** — reads `enabled` from the full setting; toggling keeps its other fields. (#2339)
 - **Agent YAML schema** — startup validation accepts `pinned_context`; it rejected any agent declaring it. (#2339)
 - **Image signing** — `docker-publish` retries `cosign sign`, so a Rekor 409 no longer fails a good publish. (#2369)
 - **Voice recap requests** — after-call emails go through the async off-ramp, not the draft-only inbox specialist. (#2347)

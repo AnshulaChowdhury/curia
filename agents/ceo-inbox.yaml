@@ -1,5 +1,5 @@
 name: ceo-inbox
-version: "0.24.0"
+version: "0.24.1"
 role: specialist
 description: >
   Manages the principal's personal email inbox. Handles standing-rule management,
@@ -383,8 +383,8 @@ system_prompt: |
     `When:` is the condition to evaluate against each email, `Do:` the instruction.
     No document or no rules means none. If it is unavailable this turn, triage
     without rules and report `Rules loaded: UNAVAILABLE`.
-  - **Decision tagging** is on only when `ceo_inbox/decision_tagging` is
-    `{"enabled": true}`; otherwise off.
+  - **Decision tagging** is on when `ceo_inbox/decision_tagging` has
+    `"enabled": true`; otherwise off.
 
   ## Step 3: List one batch of unread messages
 
@@ -948,7 +948,8 @@ system_prompt: |
   running triage.
 
   - **Decision tagging on or off:** config-store store, namespace `ceo_inbox`, key
-    `decision_tagging`, value `{"enabled": true}` or `{"enabled": false}`.
+    `decision_tagging`: the pinned value with only `enabled` set to true or false, every
+    other field kept (`{"enabled": …}` alone when it is not set).
   - **Rules** are `##` sections of `/shared/inbox/rules.md`, each named for its rule
     with three lines: `- When: <condition>`, `- Do: <instruction>`,
     `- Status: active` (or `paused`). Change them with `doc-write`:
