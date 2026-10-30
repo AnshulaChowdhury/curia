@@ -113,6 +113,15 @@ export class SignalCallBridge {
    */
   private readonly ringing = new Set<bigint>();
   /**
+   * callIds whose ENDED arrived while their RINGING_INCOMING handler was still
+   * resolving the caller (i.e. still in `ringing`), mapped to the ENDED reason.
+   * The handler checks this after its await and gives up instead of accepting
+   * a call signal-cli has already dropped (#2372: a Signal Desktop call ended
+   * with InternalFailure ~340ms after ringing, before resolution finished).
+   * Cleared in the handler's finally.
+   */
+  private readonly endedWhileRinging = new Map<bigint, string | null>();
+  /**
    * Reentrance guard for handleConnected's setup sequence. The active-callId
    * short-circuit only protects once `active` is assigned, and pending.delete
    * is deferred until then — so two CONNECTED events for the same callId
@@ -250,6 +259,19 @@ export class SignalCallBridge {
   }
 
   private async handleCallEvent(ev: SignalCallEvent): Promise<void> {
+    // One line per signal-cli call event (a call produces a handful), so a call
+    // that fails can be reconstructed from the logs alone. signal-cli itself
+    // logs call/tunnel detail only at debug, which prod does not run.
+    this.log.info(
+      {
+        callId: ev.callId.toString(),
+        state: ev.state,
+        reason: ev.reason,
+        hasNumber: ev.number !== null,
+        hasUuid: ev.uuid !== null,
+      },
+      'Signal call event',
+    );
     switch (ev.state) {
       case 'RINGING_INCOMING':
         await this.handleRingingIncoming(ev);
@@ -324,6 +346,16 @@ export class SignalCallBridge {
         this.fireAndLog(this.config.rpcClient.rejectCall(ev.callId), 'rejectCall', ev.callId);
         return;
       }
+      // signal-cli may already have ended the call while we were resolving.
+      // Accepting (or rejecting) it then only fails with "No active call", and
+      // the real failure is the ENDED reason — surface that instead.
+      if (this.endedWhileRinging.has(ev.callId)) {
+        this.log.warn(
+          { callId: ev.callId.toString(), reason: this.endedWhileRinging.get(ev.callId) },
+          'Signal call ended before it could be answered; not accepting',
+        );
+        return;
+      }
       if (!result.ok) {
         this.fireAndLog(this.config.rpcClient.rejectCall(ev.callId), 'rejectCall', ev.callId);
         this.log.info({ callId: ev.callId.toString(), reason: result.reason }, 'Rejecting incoming Signal call');
@@ -343,6 +375,7 @@ export class SignalCallBridge {
       }
     } finally {
       this.ringing.delete(ev.callId);
+      this.endedWhileRinging.delete(ev.callId);
     }
   }
 
@@ -595,8 +628,14 @@ export class SignalCallBridge {
       this.endedDuringSetup.add(ev.callId);
     }
 
+    // Still resolving the caller: flag it so handleRingingIncoming does not
+    // accept a call signal-cli has already dropped.
+    if (this.ringing.has(ev.callId)) {
+      this.endedWhileRinging.set(ev.callId, ev.reason);
+    }
+
     if (this.clearPending(ev.callId)) {
-      this.log.info({ callId: ev.callId.toString() }, 'Signal call ended before it connected');
+      this.log.info({ callId: ev.callId.toString(), reason: ev.reason }, 'Signal call ended before it connected');
     }
   }
 
