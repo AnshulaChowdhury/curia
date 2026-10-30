@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 660" width="1120" height="660"><style>
+  text { fill: #1d1d1f; font-size: 12px; font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  .t-sm { font-size: 10.5px; fill: #6b6b70; }
+  .t-b { font-weight: 600; font-size: 13px; }
+  .t-node { font-size: 10px; fill: #6b6b70; font-weight: 600; }
+  .shape { fill: #ffffff; stroke: #1d1d1f; stroke-width: 1.4; }
+  .gap { stroke: #d97706; stroke-dasharray: 5 3; stroke-width: 2; }
+  .arrow, .a2 { stroke: #1d1d1f; stroke-width: 1.2; fill: none; marker-end: url(#ah); }
+  .a2 { marker-end: url(#ah2); }
+  .loop { stroke: #2563eb; stroke-width: 1.4; fill: none; stroke-dasharray: 4 3; marker-end: url(#ahb); }
+</style><rect width="1120" height="660" fill="#ffffff"/>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1d1d1f"/></marker>
+    <marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+  </defs>
+
+  <!-- Controls (tabbed rectangles) -->
+  <g>
+    <rect class="shape" x="150" y="30" width="150" height="54" rx="2"/><rect class="shape" x="142" y="40" width="8" height="16"/>
+    <text x="225" y="52" text-anchor="middle">Onboarding plan</text><text x="225" y="68" text-anchor="middle" class="t-sm">seeded fixture · editable</text>
+
+    <rect class="shape" x="320" y="30" width="150" height="54" rx="2"/><rect class="shape" x="312" y="40" width="8" height="16"/>
+    <text x="395" y="52" text-anchor="middle">Minutes structuring</text><text x="395" y="68" text-anchor="middle" class="t-sm">skill · directed changes</text>
+
+    <rect class="shape gap" x="490" y="30" width="150" height="54" rx="2"/><rect class="shape gap" x="482" y="40" width="8" height="16"/>
+    <text x="565" y="52" text-anchor="middle">Inference heuristics</text><text x="565" y="68" text-anchor="middle" class="t-sm">prompt · not written yet</text>
+
+    <rect class="shape gap" x="660" y="30" width="150" height="54" rx="2"/><rect class="shape gap" x="652" y="40" width="8" height="16"/>
+    <text x="735" y="52" text-anchor="middle">Triage switch</text><text x="735" y="68" text-anchor="middle" class="t-sm">policy · doesn't exist yet</text>
+
+    <rect class="shape" x="830" y="30" width="150" height="54" rx="2"/><rect class="shape" x="822" y="40" width="8" height="16"/>
+    <text x="905" y="52" text-anchor="middle">Autonomy score</text><text x="905" y="68" text-anchor="middle" class="t-sm">policy · starts at 75</text>
+  </g>
+  <path class="arrow" d="M225,84 L225,150 L470,150 L470,236"/>
+  <path class="arrow" d="M395,84 L395,130 L510,130 L510,236"/>
+  <path class="arrow" d="M565,84 L565,236"/>
+  <path class="arrow" d="M735,84 L735,130 L620,130 L620,236"/>
+  <path class="arrow" d="M905,84 L905,150 L660,150 L660,236"/>
+
+  <!-- Function box -->
+  <rect class="shape" x="440" y="238" width="250" height="150" rx="3" style="stroke-width:2"/>
+  <text x="565" y="300" text-anchor="middle" class="t-b">Onboard the principal</text>
+  <text x="565" y="318" text-anchor="middle" class="t-b">to rely on Curia</text>
+  <text x="680" y="380" text-anchor="end" class="t-node">A0</text>
+
+  <!-- Inputs -->
+  <rect class="shape" x="20" y="262" width="190" height="40" rx="20"/>
+  <text x="115" y="280" text-anchor="middle">Curia with a desk</text><text x="115" y="294" text-anchor="middle" class="t-sm">from operator setup</text>
+  <path class="arrow" d="M210,282 L438,282"/>
+  <polygon class="shape" points="40,330 230,330 210,376 20,376"/>
+  <text x="125" y="349" text-anchor="middle">Principal's mail &amp;</text><text x="125" y="364" text-anchor="middle">calendar history</text>
+  <path class="arrow" d="M222,350 L438,350"/>
+
+  <!-- Outputs -->
+  <path class="arrow" d="M690,262 L888,262"/>
+  <rect class="shape" x="890" y="244" width="210" height="36" rx="18"/>
+  <text x="995" y="267" text-anchor="middle">Confirmed priorities</text>
+  <path class="arrow" d="M690,314 L888,314"/>
+  <rect class="shape" x="890" y="296" width="210" height="36" rx="18"/>
+  <text x="995" y="319" text-anchor="middle">Confirmed standing rules</text>
+  <path class="arrow" d="M690,352 L860,352 L860,366 L888,366"/>
+  <rect class="shape" x="890" y="348" width="210" height="36" rx="18"/>
+  <text x="995" y="371" text-anchor="middle">Agreed routines &amp; cadence</text>
+  <!-- governance-producing loop -->
+  <path class="arrow" d="M690,376 L800,376 L800,410"/>
+  <text x="808" y="404" class="t-sm" style="fill:#2563eb">principal's approvals</text>
+  <path class="loop" d="M800,412 L1112,412 L1112,57 L982,57"/>
+  <text x="1106" y="200" text-anchor="end" class="t-sm" style="fill:#2563eb">raise score</text>
+
+  <!-- Mechanisms -->
+  <path class="arrow" d="M140,560 L140,470 L470,470 L470,390"/>
+  <circle class="shape" cx="140" cy="590" r="30"/><text x="140" y="586" text-anchor="middle" class="t-sm">Curia</text><text x="140" y="599" text-anchor="middle" class="t-sm">voice</text>
+  <path class="arrow" d="M290,560 L290,490 L510,490 L510,390"/>
+  <circle class="shape" cx="290" cy="590" r="30"/><text x="290" y="586" text-anchor="middle" class="t-sm">Inference</text><text x="290" y="599" text-anchor="middle" class="t-sm">job</text>
+  <path class="arrow" d="M440,560 L440,510 L545,510 L545,390"/>
+  <circle class="shape" cx="440" cy="590" r="30"/><text x="440" y="586" text-anchor="middle" class="t-sm">Structuring</text><text x="440" y="599" text-anchor="middle" class="t-sm">pass</text>
+
+  <path class="arrow" d="M610,565 L610,390"/>
+  <polygon class="shape" points="560,574 680,574 670,600 550,600"/><polygon class="shape" points="566,568 686,568 676,594 556,594"/>
+  <text x="616" y="586" text-anchor="middle">Principal</text>
+  <path class="arrow" d="M780,565 L780,490 L650,490 L650,390"/>
+  <polygon class="shape" points="730,574 850,574 840,600 720,600"/><polygon class="shape" points="736,568 856,568 846,594 726,594"/>
+  <text x="786" y="586" text-anchor="middle">Operator</text>
+  <path class="arrow" d="M950,565 L950,470 L680,470 L680,390"/>
+  <polygon class="shape" points="890,574 1020,574 1010,600 880,600"/><polygon class="shape" points="896,568 1026,568 1016,594 886,594"/>
+  <text x="951" y="586" text-anchor="middle">PWA · console · email</text>
+
+  <text x="20" y="636" class="t-sm">Circles: Curia's AI agents. Stacked parallelograms: human roles and software tools. Pills: artifacts crossing the workflow's edge.</text><text x="20" y="652" class="t-sm">Dashed orange: a control that doesn't exist yet. Dashed blue: an output that loops back to govern later runs.</text>
+</svg>
