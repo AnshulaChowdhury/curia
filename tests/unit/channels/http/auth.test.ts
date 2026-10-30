@@ -46,6 +46,10 @@ describe('bypassesBearerAuth', () => {
     '/api/jobs/:jobId',
     '/api/antfarm/timeline',
     '/api/kg/nodes',
+    '/api/tasks',
+    '/api/contacts',
+    '/api/chat/messages',
+    '/api/grant-recommendations',
     '/api/identity/me',
     '/api/setup/status',
     '/api/secret-capture/:token',
@@ -59,6 +63,10 @@ describe('bypassesBearerAuth', () => {
     '/api/agents/status',
     '/api/healthz',
     '/api/nonexistent',
+    // Prefixes must not match on a shared leading substring (#872 review).
+    '/api/chat-export',
+    '/api/tasks-summary',
+    '/api/contacts.csv',
     '/*',
   ])('enforces bearer auth on %s', (url) => {
     expect(bypassesBearerAuth(url)).toBe(false);

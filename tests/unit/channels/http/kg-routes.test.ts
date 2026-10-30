@@ -6,6 +6,10 @@ import type { Logger } from '../../../../src/logger.js';
 import type { ContactService } from '../../../../src/contacts/contact-service.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { knowledgeGraphRoutes } from '../../../../src/channels/http/routes/kg.js';
+import { taskRoutes } from '../../../../src/channels/http/routes/tasks.js';
+import { contactRoutes } from '../../../../src/channels/http/routes/contacts.js';
+import { chatRoutes } from '../../../../src/channels/http/routes/chat.js';
+import { legacyKgAliasRoutes } from '../../../../src/channels/http/routes/legacy-kg-aliases.js';
 import { LLM_FAILURE_TURN_CONTENT, LLM_FAILURE_USER_MESSAGE } from '../../../../src/memory/llm-failure-turn.js';
 import { VOICE_GREETING_USER_MESSAGE } from '../../../../src/channels/voice/greeting.js';
 import type { EventBus } from '../../../../src/bus/bus.js';
@@ -23,7 +27,7 @@ function createLogger(): Logger {
 }
 
 // Minimal ContactService stub. The canonical-field validation in
-// POST /api/kg/contacts runs before any service call, so for the email-format
+// POST /api/contacts runs before any service call, so for the email-format
 // tests below createContact must never be reached.
 function createContactService(): ContactService {
   return {
@@ -52,8 +56,7 @@ function createTransactionalPool(client: Partial<PoolClient>): Pick<Pool, 'query
   } as unknown as Pick<Pool, 'query' | 'connect'>;
 }
 
-// Minimal EventBus stub — KG non-chat routes never touch the bus directly,
-// but KnowledgeGraphRouteOptions now requires bus + eventRouter for chat endpoints.
+// Minimal EventBus stub — chat history/messages routes need bus + eventRouter.
 function createMockBus(): EventBus {
   return {
     publish: vi.fn().mockResolvedValue(undefined),
@@ -70,6 +73,62 @@ function createMockEventRouter(): EventRouter {
     setupSubscriptions: vi.fn(),
   } as unknown as EventRouter;
 }
+
+
+/** Register the console route plugins a test needs. Defaults to all four. */
+async function registerConsoleRoutes(
+  app: ReturnType<typeof Fastify>,
+  opts: {
+    pool: Pool;
+    logger: Logger;
+    webAppBootstrapSecret: string | undefined;
+    sessions: Map<string, number>;
+    contactService: ContactService;
+    bus?: EventBus;
+    eventRouter?: EventRouter;
+    taskRepo?: { updateTask: ReturnType<typeof vi.fn> };
+    include?: Array<'kg' | 'tasks' | 'contacts' | 'chat' | 'aliases'>;
+  },
+): Promise<void> {
+  const include = new Set(opts.include ?? ['kg', 'tasks', 'contacts', 'chat', 'aliases']);
+  const consoleBase = {
+    pool: opts.pool,
+    logger: opts.logger,
+    webAppBootstrapSecret: opts.webAppBootstrapSecret,
+    sessions: opts.sessions,
+  };
+  if (include.has('kg')) {
+    await app.register(knowledgeGraphRoutes, {
+      ...consoleBase,
+      secureCookies: false,
+      contactService: opts.contactService,
+    });
+  }
+  if (include.has('tasks')) {
+    await app.register(taskRoutes, {
+      ...consoleBase,
+      contactService: opts.contactService,
+      taskRepo: opts.taskRepo,
+    });
+  }
+  if (include.has('contacts')) {
+    await app.register(contactRoutes, {
+      ...consoleBase,
+      contactService: opts.contactService,
+    });
+  }
+  if (include.has('chat')) {
+    await app.register(chatRoutes, {
+      ...consoleBase,
+      bus: opts.bus ?? createMockBus(),
+      eventRouter: opts.eventRouter ?? createMockEventRouter(),
+    });
+  }
+  if (include.has('aliases')) {
+    await app.register(legacyKgAliasRoutes);
+  }
+}
+
 
 // A minimal valid Contact shape returned by contactService.getContact() stubs.
 function makeContact(overrides: Record<string, unknown> = {}) {
@@ -104,7 +163,7 @@ function makeContact(overrides: Record<string, unknown> = {}) {
   };
 }
 
-describe('knowledgeGraphRoutes', () => {
+describe('console routes (kg / tasks / contacts / chat)', () => {
   const pool = {
     query: vi.fn(),
   } as unknown as Pool;
@@ -113,13 +172,50 @@ describe('knowledgeGraphRoutes', () => {
     vi.clearAllMocks();
   });
 
-  it('rejects API requests without x-web-bootstrap-secret', async () => {
+
+  it('308-redirects legacy /api/kg/{tasks,contacts,chat} paths to /api/* (#872)', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
+      sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+    });
+    // Catch-all like the console SPA — aliases must win over it for both GET and POST.
+    app.get('/*', async () => ({ spa: true }));
+    app.post('/*', async () => ({ spa: true }));
+
+    const cases: Array<{ method: 'GET' | 'POST' | 'PATCH'; url: string; location: string }> = [
+      { method: 'GET', url: '/api/kg/tasks', location: '/api/tasks' },
+      { method: 'POST', url: '/api/kg/tasks', location: '/api/tasks' },
+      { method: 'PATCH', url: '/api/kg/tasks/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', location: '/api/tasks/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+      { method: 'GET', url: '/api/kg/contacts', location: '/api/contacts' },
+      { method: 'POST', url: '/api/kg/chat/messages', location: '/api/chat/messages' },
+      { method: 'GET', url: '/api/kg/chat/stream', location: '/api/chat/stream' },
+      { method: 'GET', url: '/api/kg/chat/history?conversationId=c1', location: '/api/chat/history?conversationId=c1' },
+      { method: 'GET', url: '/api/kg/grant-recommendations', location: '/api/grant-recommendations' },
+      // Raw URL slice preserves percent-encoding (decoded `*` params would not).
+      { method: 'GET', url: '/api/kg/contacts/a%2Fb', location: '/api/contacts/a%2Fb' },
+      { method: 'GET', url: '/api/kg/contacts/x%3Fy', location: '/api/contacts/x%3Fy' },
+      { method: 'GET', url: '/api/kg/contacts/%C3%A9', location: '/api/contacts/%C3%A9' },
+    ];
+    for (const { method, url, location } of cases) {
+      const res = await app.inject({ method, url });
+      expect(res.statusCode, `${method} ${url}`).toBe(308);
+      expect(res.headers.location).toBe(location);
+    }
+    await app.close();
+  });
+
+  it('rejects API requests without x-web-bootstrap-secret', async () => {
+    const app = Fastify();
+    await registerConsoleRoutes(app, {
+      pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'secret-1',
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
@@ -150,11 +246,10 @@ describe('knowledgeGraphRoutes', () => {
     });
 
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
@@ -177,15 +272,13 @@ describe('knowledgeGraphRoutes', () => {
 
   it('returns 404 at / (console app handles that route, not kg.ts)', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
-      bus: createMockBus(),
-      eventRouter: createMockEventRouter(),
+      include: ['kg'],
     });
 
     const response = await app.inject({ method: 'GET', url: '/' });
@@ -196,15 +289,13 @@ describe('knowledgeGraphRoutes', () => {
 
   it('returns 400 for a malformed node_id UUID', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
-      bus: createMockBus(),
-      eventRouter: createMockEventRouter(),
+      include: ['kg'],
     });
 
     const response = await app.inject({
@@ -228,11 +319,10 @@ describe('knowledgeGraphRoutes', () => {
   // only stops being an RFC conformance test.
   it('accepts a v7 node_id that the old strict regex would have rejected', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
@@ -275,11 +365,10 @@ describe('knowledgeGraphRoutes', () => {
 
   it('returns 404 when node_id names no row (#1881)', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
@@ -305,11 +394,10 @@ describe('knowledgeGraphRoutes', () => {
 
   it('returns 404 for the nil UUID when it names no row (#1881)', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
@@ -334,11 +422,10 @@ describe('knowledgeGraphRoutes', () => {
 
   it('returns 200 with the node and empty edges for an isolated node (#1881)', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
@@ -380,11 +467,10 @@ describe('knowledgeGraphRoutes', () => {
 
   it('returns 200 with empty arrays when no node_id and the graph is empty (#1881)', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
@@ -410,11 +496,10 @@ describe('knowledgeGraphRoutes', () => {
     // http-adapter does not register the routes when the secret is absent, but
     // the guard is kept inside the route handler as a belt-and-suspenders check.
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: undefined,
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
@@ -436,15 +521,13 @@ describe('knowledgeGraphRoutes', () => {
   it('rejects a ReDoS-crafted primaryEmail quickly, before any service call', async () => {
     const contactService = createContactService();
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService,
-      bus: createMockBus(),
-      eventRouter: createMockEventRouter(),
+      include: ['contacts'],
     });
 
     // Trailing '@' makes the address invalid, forcing the matcher to explore
@@ -454,7 +537,7 @@ describe('knowledgeGraphRoutes', () => {
     const start = performance.now();
     const response = await app.inject({
       method: 'POST',
-      url: '/api/kg/contacts',
+      url: '/api/contacts',
       headers: { 'x-web-bootstrap-secret': 'secret-1' },
       payload: { displayName: 'Test Contact', primaryEmail: evilEmail },
     });
@@ -472,20 +555,18 @@ describe('knowledgeGraphRoutes', () => {
   it('accepts a well-formed primaryEmail through to the contact service', async () => {
     const contactService = createContactService();
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService,
-      bus: createMockBus(),
-      eventRouter: createMockEventRouter(),
+      include: ['contacts'],
     });
 
     const response = await app.inject({
       method: 'POST',
-      url: '/api/kg/contacts',
+      url: '/api/contacts',
       headers: { 'x-web-bootstrap-secret': 'secret-1' },
       payload: { displayName: 'Test Contact', primaryEmail: 'first.last@sub.example.co.uk' },
     });
@@ -503,32 +584,32 @@ describe('knowledgeGraphRoutes', () => {
     await app.close();
   });
 
-  // Regression for CodeQL #98 (js/missing-rate-limiting). GET /api/kg/chat/history
-  // reads from the working_memory table and was the only KG route missing the
-  // KG_RATE (60/min) per-route override — leaving it covered only by the looser
-  // global limit. We register @fastify/rate-limit with a deliberately high global
-  // cap (1000) so the route's own 60/min ceiling is the ONLY thing that can trip a
-  // 429: without the override all 61 requests would pass the limiter and return
-  // 401 at the secret guard; with it, the 61st is rejected by the limiter first.
-  it('rate-limits GET /api/kg/chat/history with the KG per-route cap', async () => {
+  // Regression for CodeQL #98 (js/missing-rate-limiting). GET /api/chat/history
+  // reads from the working_memory table and must carry the shared CONSOLE_RATE
+  // (60/min) per-route override — leaving it covered only by the looser
+  // global limit would be wrong. We register @fastify/rate-limit with a deliberately
+  // high global cap (1000) so the route's own 60/min ceiling is the ONLY thing that
+  // can trip a 429: without the override all 61 requests would pass the limiter and
+  // return 401 at the secret guard; with it, the 61st is rejected by the limiter first.
+  it('rate-limits GET /api/chat/history with the console per-route cap', async () => {
     const app = Fastify();
     await app.register(rateLimit, { max: 1000, timeWindow: '1 minute' });
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
       eventRouter: createMockEventRouter(),
+      include: ['chat'],
     });
 
     // The rate-limit onRequest hook runs before the handler's assertSecret check,
     // so it increments on every (unauthenticated) request. Fire a handful past the
     // 60/min cap rather than pinning the assertion to the exact 61st request — the
     // boundary index isn't what we're testing, only that the per-route cap engages.
-    const url = '/api/kg/chat/history?conversationId=c1';
+    const url = '/api/chat/history?conversationId=c1';
     const statuses: number[] = [];
     for (let i = 0; i < 65; i++) {
       const res: LightMyRequestResponse = await app.inject({ method: 'GET', url });
@@ -540,7 +621,7 @@ describe('knowledgeGraphRoutes', () => {
     // limiter and not some blanket rejection.
     expect(statuses[0]).toBe(401);
     // A 429 within 65 requests can only come from the route's own 60/min override:
-    // the global cap is 1000, so without KG_RATE none of these would be throttled.
+    // the global cap is 1000, so without CONSOLE_RATE none of these would be throttled.
     expect(statuses).toContain(429);
 
     await app.close();
@@ -557,11 +638,10 @@ describe('knowledgeGraphRoutes', () => {
     });
 
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
@@ -570,7 +650,7 @@ describe('knowledgeGraphRoutes', () => {
 
     const response = await app.inject({
       method: 'GET',
-      url: '/api/kg/chat/history?conversationId=c1',
+      url: '/api/chat/history?conversationId=c1',
       headers: { 'x-web-bootstrap-secret': 'secret-1' },
     });
 
@@ -611,11 +691,10 @@ describe('knowledgeGraphRoutes', () => {
     });
 
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService: {} as unknown as ContactService,
       bus: createMockBus(),
@@ -624,7 +703,7 @@ describe('knowledgeGraphRoutes', () => {
 
     const response = await app.inject({
       method: 'GET',
-      url: '/api/kg/chat/history?conversationId=c1&limit=2',
+      url: '/api/chat/history?conversationId=c1&limit=2',
       headers: { 'x-web-bootstrap-secret': 'secret-1' },
     });
 
@@ -640,7 +719,7 @@ describe('knowledgeGraphRoutes', () => {
 
   // ── Tier / kind validation (issue #1055) ────────────────────────────────────
 
-  describe('PATCH /api/kg/contacts/:id — tier/kind validation', () => {
+  describe('PATCH /api/contacts/:id — tier/kind validation', () => {
     it('rejects an invalid tier value with 400', async () => {
       const contactService = createContactService();
       vi.mocked(contactService.getContact).mockResolvedValue(makeContact() as never);
@@ -652,20 +731,18 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
-        bus: createMockBus(),
-        eventRouter: createMockEventRouter(),
+        include: ['contacts'],
       });
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { tier: 'superuser' },
       });
@@ -686,11 +763,10 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
         bus: createMockBus(),
@@ -699,7 +775,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { tier: 'principal' },
       });
@@ -720,11 +796,10 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
         bus: createMockBus(),
@@ -733,7 +808,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { kind: 'principal' },
       });
@@ -754,11 +829,10 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
         bus: createMockBus(),
@@ -767,7 +841,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { kind: 'agent' },
       });
@@ -790,11 +864,10 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
         bus: createMockBus(),
@@ -803,7 +876,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { tier: 'known' },
       });
@@ -825,11 +898,10 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
         bus: createMockBus(),
@@ -838,7 +910,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { displayName: 'New Name', tier: 'trusted' },
       });
@@ -865,11 +937,10 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
         bus: createMockBus(),
@@ -878,7 +949,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { tier: 'trusted', kind: 'organization' },
       });
@@ -901,11 +972,10 @@ describe('knowledgeGraphRoutes', () => {
       );
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: { query: vi.fn() } as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
         bus: createMockBus(),
@@ -914,7 +984,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { kind: 'person' },
       });
@@ -925,24 +995,22 @@ describe('knowledgeGraphRoutes', () => {
     });
   });
 
-  describe('POST /api/kg/contacts — tier/kind validation', () => {
+  describe('POST /api/contacts — tier/kind validation', () => {
     it('rejects an invalid tier value with 400', async () => {
       const contactService = createContactService();
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
-        bus: createMockBus(),
-        eventRouter: createMockEventRouter(),
+        include: ['contacts'],
       });
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/contacts',
+        url: '/api/contacts',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { displayName: 'Test', tier: 'superuser' },
       });
@@ -956,11 +1024,10 @@ describe('knowledgeGraphRoutes', () => {
     it('rejects tier="principal" in POST (structural guard)', async () => {
       const contactService = createContactService();
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
         bus: createMockBus(),
@@ -969,7 +1036,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/contacts',
+        url: '/api/contacts',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { displayName: 'Test', tier: 'principal' },
       });
@@ -980,21 +1047,19 @@ describe('knowledgeGraphRoutes', () => {
     });
   });
 
-  describe('POST /api/kg/tasks — principal lineage (#1127)', () => {
+  describe('POST /api/tasks — principal lineage (#1127)', () => {
     // Helper: register the routes with a contactService stub and return both so tests can
     // inspect findContactBySystemRole and the INSERT params.
     async function setupTasksApp(contactService: ContactService) {
       const app = Fastify();
       const logger = createLogger();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool,
         logger,
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
-        bus: createMockBus(),
-        eventRouter: createMockEventRouter(),
+        include: ['tasks'],
       });
       return { app, logger };
     }
@@ -1012,7 +1077,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/tasks',
+        url: '/api/tasks',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: validPayload,
       });
@@ -1050,7 +1115,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/tasks',
+        url: '/api/tasks',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: validPayload,
       });
@@ -1078,7 +1143,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/tasks',
+        url: '/api/tasks',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { ...validPayload, sourceAgentId: 'health-service' },
       });
@@ -1104,7 +1169,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/tasks',
+        url: '/api/tasks',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { ...validPayload, sourceAgentId: name },
       });
@@ -1130,7 +1195,7 @@ describe('knowledgeGraphRoutes', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/tasks',
+        url: '/api/tasks',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { ...validPayload, sourceAgentId: name },
       });

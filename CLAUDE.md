@@ -371,6 +371,8 @@ All three steps below happen *before* cutting the release, while there is still 
 
 Bring the docs in line with what actually shipped this batch. Do this first, so the security gate below scans the final pre-release state.
 
+- **Temporary (#872):** if `src/channels/http/routes/legacy-kg-aliases.ts` still exists **and the #872 CHANGELOG entry already sits under a released version heading**, open a follow-up to delete it (and its registration + tests) — one tagged release of stale-tab coverage is enough. Drop this bullet when that lands.
+
 - **`docs/specs/`** — update the architecture specs so they describe the system as it now behaves. New capability shipped → its spec reflects it; behavior changed → the affected spec is corrected.
 - **`docs/wip/`** — prune it. Remove artifacts whose work has shipped and been folded into `docs/specs/` (or is otherwise complete). Leave anything still in progress untouched.
 - **`docs/dev/`** — update the how-to guides (`adding-a-tool`, `adding-an-agent`, `configuration`, `setup`, etc.) wherever this release changed the steps they describe.

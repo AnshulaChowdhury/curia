@@ -109,6 +109,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 - **agent.task / llm.call / llm.error / LLMStreamEvent** — **public API:** `turnDeadlineAt`, `reasoningWatchdog`, `request_started`, `reasoning_delta` and `output_started` added. (#2371)
 - **LLM calls** — agent and infra calls on Anthropic and OpenRouter now stream internally. (#2371)
+- **Console API paths** — tasks, contacts, chat and grants move to `/api/*`; old tabs work for one release. (#872)
 - **ceo-inbox and calendar standing rules** — live in pinned `/shared/` documents, past the 2000-character cap, edited per rule. (#2339)
 - **meeting-debrief settings** — `debrief/config` arrives through `pinned_context`; no config-store read each run. (#2339)
 - **Principal-only sends** — a message to the principal alone skips autonomy gates A and B (spec 14). (#2337)

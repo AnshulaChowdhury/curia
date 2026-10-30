@@ -1,5 +1,5 @@
 // Unit tests for EventRouter.waitForResponse — the publish/wait primitive behind
-// POST /api/messages and POST /api/kg/chat/messages.
+// POST /api/messages and POST /api/chat/messages.
 //
 // Regression coverage for #983: a chat POST whose client disconnects or is
 // superseded before the agent responds must NOT produce an unhandledRejection

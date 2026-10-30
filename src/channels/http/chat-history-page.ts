@@ -41,7 +41,7 @@ export interface FetchChatHistoryPageOptions {
 }
 
 /**
- * Display-layer filters for `GET /api/kg/chat/history`.
+ * Display-layer filters for `GET /api/chat/history`.
  *
  * Adding a new rule that drops or rewrites a chat bubble belongs here.
  * `WorkingMemory.getHistory` applies `rewriteLlmFailureTurns` separately as

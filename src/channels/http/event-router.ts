@@ -68,7 +68,7 @@ export type WaitResult =
 
 /**
  * Canonical client-facing messages for the non-error WaitResult outcomes.
- * Defined here (next to WaitResult) so both the /api/messages and /api/kg/chat
+ * Defined here (next to WaitResult) so both the /api/messages and /api/chat
  * handlers map a given `kind` to identical wording — they used to be free-floating
  * strings on the Error objects and risked drifting apart once moved to the routes.
  */
@@ -77,7 +77,7 @@ export const WAIT_SUPERSEDED_MESSAGE = 'Superseded by a newer request for the sa
 
 /**
  * Map a non-ok {@link WaitResult} to its HTTP status code and client-facing
- * message. Shared by the /api/messages and /api/kg/chat/messages handlers so the
+ * message. Shared by the /api/messages and /api/chat/messages handlers so the
  * status contract can't drift between them — it already did once (rate-limit
  * rejections returned 403 instead of 429 on the KG route). The `never` guard
  * forces any new WaitResult variant to be handled here at compile time.

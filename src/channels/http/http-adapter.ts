@@ -40,6 +40,10 @@ import { antfarmAssetsRoutes } from './routes/antfarm-assets.js';
 import { messageRoutes } from './routes/messages.js';
 import { consoleRoutes } from './routes/console.js';
 import { knowledgeGraphRoutes } from './routes/kg.js';
+import { taskRoutes } from './routes/tasks.js';
+import { contactRoutes } from './routes/contacts.js';
+import { chatRoutes } from './routes/chat.js';
+import { legacyKgAliasRoutes } from './routes/legacy-kg-aliases.js';
 import { documentsRoutes } from './routes/documents.js';
 import { identityRoutes } from './routes/identity.js';
 import { executiveRoutes } from './routes/executive.js';
@@ -158,7 +162,7 @@ export interface HttpAdapterConfig {
   activityFeed?: import('../../activity/activity-service.js').ActivityFeedSource;
   /** Backs the principal home: waiting items, stats, histogram, bullpen (#2340). */
   briefing?: import('../../dashboard/briefing-service.js').BriefingService;
-  /** Status changes on PATCH /api/kg/tasks/:id go through TaskRepo (#2340). */
+  /** Status changes on PATCH /api/tasks/:id go through TaskRepo (#2340). */
   taskRepo?: import('../../db/task-repo.js').TaskRepo;
   /**
    * Telnyx SMS webhook bridge — HttpAdapter mounts POST /api/webhooks/telnyx/sms
@@ -588,29 +592,40 @@ export class HttpAdapter implements Channel {
       });
     }
 
-    // Only register KG routes when the secret is configured — if unset, the routes
-    // don't exist at all (404) rather than leaking a 503 that reveals the feature exists.
+    // Only register console session-authed routes when the secret is configured —
+    // if unset, the routes don't exist at all (404) rather than leaking a 503 that
+    // reveals the feature exists. Tasks/contacts/chat live under /api/* (#872);
+    // /api/kg/* keeps graph primitives only.
     if (webAppBootstrapSecret) {
       // secureCookies: true only when serving over HTTPS (i.e. APP_ORIGIN is https://).
       // In local dev (no APP_ORIGIN), cookies are set without the Secure flag so they
       // work on plain http://localhost.
       const secureCookies = appOrigin?.startsWith('https://') ?? false;
+      const consoleBase = { pool, logger, webAppBootstrapSecret, sessions };
       await this.app.register(knowledgeGraphRoutes, {
-        pool,
-        logger,
-        webAppBootstrapSecret,
+        ...consoleBase,
         secureCookies,
-        // bus + eventRouter are passed through for the KG chat endpoints
-        // (POST /api/kg/chat/messages, GET /api/kg/chat/stream). The chat routes
-        // reuse the shared EventRouter subscriptions set up above so we don't leak
-        // per-request bus subscribers.
-        bus,
-        eventRouter: this.eventRouter,
         contactService: this.config.contactService,
-        sessions,
         nodeMergeService: this.config.nodeMergeService,
+      });
+      await this.app.register(taskRoutes, {
+        ...consoleBase,
+        contactService: this.config.contactService,
         taskRepo: this.config.taskRepo,
       });
+      await this.app.register(contactRoutes, {
+        ...consoleBase,
+        contactService: this.config.contactService,
+      });
+      // Chat reuses the shared EventRouter subscriptions set up above so we don't
+      // leak per-request bus subscribers (POST /api/chat/messages, GET /api/chat/stream).
+      await this.app.register(chatRoutes, {
+        ...consoleBase,
+        bus,
+        eventRouter: this.eventRouter,
+      });
+      // One-release 308 aliases so a stale console tab keeps working across deploy (#872).
+      await this.app.register(legacyKgAliasRoutes);
     }
 
     // Voice session mint/end routes are always mounted. GET /api/voice/status reports

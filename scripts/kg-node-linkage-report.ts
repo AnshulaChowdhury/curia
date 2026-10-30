@@ -103,7 +103,7 @@ const REPORT_SQL = `
             AND n.archived_at IS NULL
             AND (
               -- Name-based resolution needs no email. An org contact can be created
-              -- with kind='organization' and no address at all (POST /api/kg/contacts
+              -- with kind='organization' and no address at all (POST /api/contacts
               -- takes kind directly), and migration 056 set the kind from the linked
               -- node's type. Gating the whole predicate on primary_email would push
               -- those into arm B and have 085 mint a second node for an organization

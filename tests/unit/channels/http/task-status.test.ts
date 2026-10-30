@@ -1,12 +1,10 @@
-// PATCH /api/kg/tasks/:id status changes go through TaskRepo.updateTask (#2340).
+// PATCH /api/tasks/:id status changes go through TaskRepo.updateTask (#2340).
 
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { knowledgeGraphRoutes } from '../../../../src/channels/http/routes/kg.js';
+import { taskRoutes } from '../../../../src/channels/http/routes/tasks.js';
 import { TaskTerminalStateError } from '../../../../src/db/task-repo.js';
 import type { ContactService } from '../../../../src/contacts/contact-service.js';
-import type { EventBus } from '../../../../src/bus/bus.js';
-import type { EventRouter } from '../../../../src/channels/http/event-router.js';
 import type { Pool } from 'pg';
 import { createSilentLogger } from '../../../../src/logger.js';
 
@@ -55,24 +53,21 @@ afterEach(async () => {
   app = undefined;
 });
 
-describe('PATCH /api/kg/tasks/:id status', () => {
+describe('taskRoutes — PATCH /api/tasks/:id status', () => {
   it('routes a cancel through TaskRepo.updateTask before the field update', async () => {
     const updateTask = vi.fn().mockResolvedValue({ id: TASK_ID, status: 'cancelled' });
     app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await app.register(taskRoutes, {
       pool: pool(),
       logger: createSilentLogger(),
       webAppBootstrapSecret: SECRET,
-      secureCookies: false,
-      bus: {} as EventBus,
-      eventRouter: {} as EventRouter,
       contactService: {} as ContactService,
       sessions: new Map(),
       taskRepo: { updateTask },
     });
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/tasks/${TASK_ID}`,
+      url: `/api/tasks/${TASK_ID}`,
       headers: AUTH,
       payload: { status: 'cancelled' },
     });
@@ -83,20 +78,17 @@ describe('PATCH /api/kg/tasks/:id status', () => {
   it('returns 400 for a typed terminal-state error and 500 for other failures', async () => {
     const updateTask = vi.fn().mockRejectedValue(new TaskTerminalStateError('done'));
     app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await app.register(taskRoutes, {
       pool: pool(),
       logger: createSilentLogger(),
       webAppBootstrapSecret: SECRET,
-      secureCookies: false,
-      bus: {} as EventBus,
-      eventRouter: {} as EventRouter,
       contactService: {} as ContactService,
       sessions: new Map(),
       taskRepo: { updateTask },
     });
     const terminal = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/tasks/${TASK_ID}`,
+      url: `/api/tasks/${TASK_ID}`,
       headers: AUTH,
       payload: { status: 'cancelled' },
     });
@@ -105,7 +97,7 @@ describe('PATCH /api/kg/tasks/:id status', () => {
     updateTask.mockRejectedValue(new Error("Cannot transition task from 'done' — it is a terminal state."));
     const unmatched = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/tasks/${TASK_ID}`,
+      url: `/api/tasks/${TASK_ID}`,
       headers: AUTH,
       payload: { status: 'cancelled' },
     });
@@ -114,19 +106,16 @@ describe('PATCH /api/kg/tasks/:id status', () => {
 
   it('refuses a status change when TaskRepo is not wired', async () => {
     app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await app.register(taskRoutes, {
       pool: pool(),
       logger: createSilentLogger(),
       webAppBootstrapSecret: SECRET,
-      secureCookies: false,
-      bus: {} as EventBus,
-      eventRouter: {} as EventRouter,
       contactService: {} as ContactService,
       sessions: new Map(),
     });
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/tasks/${TASK_ID}`,
+      url: `/api/tasks/${TASK_ID}`,
       headers: AUTH,
       payload: { status: 'done' },
     });
@@ -136,20 +125,17 @@ describe('PATCH /api/kg/tasks/:id status', () => {
   it('requires auth', async () => {
     const updateTask = vi.fn();
     app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await app.register(taskRoutes, {
       pool: pool(),
       logger: createSilentLogger(),
       webAppBootstrapSecret: SECRET,
-      secureCookies: false,
-      bus: {} as EventBus,
-      eventRouter: {} as EventRouter,
       contactService: {} as ContactService,
       sessions: new Map(),
       taskRepo: { updateTask },
     });
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/tasks/${TASK_ID}`,
+      url: `/api/tasks/${TASK_ID}`,
       headers: { 'content-type': 'application/json' },
       payload: { status: 'cancelled' },
     });

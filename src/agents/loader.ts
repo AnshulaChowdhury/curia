@@ -109,7 +109,7 @@ export function loadAgentConfig(filePath: string): AgentYamlConfig {
   }
 
   // Same character class as tasks.source_agent_id (#1882) — reject at load so the
-  // roster and POST /api/kg/tasks cannot drift apart. Guard config itself: yaml.load
+  // roster and POST /api/tasks cannot drift apart. Guard config itself: yaml.load
   // can return null/non-object for empty or scalar documents.
   const name = config?.name;
   if (typeof name !== 'string' || !isAgentName(name)) {

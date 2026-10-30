@@ -95,9 +95,9 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
 
   useEffect(() => {
     const controller = new AbortController();
-    apiFetch('/api/kg/contacts', { signal: controller.signal })
+    apiFetch('/api/contacts', { signal: controller.signal })
       .then(r => {
-        if (!r.ok) throw new Error(`/api/kg/contacts returned ${r.status}`);
+        if (!r.ok) throw new Error(`/api/contacts returned ${r.status}`);
         return r.json();
       })
       .then((data: { contacts: Array<{ displayName: string; systemRole?: string | null }> }) => {
