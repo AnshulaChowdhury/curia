@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **ADR-057** — retire bearer `/api/messages`; console chat on `/api/chat` is the only ingress. (#999)
 - **`doc-write` `section-delete`** — removes one `##` section and its heading; a missing section errors. (#2339)
 - **`migrate:standing-rules`** — one-off script moves inbox and calendar rule arrays into `/shared/` documents. (#2339)
 - **Scenario `seed.pinned`** — cases seed the documents and settings agents read through `pinned_context`. (#2339)
@@ -199,6 +200,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Removed
 
+- **`/api/messages`** — **public API:** bearer message and SSE routes removed; console chat is `/api/chat`. (#999)
 - **Decision posture** — gone from identity, wizard and console; the autonomy level decides act-vs-ask. (#2143)
 - **`weakExpiredWeight`** — scoring setting retired and ignored if set; safe to delete from configs. (#2159)
 - **`kg_memory` setup task** — dropped; the setup wizard cannot run until entity memory is on. (#2023)

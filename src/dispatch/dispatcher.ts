@@ -2338,10 +2338,10 @@ export class Dispatcher {
   }
 
   /**
-   * Settle HTTP/EventRouter waiters when Gate C withholds the real reply (#1733).
-   * POST /api/messages blocks on outbound.message; without a terminal event the
-   * caller hangs for RESPONSE_TIMEOUT_MS. Email/Signal escalate stays silent —
-   * those adapters do not wait on a request/response cycle.
+   * Settle an EventRouter waiter when Gate C withholds the real reply (#1733).
+   * Only channel `http` gets this outbound. The blocking POST /api/messages route
+   * that used to wait was removed (ADR-057); nothing registers that waiter now.
+   * Email/Signal escalate stays silent — those adapters do not wait.
    */
   private async publishRelayGateCPendingStatus(args: {
     conversationId: string;
