@@ -25,6 +25,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **ADR-056** — `pinned_context`: declaration is write permission; `/shared/` is durable by prefix. (#2338)
 - **Reasoning watchdog** — runaway reasoning stops early and gets one forced attempt, on every streaming provider. (#2371)
 - **Provider guide** — `docs/dev/adding-an-llm-provider.md` documents the provider and stream contract. (#2371)
+- **Onboarding journey design** — WIP doc: three-channel setup and voice-first onboarding that ends at confirmed priorities.
+- **Onboarding HAWD model** — WIP doc: onboarding modelled from the principal's side, with gaps and glossary.
 - **Agenda-driven calls** — principal calls start from parked agendas; Curia can switch agendas mid-call. (#2322)
 - **Meeting minutes** — calls with an agenda produce a transcript, minutes and one follow-up report. (#2322)
 - **Bus events** — `minutes.ready` and `minutes.pipeline_failed`, system-only. (#2322)
