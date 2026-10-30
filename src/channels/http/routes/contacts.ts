@@ -16,7 +16,7 @@ import {
   StructuralContactMergeError,
 } from '../../../contacts/types.js';
 import { LINKABLE_CHANNEL_IDENTITY_SET } from '../../../contacts/linkable-channels.js';
-import { assertSecret, type SessionStore } from '../session-auth.js';
+import { assertSecret, CONSOLE_RATE, type SessionStore } from '../session-auth.js';
 import { isUuid } from '../../../util/uuid.js';
 
 export interface ContactRouteOptions {
@@ -32,9 +32,6 @@ export async function contactRoutes(
   options: ContactRouteOptions,
 ): Promise<void> {
   const { pool, logger, webAppBootstrapSecret, sessions, contactService } = options;
-
-  // Rate limit for console session-authed APIs: 60/min per IP.
-  const CONSOLE_RATE = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
 
   // tier/kind selectable via the API — 'principal' and kind∈{principal,agent} are structural-only.
   const validContactTiers: ContactTier[] = ['blocked', 'unknown', 'known', 'trusted'];

@@ -7,7 +7,7 @@
 import type { FastifyInstance } from 'fastify';
 import type { Logger } from '../../../logger.js';
 import { isUuid } from '../../../util/uuid.js';
-import { assertSecret, type SessionStore } from '../session-auth.js';
+import { assertSecret, CONSOLE_RATE, type SessionStore } from '../session-auth.js';
 import type { BriefingService } from '../../../dashboard/briefing-service.js';
 
 export interface DashboardRouteOptions {
@@ -16,8 +16,6 @@ export interface DashboardRouteOptions {
   sessions: SessionStore;
   logger: Logger;
 }
-
-const RATE = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
 
 function shownFlag(body: unknown): boolean {
   return typeof body === 'object' && body !== null && (body as { shown?: unknown }).shown === true;
@@ -32,7 +30,7 @@ function parseApprovalId(raw: string): number | null {
 export async function dashboardRoutes(app: FastifyInstance, options: DashboardRouteOptions): Promise<void> {
   const { briefing, webAppBootstrapSecret, sessions, logger } = options;
 
-  app.get('/api/dashboard/waiting', RATE, async (request, reply) => {
+  app.get('/api/dashboard/waiting', CONSOLE_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     try {
       return reply.send(await briefing.waiting());
@@ -42,7 +40,7 @@ export async function dashboardRoutes(app: FastifyInstance, options: DashboardRo
     }
   });
 
-  app.get('/api/dashboard/stats', RATE, async (request, reply) => {
+  app.get('/api/dashboard/stats', CONSOLE_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     try {
       return reply.send(await briefing.stats());
@@ -52,7 +50,7 @@ export async function dashboardRoutes(app: FastifyInstance, options: DashboardRo
     }
   });
 
-  app.get('/api/dashboard/histogram', RATE, async (request, reply) => {
+  app.get('/api/dashboard/histogram', CONSOLE_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     try {
       return reply.send(await briefing.histogram());
@@ -62,7 +60,7 @@ export async function dashboardRoutes(app: FastifyInstance, options: DashboardRo
     }
   });
 
-  app.get('/api/dashboard/bullpen', RATE, async (request, reply) => {
+  app.get('/api/dashboard/bullpen', CONSOLE_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     try {
       return reply.send(await briefing.bullpen());
@@ -72,17 +70,17 @@ export async function dashboardRoutes(app: FastifyInstance, options: DashboardRo
     }
   });
 
-  app.post('/api/dashboard/tasks/:id/done', RATE, async (request, reply) => {
+  app.post('/api/dashboard/tasks/:id/done', CONSOLE_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     return taskStatus(request, reply, 'done');
   });
 
-  app.post('/api/dashboard/tasks/:id/cancel', RATE, async (request, reply) => {
+  app.post('/api/dashboard/tasks/:id/cancel', CONSOLE_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     return taskStatus(request, reply, 'cancelled');
   });
 
-  app.get('/api/dashboard/approvals/:id/preview', RATE, async (request, reply) => {
+  app.get('/api/dashboard/approvals/:id/preview', CONSOLE_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     const { id: raw } = request.params as { id: string };
     const id = parseApprovalId(raw);
@@ -101,12 +99,12 @@ export async function dashboardRoutes(app: FastifyInstance, options: DashboardRo
     }
   });
 
-  app.post('/api/dashboard/approvals/:id/approve', RATE, async (request, reply) => {
+  app.post('/api/dashboard/approvals/:id/approve', CONSOLE_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     return approval(request, reply, 'approve');
   });
 
-  app.post('/api/dashboard/approvals/:id/deny', RATE, async (request, reply) => {
+  app.post('/api/dashboard/approvals/:id/deny', CONSOLE_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     return approval(request, reply, 'deny');
   });

@@ -53,7 +53,7 @@ afterEach(async () => {
   app = undefined;
 });
 
-describe('PATCH /api/tasks/:id status', () => {
+describe('taskRoutes — PATCH /api/tasks/:id status', () => {
   it('routes a cancel through TaskRepo.updateTask before the field update', async () => {
     const updateTask = vi.fn().mockResolvedValue({ id: TASK_ID, status: 'cancelled' });
     app = Fastify();

@@ -43,6 +43,7 @@ import { knowledgeGraphRoutes } from './routes/kg.js';
 import { taskRoutes } from './routes/tasks.js';
 import { contactRoutes } from './routes/contacts.js';
 import { chatRoutes } from './routes/chat.js';
+import { legacyKgAliasRoutes } from './routes/legacy-kg-aliases.js';
 import { documentsRoutes } from './routes/documents.js';
 import { identityRoutes } from './routes/identity.js';
 import { executiveRoutes } from './routes/executive.js';
@@ -600,40 +601,31 @@ export class HttpAdapter implements Channel {
       // In local dev (no APP_ORIGIN), cookies are set without the Secure flag so they
       // work on plain http://localhost.
       const secureCookies = appOrigin?.startsWith('https://') ?? false;
+      const consoleBase = { pool, logger, webAppBootstrapSecret, sessions };
       await this.app.register(knowledgeGraphRoutes, {
-        pool,
-        logger,
-        webAppBootstrapSecret,
+        ...consoleBase,
         secureCookies,
         contactService: this.config.contactService,
-        sessions,
         nodeMergeService: this.config.nodeMergeService,
       });
       await this.app.register(taskRoutes, {
-        pool,
-        logger,
-        webAppBootstrapSecret,
-        sessions,
+        ...consoleBase,
         contactService: this.config.contactService,
         taskRepo: this.config.taskRepo,
       });
       await this.app.register(contactRoutes, {
-        pool,
-        logger,
-        webAppBootstrapSecret,
-        sessions,
+        ...consoleBase,
         contactService: this.config.contactService,
       });
       // Chat reuses the shared EventRouter subscriptions set up above so we don't
       // leak per-request bus subscribers (POST /api/chat/messages, GET /api/chat/stream).
       await this.app.register(chatRoutes, {
-        pool,
-        logger,
-        webAppBootstrapSecret,
-        sessions,
+        ...consoleBase,
         bus,
         eventRouter: this.eventRouter,
       });
+      // One-release 308 aliases so a stale console tab keeps working across deploy (#872).
+      await this.app.register(legacyKgAliasRoutes);
     }
 
     // Voice session mint/end routes are always mounted. GET /api/voice/status reports

@@ -11,7 +11,7 @@ import type { EventBus } from '../../../bus/bus.js';
 import { createInboundMessage } from '../../../bus/events.js';
 import type { Logger } from '../../../logger.js';
 import type { EventRouter } from '../event-router.js';
-import { assertSecret, type SessionStore } from '../session-auth.js';
+import { assertSecret, CONSOLE_RATE, type SessionStore } from '../session-auth.js';
 import { markdownToHtml } from '../../../format/markdown-to-html.js';
 import { fetchChatHistoryPage } from '../chat-history-page.js';
 
@@ -39,17 +39,14 @@ export async function chatRoutes(
 ): Promise<void> {
   const { pool, logger, webAppBootstrapSecret, sessions, bus, eventRouter } = options;
 
-  // Rate limit for console session-authed APIs: 60/min per IP.
-  const CONSOLE_RATE = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
-
   // ── Chat endpoints ──────────────────────────────────────────────────────
   //
-  // The chat endpoints let the KG web app send messages to the agent layer
+  // The chat endpoints let the web console send messages to the agent layer
   // and stream responses back. They mirror the pattern of src/channels/http/routes/messages.ts
   // (POST /api/messages + GET /api/messages/stream) but use the 'web' channel so
   // contact-resolver auto-attributes the sender to the principal (the bootstrap secret is principal-only).
   //
-  // Auth: both routes enforce the same assertSecret guard as the KG read APIs — they accept
+  // Auth: the same assertSecret guard as other console routes — they accept
   // either a valid curia_session cookie (browser flow) or x-web-bootstrap-secret header
   // (programmatic flow, e.g. tests and scripts).
 
@@ -101,7 +98,7 @@ export async function chatRoutes(
   });
 
   /**
-   * GET /api/chat/stream — SSE stream of agent events for the KG web app.
+   * GET /api/chat/stream — SSE stream of agent events for the web console.
    *
    * Streams outbound.message, tool.invoke, and tool.result events from the EventRouter,
    * optionally filtered by ?conversationId=xxx. Mirrors GET /api/messages/stream.

@@ -9,6 +9,7 @@ import { knowledgeGraphRoutes } from '../../../../src/channels/http/routes/kg.js
 import { taskRoutes } from '../../../../src/channels/http/routes/tasks.js';
 import { contactRoutes } from '../../../../src/channels/http/routes/contacts.js';
 import { chatRoutes } from '../../../../src/channels/http/routes/chat.js';
+import { legacyKgAliasRoutes } from '../../../../src/channels/http/routes/legacy-kg-aliases.js';
 import { LLM_FAILURE_TURN_CONTENT, LLM_FAILURE_USER_MESSAGE } from '../../../../src/memory/llm-failure-turn.js';
 import { VOICE_GREETING_USER_MESSAGE } from '../../../../src/channels/voice/greeting.js';
 import type { EventBus } from '../../../../src/bus/bus.js';
@@ -86,48 +87,45 @@ async function registerConsoleRoutes(
     bus?: EventBus;
     eventRouter?: EventRouter;
     taskRepo?: { updateTask: ReturnType<typeof vi.fn> };
-    include?: Array<'kg' | 'tasks' | 'contacts' | 'chat'>;
+    include?: Array<'kg' | 'tasks' | 'contacts' | 'chat' | 'aliases'>;
   },
 ): Promise<void> {
-  const include = new Set(opts.include ?? ['kg', 'tasks', 'contacts', 'chat']);
+  const include = new Set(opts.include ?? ['kg', 'tasks', 'contacts', 'chat', 'aliases']);
+  const consoleBase = {
+    pool: opts.pool,
+    logger: opts.logger,
+    webAppBootstrapSecret: opts.webAppBootstrapSecret,
+    sessions: opts.sessions,
+  };
   if (include.has('kg')) {
     await app.register(knowledgeGraphRoutes, {
-      pool: opts.pool,
-      logger: opts.logger,
-      webAppBootstrapSecret: opts.webAppBootstrapSecret,
+      ...consoleBase,
       secureCookies: false,
-      sessions: opts.sessions,
       contactService: opts.contactService,
     });
   }
   if (include.has('tasks')) {
     await app.register(taskRoutes, {
-      pool: opts.pool,
-      logger: opts.logger,
-      webAppBootstrapSecret: opts.webAppBootstrapSecret,
-      sessions: opts.sessions,
+      ...consoleBase,
       contactService: opts.contactService,
       taskRepo: opts.taskRepo,
     });
   }
   if (include.has('contacts')) {
     await app.register(contactRoutes, {
-      pool: opts.pool,
-      logger: opts.logger,
-      webAppBootstrapSecret: opts.webAppBootstrapSecret,
-      sessions: opts.sessions,
+      ...consoleBase,
       contactService: opts.contactService,
     });
   }
   if (include.has('chat')) {
     await app.register(chatRoutes, {
-      pool: opts.pool,
-      logger: opts.logger,
-      webAppBootstrapSecret: opts.webAppBootstrapSecret,
-      sessions: opts.sessions,
+      ...consoleBase,
       bus: opts.bus ?? createMockBus(),
       eventRouter: opts.eventRouter ?? createMockEventRouter(),
     });
+  }
+  if (include.has('aliases')) {
+    await app.register(legacyKgAliasRoutes);
   }
 }
 
@@ -165,7 +163,7 @@ function makeContact(overrides: Record<string, unknown> = {}) {
   };
 }
 
-describe('knowledgeGraphRoutes', () => {
+describe('console routes (kg / tasks / contacts / chat)', () => {
   const pool = {
     query: vi.fn(),
   } as unknown as Pool;
@@ -175,7 +173,7 @@ describe('knowledgeGraphRoutes', () => {
   });
 
 
-  it('returns 404 for legacy /api/kg/{tasks,contacts,chat} paths (#872)', async () => {
+  it('308-redirects legacy /api/kg/{tasks,contacts,chat} paths to /api/* (#872)', async () => {
     const app = Fastify();
     await registerConsoleRoutes(app, {
       pool,
@@ -186,17 +184,24 @@ describe('knowledgeGraphRoutes', () => {
       bus: createMockBus(),
       eventRouter: createMockEventRouter(),
     });
-    const headers = { 'x-web-bootstrap-secret': 'secret-1' };
-    for (const url of [
-      '/api/kg/tasks',
-      '/api/kg/contacts',
-      '/api/kg/chat/messages',
-      '/api/kg/chat/stream',
-      '/api/kg/chat/history?conversationId=c1',
-      '/api/kg/grant-recommendations',
-    ]) {
-      const res = await app.inject({ method: 'GET', url, headers });
-      expect(res.statusCode).toBe(404);
+    // Catch-all like the console SPA — aliases must win over it for both GET and POST.
+    app.get('/*', async () => ({ spa: true }));
+    app.post('/*', async () => ({ spa: true }));
+
+    const cases: Array<{ method: 'GET' | 'POST' | 'PATCH'; url: string; location: string }> = [
+      { method: 'GET', url: '/api/kg/tasks', location: '/api/tasks' },
+      { method: 'POST', url: '/api/kg/tasks', location: '/api/tasks' },
+      { method: 'PATCH', url: '/api/kg/tasks/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', location: '/api/tasks/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+      { method: 'GET', url: '/api/kg/contacts', location: '/api/contacts' },
+      { method: 'POST', url: '/api/kg/chat/messages', location: '/api/chat/messages' },
+      { method: 'GET', url: '/api/kg/chat/stream', location: '/api/chat/stream' },
+      { method: 'GET', url: '/api/kg/chat/history?conversationId=c1', location: '/api/chat/history?conversationId=c1' },
+      { method: 'GET', url: '/api/kg/grant-recommendations', location: '/api/grant-recommendations' },
+    ];
+    for (const { method, url, location } of cases) {
+      const res = await app.inject({ method, url });
+      expect(res.statusCode, `${method} ${url}`).toBe(308);
+      expect(res.headers.location).toBe(location);
     }
     await app.close();
   });
@@ -576,13 +581,13 @@ describe('knowledgeGraphRoutes', () => {
   });
 
   // Regression for CodeQL #98 (js/missing-rate-limiting). GET /api/chat/history
-  // reads from the working_memory table and was the only KG route missing the
-  // KG_RATE (60/min) per-route override — leaving it covered only by the looser
-  // global limit. We register @fastify/rate-limit with a deliberately high global
-  // cap (1000) so the route's own 60/min ceiling is the ONLY thing that can trip a
-  // 429: without the override all 61 requests would pass the limiter and return
-  // 401 at the secret guard; with it, the 61st is rejected by the limiter first.
-  it('rate-limits GET /api/chat/history with the KG per-route cap', async () => {
+  // reads from the working_memory table and must carry the shared CONSOLE_RATE
+  // (60/min) per-route override — leaving it covered only by the looser
+  // global limit would be wrong. We register @fastify/rate-limit with a deliberately
+  // high global cap (1000) so the route's own 60/min ceiling is the ONLY thing that
+  // can trip a 429: without the override all 61 requests would pass the limiter and
+  // return 401 at the secret guard; with it, the 61st is rejected by the limiter first.
+  it('rate-limits GET /api/chat/history with the console per-route cap', async () => {
     const app = Fastify();
     await app.register(rateLimit, { max: 1000, timeWindow: '1 minute' });
     await registerConsoleRoutes(app, {
@@ -612,7 +617,7 @@ describe('knowledgeGraphRoutes', () => {
     // limiter and not some blanket rejection.
     expect(statuses[0]).toBe(401);
     // A 429 within 65 requests can only come from the route's own 60/min override:
-    // the global cap is 1000, so without KG_RATE none of these would be throttled.
+    // the global cap is 1000, so without CONSOLE_RATE none of these would be throttled.
     expect(statuses).toContain(429);
 
     await app.close();

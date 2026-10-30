@@ -176,4 +176,6 @@ agents keep choosing the channel. Code decides only whether the app is reachable
 - **More to keep in sync.** A long-lived SSE stream per open device makes the shared
   SSE-client cross-talk between `/api/messages/stream` and `/api/chat/stream` matter, and
   that is fixed as part of #2341. Proxies must not compress `/api/chat/stream`, so
-  `curia-deploy`'s Caddyfile needs a matching exclusion.
+  `curia-deploy`'s Caddyfile needs a matching exclusion — today
+  `@not_sse { not path /api/messages/stream* }` must also exclude
+  `/api/chat/stream*` (same gap previously existed for `/api/kg/chat/stream`).

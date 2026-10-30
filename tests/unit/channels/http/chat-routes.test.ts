@@ -1,4 +1,4 @@
-// Unit tests for the KG web app chat endpoints:
+// Unit tests for the console chat endpoints:
 //   POST /api/chat/messages — publish a message and ack 202 (reply arrives over SSE)
 //   GET  /api/chat/stream  — SSE event stream
 //
@@ -50,7 +50,7 @@ function createMockBus(): EventBus {
   } as unknown as EventBus;
 }
 
-describe('KG chat routes', () => {
+describe('chatRoutes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -248,7 +248,7 @@ describe('KG chat routes', () => {
   });
 });
 
-describe('KG web UI shell', () => {
+describe('console shell routes', () => {
   it('GET /old — chatRoutes no longer defines this route (returns 404 in isolation; the SPA catch-all is not registered here)', async () => {
     const app = Fastify();
     await app.register(cookie);

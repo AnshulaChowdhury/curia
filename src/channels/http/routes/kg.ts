@@ -11,7 +11,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import type { Logger } from '../../../logger.js';
 import type { ContactService } from '../../../contacts/contact-service.js';
-import { assertSecret, compareSecrets, hashToken, type SessionStore } from '../session-auth.js';
+import { assertSecret, compareSecrets, CONSOLE_RATE, hashToken, type SessionStore } from '../session-auth.js';
 import { resolveConsoleOriginator } from '../console-originator.js';
 import { isUuid } from '../../../util/uuid.js';
 import type { NodeMergeApi } from '../../../kg-merge/service.js';
@@ -152,9 +152,8 @@ export async function knowledgeGraphRoutes(
     return reply.status(200).send({ ok: true });
   });
 
-  // Rate limit for KG API endpoints: 60/min per IP allows interactive browsing
-  // while blocking DoS-level query floods against the database.
-  const KG_RATE = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
+  // Rate limit for KG API endpoints: shared console 60/min per IP.
+  const KG_RATE = CONSOLE_RATE;
 
   app.get('/api/kg/nodes', KG_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;

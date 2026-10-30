@@ -63,6 +63,10 @@ describe('bypassesBearerAuth', () => {
     '/api/agents/status',
     '/api/healthz',
     '/api/nonexistent',
+    // Prefixes must not match on a shared leading substring (#872 review).
+    '/api/chat-export',
+    '/api/tasks-summary',
+    '/api/contacts.csv',
     '/*',
   ])('enforces bearer auth on %s', (url) => {
     expect(bypassesBearerAuth(url)).toBe(false);

@@ -7,7 +7,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import type { Logger } from '../../../logger.js';
 import type { ContactService } from '../../../contacts/contact-service.js';
-import { assertSecret, type SessionStore } from '../session-auth.js';
+import { assertSecret, CONSOLE_RATE, type SessionStore } from '../session-auth.js';
 import { resolveConsoleOriginator } from '../console-originator.js';
 import { AGENT_NAME_RULE, isAgentName } from '../../../agents/agent-name.js';
 import { isUuid } from '../../../util/uuid.js';
@@ -32,9 +32,6 @@ export async function taskRoutes(
   options: TaskRouteOptions,
 ): Promise<void> {
   const { pool, logger, webAppBootstrapSecret, sessions, contactService, taskRepo } = options;
-
-  // Rate limit for console session-authed APIs: 60/min per IP.
-  const CONSOLE_RATE = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
 
   const validTaskStatuses = [
     // Legacy values used by the scheduler before task skills shipped

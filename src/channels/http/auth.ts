@@ -75,7 +75,14 @@ const SELF_AUTHED_API_PREFIXES = [
   '/api/webhooks/telnyx',
 ];
 
-/** True when the registered route URL skips bearer enforcement (see SELF_AUTHED_API_PREFIXES). */
+/**
+ * True when the registered route URL skips bearer enforcement (see SELF_AUTHED_API_PREFIXES).
+ * Match on a path-segment boundary so `/api/chat` does not exempt `/api/chat-export`
+ * (and likewise for tasks/contacts/… — #872 review).
+ */
 export function bypassesBearerAuth(routeUrl: string): boolean {
-  return routeUrl === '/api/health' || SELF_AUTHED_API_PREFIXES.some(p => routeUrl.startsWith(p));
+  if (routeUrl === '/api/health') return true;
+  return SELF_AUTHED_API_PREFIXES.some(
+    (p) => routeUrl === p || routeUrl.startsWith(`${p}/`),
+  );
 }
