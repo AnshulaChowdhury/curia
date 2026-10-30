@@ -117,8 +117,9 @@ The dispatcher translates every `agent.response` with a routing entry into `outb
    and creates a pending approval whose approve path re-invokes the `dispatcher-relay` skill.
    If a reply skill on the same turn already Gate C–escalated, the relay is suppressed without
    a second approval (matched via `authorization.decision` `taskEventId` or `conversationId`).
-   HTTP/`EventRouter` waiters receive a terminal pending-approval status outbound so
-   `POST /api/messages` does not hang for the full response timeout.
+   Channel `http` still receives a terminal pending-approval status outbound so a
+   waiter cannot hang. No route registers that waiter after `POST /api/messages`
+   was removed (ADR-057).
 
 **A note for the principal** (prompt trim PR 5). On a turn answering someone other than the
 principal, the coordinator puts what the principal needs to hear in a

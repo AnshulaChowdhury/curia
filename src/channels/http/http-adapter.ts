@@ -1,12 +1,10 @@
 // http-adapter.ts — Fastify-based HTTP channel adapter.
 //
-// Provides REST + SSE endpoints for external clients (dashboards, mobile apps,
-// integrations). Uses the EventRouter (shared subscriber pattern) to avoid
-// per-request bus subscriber leaks.
+// Serves the console, health, and session-authenticated APIs. Console chat is
+// /api/chat/* (channel `web`). The bearer message routes (/api/messages) were
+// removed (ADR-057). Uses the EventRouter so SSE does not leak bus subscribers.
 //
-// Endpoints:
-//   POST   /api/messages        — send a message, get response
-//   GET    /api/messages/stream — SSE real-time event stream
+// Endpoints called out here:
 //   GET    /api/health          — system health check
 //   GET    /api/agents/status   — agent registry snapshot
 //
@@ -37,7 +35,6 @@ import { activityRoutes } from './routes/activity.js';
 import { dashboardRoutes } from './routes/dashboard.js';
 import { antfarmStaticRoutes } from './routes/antfarm-static.js';
 import { antfarmAssetsRoutes } from './routes/antfarm-assets.js';
-import { messageRoutes } from './routes/messages.js';
 import { consoleRoutes } from './routes/console.js';
 import { knowledgeGraphRoutes } from './routes/kg.js';
 import { taskRoutes } from './routes/tasks.js';
@@ -361,13 +358,11 @@ export class HttpAdapter implements Channel {
     }, 60_000);
     pruneInterval.unref();
 
-    // Register routes — message routes receive the eventRouter, not raw bus
     await this.app.register(healthRoutes, {
       healthService: this.config.healthService ?? createFallbackHealthService(pool, logger),
       logger,
     });
     await this.app.register(agentRoutes, { agentRegistry });
-    await this.app.register(messageRoutes, { bus, logger, eventRouter: this.eventRouter });
 
     if (this.config.schedulerService) {
       // Job routes use session-cookie auth (same as KG routes) so the dashboard can

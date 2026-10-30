@@ -59,7 +59,6 @@ describe('bypassesBearerAuth', () => {
   });
 
   it.each([
-    '/api/messages',
     '/api/agents/status',
     '/api/healthz',
     '/api/nonexistent',

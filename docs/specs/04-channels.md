@@ -144,12 +144,10 @@ Interactive terminal for local dev and testing. Reads from stdin, writes to stdo
 - **Health:** three probes cover distinct failure modes — `signal` (Signal messaging RPC socket), `voice` (LiveKit management `listRooms()`), and `signal_voice` (a **connect** to the shared PulseAudio socket, #1760). See [spec 08](08-operations.md#health--monitoring).
 - **Scope:** PSTN/SIP remains a deferred transport that should reuse `VoiceRuntime`.
 
-### HTTP API
-- REST endpoints for programmatic access
-- SSE (Server-Sent Events) for real-time response streaming
-- Token-based authentication
-- This is the interface a future web dashboard or mobile app would use
-- **Conversation ID:** provided by the client or generated server-side
+### HTTP
+The always-on Fastify adapter. It serves the console, `GET /api/health`, bearer-gated operator routes such as `GET /api/agents/status`, and the session-authenticated console APIs. It is not itself a chat ingress.
+- Console chat is `POST /api/chat/messages`, `GET /api/chat/stream`, and `GET /api/chat/history`, on the `web` channel. Auth is the session cookie or `x-web-bootstrap-secret`. The sender is the principal.
+- `POST /api/messages` and `GET /api/messages/stream` were removed ([ADR-057](../adr/057-two-http-chat-surfaces.md)). Tests were the only in-repo callers.
 - **Non-toggleable** (`isToggleable: false`): always starts, cannot be disabled — disabling HTTP would lock operators out of the registry API itself.
 
 ---
@@ -180,7 +178,7 @@ Each channel is assigned a trust level that the dispatch layer tags on every inb
 |---|---|---|
 | **CLI** | `high` | Requires SSH/physical access to the host |
 | **Signal** | `high` | Strong identity via phone number + Signal protocol |
-| **HTTP API** | `medium` | Token-authenticated, but tokens can be leaked |
+| **HTTP** | `medium` | Policy remains for a `channelId` of `http`. The bearer message route that published on it was removed (ADR-057). |
 | **Slack** | `medium` | Workspace OAuth / bot token — weaker than Signal (ADR-033) |
 | **SMS** | `medium` | Telnyx office DID — spoofable From, not E2E (ADR-036) |
 | **Voice** | `high` | Console-authenticated principal session; LiveKit media stays off the bus (ADR-037) |
