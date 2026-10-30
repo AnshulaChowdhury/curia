@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **ADR-057** — keep bearer `/api/messages` and session console chat as separate surfaces. (#999)
 - **`doc-write` `section-delete`** — removes one `##` section and its heading; a missing section errors. (#2339)
 - **`migrate:standing-rules`** — one-off script moves inbox and calendar rule arrays into `/shared/` documents. (#2339)
 - **Scenario `seed.pinned`** — cases seed the documents and settings agents read through `pinned_context`. (#2339)

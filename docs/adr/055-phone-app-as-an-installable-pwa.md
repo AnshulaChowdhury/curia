@@ -174,8 +174,9 @@ agents keep choosing the channel. Code decides only whether the app is reachable
 - **Android is unverified.** Phase 0 tested iOS only. Android goes through the manual device
   matrix before the push and voice work ships.
 - **More to keep in sync.** A long-lived SSE stream per open device makes the shared
-  SSE-client cross-talk between `/api/messages/stream` and `/api/chat/stream` matter, and
-  that is fixed as part of #2341. Proxies must not compress `/api/chat/stream`, so
+  SSE-client cross-talk between `/api/messages/stream` and `/api/chat/stream` matter.
+  ADR-057 keeps both streams and splits the clients by channel (#2380); that split is
+  not part of #2341. Proxies must not compress `/api/chat/stream`, so
   `curia-deploy`'s Caddyfile needs a matching exclusion — today
   `@not_sse { not path /api/messages/stream* }` must also exclude
   `/api/chat/stream*` (same gap previously existed for `/api/kg/chat/stream`).
