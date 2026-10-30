@@ -5,7 +5,8 @@
 // the EventRouter registers ONE subscriber per event type at startup and
 // dispatches to registered handlers via Maps and Sets.
 //
-// POST /api/messages registers a pending resolver keyed by conversationId.
+// A synchronous waiter (waitForResponse) is keyed by conversationId. Console
+// chat does not wait: POST /api/chat/messages acks 202 and the reply is SSE.
 // SSE connections register a writer function in a Set.
 // Both are cleaned up when the request completes or the client disconnects.
 
@@ -68,8 +69,8 @@ export type WaitResult =
 
 /**
  * Canonical client-facing messages for the non-error WaitResult outcomes.
- * Defined here (next to WaitResult) so both the /api/messages and /api/chat
- * handlers map a given `kind` to identical wording — they used to be free-floating
+ * Defined here (next to WaitResult) so every waiter maps a given `kind` to the
+ * same wording — they used to be free-floating
  * strings on the Error objects and risked drifting apart once moved to the routes.
  */
 export const WAIT_TIMEOUT_MESSAGE = 'Response timeout — the agent did not respond in time';
@@ -77,9 +78,9 @@ export const WAIT_SUPERSEDED_MESSAGE = 'Superseded by a newer request for the sa
 
 /**
  * Map a non-ok {@link WaitResult} to its HTTP status code and client-facing
- * message. Shared by the /api/messages and /api/chat/messages handlers so the
- * status contract can't drift between them — it already did once (rate-limit
- * rejections returned 403 instead of 429 on the KG route). The `never` guard
+ * message. Shared so the status contract can't drift between waiters. It
+ * already did once: rate-limit rejections returned 403 instead of 429 on the
+ * KG route. The `never` guard
  * forces any new WaitResult variant to be handled here at compile time.
  *
  * Mapping: too-large → 413, rate-limited → 429, other policy rejection → 403,
@@ -152,11 +153,12 @@ export interface AntfarmClient {
  */
 export class EventRouter {
   private logger: Logger;
-  /** Pending POST /api/messages responses, keyed by conversationId */
+  /** Pending synchronous HTTP responses, keyed by conversationId. No production
+   *  route registers one after /api/messages was removed (ADR-057). */
   private pendingResponses = new Map<string, PendingResponse>();
   /** Active SSE connections */
   private sseClients = new Set<SseClient>();
-  /** Ant Farm live-stream clients — separate from messages SSE (no cross-talk). */
+  /** Ant Farm live-stream clients — separate from console chat SSE (no cross-talk). */
   private antfarmClients = new Set<AntfarmClient>();
 
   constructor(logger: Logger) {
@@ -172,15 +174,10 @@ export class EventRouter {
     // outbound.message — dispatches to pending POST resolvers and SSE clients
     bus.subscribe('outbound.message', 'channel', (event: BusEvent) => {
       if (event.type !== 'outbound.message') return;
-      // Handle messages for channels that use synchronous POST/wait (http and web).
-      // Other channels (email, telegram) process replies asynchronously and have no
-      // pending promise waiting here.
+      // http: Gate C still publishes a pending-approval outbound for that channel.
+      // web: console chat. Other channels deliver on their own adapters.
       if (event.payload.channelId !== 'http' && event.payload.channelId !== 'web') return;
-      // @TODO: The sseClients Set is shared across all SSE endpoints. A client connected
-      // to /api/messages/stream with no conversationId filter will receive web-channel
-      // events after this change. Both endpoints require the same bootstrap-secret auth
-      // (contained for now), but the clean fix is to tag SseClient with channelId and
-      // filter in broadcastToSseClients. Track as a follow-up improvement.
+      // Only /api/chat/stream registers clients (ADR-057). /api/messages/stream is gone.
 
       const convId = event.payload.conversationId;
 
@@ -261,9 +258,9 @@ export class EventRouter {
 
       const convId = event.payload.conversationId;
 
-      // HTTP and web channel requests both have synchronous POST promises to reject.
-      // Other channels (email, telegram, etc.) produce rejection events for audit
-      // and SSE but have no synchronous caller waiting on a promise.
+      // Settle a synchronous waiter when one was registered. Console chat does not
+      // register one (ADR-057). Other channels produce rejection events for audit
+      // and SSE and have no waiter.
       if (event.payload.channelId === 'http' || event.payload.channelId === 'web') {
         const pending = this.pendingResponses.get(convId);
         if (pending) {

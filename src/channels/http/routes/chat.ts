@@ -1,8 +1,8 @@
 // chat.ts — console chat messages, SSE stream, and history.
 //
-// Moved off /api/kg/chat/* (#872). Mirrors /api/messages but uses the 'web'
-// channel so contact-resolver attributes the sender to the principal.
-// Auth: session cookie or x-web-bootstrap-secret via assertSecret.
+// Moved off /api/kg/chat/* (#872). Channel `web`, so contact-resolver attributes
+// the sender to the principal. Auth: session cookie or x-web-bootstrap-secret
+// via assertSecret. The bearer /api/messages routes were removed (ADR-057).
 
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
@@ -42,9 +42,8 @@ export async function chatRoutes(
   // ── Chat endpoints ──────────────────────────────────────────────────────
   //
   // The chat endpoints let the web console send messages to the agent layer
-  // and stream responses back. They mirror the pattern of src/channels/http/routes/messages.ts
-  // (POST /api/messages + GET /api/messages/stream) but use the 'web' channel so
-  // contact-resolver auto-attributes the sender to the principal (the bootstrap secret is principal-only).
+  // and stream responses back. They use the 'web' channel so contact-resolver
+  // auto-attributes the sender to the principal (the bootstrap secret is principal-only).
   //
   // Auth: the same assertSecret guard as other console routes — they accept
   // either a valid curia_session cookie (browser flow) or x-web-bootstrap-secret header
@@ -101,7 +100,7 @@ export async function chatRoutes(
    * GET /api/chat/stream — SSE stream of agent events for the web console.
    *
    * Streams outbound.message, tool.invoke, and tool.result events from the EventRouter,
-   * optionally filtered by ?conversationId=xxx. Mirrors GET /api/messages/stream.
+   * optionally filtered by ?conversationId=xxx.
    */
   app.get('/api/chat/stream', CONSOLE_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
