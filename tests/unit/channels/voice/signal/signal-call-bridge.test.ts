@@ -715,6 +715,40 @@ describe('SignalCallBridge', () => {
     expect(rpc.acceptCall).not.toHaveBeenCalled();
   });
 
+  // #2372 review: when ENDED lands mid-resolution and resolution then throws,
+  // the call is already gone — rejecting it only fails with "No active call".
+  // Skip the reject and warn with the ENDED reason, as on the success path.
+  it('does not reject a call that ENDED mid-resolution when resolution then throws, and logs the reason', async () => {
+    let failResolution!: (err: Error) => void;
+    const resolveImpl = async (): Promise<InboundSenderContext> =>
+      new Promise<InboundSenderContext>((_resolve, reject) => {
+        failResolution = reject;
+      });
+    const { logger, warn, error } = stubLogger();
+    const { bridge, rpc } = setup({ resolveImpl, logger });
+    bridge.start();
+    const callId = 97n;
+
+    rpc.emit('callEvent', ringingEvent(callId));
+    rpc.emit('callEvent', endedEvent(callId, { reason: 'InternalFailure' }));
+    await new Promise(resolve => setImmediate(resolve));
+
+    failResolution(new Error('contact resolver DB blip'));
+    await vi.waitFor(() =>
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ callId: callId.toString(), reason: 'InternalFailure' }),
+        expect.stringContaining('ended before it could be answered'),
+      ),
+    );
+    // The resolution failure itself is still reported.
+    expect(error).toHaveBeenCalledWith(
+      expect.objectContaining({ callId: callId.toString() }),
+      expect.stringContaining('Caller resolution threw'),
+    );
+    expect(rpc.rejectCall).not.toHaveBeenCalled();
+    expect(rpc.acceptCall).not.toHaveBeenCalled();
+  });
+
   // I5: acceptCall itself failing (after a successful caller resolution)
   // must also send an explicit reject, for consistency with every other
   // rejection path in handleRingingIncoming.

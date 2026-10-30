@@ -343,19 +343,11 @@ export class SignalCallBridge {
           { err, callId: ev.callId.toString() },
           'Caller resolution threw for an incoming Signal call — rejecting',
         );
+        if (this.endedBeforeAnswer(ev.callId)) return;
         this.fireAndLog(this.config.rpcClient.rejectCall(ev.callId), 'rejectCall', ev.callId);
         return;
       }
-      // signal-cli may already have ended the call while we were resolving.
-      // Accepting (or rejecting) it then only fails with "No active call", and
-      // the real failure is the ENDED reason — surface that instead.
-      if (this.endedWhileRinging.has(ev.callId)) {
-        this.log.warn(
-          { callId: ev.callId.toString(), reason: this.endedWhileRinging.get(ev.callId) },
-          'Signal call ended before it could be answered; not accepting',
-        );
-        return;
-      }
+      if (this.endedBeforeAnswer(ev.callId)) return;
       if (!result.ok) {
         this.fireAndLog(this.config.rpcClient.rejectCall(ev.callId), 'rejectCall', ev.callId);
         this.log.info({ callId: ev.callId.toString(), reason: result.reason }, 'Rejecting incoming Signal call');
@@ -377,6 +369,21 @@ export class SignalCallBridge {
       this.ringing.delete(ev.callId);
       this.endedWhileRinging.delete(ev.callId);
     }
+  }
+
+  /**
+   * True (and warns with the ENDED reason) when signal-cli ended the call while
+   * its RINGING_INCOMING handler was resolving the caller. Accepting or
+   * rejecting it then only fails with "No active call", and the real failure
+   * is the ENDED reason, so callers skip both and surface that instead.
+   */
+  private endedBeforeAnswer(callId: bigint): boolean {
+    if (!this.endedWhileRinging.has(callId)) return false;
+    this.log.warn(
+      { callId: callId.toString(), reason: this.endedWhileRinging.get(callId) },
+      'Signal call ended before it could be answered; not accepting',
+    );
+    return true;
   }
 
   private async handleConnected(ev: SignalCallEvent): Promise<void> {
