@@ -60,10 +60,22 @@ expected_behaviors:
       contains: { section: "Meeting length", content: "30" }
   - id: no_whole_document_rewrite
     weight: critical
-    description: Does not rewrite the whole document, delete a rule, or create a document.
+    description: Does not rewrite the whole document.
     check:
       not_called: [doc-write]
       with: { mode: replace }
+  - id: no_rule_removed
+    weight: critical
+    description: Does not delete a rule.
+    check:
+      not_called: [doc-write]
+      with: { mode: section-delete }
+  - id: no_document_created
+    weight: critical
+    description: Does not create a document over the existing rules.
+    check:
+      not_called: [doc-write]
+      with: { mode: create }
   - id: edit_is_exact
     weight: important
     description: >

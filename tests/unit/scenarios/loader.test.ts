@@ -275,6 +275,24 @@ describe('loadScenarioCase', () => {
     expect(loadScenarioCase(write('none.yaml', VALID)).seed).not.toHaveProperty('pinned');
   });
 
+  it('stores seed.pinned names in the canonical form the reader asks for', () => {
+    const body = VALID.replace('seed:\n', [
+      'seed:',
+      '  pinned:',
+      '    docs:',
+      `      ' /shared/inbox/rules.md': "## Board mail"`,
+      '    configs:',
+      `      ' ceo_inbox / decision_tagging ': 'on'`,
+      `    unavailable: [' /shared/calendar/rules.md', ' debrief / config ']`,
+      '',
+    ].join('\n'));
+    expect(loadScenarioCase(write('padded.yaml', body)).seed.pinned).toEqual({
+      docs: { '/shared/inbox/rules.md': '## Board mail' },
+      configs: { 'ceo_inbox/decision_tagging': 'on' },
+      unavailable: ['/shared/calendar/rules.md', 'debrief/config'],
+    });
+  });
+
   it.each([
     ['a document outside /shared/', 'docs: { /projects/x/rules.md: "x" }', /under \/shared\//],
     ['a key without a namespace', 'configs: { decision_tagging: "x" }', /namespace/],

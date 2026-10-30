@@ -8,7 +8,6 @@ import * as path from 'node:path';
 import * as yaml from 'js-yaml';
 import { hasBacklog, type PrincipalBacklogCounts } from '../../src/agents/prompts/backlog-line.js';
 import { parsePinnedContext } from '../../src/agents/pinned-context.js';
-import { normalizeDocPath } from '../../src/memory/okf.js';
 import { isKnownPiiLabel } from '../../src/pii/scrubber.js';
 import { registrableDomain } from '../../src/verification/domain.js';
 import { hasDatePlaceholders, resolveDatePlaceholders } from '../shared/date-placeholders.js';
@@ -689,18 +688,27 @@ function parsePinned(raw: Raw, file: string): SeedPinned | undefined {
   const docs = values('docs');
   const configs = values('configs');
   const unavailable = strList(block, 'unavailable', file, 'seed.pinned');
-  const docNames = [...docs.map(([name]) => name), ...unavailable.filter(name => name.startsWith('/'))];
-  const configNames = [...configs.map(([name]) => name), ...unavailable.filter(name => !name.startsWith('/'))];
+  // Classify the failing reads by their trimmed text, so ' /shared/a.md' is a document.
+  const isDoc = (name: string): boolean => name.trim().startsWith('/');
+  const failingDocs = unavailable.filter(isDoc);
+  const failingConfigs = unavailable.filter(name => !isDoc(name));
+  const docNames = [...docs.map(([name]) => name), ...failingDocs];
+  const configNames = [...configs.map(([name]) => name), ...failingConfigs];
+  let entries;
   try {
-    parsePinnedContext({ docs: docNames, configs: configNames }, 'scenario seed');
+    entries = parsePinnedContext({ docs: docNames, configs: configNames }, 'scenario seed');
   } catch (err) {
     throw new CaseError(file, `seed.pinned: ${err instanceof Error ? err.message : String(err)}`);
   }
-  // Keyed as the reader asks: a document by its normalized path, a setting as written.
-  const name = (raw: string): string => (raw.startsWith('/') ? normalizeDocPath(raw) : raw);
-  for (const [path, text] of docs) pinned.docs[name(path)] = text;
-  for (const [key, value] of configs) pinned.configs[key] = value;
-  pinned.unavailable = unavailable.map(name);
+  // Store each value under the canonical name validation accepted, which is what the
+  // reader is asked for. parsePinnedContext returns docs first, then configs, each in the
+  // order given, one entry per name (duplicates are refused above).
+  const canonical = entries.map(e => (e.kind === 'doc' ? e.path : `${e.namespace}/${e.key}`));
+  const docCanon = canonical.slice(0, docNames.length);
+  const configCanon = canonical.slice(docNames.length);
+  docs.forEach(([, text], i) => { pinned.docs[docCanon[i]!] = text; });
+  configs.forEach(([, value], i) => { pinned.configs[configCanon[i]!] = value; });
+  pinned.unavailable = [...docCanon.slice(docs.length), ...configCanon.slice(configs.length)];
   return pinned;
 }
 

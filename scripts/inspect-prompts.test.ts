@@ -84,20 +84,21 @@ describe('buildPromptInputsSnapshot', () => {
   });
 
   it('reads every declared pinned_context entry once, through the declaring agent\'s reader (#2339)', async () => {
-    const reads: string[] = [];
-    const reader: PinnedContextReader = {
+    const reads: Array<[reader: string, entry: string]> = [];
+    // A reader per agent, so an entry read through the wrong agent's reader shows up.
+    const readerFor = (agentId: string): PinnedContextReader => ({
       warnChars: 16_000,
       readDoc: async (path) => {
-        reads.push(path);
+        reads.push([agentId, path]);
         return path === '/shared/inbox/rules.md' ? { status: 'live', version: 3, content: '## Board mail' } : null;
       },
       readConfig: async (namespace, key) => {
-        reads.push(`${namespace}/${key}`);
+        reads.push([agentId, `${namespace}/${key}`]);
         return namespace === 'ceo_inbox' ? '{"enabled": true}' : null;
       },
-    };
+    });
     const declaring = (agentId: string, pinnedContext: PinnedContextEntry[]) =>
-      ({ runtimeConfig: { agentId, pinnedContext, pinnedContextReader: reader } }) as unknown as AssembledAgent;
+      ({ runtimeConfig: { agentId, pinnedContext, pinnedContextReader: readerFor(agentId) } }) as unknown as AssembledAgent;
     const agents = [
       declaring('ceo-inbox', [
         { kind: 'doc', path: '/shared/inbox/rules.md' },
@@ -113,7 +114,14 @@ describe('buildPromptInputsSnapshot', () => {
       configs: { 'ceo_inbox/decision_tagging': '{"enabled": true}', 'debrief/config': null },
     });
     expect(Object.keys(snapshot.pinned_context.docs)).toEqual(['/shared/calendar/rules.md', '/shared/inbox/rules.md']);
-    expect(reads.filter(r => r === '/shared/inbox/rules.md')).toHaveLength(1);
+    // Each unique entry is read once, by the first agent that declares it; editor's
+    // duplicate of the inbox rules is not read again.
+    expect(reads).toEqual([
+      ['ceo-inbox', '/shared/inbox/rules.md'],
+      ['ceo-inbox', 'ceo_inbox/decision_tagging'],
+      ['calendar', '/shared/calendar/rules.md'],
+      ['meeting-debrief', 'debrief/config'],
+    ]);
   });
 
   it('fails rather than guess when a pinned read fails (#2339)', async () => {
