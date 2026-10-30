@@ -8,6 +8,7 @@
 
 import type { AgentError } from '../../errors/types.js';
 import type { ReasoningEffort } from './sampling-options.js';
+import type { ReasoningWatchdogRecord } from './reasoning-watchdog.js';
 
 /**
  * Content block types for multi-turn tool-use conversations.
@@ -147,15 +148,20 @@ export interface LLMCallProvenance {
    */
   reasoningBlocksDropped?: number;
   /**
-   * OpenRouter chat() only: requests sent for this call, counting retries.
-   * Absent where the provider does not count them (#1915).
+   * OpenRouter only: requests sent for this call, counting retries (always 1 on
+   * stream(), which does not retry). Absent where the provider does not count them (#1915).
    */
   attempts?: number;
   /**
-   * OpenRouter chat() only: time spent on failed attempts and the backoff after
+   * OpenRouter only: time spent on failed attempts and the backoff after
    * each, so `latencyMs - failedAttemptsMs` is the attempt that succeeded (#1915).
    */
   failedAttemptsMs?: number;
+  /**
+   * Set when the reasoning watchdog stopped the streamed attempt and this
+   * response came from the forced attempt (#2371). Absent otherwise.
+   */
+  reasoningWatchdog?: ReasoningWatchdogRecord;
 }
 
 // Import and re-export ToolDefinition from the canonical location in skills/types.ts
@@ -186,13 +192,34 @@ export interface ToolResult {
 // partial failures gracefully without try/catch boilerplate throughout the agent.
 // Successful variants carry provenance — the runtime uses it to publish llm.call events.
 // Error paths omit provenance: when the API fails there is no response body to extract from.
+// An error can still carry the watchdog record when its forced attempt failed (#2371);
+// the runtime copies it onto llm.error.
 export type LLMResponse =
   | ({ type: 'text'; content: string; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
   | ({ type: 'tool_use'; toolCalls: ToolCall[]; content?: string; reasoningBlocks?: ReasoningContent[]; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
-  | { type: 'error'; error: AgentError; usage?: LLMUsage };
+  | { type: 'error'; error: AgentError; usage?: LLMUsage; reasoningWatchdog?: ReasoningWatchdogRecord };
 
 export type LLMStreamEvent =
+  /**
+   * Emitted exactly once per stream() call, before any other event, carrying the
+   * max_tokens the request actually sent (after the model cap and any thinking
+   * floor). A watcher arms its thresholds from it.
+   */
+  | { type: 'request_started'; maxTokens: number }
+  /**
+   * Emitted at most once, on the first chunk of a tool call, so a watcher knows
+   * output has begun even though tool-call arguments produce no delta event.
+   * Text output signals itself through `text_delta`; a provider need not emit
+   * this for text.
+   */
+  | { type: 'output_started' }
   | { type: 'text_delta'; text: string }
+  /**
+   * One per reasoning delta that carries non-empty readable text (never for
+   * encrypted or omitted thinking). A delta may carry several tokens, so a watcher
+   * estimates tokens from the delta count and the text length, whichever is higher.
+   */
+  | { type: 'reasoning_delta'; text: string }
   | ({ type: 'tool_use'; toolCalls: ToolCall[]; content?: string; reasoningBlocks?: ReasoningContent[]; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
   | ({ type: 'message_end'; content: string; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
   | { type: 'error'; error: AgentError; usage?: LLMUsage };
@@ -200,6 +227,14 @@ export type LLMStreamEvent =
 export interface LLMProvider {
   // Human-readable identifier used in logs and metrics (e.g. 'anthropic', 'openai').
   id: string;
+
+  /**
+   * When `false`, the reasoning watchdog's forced attempt omits the quoted
+   * reasoning: this provider's models refuse having their reasoning echoed back
+   * (Anthropic's `reasoning_extraction` classifier on Sonnet 5.5, 2026-10-29
+   * probe, #2371). Absent or `true` means the reasoning tail is included.
+   */
+  readonly acceptsReasoningInForcedAttempt?: boolean;
 
   // Send a conversation to the model and receive a structured response.
   // `options` is an escape hatch for provider-specific knobs (model name,
@@ -218,6 +253,8 @@ export interface LLMProvider {
    * Stream a conversation turn. Optional — providers that cannot stream omit it.
    * Voice refuses to start when stream is unavailable. Never silently buffer the
    * full reply before first yield when the backend supports true streaming.
+   * Emits `request_started` first (once), `reasoning_delta` per readable reasoning delta,
+   * and `output_started` once on the first tool-call chunk.
    * Honor `options.signal` (AbortSignal) for cancellation (barge-in).
    * Like chat(), should not throw for API failures — yield `{ type: 'error' }` instead.
    * May throw only for programmer errors (e.g. missing model) before the iterable starts,

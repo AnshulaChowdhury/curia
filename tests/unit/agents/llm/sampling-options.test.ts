@@ -1,5 +1,19 @@
 import { describe, it, expect, vi } from 'vitest';
-import { NO_REASONING, parseReasoning, parseTemperature, resolveReasoning, resolveTemperature, sentTemperature } from '../../../../src/agents/llm/sampling-options.js';
+import { NO_REASONING, parseReasoning, parseTemperature, resolveReasoning, resolveStreamMaxRetries, resolveTemperature, sentTemperature } from '../../../../src/agents/llm/sampling-options.js';
+
+describe('resolveStreamMaxRetries', () => {
+  it('returns a non-negative integer as given', () => {
+    expect(resolveStreamMaxRetries({ streamMaxRetries: 0 })).toBe(0);
+    expect(resolveStreamMaxRetries({ streamMaxRetries: 2 })).toBe(2);
+  });
+  it('is undefined when absent or malformed, so the SDK default applies', () => {
+    expect(resolveStreamMaxRetries(undefined)).toBeUndefined();
+    expect(resolveStreamMaxRetries({})).toBeUndefined();
+    expect(resolveStreamMaxRetries({ streamMaxRetries: -1 })).toBeUndefined();
+    expect(resolveStreamMaxRetries({ streamMaxRetries: 1.5 })).toBeUndefined();
+    expect(resolveStreamMaxRetries({ streamMaxRetries: '0' })).toBeUndefined();
+  });
+});
 import { ModelRegistry } from '../../../../src/agents/llm/model-registry.js';
 import { createSilentLogger } from '../../../../src/logger.js';
 import type { Logger } from '../../../../src/logger.js';

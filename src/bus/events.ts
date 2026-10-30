@@ -4,6 +4,7 @@ import type { ContactTier, DedupConfidence, SystemRole, TierElevationReason, Tru
 import type { Sensitivity, NodeType } from '../memory/types.js';
 import type { ActionRisk } from '../skills/types.js';
 import type { ReasoningEffort } from '../agents/llm/sampling-options.js';
+import type { ReasoningWatchdogRecord } from '../agents/llm/reasoning-watchdog.js';
 
 // -- Base event shape --
 // Every event on the bus shares these fields; parentEventId forms the causal chain.
@@ -78,6 +79,14 @@ export interface AgentTaskPayload {
    *  mislabelled human turn would drop its conversation from the shared-conversation check
    *  and leak that person's words into another contact's recall. */
   syntheticTurn?: boolean;
+  /** When this turn's caller will stop waiting, epoch ms (#2371). Like `liveTurn`, a DISTINCT
+   *  top-level field rather than a `metadata` key, so a skill forwarding the metadata bag
+   *  cannot copy a stale deadline into another task. Set by the `delegate` skill (dispatch time
+   *  plus the resolved wait) and by the scheduler (fire time plus the slot timeout). The runtime
+   *  hands it to the LLM call as `options.deadlineAt`, where the reasoning watchdog positions
+   *  its time trigger against it. It never cancels the turn; turns stay non-cancellable.
+   *  Absent means no deadline is known. */
+  turnDeadlineAt?: number;
   /** Resolved sender context from the contact resolver. Undefined if contacts not configured. */
   senderContext?: import('../contacts/types.js').InboundSenderContext;
   /** Original task intent for persistent scheduler tasks. Undefined for one-shot and direct tasks.
@@ -876,6 +885,11 @@ interface LlmCallPayload {
    * this is the attempt that succeeded. `null` where `attempts` is.
    */
   failedAttemptsMs?: number | null;
+  /**
+   * Set when the reasoning watchdog stopped a call and made a forced attempt
+   * (#2371); `null` otherwise.
+   */
+  reasoningWatchdog?: ReasoningWatchdogRecord | null;
 }
 
 // ModelFallbackEngagedPayload — emitted by the agent runtime when the primary
@@ -1605,6 +1619,12 @@ interface LlmErrorPayload {
   provider: string;
   errorType: string;
   parentEventId: string;
+  /**
+   * Set when the reasoning watchdog stopped the call and its forced attempt then
+   * failed (`forcedOutcome: 'error'`, #2371); absent otherwise. Successful forced
+   * attempts are recorded on llm.call instead.
+   */
+  reasoningWatchdog?: ReasoningWatchdogRecord;
 }
 
 export interface LlmErrorEvent extends BaseEvent {

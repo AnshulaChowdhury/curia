@@ -22,6 +22,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **`pinned_context`** — **public API:** agent YAML field injecting declared `/shared/` documents and config keys every turn. (#2338)
 - **`/shared/` documents** — durable, never archived with a project; only declaring agents can write them. (#2338)
 - **ADR-056** — `pinned_context`: declaration is write permission; `/shared/` is durable by prefix. (#2338)
+- **Reasoning watchdog** — runaway reasoning stops early and gets one forced attempt, on every streaming provider. (#2371)
+- **Provider guide** — `docs/dev/adding-an-llm-provider.md` documents the provider and stream contract. (#2371)
 - **Agenda-driven calls** — principal calls start from parked agendas; Curia can switch agendas mid-call. (#2322)
 - **Meeting minutes** — calls with an agenda produce a transcript, minutes and one follow-up report. (#2322)
 - **Bus events** — `minutes.ready` and `minutes.pipeline_failed`, system-only. (#2322)
@@ -105,6 +107,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **agent.task / llm.call / llm.error / LLMStreamEvent** — **public API:** `turnDeadlineAt`, `reasoningWatchdog`, `request_started`, `reasoning_delta` and `output_started` added. (#2371)
+- **LLM calls** — agent and infra calls on Anthropic and OpenRouter now stream internally. (#2371)
 - **ceo-inbox and calendar standing rules** — live in pinned `/shared/` documents, past the 2000-character cap, edited per rule. (#2339)
 - **meeting-debrief settings** — `debrief/config` arrives through `pinned_context`; no config-store read each run. (#2339)
 - **Principal-only sends** — a message to the principal alone skips autonomy gates A and B (spec 14). (#2337)

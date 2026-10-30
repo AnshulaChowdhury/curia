@@ -22,9 +22,10 @@ import type { LLMProvider, LLMResponse, LLMStreamEvent, LLMUsage, LLMCallProvena
 import type { Logger } from '../../logger.js';
 import { classifyError } from '../../errors/classify.js';
 import type { ModelRegistry } from './model-registry.js';
-import { logUnsentReasoningEffort, resolveReasoning, resolveTemperature, type ReasoningEffort } from './sampling-options.js';
+import { logUnsentReasoningEffort, resolveReasoning, resolveStreamMaxRetries, resolveTemperature, type ReasoningEffort } from './sampling-options.js';
 import { sendableReasoningBlocks } from './reasoning-blocks.js';
 import { isCallerCancellation } from './cancellation.js';
+import { LLM_REQUEST_TIMEOUT_MS } from './request-timeout.js';
 
 /**
  * Best-effort message extraction, mirroring classify.ts's own logic so the
@@ -108,11 +109,8 @@ export function upstreamProviderFrom(carrier: object): string | undefined {
   return typeof value === 'string' && value ? value : undefined;
 }
 
-/**
- * Per-attempt request timeout. This is the openai SDK's own default, made explicit:
- * a non-streamed call still running at this point is aborted as a timeout (#1915).
- */
-export const OPENROUTER_REQUEST_TIMEOUT_MS = 600_000;
+/** Per-attempt request timeout; see LLM_REQUEST_TIMEOUT_MS (#1915). */
+export const OPENROUTER_REQUEST_TIMEOUT_MS = LLM_REQUEST_TIMEOUT_MS;
 
 /** Attempts per chat() call: the first plus the SDK's default of two retries. */
 export const OPENROUTER_MAX_ATTEMPTS = 3;
@@ -295,6 +293,19 @@ function absorbReasoningDetail(state: ReasoningDetailState, detail: unknown): vo
 function absorbReasoningDetails(state: ReasoningDetailState, details: unknown): void {
   if (!Array.isArray(details)) return;
   for (const detail of details) absorbReasoningDetail(state, detail);
+}
+
+/** The readable text (reasoning.text and reasoning.summary) in one chunk's reasoning_details; encrypted entries add nothing. */
+function readableReasoningDetailsText(details: unknown): string {
+  if (!Array.isArray(details)) return '';
+  let text = '';
+  for (const detail of details) {
+    if (typeof detail !== 'object' || detail === null) continue;
+    const record = detail as Record<string, unknown>;
+    if (record.type === 'reasoning.text' && typeof record.text === 'string') text += record.text;
+    else if (record.type === 'reasoning.summary' && typeof record.summary === 'string') text += record.summary;
+  }
+  return text;
 }
 
 /** Models already warned for returning reasoning tokens without readable text. */
@@ -731,8 +742,8 @@ export class OpenRouterProvider implements LLMProvider {
   /**
    * Send a non-streamed request, retrying it here rather than in the SDK
    * (`maxRetries: 0`) so every failed attempt is logged and the count reaches
-   * llm.call (#1915). stream() keeps the SDK's retries: they happen before any
-   * token arrives.
+   * llm.call (#1915). stream() sends one request with SDK retries off too; a
+   * failed watched stream falls back to chat(), which retries here (#2371).
    *
    * A response that hit max_tokens with no answer is retried too, at once: it is
    * not an overload signal. The last attempt's response is returned whatever it
@@ -970,12 +981,20 @@ export class OpenRouterProvider implements LLMProvider {
       const built = this.buildCreateParams(params, 'stream');
       model = built.model;
       const { createParams, signal, reasoningEffort } = built;
+      yield { type: 'request_started', maxTokens: createParams.max_tokens as number };
       const streamParams: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
         ...createParams,
         stream: true,
         stream_options: { include_usage: true },
       };
-      const stream = await this.client.chat.completions.create(streamParams, signal ? { signal } : undefined);
+      // The watchdog's stream sets streamMaxRetries: 0, because its fallback to chat()
+      // retries and counts each attempt (#2371). Direct callers such as voice keep the
+      // SDK's retries, which happen before any token arrives (nothing reached TTS yet).
+      const streamMaxRetries = resolveStreamMaxRetries(params.options);
+      const stream = await this.client.chat.completions.create(streamParams, {
+        ...(streamMaxRetries !== undefined ? { maxRetries: streamMaxRetries } : {}),
+        ...(signal ? { signal } : {}),
+      });
       abortStream = () => stream.controller.abort();
 
       let content = '';
@@ -991,6 +1010,7 @@ export class OpenRouterProvider implements LLMProvider {
       let seenChunk = false;
       let finishReason: string | null = null;
       const toolCallDeltas = new Map<number, PendingToolCall>();
+      let outputStarted = false;
       let reasoningDirect = '';
       const reasoningState = emptyReasoningState();
       // The raw details, rebuilt for pass-back; reasoningState only holds readable text.
@@ -1016,10 +1036,22 @@ export class OpenRouterProvider implements LLMProvider {
 
           const delta = choice.delta as { reasoning?: unknown; reasoning_details?: unknown };
           if (typeof delta.reasoning === 'string') reasoningDirect += delta.reasoning;
+          // One reasoning_delta per chunk: a non-empty delta.reasoning wins; the
+          // details text is used when it is absent or empty.
+          const reasoningText = typeof delta.reasoning === 'string' && delta.reasoning !== ''
+            ? delta.reasoning
+            : readableReasoningDetailsText(delta.reasoning_details);
+          if (reasoningText) yield { type: 'reasoning_delta', text: reasoningText };
           absorbReasoningDetails(reasoningState, delta.reasoning_details);
           mergeReasoningDetailDeltas(reasoningDetails, delta.reasoning_details);
 
-          for (const toolCallDelta of choice.delta.tool_calls ?? []) {
+          const toolCallChunks = choice.delta.tool_calls ?? [];
+          if (toolCallChunks.length > 0 && !outputStarted) {
+            // Tool-call arguments yield no delta event; tell watchers output has begun.
+            outputStarted = true;
+            yield { type: 'output_started' };
+          }
+          for (const toolCallDelta of toolCallChunks) {
             const pending = toolCallDeltas.get(toolCallDelta.index) ?? { name: '', arguments: '' };
             if (toolCallDelta.id) pending.id = toolCallDelta.id;
             if (toolCallDelta.function?.name) pending.name += toolCallDelta.function.name;
@@ -1060,6 +1092,10 @@ export class OpenRouterProvider implements LLMProvider {
         providerRequestId,
         ...(upstreamProvider !== undefined ? { upstreamProvider } : {}),
         ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+        // With SDK retries off it was exactly one request, so the #1915 attempt
+        // telemetry reads the same as a first-try chat(). With SDK retries on the
+        // count is unknowable here, so it is left out (llm.call records null).
+        ...(streamMaxRetries === 0 ? { attempts: 1, failedAttemptsMs: 0 } : {}),
       };
       const reasoning = reasoningFieldsFromParts(
         reasoningDirect,

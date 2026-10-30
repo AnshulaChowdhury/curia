@@ -28,7 +28,7 @@ import type { LLMProvider, LLMReasoning, LLMResponse, LLMStreamEvent, LLMUsage, 
 import type { Logger } from '../../logger.js';
 import { classifyError } from '../../errors/classify.js';
 import type { ModelRegistry } from './model-registry.js';
-import { logUnsentReasoningEffort, resolveReasoning, resolveTemperature, type ReasoningEffort } from './sampling-options.js';
+import { logUnsentReasoningEffort, resolveReasoning, resolveStreamMaxRetries, resolveTemperature, type ReasoningEffort } from './sampling-options.js';
 import { PrefixHasher, sendableReasoningBlocks } from './reasoning-blocks.js';
 import { isCallerCancellation } from './cancellation.js';
 
@@ -96,6 +96,9 @@ function reasoningFieldsFrom(response: AnthropicMessage, usage: LLMUsage): LLMRe
 
 export class AnthropicProvider implements LLMProvider {
   id = 'anthropic';
+  // Sonnet 5.5 refuses (stop_reason "refusal", category reasoning_extraction) any
+  // forced attempt that quotes its reasoning back; 2026-10-29 probe, #2371.
+  readonly acceptsReasoningInForcedAttempt = false;
   private client: Anthropic;
   private logger: Logger;
   private readonly modelRegistry: ModelRegistry;
@@ -527,7 +530,17 @@ export class AnthropicProvider implements LLMProvider {
       const built = this.buildCreateParams(params, 'stream');
       model = built.model;
       const { createParams, signal, prefixHash, reasoningEffort, reasoningBlocksDropped } = built;
-      const stream = this.client.messages.stream(createParams, signal ? { signal } : undefined);
+      // The watchdog's stream sets streamMaxRetries: 0 so its chat() fallback owns the
+      // retries (#2371); direct callers such as voice keep the SDK's default retries.
+      const streamMaxRetries = resolveStreamMaxRetries(params.options);
+      const requestOptions = {
+        ...(signal ? { signal } : {}),
+        ...(streamMaxRetries !== undefined ? { maxRetries: streamMaxRetries } : {}),
+      };
+      const stream = this.client.messages.stream(
+        createParams,
+        Object.keys(requestOptions).length > 0 ? requestOptions : undefined,
+      );
 
       // Guarantee the underlying fetch Response / ReadableStream is released on every
       // exit path — normal completion, a thrown error, an AbortSignal firing, or a
@@ -537,9 +550,21 @@ export class AnthropicProvider implements LLMProvider {
       // that accumulates until an OOM restart (#1648; upstream anthropics/claude-code#33380).
       // MessageStream.abort() is idempotent — calling it after finalMessage() is a no-op.
       try {
+        // Inside the try: the request is already in flight, so a consumer that stops
+        // at this event must still reach the abort() below.
+        yield { type: 'request_started', maxTokens: createParams.max_tokens };
+        let outputStarted = false;
         for await (const event of stream) {
-          if (event.type === 'content_block_delta' && event.delta.type === 'text_delta' && event.delta.text) {
+          if (event.type === 'content_block_start' && event.content_block.type === 'tool_use') {
+            // input_json_delta chunks yield no event; tell watchers output has begun.
+            if (!outputStarted) {
+              outputStarted = true;
+              yield { type: 'output_started' };
+            }
+          } else if (event.type === 'content_block_delta' && event.delta.type === 'text_delta' && event.delta.text) {
             yield { type: 'text_delta', text: event.delta.text };
+          } else if (event.type === 'content_block_delta' && event.delta.type === 'thinking_delta' && event.delta.thinking) {
+            yield { type: 'reasoning_delta', text: event.delta.thinking };
           }
         }
 
