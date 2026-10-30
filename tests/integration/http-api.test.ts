@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import Fastify from 'fastify';
 import type { Pool } from 'pg';
 import { EventBus } from '../../src/bus/bus.js';
@@ -12,7 +14,6 @@ import { Dispatcher } from '../../src/dispatch/dispatcher.js';
 import { validateBearerToken } from '../../src/channels/http/auth.js';
 import type { LLMProvider } from '../../src/agents/llm/provider.js';
 const MOCK_PROVENANCE = { requestedModel: 'mock-model', actualModel: 'mock-model', providerRequestId: 'msg_mock_000' } as const;
-import type { BusEvent } from '../../src/bus/events.js';
 import pino from 'pino';
 import type { HealthService } from '../../src/health/health-service.js';
 import { makePrincipalContactResolver } from '../helpers/principal-contact-resolver.js';
@@ -44,7 +45,8 @@ function chatAuthHeader(): Record<string, string> {
 }
 
 describe('HTTP API integration', () => {
-  const app = Fastify();
+  // forceCloseConnections: an SSE socket left open would otherwise stall app.close().
+  const app = Fastify({ forceCloseConnections: true });
   const bus = new EventBus(logger);
   const agentRegistry = new AgentRegistry();
   agentRegistry.register('coordinator', { role: 'coordinator', description: 'Main' });
@@ -99,29 +101,56 @@ describe('HTTP API integration', () => {
     await app.close();
   });
 
-  it('POST /api/chat/messages acks 202 and the agent reply is delivered on the bus', async () => {
-    const replies: string[] = [];
-    bus.subscribe('outbound.message', 'channel', (event: BusEvent) => {
-      if (event.type !== 'outbound.message') return;
-      if (event.payload.conversationId !== 'test-conv-1') return;
-      replies.push(event.payload.content);
-    });
+  it('POST /api/chat/messages acks 202 and the reply arrives on /api/chat/stream', async () => {
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (app.server.address() as AddressInfo).port;
+    const chunks: string[] = [];
+    let connected: () => void = () => {};
+    const sawConnected = new Promise<void>((resolve) => { connected = resolve; });
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/chat/messages',
-      headers: chatAuthHeader(),
-      payload: {
-        message: 'Hello!',
-        conversationId: 'test-conv-1',
+    const stream = http.request(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/chat/stream?conversationId=test-conv-1',
+        headers: chatAuthHeader(),
       },
-    });
+      (res) => {
+        expect(res.statusCode).toBe(200);
+        res.setEncoding('utf8');
+        res.on('data', (chunk: string) => {
+          chunks.push(chunk);
+          if (chunk.includes(':connected') || chunks.join('').includes(':connected')) connected();
+        });
+      },
+    );
+    stream.on('error', () => { /* closed by the test */ });
+    stream.end();
 
-    expect(response.statusCode).toBe(202);
-    expect(response.json()).toMatchObject({ conversationId: 'test-conv-1' });
-    await vi.waitFor(() => {
-      expect(replies).toContain('Hello from the HTTP API!');
-    }, { timeout: 5_000 });
+    try {
+      await sawConnected;
+      // :connected is written just before the client is registered. Yield so
+      // addSseClient has run before the POST, or the reply can be missed.
+      await new Promise((resolve) => { setImmediate(resolve); });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/chat/messages',
+        headers: chatAuthHeader(),
+        payload: {
+          message: 'Hello!',
+          conversationId: 'test-conv-1',
+        },
+      });
+
+      expect(response.statusCode).toBe(202);
+      expect(response.json()).toMatchObject({ conversationId: 'test-conv-1' });
+      await vi.waitFor(() => {
+        expect(chunks.join('')).toContain('Hello from the HTTP API!');
+      }, { timeout: 5_000 });
+    } finally {
+      stream.destroy();
+    }
   });
 
   it('POST /api/chat/messages returns 400 for missing message', async () => {

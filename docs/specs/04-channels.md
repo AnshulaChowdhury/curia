@@ -145,6 +145,7 @@ Interactive terminal for local dev and testing. Reads from stdin, writes to stdo
 - **Scope:** PSTN/SIP remains a deferred transport that should reuse `VoiceRuntime`.
 
 ### HTTP
+
 The always-on Fastify adapter. It serves the console, `GET /api/health`, bearer-gated operator routes such as `GET /api/agents/status`, and the session-authenticated console APIs. It is not itself a chat ingress.
 - Console chat is `POST /api/chat/messages`, `GET /api/chat/stream`, and `GET /api/chat/history`, on the `web` channel. Auth is the session cookie or `x-web-bootstrap-secret`. The sender is the principal.
 - `POST /api/messages` and `GET /api/messages/stream` were removed ([ADR-057](../adr/057-two-http-chat-surfaces.md)). Tests were the only in-repo callers.
