@@ -4,28 +4,24 @@
 // A console tab left open across a deploy keeps the old bundle and keeps calling
 // /api/kg/{tasks,contacts,chat,grant-recommendations}. Without these aliases,
 // GETs fall into the SPA /* catch-all and look like a broken session. Remove
-// after one release once stale clients have recycled.
+// after one release once stale clients have recycled (see CLAUDE.md Preparing a
+// release pre-flight).
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 // Omit HEAD — Fastify derives it from GET and rejects a second declaration.
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 
-function querySuffix(url: string): string {
-  const i = url.indexOf('?');
-  return i === -1 ? '' : url.slice(i);
-}
-
-function bounce(to: string) {
-  return async (request: FastifyRequest, reply: FastifyReply) => {
-    return reply.redirect(`${to}${querySuffix(request.url)}`, 308);
-  };
-}
-
 /**
  * Register exact + wildcard 308 aliases for each moved prefix.
- * Mounted under the same webAppBootstrapSecret gate as the new routes; the
- * paths still sit under /api/kg so SELF_AUTHED_API_PREFIXES already covers them.
+ *
+ * Registered only when `webAppBootstrapSecret` is configured (same gate as the
+ * new console routes). These handlers do not call `assertSecret` — the target
+ * route does. Paths still sit under `/api/kg`, so SELF_AUTHED_API_PREFIXES
+ * already covers the redirect hop.
+ *
+ * Rebuild the Location from `request.url` (raw path + query) rather than the
+ * decoded `*` param, so percent-encoding is preserved (#872 review).
  */
 export async function legacyKgAliasRoutes(app: FastifyInstance): Promise<void> {
   const aliases: Array<{ from: string; to: string }> = [
@@ -36,16 +32,12 @@ export async function legacyKgAliasRoutes(app: FastifyInstance): Promise<void> {
   ];
 
   for (const { from, to } of aliases) {
+    const handler = async (request: FastifyRequest, reply: FastifyReply) =>
+      reply.redirect(`${to}${request.url.slice(from.length)}`, 308);
+
     for (const method of METHODS) {
-      app.route({ method, url: from, handler: bounce(to) });
-      app.route({
-        method,
-        url: `${from}/*`,
-        handler: async (request, reply) => {
-          const rest = (request.params as Record<string, string>)['*'] ?? '';
-          return reply.redirect(`${to}/${rest}${querySuffix(request.url)}`, 308);
-        },
-      });
+      app.route({ method, url: from, handler });
+      app.route({ method, url: `${from}/*`, handler });
     }
   }
 }

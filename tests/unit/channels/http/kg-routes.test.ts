@@ -197,6 +197,10 @@ describe('console routes (kg / tasks / contacts / chat)', () => {
       { method: 'GET', url: '/api/kg/chat/stream', location: '/api/chat/stream' },
       { method: 'GET', url: '/api/kg/chat/history?conversationId=c1', location: '/api/chat/history?conversationId=c1' },
       { method: 'GET', url: '/api/kg/grant-recommendations', location: '/api/grant-recommendations' },
+      // Raw URL slice preserves percent-encoding (decoded `*` params would not).
+      { method: 'GET', url: '/api/kg/contacts/a%2Fb', location: '/api/contacts/a%2Fb' },
+      { method: 'GET', url: '/api/kg/contacts/x%3Fy', location: '/api/contacts/x%3Fy' },
+      { method: 'GET', url: '/api/kg/contacts/%C3%A9', location: '/api/contacts/%C3%A9' },
     ];
     for (const { method, url, location } of cases) {
       const res = await app.inject({ method, url });
