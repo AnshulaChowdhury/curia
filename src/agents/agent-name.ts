@@ -3,7 +3,7 @@
  * TEXT columns that hold agent identifiers (#1882).
  *
  * Enforced at agent load time (`loadAgentConfig`) so the roster cannot drift
- * from what `POST /api/kg/tasks` accepts. System writers (e.g. `health-service`)
+ * from what `POST /api/tasks` accepts. System writers (e.g. `health-service`)
  * must use the same character class.
  */
 export const AGENT_NAME_MAX_LENGTH = 64;

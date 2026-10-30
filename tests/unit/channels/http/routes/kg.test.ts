@@ -1,14 +1,11 @@
-// kg.test.ts — exercises the contact POST and PATCH routes against a fake
-// ContactService. Auth uses the x-web-bootstrap-secret header path (same path
-// as the route uses). Pool, Bus, EventRouter are stubbed — the contact endpoints
-// do not touch them.
+// kg.test.ts — contact CRUD (via contactRoutes) and node-merge routes (via
+// knowledgeGraphRoutes). Auth uses the x-web-bootstrap-secret header path.
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { knowledgeGraphRoutes } from '../../../../../src/channels/http/routes/kg.js';
+import { contactRoutes } from '../../../../../src/channels/http/routes/contacts.js';
 import type { ContactService } from '../../../../../src/contacts/contact-service.js';
 import type { ChannelIdentity, Contact } from '../../../../../src/contacts/types.js';
-import type { EventBus } from '../../../../../src/bus/bus.js';
-import type { EventRouter } from '../../../../../src/channels/http/event-router.js';
 import type { Pool } from 'pg';
 import type { Logger } from '../../../../../src/logger.js';
 import type { NodeMergeApi } from '../../../../../src/kg-merge/service.js';
@@ -83,19 +80,14 @@ function makeFakePool(): Pool {
   return pool as unknown as Pool;
 }
 
-const stubBus = {} as EventBus;
-const stubEventRouter = {} as EventRouter;
 const stubLogger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() } as unknown as Logger;
 
 async function build(service: ContactService): Promise<FastifyInstance> {
   const app = Fastify();
-  await app.register(knowledgeGraphRoutes, {
+  await app.register(contactRoutes, {
     pool: makeFakePool(),
     logger: stubLogger,
     webAppBootstrapSecret: BOOTSTRAP,
-    secureCookies: false,
-    bus: stubBus,
-    eventRouter: stubEventRouter,
     contactService: service,
     sessions: new Map(),
   });
@@ -104,7 +96,7 @@ async function build(service: ContactService): Promise<FastifyInstance> {
 
 const auth = { 'x-web-bootstrap-secret': BOOTSTRAP };
 
-describe('POST /api/kg/contacts — status field removal', () => {
+describe('POST /api/contacts — status field removal', () => {
   let app: FastifyInstance;
   afterEach(async () => {
     await app?.close();
@@ -115,7 +107,7 @@ describe('POST /api/kg/contacts — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'POST',
-      url: '/api/kg/contacts',
+      url: '/api/contacts',
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ displayName: 'Alice' }),
     });
@@ -131,7 +123,7 @@ describe('POST /api/kg/contacts — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'POST',
-      url: '/api/kg/contacts',
+      url: '/api/contacts',
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ displayName: 'Alice', status: 'confirmed' }),
     });
@@ -143,7 +135,7 @@ describe('POST /api/kg/contacts — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'POST',
-      url: '/api/kg/contacts',
+      url: '/api/contacts',
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ status: 'confirmed' }),
     });
@@ -151,7 +143,7 @@ describe('POST /api/kg/contacts — status field removal', () => {
   });
 });
 
-describe('PATCH /api/kg/contacts/:id — status field removal', () => {
+describe('PATCH /api/contacts/:id — status field removal', () => {
   let app: FastifyInstance;
   afterEach(async () => {
     await app?.close();
@@ -162,7 +154,7 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/contacts/${BASE_CONTACT.id}`,
+      url: `/api/contacts/${BASE_CONTACT.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ displayName: 'Alice Updated' }),
     });
@@ -179,7 +171,7 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/contacts/${BASE_CONTACT.id}`,
+      url: `/api/contacts/${BASE_CONTACT.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ status: 'confirmed' }),
     });
@@ -196,7 +188,7 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/contacts/${BASE_CONTACT.id}`,
+      url: `/api/contacts/${BASE_CONTACT.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ primaryEmail: 'Local@Domain.ca' }),
     });
@@ -211,7 +203,7 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/contacts/${BASE_CONTACT.id}`,
+      url: `/api/contacts/${BASE_CONTACT.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ primaryEmail: 'other@domain.com' }),
     });
@@ -234,7 +226,7 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/contacts/${BASE_CONTACT.id}`,
+      url: `/api/contacts/${BASE_CONTACT.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });
@@ -249,7 +241,7 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/contacts/${BASE_CONTACT.id}`,
+      url: `/api/contacts/${BASE_CONTACT.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ pronouns: 'he/him' }),
     });
@@ -267,7 +259,7 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/contacts/${BASE_CONTACT.id}`,
+      url: `/api/contacts/${BASE_CONTACT.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ timezone: 'America/Toronto' }),
     });
@@ -280,7 +272,7 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/contacts/${BASE_CONTACT.id}`,
+      url: `/api/contacts/${BASE_CONTACT.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ displayName: 'X' }),
     });
@@ -288,7 +280,7 @@ describe('PATCH /api/kg/contacts/:id — status field removal', () => {
   });
 });
 
-describe('GET /api/kg/contacts/:id/identities', () => {
+describe('GET /api/contacts/:id/identities', () => {
   let app: FastifyInstance;
   afterEach(async () => {
     await app?.close();
@@ -320,7 +312,7 @@ describe('GET /api/kg/contacts/:id/identities', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'GET',
-      url: `/api/kg/contacts/${CID}/identities`,
+      url: `/api/contacts/${CID}/identities`,
       headers: auth,
     });
     expect(res.statusCode).toBe(200);
@@ -347,7 +339,7 @@ describe('GET /api/kg/contacts/:id/identities', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'GET',
-      url: `/api/kg/contacts/${CID}/identities`,
+      url: `/api/contacts/${CID}/identities`,
       headers: auth,
     });
     expect(res.statusCode).toBe(200);
@@ -362,7 +354,7 @@ describe('GET /api/kg/contacts/:id/identities', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'GET',
-      url: `/api/kg/contacts/${CID}/identities`,
+      url: `/api/contacts/${CID}/identities`,
       headers: auth,
     });
     expect(res.statusCode).toBe(404);
@@ -373,7 +365,7 @@ describe('GET /api/kg/contacts/:id/identities', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'GET',
-      url: '/api/kg/contacts/not-a-uuid/identities',
+      url: '/api/contacts/not-a-uuid/identities',
       headers: auth,
     });
     expect(res.statusCode).toBe(400);
@@ -384,7 +376,7 @@ describe('GET /api/kg/contacts/:id/identities', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'GET',
-      url: `/api/kg/contacts/${CID}/identities`,
+      url: `/api/contacts/${CID}/identities`,
     });
     expect(res.statusCode).toBe(401);
   });
@@ -407,7 +399,7 @@ function makeIdentity(overrides: Partial<ChannelIdentity> = {}): ChannelIdentity
   };
 }
 
-describe('POST /api/kg/contacts/:id/identities — link (#1514)', () => {
+describe('POST /api/contacts/:id/identities — link (#1514)', () => {
   let app: FastifyInstance;
   const CID = '11111111-1111-4111-8111-111111111111';
   const contact = { ...BASE_CONTACT, id: CID };
@@ -425,7 +417,7 @@ describe('POST /api/kg/contacts/:id/identities — link (#1514)', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'POST',
-      url: `/api/kg/contacts/${CID}/identities`,
+      url: `/api/contacts/${CID}/identities`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ channel: 'slack', channelIdentifier: 'U_CEO' }),
     });
@@ -446,7 +438,7 @@ describe('POST /api/kg/contacts/:id/identities — link (#1514)', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'POST',
-      url: `/api/kg/contacts/${CID}/identities`,
+      url: `/api/contacts/${CID}/identities`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ channel: 'discord', channelIdentifier: 'x' }),
     });
@@ -462,7 +454,7 @@ describe('POST /api/kg/contacts/:id/identities — link (#1514)', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'POST',
-      url: `/api/kg/contacts/${CID}/identities`,
+      url: `/api/contacts/${CID}/identities`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ channel: 'slack', channelIdentifier: 'U_CEO' }),
     });
@@ -470,7 +462,7 @@ describe('POST /api/kg/contacts/:id/identities — link (#1514)', () => {
   });
 });
 
-describe('PATCH /api/kg/contacts/:id/identities/:identityId — verify/status (#1514)', () => {
+describe('PATCH /api/contacts/:id/identities/:identityId — verify/status (#1514)', () => {
   let app: FastifyInstance;
   const CID = '11111111-1111-4111-8111-111111111111';
   const contact = { ...BASE_CONTACT, id: CID };
@@ -489,7 +481,7 @@ describe('PATCH /api/kg/contacts/:id/identities/:identityId — verify/status (#
     app = await build(svc);
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/contacts/${CID}/identities/${existing.id}`,
+      url: `/api/contacts/${CID}/identities/${existing.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ verified: true }),
     });
@@ -508,7 +500,7 @@ describe('PATCH /api/kg/contacts/:id/identities/:identityId — verify/status (#
     app = await build(svc);
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/contacts/${CID}/identities/${existing.id}`,
+      url: `/api/contacts/${CID}/identities/${existing.id}`,
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ status: 'defunct' }),
     });
@@ -517,7 +509,7 @@ describe('PATCH /api/kg/contacts/:id/identities/:identityId — verify/status (#
   });
 });
 
-describe('DELETE /api/kg/contacts/:id/identities/:identityId — unlink (#1514)', () => {
+describe('DELETE /api/contacts/:id/identities/:identityId — unlink (#1514)', () => {
   let app: FastifyInstance;
   const CID = '11111111-1111-4111-8111-111111111111';
   const contact = { ...BASE_CONTACT, id: CID };
@@ -536,7 +528,7 @@ describe('DELETE /api/kg/contacts/:id/identities/:identityId — unlink (#1514)'
     app = await build(svc);
     const res = await app.inject({
       method: 'DELETE',
-      url: `/api/kg/contacts/${CID}/identities/${existing.id}`,
+      url: `/api/contacts/${CID}/identities/${existing.id}`,
       headers: auth,
     });
     expect(res.statusCode).toBe(204);
@@ -553,14 +545,14 @@ describe('DELETE /api/kg/contacts/:id/identities/:identityId — unlink (#1514)'
     app = await build(svc);
     const res = await app.inject({
       method: 'DELETE',
-      url: `/api/kg/contacts/${CID}/identities/${existing.id}`,
+      url: `/api/contacts/${CID}/identities/${existing.id}`,
       headers: auth,
     });
     expect(res.statusCode).toBe(404);
   });
 });
 
-describe('POST /api/kg/contacts/merge — merge lookalikes (#1514)', () => {
+describe('POST /api/contacts/merge — merge lookalikes (#1514)', () => {
   let app: FastifyInstance;
   afterEach(async () => {
     await app?.close();
@@ -587,7 +579,7 @@ describe('POST /api/kg/contacts/merge — merge lookalikes (#1514)', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'POST',
-      url: '/api/kg/contacts/merge',
+      url: '/api/contacts/merge',
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({ primaryContactId: PRIMARY, secondaryContactId: SECONDARY }),
     });
@@ -616,7 +608,7 @@ describe('POST /api/kg/contacts/merge — merge lookalikes (#1514)', () => {
     app = await build(svc);
     const res = await app.inject({
       method: 'POST',
-      url: '/api/kg/contacts/merge',
+      url: '/api/contacts/merge',
       headers: { ...auth, 'content-type': 'application/json' },
       body: JSON.stringify({
         primaryContactId: PRIMARY,
@@ -658,8 +650,6 @@ async function buildWithMerge(
     logger: stubLogger,
     webAppBootstrapSecret: BOOTSTRAP,
     secureCookies: false,
-    bus: stubBus,
-    eventRouter: stubEventRouter,
     contactService: contacts,
     sessions: new Map(),
     nodeMergeService: mergeService,

@@ -771,7 +771,7 @@ export default function KgPage() {
       // principal has no linked KG node or the contacts fetch fails.
       void (async () => {
         try {
-          const res = await apiFetch('/api/kg/contacts');
+          const res = await apiFetch('/api/contacts');
           if (res.ok) {
             const { contacts } = await res.json() as { contacts: Array<{
               systemRole: string | null;

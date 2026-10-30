@@ -368,7 +368,7 @@ environment snapshot plus the one operator write the console offers.
 
 ### Web Console Chat API
 
-As of v0.35.0, `POST /api/kg/chat/messages` acknowledges with `202 { conversationId }` immediately after publishing the inbound message, rather than blocking on a synchronous wait for the agent's reply. The reply and intermediate progress events stream back over the existing `GET /api/kg/chat/stream` SSE endpoint. This removes the old 120s synchronous wait, so long agent tasks (browser automation, multi-agent delegation chains, research) no longer hit a 504 timeout. Rate-limited chat requests return `429`.
+As of v0.35.0, `POST /api/chat/messages` acknowledges with `202 { conversationId }` immediately after publishing the inbound message, rather than blocking on a synchronous wait for the agent's reply. The reply and intermediate progress events stream back over the existing `GET /api/chat/stream` SSE endpoint. This removes the old 120s synchronous wait, so long agent tasks (browser automation, multi-agent delegation chains, research) no longer hit a 504 timeout. Rate-limited chat requests return `429`.
 
 ---
 

@@ -53,7 +53,7 @@ export function isLlmFailureTurn(turn: { role: string; content: string }): boole
  *
  * Raw-SQL readers that cannot use `getHistory` must call this explicitly:
  * - `Dispatcher.fireCheckpoint`
- * - `GET /api/kg/chat/history` (via `toChatHistoryMessage`)
+ * - `GET /api/chat/history` (via `toChatHistoryMessage`)
  * - working-memory summarization (archive-window transcript)
  */
 export function rewriteLlmFailureTurns<T extends { role: string; content: string }>(turns: T[]): T[] {

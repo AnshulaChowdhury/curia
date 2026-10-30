@@ -23,7 +23,7 @@ function rejectionText(reason: string): string {
 }
 
 /**
- * Parses a raw SSE event data string from GET /api/kg/chat/stream into a
+ * Parses a raw SSE event data string from GET /api/chat/stream into a
  * normalized SseEvent, or null for events the chat UI ignores.
  *
  * Ack-and-stream (#985): the POST only acks, so the `message` event is now the

@@ -241,13 +241,13 @@ function TaskEditDrawer({ task, creating, onClose, onSaved, onDeleted, lookupTas
 
       let res: Response;
       if (creating) {
-        res = await apiFetch('/api/kg/tasks', {
+        res = await apiFetch('/api/tasks', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
       } else {
-        res = await apiFetch(`/api/kg/tasks/${task!.id}`, {
+        res = await apiFetch(`/api/tasks/${task!.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -270,7 +270,7 @@ function TaskEditDrawer({ task, creating, onClose, onSaved, onDeleted, lookupTas
     setDeleting(true);
     setError(null);
     try {
-      const res = await apiFetch(`/api/kg/tasks/${task.id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/tasks/${task.id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error(await errorMessage(res));
       onDeleted(task.id);
     } catch (err) {
@@ -512,7 +512,7 @@ export default function TasksPage() {
   const load = useCallback(async () => {
     setLoadError(null);
     try {
-      const res = await apiFetch('/api/kg/tasks');
+      const res = await apiFetch('/api/tasks');
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as { tasks: Task[] };
       setTasks(data.tasks);

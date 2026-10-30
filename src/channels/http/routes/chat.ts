@@ -1,0 +1,246 @@
+// chat.ts — console chat messages, SSE stream, and history.
+//
+// Moved off /api/kg/chat/* (#872). Mirrors /api/messages but uses the 'web'
+// channel so contact-resolver attributes the sender to the principal.
+// Auth: session cookie or x-web-bootstrap-secret via assertSecret.
+
+import { randomUUID } from 'node:crypto';
+import type { FastifyInstance } from 'fastify';
+import type { Pool } from 'pg';
+import type { EventBus } from '../../../bus/bus.js';
+import { createInboundMessage } from '../../../bus/events.js';
+import type { Logger } from '../../../logger.js';
+import type { EventRouter } from '../event-router.js';
+import { assertSecret, type SessionStore } from '../session-auth.js';
+import { markdownToHtml } from '../../../format/markdown-to-html.js';
+import { fetchChatHistoryPage } from '../chat-history-page.js';
+
+export interface ChatRouteOptions {
+  pool: Pool;
+  logger: Logger;
+  webAppBootstrapSecret: string | undefined;
+  sessions: SessionStore;
+  bus: EventBus;
+  eventRouter: EventRouter;
+}
+
+// Channel identifier used when the console dispatches messages to the agent layer.
+// The 'web' channel is special-cased in contact-resolver.ts to auto-resolve to the principal —
+// the bootstrap secret is principal-only, so any authenticated web request is implicitly the principal.
+// See config/channel-trust.yaml for the channel policy.
+const WEB_CHANNEL_ID = 'web';
+// Sentinel sender ID for the web channel. The value is cosmetic — contact-resolver.ts
+// short-circuits to the principal contact for this channel regardless of the sender string.
+const WEB_SENDER_ID = 'ceo-web-user';
+
+export async function chatRoutes(
+  app: FastifyInstance,
+  options: ChatRouteOptions,
+): Promise<void> {
+  const { pool, logger, webAppBootstrapSecret, sessions, bus, eventRouter } = options;
+
+  // Rate limit for console session-authed APIs: 60/min per IP.
+  const CONSOLE_RATE = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
+
+  // ── Chat endpoints ──────────────────────────────────────────────────────
+  //
+  // The chat endpoints let the KG web app send messages to the agent layer
+  // and stream responses back. They mirror the pattern of src/channels/http/routes/messages.ts
+  // (POST /api/messages + GET /api/messages/stream) but use the 'web' channel so
+  // contact-resolver auto-attributes the sender to the principal (the bootstrap secret is principal-only).
+  //
+  // Auth: both routes enforce the same assertSecret guard as the KG read APIs — they accept
+  // either a valid curia_session cookie (browser flow) or x-web-bootstrap-secret header
+  // (programmatic flow, e.g. tests and scripts).
+
+  /**
+   * POST /api/chat/messages — publish a chat message and ack immediately.
+   *
+   * Body: { message: string, conversationId?: string }
+   * Response: 202 { conversationId }
+   *
+   * Ack-and-stream (#985): the handler publishes the inbound message and returns
+   * 202 without waiting for the agent's reply. The final reply and intermediate
+   * progress (tool.invoke / tool.result) arrive over GET /api/chat/stream,
+   * which is the source of truth for the assistant turn. This removes the former
+   * synchronous 120s wait that 504'd on long tasks (browser automation, delegation
+   * chains, research).
+   */
+  app.post('/api/chat/messages', CONSOLE_RATE, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+
+    const body = request.body as { message?: unknown; conversationId?: unknown };
+    if (typeof body?.message !== 'string' || body.message.trim().length === 0) {
+      return reply.status(400).send({ error: 'Missing required field: message (non-empty string)' });
+    }
+
+    const conversationId =
+      typeof body.conversationId === 'string' && body.conversationId.length > 0
+        ? body.conversationId
+        : `kg-web-${randomUUID()}`;
+
+    try {
+      await bus.publish('channel', createInboundMessage({
+        conversationId,
+        channelId: WEB_CHANNEL_ID,
+        senderId: WEB_SENDER_ID,
+        content: body.message,
+        // Tag with structural channel trust level — session-cookie auth earns medium trust,
+        // same as bearer token auth on the API channel. Required for messageTrustScore computation.
+        metadata: { trustLevel: 'medium' },
+      }));
+    } catch (publishErr) {
+      // Log the real error server-side (full context) but return a fixed,
+      // client-safe message — don't echo internal bus/implementation detail back.
+      logger.error({ err: publishErr, conversationId }, 'chat message publish failed');
+      return reply.status(500).send({ error: 'Failed to publish chat message.' });
+    }
+
+    // Ack: the reply is delivered over the SSE stream, not this response.
+    return reply.status(202).send({ conversationId });
+  });
+
+  /**
+   * GET /api/chat/stream — SSE stream of agent events for the KG web app.
+   *
+   * Streams outbound.message, tool.invoke, and tool.result events from the EventRouter,
+   * optionally filtered by ?conversationId=xxx. Mirrors GET /api/messages/stream.
+   */
+  app.get('/api/chat/stream', CONSOLE_RATE, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+
+    const query = request.query as { conversationId?: string };
+
+    // Hand the raw socket over to us — Fastify won't send a default response after the
+    // handler returns, which is what we want for a long-lived SSE stream.
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      // Nginx/ALB/Cloudflare buffer SSE by default — this header disables that.
+      'X-Accel-Buffering': 'no',
+    });
+    reply.raw.write(':connected\n\n');
+
+    const cleanup = eventRouter.addSseClient({
+      res: reply.raw,
+      conversationId: query.conversationId,
+    });
+
+    // 30s heartbeat keeps intermediary proxies from closing the connection on idle.
+    const heartbeat = setInterval(() => {
+      try {
+        reply.raw.write(':ping\n\n');
+      } catch (err) {
+        // Write failed — client likely disconnected without a clean TCP close.
+        // Clear the interval and explicitly remove the SSE client to prevent a leak
+        // in the case where the 'close' event on request.raw doesn't fire.
+        logger.debug({ err, conversationId: query.conversationId }, 'chat SSE heartbeat write failed — removing client');
+        clearInterval(heartbeat);
+        cleanup();
+      }
+    }, 30_000);
+
+    request.raw.on('close', () => {
+      clearInterval(heartbeat);
+      cleanup();
+    });
+  });
+
+  /**
+   * GET /api/chat/history — fetch paginated chat history from working_memory.
+   *
+   * Query params:
+   *   - conversationId: string (required)
+   *   - before: string (optional ISO timestamp — returns messages older than this cursor;
+   *     microseconds are preserved; do not round-trip through JS Date)
+   *   - limit: number (optional, default 25, max 50)
+   *
+   * Returns messages in chronological order (oldest first) so the client can
+   * prepend them to the thread. Pages fill to `limit` *display* messages;
+   * `hasMore` reflects displayable turns, not raw rows (#1775).
+   *
+   * Only user/assistant turns are returned — system turns (synthetic summaries
+   * inserted by the summarisation pass) are excluded since they are internal
+   * artifacts not intended for display. Display filters (voice greeting cue,
+   * LLM-failure rewrite, outbound-context preamble) live in
+   * `chat-history-page.ts`.
+   */
+  app.get('/api/chat/history', CONSOLE_RATE, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+
+    const query = request.query as {
+      conversationId?: string;
+      before?: string;
+      limit?: string;
+    };
+
+    if (typeof query.conversationId !== 'string' || query.conversationId.trim().length === 0) {
+      return reply.status(400).send({ error: 'Missing required query param: conversationId' });
+    }
+    const conversationId = query.conversationId.trim();
+
+    const rawLimit = parseInt(query.limit ?? '25', 10);
+    const limit = isNaN(rawLimit) || rawLimit < 1 ? 25 : Math.min(rawLimit, 50);
+
+    // Validate the before cursor: must be a parseable ISO date if provided.
+    // Keep the original string for SQL — `new Date(...).toISOString()` drops
+    // microseconds and would skip same-millisecond rows (#1775 review).
+    let beforeCursor: { createdAtIso: string } | undefined;
+    if (query.before !== undefined && query.before.trim().length > 0) {
+      const beforeRaw = query.before.trim();
+      if (isNaN(new Date(beforeRaw).getTime())) {
+        return reply.status(400).send({ error: 'Invalid before param: must be an ISO timestamp' });
+      }
+      beforeCursor = { createdAtIso: beforeRaw };
+    }
+
+    try {
+      // Keyset pagination over raw rows; fetchChatHistoryPage keeps scanning
+      // until it has `limit` display messages (or the table is exhausted).
+      // Composite (created_at, id) cursor + microsecond text so internal
+      // batches do not skip rows that JS Date would collapse.
+      const page = await fetchChatHistoryPage({
+        before: beforeCursor,
+        limit,
+        load: async (cursor, fetchLimit) => {
+          const result = await pool.query<{
+            id: string;
+            role: string;
+            content: string;
+            created_at: Date;
+            created_at_iso: string;
+          }>(
+            `SELECT id, role, content, created_at,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso
+             FROM working_memory
+             WHERE conversation_id = $1
+               AND archived = false
+               AND role IN ('user', 'assistant')
+               AND ($2::timestamptz IS NULL
+                    OR (created_at, id) < ($2::timestamptz, COALESCE($3::uuid, '00000000-0000-0000-0000-000000000000'::uuid)))
+             ORDER BY created_at DESC, id DESC
+             LIMIT $4`,
+            [conversationId, cursor?.createdAtIso ?? null, cursor?.id ?? null, fetchLimit],
+          );
+          return result.rows;
+        },
+        renderAssistantHtml: markdownToHtml,
+        onMarkdownError: (err, messageId) => {
+          logger.warn({ err, messageId }, 'markdownToHtml failed for history row; falling back to plain text');
+        },
+      });
+
+      // JSON body (Fastify application/json), not HTML. Assistant `html` is
+      // produced by markdownToHtml → sanitize-html. `resp.render()` does not
+      // apply. Same send path as the other KG JSON routes; flagged because
+      // this line moved.
+      // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write
+      return reply.send(page);
+    } catch (err) {
+      logger.error({ err, conversationId }, 'chat history fetch failed');
+      return reply.status(500).send({ error: 'Failed to fetch chat history' });
+    }
+  });
+}

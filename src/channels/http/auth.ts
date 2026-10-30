@@ -47,6 +47,11 @@ export function validateBearerToken(
  */
 const SELF_AUTHED_API_PREFIXES = [
   '/api/kg',
+  // Console CRUD moved off /api/kg/* (#872) — each prefix self-auths via assertSecret.
+  '/api/tasks',
+  '/api/contacts',
+  '/api/chat',
+  '/api/grant-recommendations',
   '/api/voice',
   '/api/identity',
   '/api/executive',

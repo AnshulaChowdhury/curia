@@ -23,7 +23,7 @@ type IdentityStatus = 'active' | 'defunct' | 'bounced';
 type DrawerMode = 'view' | 'edit' | 'create' | null;
 
 // A contact's linked channel identity, as serialized by
-// GET /api/kg/contacts/:id/identities (Date fields are ISO strings here).
+// GET /api/contacts/:id/identities (Date fields are ISO strings here).
 interface ContactIdentity {
   id: string;
   contactId: string;
@@ -200,7 +200,7 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
     if (!contact || creating) return;
     setIdentitiesError(null);
     try {
-      const res = await apiFetch(`/api/kg/contacts/${contact.id}/identities`);
+      const res = await apiFetch(`/api/contacts/${contact.id}/identities`);
       if (!res.ok) { setIdentitiesError('Failed to load identities'); return; }
       const d = await res.json() as { identities: ContactIdentity[] };
       setIdentities(d.identities);
@@ -212,7 +212,7 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
   useEffect(() => {
     if (!contact || creating) return;
     setOverridesError(null);
-    apiFetch(`/api/kg/contacts/${contact.id}/overrides`)
+    apiFetch(`/api/contacts/${contact.id}/overrides`)
       .then(async res => {
         if (!res.ok) { setOverridesError('Failed to load permissions'); return; }
         const d = await res.json() as { overrides: AuthOverride[] };
@@ -230,7 +230,7 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
     if (!contact) return;
     setRevoking(permission);
     try {
-      const res = await apiFetch(`/api/kg/contacts/${contact.id}/overrides/${permission}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/contacts/${contact.id}/overrides/${permission}`, { method: 'DELETE' });
       if (!res.ok) { setOverridesError('Failed to revoke permission'); return; }
       setOverrides(prev => prev.filter(o => o.permission !== permission));
     } catch (_err: unknown) {
@@ -250,7 +250,7 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
     setIdentityBusy('add');
     setIdentitiesError(null);
     try {
-      const res = await apiFetch(`/api/kg/contacts/${contact.id}/identities`, {
+      const res = await apiFetch(`/api/contacts/${contact.id}/identities`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -276,7 +276,7 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
     setIdentityBusy(identityId);
     setIdentitiesError(null);
     try {
-      const res = await apiFetch(`/api/kg/contacts/${contact.id}/identities/${identityId}`, {
+      const res = await apiFetch(`/api/contacts/${contact.id}/identities/${identityId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ verified: true }),
@@ -296,7 +296,7 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
     setIdentityBusy(identityId);
     setIdentitiesError(null);
     try {
-      const res = await apiFetch(`/api/kg/contacts/${contact.id}/identities/${identityId}`, {
+      const res = await apiFetch(`/api/contacts/${contact.id}/identities/${identityId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status }),
@@ -316,7 +316,7 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
     setIdentityBusy(identityId);
     setIdentitiesError(null);
     try {
-      const res = await apiFetch(`/api/kg/contacts/${contact.id}/identities/${identityId}`, {
+      const res = await apiFetch(`/api/contacts/${contact.id}/identities/${identityId}`, {
         method: 'DELETE',
       });
       if (!res.ok) throw new Error(await errorMessage(res));
@@ -334,7 +334,7 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
     setMerging(true);
     setMergeError(null);
     try {
-      const preview = await apiFetch('/api/kg/contacts/merge', {
+      const preview = await apiFetch('/api/contacts/merge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -353,7 +353,7 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
       );
       if (!confirmed) return;
 
-      const res = await apiFetch('/api/kg/contacts/merge', {
+      const res = await apiFetch('/api/contacts/merge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -411,13 +411,13 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
 
       let res: Response;
       if (creating) {
-        res = await apiFetch('/api/kg/contacts', {
+        res = await apiFetch('/api/contacts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
       } else {
-        res = await apiFetch(`/api/kg/contacts/${contact!.id}`, {
+        res = await apiFetch(`/api/contacts/${contact!.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -443,7 +443,7 @@ function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, o
     setDeleting(true);
     setError(null);
     try {
-      const res = await apiFetch(`/api/kg/contacts/${contact.id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/contacts/${contact.id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error(await errorMessage(res));
       onDeleted(contact.id);
     } catch (err) {
@@ -819,7 +819,7 @@ function ContactViewDrawer({ contact, onClose, onEdit }: ViewDrawerProps) {
     setIdentities([]);
     setIdentitiesLoaded(false);
     setIdentitiesError(null);
-    apiFetch(`/api/kg/contacts/${contact.id}/identities`)
+    apiFetch(`/api/contacts/${contact.id}/identities`)
       .then(async res => {
         if (cancelled) return;
         if (!res.ok) { setIdentities([]); setIdentitiesError('Failed to load identities'); return; }
@@ -834,7 +834,7 @@ function ContactViewDrawer({ contact, onClose, onEdit }: ViewDrawerProps) {
   useEffect(() => {
     let cancelled = false;
     setOverrides([]);
-    apiFetch(`/api/kg/contacts/${contact.id}/overrides`)
+    apiFetch(`/api/contacts/${contact.id}/overrides`)
       .then(async res => {
         if (cancelled) return;
         if (!res.ok) { setOverrides([]); return; }
@@ -966,7 +966,7 @@ export default function ContactsPage() {
   // stale pre-fetch closure.
   const load = useCallback(async (): Promise<Contact[] | null> => {
     try {
-      const res = await apiFetch('/api/kg/contacts');
+      const res = await apiFetch('/api/contacts');
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as { contacts: Contact[] };
       setContacts(data.contacts);
