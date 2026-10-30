@@ -28,7 +28,7 @@ import type { LLMProvider, LLMReasoning, LLMResponse, LLMStreamEvent, LLMUsage, 
 import type { Logger } from '../../logger.js';
 import { classifyError } from '../../errors/classify.js';
 import type { ModelRegistry } from './model-registry.js';
-import { logUnsentReasoningEffort, resolveReasoning, resolveTemperature, type ReasoningEffort } from './sampling-options.js';
+import { logUnsentReasoningEffort, resolveReasoning, resolveStreamMaxRetries, resolveTemperature, type ReasoningEffort } from './sampling-options.js';
 import { PrefixHasher, sendableReasoningBlocks } from './reasoning-blocks.js';
 import { isCallerCancellation } from './cancellation.js';
 
@@ -530,7 +530,17 @@ export class AnthropicProvider implements LLMProvider {
       const built = this.buildCreateParams(params, 'stream');
       model = built.model;
       const { createParams, signal, prefixHash, reasoningEffort, reasoningBlocksDropped } = built;
-      const stream = this.client.messages.stream(createParams, signal ? { signal } : undefined);
+      // The watchdog's stream sets streamMaxRetries: 0 so its chat() fallback owns the
+      // retries (#2371); direct callers such as voice keep the SDK's default retries.
+      const streamMaxRetries = resolveStreamMaxRetries(params.options);
+      const requestOptions = {
+        ...(signal ? { signal } : {}),
+        ...(streamMaxRetries !== undefined ? { maxRetries: streamMaxRetries } : {}),
+      };
+      const stream = this.client.messages.stream(
+        createParams,
+        Object.keys(requestOptions).length > 0 ? requestOptions : undefined,
+      );
 
       // Guarantee the underlying fetch Response / ReadableStream is released on every
       // exit path — normal completion, a thrown error, an AbortSignal firing, or a

@@ -3498,6 +3498,7 @@ export class AgentRuntime {
           provider: providerIdOverride ?? provider.id,
           errorType: response.error.type,
           parentEventId: taskEvent.id,
+          ...(response.reasoningWatchdog !== undefined ? { reasoningWatchdog: response.reasoningWatchdog } : {}),
         });
         await bus.publish('agent', event);
       } catch (err) {

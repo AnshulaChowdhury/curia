@@ -22,7 +22,7 @@ import type { LLMProvider, LLMResponse, LLMStreamEvent, LLMUsage, LLMCallProvena
 import type { Logger } from '../../logger.js';
 import { classifyError } from '../../errors/classify.js';
 import type { ModelRegistry } from './model-registry.js';
-import { logUnsentReasoningEffort, resolveReasoning, resolveTemperature, type ReasoningEffort } from './sampling-options.js';
+import { logUnsentReasoningEffort, resolveReasoning, resolveStreamMaxRetries, resolveTemperature, type ReasoningEffort } from './sampling-options.js';
 import { sendableReasoningBlocks } from './reasoning-blocks.js';
 import { isCallerCancellation } from './cancellation.js';
 import { LLM_REQUEST_TIMEOUT_MS } from './request-timeout.js';
@@ -987,11 +987,12 @@ export class OpenRouterProvider implements LLMProvider {
         stream: true,
         stream_options: { include_usage: true },
       };
-      // No SDK retries (#2371): a retry inside the SDK is invisible to llm.call's
-      // attempt count. A failed watched call falls back to chat(), which retries
-      // and counts each attempt; voice fails the turn fast rather than hanging.
+      // The watchdog's stream sets streamMaxRetries: 0, because its fallback to chat()
+      // retries and counts each attempt (#2371). Direct callers such as voice keep the
+      // SDK's retries, which happen before any token arrives (nothing reached TTS yet).
+      const streamMaxRetries = resolveStreamMaxRetries(params.options);
       const stream = await this.client.chat.completions.create(streamParams, {
-        maxRetries: 0,
+        ...(streamMaxRetries !== undefined ? { maxRetries: streamMaxRetries } : {}),
         ...(signal ? { signal } : {}),
       });
       abortStream = () => stream.controller.abort();
@@ -1091,10 +1092,10 @@ export class OpenRouterProvider implements LLMProvider {
         providerRequestId,
         ...(upstreamProvider !== undefined ? { upstreamProvider } : {}),
         ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
-        // One request, never retried here (SDK retries are off above), so the
-        // #1915 attempt telemetry reads the same as a first-try chat().
-        attempts: 1,
-        failedAttemptsMs: 0,
+        // With SDK retries off it was exactly one request, so the #1915 attempt
+        // telemetry reads the same as a first-try chat(). With SDK retries on the
+        // count is unknowable here, so it is left out (llm.call records null).
+        ...(streamMaxRetries === 0 ? { attempts: 1, failedAttemptsMs: 0 } : {}),
       };
       const reasoning = reasoningFieldsFromParts(
         reasoningDirect,

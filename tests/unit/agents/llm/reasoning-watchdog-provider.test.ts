@@ -446,6 +446,16 @@ describe('ReasoningWatchdogProvider', () => {
     });
   });
 
+  it('asks the watched stream for no SDK retries; the forced attempt keeps the provider default', async () => {
+    const inner = fakeProvider({
+      steps: [{ type: 'request_started', maxTokens: 10 }, ...reasoning(6)],
+      chatResponses: [textResponse('forced')],
+    });
+    await new ReasoningWatchdogProvider(inner, createSilentLogger()).chat(baseParams({ reasoning: { effort: 'low' } }));
+    expect(inner.streamCalls[0]!.options).toMatchObject({ streamMaxRetries: 0, reasoning: { effort: 'low' } });
+    expect(inner.chatCalls[0]!.options).not.toHaveProperty('streamMaxRetries');
+  });
+
   it('message_end empty after reasoning is a watchdog stop with trigger "cap", counting its real usage', async () => {
     const stoppedUsage = usage({
       inputTokens: 500,
@@ -625,7 +635,7 @@ describe('ReasoningWatchdogProvider', () => {
     expect(result.provenance.reasoningWatchdog).toMatchObject({ trigger: 'tokens', forcedOutcome: 'empty' });
   });
 
-  it('the forced response is an error: returned as-is, warn logged with forcedOutcome "error"', async () => {
+  it('the forced response is an error: returned with the watchdog record for llm.error, warn logged', async () => {
     const forcedError: LLMResponse = { type: 'error', error: agentError('upstream 502') };
     const inner = fakeProvider({
       steps: [{ type: 'request_started', maxTokens: 10 }, ...reasoning(6)],
@@ -634,7 +644,9 @@ describe('ReasoningWatchdogProvider', () => {
     const logger = createSilentLogger();
     const warn = vi.spyOn(logger, 'warn');
     const result = await new ReasoningWatchdogProvider(inner, logger).chat(baseParams());
-    expect(result).toEqual(forcedError);
+    if (result.type !== 'error') throw new Error(`expected error, got ${result.type}`);
+    expect(result.error).toBe(forcedError.error);
+    expect(result.reasoningWatchdog).toMatchObject({ trigger: 'tokens', firedAtReasoningTokens: 5, forcedOutcome: 'error' });
     expect(inner.chatCalls).toHaveLength(1);
     expect(warn).toHaveBeenCalledWith(
       expect.objectContaining({ reasoningWatchdog: expect.objectContaining({ trigger: 'tokens', forcedOutcome: 'error' }) }),

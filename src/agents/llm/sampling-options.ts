@@ -115,6 +115,18 @@ export function parseTemperature(
 }
 
 /**
+ * `options.streamMaxRetries`: the SDK retry count for one `stream()` request, or
+ * undefined to keep the SDK default. The reasoning watchdog sets 0 on the stream
+ * it watches, because its fallback to `chat()` owns and counts the retries (#2371).
+ * Direct stream callers such as voice leave it unset and keep the SDK's retries,
+ * which run before any token arrives. Anything but a non-negative integer is unset.
+ */
+export function resolveStreamMaxRetries(options: Record<string, unknown> | undefined): number | undefined {
+  const value = options?.streamMaxRetries;
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
  * Resolve `options.temperature` for an LLM request.
  *
  * Returns a finite number when the caller set one (including 0). Returns

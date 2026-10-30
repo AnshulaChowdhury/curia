@@ -192,10 +192,12 @@ export interface ToolResult {
 // partial failures gracefully without try/catch boilerplate throughout the agent.
 // Successful variants carry provenance — the runtime uses it to publish llm.call events.
 // Error paths omit provenance: when the API fails there is no response body to extract from.
+// An error can still carry the watchdog record when its forced attempt failed (#2371);
+// the runtime copies it onto llm.error.
 export type LLMResponse =
   | ({ type: 'text'; content: string; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
   | ({ type: 'tool_use'; toolCalls: ToolCall[]; content?: string; reasoningBlocks?: ReasoningContent[]; usage: LLMUsage; provenance: LLMCallProvenance } & LLMReasoning)
-  | { type: 'error'; error: AgentError; usage?: LLMUsage };
+  | { type: 'error'; error: AgentError; usage?: LLMUsage; reasoningWatchdog?: ReasoningWatchdogRecord };
 
 export type LLMStreamEvent =
   /**

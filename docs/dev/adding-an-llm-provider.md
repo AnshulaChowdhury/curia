@@ -61,7 +61,7 @@ Register dated snapshots in their own right. Lookup is exact-first, then longest
 Four more rules:
 
 - **Yield `error` events** for API failures, as `chat()` returns them. Do not throw mid-stream.
-- **No SDK retries.** Send the stream request with the SDK's retries off (`maxRetries: 0`). A failed watched stream falls back to `chat()`, which retries and counts each attempt; SDK retries underneath would be hidden and multiply the requests.
+- **Honor `options.streamMaxRetries`.** When it is set (the watchdog sets `0` on the stream it watches), pass it as the SDK's `maxRetries` for that request: a failed watched stream falls back to `chat()`, which retries and counts each attempt, so SDK retries underneath would be hidden and multiply the requests. When it is unset, keep the SDK's default retries: direct callers such as voice cannot fall back, and a retry before the first token is safe. Read it with `resolveStreamMaxRetries` (`sampling-options.ts`).
 - **Honor `options.signal`.** A cancelled stream ends promptly, with an `error` event or by throwing the SDK's abort error.
 - **Release the SDK stream on every exit.** Close it in a `finally`, so a consumer that stops early (the watchdog does, and so does barge-in) frees the response buffers. A consumer calling `return()` on your iterator must reach that `finally`.
 
@@ -97,7 +97,7 @@ The wrapper does nothing for a provider that has no `stream()`: it passes `chat(
 - falls back to a plain `inner.chat()` once if the stream fails with a retryable error, or ends empty with no readable reasoning (so `chat()`'s own empty-reply retry runs); a non-retryable error event is returned as is;
 - passes a caller's abort straight through, and never cuts a reply once output has started.
 
-The thresholds are in `reasoning-watchdog.ts`. The stopped call is recorded on `llm.call` as `reasoningWatchdog` (`null` when it did not fire). The test-mode stack, `src/startup/test-mode-stack.ts`, wraps each provider the same way, so wrap yours there too if the behavior suites should be able to run on it.
+The thresholds are in `reasoning-watchdog.ts`. The stopped call is recorded on `llm.call` as `reasoningWatchdog` (`null` when it did not fire); when the forced attempt itself fails, the record rides on the error response and lands on `llm.error` instead. The test-mode stack, `src/startup/test-mode-stack.ts`, wraps each provider the same way, so wrap yours there too if the behavior suites should be able to run on it.
 
 Do not import the wrapper from your provider, or your provider from the wrapper. The wrapper imports no concrete provider module, even indirectly; a value both sides need (like the request timeout in `request-timeout.ts`) goes in a neutral module.
 
@@ -126,7 +126,7 @@ Also add the models to the checks in `model-registry.test.ts` and `provider-rout
 - [ ] `max_tokens` is capped at the registry value; `signal`, `temperature` and `reasoning` go through `sampling-options.ts`
 - [ ] No reasoning budget is sent, and never an effort together with a budget
 - [ ] `LLMCallProvenance` and `LLMUsage` are filled, including `reasoningTokens` where reported
-- [ ] If `stream()` exists: `request_started` first and once, `reasoning_delta` per readable delta, `output_started` on the first tool-call chunk, then `tool_use` or `message_end`; SDK retries off; it honors `options.signal` and releases the SDK stream on every exit
+- [ ] If `stream()` exists: `request_started` first and once, `reasoning_delta` per readable delta, `output_started` on the first tool-call chunk, then `tool_use` or `message_end`; SDK retries follow `options.streamMaxRetries`; it honors `options.signal` and releases the SDK stream on every exit
 - [ ] If `stream()` is omitted, it is omitted entirely (no stub), and the docs note that the provider is unwatched and cannot serve voice
 - [ ] Reasoning blocks are returned and passed back verbatim, filtered with `sendableReasoningBlocks`
 - [ ] Registered in `src/index.ts` (and the test-mode stack) wrapped with `watchProvider`

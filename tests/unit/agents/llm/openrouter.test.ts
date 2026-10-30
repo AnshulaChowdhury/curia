@@ -710,7 +710,7 @@ describe('OpenRouterProvider — stream', () => {
         type: 'message_end',
         content: 'hello',
         usage: { inputTokens: 12, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
-        provenance: { requestedModel: 'openai/gpt-4o', actualModel: 'openai/gpt-4o', providerRequestId: 'chatcmpl-stream-123', attempts: 1, failedAttemptsMs: 0 },
+        provenance: { requestedModel: 'openai/gpt-4o', actualModel: 'openai/gpt-4o', providerRequestId: 'chatcmpl-stream-123' },
       },
     ]);
     const params = mockCreate.mock.calls[0]![0];
@@ -781,7 +781,7 @@ describe('OpenRouterProvider — stream', () => {
       toolCalls: [{ id: 'call_1', name: 'search', input: { query: 'curia' } }],
       content: 'Checking. ',
       usage: { inputTokens: 22, outputTokens: 8, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
-      provenance: { requestedModel: 'openai/gpt-4o', actualModel: 'openai/gpt-4o', providerRequestId: 'chatcmpl-stream-tool', attempts: 1, failedAttemptsMs: 0 },
+      provenance: { requestedModel: 'openai/gpt-4o', actualModel: 'openai/gpt-4o', providerRequestId: 'chatcmpl-stream-tool' },
     });
   });
 
@@ -936,22 +936,40 @@ describe('OpenRouterProvider — stream', () => {
       options: { signal: controller.signal },
     }));
 
-    expect(mockCreate.mock.calls[0]![1]).toEqual({ signal: controller.signal, maxRetries: 0 });
+    expect(mockCreate.mock.calls[0]![1]).toEqual({ signal: controller.signal });
   });
 
-  it('turns off SDK retries on the stream request, so retries are counted where they happen (#1915)', async () => {
-    mockCreate.mockResolvedValue(makeStream([
-      {
-        id: 'chatcmpl-noretry',
-        model: 'openai/gpt-4o',
-        choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: 'stop', logprobs: null }],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-        object: 'chat.completion.chunk',
-        created: 1700000000,
-      },
-    ]));
+  const noRetryChunk = () => makeStream([
+    {
+      id: 'chatcmpl-noretry',
+      model: 'openai/gpt-4o',
+      choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: 'stop', logprobs: null }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      object: 'chat.completion.chunk',
+      created: 1700000000,
+    },
+  ]);
+
+  it('keeps the SDK retries on a direct stream such as voice, and reports no attempt count', async () => {
+    mockCreate.mockResolvedValue(noRetryChunk());
     const provider = new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
     const events = await collectStream(provider.stream({ messages: [{ role: 'user', content: 'Hello' }], model: 'openai/gpt-4o' }));
+
+    expect(mockCreate.mock.calls[0]![1]).toEqual({});
+    const end = events.at(-1);
+    if (end?.type !== 'message_end') throw new Error(`expected message_end, got ${end?.type}`);
+    expect(end.provenance).not.toHaveProperty('attempts');
+    expect(end.provenance).not.toHaveProperty('failedAttemptsMs');
+  });
+
+  it('turns off SDK retries when options.streamMaxRetries is 0, and counts the one attempt (#1915, #2371)', async () => {
+    mockCreate.mockResolvedValue(noRetryChunk());
+    const provider = new OpenRouterProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    const events = await collectStream(provider.stream({
+      messages: [{ role: 'user', content: 'Hello' }],
+      model: 'openai/gpt-4o',
+      options: { streamMaxRetries: 0 },
+    }));
 
     expect(mockCreate.mock.calls[0]![1]).toEqual({ maxRetries: 0 });
     const end = events.at(-1);

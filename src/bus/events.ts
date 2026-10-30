@@ -1619,6 +1619,12 @@ interface LlmErrorPayload {
   provider: string;
   errorType: string;
   parentEventId: string;
+  /**
+   * Set when the reasoning watchdog stopped the call and its forced attempt then
+   * failed (`forcedOutcome: 'error'`, #2371); absent otherwise. Successful forced
+   * attempts are recorded on llm.call instead.
+   */
+  reasoningWatchdog?: ReasoningWatchdogRecord;
 }
 
 export interface LlmErrorEvent extends BaseEvent {

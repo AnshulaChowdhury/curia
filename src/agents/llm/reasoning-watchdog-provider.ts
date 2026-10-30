@@ -143,7 +143,9 @@ export class ReasoningWatchdogProvider implements LLMProvider {
     };
     const callerAborted = (): boolean => callerSignal?.aborted === true;
 
-    const iterator = stream({ ...params, options: { ...options, signal } })[Symbol.asyncIterator]();
+    // streamMaxRetries: 0 — a failed watched stream falls back to inner.chat(), which
+    // owns the retries and counts them; SDK retries underneath would be hidden.
+    const iterator = stream({ ...params, options: { ...options, signal, streamMaxRetries: 0 } })[Symbol.asyncIterator]();
     // The next event, or 'stopped' as soon as the watchdog aborts, so a stream stalled
     // mid-reasoning is abandoned at once even if the provider is slow to honour the
     // signal. A fresh promise per event, with its abort listener removed when the event
@@ -307,7 +309,11 @@ export class ReasoningWatchdogProvider implements LLMProvider {
         reasoningTokens: (response.usage.reasoningTokens ?? 0) + reasoningTokens,
       };
     }
-    if (response.type === 'error') return usage === undefined ? response : { ...response, usage };
+    // An error has no provenance, so the record rides on the response itself and the
+    // runtime copies it onto llm.error; otherwise a failed forced attempt leaves no trace.
+    if (response.type === 'error') {
+      return { ...response, ...(usage !== undefined ? { usage } : {}), reasoningWatchdog: record };
+    }
     return {
       ...response,
       usage: usage ?? response.usage,

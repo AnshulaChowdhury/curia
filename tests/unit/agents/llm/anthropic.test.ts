@@ -753,6 +753,19 @@ describe('AnthropicProvider — stream', () => {
     expect(stream.abort).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps the SDK retries on a direct stream, and turns them off for streamMaxRetries: 0 (#2371)', async () => {
+    const provider = new AnthropicProvider('test-key', createSilentLogger(), new ModelRegistry(createSilentLogger()));
+    const messages: Message[] = [{ role: 'user', content: 'Hello' }];
+
+    mockStream.mockReturnValue(makeStream([], streamFinal()));
+    for await (const _ of provider.stream({ messages, model: 'claude-sonnet-4-6' })) { /* drain */ }
+    expect(mockStream.mock.calls[0]![1]).toBeUndefined();
+
+    mockStream.mockReturnValue(makeStream([], streamFinal()));
+    for await (const _ of provider.stream({ messages, model: 'claude-sonnet-4-6', options: { streamMaxRetries: 0 } })) { /* drain */ }
+    expect(mockStream.mock.calls[1]![1]).toEqual({ maxRetries: 0 });
+  });
+
   it('aborts the underlying stream when the consumer stops at request_started', async () => {
     const stream = makeStream(
       [{ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'a' } }],

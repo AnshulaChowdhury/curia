@@ -401,6 +401,23 @@ describe('AgentRuntime turn deadline (#2371)', () => {
     expect(optionsOfCall(fallback, 0)).toEqual({ reasoning: { effort: 'high' }, deadlineAt: DEADLINE });
   });
 
+  it('copies a failed forced attempt\'s watchdog record onto llm.error', async () => {
+    const record = { trigger: 'time' as const, firedAtReasoningTokens: 4_300, firedAfterMs: 45_000, forcedOutcome: 'error' as const };
+    const notFound = makeNotFoundResponse();
+    if (notFound.type !== 'error') throw new Error('expected an error response');
+    const primary = makeProvider('openrouter', { ...notFound, reasoningWatchdog: record });
+    const fallback = makeProvider('anthropic', makeSuccessResponse(FALLBACK_MODEL));
+    const errors: Array<{ payload: { reasoningWatchdog?: unknown } }> = [];
+    bus.subscribe('llm.error', 'system', (event) => { errors.push(event as unknown as { payload: { reasoningWatchdog?: unknown } }); });
+    new AgentRuntime({
+      agentId: AGENT_ID, systemPrompt: 'You are helpful.', provider: primary, resolvedModel: PRIMARY_MODEL, tier: 'standard',
+      fallbackModel: FALLBACK_MODEL, fallbackProvider: fallback, bus, logger,
+    }).register();
+    await runTask(bus, AGENT_ID, 'hello', DEADLINE);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.payload.reasoningWatchdog).toEqual(record);
+  });
+
   it('passes deadlineAt on the retry call', async () => {
     const retryable: LLMResponse = {
       type: 'error',
