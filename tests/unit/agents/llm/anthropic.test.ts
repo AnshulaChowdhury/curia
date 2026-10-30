@@ -758,11 +758,11 @@ describe('AnthropicProvider — stream', () => {
     const messages: Message[] = [{ role: 'user', content: 'Hello' }];
 
     mockStream.mockReturnValue(makeStream([], streamFinal()));
-    for await (const _ of provider.stream({ messages, model: 'claude-sonnet-4-6' })) { /* drain */ }
+    await collectStream(provider.stream({ messages, model: 'claude-sonnet-4-6' }));
     expect(mockStream.mock.calls[0]![1]).toBeUndefined();
 
     mockStream.mockReturnValue(makeStream([], streamFinal()));
-    for await (const _ of provider.stream({ messages, model: 'claude-sonnet-4-6', options: { streamMaxRetries: 0 } })) { /* drain */ }
+    await collectStream(provider.stream({ messages, model: 'claude-sonnet-4-6', options: { streamMaxRetries: 0 } }));
     expect(mockStream.mock.calls[1]![1]).toEqual({ maxRetries: 0 });
   });
 
