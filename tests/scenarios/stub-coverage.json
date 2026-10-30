@@ -107,7 +107,7 @@
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T21:24:55.420Z"
+      "recordedAt": "2026-10-30T00:04:10.312Z"
     },
     "cc coffee follows standing rule (prefs)": {
       "unstubbed": 0,
@@ -119,7 +119,7 @@
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T21:22:49.103Z"
+      "recordedAt": "2026-10-29T23:53:17.003Z"
     },
     "cc coffee in a week or two": {
       "unstubbed": 0,
@@ -131,7 +131,7 @@
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T21:24:55.420Z"
+      "recordedAt": "2026-10-29T23:59:08.384Z"
     },
     "cc drinks follows standing rule (prefs)": {
       "unstubbed": 0,
@@ -143,7 +143,7 @@
       "unstubbed": 0,
       "runs": 5,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-21T21:22:49.103Z"
+      "recordedAt": "2026-10-29T23:47:13.817Z"
     },
     "cc move things around asks first at approval band": {
       "unstubbed": 0,
@@ -393,9 +393,9 @@
     },
     "inbox delegated rules request runs no triage": {
       "unstubbed": 0,
-      "runs": 5,
+      "runs": 1,
       "model": "deepseek/deepseek-v4.1-flash",
-      "recordedAt": "2026-10-14T16:53:34.402Z"
+      "recordedAt": "2026-10-30T00:22:00.106Z"
     },
     "inbox delegated summary reads and ranks the unread mail": {
       "unstubbed": 0,

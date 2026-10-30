@@ -675,7 +675,7 @@ function parseOutreach(raw: Raw, file: string): SeedOutreach[] {
  */
 function parsePinned(raw: Raw, file: string): SeedPinned | undefined {
   if (raw['pinned'] === undefined) return undefined;
-  const pinned: SeedPinned = { docs: new Map(), configs: new Map(), unavailable: new Set() };
+  const pinned: SeedPinned = { docs: {}, configs: {}, unavailable: [] };
   const block = mapping(raw, 'pinned', file, 'seed');
   onlyKeys(block, PINNED_KEYS, file, 'seed.pinned');
   const values = (key: 'docs' | 'configs'): Array<[string, string]> => {
@@ -698,9 +698,9 @@ function parsePinned(raw: Raw, file: string): SeedPinned | undefined {
   }
   // Keyed as the reader asks: a document by its normalized path, a setting as written.
   const name = (raw: string): string => (raw.startsWith('/') ? normalizeDocPath(raw) : raw);
-  for (const [path, text] of docs) pinned.docs.set(name(path), text);
-  for (const [key, value] of configs) pinned.configs.set(key, value);
-  for (const entry of unavailable) pinned.unavailable.add(name(entry));
+  for (const [path, text] of docs) pinned.docs[name(path)] = text;
+  for (const [key, value] of configs) pinned.configs[key] = value;
+  pinned.unavailable = unavailable.map(name);
   return pinned;
 }
 

@@ -485,15 +485,16 @@ export function scopedPinnedContextReader(real: PinnedContextReader, currentScop
     warnChars: real.warnChars,
     async readDoc(path) {
       const pinned = currentScope()?.pinned;
-      if (pinned?.unavailable.has(path)) throw new Error(`scenario seed: the read of ${path} fails`);
-      const content = pinned?.docs.get(path);
-      return content === undefined ? null : { status: 'live', version: 1, content };
+      if (pinned?.unavailable.includes(path)) throw new Error(`scenario seed: the read of ${path} fails`);
+      return pinned && Object.hasOwn(pinned.docs, path)
+        ? { status: 'live', version: 1, content: pinned.docs[path]! }
+        : null;
     },
     async readConfig(namespace, key) {
       const name = `${namespace}/${key}`;
       const pinned = currentScope()?.pinned;
-      if (pinned?.unavailable.has(name)) throw new Error(`scenario seed: the read of ${name} fails`);
-      return pinned?.configs.get(name) ?? null;
+      if (pinned?.unavailable.includes(name)) throw new Error(`scenario seed: the read of ${name} fails`);
+      return pinned && Object.hasOwn(pinned.configs, name) ? pinned.configs[name]! : null;
     },
   };
 }

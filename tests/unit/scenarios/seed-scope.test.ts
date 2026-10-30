@@ -131,9 +131,9 @@ describe('scoped views with overlapping runs', () => {
     const view = scopedPinnedContextReader(real, currentScope);
     const withRules = run('A', []);
     withRules.scope.pinned = {
-      docs: new Map([['/shared/inbox/rules.md', '## Board mail']]),
-      configs: new Map([['ceo_inbox/decision_tagging', '{"enabled": true}']]),
-      unavailable: new Set(['/shared/calendar/rules.md', 'debrief/config']),
+      docs: { '/shared/inbox/rules.md': '## Board mail' },
+      configs: { 'ceo_inbox/decision_tagging': '{"enabled": true}' },
+      unavailable: ['/shared/calendar/rules.md', 'debrief/config'],
     };
     const [a, b] = await Promise.all([
       context.run(withRules, async () => ({

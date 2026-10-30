@@ -11,6 +11,7 @@ import {
   selectRunCases,
 } from '../../scenarios/loader.js';
 import type { ScenarioCase } from '../../scenarios/types.js';
+import { resolveDatePlaceholders } from '../../shared/date-placeholders.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(path.join(tmpdir(), 'scenarios-')); });
@@ -264,9 +265,13 @@ describe('loadScenarioCase', () => {
       '',
     ].join('\n'));
     const c = loadScenarioCase(write('pinned.yaml', body));
-    expect(c.seed.pinned?.docs).toEqual(new Map([['/shared/inbox/rules.md', '## Board mail']]));
-    expect(c.seed.pinned?.configs).toEqual(new Map([['ceo_inbox/decision_tagging', '{"enabled": true}']]));
-    expect(c.seed.pinned?.unavailable).toEqual(new Set(['/shared/calendar/rules.md', 'debrief/config']));
+    expect(c.seed.pinned).toEqual({
+      docs: { '/shared/inbox/rules.md': '## Board mail' },
+      configs: { 'ceo_inbox/decision_tagging': '{"enabled": true}' },
+      unavailable: ['/shared/calendar/rules.md', 'debrief/config'],
+    });
+    // The harness seeds from a date-resolved copy (harness.ts); the values must survive it.
+    expect(resolveDatePlaceholders(c.seed, 'America/Toronto').pinned).toEqual(c.seed.pinned);
     expect(loadScenarioCase(write('none.yaml', VALID)).seed).not.toHaveProperty('pinned');
   });
 

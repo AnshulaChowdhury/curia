@@ -159,14 +159,16 @@ export interface ExpectedBehavior {
  * What the run's agents read through pinned_context (`seed.pinned`, #2339). The harness
  * serves these instead of the database's own, so runs never see each other's documents
  * or the copied database's: an entry not named here reads as not yet created / not set.
+ * Plain records and arrays, not Map/Set: the seed passes through resolveDatePlaceholders,
+ * which rebuilds every object from its own entries.
  */
 export interface SeedPinned {
   /** Document text by `/shared/` path, shown as the block shows a live document. */
-  docs: Map<string, string>;
+  docs: Record<string, string>;
   /** Config value by `<namespace>/<key>`. */
-  configs: Map<string, string>;
+  configs: Record<string, string>;
   /** Paths and `<namespace>/<key>` keys whose read fails: the block shows them as unavailable. */
-  unavailable: Set<string>;
+  unavailable: string[];
 }
 
 /** A contact to create for the run. Referenced elsewhere as `{{contact:<key>}}`. */
