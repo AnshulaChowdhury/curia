@@ -8,27 +8,31 @@
 //   - Structural pair (shared channel identity / same kg_node_id / exact name) → auto-merge
 //     UNLESS either contact is the principal (system_role='principal') → task instead.
 //   - Fuzzy pair (name/JW similarity) → Curia-owned task (never auto-merge).
-//   - Excluded pair (dedup_exclusion KG fact) → skip entirely.
+//   - Excluded pair (row in contact_dedup_exclusions) → skip entirely.
 //
 // Dry-run mode (--dry-run flag): reports what would happen without writing anything.
 //
 // Run: pnpm run dedup:contacts [--dry-run]
 
+import path from 'node:path';
 import pg from 'pg';
 import { createLogger } from '../src/logger.js';
 import { classifyPair, type PairClassification } from '../src/contacts/dedup-classifier.js';
-import type { Contact, ChannelIdentity, ContactKind } from '../src/contacts/types.js';
-import type { KgNode } from '../src/memory/types.js';
+import { meetsMinimumTier, type Contact, type ChannelIdentity, type ContactKind } from '../src/contacts/types.js';
 import {
-  writeExclusion,
-  hasExclusion,
-  type WriteExclusionOptions,
-  type HasExclusionOptions,
-} from '../src/contacts/dedup-exclusions.js';
+  canonicalPairKey,
+  dedupPairTag,
+  pairKeyFromDedupTask,
+} from '../src/contacts/dedup-pair-key.js';
 import { ModelRegistry } from '../src/agents/llm/model-registry.js';
 import { EventBus } from '../src/bus/bus.js';
 import { AuditLogger } from '../src/audit/logger.js';
 import { EmbeddingService } from '../src/memory/embedding.js';
+import { resolveKnowledgeGraphEmbedding, type KnowledgeGraphEmbedding } from '../src/memory/embedding-schema.js';
+import { loadConfig, loadYamlConfig } from '../src/config.js';
+import { loadEncryptionKey } from '../src/secrets/crypto.js';
+import { SecretsService } from '../src/secrets/secrets-service.js';
+import { applyVaultSecrets } from '../src/secrets/apply-vault-secrets.js';
 import { KnowledgeGraphStore } from '../src/memory/knowledge-graph.js';
 import { MemoryValidator } from '../src/memory/validation.js';
 import { EntityMemory } from '../src/memory/entity-memory.js';
@@ -54,8 +58,10 @@ export interface DedupRunResult {
   mergedCount: number;
   /** Number of fuzzy pairs that had tasks created (0 in dry-run). */
   taskCount: number;
-  /** Number of pairs skipped due to dedup_exclusion facts. */
+  /** Number of pairs skipped due to a recorded dedup exclusion. */
   skippedExcludedCount: number;
+  /** Number of pairs skipped because an open dedup review task already exists. */
+  skippedExistingCount: number;
   /** Number of structural pairs involving the principal (routed to task instead of merge). */
   principalSkippedCount: number;
   /** Number of pairs that would have been merged (dry-run report). */
@@ -68,7 +74,8 @@ export interface DedupRunResult {
   skippedAboveMaxScoreCount: number;
   /** Number of would-be review tasks suppressed by --no-tasks or the --max-tasks cap. */
   suppressedTaskCount: number;
-  /** Number of errors during merge/task-create operations. */
+  /** Number of pairs that failed and were skipped fail-closed. Three sources:
+   *  pair classification, contact merge, and review-task creation. */
   errorCount: number;
 }
 
@@ -87,8 +94,7 @@ export interface DedupRunOptions {
    * (counted in skippedAboveMaxScoreCount). Pairs with `minScore ≤ score < maxScore` are
    * acted on. Used for incremental band runs: a later, lower `--min-score` pass sets
    * `--max-score` to the previous run's `--min-score` so it doesn't re-create tasks for
-   * pairs the earlier run already surfaced (the sweep is not task-idempotent). Undefined =
-   * no upper bound.
+   * pairs the earlier run already surfaced. Undefined = no upper bound.
    */
   maxScore?: number;
   /**
@@ -113,14 +119,18 @@ export interface DedupRunOptions {
     sourceAgentId: string;
     tags: string[];
   }) => Promise<unknown>;
-  // storeFact is NOT included here: the sweep never writes exclusion facts.
-  // Decline→exclusion writes go through the contacts agent calling contact-dedup-exclude.
-  /** Calls EntityMemory.getFacts for a KG node — returns fact nodes. */
-  getFacts: (kgNodeId: string) => Promise<KgNode[]>;
+  /** Open dedup review tasks for idempotency checks. Omit in unit tests that don't need it. */
+  listOpenDedupTasks?: () => Promise<Array<{ tags?: string[]; description?: string | null }>>;
+  /**
+   * Every recorded exclusion as a canonical pair key (ContactService.listDedupExclusionPairKeys).
+   * Loaded once per run, before the O(n²) pair loop — one query instead of a lookup per pair.
+   *
+   * The sweep never WRITES exclusions: decline→exclude goes through the contacts agent
+   * calling contact-dedup-exclude. A failure here aborts the whole sweep (fail closed) —
+   * proceeding with an empty set would auto-merge pairs the CEO ruled apart.
+   */
+  listExclusionPairKeys: () => Promise<Set<string>>;
 }
-
-// Re-export shared helpers so existing test imports from this module keep working.
-export { writeExclusion, hasExclusion, type WriteExclusionOptions, type HasExclusionOptions };
 
 // ---------------------------------------------------------------------------
 // Core sweep logic (exported for tests)
@@ -142,27 +152,14 @@ export async function runDedup(
   identityMap: Map<string, ChannelIdentity[]>,
   opts: DedupRunOptions,
 ): Promise<DedupRunResult> {
-  const { dryRun, mergeContacts, createTask, getFacts, minScore, maxScore, maxTasks, noTasks } = opts;
-
-  // Memoize getFacts per KG node for the duration of the sweep. The exclusion check
-  // runs inside the O(n²) pair loop, and a contact that appears in many candidate
-  // pairs would otherwise re-fetch its KG facts each time. Exclusion facts are static
-  // within a run (the sweep never writes them — that's the agent's decline path), so
-  // caching is safe. Keyed by kg_node_id; contacts without a node are never looked up.
-  const factsCache = new Map<string, KgNode[]>();
-  const cachedGetFacts = async (kgNodeId: string): Promise<KgNode[]> => {
-    const hit = factsCache.get(kgNodeId);
-    if (hit !== undefined) return hit;
-    const facts = await getFacts(kgNodeId);
-    factsCache.set(kgNodeId, facts);
-    return facts;
-  };
+  const { dryRun, mergeContacts, createTask, listExclusionPairKeys, minScore, maxScore, maxTasks, noTasks, listOpenDedupTasks } = opts;
 
   const result: DedupRunResult = {
     dryRun,
     mergedCount: 0,
     taskCount: 0,
     skippedExcludedCount: 0,
+    skippedExistingCount: 0,
     principalSkippedCount: 0,
     wouldMergeCount: 0,
     wouldCreateTaskCount: 0,
@@ -174,6 +171,48 @@ export async function runDedup(
 
   if (contacts.length < 2) return result;
 
+  // Load exclusions before any pair is classified. The sweep never WRITES exclusions,
+  // so one bulk read covers the entire O(n²) loop. An error propagates and aborts the
+  // sweep — see listExclusionPairKeys' doc comment.
+  const excludedPairKeys = await listExclusionPairKeys();
+  logger.debug({ exclusions: excludedPairKeys.size }, 'dedup: loaded recorded exclusions');
+
+  /**
+   * Mirror ContactService.reattachDedupExclusions onto the in-memory snapshot after a
+   * merge. The sweep does not write exclusions, but it does MERGE, and a merge re-points
+   * the secondary's exclusion rows onto the survivor. Without this the snapshot goes
+   * stale mid-run and a transitively-inherited exclusion is invisible to later pairs:
+   *
+   *   c1, c2, c3 all named "Seth Berman"; the CEO ruled c2 ≠ c3.
+   *   (c1, c2) merges structurally on exact name → the DB row becomes (c1, c3).
+   *   (c1, c3) is then checked against a snapshot that still says (c2, c3) → miss →
+   *   auto-merged, silently overriding the CEO's ruling.
+   *
+   * Applied in dry-run too, so the preview reports what a real run would actually do.
+   */
+  function reattachExclusionsInSnapshot(primaryId: string, secondaryId: string): void {
+    for (const excludedKey of [...excludedPairKeys]) {
+      const [x, y] = excludedKey.split(':') as [string, string];
+      if (x !== secondaryId && y !== secondaryId) continue;
+
+      excludedPairKeys.delete(excludedKey);
+      const other = x === secondaryId ? y : x;
+      // The exclusion between the two merged contacts is superseded by the merge
+      // itself — the DB drops it for the same reason.
+      if (other === primaryId) continue;
+      excludedPairKeys.add(canonicalPairKey(primaryId, other));
+    }
+  }
+
+  const existingPairKeys = new Set<string>();
+  if (listOpenDedupTasks) {
+    const existingTasks = await listOpenDedupTasks();
+    for (const task of existingTasks) {
+      const key = pairKeyFromDedupTask(task);
+      if (key) existingPairKeys.add(key);
+    }
+  }
+
   // Track pairs we've already handled to avoid double-processing (A,B) and (B,A).
   const processedPairs = new Set<string>();
 
@@ -184,7 +223,7 @@ export async function runDedup(
 
   // We need a canonical ordering for pair keys
   function pairKey(aId: string, bId: string): string {
-    return aId < bId ? `${aId}:${bId}` : `${bId}:${aId}`;
+    return canonicalPairKey(aId, bId);
   }
 
   for (let i = 0; i < contacts.length; i++) {
@@ -205,41 +244,29 @@ export async function runDedup(
       const aIdentities = identityMap.get(a.id) ?? [];
       const bIdentities = identityMap.get(b.id) ?? [];
 
-      // F4: Wrap the exclusion check and classification in a try-catch so that
-      // a transient DB error (e.g. getFacts throws) does not abort the entire
-      // sweep. On error we FAIL CLOSED: the pair is skipped (never merged)
-      // and errorCount is incremented so the operator knows something went wrong.
+      // F4: Wrap classification in a try-catch so that an error on one pair does not
+      // abort the entire sweep. On error we FAIL CLOSED: the pair is skipped (never
+      // merged) and errorCount is incremented so the operator knows something went wrong.
       let classification: PairClassification | null;
-      let excluded: boolean;
       try {
         // Classify the pair: structural, fuzzy, or null (below threshold)
         classification = classifyPair(a, aIdentities, b, bIdentities);
-        if (classification === null) continue;
-
-        // ------------------------------------------------------------------
-        // Check for a prior dedup_exclusion in either direction
-        // ------------------------------------------------------------------
-        // We check regardless of classification type — exclusions apply to all matches.
-        excluded = await hasExclusion({
-          contactAId: a.id,
-          contactBId: b.id,
-          kgNodeIdA: a.kgNodeId,
-          kgNodeIdB: b.kgNodeId,
-          getFacts: cachedGetFacts,
-        });
       } catch (err) {
-        // Fail closed: any error during classification or exclusion check means
-        // we DO NOT proceed to merge. Log and move on to the next pair.
         logger.error(
           { err, contactAId: a.id, contactBId: b.id },
-          'dedup: error during classification/exclusion check — skipping pair (fail closed)',
+          'dedup: error during classification — skipping pair (fail closed)',
         );
         result.errorCount++;
         continue;
       }
+      if (classification === null) continue;
 
-      if (excluded) {
-        logger.debug({ contactAId: a.id, contactBId: b.id }, 'dedup: skipped — dedup_exclusion fact present');
+      // ------------------------------------------------------------------
+      // Check for a prior exclusion (order-independent)
+      // ------------------------------------------------------------------
+      // We check regardless of classification type — exclusions apply to all matches.
+      if (excludedPairKeys.has(key)) {
+        logger.debug({ contactAId: a.id, contactBId: b.id }, 'dedup: skipped — pair has a recorded exclusion');
         result.skippedExcludedCount++;
         continue;
       }
@@ -278,6 +305,7 @@ export async function runDedup(
           // dry-run counts and recommendations accurate (no double-counting a
           // contact that a real run would already have removed).
           mergedAwayIds.add(secondaryId!);
+          reattachExclusionsInSnapshot(primaryId!, secondaryId!);
           continue;
         }
 
@@ -299,6 +327,10 @@ export async function runDedup(
           ];
           identityMap.set(primaryId!, mergedIdentities);
           identityMap.delete(secondaryId!);
+          // Same reasoning as identityMap above, for exclusions: mergeContacts has just
+          // re-pointed the secondary's exclusion rows onto the primary in the DB, so the
+          // snapshot the remaining pairs are checked against must follow.
+          reattachExclusionsInSnapshot(primaryId!, secondaryId!);
           logger.info({ primaryId, secondaryId }, 'dedup: merge complete');
         } catch (err) {
           logger.error({ err, primaryId, secondaryId }, 'dedup: merge failed — continuing');
@@ -328,6 +360,11 @@ export async function runDedup(
         // involving the principal would never auto-merge anyway, so it must not inflate this.
         if (classification.type === 'structural' && involvePrincipal) {
           result.principalSkippedCount++;
+        }
+
+        if (existingPairKeys.has(key)) {
+          result.skippedExistingCount++;
+          continue;
         }
 
         // --no-tasks (merge-only) or the --max-tasks cap: suppress task creation. Compare
@@ -381,9 +418,10 @@ export async function runDedup(
             owner: 'curia',
             source: 'agent',
             sourceAgentId: 'contacts',
-            tags: ['dedup', 'contacts'],
+            tags: ['dedup', 'contacts', dedupPairTag(a.id, b.id)],
           });
           result.taskCount++;
+          existingPairKeys.add(key);
         } catch (err) {
           logger.error({ err, contactAId: a.id, contactBId: b.id }, 'dedup: task creation failed — continuing');
           result.errorCount++;
@@ -406,11 +444,9 @@ type ContactRow = {
   display_name: string;
   role: string | null;
   system_role: string | null;
-  status: string;
   tier: string;
   kind: string | null;
   contact_confidence: string;
-  trust_level: string | null;
   last_seen_at: Date | null;
   inbound_message_count: string;
   outbound_message_count: string;
@@ -468,11 +504,9 @@ function rowToContact(row: ContactRow): Contact {
     systemRole: (row.system_role === 'principal' || row.system_role === 'agent' || row.system_role === 'system')
       ? row.system_role
       : null,
-    status: row.status as Contact['status'],
     tier: row.tier as Contact['tier'],
     kind: parseContactKind(row.id, row.kind),
     contactConfidence: Number(row.contact_confidence),
-    trustLevel: row.trust_level as Contact['trustLevel'],
     lastSeenAt: row.last_seen_at,
     inboundMessageCount: Number(row.inbound_message_count),
     outboundMessageCount: Number(row.outbound_message_count),
@@ -514,18 +548,26 @@ async function loadContactsAndIdentities(pool: pg.Pool): Promise<{
   contacts: Contact[];
   identityMap: Map<string, ChannelIdentity[]>;
 }> {
-  // Load only 'confirmed' and 'provisional' contacts — skip 'blocked'.
-  // Blocked contacts should not be merged; they are deliberately excluded.
+  // Load every contact, then drop the blocked ones — blocked contacts must not be
+  // merged, and they are deliberately excluded.
+  //
+  // The filter is applied in JS rather than SQL so it can go through meetsMinimumTier()
+  // instead of naming tiers in a WHERE clause: 'unknown' is the lowest non-blocked tier,
+  // so "meets minimum 'unknown'" is exactly "not blocked" and stays correct if the tier
+  // ladder is ever reordered. This replaced `WHERE status IN ('confirmed','provisional')`
+  // — contacts.status was dropped in migration 059 (#955/#1070), so that query had been
+  // failing outright against any migrated database (#1729).
   const contactsResult = await pool.query<ContactRow>(
-    `SELECT id, kg_node_id, display_name, role, system_role, status, tier, kind, contact_confidence,
-            trust_level, last_seen_at, inbound_message_count, outbound_message_count, notes,
+    `SELECT id, kg_node_id, display_name, role, system_role, tier, kind, contact_confidence,
+            last_seen_at, inbound_message_count, outbound_message_count, notes,
             created_at, updated_at, preferred_name, title, organization, primary_email,
             primary_phone, timezone, locale, location, pronouns, linkedin_url, bio, birthday
      FROM contacts
-     WHERE status IN ('confirmed', 'provisional')
      ORDER BY created_at ASC`,
   );
-  const contacts = contactsResult.rows.map(rowToContact);
+  const contacts = contactsResult.rows
+    .map(rowToContact)
+    .filter((contact) => meetsMinimumTier(contact.tier, 'unknown'));
 
   // Load all identities for the fetched contacts in one query.
   // The contact IDs are parameterized via ANY($1) to avoid string interpolation.
@@ -653,21 +695,38 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
       logger.info({ contactCount: contacts.length }, 'dedup-contacts: loaded contacts');
 
       // Wire the real service stack — mirrors the construction order in src/index.ts.
-      // All four hand-rolled callbacks (mergeContacts, createTask, storeFact, getFacts)
-      // are replaced with delegates to real services so that:
-      //   - mergeContacts: uses ContactService.mergeContacts(), which is transactional,
-      //     repoints kg_node_id and contact_calendars, and fires the contact.merged bus
-      //     event (audit-logged by the write-ahead hook in EventBus).
+      // Every injected callback delegates to a real service, no hand-rolled SQL:
+      //   - mergeContacts: uses ContactService.mergeContacts(), which repoints kg_node_id,
+      //     contact_calendars and dedup exclusions, and fires the contact.merged bus event
+      //     (audit-logged by the write-ahead hook in EventBus). Its contact writes run in
+      //     one transaction (#1695), so a failed merge rolls back whole and rethrows — the
+      //     sweep can treat it as "this pair did not merge", with no partial state to
+      //     reconcile. The KG node merge it attempts first is best-effort and outside that
+      //     transaction.
       //   - createTask: uses TaskRepo.createTask(), which publishes task.created events.
-      //   - storeFact/getFacts: use EntityMemory, which embeds labels and validates facts.
+      //   - listExclusionPairKeys: reads contact_dedup_exclusions via ContactService.
       // A real sweep merges KG entity nodes (entityMemory.mergeEntities), which embeds fact
-      // labels and therefore needs OpenAI credentials. A dry-run only READS facts
-      // (getFacts → KG node reads, no embedding), so it can run with a fake embedding backend
-      // and no API key — keeping the preview usable in CI / minimal environments. Fail fast
-      // only for a real run.
-      const openaiApiKey = process.env['OPENAI_API_KEY'];
-      if (!dryRun && !openaiApiKey) {
-        logger.error('dedup-contacts: OPENAI_API_KEY is required for a real sweep (KG entity merge embeds fact labels). Re-run with --dry-run to preview without it.');
+      // labels and therefore needs entity memory as boot would build it: an endpoint, a
+      // profile, and a table the schema check accepts. A dry-run never embeds, so it skips
+      // that check and runs with a fake embedding backend, keeping the preview usable in
+      // CI / minimal environments. Fail fast only for a real run.
+      // A real run reads the embedding keys from the vault, as boot and reembed-kg.ts do.
+      let embedding: KnowledgeGraphEmbedding | undefined;
+      if (!dryRun) {
+        const config = loadConfig();
+        await applyVaultSecrets(config, new SecretsService(pool, loadEncryptionKey(), logger), logger);
+        embedding = await resolveKnowledgeGraphEmbedding(
+          pool,
+          config,
+          loadYamlConfig(path.resolve(import.meta.dirname, '../config')).embedding?.profiles,
+          logger,
+        );
+      }
+      if (embedding && !embedding.ok) {
+        logger.error(
+          { err: embedding.gate === 'schema' ? embedding.err : undefined },
+          `dedup-contacts: ${embedding.message} A real sweep needs entity memory (KG entity merge embeds fact labels). Re-run with --dry-run to preview without it.`,
+        );
         process.exit(1);
       }
 
@@ -681,11 +740,10 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
       );
 
       const modelRegistry = new ModelRegistry(logger);
-      // With a key, use the real OpenAI-backed embeddings. Without one (dry-run only — the
-      // check above exits a real run that lacks a key), fall back to the fake backend; the
-      // dry-run path never embeds, so its results are unaffected.
-      const embeddingService = openaiApiKey
-        ? EmbeddingService.createWithOpenAI(openaiApiKey, logger, bus, modelRegistry)
+      // A real run uses real embeddings (the check above exits one that lacks them). A
+      // dry-run uses the fake backend; it never embeds, so its results are unaffected.
+      const embeddingService = embedding?.ok
+        ? EmbeddingService.createWithEndpoint(embedding.endpoint, embedding.profile, logger, bus, modelRegistry)
         : EmbeddingService.createForTesting();
       const kgStore = KnowledgeGraphStore.createWithPostgres(pool, embeddingService, logger);
       const validator = new MemoryValidator(kgStore, embeddingService);
@@ -730,19 +788,38 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
         noTasks,
 
         // ContactService.mergeContacts handles: identity dedup (resolves the unique-email
-        // constraint violation the old UPDATE would have caused), kg_node_id repointing,
-        // contact_calendars reattachment, golden-record field consolidation, and deletion
-        // of the loser row — all in a single transaction.
+        // constraint violation the old UPDATE would have caused), auth-override and
+        // dedup-exclusion re-pointing, golden-record field consolidation, and deletion of
+        // the loser row — all in one transaction since #1695. The KG entity merge it
+        // attempts first is best-effort and sits outside that transaction, and the loser's
+        // contact_calendars rows cascade away with the row rather than being reattached.
         mergeContacts: (primaryId, secondaryId) => contactService.mergeContacts(primaryId, secondaryId, false),
 
         // TaskRepo.createTask publishes task.created and handles progress/error_budget cols.
         createTask: (params) => taskRepo.createTask(params),
 
-        // storeFact is NOT included in DedupRunOptions — the sweep never writes exclusion
-        // facts directly. See writeExclusion() and its doc comment for the intended call site.
+        listOpenDedupTasks: async () => {
+          const limit = 1000;
+          const tasks = await taskRepo.listTasks({
+            statuses: ['open', 'in_progress', 'waiting', 'blocked'],
+            tag: 'dedup',
+            limit,
+          });
+          // Hitting the ceiling means the idempotency set is truncated — pairs beyond
+          // this page may be re-filed. Mirror the warning already documented on the
+          // skill's EXISTING_TASK_FETCH_LIMIT.
+          if (tasks.length >= limit) {
+            logger.warn(
+              { count: tasks.length, limit },
+              'dedup: open-task fetch hit limit — idempotency guard may miss older pairs',
+            );
+          }
+          return tasks;
+        },
 
-        // EntityMemory.getFacts returns fact nodes linked to the KG entity node.
-        getFacts: (kgNodeId) => entityMemory.getFacts(kgNodeId),
+        // Read-only: the sweep never records exclusions. Decline→exclude goes through the
+        // contacts agent calling contact-dedup-exclude (#1625).
+        listExclusionPairKeys: () => contactService.listDedupExclusionPairKeys(),
       };
 
       const result = await runDedup(contacts, identityMap, opts);

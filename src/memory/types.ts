@@ -51,6 +51,21 @@ export type EdgeType = (typeof EDGE_TYPES)[number];
 export const DECAY_CLASSES = ['permanent', 'slow_decay', 'fast_decay'] as const;
 export type DecayClass = (typeof DECAY_CLASSES)[number];
 
+// -- Identity tiers (ADR-040) --
+//
+// Which anchor gives a node its identity:
+//   'label'   — (lower(label), type). Deduplicated by idx_kg_nodes_unique, so a label
+//               resolves to exactly one node. The default, and the only tier upsertNode
+//               ever writes.
+//   'contact' — the contact that points at it via contacts.kg_node_id. The label is a
+//               display attribute and is free to collide, so two people called
+//               "Seth Berman" each hold their own node. Minted by createNode, or promoted
+//               from 'label' by anchorNode() when a new contact adopts an existing node.
+//               Never decayed or archived by the DreamEngine (ADR-040, "Identity does not
+//               decay") — only contact deletion retires one.
+export const IDENTITY_SOURCES = ['label', 'contact'] as const;
+export type IdentitySource = (typeof IDENTITY_SOURCES)[number];
+
 // -- Temporal metadata, present on every node and edge (spec line 82-91) --
 export interface TemporalMetadata {
   createdAt: Date;
@@ -66,7 +81,10 @@ export interface KgNode {
   type: NodeType;
   label: string;
   properties: Record<string, unknown>;
-  embedding?: number[]; // VECTOR(1536) — undefined until embedded
+  embedding?: number[]; // width from the embedding profile — undefined until embedded
+  // embeddingStamp() of the profile that produced `embedding`; set exactly when `embedding`
+  // is (migration 103). Vectors with different stamps are never compared.
+  embeddingModel?: string;
   temporal: TemporalMetadata;
   // Sensitivity classification assigned at creation time (#200).
   // Immutable after creation — changing sensitivity requires a manual data migration.
@@ -75,6 +93,9 @@ export interface KgNode {
   // Stored as lowercased strings; exact-match resolution checks aliases
   // alongside the canonical label. Capped at MAX_ALIASES_PER_ENTITY (10).
   aliases: string[];
+  // Which anchor identifies this node (ADR-040). See IdentitySource above.
+  // Only ever moves 'label' → 'contact', via anchorNode().
+  identitySource: IdentitySource;
 }
 
 // -- Knowledge Graph Edge --
@@ -101,6 +122,27 @@ export interface StoreFactOptions {
   // Optional category hint passed to the classifier (e.g. 'financial').
   // Allows skills that know the category of their data to skip keyword scanning.
   sensitivityCategory?: string;
+  /**
+   * When true, this fact is multi-valued: multiple facts with the same
+   * `properties.attribute` but different `properties.value` may coexist on one
+   * entity. Contradiction detection and embedding dedup-merge skip when values
+   * differ. Callers that write a genuinely multi-valued attribute (e.g. a person's
+   * several email addresses) must set this flag — the validator stays
+   * domain-agnostic (#1623).
+   */
+  multiValued?: boolean;
+  /**
+   * When true, skip embedding-based semantic dedup. Match an existing fact on the
+   * same entity only when `properties.key` equals the incoming `properties.key`
+   * (exact string equality). Used by config-store, where keys are opaque
+   * identifiers — similar stems like `foo_1` / `foo_2` must never merge (#2252).
+   * Callers must set a string `properties.key` (throws if missing). The validator
+   * also persists `properties.exact_key: true` so a later semantic write without
+   * this flag cannot merge into the fact (same pattern as `multi_valued`). Rate
+   * limiting and entity-existence checks still apply. On a key match the
+   * validator returns `newLabel` so the caller's update keeps `label` aligned.
+   */
+  exactKey?: boolean;
 }
 
 // -- Validated data for a new fact node, produced by MemoryValidator --
@@ -118,15 +160,22 @@ export interface ValidatedFactData {
     decayClass: DecayClass;
     source: string;
   };
-  // Pre-computed embedding from the dedup scan — passed through so the store
-  // can skip a redundant embed() call when persisting the new node.
-  embedding: number[];
+  // The dedup scan's vector, passed through so the store can skip a second embed()
+  // call. Absent when the profile's `similarity` and `document` prefixes differ: the
+  // stored vector must be the `document` one that search and pnpm reembed:kg expect.
+  embedding?: number[];
 }
 
 // -- Validation result --
 export type ValidationResult =
   | { action: 'create'; validated: ValidatedFactData }
-  | { action: 'update'; existingNodeId: string; mergedProperties: Record<string, unknown> }
+  | {
+      action: 'update';
+      existingNodeId: string;
+      mergedProperties: Record<string, unknown>;
+      /** When set (exactKey upserts), persist this as the node's label so label stays aligned with the key. */
+      newLabel?: string;
+    }
   | { action: 'conflict'; existingNodeId: string; reason: string }
   | { action: 'auto_rejected'; existingNodeId: string; reason: string }
   | {
@@ -161,6 +210,3 @@ export function createNodeId(): string {
 export function createEdgeId(): string {
   return randomUUID();
 }
-
-// -- Embedding dimensions constant (hardcoded for text-embedding-3-small) --
-export const EMBEDDING_DIMENSIONS = 1536;

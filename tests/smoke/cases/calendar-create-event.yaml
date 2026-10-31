@@ -1,10 +1,15 @@
 name: Create Event with Full Context
 description: Agent should capture all meeting details and create a properly formatted calendar event with attendee, time, timezone, duration, topic, and Zoom link
+# Chains several real specialists and has run past 180s (prompt trim PR 6 smoke A/B).
+timeout_seconds: 300
 tags:
   - calendar
   - scheduling
   - single-turn
 
+# 'Creates the event on the principal's calendar' is decided by the calendar specialist's
+# calendar-create-event call, so the judge needs to see it.
+judge_tool_calls: true
 turns:
   - role: user
     content: |

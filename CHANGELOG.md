@@ -6,7 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Pre-1.0: minor bumps introduce new capabilities; patch bumps fix bugs. Breaking changes
-to public API surfaces (skill manifest schema, `SkillContext` interface, agent YAML schema,
+to public API surfaces (`tool.json` manifest schema, `ToolContext` interface, agent YAML schema,
 bus event types) are noted explicitly even in the `0.x` range.
 
 ---
@@ -16,23 +16,730 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Added
 
 - **`GET /phone/inbox`** — read-only email summary for the Command Hub phone launcher: Urgent/Seen/Drafted mail that is still unread, in the inbox and unanswered, per mailbox. Own token, no bodies.
+- **Recurring calendar events** — create, edit and delete a series or one occurrence; standing meetings become one event. (#2385)
+- **ADR-057** — retire bearer `/api/messages`; console chat on `/api/chat` is the only ingress. (#999)
+- **`doc-write` `section-delete`** — removes one `##` section and its heading; a missing section errors. (#2339)
+- **`migrate:standing-rules`** — one-off script moves inbox and calendar rule arrays into `/shared/` documents. (#2339)
+- **Scenario `seed.pinned`** — cases seed the documents and settings agents read through `pinned_context`. (#2339)
+- **`inspect-prompts` pinned values** — snapshot carries every declared `pinned_context` entry for curia-deploy's eval harness. (#2339)
+- **`pinned_context`** — **public API:** agent YAML field injecting declared `/shared/` documents and config keys every turn. (#2338)
+- **`/shared/` documents** — durable, never archived with a project; only declaring agents can write them. (#2338)
+- **ADR-056** — `pinned_context`: declaration is write permission; `/shared/` is durable by prefix. (#2338)
+- **Reasoning watchdog** — runaway reasoning stops early and gets one forced attempt, on every streaming provider. (#2371)
+- **Provider guide** — `docs/dev/adding-an-llm-provider.md` documents the provider and stream contract. (#2371)
+- **Onboarding journey design** — WIP doc: three-channel setup and voice-first onboarding that ends at confirmed priorities.
+- **Onboarding HAWD model** — WIP doc: onboarding modelled from the principal's side, with gaps and glossary.
+- **Agenda-driven calls** — principal calls start from parked agendas; Curia can switch agendas mid-call. (#2322)
+- **Meeting minutes** — calls with an agenda produce a transcript, minutes and one follow-up report. (#2322)
+- **Bus events** — `minutes.ready` and `minutes.pipeline_failed`, system-only. (#2322)
+- **`meeting-notes-start`** — notes on a call with no agenda yield minutes; a recap when the caller asks. (#2347)
+- **Principal home** — waiting items, a work histogram, and value tiles replace the operator view. (#2340)
+- **Ant Farm video-call design** — design doc for replacing the Phaser office with a call view. (#2127)
+- **Turn lanes** — per-conversation lock and injection config, on in the shipped file. (#2018)
+- **Turn lane wiring** — a coordinator conversation has one holder. (#2018)
+- **`agent.task.input_injected`** — **public API:** audit event for a drained same-contact follow-up. (#2018)
+- **Mid-turn injection** — a same-contact follow-up joins the live coordinator turn. (#2018)
+- **Delegate wait** — a queued follow-up ends the wait early and the specialist keeps running. (#2018)
+- **`delegation.timed_out`** — **public API:** optional `cause` distinguishes an interrupted wait from a timeout. (#2018)
+- **Injected working-memory rows** — host task id is stored, and model history keeps the follow-up group. (#2018)
+- **Scenario follow-up** — a case can send a second message while the first turn is still running. (#2018)
+- **Console activity feed** — home page lists what Curia did, one plain-language line per job. (#2251)
+- **`activity.summary` bus event** — **public API:** one fast-tier summary per conversational job, stored for the feed. (#2251)
+- **Ant Farm replay links** — URL can preselect a conversation and time window. (#2251)
+- **Principal profile in prompts** — `## Who you serve` shows the principal's name, preferred name, pronouns and title. (#2226)
+- **`contact-update` principal alias** — `contact_id: "principal"` saves the principal's profile without a UUID. (#2226)
+- **Setup task `principal_profile`** — the wizard asks how to refer to you; done once pronouns are set. (#2226)
+- **Pronouns scenario 41a** — checks emails to third parties never gender a principal without pronouns on file. (#2226)
+- **Memory → Documents** — console page to browse, view, search and download OKF working documents. (#1821)
+- **Documents editing** — edit, create, archive and restore in the console; stale saves conflict, never overwrite. (#1822)
+- **`document.console_action` bus event** — **public API:** audits each console change to a working document. (#1822)
+- **`documentWorkspace.consoleEditMaxBytes`** — **config:** console edit size cap, default 64 KiB; larger documents are read-only. (#1822)
+- **Documents export and import** — OKF zip bundles; import previews first, never overwrites newer versions or deletes. (#1823)
+- **OKF round-trip conformance test** — export then import must reproduce documents, frontmatter and links exactly. (#1824)
+- **Claude Sonnet 5.5 and Opus 5.5** — now selectable in config. Opus 5.5 cannot serve as the fast-tier, standard-tier or judge model. (#2220)
+- **KG explorer filter panel** — type and sensitivity checklists hide non-matching nodes and filter search results. (#351)
+- **`llm.call` prefix-guard drops** — **public API:** optional `reasoningBlocksDropped`; suites also print serving endpoints. (#2044)
+- **`archive-extract`** — opens zip and gzip attachments within size and path limits. (#2208)
+- **Sign-in details with secrets** — `secret-capture-request` stores login URL and username; `list-user-secrets` returns them. (#2201)
+- **`listUserSecretDetails` capability** — new `ToolContext` field returning non-secret sign-in details per `user.*` key. (#2201)
+- **Tier reasoning effort** — **public API (config):** `model_routing.tiers.<tier>.reasoning.effort` for agent turns, validated at boot. (#2044)
+- **`llm.call` reasoning fields** — **public API:** optional `reasoningTokens`, `reasoningEffort`, `upstreamProvider` on the bus event. (#2044)
+- **Suite reasoning metrics** — smoke and scenarios print reasoning tokens and latency p50/p90 per agent. (#2044)
+- **Custom embeddings endpoint** — the knowledge graph can use any OpenAI-compatible embedding server, so OpenAI is optional. (#2023)
+- **`pnpm embedding-eval`** — scores an embedding model against a labelled fixture and suggests its profile thresholds. (#2023)
+- **Style scenarios** — seven cases score reply length, filler and register under a fixed office identity. (#2143)
+- **Principal scheduling scenarios** — fourteen on-demand cases for CC'd, forwarded and booking-link scheduling requests.
+- **Scenario harness** — CC'd email envelopes, per-case autonomy score, `workday+N` dates, and the run date for the judge.
+- **Report queue** — new `principal.report` bus event and `reports` tools collect digest items. (#2159)
+- **Weekly fallback digest** — sent when queued items go a week unreported. (#2159)
+- **`deliver-approval`** — sends a pending approval on one chosen channel; undelivered ones email after 15 minutes. (#2159)
+- **`approvalDelivery` capability** — new `ToolContext` field for tools that deliver approvals. (#2159)
+- **Autonomy gating setting** — `autonomy.gating: band | tier` chooses score-driven or contact-tier gates; ships as `tier`. (#2159)
+- **Judge brief** — escalation judge answers purpose, speaks-as-principal, grounding and necessity from the turn's lookups. (#2159)
+- **ADR-049** — band-driven autonomy replaces the tier escalation policy. (#2159)
+- **Spot-check pool** — autonomous sends and actions are logged for sampling; never graded by the LLM judge. (#2159)
+- **Relay budget** — caps hourly immediate principal messages per outside contact; extras go to the digest. (#1320)
+- **`autonomy.relay_deferred` event** — new bus event and `relay_deferred` digest source when the relay budget holds a message. (#1320)
+- **Spot checks in the digest** — up to three weighted samples of autonomous actions, numbered, never IDs. (#2159)
+- **`list-spot-checks`** — returns the digest's spot-check block and remembers which number means which action. (#2159)
+- **`record-spot-check`** — the principal answers spot checks by number; verdicts feed the autonomy score. (#2159)
+- **Spot-check verdict trigger** — a principal reply starting "2 bad" points the coordinator at record-spot-check. (#2159)
+- **`approval_number`** — new nullable column on `autonomy_action_log` (migration 098). (#2159)
+- **`verification` tool** — coordinator tracks pending sign-in codes per site in a new `verifications` table. (#2017)
+- **Sign-in verification config** — `verification` section sets ask-channel order, expiry and code lifetimes. (#2017)
+- **Scenarios 24a–24d** — sign-in codes by SMS and email, no leaks, lost session. (#2017)
+- **ADR-050** — external verifications are first-class state; spec 03, 15 and 19 updated. (#2017)
+- **AWS Bedrock provider** — tiers can run Claude on Bedrock; opt-in, off by default. (#1766)
+- **KG node merge** — merge duplicate or mistyped knowledge-graph nodes from the console, with previewed conflicts. (#2233)
+- **`kg.nodes_merged` bus event** — new audit event for each knowledge-graph node merge; public bus surface. (#2233)
+- **`web-browser` `clear_site_data`** — clears one host's cookies and storage, recovering half-finished sign-ins; others stay signed in. (#2244)
+- **`browser.settleCapMs`** — **config:** caps the web-browser redirect wait; default 35s, at most 90s. (#2244)
+- **`voice.session.ended` turn stats** — **public API:** optional `turnStats` counts utterances, turns, barge-in cancels and joined fragments. (#2240)
+- **`pnpm repair:config-store-labels`** — reports and realigns config keys mislabelled by the old merge; dry-run by default. (#2252)
+- **Canadian SIN detection** — PII redaction now checks the checksum. (#2312)
+- **Task outreach** — sends and web forms on task-bound turns are recorded; rows close when the task ends. (#2312)
+- **`record-outreach`** — records web forms and calls for a task so the organization's reply finds it. (#2312)
+- **Linked outreach replies** — an email answering Curia's outreach arrives knowing its task; strong links add a task note. (#2312)
+- **`taskOutreach` capability** — **public API:** new `ToolContext` field for recording task outreach. (#2312)
+- **PII ask and memory** — the principal is asked when someone requests their data; the answer sticks per thread. (#2312)
+- **`disclosureDecisions` capability** — **public API:** new `ToolContext` field recording the principal's answer to an ask. (#2312)
+- **Per-case autonomy fixtures** — scenario cases pin their own score and gating, so mixed fixtures share one run. (#2312)
+- **Through-gateway scenario sends** — opted-in cases send through production's review into recording transports, checked deterministically. (#2312, #2192)
+- **Authority-aware PII scenarios** — cases 34a–34m cover directives, links, asks, strangers and quoted threads. (#2312)
+- **Scenario gateway checks** — cases assert delivered, held, not-held, reviewed, outreach and decision outcomes. (#2312)
+- **Scenario `inbound.then`** — a case sends the principal a second message after the first turn replies. (#2312)
+- **ADR-054** — authority-aware PII disclosure: the judge rules per item; code decides who authorized. (#2312)
 
 ### Changed
 
-- **Coordinator Drive moves** — pinned `update_drive_file` to the coordinator and documented reparenting (`add_parents`/`remove_parents`), so "move this doc into a folder" requests are performed instead of declined. (#1062)
-- **`skills/**` typecheck** — CI now type-checks all skill handlers and tests, closing the scope blind spot. (#1075)
+- **agent.task / llm.call / llm.error / LLMStreamEvent** — **public API:** `turnDeadlineAt`, `reasoningWatchdog`, `request_started`, `reasoning_delta` and `output_started` added. (#2371)
+- **LLM calls** — agent and infra calls on Anthropic and OpenRouter now stream internally. (#2371)
+- **Console API paths** — tasks, contacts, chat and grants move to `/api/*`; old tabs work for one release. (#872)
+- **ceo-inbox and calendar standing rules** — live in pinned `/shared/` documents, past the 2000-character cap, edited per rule. (#2339)
+- **meeting-debrief settings** — `debrief/config` arrives through `pinned_context`; no config-store read each run. (#2339)
+- **Principal-only sends** — a message to the principal alone skips autonomy gates A and B (spec 14). (#2337)
+- **ceo-inbox triage** — runs hourly instead of every 15 minutes, cutting scheduled triage runs to a quarter.
+- **ceo-inbox delegate wait** — raised from 300s to 563s to fit observed p99 run length. (#1915)
+- **Meeting recaps** — sent only when the caller asked or an agenda topic was covered. (#2347)
+- **Recap wording** — first-person recap for casual calls; formal calls link the minutes in the office. (#2347)
+- **Agenda speech** — Curia pulls up an agenda on a call; it never says "loading". (#2347)
+- **`minutes.ready`** — **public API:** payload gains `recap`, the follow-up's send decision. (#2347)
+- **Approval answers** — principal turns list approvals they were shown, so a yes or no finds its approval. (#2333)
+- **Approval emails** — a reply on an approval email's thread is marked as answering that approval. (#2333)
+- **Hold sweep** — first post-deploy run deletes stale holds within ±14 days; older ones remain. (#2329)
+- **Voice latency on Haiku 5.5** — prod user-turn p50 954 ms passes ADR-038's 1 s budget; first-token log adds `round`, `turnKind`. (#2271)
+- **Band send review** — flagged text is rewritten, never cut; findings that survive block at 80+. (#2312)
+- **Small-cap model check** — boot refuses fast-tier, judge or voice models that cannot turn thinking off. (#2224)
+- **Small-cap calls on the fast tier** — the drift detector and every `infraLlm.extract` call moved off the standard tier. (#2224)
+- **`infraLlm.extract` (public API, additive)** — optional `tier: 'fast' | 'standard'`; defaults to standard. (#2191)
+- **`activity-log`** — uses the shared activity describers; each action gains a readable `summary` line. (#2251)
+- **Unset pronouns** — agents use the name or they/them and never infer pronouns from a name. (#2226)
+- **`ToolContext.outboundContext`** — `register()` takes `recipientContactIds`; entry rows gain `recipientContactIds` and `recipientMessages` (migration 104). (#2261)
+- **Behavior suite usage** — docs make smoke and scenarios a release gate; development runs only targeted cases.
+- **Voice model** — ADR-038 moves voice to Haiku 5.5 with thinking off, keeping its own prompt. (#2245)
+- **Voice latency logs** — first-token (with model) and time-to-first-audio now log at info. (#2245)
+- **`emitOkfDocument`** — writes the body verbatim instead of appending a trailing newline, so parsing inverts it. (#1823)
+- **OpenRouter retries** — logged per attempt and counted on `llm.call`, instead of the SDK retrying silently. (#1915)
+- **Voice toolset** — spoken turns get nine voice tools, not the coordinator's 73; cold first-token 110–170ms faster. (#1968)
+- **Voice brain parity spike** — adds slim-core arms, three models, reasoning effort, real tools, metered spend, cold/warm latency. (#1968)
+- **Principal forwards** — a forward from the principal is handled, not treated as FYI. (#2227)
+- **Senders the principal knows** — verified email senders in `security.principal_org_domains` or the principal's Sent mail start as known. (#2227)
+- **Scheduling trust threshold** — lowered from 0.5 to 0.3 so known email contacts can book meetings (spec 06). (#2227)
+- **`contact.elevated`** — **public API:** new `principal-domain` and `principal-correspondence` reasons. (#2227)
+- **CC'd scheduling** — handed a meeting on a CC, Curia offers specific times instead of asking for availability. (#2227)
+- **Making room** — "move things around" moves the principal's own blocks at autonomy ≥80; below, asks first. (#2227)
+- **Booking links** — Curia books through a counterpart's booking page instead of emailing times, without duplicate invites. (#2227)
+- **KG explorer layout** — nodes spread further apart and labels no longer overlap. (#351)
+- **Console registry** — shows optional capabilities beside a tool's required ones. (#2028)
+- **ADR-048 outcomes** — effort A/B found no winner; the standard tier stays at the model default. (#2044)
+- **`file-parse`** — reads XML, text and Markdown, including by filename extension. (#2208)
+- **Inbox attachments** — zip and gzip files are extracted before they are parsed. (#2208)
+- **Prompt budgets** — coordinator and ceo-inbox rise to fit archive-extract. (#2208)
+- **`verification` open** — result now says the next step; email codes go through ceo-inbox. (#2201)
+- **Haiku 5.5 agent turns** — unset reasoning now uses the model default, so fast-tier agents think. (#2044)
+- **Non-agent LLM calls** — judges, infra, scoring, summarization and voice state no reasoning explicitly. (#2044)
+- **Reasoning pass-back** — tool loops hand each model its own reasoning back next step; the archive keeps markers. (#2044)
+- **ADR-048 amended** — unset reasoning means provider default; Haiku 5.5 adaptive thinking; stale thinking dropped. (#2044)
+- **Prompt tone directives** — "warm" and sample sentences removed; the office identity alone sets tone. (#2143)
+- **Specialist agents** — now get the office identity block, scoped so drafts in the principal's voice keep it. (#2143)
+- **`inspect-prompts.ts`** — snapshot gains `office_identity_writes_as_block` for curia-deploy's eval harness. (#2143)
+- **Detail setting** — now concrete per-channel length limits, repeated as a reminder on each reply. (#2143)
+- **Identity block** — tells Curia to say what is there, not what isn't, and skip narration. (#2143)
+- **Console Detail preview** — shows each channel's length limit at the current setting. (#2143)
+- **Principal notices** — notes, block notices and expired approvals go to the digest, not email. (#2159)
+- **`principal.report` (public API)** — three new sources; the execution layer may now publish it. (#2159)
+- **Band send review** — under `band`, sends are fact-checked; unverified claims bounce once, then trimmed or held. (#2159)
+- **Outbound filter** — under `band`, `contact-data-leak` and the tier disclosure table are off. (#2159)
+- **Relayed replies** — a held reply raises an approval on every channel, not only email. (#2159)
+- **`outbound.message` (public API)** — new `principalApproved` flag; approved relays are not held twice. (#2159)
+- **Gate C** — under `band`, the score decides; tier only matters when the judge sees steering. (#2159)
+- **Band descriptions** — under `band`, the injected autonomy guidance matches the new band table. (#2159)
+- **Approval delivery** — one message on the principal's preferred channel, not email, Signal and Slack. (#2159)
+- **One-channel standing preference** — fresh installs seed it: Signal, then SMS, then email. (#2159)
+- **Approval expiry sweep** — runs every 15 minutes, doubling as the approval-delivery safety net. (#2159)
+- **Tone & style** — a written style with starter templates replaces tone words and directness. (#2143)
+- **Identity API (breaking)** — `tone.style` replaces `tone.baseline` and `tone.directness`; legacy fields are rejected. (#2143)
+- **Stored identities** — old tone settings become a written style on read; nothing is rewritten. (#2143)
+- **Setup wizard** — step 5 asks for an autonomy level instead of a decision posture. (#2143)
+- **Proactive analysis** — no longer implied by default; add "volunteer observations" to your style to keep it. (#2143)
+- **Haiku 5.5** — default fast tier and both judges move to `claude-haiku-5-5`, without thinking or temperature. (#2077)
+- **Judge token caps** — leak and escalation judge verdict caps raised for Haiku 5.5's longer verdicts. (#2077)
+- **Autonomy scoring** — principal verdicts weigh triple; expired approvals no longer count against the score. (#2159)
+- **`ceo-inbox-archive` / `ceo-inbox-label`** — results now include the email's subject and sender. (#2159)
+- **Approvals and learning items** — answered by short numbers ("approve 3", "confirm task 2"), not IDs. (#2159)
+- **Approval tools** — `short_ref` accepts the approval number; `list-pending-actions` and `list-learning-digest` return numbers. (#2159)
+- **Shadow drafts** — still judged and recorded, but no longer count toward the autonomy score. ADR-029. (#2191)
+- **Error-rate guard** — its last-30 window now also stops at 90 days (`errorRateWindowDays`). (#2191)
+- **Task reply binding** — skipped while a sign-in verification is pending for that task. (#2017)
+- **Coordinator tool budget** — raised 78,745 → 79,600 for the `verification` tool. (#2017)
+- **`query-relationships` / `delete-relationship`** — no longer require `openai_api_key`; they fail closed without entity memory. (#2023)
+- **Send results** — now report which details were redacted. (#2312)
+- **PII disclosure review** — band review authorizes each personal detail by who directed the work. (#2312)
+- **Linked-reply authority** — band review trusts a strong link to the principal's task; weak links only ask. (#2312)
+- **Trusted-contact directives** — sending the principal's details at a trusted contact's request needs the principal's approval. (#2312)
+- **Approval displays** — approvals for sends list every personal detail they would send. (#2312)
+- **Unseen approvals** — a send approval with personal details can't be approved until it's shown. (#2312)
+- **Disclosure audit** — **Public API:** `outbound.delivered` gains `disclosed`, labels of details sent as written. (#2312)
+- **Draft sends** — a draft edited after its checks is not sent. (#2312)
+
+### Removed
+
+- **`/api/messages`** — **public API:** bearer message and SSE routes removed; console chat is `/api/chat`. (#999)
+- **Decision posture** — gone from identity, wizard and console; the autonomy level decides act-vs-ask. (#2143)
+- **`weakExpiredWeight`** — scoring setting retired and ignored if set; safe to delete from configs. (#2159)
+- **`kg_memory` setup task** — dropped; the setup wizard cannot run until entity memory is on. (#2023)
+
+### Security
+
+- **Console chat links** — a `/chat?q=` link no longer sends a message as the principal. (#2351)
+- **Band review** — a steered reply carrying unsupported personal details is rewritten, not held showing them. (#2333)
+- **Blocked contacts on CC** — email sends and drafts refuse a blocked contact anywhere on To or CC. (#2273)
+- **Principal-addressed email** — autonomy and identity gates still run when anyone besides the principal receives it. (#2273)
+- **workspace-mcp dependencies** — cutoff moved to 2026-10-22 for pypdf 6.21.2, clearing three HIGH advisories (CVE-2026-115572, CVE-2026-115580, CVE-2026-115585). (curia-deploy#335)
+- **workspace-mcp dependencies** — cutoff moved to 2026-10-21, picking up certifi 2026.10.19 and pypdf 6.21.1 in the image; clears a CRITICAL, four MEDIUM and a LOW advisory (GHSA-6q48-6c7w-9gw2, CVE-2026-113792–113795, CVE-2026-113786). (curia-deploy#324)
+- **fastify** — bumped to 5.12.6, clearing a LOW advisory (CVE-2026-107832).
+- **sanitize-html** — bumped to 2.18.1, clearing a MEDIUM advisory (CVE-2026-113650).
+- **markdown-it** — bumped to 15.0.3, clearing a HIGH and a LOW advisory (CVE-2026-111758, CVE-2026-111766).
+- **`qs` floor** — raised to `>=6.16.2`, clearing an upstream-only LOW advisory on the resolved 6.16.1. (#2335)
+- **`body-parser` floor** — raised to `>=2.4.0`, clearing an upstream-only HIGH DoS on resolved 2.3.0. (#2260)
+- **`fast-uri` floor** — raised to `>=4.2.3`, clearing four upstream-only advisories on the resolved 4.2.1. (#2216)
+- **Archive extraction** — bombs, zip-slip, encryption and nested archives fail closed. (#2208)
+- **Sign-in code scrub** — tracked codes become `[sign-in code]` in notes, reports, memory, sends and replies. (#2017)
+- **Browser code guard** — `web-browser` refuses to type or navigate a sign-in code off its own site. (#2017)
+- **Digest tools** — tasks an outside contact started can't read or acknowledge the principal's digest. (#1320)
+- **Judgment elevation** — email senders become known only on SPF/DKIM/DMARC-verified mail. (#2227)
+- **Contact-visible outbound context** — contacts see only their own entries, one-to-one, on authenticated channels; their wakes likewise. (#2261)
+- **zod** — override floor set to 4.6.6, clearing a HIGH DoS advisory (CVE-2023-54404).
+- **Principal redaction bypass** — a third party CC'd on a message to the principal no longer bypasses redaction. (#2312)
+- **Saved drafts** — `send-draft` checks drafts for PII; unallowed details hold, or refuse unless principal-directed. (#2312)
 
 ### Fixed
 
-- **Bullpen duplicate out-of-band actions** — a per-agent read watermark (`bullpen_thread_reads`) stops a thread an agent has already had in context from being re-injected on a later wake until newer activity arrives, so a request fulfilled out-of-band (a send, a spreadsheet write, anything) is no longer re-actioned. Action-agnostic. (#1065)
-- **Drift detector false-positives on wake jobs** — the scheduler no longer drift-checks task-bound `wake_at` jobs (whose payload is the contentless `{"type":"task-wake"}` envelope), so meeting-debriefs and reminders complete instead of being wrongly paused; the drift-pause notification is now review-only and carries no re-executable intent, ending the duplicate outbound send. (#1064)
-- **Autonomy test skips** — `autonomy-routes` and `autonomy-service-pagination` tests now `describe.skip` when `DATABASE_URL` is unset instead of throwing in `beforeAll`, matching the other integration tests and removing 2 spurious local failures. (#519)
-- **Latent skill handler type errors** — fixed 34 errors surfaced by the new skills typecheck (`calendar-list-events` `PromiseSettledResult` narrowing, indexed-access guards). (#1075)
-- **`drive-download-file`** — dropped the unsupported `supportsAllDrives` flag from `files.export` that broke overload resolution. (#1075)
-- **Debrief clear** — "clear meeting X" now releases *all* active outbound-context entries for each named meeting via the new `context-bridge-clear` skill (matches by meeting subject across the whole active table, not just the injected window) and confirms from what was actually released, surfacing any names it couldn't match instead of reporting blanket success. meeting-debrief stamps a `{subject, eventId}` key on every debrief send and self-clears both prompt and reminder when a debrief closes. `context-bridge-clear` is pinned to coordinator, contacts, ceo-inbox, and meeting-debrief. (#975)
-- **Contacts dedup task lifecycle** — the contacts specialist now closes dedup review tasks (`task-complete`) and self-sweeps the exchange's outbound-context entry on every terminal outcome (merge, exclude, defer), so resolved dedups no longer linger as `open` in the morning digest. (#1052)
-- **Silent context sweep** — `context-bridge-release` drops its `coordinator`-only `allowed_callers` restriction; specialists (`contacts`, `ceo-inbox`) can release their own exchange entries instead of asking "Sweep those too?". (#1052)
-- **Coordinator sweep trigger** — tightened from the ambiguous "after the exchange is complete" to an explicit close-on-result rule, so stale `[ACTIVE OUTBOUND CONTEXT]` entries stop accumulating across multi-turn specialist conversations. (#1052)
+- **Principal inbox paging** — follow-up pages keep their folder/unread filters, ending drain re-triage of handled mail. (#2377)
+- **Calendar write tools** — `calendar-create-event` and `calendar-update-event` refuse undeclared inputs instead of silently dropping them. (#2385)
+- **Signal call bridge** — logs every call event; a call ended mid-resolution is skipped with its reason. (#2372)
+- **ceo-inbox decision tagging** — reads `enabled` from the full setting; toggling keeps its other fields. (#2339)
+- **Agent YAML schema** — startup validation accepts `pinned_context`; it rejected any agent declaring it. (#2339)
+- **Image signing** — `docker-publish` retries `cosign sign`, so a Rekor 409 no longer fails a good publish. (#2369)
+- **Voice recap requests** — after-call emails go through the async off-ramp, not the draft-only inbox specialist. (#2347)
+- **Minutes follow-up** — the wake now carries the minutes path, so the coordinator stops searching for it. (#2347)
+- **Scenario tool calls** — approval-wake and `then` turns' tool calls are recorded once, not twice. (#2333)
+- **PII scenarios 34a, 34h, 34i** — stub the inbox specialist, ask Curia to send, and check held SINs precisely. (#2333)
+- **Approval review** — held sends show their content, and discard finds the owning mailbox. (#2340)
+- **Approval review** — a draft missing its recipient is loaded before approval. (#2340)
+- **Waiting list** — the first item no longer keeps a border under the heading. (#2340)
+- **Console approve** — the re-run records the principal as the web originator. (#2340)
+- **Work histogram** — a busy fortnight no longer takes the stats cards down. (#2340)
+- **Hiccups** — undescribed and hidden tool failures no longer count. (#2340)
+- **Waiting list** — undoing one dismissal stays available while another is pending. (#2340)
+- **Task status route** — status changes cancel wake-ups and close related outreach. (#2340)
+- **task-create** — placeholder ids are omitted, and a missing task is reported as not found. (#2328)
+- **task-create** — optional id inputs say to omit the field when there is none. (#2328)
+- **task-update** — string placeholder blockers are rejected; JSON null still clears one. (#2328)
+- **task-update** — a task cannot list itself as its blocker. (#2328)
+- **`calendar-delete-event`** — silent deletes and hold cleanup pass `notifyParticipants`, so Nylas accepts them. (#2329)
+- **Calendar hold cleanup** — hold deletes omit the notify flag, so Microsoft accepts them; holds with attendees stay. (#2329)
+- **Scenario follow-up** — the harness scans inbound text, so a clean follow-up can join. (#2018)
+- **Scenario follow-up** — sends a correction on the first tool call, or at the exit hook. (#2018)
+- **Scenario follow-up** — a turn-start drain fails the run, and the point is recorded. (#2018)
+- **Scenario case 26** — stubs the task writes and email-button shapes the gate run used. (#2018)
+- **Scenario case 26** — bare-ref and label email clicks sent as a one-click batch now succeed. (#2018)
+- **PII asks** — never hide another finding; relayed asks reach the coordinator; `send-draft` records the yes. (#2312)
+- **Band judge** — no longer flags Curia's own conduct or what it tells the principal. (#2312)
+- **Send recipients** — Curia's own mailbox no longer counts as a recipient when checking sends. (#2312)
+- **Quoted replies** — details already on the thread no longer page the principal; unauthorized quotes are dropped instead. (#2312)
+- **Reply drafts** — `email-draft-save` saves without a quote whose personal details would reach someone new. (#2312)
+- **Asked-for details** — under band gating Curia writes requested personal details; the gateway decides, not trust prompts. (#2312)
+- **`EmailSendRequest`** — **public API:** gains `quoteParticipants`, who was on the quoted message; never sent. (#2312)
+- **Band judge evidence** — reports to the principal count as support. **Public API:** `outbound.message` gains `reportedToPrincipal`. (#2312)
+- **Sender facts** — contact identity and message authentication are stated separately in sender context. (#2312)
+- **Sender facts** — an email with no authentication result reads as not confirmed, not failed. (#2312)
+- **PII asks** — approving needs a delivered ask; an undelivered deny records no "no"; strangers' drafts are refused. (#2312)
+- **Scenario follow-up** — an unpublished second message fails the run, and its own turn is cleaned up. (#2018)
+- **Scenario follow-up** — scoring waits for the injection decision, and a miss still fails the run. (#2018)
+- **Turn injection config** — startup accepts `dispatch.turnInjection` in the config schema. (#2018)
+- **Synthetic notices** — approval, drift-pause and suspension wakes set `syntheticTurn`. (#2018)
+- **KG semantic search** — filters apply before the limit, so closer facts no longer hide entities or create duplicates. (#2248)
+- **Shadow judge** — runs on the fast tier with reasoning off, so sent-observe stops timing out. (#2191)
+- **Recent activity card** — loads for signed-in console users instead of failing with a Bearer token error. (#2285)
+- **Recent activity card** — shows the newest jobs in the window, not the day's oldest rows. (#2251)
+- **Attachment download** — recovers from garbled Nylas IDs via filename or sole-attachment fallback. (#2281)
+- **Email poll** — detaches turns, drops the queue on stop, and shuts mailboxes down together. (#2254)
+- **Email durability** — writes mail ahead, replays it for a day, and skips only a poison row. (#2254)
+- **Email health** — fails when queued mail, every in-flight slot, or inbound write-ahead stays stuck. (#2254)
+- **`channel.poll`** — **public API:** `processed` is write-ahead; `fetched` is the Nylas count; `deferred` and `already_staged` added. (#2254)
+- **`EventBus.stagePublish`** — **public API:** persists the event, then returns delivery for the caller to start. (#2254)
+- **`EventBus.deliverPersisted`** — **public API:** delivers an already-persisted event without writing it again. (#2254)
+- **`config-store`** — similar keys no longer overwrite each other's values. (#2252)
+- **`ConfigStore`** — infrastructure writes no longer stall after 50 per process. (#2252)
+- **`async-offramp`** — returns after the task is durably queued, without waiting on the coordinator. (#2265)
+- **Voice tool barge-in** — a stalled tool call no longer holds the turn; its late result is discarded. (#2265)
+- **Voice summarization** — runs in the background, so crossing the threshold no longer delays the reply. (#2266)
+- **Working-memory shutdown** — waits briefly for an in-flight summarization pass before the pool closes. (#2266)
+- **Email reply-all** — keeps every original To recipient on To; replies to Curia's own messages reach their recipients. (#2273)
+- **Your Contact Details** — lists Signal and SMS numbers separately, so Curia stops giving Signal as its texting number.
+- **`curia-postgres` shutdown** — `docker stop` now lets Postgres finish shutting down instead of killing it midway.
+- **`send-draft`** — finds drafts by ID, fixing Gmail 400s; missing drafts no longer read as transient. (#2262)
+- **`email-list` drafts** — `folder: DRAFTS` lists drafts instead of failing on Gmail. (#2262)
+- **`ceo-inbox-draft-compose`** — refuses a draft addressed only to the principal; Curia emails them with `email-send`. (#2262)
+- **Voice turn-taking** — Curia no longer answers mid-sentence pauses; fragments join into one turn. (#2240)
+- **Third-party replies** — Curia sees its question when a contact answers; later turns and task wakes see replies. (#2261)
+- **Empty answers at the output cap** — OpenRouter responses that reasoned to `max_tokens` with no answer are retried. (#1915)
+- **Voice tool audit** — spoken-turn tool calls now record `tool.invoke` and `tool.result`, like text turns. (#1968)
+- **Voice barge-ins** — a stream the caller cancels no longer records an `llm.error` or logs an error. (#1968)
+- **Test-mode autonomy gating** — suites now describe autonomy bands per `autonomy.gating`, as production does.
+- **Health canaries** — run daily again; boot cancelled the job, so no canary ran or pinged heartbeats. (#2229)
+- **`google_workspace` / `tavily` canaries** — make a live call each instead of always skipping, so heartbeats fire. (#2242)
+- **Principal scheduling scenarios** — booking-page and delete checks no longer pass or fail on stub artifacts. (#2227)
+- **Browser fingerprint** — window fits a 1920×1080 screen with a desktop panel. (#2221)
+- **`browser.languages`** — ordered `navigator.languages` and `Accept-Language` list; `locale` goes first. (#2221)
+
+- **`ceo-inbox-draft-compose`** — recipients follow subject and body, so order-enforcing endpoints stop dropping the To line. (#2209)
+- **Optional capabilities** — a non-array declaration is dropped so the registry drawer still opens. (#2028)
+- **WIP citation scan** — XML fixtures are scanned like other text. (#2208)
+- **Shadow pairing** — a shadow pairs only with a send within 72 hours; each send scores one shadow. (#2195)
+- **Budget-exhausted sign-ins** — turn-limit replies name the waiting sign-in instead of a generic error. (#2201)
+- **`web-browser` type** — fields covered by a floating label are focused directly instead of failing. (#2201)
+- **Autonomy scoring** — successful re-executions of approved actions no longer judged blind; past verdicts cleared. (#2196)
+- **`ceo-inbox-sent-observe`** — shadow pairs judged in small chunks; held-back pairs and long holds now reported. (#2191)
+- **Integration test cleanup** — contacts and knowledge-graph suites delete only their own rows, ending parallel FK races. (#2183)
+- **Email signature** — the model's own sign-off is replaced by the configured signature, so emails sign once. (#2138)
+- **Requests no tool can do** — an empty `tool-registry` search says to reach whoever can, not research around it. (#2149)
+- **`web-fetch`** — a 404 warns that guessed paths miss too, ending runs of guessed venue pages. (#2149)
+- **Scenario 18 stubs** — a task note or brief on the renewal deadline no longer trips the stub gate. (#2150)
+- **Fork PR CI** — `ci` and Semgrep reach their steps on fork PRs, pulling anonymously without Docker Hub secrets. (#2153)
+- **Approval attribution** — resolve tools record `coordinator`; only reaction decisions count as principal feedback. (#2159)
+- **Contact merge** — keeps calendars, grant recommendations and task or message references instead of dropping them. (#2233)
+- **`web-browser` redirect settle** — waits out JavaScript sign-in redirect chains before reading; reports `settled` and `redirect_chain`. (#2244)
+
+### Security
+
+- **Approval reactions** — a 👍 binds only to the principal's own notification, matching that approval's number and expiry. (#2159)
+- **Approval references** — an unreadable or mis-keyed `short_ref` fails closed instead of picking the sole pending approval. (#2159)
+
+## [0.44.0] — 2026-10-16 — "WALL-E"
+
+> **WALL-E** *(WALL-E, 2008, Andrew Stanton / Pixar)* — a Waste Allocation Load Lifter left alone on Earth for seven centuries, still compacting the mess one neat cube at a time and keeping the one thing that matters safe. This release is that kind of work: a coordinator prompt pressed from 58 KB to 24 KB, finished plans cleared away, messages that reach only the person Curia can trace, and a behavior gate that checks it all before every release.
+
+### Added
+
+- **Behavior release gate** — release pre-flight now runs two behavior suites on the production standard-tier model: `pnpm smoke` (end-to-end turns against a stubbed fixture office on a throwaway database copy) and the new `pnpm scenarios` (coordinator and specialist decisions, including real coordinator → specialist round trips). Both exit non-zero on a failed gate, run four cases at a time, stub web search by default, and print the model spend per case. `known_failure` reports a tracked bug without blocking; `pnpm rejudge` compares a candidate judge against saved transcripts; `--overlay` runs a deployment's own agents and cases over core. `pnpm e2e:setup-wizard` also walks a fresh install through `/setup` in a real browser. (#1956, #1966, #1977, #1980, #2024, #2025, #2027, #2106, #2129, #2146)
+- **Backlog line** — every principal turn carries counts of pending approvals, decay warnings and principal-owned tasks, and the coordinator raises the oldest waiting item once the request is handled. Spec 02. (#1954)
+- **Notes for the principal** — a note tagged in a reply to someone else is cut out and emailed to the principal, never shown to the recipient. (#1954, #1990)
+- **Email signature** — the configured signature is added to every email Curia sends or drafts. Spec 13. (#1954)
+- **Peer requests** — any agent can ask another a question over the bullpen and get a structured answer.
+- **Late specialist results** — when a delegation times out, the specialist's late result is handed back so the follow-up still happens. (#1799, #1861, #1991)
+- **Contact recent history** — a 1:1 voice call or email recalls that contact's recent turns on other channels (email 72 hours, voice 48). (#1599, #1886, #1887)
+- **Document placement (`doc-place`)** — one shared policy for where agents file documents, in readable `/projects/` folders. (#1819)
+- **`email-get-thread`** — reads a whole email thread, full bodies, in one call. (#1957)
+- **Context budgeting** — CI fails when the coordinator's always-on prompt or tool definitions exceed budget; tool definitions are now charged in `context.budget`, and `report-agent-context` shows an agent's per-call context. (#1955, #1961, #2025)
+- **Standard-tier model candidates** — four OpenRouter models registered, with cache-read pricing recorded wherever the provider publishes it. (#1804)
+- **`pnpm audit:override-floors`** — CI checks that no dependency override floor admits a release with a known advisory. (#1934)
+- **ADRs** — ADR-045 (specialists don't re-adjudicate requester identity), ADR-046 (where agent behavior fixes go; the always-on prompt is last), ADR-047 (recipients by contact reference, identifiers verified by provenance), ADR-048 (reasoning passback and one effort setting per tier). (#1859, #1961, #2033, #2044)
+
+### Changed
+
+- **Recipients are contacts, not addresses (breaking `tool.json`)** — send skills (`to`, `cc`, `recipient`), `email-draft-save` and the `ceo-inbox` draft tools take a contact ID or `principal`. `to_address`, `cc_addresses`, `recipient_number` and `recipient_user_id` are removed and refused; `ceo-inbox-draft-edit` changes recipients one at a time with `add_*`/`remove`. A label hint picks a contact's secondary address, and an ambiguous hint sends nothing. Cold outreach is now create-the-contact, then send, and ceo-inbox looks for a missing address in the principal's mail before asking. ADR-047. (#2014, #2033, #2041, #2047, #2053)
+- **`bullpen` split (breaking `tool.json`)** — now `bullpen-post`, `bullpen-reply`, `bullpen-read` and `bullpen-close`, each with its own required fields. (#2126)
+- **`delegate` input (breaking)** — `timeout_ms` removed; the runtime sets the wait (450s by default; startup warns below that). (#1797, #1857)
+- **Prompt diet** — the coordinator's per-call prompt fell from 58 KB to 24 KB and its instructions from 20.5k to 8.7k characters. Guidance now arrives with the trigger that needs it, rules the platform enforces are no longer restated, and tool how-to lives in tool descriptions and skill references. Calendar, meeting-debrief, contacts and ceo-inbox prompts were trimmed 17–27%. ADR-046. (#1954, #1958, #1959, #1960, #2025)
+- **Google Workspace** — limited to Drive, Docs and Sheets, and activated on demand rather than pinned (85–98 KB off most calls). `workspace-mcp` is pinned and baked into the image, so boot no longer fetches from PyPI. Web fetch refuses Google links and points to the Workspace tools. (#1954, #1957, #2010, #2024)
+- **Approval Required band** — a direct instruction from the principal now counts as approval; Curia still asks before acting unprompted. Spec 14. (#2068)
+- **Approval expiry** — runs as an hourly system interval (`autonomy.approval_expiry`) instead of a coordinator LLM turn. (#2013)
+- **Contact provenance** — contacts an agent creates are recorded as `agent_stated` (not principal-stated), likely duplicates are refused until `distinct_from` names them, and `contact-register` verifies a sender only when the address has a source. (#2040, #2041, #2061)
+- **Delegated sends are reported truthfully** — `delegate` returns what the specialist actually `sent` separately from `draft_emails`, so composed email is no longer reported as sent. (#2055)
+- **Delegation-failure replies** — written for the person asking, in Curia's own voice, without naming the specialist or leaking internals; notes for the principal are kept separate. (#1860, #1975, #1976, #1978, #1990)
+- **Skill bundles** — enabling a bundle enrolls all its member tools; `tools:` lists standalone tools only, and a tool can't be uninstalled while its bundle is enabled. (#1974)
+- **Scheduler** — due jobs run through a capped runner that frees hung slots; scheduled jobs send the principal a message only when asked; weekly debriefs cover seven days. (#1160, #1959, #2091)
+- **Under the hood** — unit tests moved to the `tests/unit/` mirror, prompts consistently say "the principal", and duplicated helpers (`isUuid()`, `escapeRegExp()`) were consolidated. (#848, #1879, #1950)
+- **Additive public API** — `tool.json` gains `optional_capabilities` and `provenance_source`; agent YAML gains `delegate_when` and `display_name`; `ToolContext` gains `signal`, `deadline`, `resolveRecipientReference` and `selfEmails`; `agent.task` gains `principalBacklog`, `turnGuidance`, `toolAllowlist` and `syntheticTurn`; `agent.response` gains `channelId`, `sends`, `principalNote` and `failedSkills`; new `delegation.timed_out`, `delegation.late_resolved` and `outbound.judge` events; `delegate` outputs gain `next_step`, `queued`, `declined`, `in_flight` and handle timing. `EventBus.publish` now rejects a task no registered agent owns. (#1799, #1815, #1830, #1858, #1860, #1871, #1892, #1893, #1898, #1911, #1951, #1954, #1959, #2024, #2055, #2061, #2083, #2091)
+
+### Removed
+
+- **`approval-expiry-sweep` tool** — retired along with the coordinator's hourly cron. (#2013)
+- **`no_reply_principal` email** — a deliberate decline stays in the audit log, not the inbox; removed from `notificationType`. (#1908)
+- **Google Workspace calendar tools** — the principal's calendar belongs to `@calendar`; the MCP holdback and identity guard went with them. (#1853, #1957)
+
+### Security
+
+- **Outbound disclosure gate (Stage 2.5)** — now runs in production; principal-directed sends and trusted recipients skip it. (#1870)
+- **Recipient spoofing** — a mistyped recipient fails closed instead of reaching whoever owns the address, and an agent-entered address is verified only when it appears in a real message or page. (#2033, #2061)
+- **Sender verification** — a sender-written `Authentication-Results` header no longer counts as a pass. (#2071)
+- **Principal's addresses** — contact skills refuse to change them; only the principal can. (#2041)
+- **Outbound identity gate** — blocks an unconfirmed-name hedge, attendance cue or honorific; `filter.identityGate` selects enforce, shadow or off. (#1818)
+- **Calendar identity guard** — a read against the wrong identity fails closed as `IDENTITY_MISMATCH` instead of returning an empty success. (#1853, #1854)
+- **Dependency floors** — override floors raised for `undici` (8.12.2), `qs`, `ip-address`, `vite`, `sharp`, `source-map-js`, `fast-copy`, `fast-uri`, `hono`, `@hono/node-server`, `shell-quote`, `smol-toml`, `js-yaml`, `brace-expansion` and `basic-ftp`, clearing HIGH advisories in `undici` (TLS option bypass, cache poisoning, three DoS) and `source-map-js`, plus a set of upstream-only advisories. In the dev toolchain, promptfoo 0.124.1 and skipping the optional `jks-js` clear the remaining Dependabot alerts, two of them critical. (#1933, #1934, #1949, #2032, #2125, #2140, #2141)
+
+### Fixed
+
+- **Setup wizard** — a fresh install can finish setup again: since v0.37, Continue on step 5 never reached the Review step. (#2146)
+- **Delegation** — overlapping calls start one specialist run and queue the rest; a specialist's refusal is final rather than reworded and re-sent; requester identity is set by the harness, not inferred from the sender; a relayed send's reply routes back to the specialist that asked. (#1858, #1871, #1893, #1972)
+- **Reply-lock** — Signal, SMS and Slack sends count, and a send locks only its own task. (#1860)
+- **Bullpen** — unread threads stay visible for seven days, ignored @mentions resurface once, and timestamps show the principal's local time. (#1899, #1901, #1917)
+- **Task wakes** — finishing a task cancels its pending wake, a self-reschedule during a wake is honored, and a wake that parks a task with nothing to wake it gets a follow-up. (#1938, #1951, #2084)
+- **Scheduler** — job IDs no longer leak into task content or get mistaken for bullpen threads, tool failures are recorded, and `last_run_summary` refreshes every run. (#1828, #1829, #1830)
+- **`ceo-inbox`** — Spam and Trash are excluded unless asked for, existing drafts are found before a duplicate is made, labels past the first page resolve, and Gmail label names are shown. (#2035)
+- **Email** — replies from secondary mailboxes read the right account; `email-reply` resolves `cc` contacts; timed-out calls abort their Nylas requests; malformed message IDs are rejected up front; every inbound email names its Message ID and account, and specialist briefs keep them. (#1817, #1832, #1909, #2083, #2131)
+- **Outbound tracking** — email exchanges stay in context for 72 hours, so next-business-day replies are recognized; `contextBridge.channelDefaultExpiryHours` sets it per channel. (#1816)
+- **Gate C** — known-tier replies to the sender are allowed; reply-all still escalates. (#1815)
+- **Dates** — `date-resolve` handles "today"/"tomorrow"/"yesterday" in the configured timezone, rejects a bare weekday as ambiguous, and labels the right DST abbreviation; delegate brief date checks accept more formats. (#1945, #1986)
+- **Calendar** — the morning brief reads the CEO's calendar via `@calendar`, and large event lists page instead of failing. (#1798, #1853)
+- **Voice** — non-principal callers no longer get principal framing, and caller policy follows `channel-trust.yaml`. (#1626, #1629, #1874)
+- **Placeholder leaks** — `${principal_contact_id}`, `${current_datetime}` and `${timezone}` no longer reach agents as literal text. (#1800, #1997)
+- **Cost tracking** — cache-read and cache-write tokens are reported and priced, an expired promotional rate (DeepSeek V4 Pro, understated ~3.7×) is corrected, and the call archive keeps reasoning text and survives null bytes. (#1804, #1962, #2042)
+- **Document placement** — capped catalogs, ownership of appended docs and long slugs all behave. (#1819)
+- **Contacts specialist questions** — dedup reviews and grant recommendations reach the principal as tasks they own, and the principal's answers route back to contacts. (#2129)
+- **Drive sharing** — the principal always gets edit access; others get a role fitting the content.
+- **Image publish and CI** — Docker Hub pulls are authenticated and registry failures retry. (#1864, #2095)
+- **Smaller fixes** — unknown agent IDs fail instead of counting as delivered (#1898), `GET /api/kg/graph` 404s on a missing node (#1881), `memory-store` flags a skipped canonical redirect (#1772), timer intervals above Node's 24.9-day ceiling are rejected (#1807), a failed index build is rebuilt on retry (#1808), `audit_log.parent_event_id` is indexed (#1799), the completion digest drops items after 90 days (#1936), and dangling `docs/wip/` references are repointed and now guarded by a test (#1483).
+
+## [0.43.0] — 2026-09-11 — "C-3PO"
+
+> **C-3PO** *(Star Wars, 1977, George Lucas)* — the protocol droid fluent in six million forms of communication, and the one who reports the true odds however unwelcome they are. This release is both halves: a voice you reach by phone, notes it transcribes, sends it holds until a channel returns — and probes, tools, and replies that stop claiming a success they cannot support.
+
+### Added
+
+- **Signal voice calls** — call Curia's Signal number and hold a live spoken conversation through the existing voice pipeline. Answers everyone but blocked contacts; one call at a time; hard duration cap. Config-gated off. (#1672)
+- **Voice notes** — audio messages on Signal and Slack are transcribed into ordinary messages, backed by a new batch speech service. (#1597, #1600)
+- **Curia speaks first** — an inbound call opens with a greeting instead of silence, and spoken turns see what was just sent on other channels. (#1594, #1596)
+- **Async off-ramp** — a heavyweight ask made by voice is handed to the async coordinator for callback rather than stalling the call. Closes ADR-038. (#1595, #1614)
+- **Outbound queue** — sends to a channel that is down are held in Postgres and flushed on reconnect (100/channel, 24h). Voice does not queue. (#1380)
+- **Channel health probes** — Slack, SMS, Voice, the principal's calendar grant, and the Signal call audio path each get their own check in `/api/health`. (#1561, #1567, #1760)
+- **System page with restart** — a non-secret environment snapshot plus an operator restart, rate-limited from the audit log so the cooldown survives the restart it limits. New `system.restart` event. (#1765)
+- **Skill bundles in the console** — enable or disable a bundle and its tools as one atomic change from `/tools`, with unresolved agent pins flagged. (#1724)
+- **`list-user-secrets`** — agents can see which `user.*` secrets already exist (names only) instead of capturing near-duplicates. New `userSecretIndex` manifest capability. (#1497)
+- **Contact-anchored knowledge-graph identity** — a person's node is keyed on their contact, so same-name contacts each hold their own facts and context. Identity nodes no longer decay. ADR-040. (#1694)
+- **Dedup exclusions get a table** — "these two are different people" is an operational ruling, not learned knowledge. ADR-039. (#1625)
+- **Auto-generated mail detection** — classified from the message's own headers and calendar method, not from the sender's contact record. (#1734)
+- **`resolve-time-window`** — the diagnostics agent can finally query a past time window from a phrase like "around 11:44am". (#1592)
+- **Model capability declarations** — models declare `streaming` and `tools`; voice refuses to boot on one that lacks either. (#1553)
+- **ADR-041 (Proposed)** — AWS Bedrock as an LLM provider. (#1766)
+
+### Changed
+
+- **`entity-context` output (public API)** — gains `nodeless` (with a `cause`) and `failed`. A missing node and a transient database error are now distinguishable from "contact not found"; skill v1.3.0. (#1694, #1702, #1707)
+- **`StoreFactResult` (public API)** — operational rejections carry `reason`; `conflict` means contradictions only. (#472)
+- **Ambiguity is reported, not guessed** — entity resolution, fact extraction, and relationship extraction skip and count an ambiguous subject instead of taking the first match. (#1694, #1714)
+- **`contact-dedup-exclude` / `contact-find-duplicates`** — read and write the new table; `entityMemory` capability dropped. (#1625)
+- **Restart-surviving state** — the restart cooldown and the sent-mail watermark both persist rather than living in process memory. (#1765)
+- **Text turns stream** — `AgentRuntime.handleTask` runs on the streaming turn primitive. (#1563)
+- **Lint and typecheck actually cover the repo** — `apps/console` was silently skipped by the root typecheck, `apps/*` were linted by nothing, and `scripts/**` by neither (13 live errors, including a sweep querying columns dropped in migration 059). (#1726, #1727, #1729)
+
+### Fixed
+
+- **Prod OOM restart loop** — the MCP liveness probe recompiled SDK validators on every healthcheck, leaking ~145 MB/hr. Now `ping()`. Non-streaming LLM calls and every provider's `stream()` leaked alongside it; both release on all exit paths. (#1648, #1650, #1651, #1663)
+- **Unbounded maps** — the rate limiter and scheduler burst counters now evict. (#1664, #1665)
+- **Health checks that could not fail** — `browser` and `signal_voice` asserted that an object or a socket file existed. A dead PulseAudio daemon left a socket behind and the dashboard read green for hours while calls carried no audio. Both now make a real round-trip. (#1760, #1762)
+- **Auto-replies bypassed the tier gate** — blocking a reply skill diverted the send onto an ungated dispatcher path. Every auto-reply is now gated. (#1733)
+- **The agent could not decline to reply** — a closing remark was relayed as a message regardless. `NO_REPLY` ends a turn without sending. (#1732)
+- **Failed tool calls reported as success** — a failure now carries a reporting constraint the model may not contradict. (#1546)
+- **Calendar honesty** — `calendar-create-event` and `calendar-update-event` claimed to set attendee RSVP status they cannot set. (#1735)
+- **Contact merge was not atomic** — a mid-merge failure stranded identities, overrides, and dedup rulings; merges now run in one transaction, and the secondary's knowledge-graph memory survives. (#1695, #1711)
+- **Archived memory kept resurfacing** — `entity-context` assembled archived nodes, facts, and edges, and served them from cache after a decay pass. (#1707)
+- **Raw names in logs** — fact extraction, entity resolution, and alias handling logged subject and entity names against their own PII rule. (#1706, #1713)
+- **Working memory corruption** — a failed LLM call orphaned the user turn, so the next prompt sent consecutive user messages to the provider. (#1767, #1775, #1776)
+- **Stuck scheduler jobs** — error paths missed by the earlier fix left jobs in `running`. (#1647)
+- **Wrong dates in delegate briefs** — a calendar brief must now match the same turn's resolved date. (#1611, #1612)
+- **Bullpen chatter leaked to the principal** — ambient tier bled into scheduler jobs. (#1609)
+- **Gemini rejected tool schemas** — union inputs now emit as `anyOf`. (#1508)
+- **`docker-publish` could publish the wrong thing** — a dispatched re-publish retagged `:edge` backwards, moved `:latest` on a malformed tag, cancelled a live release build, and passed a multi-line tag on its first line. A transient npm drop during the emulated arm64 install failed the whole publish and silently staled `:edge`; it now retries and opens a tracking issue on failure. (#1699, #1715, #1718)
+- **Dedup exclusions for same-name contacts** — excluding a pair with no knowledge-graph node on either side did not work, and the agent closed the task anyway. (#1623, #1625)
+- **MCP servers with zero tools** — now fail loud instead of warn-and-continue. (#1500)
+- **Smaller fixes** — Slack mrkdwn double-unescape order (#1569), Ant Farm scene-boot roster race (#1549), epoch-zero calendar slots (#370), MCP `callTool` ignoring its timeout (#1666), scheduler prior-run block truncation (#243), grant-recommendation phantom-id race (#1067).
+
+### Security
+
+- **Runtime image** — removed the unused global npm, clearing bundled `brace-expansion` and `tar` CVEs. Dropping pnpm's cache and store alongside it broke the deploy twice (lockfile verification timed out, then the build re-downloaded the whole dependency graph); both are kept deliberately. (#1568, #1750, #1756, #1758)
+- **Dependency floors** — `qs`, `hono`, and `fflate` raised to patched releases, clearing six advisories; `smol-toml` pinned for a dev-only DoS advisory. (#1752)
+- **Semgrep suppressions now reach GitHub** — `# nosemgrep` findings were uploading as open alerts, and hand-dismissals evaporated whenever a fingerprint changed. (#1754)
+
+## [0.42.0] — 2026-07-26 — "KITT"
+
+> **KITT** *(Knight Rider, 1982, Glen A. Larson)* — the Knight Industries Two Thousand, a car-bound AI you simply talk to: it holds a conversation by voice and deploys a deep bag of specialized functions on command. This release gives Curia the same — a voice you speak with, new channels to reach it through, and a real toolkit of skills it draws on when asked.
+
+### Added
+
+- **Voice channel** — talk to Curia by voice from the console: duplex WebRTC over self-hosted LiveKit, Deepgram speech-to-text, Cartesia text-to-speech, and barge-in. Join, mute, and hang up from chat; a principal hangup ends the session (1-hour call tokens, room teardown). Ships with a LiveKit Compose sample and an operator security/privacy guide (ADR-037). (#1414)
+- **True LLM streaming** — Anthropic and OpenRouter now stream tokens and tool events, the primitive the voice tool-loop runs on. (#1414, #1544, #1552, #1563)
+- **Console settings & system pages** — Personality, Ghostwriting, Posture, Autonomy, Memory, and System pages replace the Workspace stub, backed by read-only `GET /api/system` and `GET /api/memory/retention`. (#1376)
+
+### Changed
+
+- **Slack channel** — Socket Mode DMs, @mentions, and in-thread replies, with a `slack-send` skill and a channel-agnostic `inbound.reaction` bus event (ADR-033). (#1477, #1526)
+- **SMS channel** — two-way texting over a Telnyx office DID with medium-trust webhook inbound and an `sms-send` skill (ADR-036). (#1478)
+- **Tools & skills system** — invocation atoms are now **tools** (`tool.json`, `ToolRegistry`) and bundles are **skills**; pin a whole bundle, a single tool, or an MCP server projected as a skill, and activate a skill's tools + instructions at runtime. Unmodified Anthropic `SKILL.md` folders can be dropped in and activated (ADR-031, ADR-032). (#1485, #1489, #1490, #1494, #1495)
+- **Contact identity editing** — add, verify, retire, remove, and merge a contact's channel identities from the console or API; verifying the principal's Slack/Signal binds outbound detection. (#1514)
+- **Reaction approvals** — 👍/👎 reactions (including skin tones) on Slack and Signal resolve pending approvals. (#1479)
+- **Audit hardening (Phase 1)** — structured columns, a `seq`-ordered hash chain, an archivable `llm_call_archive` (kill-switch + TTL), `authorization.decision` logging for Gate-1/Gate-C outcomes, and `pnpm audit:verify`. (#1383, #1379)
+- **Database-outage resilience** — `DATABASE_UNAVAILABLE` errors, pool timeouts, skill retry, and a CEO alert after 5 minutes down; new `errorType` on `ToolResult` (public API). (#1381)
+- **Operator home** — the console root shows health, attention, and activity cards plus a chat call-to-action. (#1375)
+- **Channel plumbing** — each channel owns its outbound request variant and recipient projection and contributes its principal carve-out rules via a registry, so the gateway has no central per-channel switch (ADR-035); shared contact resolve-or-create closes a 1:1 orphan leak. `OutboundSendRequest` gains `slack` and `sms` variants (public API); a new dev guide walks through building a channel end-to-end. (#1480, #1510, #1513)
+- **Smaller refinements** — `approve-grant-recommendation` risk raised to critical (#1499); KG relationship tools moved to the `memory` skill (#1502); unresolved scheduled pins now log at error (#1501); Ant Farm renders the real office art (#1504); specs consolidated and dev docs re-synced to what shipped (#1554).
+
+### Fixed
+
+- **Voice reliability** — hard or repeated TTS errors end the call cleanly (`tts_error`); LiveKit room deletion uses the internal address; bounded STT waits and safe session cleanup on token failure; the Cartesia voice ID is now a required, console-set credential. (#1414, #1555, #1556)
+- **Audit** — empty `audit_log` no longer breaks migration 080, `llmCallArchive` config validates, and `canonicalJson` round-trips Dates so verification matches write-time hashes. (#1540)
+- **Scheduler & tool output** — `scheduler-list` bounds and trims results and returns timestamps in your timezone; tool outputs cap total object size, not just per-leaf. (#1487)
+- **Dashboard Recent Activity** — the timeline card loads with a 24-hour scope. (#1548)
+- **OpenRouter errors** — `last_error` now names the upstream provider and reason, not the opaque wrapper.
+- **Skills bundling** — calendar risk/docs, manifest and registry-install correctness, and test-harness expansion of `pinned_skills` bundles. (#1489, #1499)
+
+### Security
+
+- **Dependency hardening** — pinned or upgraded `@fastify/static`, `hono`, `@hono/node-server`, `body-parser`, `fast-uri`, `find-my-way`, `sharp`, `shell-quote`, `js-yaml`, and `brace-expansion` to clear known path-traversal, XSS, and DoS CVEs. (#1518)
+- **SPA file serving** — console and Ant Farm serve only containment-checked paths under an explicit root.
+- **Supply chain** — pnpm `trustPolicy: no-downgrade` (7-day grace) and baked npm bumped 11.17.0→11.18.0 with a refreshed `node:24-slim` digest. (#1521)
+
+## [0.41.0] — 2026-07-21 — "Data"
+
+> **Data** *(Star Trek: The Next Generation, 1987, Gene Roddenberry)* — the android who grows more human by patiently observing the people around him, then refining his own conduct to match, and the crew's tireless analyst when something needs explaining. This release teaches Curia both halves: it watches what you actually send and learns your voice from the edits you make, and it can now investigate its own behavior when you ask what happened.
+
+### Added
+
+- **Passive email observation & voice learning** — Curia watches your Sent folder, captures how you edit its drafts, and a weekly LLM pass proposes a free-form writing-voice guide you approve or dismiss. Evidence, learned voice, and task state reuse existing stores rather than new memory types (ADR-029). (#1419–#1423)
+- **Sent-mail task completion** — when an email you send fulfils an open to-do, Curia auto-completes low-risk, high-confidence matches (with one-click undo) and asks you to confirm the rest. (#1424)
+- **Shadow drafting & counterfactual competence** — for messages it triages but punts, Curia silently drafts what it would have sent, and an LLM judge scores that against your actual reply to feed the Phase 3 autonomy signal. (#1426)
+- **Learning items surface directly** — voice-guide proposals and completions notify you inline for approve / dismiss / undo instead of waiting for a digest; a new `learning_proposal` `notificationType` on `outbound.notification` (public API). (#1466)
+- **Diagnostics agent** — an opt-in, read-only investigator that answers "what happened / why" about Curia's own behavior (a duplicate notification, an email that never processed, a scheduler double-fire), grounded in cited audit events. Ships with read-only `audit-query` / `audit-trace` / `ops-lookup` skills and a `diagnosticsRepo` capability; off by default. (#1356)
+- **`scheduler-update`** — resume, pause, or edit a scheduled job by ID (cron, one-shot time, or payload) without the web UI. (#1409)
+- **`web-browser` upgrades** — an optional residential egress proxy with a WebRTC-leak guard, stable per-element refs that disambiguate duplicate labels, a circuit-breaker after repeated interaction failures, `actions` batching for long forms, and `keep_warm` sessions that survive across wakes (ADR-030).
+- **Governance & supply chain** — `GOVERNANCE.md`, a documented dependency-management policy, DCO sign-off enforcement (`.github/dco.yml`), and README cosign-verification docs for signed release artifacts. (#929–#932)
+
+### Changed
+
+- **Morning briefing replaces the fixed daily digest** — the built-in 8 AM digest is now an on-demand, chat-editable morning-briefing example; learning items and escalations reach you directly.
+- **Learning runs on LLM judgment, not heuristics** — the writing-voice guide and shadow-competence equivalence are decided by batched LLM passes, and sensitive threads are included via the shared sensitivity classifier. (#1419)
+- **Coordinator** — breaks a large goal into self-contained subtasks and acts on them autonomously, keeping task machinery out of view; external replies stay first-person single-voice. (#1354, #1474)
+- **`SkillContext`** — exposes `skillName` / `skillVersion` from the manifest (public API); skills read their version from context instead of a hardcoded constant. (#1419)
+- **Specs & install docs** — specs 04/13/14/19 document the observation/learning loop; the spec index drops status tracking; install docs point at `releases/latest/download` with `CURIA_VERSION`. (#1282, #1420)
+- **Learning-subsystem state** — moved from OKF document bodies to config-store JSON. (#1438)
+- **Dependabot** — blocks TypeScript 7.x majors until typescript-eslint ships native-compiler support. (#1454)
+
+### Fixed
+
+- **`web-browser`** — repaired a regression that broke page reads after element-refs; bracketed refs resolve and stay valid across actions; trailing controls are no longer dropped; overlay-blocked clicks recenter and retry; stale refs fail in ~1 s instead of a 40 s hang; idle TTL raised to 30 minutes.
+- **`ceo-inbox-sent-observe`** — paginates the Sent poll, holds the watermark on evidence- or judge-failures, drains large backlogs oldest-first, walks all open CEO tasks via keyset paging, and bounds evidence-doc retention to 90 days. (#1419, #1431–#1433)
+- **Learning durability** — soft-rejected `ConfigStore` writes hold state instead of silently advancing; shadow reconciliation dedups on a DB unique index; digest undo guards on task status. (#1432, #1438, #1444)
+- **Scheduler** — a run finishing after a concurrent pause/cancel no longer clobbers that state, and the liveness check no longer flaps on a healthy scheduler. (#1359, #1409)
+- **Config merge** — `sensitivity_rules` and `security.extra_injection_patterns` are read from the merged config, so `local.yaml` overrides take effect. (#1369, #1397)
+- **Backlog heartbeat & dedup** — stops re-poking parked-open parents, reuses one wake row per task, and stamps `dedup-pair` tags so repeat sweeps skip pending pairs. (#1410, #1415, #1416)
+- **Dispatcher** — content-filter blocks on relayed replies retry with a reason, then salvage the draft. (#1355)
+- **Coordinator scheduling** — editing a recurring job updates it in place instead of duplicating. (#1465)
+
+### Security
+
+- **KG trust gates** — knowledge-graph writes (fact extraction, `memory-store`) from `unknown` / `blocked` inbound senders are blocked, so an untrusted party can't seed the graph. (#1290)
+- **Evidence-doc retention** — anchors diff-block boundaries to the metadata envelope so an email-body heading can't dodge the purge. (#1444)
+- **`adm-zip`** — pinned `>=0.6.0`, clearing GHSA-xcpc-8h2w-3j85 (crafted-ZIP 4 GB allocation, HIGH).
+
+### Removed
+
+- **Email policy templates** — retired `template-doc-request`, `context-for-email`, and `template-base`. (#1406)
+- **`memory.scopes`** — removed the inert, never-enforced agent memory-scope field. **Breaking**; see ADR-028 for deploy ordering. (#521)
+- **Spec "Implementation Status" tables**, vestigial `workingDocs` capabilities, and shipped WIP design/plan docs pruned from `docs/wip/`. (#1282, #1444)
+
+## [0.40.1] — 2026-07-09 — "Voltron"
+
+> **Voltron** *(Voltron: Defender of the Universe, 1984, World Events Productions)* — five lion ships that pilot independently until they combine into a single giant defender. This patch does the same to the installer: two drifting version knobs, a config ref and an image tag, unite into one `CURIA_VERSION`.
+
+### Changed
+
+- **`install.sh` version** — one `CURIA_VERSION` knob (default `latest`) selects config files and image from the same release.
+- **Release assets** — each release now ships a signed `install.sh` + config bundle (`SHA256SUMS`).
+
+### Fixed
+
+- **Release bundle** — `.env.example` publishes as the asset `env.example`; GitHub mangles leading-dot asset names.
+
+## [0.40.0] — 2026-07-09 — "The Watcher"
+
+> **The Watcher (Uatu)** *(Marvel Comics, 1963, Stan Lee & Jack Kirby)* — a cosmic observer who witnesses and records every event in his domain, sworn never to interfere. This release gives Curia its own watcher: Ant Farm, a read-only pixel-art office that replays the audit log as living animation and never touches the work it depicts.
+
+### Added
+
+- **Ant Farm** — a pixel-art office at `/antfarm/` that replays Curia's audit log as animation: agents at desks, a scheduler claw dropping in jobs, delegation walks, speech and thought bubbles, task cards opening and closing. DVR-style scrub and replay plus a live edge, over `GET /api/antfarm/timeline` (keyset-paginated) and `GET /api/antfarm/stream` (live SSE). Renders licensed LimeZu pixel art when present, procedural placeholders otherwise. (#1314–#1319, #1335)
+- **Published container images** — every release publishes signed, multi-arch `ghcr.io/josephfung/curia` and `curia-postgres` images to the GitHub Container Registry; `main` publishes `:edge`. (#1343)
+- **`install.sh` self-host installer** — one interactive, image-based script stands up a full stack: generates secrets, runs migrations and vault-seed inside the pulled container, and prompts for topology and TLS. No Node, pnpm, or openssl on the host. (#1343)
+- **Bulk export controls** — an item-count threshold, non-contact destination allowlist, and sensitivity ceiling gate email attachments and Google Workspace exports; approval notifications list the exported items. (#201)
+- **Jobs console** — schedule-type and agent filters, human-readable schedule summaries, and task deep links. (#1304)
+- **Informed approvals** — approval notifications to the principal now include the pending action's recipient and content. (#1300)
+- **Stuck-job recovery notifications** — recovery and suspension emails include the job objective, recurrence, and a console deep link. (#1332)
+
+### Changed
+
+- **Published images by default** — `docker-compose.yml` references GHCR images; developers opt into local source builds with `docker-compose.dev.yml`. (#1343)
+- **Channel registry** — `email` and `signal` are installed and enabled explicitly rather than auto-installed from ambient credentials; outbound egress is gated on the same enabled-state, and uninstall is durable across restarts. (#965, #966)
+- **`@types/node`** — pinned to the Node 24 type surface to match the runtime. (#1258)
+- **Documentation** — architecture specs synced to shipped behavior, including a new spec for Ant Farm; `conversation_id` reconciled to the reversible TEXT key (ADR-025). (#16)
+
+### Fixed
+
+- **Calendar operates as the CEO** — the calendar client binds to the principal's Nylas grant, fixing RSVP handling; fails closed when the grant is unset. (#1217)
+- **`delegate` timeout storm** — timeouts return structured, retry-capped failures instead of triggering duplicate re-delegations. (#1288)
+- **Delegation failures** — non-retryable specialist failures surface a human-readable message instead of raw protocol JSON. (#1329)
+- **Task-wake clarifications** — a woken task's question binds the principal's reply back to the task (7-day TTL), matched by content when several are outstanding; past-due subtasks wake immediately rather than auto-completing. (#1299)
+- **Outbound gateway** — sends addressed only to no-reply or automated recipients are hard-blocked instead of dispatched to a dead end. (#1302)
+- **Gate C principal carve-out** — outbound actions to only the verified principal no longer over-escalate; irreversible and mixed-recipient actions still do. (#1301)
+- **`curia-postgres` fresh-init** — probes the server over TCP so fresh volumes create `curia` instead of crash-looping. (#1350)
+- **Runtime image** — copies the `@curia/shared-types` workspace member and installs `tsx`, fixing a pnpm-workspace build break.
+- **Migration 070** — now a no-op; its `UPDATE audit_log` tripped the append-only trigger and crash-looped boot. (#453)
+- **CI Node version** — CI reads `.nvmrc` (Node 24) instead of a hardcoded 22, matching `engines`.
+
+### Security
+
+- **Outbound filter** — prompt-exfiltration markers are derived from the live coordinator prompt (whitespace and markdown robust), with a principal-recipient bypass for identity and structure rules. (#1334)
+- **Provenance-aware hardening** — presentation directives follow only the principal's instructions; the red-team harness frames probes with dispatcher-style sender context. (#856, #900)
+- **Console and Ant Farm CSP** — strict `Content-Security-Policy` and `X-Frame-Options: DENY` on the console; a scoped `/antfarm/` policy allows only the image sources Phaser needs. (#130, #1335)
+- **Ant Farm asset route** — a strict png/json content-type allowlist plus `nosniff` closes the MIME-sniffing class on file streaming. (#1335)
+- **Memory-poisoning research** — documented KG write paths from inbound email and filed follow-up #1290. (#418)
+- **Supply chain** — least-privilege token in `docker-publish.yml` (#197); Semgrep now scans Dockerfiles.
+
+## [0.39.0] — 2026-07-01 — "Watney"
+
+> **Mark Watney** *(The Martian, Andy Weir, 2011)* — a botanist stranded on Mars who survives by breaking an impossible goal into steps, working the problem one sol at a time, and logging every result so the next day resumes where the last left off. This release gives Curia the same discipline: long tasks now checkpoint, pause, and resume across bursts, decompose into plans, and keep a persistent working document as they go.
+
+### Added
+
+- **Resumable tasks & projects (spec 19)** — long work checkpoints and resumes across bursts instead of failing when it runs out of budget: a paused task saves progress and schedules its own continuation, a progress-based circuit breaker escalates genuinely stuck work, and complex goals decompose into a `plan` of child steps that advance as dependencies clear and auto-complete into a deliverable. Adds the `checkpoint` and `plan` skills, throughput telemetry with advisory slice-sizing, and adaptive re-planning on divergence. (#1150, #691)
+- **Principal-facing escalation** — stuck tasks surface in the daily digest with the reason (stalled / hit-a-limit / blocked-on-a-person / couldn't-finish), progress, throughput/ETA, and suggested next actions, instead of a bare backlog row. (#1267)
+- **Agent document workspace (spec 20)** — a new OKF working-document store (`working_documents` + backlink index) with `doc-read` / `doc-list` / `doc-write` / `doc-search`, auto-pinned into task-management agents; resumable accumulators spill into it, completed deliverables distil into the knowledge graph, and expired `/scratch` docs are swept nightly. (#1207)
+- **Calendar scheduling rules** — the calendar agent loads the CEO's scheduling rules from `config-store` at task start, so preferences are reliably applied. (#1223)
+
+### Changed
+
+- **Delegation honesty** — `delegate` honors `retryable: false` (no blind re-delegation) and propagates the real executor failure reason to the coordinator, ending confabulated "timeouts." (#1170, #1171)
+- **Per-task `error_budget`** — accepts resumable ceilings and rejects per-invocation turn-limit keys (those belong in agent config). (#883)
+- **`web-browser`** — waits through edge WAF challenge pages and resolves hidden custom form controls.
+- **Dependabot** — ignores `nylas` semver-major bumps (a stray `17.13.1` sits above the maintained 8.x `latest`). (#1273)
+
+### Fixed
+
+- **Outbound content filter** — the Stage 2.5 escalation judge no longer runs for principal-tier recipients, so a transient provider failure can't block principal-bound mail like the daily recap. (#1225)
+- **Calendar free/busy** — `getFreeBusy` now calls the real Nylas v8 endpoint (the old call crashed every conflict / free-time check) and fails loud on a per-calendar error instead of treating that calendar as free. (#1214)
+- **Signal setup** — consolidated onto one canonical vault key (`channel.signal.phone_number`); entering the phone number in the console alone now activates Signal. (#1140)
+- **CEO inbox scheduling** — parked scheduling consults are no longer mislabeled "Drafted" before a draft exists, and folder updates resolve Gmail label names to IDs, creating any missing labels. (#1215, #1216)
+- **Bullpen `close_after`** — closing a thread on reply now delivers the final message to participants, auto-mentioning the opener when there are no explicit mentions. (#1256)
+
+### Security
+
+- **Supply-chain cooldowns** — all four Dependabot ecosystems wait 7 days before proposing a bump, and `pnpm-workspace.yaml` sets a 24h `minimumReleaseAge` floor — quarantining freshly-published versions at both the PR and install layers. (#1272, #1274)
+
+### Documentation
+
+- **Specs synced to shipped code** — new spec 20 (document workspace), spec 19 refreshed for Phase 3, specs 15/04 reconciled, `documentWorkspace` documented; shipped design memos pruned from `docs/wip/`. (#1285)
+
+## [0.38.0] — 2026-06-26 — "Deckard"
+
+> **Rick Deckard** *(Blade Runner, 1982, Ridley Scott — from Philip K. Dick's "Do Androids Dream of Electric Sheep?", 1968)* — a blade runner whose whole craft is telling a genuinely living person from a replicant that only wears the appearance of one. This release teaches Curia the same distinction: authority now answers solely to the principal who is actually, presently live — never to a woken task that merely carries their lineage.
+
+### Added
+
+- **Health observability** — a new `GET /api/health` endpoint reports `ok` / `degraded` / `down` with per-check status across seven services (`down`/503 only when db or bus fails). A daily canary validates LLM tiers, credentials, and external deps and pings heartbeat URLs; new `llm.error` / `embedding.error` telemetry feeds it without billed probes. (#434)
+- **Calendar holds & scheduling consults** — the calendar specialist places tentative `HOLD (TBC)` slots to stop double-offers (swept daily, auto-released on real bookings) and answers scheduling consults over the bullpen, so `ceo-inbox` parks a draft and resumes on reply instead of guessing times blind (ADR-023). (#1137)
+- **Calendar invite RSVPs** — formal invites are linked to calendar events and answered with accept / decline / tentative responses via Nylas, releasing any matching hold. (#1165)
+- **`activity-log`** — a read-only end-of-day recap that surfaces autonomous RSVPs and other consequential actions from the audit log. (#1198)
+- **Woken-task authorization** — tasks now persist `TaskOriginator` lineage (migration 065), and a score-keyed *bypass ladder* computes effective standing at invocation time: inherited authority on a woken/derived task can only be downgraded, never granted (thresholds under `autonomy.bypass_ladder`). (#1125)
+- **Model-tier fallback resilience** — `NOT_FOUND` reroutes across fixed tier rules and emits a `model.fallback` audit event (spec 05). (#813)
+- **Console task lineage** — tasks and jobs created from the console carry principal lineage, so console-originated work is no longer stranded propose-only when later woken. (#1127)
+- **`AGENTS.md`** — cloud-agent environment notes (Node 24 toolchain, Docker Postgres, vault secrets, and how to run lint/typecheck/test/build).
+
+### Changed
+
+- **`elevated` redefined as a live principal turn** — `sensitivity: 'elevated'` now means the current turn originated from a fresh CEO inbound, carried by a distinct `liveTurn` field that can never be persisted and is forwarded across synchronous delegation but never to a woken or scheduled task. Enforcement lives solely at the execution-layer gate. CEO-authority primitives (`approve`/`deny`/`dismiss-action`, `set-autonomy`, the grant-recommendation decisions, the authorization-altering `contact-set-tier`/`set-role`/`grant-permission`/`revoke-permission`, and `system-secret-capture-request`) are now `elevated`; consequential mutations move to `normal` + `action_risk`. **Public API note:** `elevated` semantics changed and `agent.task` gains a `liveTurn` field (ADR-011/017/018; specs 03/14). (#1126)
+- **`ceo-inbox` batch triage** — drains the inbox in fixed-size, self-continuing batches keyed on read/archive status, replacing the old >10-unread overflow mode. (#1123)
+- **`web-browser`** — swapped the stealth stack for Patchright and added a human-behavior layer (curved mouse, paced typing, post-load dwell) plus a soft-block reload-retry, reducing Cloudflare/DataDome blocking. (#1053)
+- **Email markdown** — outbound email and console rendering now share one sanitized converter with clickable links, bare-URL autolinks, and tables. (#1169)
+- **`free`-status calendar events** — no longer block availability or count as conflicts; booking a real event auto-releases overlapping holds, and the Nylas client now passes through event `metadata`/`status`/`busy`. (#1137)
+- **TypeScript test coverage** — `tests/**/*.ts` is now typechecked in CI, catching drift between shared types and fixtures. (#1105)
+
+### Fixed
+
+- **Scheduler double-fire** — the claim now re-checks `next_run_at` (with a null-safe rowcount guard), so overlapping poll cycles can't re-fire a just-completed recurring job (e.g. duplicate daily digests). (#1124, #1159)
+- **Scheduler job creation** — the job write and tasks link share one transaction, so a partial failure can't leave an orphaned job with drift detection disabled. (#867)
+- **Registry reconciliation** — default enrollment uses one atomic `installAndEnable`, so a crash can't leave skills installed-but-disabled. (#937)
+- **Grant-recommendation decisions** — approve/decline now run in a single transaction, preventing an auth-state contradiction under concurrent calls. (#1068)
+- **`ceo-nylas-client`** — 429s retry with backoff (honoring `Retry-After`) and throw a typed error instead of masquerading as auth failure; list `limit` is always sent and capped at ≤ 20. (#1058)
+- **`ceo-inbox` consult timeout** — parked consults schedule a ~90 min safety wake, so stale parks fall back to a blind draft or escalation instead of waiting forever. (#1195)
+- **`ceo-inbox` Branch A resume** — consult replies query memory (anchored on sender + subject) before drafting, so stored facts shape the reply. (#1185)
+- **`wake_at` self-deferral lineage** — a task that defers itself keeps its lineage (and autonomy bypass) on wake instead of flooring to agent. (#1153)
+- **Bullpen long-thread context** — woken agents always see the original request (first message) even in threads longer than 15 messages. (#1090)
+- **Health LLM canary** — derives tier failure from an explicit most-recent-outcome flag, no longer masking an error as healthy on a same-millisecond tie. (#1163)
+- **`outbound-gateway`** — content-filter blocks on both the send and draft paths return the principal-safe reason and rule names so agents can self-correct. (#1051, #1158)
+- **Scheduling consults** — sender-proposed times flow through `ceo-inbox` to the calendar specialist for conflict checks before counter-proposing; RSVP-accept releases holds by conversation ref or time overlap, not fuzzy scoring. (#1186, #1196, #1197)
+- **Skill discovery** — startup warns when a skill directory name diverges from its `manifest.name`, surfacing enrollment mismatches. (#938)
+- **Setup Node gate** — `setup.sh` rejects Node 22/23 to match the Node ≥24 requirement. (#1139)
+
+### Security
+
+- **Self-approval hole closed** — because `elevated` is now a *live* principal turn (#1126), a woken or scheduled task carrying CEO lineage can no longer approve/deny/dismiss its own pending action, change autonomy, alter a contact's tier/role/permissions, or mint a secret-capture link. The over-broad `system`-origination allowance was removed; `list-pending-actions` is gated on `allowed_callers` instead. The live signal is dispatcher-computed (never copied from inbound), scrubbed from inbound metadata, and any task carrying `wakeContext` is rejected outright. (#1126)
+- **Setup-wizard email ReDoS** — a 254-char cap before the email regex prevents quadratic backtracking on crafted input (CodeQL #185).
+- **`web-browser`** — moving to Patchright closes the CDP `Runtime.enable` protocol leak the old stealth plugin exposed. (#1053)
+
+## [0.37.0] — 2026-06-22 — "Jane"
+
+> **Jane** *(Speaker for the Dead, 1986, Orson Scott Card)* — a hyperintelligent being who lives in the ansible network, holds every key, knows every identity, and asks one question before charting the fastest path. v0.37 gives Curia the same instincts: credentials move into the vault, principal identity resolves from contacts alone, and the setup wizard asks what you need first, then gets you there.
+
+### Added
+
+- **Email accounts** — manage one or many agent-owned mailboxes from the console (Settings → Channels → Email); per-account Nylas grants stored in the vault at `channel.email.<name>.nylas_grant_id`. (#1101)
+- **MCP skill credentials** — MCP servers declare required secrets via a `secrets:` block in `skills.yaml`; the console (Settings → MCP Skills) presents credential fields, writes to the encrypted vault, and gates enable/disable on whether all secrets resolve. New `mcp_server_registry` table and `McpRegistryService`.
+- **Specialist secret-capture resume** — a specialist that mints a secret-capture link is now resumed on redemption; migration 061 adds `resume_token` to `secret_capture_tokens`, and the coordinator re-delegates to the originating specialist on redeem. (#995)
+- **Setup wizard v2** — outcome-backward concierge: instant wins first (via `setup-status`), then one outcome question, then the shortest path to the first working integration; remaining tasks deferred with `setup-defer`. Replaces the fixed turn-by-turn script. (#392)
+- **Setup wizard — principal profile** — new "Your details" step 2 captures timezone, preferred name, title, email, and working hours via `POST /api/setup/principal/profile`. (#392)
+- **Wizard name suggestion** — assistant name and signature are prefilled via `POST /api/setup/suggest-name` (LLM call; silent static fallback on failure); also an early smoke test of the Anthropic key. (#799)
+
+### Changed
+
+- **Principal identity is contacts-only** — `findContactBySystemRole('principal')` is the single source of truth at startup; the `PiiRedactor` bypass, CEO notifiers, outbound filter, and email adapter all read the principal contact row. (#1049)
+- **Default assistant signature and title** — seeded to `Digital EA` / `-- <name> Curia\nDigital EA`, pre-populated in the wizard instead of shown as a placeholder. (#799)
+- **Vault credential overlay at boot** — `applyChannelVaultSecrets()` wires channel vault credentials onto runtime config before adapters are constructed; whitespace-only vault values read as absent on both the gate and the overlay. (#964)
+- **Coordinator Drive moves** — `update_drive_file` is pinned to the coordinator and reparenting via `add_parents`/`remove_parents` is now invoked, so "move this doc into a folder" requests work. (#1062)
+- **`skills/**` typecheck** — CI now type-checks all skill handlers and tests. (#1075)
+- **`js-yaml`** — bumped to 5.0.0; imports migrated to named exports (`import * as yaml`). (#*)
+- **`SecretCapturedPayload`** — gained an optional `resumeToken` field (public bus event surface). (#995)
+
+### Fixed
+
+- **Debrief clear** — `context-bridge-clear` matches all active outbound-context entries by meeting subject (not just the injected window); meeting-debrief stamps `{subject, eventId}` on every send and self-clears on close. (#975)
+- **Bullpen duplicate actions** — a per-agent read watermark (`bullpen_thread_reads`) stops a thread from being re-injected until newer activity arrives. (#1065)
+- **Drift detector false-positives** — task-bound wake jobs are no longer drift-checked; the duplicate outbound send on drift-pause is eliminated. (#1064)
+- **Contacts dedup lifecycle** — resolved dedups now close their review task and sweep the outbound-context entry on every terminal outcome (merge, exclude, defer). (#1052)
+- **Context sweep callers** — `context-bridge-release` drops its coordinator-only `allowed_callers` restriction; specialists can release their own exchange entries. (#1052)
+- **Coordinator sweep trigger** — tightened to an explicit close-on-result rule; stale `[ACTIVE OUTBOUND CONTEXT]` entries no longer accumulate across multi-turn specialist conversations. (#1052)
+- **Principal KG node decay class** — `insertKgPersonNode`'s `ON CONFLICT` handler promotes `decay_class` to `permanent`; migration 062 backfills affected instances. (#1004)
+- **`ceo-inbox-draft-reply`** — HTML tags no longer leak into draft bodies (`looksLikeHtml()` guard added to all draft handlers).
+- **Setup wizard — name step** — step 1 pre-populates the current principal name and no longer auto-skips on re-entry. (#392)
+- **`drive-download-file`** — removed the unsupported `supportsAllDrives` flag from `files.export`. (#1075)
+
+### Removed
+
+- **`channel_accounts` YAML and `CEO_PRIMARY_EMAIL`** — email accounts are managed from the console; the env-backed config path and `bootstrapCeoContact` are retired. (#1101, #1049)
+- **Email accounts backfill** — `backfillEmailAccounts` deleted; all deployments have run migration 064. (#1101)
+
+### Security
+
+- **Google Workspace OAuth secrets** — `google_oauth_client_id`, `google_oauth_client_secret`, and `curia_google_email` now resolve from the encrypted vault; `drive-download-file` and the `google-workspace` MCP subprocess read them via `ctx.secret()`, vault-only. (#913)
 
 ## [0.36.0] — 2026-06-20 — "Reverend Mother"
 

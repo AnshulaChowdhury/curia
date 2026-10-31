@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { RateLimiter } from '../../../src/dispatch/rate-limiter.js';
 
+/** Read the private per-sender Map's size to assert eviction bounds memory.
+ *  TypeScript `private` is not enforced at runtime, so a cast is the standard
+ *  way to inspect internal bookkeeping from a unit test. */
+function senderCount(limiter: RateLimiter): number {
+  return (limiter as unknown as { senderWindows: Map<string, unknown> }).senderWindows.size;
+}
+
 describe('RateLimiter', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -109,6 +116,76 @@ describe('RateLimiter', () => {
       // Window reset — alice is allowed again
       expect(limiter.checkSender('alice')).toBe(true);
       expect(limiter.checkSender('alice')).toBe(false); // blocked again
+    });
+  });
+
+  // -- Idle-sender eviction (#1665) --
+
+  describe('idle-sender eviction', () => {
+    // Pin the fake clock to a fixed epoch far larger than windowMs. lastSweepAt
+    // starts at 0, so this guarantees the first checkSender trips the sweep gate
+    // and resets each sender's windowStart to "now" — making these tests
+    // deterministic instead of dependent on the machine's wall-clock.
+    beforeEach(() => {
+      vi.setSystemTime(1_600_000_000_000); // 2020-09-13T12:26:40Z, >> windowMs
+    });
+
+    it('evicts an idle sender window once its window has fully elapsed', async () => {
+      const limiter = new RateLimiter({ windowMs: 60_000, maxPerSender: 5, maxGlobal: 100 });
+
+      expect(limiter.checkSender('alice')).toBe(true);
+      expect(senderCount(limiter)).toBe(1); // alice tracked
+
+      // Alice goes idle for longer than a full window, then bob sends. Bob's call
+      // triggers the once-per-window sweep, which drops alice's fully-elapsed window.
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(limiter.checkSender('bob')).toBe(true);
+
+      expect(senderCount(limiter)).toBe(1); // only bob remains — alice evicted
+    });
+
+    it('bounds memory under many one-shot senders', async () => {
+      const limiter = new RateLimiter({ windowMs: 60_000, maxPerSender: 5, maxGlobal: 10_000 });
+
+      // 50 distinct senders each send one message inside the first window.
+      for (let i = 0; i < 50; i++) {
+        expect(limiter.checkSender(`sender-${i}`)).toBe(true);
+      }
+      expect(senderCount(limiter)).toBe(50);
+
+      // A full window passes with no activity from any of them; one new sender
+      // arrives and triggers the sweep. All 50 idle windows are reclaimed.
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(limiter.checkSender('newcomer')).toBe(true);
+
+      expect(senderCount(limiter)).toBe(1);
+    });
+
+    it('spares a sender whose window is still active when the sweep runs', async () => {
+      const limiter = new RateLimiter({ windowMs: 60_000, maxPerSender: 1, maxGlobal: 100 });
+
+      // Clock is pinned in beforeEach to a fixed epoch >> windowMs, so the first
+      // checkSender stamps lastSweepAt and resets each sender's windowStart to "now".
+      // t below is relative to that pinned base.
+
+      // alice sends at t=0 (window [t, t+60_000)).
+      expect(limiter.checkSender('alice')).toBe(true);
+
+      // bob sends at t=30_000 (window [30_000, 90_000)) — no sweep yet this window.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(limiter.checkSender('bob')).toBe(true);
+
+      // carol sends at t=60_001. Her call triggers the sweep: alice's window has
+      // fully elapsed (idle 60_001ms) → evicted; bob's window is still active
+      // (idle 30_001ms) → spared.
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(limiter.checkSender('carol')).toBe(true);
+
+      expect(senderCount(limiter)).toBe(2); // bob + carol; alice evicted
+
+      // bob survived the sweep with his window intact: still inside it and already
+      // used his single message, so he stays blocked.
+      expect(limiter.checkSender('bob')).toBe(false);
     });
   });
 

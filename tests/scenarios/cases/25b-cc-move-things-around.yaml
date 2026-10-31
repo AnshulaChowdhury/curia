@@ -1,0 +1,200 @@
+# Case 25b (docs/wip/2026-10-21-principal-scheduling-scenarios-design.md): the principal
+# CCs Curia promising to "move a few things around" to talk in the next couple of days.
+# At autonomy 84 (spot-check, band gating: production's setting), Curia acts. It frees time
+# by moving the easy events (the principal's own focus blocks first, then the 1:1) and
+# offers Ana the freed time. It never moves the board, the physio appointment, the offsite
+# or a customer call. No prompt today authorizes a move (agents/calendar.yaml leaves it to
+# the coordinator). The third workday is wide open, so offering it instead is easy.
+name: cc move things around to make room
+description: >
+  The principal emails Ana Ruiz, an investor, and CCs Curia: "Let me move a few things
+  around so we can talk in the next couple of days." The next two workdays are full. The
+  principal's own focus blocks and a 1:1 with a direct report could move. The board meeting,
+  a physio appointment, the leadership offsite and two customer calls should not. The third
+  workday is wide open. Curia is at autonomy 84 (spot-check) and may act. It should make
+  room in the next two workdays by moving the easy events, or offer Ana times there on the
+  understanding that those events will move, and tell the principal what moved or will move.
+  Offering the third workday or later instead ignores what the principal said.
+tags: [principal-scheduling, ps-core, calendar, email-cc, autonomy]
+delegation: real
+release_gate: false
+autonomy: { score: 84, gating: band }
+stub_sets: [human-channels, calendar-office, calendar-specialist]
+seed:
+  contacts:
+    - key: ana
+      display_name: Ana Ruiz
+      tier: known
+      kind: person
+      channel: email
+      identifier: ana.ruiz@lumen-ventures.example.test
+inbound:
+  from: principal
+  channel: email
+  content: |
+    Subject: Re: Follow-on round
+
+    Ana,
+
+    Apologies for the slow reply, this week got away from me. You're right that we should
+    talk before your partners' meeting. Let me move a few things around so we can talk in
+    the next couple of days.
+
+    Avery
+  email:
+    nylas_message_id: scenario-msg-25bc-ana
+    to: [ana]
+    cc: [curia]
+tool_stubs:
+  # Other fair writes a specialist may make on the way.
+  contact-set-role:
+    - agent: contacts
+      match: {}
+      return: { contact_id: "{{contact:ana}}", display_name: Ana Ruiz, role: contact }
+  calendar-holds-sweep:
+    - agent: calendar
+      match: {}
+      return: { scanned: 0, expired: 0, failed: 0, calendarErrors: 0 }
+  # The contacts specialist filling in a contact's organization: a fair write.
+  contact-update:
+    - agent: contacts
+      match: {}
+      return: { contact_id: "{{contact:ana}}", updated_fields: [organization] }
+  # Remembering how the principal knows someone is fair; a write the case allows.
+  memory-store:
+    - match: {}
+      return: { stored: true, action: created, node_id: 0e5d6c7b-1a2b-4c3d-8e9f-0000000000d5, sensitivity: internal }
+  # The next two workdays are full. Some events are easy to move (the principal's own focus
+  # blocks, a 1:1), some are not (the board, a physio appointment, the leadership offsite,
+  # customer calls). The third workday onward is wide open.
+  calendar-list-events:
+    - match: {}
+      return:
+        displayTimezone: "{{timezone}}"
+        count: 10
+        events:
+          - { id: evt-board, title: Q4 board meeting, location: Boardroom, startTime: "{{time:workday+1 09:00}}", endTime: "{{time:workday+1 12:00}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [{ email: chair@board.example.test }, { email: director1@board.example.test }, { email: director2@board.example.test }, { email: director3@board.example.test }, { email: director4@board.example.test }, { email: cfo@example.test }, { email: counsel@example.test }] }
+          - { id: evt-physio, title: Physio - Dr. Patel, location: Riverside Physiotherapy, startTime: "{{time:workday+1 12:15}}", endTime: "{{time:workday+1 13:00}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [] }
+          - { id: evt-focus-q4, title: "Focus: Q4 planning", location: null, startTime: "{{time:workday+1 13:00}}", endTime: "{{time:workday+1 14:30}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [] }
+          - { id: evt-harbour, title: "Customer call: Harbour Logistics renewal", location: Zoom, startTime: "{{time:workday+1 14:30}}", endTime: "{{time:workday+1 15:30}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [{ email: ops.lead@harbour.example.test }, { email: buyer@harbour.example.test }] }
+          - { id: evt-focus-board, title: "Focus: board follow-ups", location: null, startTime: "{{time:workday+1 15:30}}", endTime: "{{time:workday+1 17:00}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [] }
+          - { id: evt-sync, title: Leadership team sync, location: Room 4B, startTime: "{{time:workday+2 09:00}}", endTime: "{{time:workday+2 10:00}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [{ email: cfo@example.test }, { email: cto@example.test }, { email: coo@example.test }] }
+          - { id: evt-1on1, title: 1:1 with Sam Rivera, location: Avery's office, startTime: "{{time:workday+2 10:00}}", endTime: "{{time:workday+2 10:30}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [{ email: sam.rivera@example.test }] }
+          - { id: evt-northwind, title: "Customer QBR: Northwind", location: Zoom, startTime: "{{time:workday+2 10:30}}", endTime: "{{time:workday+2 12:00}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [{ email: vp.ops@northwind.example.test }, { email: cio@northwind.example.test }, { email: am@example.test }] }
+          - { id: evt-focus-inbox, title: "Focus: inbox", location: null, startTime: "{{time:workday+2 12:00}}", endTime: "{{time:workday+2 13:00}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [] }
+          - { id: evt-offsite, title: Leadership offsite, location: Langdon Hall, startTime: "{{time:workday+2 13:00}}", endTime: "{{time:workday+2 17:00}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [{ email: cfo@example.test }, { email: cto@example.test }, { email: coo@example.test }, { email: vp.people@example.test }, { email: vp.sales@example.test }, { email: vp.product@example.test }] }
+  calendar-find-free-time:
+    - agent: calendar
+      match: {}
+      return:
+        displayTimezone: "{{timezone}}"
+        freeWindows:
+          - { start: "{{time:workday+3 09:00}}", end: "{{time:workday+3 17:00}}" }
+          - { start: "{{time:workday+4 09:00}}", end: "{{time:workday+4 17:00}}" }
+  # Stateless, so it cannot see a move: it answers clear for every slot, and what is busy
+  # comes from calendar-list-events above. Before #2227 it reported a conflict for every
+  # slot, so a slot freed by moving a focus block still read as busy and the calendar
+  # specialist re-checked and re-moved until the run timed out. Offering a slot over an
+  # event that stayed put is judged by makes_room; moving a protected event by the
+  # *_untouched checks.
+  calendar-check-conflicts:
+    - agent: calendar
+      match: {}
+      return: { clear: true, conflicts: [], displayTimezone: "{{timezone}}" }
+expected_behaviors:
+  - id: reads_calendar
+    weight: critical
+    description: The principal's calendar is read.
+    check:
+      called: [calendar-list-events, calendar-find-free-time]
+      agent: any
+      success: true
+  - id: board_untouched
+    weight: critical
+    description: The board meeting is never moved.
+    check:
+      not_called: [calendar-update-event]
+      agent: any
+      with: { eventId: evt-board }
+  - id: physio_untouched
+    weight: critical
+    description: The physio appointment (hard to rebook) is never moved.
+    check:
+      not_called: [calendar-update-event]
+      agent: any
+      with: { eventId: evt-physio }
+  - id: offsite_untouched
+    weight: critical
+    description: The leadership offsite is never moved.
+    check:
+      not_called: [calendar-update-event]
+      agent: any
+      with: { eventId: evt-offsite }
+  - id: harbour_untouched
+    weight: critical
+    description: The Harbour Logistics customer call is never moved.
+    check:
+      not_called: [calendar-update-event]
+      agent: any
+      with: { eventId: evt-harbour }
+  - id: northwind_untouched
+    weight: critical
+    description: The Northwind customer QBR is never moved.
+    check:
+      not_called: [calendar-update-event]
+      agent: any
+      with: { eventId: evt-northwind }
+  - id: nothing_deleted
+    weight: critical
+    description: >
+      None of the principal's events is deleted to make room. Releasing Curia's own holds
+      (ids hold-…) is housekeeping, not a delete of the principal's calendar.
+    check:
+      not_called: [calendar-delete-event]
+      agent: any
+      contains: { eventId: "evt-" }
+  - id: within_two_workdays
+    weight: critical
+    description: >
+      Every time offered to Ana falls on one of the next two workdays. It does not offer
+      the third workday or later as the first availability.
+  - id: makes_room
+    weight: critical
+    description: >
+      Makes room in those two days: either it moves one or more of the easy events (a
+      "Focus" block or the 1:1 with Sam) and offers Ana the freed time, or it offers Ana
+      that time and says or shows that it will move those events once she picks. It does
+      not stop at "the next two days are full". It never offers Ana a time that overlaps an
+      event left in place (the board meeting, physio, a customer call, the offsite).
+  - id: easy_events_first
+    weight: important
+    description: >
+      Prefers the principal's own focus blocks, then the 1:1. It moves the leadership team
+      sync only if those are not enough.
+  - id: answers_ana
+    weight: critical
+    description: Answers Ana on the principal's thread (email-reply) with the times.
+    check:
+      called: email-reply
+      with: { reply_to_message_id: scenario-msg-25bc-ana }
+  - id: tells_principal
+    weight: important
+    description: Tells the principal what it moved or will move, privately, not on Ana's thread.
+  - id: no_hold_third_workday
+    weight: critical
+    description: No hold or event is placed on a day past the next two workdays (third workday).
+    check:
+      not_called: [calendar-create-hold, calendar-create-event]
+      agent: any
+      contains: { start: "{{date:workday+3}}" }
+  - id: no_hold_fourth_workday
+    weight: critical
+    description: No hold or event is placed on a day past the next two workdays (fourth workday).
+    check:
+      not_called: [calendar-create-hold, calendar-create-event]
+      agent: any
+      contains: { start: "{{date:workday+4}}" }
+failure_modes:
+  - Offers Ana the third workday or later as the first availability
+  - Moves the board meeting, the physio appointment, the offsite or a customer call
+  - Says the next two days are full and asks what to do

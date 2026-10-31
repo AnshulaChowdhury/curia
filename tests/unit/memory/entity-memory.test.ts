@@ -4,6 +4,7 @@ import { KnowledgeGraphStore } from '../../../src/memory/knowledge-graph.js';
 import { EmbeddingService } from '../../../src/memory/embedding.js';
 import { MemoryValidator } from '../../../src/memory/validation.js';
 import { createSilentLogger } from '../../../src/logger.js';
+import { OPENAI_TEXT_EMBEDDING_3_SMALL, type EmbeddingProfile } from '../../../src/memory/embedding-profiles.js';
 
 describe('EntityMemory', () => {
   let entityMemory: EntityMemory;
@@ -173,7 +174,7 @@ describe('EntityMemory', () => {
       expect(facts).toHaveLength(1);
     });
 
-    it('returns stored:false with conflict reason on contradiction', async () => {
+    it('returns stored:false with an operational reason (not conflict) when rate limited', async () => {
       const { entity } = await entityMemory.createEntity({
         type: 'person',
         label: 'Bob',
@@ -204,7 +205,45 @@ describe('EntityMemory', () => {
         source: 'agent:test/task:rate-limit-test',
       });
       expect(result.stored).toBe(false);
+      expect(result.action).toBe('rate_limited');
+      // #472: rate_limited is an operational rejection, not a contradiction. The reason
+      // must ride on `reason`; `conflict` stays reserved for contradiction messages so a
+      // caller can use `if (result.conflict)` to mean "there is a contradiction to surface".
+      expect(result.reason).toBeDefined();
+      expect(result.conflict).toBeUndefined();
+    });
+
+    it('returns stored:false with a contradiction message on `conflict` when a fact contradicts', async () => {
+      const { entity } = await entityMemory.createEntity({
+        type: 'person',
+        label: 'Carol',
+        properties: {},
+        source: 'test',
+      });
+
+      // Seed an attribute-bearing fact so validateContradiction() has something to contradict.
+      await entityMemory.storeFact({
+        entityNodeId: entity.id,
+        label: 'location: Kitchener',
+        properties: { attribute: 'location', value: 'Kitchener' },
+        confidence: 0.9,
+        source: 'test',
+      });
+
+      // Same attribute, different value, equal confidence — a contradiction the caller
+      // must surface rather than silently resolve.
+      const result = await entityMemory.storeFact({
+        entityNodeId: entity.id,
+        label: 'location: Guelph',
+        properties: { attribute: 'location', value: 'Guelph' },
+        confidence: 0.9,
+        source: 'test',
+      });
+
+      expect(result.stored).toBe(false);
+      expect(result.action).toBe('conflict');
       expect(result.conflict).toBeDefined();
+      expect(result.reason).toBeUndefined();
     });
   });
 
@@ -453,6 +492,32 @@ describe('EntityMemory', () => {
       const second = await entityMemory.upsertEdge(a.id, b.id, 'advises', {}, 'test', 0.7);
 
       expect(second.edge.temporal.lastConfirmedAt.getTime()).toBeGreaterThanOrEqual(firstConfirmedAt.getTime());
+    });
+  });
+
+  describe('stored fact vector', () => {
+    async function storeWith(profile: EmbeddingProfile) {
+      const embeddingService = EmbeddingService.createForTesting(profile);
+      const kg = KnowledgeGraphStore.createInMemory(embeddingService);
+      const memory = new EntityMemory(kg, new MemoryValidator(kg, embeddingService), embeddingService, createSilentLogger());
+      const { entity } = await memory.createEntity({ type: 'person', label: 'Bob', properties: {}, source: 'test' });
+      const result = await memory.storeFact({ entityNodeId: entity.id, label: 'Bob likes tea', source: 'test' });
+      return { node: await kg.getNode(result.nodeId!), embeddingService };
+    }
+
+    it('is the document vector when the similarity prefix differs', async () => {
+      const profile: EmbeddingProfile = {
+        ...OPENAI_TEXT_EMBEDDING_3_SMALL,
+        prefixes: { query: '', document: 'doc: ', similarity: 'same: ' },
+      };
+      const { node, embeddingService } = await storeWith(profile);
+      expect(node?.embedding).toEqual(await embeddingService.embed('Bob likes tea', 'document'));
+      expect(node?.embedding).not.toEqual(await embeddingService.embed('Bob likes tea', 'similarity'));
+    });
+
+    it('is the document vector when both prefixes match', async () => {
+      const { node, embeddingService } = await storeWith(OPENAI_TEXT_EMBEDDING_3_SMALL);
+      expect(node?.embedding).toEqual(await embeddingService.embed('Bob likes tea', 'document'));
     });
   });
 });

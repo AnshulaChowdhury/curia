@@ -1,0 +1,65 @@
+import { describe, it, expect } from 'vitest';
+import { isPrincipalDirectedSend, originatorOption, relayDeferredData, RELAY_DEFERRED_NOTE } from '../../../../src/skills/_shared/principal-directed.js';
+
+function originator(systemRole: 'principal' | 'agent' | 'system' | null) {
+  return { originator: { contactId: 'c1', systemRole, channel: 'signal', initiatedAt: '2026-09-17T14:00:00Z', tier: null } };
+}
+
+describe('isPrincipalDirectedSend (#1870)', () => {
+  it('is true for a live principal turn', () => {
+    expect(isPrincipalDirectedSend({ taskMetadata: originator('principal'), liveTurn: true })).toBe(true);
+  });
+
+  it('is true when the principal approved the exact action', () => {
+    expect(isPrincipalDirectedSend({ taskMetadata: undefined, humanApproved: true })).toBe(true);
+  });
+
+  it('is false for principal lineage without a live turn (woken or scheduled task)', () => {
+    // A heartbeat wake can keep principal standing through the bypass ladder, but its
+    // content is composed autonomously, so it must not skip the disclosure gate.
+    expect(isPrincipalDirectedSend({ taskMetadata: originator('principal') })).toBe(false);
+    expect(isPrincipalDirectedSend({ taskMetadata: originator('principal'), liveTurn: false })).toBe(false);
+  });
+
+  it('is false for a live-turn flag without principal lineage (defence in depth)', () => {
+    expect(isPrincipalDirectedSend({ taskMetadata: originator('agent'), liveTurn: true })).toBe(false);
+  });
+
+  it.each(['agent', 'system', null] as const)('is false for a %s-originated task', (role) => {
+    expect(isPrincipalDirectedSend({ taskMetadata: originator(role) })).toBe(false);
+  });
+
+  it('is false with no task metadata (fail-closed default)', () => {
+    expect(isPrincipalDirectedSend({ taskMetadata: undefined })).toBe(false);
+  });
+});
+
+describe('originatorOption (#1320)', () => {
+  it('passes the task originator through for the relay budget', () => {
+    const meta = originator(null);
+    expect(originatorOption({ taskMetadata: meta })).toEqual({ originator: meta.originator });
+  });
+
+  it('is empty when the task has no originator', () => {
+    expect(originatorOption({ taskMetadata: undefined })).toEqual({});
+    expect(originatorOption({ taskMetadata: {} })).toEqual({});
+  });
+
+  it('is empty when the originator has no usable contact id, so unrelated sends never share one budget', () => {
+    expect(originatorOption({ taskMetadata: { originator: { systemRole: null, tier: 'known' } } })).toEqual({});
+    expect(originatorOption({ taskMetadata: { originator: { contactId: '  ', systemRole: null } } })).toEqual({});
+    expect(originatorOption({ taskMetadata: { originator: 'contact-1' } })).toEqual({});
+  });
+});
+
+describe('relayDeferredData (#1320)', () => {
+  it('tells the agent the message is queued and must not be re-sent', () => {
+    expect(relayDeferredData({ deferredToDigest: true })).toEqual({ deferred_to_digest: true, note: RELAY_DEFERRED_NOTE });
+    expect(RELAY_DEFERRED_NOTE).toMatch(/digest/);
+    expect(RELAY_DEFERRED_NOTE).toMatch(/not re-send/i);
+  });
+
+  it('adds nothing to a delivered send', () => {
+    expect(relayDeferredData({})).toEqual({});
+  });
+});

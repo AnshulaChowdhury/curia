@@ -10,7 +10,7 @@ Five layers connected by a message bus. Four domain layers have hard security bo
 
 - **Channel Layer** — translates platform messages (Signal, Email, etc.) into normalized bus events
 - **Dispatch Layer** — routes messages to agents, enforces policy, translates responses back
-- **Agent Layer** — LLM-powered agents with isolated memory scopes
+- **Agent Layer** — LLM-powered agents that read and write a shared knowledge graph
 - **Execution Layer** — runs skills (local or MCP), validates permissions, sanitizes outputs
 - **System Layer** — trusted infrastructure with full pub/sub access (audit logger, scheduler)
 
@@ -27,9 +27,38 @@ Cross-cutting: Audit Logger, Memory Engine, Scheduler.
 
 ### Type Checking
 
-Always run `pnpm --prefix <worktree> run typecheck` (not raw `tsc --noEmit`) —
+Always run `pnpm -C <worktree> run typecheck` (not raw `tsc --noEmit`) —
 CI uses `pnpm run typecheck` which may resolve a different tsconfig chain than
 a bare `tsc` invocation. Run this before every commit that touches `.ts` files.
+
+What it covers: `src/`, `skills/`, `tests/` and `scripts/` (four tsconfig
+projects) plus **every workspace package** under `apps/*` and `packages/*`, via
+`pnpm -r run typecheck`. No workspace package needs checking separately, and new
+ones are picked up automatically — they only need their own `typecheck` script,
+which `tests/unit/workspace-typecheck-coverage.test.ts` requires of any package
+shipping `.ts` sources (`pnpm -r` silently *skips* a package that lacks the
+script, so that test is what keeps the skip loud).
+
+The root projects have the mirror-image failure mode: a file in no project at
+all is checked by nothing and reports green forever (that was `scripts/**` and
+`vitest.config.ts`, with 13 live errors, until #1729).
+`tests/unit/root-typecheck-coverage.test.ts` keeps that loud too — it fails if
+any TypeScript file outside the workspace packages is absent from every root
+project. A new top-level tree therefore needs a home in a tsconfig on day one.
+
+Non-test files under `scripts/**` live in `tsconfig.scripts.json`, which keeps
+the base project's strict settings — they are maintenance tools run against
+production. `scripts/**/*.test.ts` and `vitest.config.ts` are in
+`tsconfig.tests.json` with the relaxations mock-heavy test code needs.
+
+What it does **not** cover, so don't read the green as total:
+
+- `apps/*/vite.config.ts` — reachable only through a project reference, and
+  plain `tsc --noEmit` does not build references (that needs `tsc -b`).
+
+Use `-C`, not `--prefix`: for pnpm (unlike npm) `--prefix` sets only the install
+location, so workspace resolution still comes from the process CWD and can
+resolve the wrong workspace entirely.
 
 ### Strict TypeScript Patterns
 
@@ -58,13 +87,21 @@ Two patterns that pass local checks but fail CI regularly:
 
 ### Logging
 - pino for all logging (structured JSON)
-- No `console.log` anywhere — enforced by lint rule
+- No `console.log` in backend code (`src/`, `tests/`) — enforced by the `no-console` lint rule
+- The browser apps under `apps/` are exempt: pino is a Node logger, so `no-console` is
+  deliberately not set on their `eslint.config.js` block. Antfarm has `clientWarn`
+  (`apps/antfarm/src/client-log.ts`); the console app uses `console.error` directly
 - Log levels: error, warn, info, debug
 
 ### Testing
 - Vitest for unit and integration tests
 - Integration tests use real Postgres (via Docker), not mocks
-- Tests live next to the code they test, or in `tests/unit/` and `tests/integration/`
+- Unit tests for `src/` live in `tests/unit/` (mirror the source tree). Integration tests live in `tests/integration/`. Skill handler tests stay beside the skill; app tests stay in the app package.
+- **The behavior suites (`pnpm smoke`, `pnpm scenarios`) cost money and are the release gate** (see "Behavior gate" below), not a development check. Every run bills real model calls, agents plus the judge, and day-to-day runs added up to hundreds of dollars a month. While developing, rely on unit and integration tests. Run a suite only when the change is to a prompt or a behavior, and then:
+  - run only the cases the change touches (`--case`, `--tags`), with few runs;
+  - compare against saved baseline transcripts rather than re-running a `main` arm;
+  - get the maintainer's agreement first, stating the cases, the run count and the estimated cost, and report the summary's spend afterwards;
+  - never run a full suite mid-branch to check that nothing else broke. That is the release gate's job.
 
 ### pnpm-workspace.yaml — do not edit during worktree setup
 
@@ -84,7 +121,7 @@ When you need to pin a transitive dependency (e.g. to clear a CVE), add it to th
 - `src/bus/events.ts` — event type registry (discriminated union), source of truth
 - `src/bus/permissions.ts` — layer-to-event authorization map (security boundary)
 - `agents/*.yaml` — agent configuration files
-- `skills/*/skill.json` — skill manifests
+- `skills/<bundle>/tools/<tool>/tool.json` — tool manifests in a bundle (most tools); `skills/<tool>/tool.json` for standalone tools
 - `config/default.yaml` — base configuration
 
 ## Adding Things
@@ -92,20 +129,22 @@ When you need to pin a transitive dependency (e.g. to clear a CVE), add it to th
 ### New Channel Adapter
 1. Create `src/channels/<name>/` implementing the `Channel` interface from `src/channels/channel.ts` (`name`, `isToggleable`, `start()`, `stop()`)
 2. Add a `ChannelDescriptor` to `src/channels/catalog.ts` (credential fields + required secret keys)
-3. Register as `layer: "channel"` with the bus
-4. Add config section to `config/default.yaml`
-5. Write tests
+3. Add `src/channels/<name>/outbound-request.ts` (the channel's `OutboundSendRequest` variant) and export `principal-rules.ts` with `PrincipalChannelRules`: identity comparator, `extractRecipients` (principal-eligible vs never-principal ids — group/conversation ids must be never-principal), and optional Gate C `carveoutSkill`. Append the contribution to `src/contacts/principal-channel-registry.ts` — omit `carveoutSkill` to fail closed for Gate C (ADR-034, ADR-035). Recipient projection for principal tagging needs **no** edit to `src/skills/outbound-gateway.ts`.
+4. Re-export the new request variant into the `OutboundSendRequest` union in `outbound-gateway.ts` and add delivery dispatch (`OutboundGatewayConfig` client + `dispatch<Channel>()` + `send()` branch) when the channel sends externally
+5. Register as `layer: "channel"` with the bus
+6. Add config section to `config/default.yaml`
+7. Write tests (include never-principal fields in `extractRecipients` tests)
 
-### New Skill
-1. Create `skills/<name>/skill.json` (manifest) + `handler.ts`
+### New Tool
+1. Create `tool.json` (manifest) + `handler.ts` — inside a bundle at `skills/<bundle>/tools/<name>/` and listed in that bundle's `SKILL.md`, or standalone at `skills/<name>/`. A tool listed in an enabled bundle's `SKILL.md` is enrolled in the registry on the next boot; a standalone tool starts disabled unless `config/registry-defaults.yaml` `tools:` lists it (#1974)
 2. Declare permissions and secrets in the manifest
 3. Write `handler.test.ts`
-4. **Pin it to at least one agent.** Add the skill name to `pinned_skills` in the relevant agent YAML (`agents/coordinator.yaml` for most skills). A skill that isn't pinned to any agent is invisible to that agent unless dynamic discovery happens to surface it — which is unreliable. Exception: pure infrastructure skills invoked by the system (e.g. `extract-facts`, `extract-relationships`, `scheduler-report`) intentionally have no agent owner.
+4. **Pin it to at least one agent.** Prefer pinning a **skill bundle** (`pinned_skills: [calendar]`) so the agent gets the whole toolset + any SKILL.md instructions. For singleton tools still living at `skills/<tool>/`, pin the tool name (auto-wrapped as a singleton skill). A tool that isn't reachable via any pinned skill is invisible unless discovery surfaces it. Exception: pure infrastructure tools invoked by the system (e.g. `extract-facts`, `extract-relationships`, `scheduler-report`) intentionally have no agent owner.
 5. **Timestamps:** When a skill returns timestamps for user-facing display, use `toLocalIso()` from `src/time/timestamp.ts` to convert to the user's local timezone (available as `ctx.timezone`). Never return raw UTC Z-suffix strings for times the user will see — LLMs cannot reliably perform timezone conversion. Include `displayTimezone: formatDisplayTimezone(ctx.timezone)` in the result data so the LLM can label its output.
 
 ### Versioning skills and agents
 
-Bump the `version` field in `skill.json` (for skills) or the `version` field in `agents/<name>.yaml` (for agents) whenever you make a meaningful change:
+Bump the `version` field in `tool.json` (for skills) or the `version` field in `agents/<name>.yaml` (for agents) whenever you make a meaningful change:
 
 - New skill or agent → start at `"0.1.0"`.
 - New capability, new input/output field, new pinned skill → bump **minor** (`0.X.0`).
@@ -115,7 +154,7 @@ The version is surfaced in structured logs and useful for correlating prod behav
 
 ### Autonomy Awareness
 
-When adding a new skill, declare its action risk in `skill.json`. This field is **required** — manifests that omit it are rejected at startup, and the execution layer enforces it against the live autonomy score:
+When adding a new skill, declare its action risk in `tool.json`. This field is **required** — manifests that omit it are rejected at startup, and the execution layer enforces it against the live autonomy score:
 
 ```json
 "action_risk": "medium"
@@ -124,7 +163,7 @@ When adding a new skill, declare its action risk in `skill.json`. This field is 
 Values by capability class:
 - `"none"` — reads, retrieval, summarization (no external effect; min score 0)
 - `"low"` — internal state writes, memory, contacts (min score 60)
-- `"medium"` — outbound communications (min score 70)
+- `"medium"` — outbound communications (min score 70; a send to the principal alone is exempt, #2337)
 - `"high"` — calendar writes, commitments on behalf of CEO (min score 80)
 - `"critical"` — financial / destructive / irreversible actions (min score 90)
 
@@ -136,13 +175,47 @@ When adding a new agent, ensure it receives the autonomy block via the runtime i
 1. Create `agents/<name>.yaml` with required fields (name, description, model, system_prompt)
 2. Optionally add `handler: ./<name>.handler.ts` for custom logic
 
+### Fixing agent behavior
+
+Don't append a paragraph to `system_prompt`. Put the rule on the highest rung that works: code enforcement → injection with its trigger → tool description → lazy playbook → always-on prompt. See [ADR-046](docs/adr/046-agent-behavior-fix-placement.md). `tests/unit/agents/prompt-budget.test.ts` fails CI when a budgeted agent's always-on prompt or local tool definitions grow past budget — the coordinator plus calendar, ceo-inbox, contacts and meeting-debrief (#2025). Prefer a behavioral test (scenario, smoke, or a unit test of the code) over one that pins prompt text. Writing a case is free; running one is not (see Testing).
+
+### Setup wizard — keep the catalog current
+
+When adding a **significant new capability** — a new channel adapter, a new
+third-party integration, a credential-requiring skill bundle, or a major skill
+that changes what a new user would want to configure — check whether the setup
+wizard catalog needs a matching entry:
+
+- The catalog lives in `skills/setup/tools/setup-status/catalog.yaml`. It is the canonical
+  list of "what a new user sets up" and is owned by the setup-wizard agent, not
+  core.
+- If your change adds a configurable capability, add a catalog entry with:
+  - A `completion_check` (how setup-status detects it is done)
+  - A `credential_how_to` summary (one-sentence inline guide)
+  - A `docs_url` pointing to the relevant curia-docs page
+- If the docs page does not exist yet, create it in `curia-docs` as part of
+  shipping the capability — not as a follow-up.
+- If your change **removes** or **renames** a capability, remove or update the
+  catalog entry and its docs link.
+
+Keeping the catalog current is part of shipping the capability, not a follow-up
+task.
+
 ### Reaching the principal
 
-The runtime injects a **`## Principal Contact Details`** block into every agent's
-effective system prompt on each task turn. The block lists the principal's verified
-channel identities (email, Signal, phone, etc.) loaded from `contact_channel_identities`
-at startup. Agents should use those values when they need to reach the principal —
-they are authoritative and labelled as such in the block.
+The runtime injects a **`## Who you serve`** section into every agent's effective
+system prompt on each task turn, ahead of the YAML body. Its **`### Principal Contact
+Details`** block lists the principal's verified channel identities (email, Signal,
+phone, etc.) loaded from `contact_channel_identities` at startup. They are
+authoritative and labelled as such in the block.
+
+To **send** to the principal, agents pass the reserved alias `principal` as the
+recipient of `email-send`, `signal-send`, `sms-send` or `slack-send`, or in `email-reply`'s
+`cc`; the skill looks the address up from those verified identities (#2033, #2131,
+[ADR-047](docs/adr/047-send-skills-address-recipients-by-reference.md)). A model with
+the right address in context still mistypes it, so no prompt or task payload should
+ask an agent to copy the principal's address into a send skill. The block's values are
+for tools that need a literal address.
 
 The `${principal_contact_id}` placeholder is also injected at bootstrap by
 `interpolateRuntimeContext()` for agents that reference it. Use the contact ID
@@ -152,7 +225,34 @@ the platform resolves the ID once at bootstrap.
 
 For **other contacts** (third parties, external people), use `${principal_contact_id}`
 with `entity-context` or resolve via the contacts specialist — do not hardcode
-their addresses.
+their addresses. Send skills and `email-draft-save` take the contact's UUID; there is no
+raw-address path. Someone with no contact record is added first with `contact-create`,
+which returns the UUID (#2041, ADR-047).
+
+#### Where the placeholder resolves — and where it does not
+
+Two places interpolate `${principal_contact_id}`:
+
+- **Agent system prompts** — `interpolateRuntimeContext()` at bootstrap.
+- **Scheduled-job payloads** — the scheduler, when it builds the `agent.task` content at
+  fire time (#1800). One rule covers every job whatever created it: a `schedule:` block in
+  `agents/*.yaml`, a `POST /api/jobs` request, and a `scheduler-create` call all land in
+  the same `task_payload` column and fire through the same path.
+
+Any *other* `${...}` token in a payload is left as literal text. The scheduler substitutes
+nothing and logs a warning naming the token — inventing a value would be worse than the
+agent seeing the token it was handed.
+
+Everywhere else the token is inert text that the model reads as literal advice and copies
+straight into tool arguments, where it is rejected as a non-UUID. In particular, **never
+put `${...}` in a `tool.json`** — manifests are passed through verbatim to the model, and
+`tests/unit/skills/manifest-placeholder-free.test.ts` fails the build if one appears.
+Describe the value instead: "the principal's contact ID as given in your system prompt".
+
+Skills that take a contact ID should reject a bare token with
+`isUnresolvedPlaceholder()` / `unresolvedPlaceholderError()` from
+`src/skills/_shared/placeholder-guard.ts`, so a model that gets this wrong is told what
+actually went wrong rather than "must be a UUID".
 
 ## Creating Issues
 
@@ -220,10 +320,17 @@ Use these sections as needed:
 - **Security** — security fixes or hardening
 
 One bullet per logical change. Lead with the **feature name in bold**, then a brief description.
-Aim for one clause — what changed and the key consequence. Cut implementation detail; if it
-needs more than ~15 words after the em-dash, it's too long. For example:
+
+**Hard cap: 15 words maximum after the em-dash. A limit, not a target — count them.**
+Say only *what* changed and its key consequence. The mechanism, root cause, and "how"
+belong in the PR and commit body, never here. If it won't fit in 15 words, you're
+keeping implementation detail — cut it. For example:
 
 - **`extract-facts`** — programming errors in the per-fact loop now re-throw instead of silently incrementing `failed`. (#493)
+
+Too long → trimmed:
+- ✗ "…`verify-pgaudit.sh` probed the socket-only temp init server, racing `CREATE DATABASE`… so a fresh volume never created `curia`…"
+- ✓ "…probe the real server over TCP so fresh volumes create `curia` instead of crash-looping."
 
 Reference spec numbers where relevant (e.g. "spec 14").
 
@@ -239,11 +346,11 @@ When cutting a release, use this table to determine the bump size:
 | New spec shipped for the first time (brand-new capability) | **minor** (`0.X.0`) | Autonomy engine shipped, entity context enrichment |
 | Completing a partially-shipped spec or feature | **patch** (`0.x.Y`) | Context summarization completing §01-memory-system.md |
 | Bug fix, small improvement, doc-only | **patch** (`0.x.Y`) | Fixing a skill error path, updating a guide |
-| Breaking change to public API surface | **minor** + note in changelog | Renaming a `SkillContext` field, changing `skill.json` schema |
+| Breaking change to public API surface | **minor** + note in changelog | Renaming a `ToolContext` field, changing `tool.json` schema |
 
 **Public API surfaces** (changes here must be called out explicitly in the changelog even pre-1.0):
-- `skill.json` manifest schema (fields, types, required/optional)
-- `SkillHandler` / `SkillContext` / `SkillResult` TypeScript interfaces
+- `tool.json` manifest schema (fields, types, required/optional)
+- `ToolHandler` / `ToolContext` / `ToolResult` TypeScript interfaces
 - Agent YAML schema (`agents/*.yaml` fields)
 - Bus event type definitions (`src/bus/events.ts`)
 - Channel adapter interface
@@ -258,15 +365,17 @@ A release is a deliberate, standalone step — separate from day-to-day PR work.
 
 **Pre-flight — get `main` release-ready (before the numbered steps)**
 
-Both of the steps below happen *before* cutting the release, while there is still room to fix problems on a normal branch. They land as ordinary PRs — each with its own CHANGELOG entry, which then rolls into this release — and never inside the release PR itself, which carries no code changes (step 6).
+All three steps below happen *before* cutting the release, while there is still room to fix problems on a normal branch. Any fixes they need land as ordinary PRs — each with its own CHANGELOG entry, which then rolls into this release — and never inside the release PR itself, which carries no code changes (step 6).
 
 ***A. Sync the documentation***
 
 Bring the docs in line with what actually shipped this batch. Do this first, so the security gate below scans the final pre-release state.
 
+- **Temporary (#872):** if `src/channels/http/routes/legacy-kg-aliases.ts` still exists **and the #872 CHANGELOG entry already sits under a released version heading**, open a follow-up to delete it (and its registration + tests) — one tagged release of stale-tab coverage is enough. Drop this bullet when that lands.
+
 - **`docs/specs/`** — update the architecture specs so they describe the system as it now behaves. New capability shipped → its spec reflects it; behavior changed → the affected spec is corrected.
 - **`docs/wip/`** — prune it. Remove artifacts whose work has shipped and been folded into `docs/specs/` (or is otherwise complete). Leave anything still in progress untouched.
-- **`docs/dev/`** — update the how-to guides (`adding-a-skill`, `adding-an-agent`, `configuration`, `setup`, etc.) wherever this release changed the steps they describe.
+- **`docs/dev/`** — update the how-to guides (`adding-a-tool`, `adding-an-agent`, `configuration`, `setup`, etc.) wherever this release changed the steps they describe.
 - **curia-docs repo** — the public site (docs.meetcuria.com) lives in the separate `curia-docs` repo. Where this release changed user-facing behavior, update it there via its own PR. This is not part of the Curia release PR.
 
 ***B. Pre-release security gate***
@@ -288,9 +397,30 @@ Review **GitHub → Security → Code Scanning** for the results of all scanners
 
 Don't merge other code PRs between clearing this gate and tagging. If code lands on `main` after the gate clears, re-run it — the release PR adds no code, so the gate is only meaningful if `main` hasn't moved underneath it.
 
+**Record the commit the scans ran against** (`git rev-parse origin/main`) — step 7 diffs against it to prove the gate still applies at tag time.
+
 The ZAP DAST scan (`zap-dast` category) is alert-only and review-only for now — until its first run is triaged into the `alertFilter` baseline in `.zap/plan.yaml`, its findings are informational and do not block a release. Once a triaged baseline exists (and `failOnError` flips), treat its unresolved CRITICALs the same as the other scanners.
 
-With docs synced and the security gate clear, cut the release:
+***C. Behavior gate***
+
+Run both behavior suites against the **same `main` commit as the security gate**, on the standard-tier model the production deployment uses (its `model_routing.tiers.standard.model`, e.g. `deepseek/deepseek-v4.1-flash`). Run them from a worktree checked out at that commit, against the local dev database:
+
+```bash
+docker stop curia-curia-1                       # scenarios refuses to run beside a live instance
+CURIA_RELEASE_GATE=1 pnpm smoke --model <standard-tier model>        # terminal 1; docs/dev/smoke-tests.md
+CURIA_RELEASE_GATE=1 pnpm scenarios --model <standard-tier model>    # terminal 2, once smoke prints "Database: throwaway copy"; tests/scenarios/README.md
+```
+
+`CURIA_RELEASE_GATE=1` marks the run as the release gate. The suites ignore it, but the maintainer's local guard refuses an unfiltered run without it (see Testing).
+
+Run them side by side, smoke first: smoke copies the dev database, and Postgres copies a database only while nothing else is connected to it, so scenarios must start after the copy. Each suite runs 4 cases at a time (`--concurrency`). Measured on 2026-10-05 (#1980): **both suites together took 12 min and OpenRouter billed $2.10**. Each summary prints the run's own spend by agent and judge. On that run the estimate priced cached input as uncached and ran about 2× the bill (estimated $4.39: smoke $2.84, scenarios $1.55, the judge about 10%); #1962 has since fixed the cache accounting; see `docs/dev/smoke-tests.md`. Since #2027 the scenario gate also runs three cases with real delegation (about $0.25 and two minutes more); the other real-delegation cases run on demand (`pnpm scenarios --on-demand`, see `tests/scenarios/README.md`). Since #2025 the scenario gate also runs the specialists' cases: 77 cases, measured on 2026-10-14 at about 38 minutes and $2.87 estimated (the judge about half). Smoke still starts first and finishes well before it.
+
+- **Block the release** if either command exits non-zero: any smoke case fails its gate, or any critical scenario behavior is below threshold. Judge errors and errored runs also fail the gate; re-run those rather than waving them through. A case marked `known_failure` (smoke shows it as `KNOWN`; scenarios list it under known failures) is reported but not gated: confirm each one's issue is still open, because a marker on a closed issue would wave a regression through.
+- **Record the results with the gate SHA.** Each suite prints the `Commit:` it ran on, and it must equal `<gate-sha>` exactly — a `-dirty` suffix means uncommitted changes were tested, so the run does not count. Note both suites' outcomes next to the security gate's (smoke: cases passed, any `PASS*` retries and `KNOWN` known failures; scenarios: gate passed, plus any known failures).
+- **Setup wizard walkthrough.** From the same worktree, also run `pnpm e2e:setup-wizard` (about a minute, no model spend; `docs/dev/setup-wizard-e2e.md`). It installs Curia into an empty throwaway database and clicks through `/setup` to `/chat` in Chromium — the first-run path neither behavior suite reaches (#2146). It uses its own database and port, so it can run beside them. **Block the release** if it exits non-zero, and record the result with the others.
+- Fix a failure on a normal branch, as with the security gate. That moves `main`, so re-run **both B and C** on the new commit. Step 7's diff against `<gate-sha>` then proves the tag is code-identical to what both gates checked.
+
+With docs synced and both gates clear, cut the release:
 
 **1. Read the unreleased changes**
 
@@ -299,6 +429,14 @@ Open `CHANGELOG.md` and review all entries under `## [Unreleased]`. Read for the
 **2. Name the release and determine the version bump**
 
 Name each release after a sci-fi character whose nature embodies the dominant theme of the changes. Choose characters that readers are likely to know; draw from a broad canon (films, novels, games — not just one franchise). The fit should be genuinely tight, not forced. If no character fits well, defer to a short evocative phrase.
+
+**Names are never reused. List the ones already taken before you pick:**
+
+```bash
+grep '^## \[' CHANGELOG.md
+```
+
+Every prior release name is in that output. Check the *character*, not the release theme — the same character can fit two releases for entirely different reasons, and it is still a collision (v0.31.0 and a proposed v0.43.0 both landed on TARS, one for carrying messages across the tesseract, one for the honesty setting). Also note which canons are already heavily drawn on; by twenty releases in, Star Trek and Dune will each have been used more than once, and reaching for an untouched canon usually produces a better name than squeezing a third character out of a used one.
 
 Use the bump table above to determine the version bump. If the unreleased batch mixes types, the highest applicable bump wins (any minor → minor; all patches → patch).
 
@@ -317,8 +455,11 @@ Use the bump table above to determine the version bump. If the unreleased batch 
 
 **4. Update version numbers**
 
+This is the **only** place the version is bumped. Day-to-day PRs never touch `package.json`'s version or the README badge — a feature branch that bumps it is wrong, and two unmerged branches that both bump it will conflict. The version moves once, here, in the release PR.
+
 - `package.json` → `"version": "X.Y.Z"`
-- `README.md` line 18 → update the shields.io badge URL (`version-X.Y.Z`) and its `alt` attribute (`Version: X.Y.Z`)
+- `README.md` → update the shields.io version badge: both the URL (`version-X.Y.Z`) and its `alt` attribute (`Version: X.Y.Z`). Find it rather than trusting a line number — `grep -n 'shields.io/badge/version' README.md`.
+- If this release changed a **runtime** requirement (Node, pnpm, Postgres), also update the matching README badge, `engines` in `package.json`, and any version named in this file.
 
 **5. Generate a release haiku**
 
@@ -334,17 +475,30 @@ Write a haiku thematically aligned with the release — drawn from the changes, 
 
 **7. Tag and publish**
 
-Confirm the merge landed, then tag `origin/main` directly (do not rely on local branch state — the release worktree is on `chore/release-X.Y.Z`, not `main`):
+Tag `origin/main` directly (do not rely on local branch state — the release worktree is on `chore/release-X.Y.Z`, not `main`).
+
+Two things must both be true before you tag: the release PR actually merged, and no code has landed since the security and behavior gates cleared. Check both explicitly. A bare `grep "X.Y.Z"` on `CHANGELOG.md` is a weak proxy for the first and says nothing about the second — it is an unanchored substring match, so it also hits the `[X.Y.Z]:` compare-link definitions at the bottom of the file and any bullet that happens to cite a version number, and the dots are regex wildcards. Anchor on the heading instead, and corroborate with `package.json`.
 
 ```bash
-# Confirm the merge landed — grep must return a result before proceeding
 git -C /path/to/repo fetch origin main
-git -C /path/to/repo show origin/main:CHANGELOG.md | grep "X.Y.Z"
+
+# 1. The merge landed: the version heading exists AND package.json agrees.
+#    Both must return a result before proceeding.
+git -C /path/to/repo show origin/main:CHANGELOG.md | grep '^## \[X.Y.Z\]'
+git -C /path/to/repo show origin/main:package.json | grep '"version": "X.Y.Z"'
+
+# 2. The gate still applies: nothing but the three release files changed
+#    since the commit the scans ran against. <gate-sha> is the commit that
+#    was on main when pre-flights B and C cleared.
+git -C /path/to/repo diff --stat <gate-sha> origin/main
+#    expect exactly: CHANGELOG.md, README.md, package.json
 
 # Tag origin/main directly — no checkout or pull needed
 git -C /path/to/repo tag -a vX.Y.Z -m "vX.Y.Z — Character Name" origin/main
 git -C /path/to/repo push origin vX.Y.Z
 ```
+
+If that diff shows anything else, code landed after the gates cleared. Re-run pre-flights B and C against the new `main` before tagging — this check is what makes the no-code release PR worth the ceremony, so skipping it forfeits the guarantee the whole ordering exists to provide.
 
 Then write the release notes (open with the character blockquote; rewrite the CHANGELOG bullets into natural, friendly prose — past tense, as if narrating what changed; prioritize what a user of Curia would care about; close with a horizontal rule and the haiku) and create the GitHub release:
 
@@ -367,14 +521,17 @@ Tagging stays `git tag -a` (annotated, **unsigned**) — releases are signed at 
 
 **8. Verify release artifacts (SBOM + signatures)**
 
-Publishing the release triggers `release.yml`, which generates an SPDX SBOM and a source tarball, signs both with cosign (keyless, via GitHub OIDC), and attaches all four files to the release. This step is **not optional and not silent** — the workflow fails loudly if anything is missing or a signature fails to verify (this is the fix for v0.34.0, which shipped with no SBOM because the old auto-attach skipped silently).
+Publishing the release triggers `release.yml`, which generates an SPDX SBOM, a source tarball, and the operator install bundle (`install.sh` + `docker-compose.yml` + `docker-compose.tls.yml` + `env.example` + `Caddyfile` + `setup-common.sh`), signs the SBOM, tarball, and a `SHA256SUMS` manifest with cosign (keyless, via GitHub OIDC), and attaches all **twelve** files to the release. This step is **not optional and not silent** — the workflow fails loudly if anything is missing or a signature fails to verify (this is the fix for v0.34.0, which shipped with no SBOM because the old auto-attach skipped silently).
 
-Confirm the workflow succeeded and the four assets are present:
+Confirm the workflow succeeded and all twelve assets are present:
 
 ```bash
 gh run list --workflow=release.yml --limit 1   # must be green
 gh release view vX.Y.Z --json assets --jq '.assets[].name'
-# expect: sbom.spdx.json, sbom.spdx.json.sigstore, curia-vX.Y.Z.tar.gz, curia-vX.Y.Z.tar.gz.sigstore
+# expect (12): sbom.spdx.json, sbom.spdx.json.sigstore, curia-vX.Y.Z.tar.gz,
+#   curia-vX.Y.Z.tar.gz.sigstore, install.sh, docker-compose.yml,
+#   docker-compose.tls.yml, env.example, Caddyfile, setup-common.sh,
+#   SHA256SUMS, SHA256SUMS.sigstore
 ```
 
 If the run failed or assets are missing, re-run it (do **not** consider the release done until they are present):
@@ -396,6 +553,28 @@ cosign verify-blob --bundle sbom.spdx.json.sigstore \
   --certificate-identity-regexp '^https://github.com/<owner>/curia/.github/workflows/release.yml@' \
   sbom.spdx.json
 ```
+
+**9. Verify the image publish, then close out**
+
+Tagging also triggers `docker-publish.yml`. A green run is not enough — that workflow has historically published the *wrong* thing (retagged `:edge` backwards, moved `:latest` on a malformed tag). Check the registry itself:
+
+```bash
+gh api "users/<owner>/packages/container/curia/versions?per_page=10" \
+  --jq '.[] | "\(.updated_at)\t\(.metadata.container.tags | join(", "))"'
+# expect the new release to carry: vX.Y, vX.Y.Z, latest
+# `edge` should sit on main's own build, not on the release
+```
+
+Then close out the release:
+
+- **Close the milestone** — it should read 0 open. (`gh api -X PATCH repos/<owner>/curia/milestones/<n> -f state=closed`)
+- **Remove merged worktrees and branches** — the docs-sync and release worktrees are both disposable once merged:
+  ```bash
+  git -C /path/to/repo worktree remove /path/to/worktrees/<name>
+  git -C /path/to/repo branch -d <branch>
+  git -C /path/to/repo worktree list   # confirm only active work remains
+  ```
+- **`main` is unfrozen.** The gate's "don't merge code PRs" hold ends at the tag, so anything parked for the release window can go in now.
 
 ## Scope Discipline
 

@@ -8,9 +8,10 @@
 
 import type { ContactService } from './contact-service.js';
 import type { AuthorizationService } from './authorization.js';
+import { buildPrincipalSenderContext } from './build-principal-sender-context.js';
 import type { EntityMemory } from '../memory/entity-memory.js';
 import type { Logger } from '../logger.js';
-import type { AuthorizationResult, ContactTier, ContactKind, InboundSenderContext } from './types.js';
+import type { AuthorizationResult, InboundSenderContext } from './types.js';
 
 /**
  * Resolves inbound message senders to known contacts.
@@ -30,48 +31,22 @@ export class ContactResolver {
    * Returns rich SenderContext (with KG facts) for known contacts,
    * or UnknownSenderContext for unrecognized senders.
    *
-   * CLI, smoke-test, and the KG web app channels always resolve as the primary user (CEO).
+   * CLI, smoke-test, and the KG web app channels always resolve as the primary user (principal).
    */
   async resolve(channel: string, senderId: string): Promise<InboundSenderContext> {
-    // CLI, smoke-test, and 'web' are always the primary user (CEO):
-    // - 'cli' and 'smoke-test' are local console sessions — only the CEO has shell access.
+    // CLI, smoke-test, and 'web' are always the primary user (principal):
+    // - 'cli' and 'smoke-test' are local console sessions — only the principal has shell access.
     // - 'web' is the KG web app, authenticated upstream via the bootstrap secret. The secret
-    //   is CEO-only, so any request that reaches the dispatch layer through this channel
-    //   has already been proven to be the CEO at the HTTP route level.
-    // Look up the real CEO contact in the DB so downstream skills (calendar, entity-context)
+    //   is principal-only, so any request that reaches the dispatch layer through this channel
+    //   has already been proven to be the principal at the HTTP route level.
+    // Look up the real principal contact in the DB so downstream skills (calendar, entity-context)
     // get a proper UUID — passing the synthetic 'primary-user' string to UUID columns causes
-    // PostgreSQL errors. Fall back to the synthetic ID only if no CEO contact exists yet.
+    // PostgreSQL errors. Fall back to the synthetic ID only if no principal contact exists yet.
     if (channel === 'cli' || channel === 'smoke-test' || channel === 'web') {
       try {
         const principal = await this.contactService.findContactBySystemRole('principal');
         if (principal) {
-          // Warn if migration-055 backfill missed this principal row — kind should
-          // always be 'principal' for a system_role='principal' contact. The ?? fallback
-          // can't catch this because the kind column is NOT NULL (backfill leaves 'person',
-          // not NULL). Making it unconditional here is both authoritative and observable.
-          if (principal.kind !== 'principal') {
-            this.logger.warn(
-              { contactId: principal.id, kind: principal.kind },
-              'contact-resolver: principal contact has kind != "principal" — migration-055 backfill may have missed this row',
-            );
-          }
-          return {
-            resolved: true,
-            contactId: principal.id,
-            displayName: principal.displayName,
-            role: principal.role,
-            systemRole: principal.systemRole,
-            verified: true,
-            kgNodeId: principal.kgNodeId,
-            knowledgeSummary: '',
-            authorization: null,
-            contactConfidence: 1.0,   // principal always gets max confidence
-            // Principal always gets the highest tier and is always kind='principal'.
-            // Set unconditionally — the stored row value is authoritative only for the
-            // warning check above; we never surface a non-principal kind for the CEO.
-            tier: 'principal' as ContactTier,
-            kind: 'principal' as ContactKind,
-          };
+          return buildPrincipalSenderContext(principal, this.logger, 'contact-resolver');
         }
         // DB call succeeded but no principal contact row exists yet (fresh install before seeding).
         // Skills that need a real UUID will return empty results — best we can do.
@@ -94,20 +69,7 @@ export class ContactResolver {
         // The CLI continuing to work in degraded mode is acceptable; operators still need to know.
         this.logger.error({ err }, 'contact-resolver: DB error looking up principal contact — falling back to synthetic ID');
       }
-      return {
-        resolved: true,
-        contactId: 'primary-user',
-        displayName: 'CEO',
-        role: 'ceo',
-        systemRole: 'principal',
-        verified: true,
-        kgNodeId: null,
-        knowledgeSummary: '',
-        authorization: null,
-        contactConfidence: 1.0,   // principal always gets max confidence
-        tier: 'principal' as ContactTier,
-        kind: 'principal' as ContactKind,
-      };
+      return buildPrincipalSenderContext(null, this.logger, 'contact-resolver');
     }
 
     const resolved = await this.contactService.resolveByChannelIdentity(channel, senderId);
@@ -138,8 +100,10 @@ export class ContactResolver {
     // Evaluate authorization if auth service is available.
     // Isolated in its own try/catch: a DB failure here must not lose the identity
     // resolution above. The coordinator still sees who the sender is — just without
-    // permission context (authorization=null).
+    // permission context (authorization=null). authorizationEvalFailed lets the
+    // dispatcher emit a fail-closed authorization.decision deny for audit (#1379).
     let authorization: AuthorizationResult | null = null;
+    let authorizationEvalFailed = false;
     if (this.authService) {
       try {
         const overrides = await this.contactService.getAuthOverrides(resolved.contactId);
@@ -153,6 +117,7 @@ export class ContactResolver {
         // Authorization eval failure should not lose identity resolution.
         // Log and continue with authorization=null — the coordinator still sees
         // who the sender is, just without permission context.
+        authorizationEvalFailed = true;
         this.logger.error(
           { err, contactId: resolved.contactId, errMessage: err instanceof Error ? err.message : String(err) },
           'Authorization evaluation failed — proceeding without auth context',
@@ -175,6 +140,7 @@ export class ContactResolver {
       kgNodeId: resolved.kgNodeId,
       knowledgeSummary,
       authorization,
+      ...(authorizationEvalFailed ? { authorizationEvalFailed: true as const } : {}),
       contactConfidence: resolved.contactConfidence,
       tier: resolved.tier,
       kind: resolved.kind,

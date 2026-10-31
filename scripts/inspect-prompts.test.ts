@@ -1,0 +1,192 @@
+// inspect-prompts snapshot (curia-deploy#261). The snapshot must carry exactly the
+// coordinator's prompt inputs — curia-deploy renders every agent from it — and must
+// refuse to emit one with a coordinator block missing.
+
+import { describe, expect, it } from 'vitest';
+import type { AgentConfig } from '../src/agents/runtime.js';
+import type { AssembledAgent } from '../src/startup/agent-assembly.js';
+import type { SkillRegistry } from '../src/skills/skill-registry.js';
+import type { PinnedContextEntry, PinnedContextReader } from '../src/agents/pinned-context.js';
+import { buildPromptInputsSnapshot } from './inspect-prompts.js';
+
+const AGENT_CONTACT_ID = '11111111-1111-4111-8111-111111111111';
+const PRINCIPAL_CONTACT_ID = '22222222-2222-4222-8222-222222222222';
+
+function coordinatorConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
+  return {
+    agentId: 'coordinator',
+    systemPrompt: 'body',
+    officeIdentityService: {
+      compileSystemPromptBlock: () => '## Identity\nYou are Curia.',
+      compileWritesAsBlock: () => '## Identity\nYou write as Curia.',
+    },
+    securityContextBlock: '## Security\nPolicy.',
+    availableSpecialists: '- @researcher: Looks things up',
+    autonomyService: {
+      getConfig: async () => ({ score: 82, band: 'spot-check', updatedAt: new Date(0), updatedBy: 'principal' }),
+    },
+    timezone: 'America/Toronto ',
+    channelAccounts: { email: 'curia@example.com', signal: '+15550003333', sms: undefined },
+    agentContactId: AGENT_CONTACT_ID,
+    principalIdentities: [
+      { channel: 'email', channelIdentifier: 'p@example.com', label: 'work', verified: true, status: 'active' },
+      { channel: 'signal', channelIdentifier: '+15550001111', label: null, verified: true, status: 'active' },
+    ],
+    principalPrimaryEmail: { current: 'p@example.com' },
+    principalProfile: {
+      current: { displayName: 'Pat Principal', preferredName: 'Pat', title: 'CEO', pronouns: null },
+    },
+    ...overrides,
+  } as unknown as AgentConfig;
+}
+
+const ENABLED_SKILLS = new Set(['tasks', 'documents']);
+const DISCOVERED = ['documents', 'tasks', 'ceo-inbox', 'calendar'];
+
+function stackWith(rc: AgentConfig, opts: { noPrincipal?: boolean; agents?: AssembledAgent[] } = {}) {
+  const principalContactId = opts.noPrincipal ? undefined : PRINCIPAL_CONTACT_ID;
+  return {
+    skillRegistry: { get: (name: string) => (ENABLED_SKILLS.has(name) ? {} : undefined) } as unknown as SkillRegistry,
+    agents: [{ runtimeConfig: rc } as AssembledAgent, ...(opts.agents ?? [])],
+    agent: (name: string) => {
+      if (name !== 'coordinator') throw new Error(`Agent '${name}' is not loaded in this stack`);
+      return { runtimeConfig: rc } as AssembledAgent;
+    },
+    principalContactId,
+  };
+}
+
+describe('buildPromptInputsSnapshot', () => {
+  it('emits every coordinator prompt input and the curia version', async () => {
+    const snapshot = await buildPromptInputsSnapshot(stackWith(coordinatorConfig()), '0.44.0', DISCOVERED);
+    expect(snapshot).toMatchObject({
+      curia: { version: '0.44.0' },
+      timezone: 'America/Toronto',
+      office_identity_block: '## Identity\nYou are Curia.',
+      // Every other agent's block (#2143).
+      office_identity_writes_as_block: '## Identity\nYou write as Curia.',
+      security_context_block: '## Security\nPolicy.',
+      available_specialists: '- @researcher: Looks things up',
+      autonomy: { score: 82, band: 'spot-check' },
+      agent_contact_id: AGENT_CONTACT_ID,
+      principal_contact_id: PRINCIPAL_CONTACT_ID,
+      principal_identities: [
+        { channel: 'email', channel_identifier: 'p@example.com', label: 'work' },
+        { channel: 'signal', channel_identifier: '+15550001111', label: null },
+      ],
+      principal_primary_email: 'p@example.com',
+      principal_profile: { display_name: 'Pat Principal', preferred_name: 'Pat', title: 'CEO', pronouns: null },
+      // phone mirrors signal for curia-deploy's loader until it reads signal/sms.
+      channel_accounts: { email: 'curia@example.com', signal: '+15550003333', sms: null, phone: '+15550003333' },
+      disabled_skills: ['calendar', 'ceo-inbox'],
+      pinned_context: { docs: {}, configs: {} },
+    });
+  });
+
+  it('reads every declared pinned_context entry once, through the declaring agent\'s reader (#2339)', async () => {
+    const reads: Array<[reader: string, entry: string]> = [];
+    // A reader per agent, so an entry read through the wrong agent's reader shows up.
+    const readerFor = (agentId: string): PinnedContextReader => ({
+      warnChars: 16_000,
+      readDoc: async (path) => {
+        reads.push([agentId, path]);
+        return path === '/shared/inbox/rules.md' ? { status: 'live', version: 3, content: '## Board mail' } : null;
+      },
+      readConfig: async (namespace, key) => {
+        reads.push([agentId, `${namespace}/${key}`]);
+        return namespace === 'ceo_inbox' ? '{"enabled": true}' : null;
+      },
+    });
+    const declaring = (agentId: string, pinnedContext: PinnedContextEntry[]) =>
+      ({ runtimeConfig: { agentId, pinnedContext, pinnedContextReader: readerFor(agentId) } }) as unknown as AssembledAgent;
+    const agents = [
+      declaring('ceo-inbox', [
+        { kind: 'doc', path: '/shared/inbox/rules.md' },
+        { kind: 'config', namespace: 'ceo_inbox', key: 'decision_tagging' },
+      ]),
+      declaring('calendar', [{ kind: 'doc', path: '/shared/calendar/rules.md' }]),
+      declaring('editor', [{ kind: 'doc', path: '/shared/inbox/rules.md' }]),
+      declaring('meeting-debrief', [{ kind: 'config', namespace: 'debrief', key: 'config' }]),
+    ];
+    const snapshot = await buildPromptInputsSnapshot(stackWith(coordinatorConfig(), { agents }), '0.44.0', DISCOVERED);
+    expect(snapshot.pinned_context).toEqual({
+      docs: { '/shared/calendar/rules.md': null, '/shared/inbox/rules.md': { status: 'live', version: 3, content: '## Board mail' } },
+      configs: { 'ceo_inbox/decision_tagging': '{"enabled": true}', 'debrief/config': null },
+    });
+    expect(Object.keys(snapshot.pinned_context.docs)).toEqual(['/shared/calendar/rules.md', '/shared/inbox/rules.md']);
+    // Each unique entry is read once, by the first agent that declares it; editor's
+    // duplicate of the inbox rules is not read again.
+    expect(reads).toEqual([
+      ['ceo-inbox', '/shared/inbox/rules.md'],
+      ['ceo-inbox', 'ceo_inbox/decision_tagging'],
+      ['calendar', '/shared/calendar/rules.md'],
+      ['meeting-debrief', 'debrief/config'],
+    ]);
+  });
+
+  it('fails rather than guess when a pinned read fails (#2339)', async () => {
+    const agent = {
+      runtimeConfig: {
+        agentId: 'calendar',
+        pinnedContext: [{ kind: 'doc', path: '/shared/calendar/rules.md' }],
+        pinnedContextReader: {
+          warnChars: 1,
+          readDoc: async () => { throw new Error('connection reset'); },
+          readConfig: async () => null,
+        },
+      },
+    } as unknown as AssembledAgent;
+    await expect(buildPromptInputsSnapshot(stackWith(coordinatorConfig(), { agents: [agent] }), '0.44.0', DISCOVERED))
+      .rejects.toThrow(/reading pinned_context \/shared\/calendar\/rules\.md \(declared by calendar\) failed/);
+  });
+
+  it('no longer emits executive_voice_block (its injection was removed in #957)', async () => {
+    const snapshot = await buildPromptInputsSnapshot(stackWith(coordinatorConfig()), '0.44.0', DISCOVERED);
+    expect(snapshot).not.toHaveProperty('executive_voice_block');
+    expect(snapshot).not.toHaveProperty('coordinator');
+  });
+
+  it('carries only the identity fields the principal block renders', async () => {
+    const snapshot = await buildPromptInputsSnapshot(stackWith(coordinatorConfig()), '0.44.0', DISCOVERED);
+    for (const identity of snapshot.principal_identities) {
+      expect(Object.keys(identity).sort()).toEqual(['channel', 'channel_identifier', 'label']);
+    }
+  });
+
+  it('records a missing autonomy row and a missing principal as null', async () => {
+    const rc = coordinatorConfig({
+      autonomyService: { getConfig: async () => null } as unknown as AgentConfig['autonomyService'],
+    });
+    const snapshot = await buildPromptInputsSnapshot(stackWith(rc, { noPrincipal: true }), '0.44.0', DISCOVERED);
+    expect(snapshot.autonomy).toBeNull();
+    expect(snapshot.principal_contact_id).toBeNull();
+  });
+
+  it.each([
+    ['officeIdentityService', { officeIdentityService: undefined }],
+    ['securityContextBlock', { securityContextBlock: undefined }],
+    ['availableSpecialists', { availableSpecialists: undefined }],
+    ['autonomyService', { autonomyService: undefined }],
+    ['timezone', { timezone: '  ' }],
+    // Every-agent fields: absent must not read as "a principal with no identities".
+    ['principalIdentities', { principalIdentities: undefined }],
+    ['principalPrimaryEmail', { principalPrimaryEmail: undefined }],
+    ['principalProfile', { principalProfile: undefined }],
+    ['channelAccounts', { channelAccounts: undefined }],
+    ['agentContactId', { agentContactId: undefined }],
+  ] as const)('refuses to emit a snapshot when the coordinator has no %s', async (_field, overrides) => {
+    await expect(
+      buildPromptInputsSnapshot(stackWith(coordinatorConfig(overrides as Partial<AgentConfig>)), '0.44.0', DISCOVERED),
+    ).rejects.toThrow(/coordinator runtime config has no/);
+  });
+
+  it('fails when the coordinator is not loaded', async () => {
+    const stack = {
+      agent: () => { throw new Error("Agent 'coordinator' is not loaded in this stack"); },
+      agents: [],
+      principalContactId: undefined,
+      skillRegistry: {} as SkillRegistry,
+    };
+    await expect(buildPromptInputsSnapshot(stack, '0.44.0', DISCOVERED)).rejects.toThrow(/not loaded/);
+  });
+});

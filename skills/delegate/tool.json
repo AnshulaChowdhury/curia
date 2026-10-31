@@ -1,0 +1,56 @@
+{
+  "name": "delegate",
+  "description": "Delegate a task to a specialist agent. Use this when the user's request requires specialized expertise (research, expense tracking, etc.). Provide the specialist's name and a clear task description. How long to wait for the specialist is set by the runtime — do not pass a timeout. If the result reason is already_in_flight, that specialist is still working in this conversation: do not call delegate for them again. Whenever a result carries next_step, follow it.",
+  "version": "1.14.2",
+  "sensitivity": "normal",
+  "action_risk": "none",
+  "inputs": {
+    "agent": "string",
+    "task": "string",
+    "conversation_id": "string?",
+    "resume_token": "string?",
+    "outbound_entry_id": "string? (When this delegation routes a reply to an [ACTIVE OUTBOUND CONTEXT] entry, that entry's entry_id. The platform releases the entry when the delegation ends, and keeps it only when routing the reply again could still work; the result's outbound_entry says which. Do not call context-bridge-release for it yourself.)"
+  },
+  "outputs": {
+    "response": "string?",
+    "sent": "string[]? (the send skills that succeeded in the specialist's task; empty means it sent nothing, whatever response says)",
+    "draft_emails": "object[]? ({ subject?, body } — email the specialist composed and did not send)",
+    "agent": "string",
+    "resolvedContactIds": "string[]?",
+    "needs_clarification": "boolean?",
+    "question": "string?",
+    "context": "string?",
+    "resume_token": "string?",
+    "declined": "boolean?",
+    "failed": "boolean?",
+    "blocked": "boolean?",
+    "in_flight": "boolean? (true when reason is already_in_flight — no second run was started)",
+    "in_progress": "boolean? (true when a queued same-contact follow-up ended the wait; the specialist is still running)",
+    "reason": "string? (interrupted, timeout, blocked, specialist_decline, already_delivered, already_in_flight, or a specialist failure reason)",
+    "retryable": "boolean?",
+    "errorType": "string?",
+    "message": "string?",
+    "possibly_succeeded": "boolean?",
+    "escalated": "boolean?",
+    "delegate_event_id": "string? (in-flight or timed-out delegation's agent.task id)",
+    "delegate_conversation_id": "string?",
+    "wait_timeout_ms": "number?",
+    "open_handle_age_ms": "number? (ms since the already_in_flight row was written; a running claim starts at dispatch, a promoted pending handle keeps that time)",
+    "handle_status": "string? (running or pending, on an already_in_flight result)",
+    "handle_expires_at": "string? (ISO time the already_in_flight row stops blocking, before the sweep's lag)",
+    "next_step": "string? (on an already_in_flight, needs_clarification or paused result, or one with draft_emails or composed text that was not sent: what to do next. For you, not the requester; never relay it)",
+    "queued": "boolean? (on an already_in_flight result: true when this brief was saved to run after the open request, false when it was not)",
+    "outbound_entry": "object? ({ id, status, reason? } — what the platform did with the linked outbound-context entry: released, kept_open (the specialist still needs the principal on it), kept (the specialist could not take the reply; retry or tell the principal), already_released, release_failed, or not_linked with the reason)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 900000,
+  "capabilities": [
+    "bus",
+    "agentRegistry"
+  ],
+  "optional_capabilities": [
+    "verification"
+  ],
+  "allowed_callers": ["coordinator"]
+}

@@ -14,7 +14,7 @@ import type { DbPool, DbPoolClient } from '../db/connection.js';
 import type { Logger } from '../logger.js';
 import type { EntityMemory } from '../memory/entity-memory.js';
 import { sanitizeDisplayName } from '../skills/sanitize.js';
-import { TIER_RANK, IdentityNotFoundError } from './types.js';
+import { TIER_RANK, IdentityNotFoundError, ContactNotFoundError, StructuralContactMergeError } from './types.js';
 import type {
   AuthOverride,
   Contact,
@@ -25,7 +25,10 @@ import type {
   ContactServiceOptions,
   CreateContactOptions,
   DedupConfidence,
+  DuplicateCandidate,
+  DuplicateCheck,
   DuplicatePair,
+  DuplicateReason,
   GrantRecommendation,
   GrantRecommendationStatus,
   LinkIdentityOptions,
@@ -36,9 +39,24 @@ import type {
   IdentitySource,
   IdentityStatus,
   SystemRole,
+  TierElevationReason,
 } from './types.js';
-import type { DedupService } from './dedup-service.js';
+import { jaroWinkler, normalizeDisplayName, type DedupService } from './dedup-service.js';
 import type { ContactCalendar, CreateCalendarLinkOptions, ResolvedCalendar } from './calendar-types.js';
+import { normalizeExclusionPair, type ExclusionPair } from './dedup-exclusions.js';
+import { canonicalPairKey } from './dedup-pair-key.js';
+import { comparableChannels, isNearMiss, sameIdentifier } from './identifier-near-miss.js';
+import { PERSONAL_EMAIL_DOMAINS } from './non-org-domains.js';
+
+/** Outcome of re-pointing a merged-away contact's dedup exclusions onto the survivor. */
+export interface ReattachExclusionsResult {
+  /** Rows the loser held (all are removed from the loser). */
+  removed: number;
+  /** Rows carried across to the survivor. */
+  moved: number;
+  /** removed - moved: rulings discarded as superseded or already held by the survivor. */
+  dropped: number;
+}
 
 /** Thrown when a caller provides invalid data for a contact field (e.g., primaryEmail not in CCI). */
 export class ContactValidationError extends Error {
@@ -54,9 +72,109 @@ export class ContactValidationError extends Error {
  * non-null system_role. Such rows must never be deleted by a merge and a structural
  * primary's tier must never be downgraded by survivorship. Exported for unit testing.
  */
-export function isStructuralContact(c: Contact): boolean {
+export function isStructuralContact(c: Pick<Contact, 'systemRole' | 'kind' | 'tier'>): boolean {
   return c.systemRole !== null || c.kind === 'principal' || c.kind === 'agent' || c.tier === 'principal';
 }
+
+/**
+ * Tier survivorship of a merge — the one implementation, shared by mergeContacts
+ * (computeGoldenRecord) and the KG node merge's multi-contact fold (src/kg-merge).
+ *
+ * A structural primary (principal/agent/system-role) always keeps its own tier — a merge
+ * must never downgrade it, not even via blocked-wins: merging a 'blocked' duplicate into
+ * the principal must not lock the principal out. For ordinary contacts, a 'blocked' tier
+ * on any side wins (most restrictive, so a merge can never un-block a contact); otherwise
+ * the more-capable (higher TIER_RANK) tier survives, the primary's on a tie, preserving any
+ * explicit principal grant (trusted/principal).
+ */
+export function survivingTier(
+  primary: Pick<Contact, 'systemRole' | 'kind' | 'tier'>,
+  others: ReadonlyArray<Pick<Contact, 'tier'>>,
+): ContactTier {
+  if (isStructuralContact(primary)) return primary.tier;
+  if (primary.tier === 'blocked' || others.some(c => c.tier === 'blocked')) return 'blocked';
+  return others.reduce<ContactTier>((best, c) => (TIER_RANK[c.tier] > TIER_RANK[best] ? c.tier : best), primary.tier);
+}
+
+/**
+ * The surviving contact row a merge writes: every mutable column except system_role,
+ * which a merge never changes (see the structural-contact guard in mergeContacts).
+ * Computed by the caller — mergeContacts from its golden record, the KG node merge
+ * (src/kg-merge) from the user's resolutions — and written by mergeContactRowsInTx.
+ */
+export interface MergedContactRow {
+  kgNodeId: string | null;
+  displayName: string;
+  role: string | null;
+  notes: string | null;
+  tier: ContactTier;
+  kind: ContactKind;
+  preferredName: string | null;
+  title: string | null;
+  organization: string | null;
+  primaryEmail: string | null;
+  primaryPhone: string | null;
+  timezone: string | null;
+  locale: string | null;
+  location: string | null;
+  pronouns: string | null;
+  linkedinUrl: string | null;
+  bio: string | null;
+  birthday: string | null;
+  contactConfidence: number;
+  lastSeenAt: Date | null;
+  inboundMessageCount: number;
+  outboundMessageCount: number;
+}
+
+/**
+ * Rows re-pointed (or dropped) by reattachContactReferences, per table. Before #2233 a
+ * merge lost these: the FK cascades deleted calendars, grant recommendations and
+ * conversation resolutions; SET NULL blanked task/voice/working-memory references; and
+ * originator JSON kept naming the deleted contact.
+ */
+export const CONTACT_REFERENCE_KEYS = [
+  'contact_calendars',
+  'contact_calendars_demoted',
+  'grant_recommendations',
+  'grant_recommendations_dropped',
+  'conversation_resolved_entities',
+  'conversation_resolved_entities_dropped',
+  'tasks_waiting_on',
+  'voice_sessions',
+  'working_memory',
+  'originator_tasks',
+  'originator_scheduled_jobs',
+  'originator_bullpen_threads',
+  'originator_secret_capture_tokens',
+  'originator_pending_delegations',
+  'outbound_context_recipients',
+] as const;
+export type ContactReferenceKey = (typeof CONTACT_REFERENCE_KEYS)[number];
+export type ContactReferenceCounts = Record<ContactReferenceKey, number>;
+
+export function emptyContactReferenceCounts(): ContactReferenceCounts {
+  return Object.fromEntries(CONTACT_REFERENCE_KEYS.map(k => [k, 0])) as ContactReferenceCounts;
+}
+
+/** Rows that now point at the survivor (excludes the dropped / demoted tallies). */
+export function countRepointedReferences(counts: ContactReferenceCounts): number {
+  return CONTACT_REFERENCE_KEYS
+    .filter(k => !k.endsWith('_dropped') && !k.endsWith('_demoted'))
+    .reduce((sum, k) => sum + counts[k], 0);
+}
+
+/** What one contact fold changed, for logging and the node-merge result. */
+export interface ContactRowMergeOutcome {
+  exclusions: ReattachExclusionsResult;
+  references: ContactReferenceCounts;
+}
+
+/** Canonical attribute keys copied by a contact merge (migration 048). */
+const CANONICAL_ATTRIBUTE_KEYS = [
+  'preferredName', 'title', 'organization', 'primaryEmail', 'primaryPhone', 'timezone',
+  'locale', 'location', 'pronouns', 'linkedinUrl', 'bio', 'birthday',
+] as const;
 
 // ---------------------------------------------------------------------------
 // Email sender classification (issue #946)
@@ -64,18 +182,8 @@ export function isStructuralContact(c: Contact): boolean {
 // Helpers to decide whether an email sender should be stored as a person or
 // routed to an organization KG node. Exported for unit testing.
 
-/** Well-known personal webmail domains that should never generate org nodes. */
-const PERSONAL_EMAIL_DOMAINS = new Set([
-  'gmail.com', 'googlemail.com',
-  'yahoo.com', 'ymail.com',
-  'hotmail.com', 'hotmail.co.uk', 'hotmail.ca',
-  'outlook.com',
-  'live.com', 'live.ca', 'live.co.uk',
-  'icloud.com', 'me.com', 'mac.com',
-  'aol.com',
-  'msn.com',
-  'protonmail.com', 'proton.me', 'pm.me',
-]);
+// The webmail list lives in non-org-domains.ts, shared with outreach linking (#2312).
+export { PERSONAL_EMAIL_DOMAINS };
 
 /**
  * Local-part prefixes that are unambiguously machine-generated: no-reply addresses,
@@ -148,28 +256,41 @@ interface ContactServiceBackend {
   listContacts(filters?: { tier?: ContactTier; kind?: ContactKind[]; limit?: number; offset?: number }): Promise<Contact[]>;
   updateContact(contact: Contact, client?: DbPoolClient): Promise<void>;
   createIdentity(identity: ChannelIdentity): Promise<void>;
+  getIdentity(identityId: string): Promise<ChannelIdentity | null>;
   getIdentitiesForContact(contactId: string): Promise<ChannelIdentity[]>;
+  /** Every identity on any of these channels, for the duplicate check (#2041). */
+  listIdentitiesOnChannels(channels: string[]): Promise<ChannelIdentity[]>;
   resolveByChannelIdentity(channel: string, channelIdentifier: string): Promise<ResolvedSender | null>;
   unlinkIdentity(identityId: string): Promise<boolean>;
   setIdentityStatus(identityId: string, status: IdentityStatus): Promise<ChannelIdentity>;
+  verifyIdentity(identityId: string): Promise<ChannelIdentity>;
 
   /**
    * Atomically elevate a contact's tier from 'unknown' to 'known'.
    * Guards against automated/agent kinds at DB level.
    * Returns true if the row was updated, false otherwise (already elevated, wrong tier, or excluded kind).
    */
-  elevateTierToKnown(contactId: string, reason: 'correspondence' | 'domain-validated' | 'judgment'): Promise<boolean>;
+  elevateTierToKnown(contactId: string, reason: TierElevationReason): Promise<boolean>;
 
   getAuthOverrides(contactId: string): Promise<Array<{ permission: string; granted: boolean }>>;
-  createAuthOverride(override: AuthOverride): Promise<void>;
-  revokeAuthOverride(contactId: string, permission: string): Promise<boolean>;
+  createAuthOverride(override: AuthOverride, client?: DbPoolClient): Promise<void>;
+  revokeAuthOverride(contactId: string, permission: string, client?: DbPoolClient): Promise<boolean>;
 
   // -- Grant recommendations (issue #952) --
-  createGrantRecommendation(rec: GrantRecommendation): Promise<void>;
+  /** Insert a recommendation. Returns true if a row was written, false if the unique pair already existed. */
+  createGrantRecommendation(rec: GrantRecommendation): Promise<boolean>;
   getGrantRecommendation(id: string): Promise<GrantRecommendation | null>;
   findGrantRecommendation(contactId: string, permission: string): Promise<GrantRecommendation | null>;
   listGrantRecommendations(filters?: { status?: GrantRecommendationStatus; limit?: number }): Promise<GrantRecommendation[]>;
-  resolveGrantRecommendation(id: string, status: 'approved' | 'declined', resolvedBy: string): Promise<boolean>;
+  resolveGrantRecommendation(id: string, status: 'approved' | 'declined', resolvedBy: string, client?: DbPoolClient): Promise<boolean>;
+
+  /**
+   * Run a callback inside a single database transaction. The client is passed
+   * into the callback and must be threaded through any backend calls that
+   * should participate in the same transaction. For in-memory backends, JS is
+   * single-threaded so the callback runs directly with no client.
+   */
+  withTransaction<T>(fn: (client?: DbPoolClient) => Promise<T>): Promise<T>;
   createCalendarLink(calendar: ContactCalendar): Promise<void>;
   deleteCalendarLink(nylasCalendarId: string): Promise<boolean>;
   getCalendarsForContact(contactId: string): Promise<ContactCalendar[]>;
@@ -179,19 +300,68 @@ interface ContactServiceBackend {
   /**
    * Re-point all channel identities from fromContactId → toContactId.
    * Identities that would violate UNIQUE(channel, channelIdentifier) are deleted.
+   * Pass `client` to enlist in a caller's transaction (mergeContacts does — #1695).
    */
-  reattachIdentities(fromContactId: string, toContactId: string): Promise<void>;
+  reattachIdentities(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<void>;
 
   /**
    * Re-point active auth overrides from fromContactId → toContactId.
    * If primary already has an override for the same permission, secondary's is discarded.
+   * Pass `client` to enlist in a caller's transaction (#1695).
    */
-  reattachAuthOverrides(fromContactId: string, toContactId: string): Promise<void>;
+  reattachAuthOverrides(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<void>;
+
+  // -- Dedup exclusions (#1625, ADR-039) --
+
+  /**
+   * Record a dedup exclusion for an already-normalized ordered pair
+   * (contactAId < contactBId, both lowercase — see normalizeExclusionPair).
+   * Idempotent: returns false when the pair was already excluded.
+   */
+  addDedupExclusion(pair: ExclusionPair, decidedBy: string): Promise<boolean>;
+
+  /** True when the normalized pair has an exclusion row. */
+  hasDedupExclusion(pair: ExclusionPair): Promise<boolean>;
+
+  /** Every exclusion row, in stored (normalized) order. */
+  listDedupExclusions(): Promise<ExclusionPair[]>;
+
+  /**
+   * Re-point exclusion rows from fromContactId → toContactId during a merge,
+   * renormalizing each pair into stored order. Rows that would become a self-pair
+   * (the two merged contacts excluded against each other) or that would duplicate
+   * an exclusion the survivor already holds are dropped.
+   *
+   * Returns the counts so the caller can log dropped rulings — a dropped row is a principal
+   * decision leaving the ledger, and it must be visible to an operator, not only
+   * explained in a comment.
+   */
+  reattachDedupExclusions(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<ReattachExclusionsResult>;
+
+  /**
+   * Re-point every other row that references fromContactId onto toContactId (#2233,
+   * spec §6.2): calendars, grant recommendations, conversation resolutions, the SET NULL
+   * reference columns and originator JSON. Rows that would collide with the survivor's
+   * own are dropped (grant recommendations, conversation resolutions) or demoted (a
+   * second primary calendar). Pass `client` to enlist in the merge transaction.
+   */
+  reattachContactReferences(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<ContactReferenceCounts>;
+
+  /** Write a merge's surviving row, including the scoring counters updateContact leaves alone. */
+  writeMergedContact(id: string, row: MergedContactRow, client?: DbPoolClient): Promise<void>;
+
+  /**
+   * Lock the given contact rows for a merge (SELECT … FOR UPDATE, ordered by id so two
+   * merges touching the same rows queue instead of deadlocking) and return them as read
+   * under the lock. Missing ids are simply absent. Pass the merge transaction's `client`.
+   */
+  lockContactsForMerge(ids: string[], client?: DbPoolClient): Promise<Contact[]>;
 
   /**
    * Delete a contact by ID. Call only after FK-referenced rows have been re-pointed.
+   * Pass `client` to enlist in a caller's transaction (#1695).
    */
-  deleteContact(id: string): Promise<void>;
+  deleteContact(id: string, client?: DbPoolClient): Promise<void>;
 
   /**
    * Update scoring-owned fields on a contact. Uses atomic increments for message
@@ -213,17 +383,58 @@ interface ContactServiceBackend {
 // Per spec: ceo_stated, email_participant, crm_import, calendar_attendee are auto-verified.
 // signal_participant is also auto-verified — Signal's phone-number identity is stronger than
 // email (no header spoofing), so we trust the source number at the same level as email_participant.
-// agent_called is auto-verified — the agent extracted the identifier mechanically from the channel
-// (e.g. an email sender address), not from LLM-generated content. Same trust level as email_participant.
-// Only self_claimed starts unverified and cannot be force-verified.
+// slack_participant is auto-verified — Slack user ids from the principal's workspace (ADR-033).
+// sms_participant is NOT auto-verified — SMS From is spoofable (ADR-036); principal must verify.
+// agent_called and agent_stated are NOT auto-verified — an agent typed the identifier. Their writers
+// (contact-register; contact-create and contact-link-identity) pass `verified` explicitly: true only
+// when the identifier occurs in text the model did not write (a message a person sent, a source-tool
+// result), so a typo is never verified (#2061, ADR-047). A new writer of either source stores
+// unverified unless it runs that check.
+// outbound_recipient is NOT auto-verified — the address was not read from a message
+// header that passed the reply checks (#2033, ADR-047). email-reply records
+// email_participant, which is auto-verified, only when the From is not an owned
+// mailbox, SPF/DKIM/DMARC all pass, and the duplicate check is clear (#2071).
+// An agent re-stating an outbound_recipient address with contact-link-identity verifies it (#2041).
+// A later reply that meets the same bar verifies the existing identity in place.
+// Only self_claimed cannot be force-verified.
 const AUTO_VERIFIED_SOURCES: ReadonlySet<IdentitySource> = new Set([
   'ceo_stated',
   'email_participant',
   'signal_participant',
+  'slack_participant',
   'crm_import',
   'calendar_attendee',
-  'agent_called',
 ]);
+
+/**
+ * Jaro-Winkler score (0-1, on names normalized by normalizeDisplayName) at which a
+ * display name counts as a likely mistyping of an existing contact's (#2041). The
+ * check lists the contact as a `similar_name` candidate; the agent can still name it
+ * in distinct_from.
+ *
+ * Why 0.95. The scores sit in two groups with a gap between them:
+ *   typos of one person:  Priya Natarajan / Priya Natrajan  0.958
+ *                         Jenna Torres / Jena Torres        0.981
+ *                         Michael O'Connor / Micheal O'Connor  0.987
+ *   two people who share a first name or a surname:
+ *                         David Kim / David King            0.938
+ *                         Sarah Johnson / Sarah Jones       0.936
+ *                         Alex Morgan / Alex Martin         0.905
+ *                         Pat Principal / Sam Principal     0.852
+ * 0.95 is inside the gap. It catches a one-letter typo after the first letter in a
+ * name of about eight or more characters; shorter names and first-letter typos can
+ * fall below it, and a few different people with one-letter-apart names of 8+
+ * characters can land above it (Wei Chen / Wei Chan, 0.95). Raising it to 0.96
+ * would miss "Natrajan"; lowering it
+ * to 0.93 would list Sarah Jones and David King. The dedup scan's cut-offs (0.7 and
+ * 0.9, dedup-service.ts) apply to a combined score and are too loose for a check
+ * that interrupts an agent's write. Some different people still score above 0.95
+ * (Michael Brown / Michelle Brown, 0.956); distinct_from clears those.
+ */
+export const NAME_NEAR_MISS_THRESHOLD = 0.95;
+
+/** Canonical fields the principal's prompt block reads. A write to one refreshes it. */
+export const PRINCIPAL_PROMPT_FIELDS = ['primaryEmail', 'preferredName', 'title', 'pronouns'] as const;
 
 /**
  * ContactService manages the lifecycle of contacts and their channel identities.
@@ -237,7 +448,8 @@ const AUTO_VERIFIED_SOURCES: ReadonlySet<IdentitySource> = new Set([
 export class ContactService {
   private onContactMerged?: (primaryId: string, secondaryId: string, mergedAt: Date) => void;
   private onIdentityVerified?: (contactId: string) => void;
-  private onContactElevated?: (contactId: string, reason: 'correspondence' | 'domain-validated' | 'judgment') => void;
+  private onIdentitiesChanged?: (contactId: string) => void | Promise<void>;
+  private onContactElevated?: (contactId: string, reason: TierElevationReason) => void;
   private dedupService?: DedupService;
   private onDuplicateDetected?: (
     newContactId: string,
@@ -254,9 +466,50 @@ export class ContactService {
   ) {
     this.onContactMerged = options?.onContactMerged;
     this.onIdentityVerified = options?.onIdentityVerified;
+    this.onIdentitiesChanged = options?.onIdentitiesChanged;
     this.onContactElevated = options?.onContactElevated;
     this.dedupService = options?.dedupService;
     this.onDuplicateDetected = options?.onDuplicateDetected;
+  }
+
+  /** Fire-and-forget maybe-async callback. Never fails the caller (#1514). */
+  private invokeNonFatalCallback(
+    label: string,
+    callback: (() => void | Promise<void>) | undefined,
+    context: Record<string, unknown>,
+  ): void {
+    if (!callback) return;
+    try {
+      const maybePromise = callback();
+      if (maybePromise instanceof Promise) {
+        maybePromise.catch(err => {
+          this.logger?.warn({ err, ...context }, `${label} callback rejected (non-fatal)`);
+        });
+      }
+    } catch (err) {
+      this.logger?.warn({ err, ...context }, `${label} callback threw (non-fatal)`);
+    }
+  }
+
+  /** Fire-and-forget identity-mutation notifier (#1514). Never fails the caller. */
+  private notifyIdentitiesChanged(contactId: string): void {
+    this.invokeNonFatalCallback(
+      'onIdentitiesChanged',
+      this.onIdentitiesChanged
+        ? () => this.onIdentitiesChanged!(contactId)
+        : undefined,
+      { contactId },
+    );
+  }
+
+  /**
+   * Ask identity subscribers to reload after a committed write to a column the
+   * principal prompt block shows: `primary_email` (#1950), or the profile's
+   * `preferred_name`, `title` and `pronouns` (#2226). None is an identity row,
+   * so link/unlink would not otherwise refresh the block.
+   */
+  notePrimaryEmailChanged(contactId: string): void {
+    this.notifyIdentitiesChanged(contactId);
   }
 
   /** Create a Postgres-backed instance for production use */
@@ -269,9 +522,15 @@ export class ContactService {
     return new ContactService(new PostgresContactBackend(pool, logger), entityMemory, logger, options);
   }
 
-  /** Create an in-memory instance for testing */
-  static createInMemory(entityMemory?: EntityMemory, options?: ContactServiceOptions): ContactService {
-    return new ContactService(new InMemoryContactBackend(), entityMemory, undefined, options);
+  /** Create an in-memory instance for testing.
+   *  `logger` is optional and off by default — pass one only when a test needs to assert
+   *  on a log line (e.g. the dedup-exclusion override warning in mergeContacts). */
+  static createInMemory(
+    entityMemory?: EntityMemory,
+    options?: ContactServiceOptions,
+    logger?: Logger,
+  ): ContactService {
+    return new ContactService(new InMemoryContactBackend(), entityMemory, logger, options);
   }
 
   /**
@@ -350,13 +609,167 @@ export class ContactService {
   }
 
   /**
+   * Mint a fresh contact-anchored person node after losing a race for an existing one
+   * (ADR-040). Anchored nodes sit outside idx_kg_nodes_unique, so this cannot collide on
+   * the label no matter how many namesakes are already stored.
+   *
+   * Returns null rather than throwing: this runs inside createContact's 23505 recovery,
+   * and a contact with no KG link is a degraded contact, whereas a thrown error is no
+   * contact at all. A null is logged by the caller with the full collision context.
+   */
+  private async mintAnchoredNodeForContact(
+    contact: Contact,
+    source: string,
+  ): Promise<string | null> {
+    if (!this.entityMemory) return null;
+    try {
+      const entity = await this.entityMemory.createAnchoredEntity({
+        type: 'person',
+        label: contact.displayName,
+        properties: contact.role ? { role: contact.role } : {},
+        source,
+      });
+      return entity.id;
+    } catch (err) {
+      if (err instanceof TypeError || err instanceof RangeError) throw err;
+      this.logger?.error(
+        { err, contactId: contact.id, step: 'mintAnchoredNodeForContact' },
+        'createContact: could not mint a replacement KG node after a link collision',
+      );
+      return null;
+    }
+  }
+
+  /**
+   * ADR-040 adoption: claim an existing *unanchored* person node whose label matches, so
+   * a new contact inherits facts Curia already accumulated about that name (learned from
+   * an email body, say) instead of starting empty.
+   *
+   * Returns the adopted node id, or undefined when there is nothing safe to adopt — the
+   * caller then mints a fresh anchored node. "Nothing safe" covers three cases, and all
+   * three must mint rather than share:
+   *   - no label match at all;
+   *   - every match is already anchored to some other contact (the case that used to
+   *     produce a nodeless contact, which is the whole reason #1694 exists);
+   *   - two or more unanchored candidates of the right type. Aliases carry no cross-node
+   *     uniqueness, so this is reachable; picking one would be the same silent
+   *     first-match guess resolveOrCreate stopped making in #1705.
+   *
+   * Adoption itself is a compare-and-set inside the store, so two contacts racing for one
+   * node cannot both win — the loser sees false here and mints.
+   *
+   * KG I/O failures return undefined rather than propagating: falling back to a fresh
+   * node loses an inheritance, while failing the create loses the contact.
+   */
+  private async adoptUnanchoredPersonNode(
+    safeName: string,
+    role: string | null | undefined,
+  ): Promise<string | undefined> {
+    if (!this.entityMemory) return undefined;
+
+    try {
+      const matches = await this.entityMemory.findEntities(safeName);
+      const candidates = matches.filter(
+        n => n.type === 'person' && n.identitySource === 'label',
+      );
+
+      if (candidates.length !== 1) {
+        if (candidates.length > 1) {
+          this.logger?.warn(
+            { displayName: safeName, candidateIds: candidates.map(n => n.id) },
+            'createContact: several unanchored person nodes share this label — minting a fresh node rather than guessing',
+          );
+        }
+        return undefined;
+      }
+
+      const candidate = candidates[0]!;
+
+      // identity_source = 'label' is a proxy for "no contact owns this", and a proxy can
+      // be wrong: any node inserted without an explicit identity_source defaults to the
+      // label tier even when a contact points at it. Ask the contacts table directly
+      // rather than trusting the tier alone — adopting a node out from under an existing
+      // contact is the one outcome ADR-040 forbids outright.
+      const owner = await this.backend.findContactByKgNodeId(candidate.id);
+      if (owner) {
+        this.logger?.warn(
+          { displayName: safeName, nodeId: candidate.id, ownerContactId: owner.id },
+          'createContact: label-tier KG node is already claimed by a contact — not adopting; '
+            + 'this is an ADR-040 invariant violation worth investigating',
+        );
+        return undefined;
+      }
+
+      if (!(await this.entityMemory.adoptEntity(candidate.id))) {
+        // Lost the race, or the node was archived between the lookup and the CAS.
+        this.logger?.info(
+          { displayName: safeName, nodeId: candidate.id },
+          'createContact: KG node was claimed before adoption — minting a fresh node',
+        );
+        return undefined;
+      }
+
+      // Apply the role only when the node does not already carry one: the existing node
+      // may have been created without one (extract-relationships always passes empty
+      // properties), but a role already there is better-sourced than ours.
+      if (role && !candidate.properties.role) {
+        try {
+          await this.entityMemory.updateNode(candidate.id, {
+            properties: { ...candidate.properties, role },
+          });
+        } catch (err) {
+          // Non-fatal: the adoption is already committed and is the valuable part.
+          this.logger?.warn(
+            { err, nodeId: candidate.id, step: 'adoptUnanchoredPersonNode_role' },
+            'createContact: adopted KG node but could not apply role property',
+          );
+        }
+      }
+
+      this.logger?.info(
+        { displayName: safeName, nodeId: candidate.id },
+        'createContact: adopted an unanchored KG node as this contact\'s identity',
+      );
+      return candidate.id;
+    } catch (err) {
+      if (err instanceof TypeError || err instanceof RangeError) throw err;
+      this.logger?.error(
+        { err, displayName: safeName, step: 'adoptUnanchoredPersonNode' },
+        'createContact: KG adoption lookup failed — minting a fresh node instead',
+      );
+      return undefined;
+    }
+  }
+
+  /**
    * Create a new contact. If entityMemory is available and no kgNodeId is provided,
    * auto-creates or resolves a KG node and links it to the contact. When primaryEmail
    * is set and classifies as an org sender, routes to an organization KG node instead
    * of minting a person node.
    */
   async createContact(options: CreateContactOptions): Promise<Contact> {
+    return (await this.createContactWithKgOutcome(options)).contact;
+  }
+
+  /**
+   * `createContact`, plus whether the KG node it linked was MINTED here or was already
+   * there (adopted, caller-supplied, or a shared organization node).
+   *
+   * Orphan-cleanup paths need this. When `linkIdentity` loses its race they delete the
+   * contact, and what should happen to the node depends entirely on where it came from: a
+   * node minted moments ago for this failed attempt should go with it, whereas an adopted
+   * one may carry facts and edges accrued long before and is not ours to remove. Since
+   * ADR-040 a minted anchored node also never decays, so leaving it behind is a permanent
+   * leak that makes later resolution ambiguous — the reason this is threaded rather than
+   * left to a periodic sweep.
+   */
+  async createContactWithKgOutcome(
+    options: CreateContactOptions,
+  ): Promise<{ contact: Contact; kgNodeCreated: boolean }> {
     const now = new Date();
+    // Set only where this call actually mints a node. Adoption, an explicit kgNodeId and
+    // organization routing all leave it false: those nodes outlive this contact.
+    let kgNodeCreated = false;
 
     // Defense-in-depth: sanitize display names at storage time to prevent
     // stored prompt injection. External sources (email participants, CRM imports)
@@ -428,24 +841,22 @@ export class ContactService {
         }
       }
 
-      // If no org node was resolved, auto-create a person KG node as before.
+      // If no org node was resolved, resolve a person KG node under the ADR-040
+      // adoption rule: adopt an unanchored node whose label matches, otherwise mint a
+      // fresh anchored one. Never take a node that already belongs to another contact.
       if (!kgNodeId) {
-        const { entity, created } = await this.entityMemory.createEntity({
-          type: 'person',
-          label: safeName,
-          properties: options.role ? { role: options.role } : {},
-          source: options.source,
-        });
-        if (!created && options.role) {
-          // A KG node already existed for this label. Apply the role property if
-          // it isn't already set — the existing node may have been created without
-          // one (e.g. by extract-relationships which always passes empty properties).
-          const { node } = await this.entityMemory.updateNode(entity.id, {
-            properties: { ...entity.properties, role: options.role },
-          });
-          kgNodeId = node.id;
+        const adopted = await this.adoptUnanchoredPersonNode(safeName, options.role);
+        if (adopted) {
+          kgNodeId = adopted;
         } else {
+          const entity = await this.entityMemory.createAnchoredEntity({
+            type: 'person',
+            label: safeName,
+            properties: options.role ? { role: options.role } : {},
+            source: options.source,
+          });
           kgNodeId = entity.id;
+          kgNodeCreated = true;
         }
 
         // Org routing did not fire or returned null (KG transient failure), so we fell
@@ -466,7 +877,7 @@ export class ContactService {
     // Otherwise default to 'known' (the former status='confirmed' default).
     //
     // 'trusted' and 'principal' are capability grants, not creation-time states:
-    // 'trusted' is a deliberate CEO grant (#952) and 'principal' is structural
+    // 'trusted' is a deliberate principal grant (#952) and 'principal' is structural
     // (derived from system_role, set by bootstrap). Enforce that invariant here so a
     // caller cannot mint a high-capability contact in a single createContact() call —
     // a contact must be created at a lower tier and elevated explicitly afterwards.
@@ -520,21 +931,33 @@ export class ContactService {
     } catch (err) {
       const pgCode = (err as { code?: string }).code;
       const constraint = (err as { constraint?: string }).constraint;
-      // idx_contacts_kg_node_unique (partial unique index on kg_node_id) fires when
-      // upsertNode returned an existing kg_node that is already claimed by another
-      // contact — e.g. two people both named "Alice Smith". Retry without a KG link;
-      // the two contacts can be merged later via the contact-merge flow.
+      // idx_contacts_kg_node_unique fires when the node we resolved was claimed by
+      // another contact between our lookup and this INSERT — two people both named
+      // "Alice Smith", or a lost adoption race.
+      //
+      // Before ADR-040 the retry dropped the link and stored kg_node_id = NULL, leaving a
+      // contact that could hold no facts, relationships or entity-context enrichment.
+      // That is the behaviour #1694 exists to remove: retry with a FRESH anchored node
+      // instead. Anchored nodes are exempt from label uniqueness, so minting one cannot
+      // collide however many namesakes already exist.
       if (pgCode === '23505' && constraint === 'idx_contacts_kg_node_unique') {
-        // Downgrade kind to 'person' alongside stripping the KG link — but only if the
-        // contact was an org contact, to avoid violating the invariant that org contacts
-        // are always linked to a KG org node. Automated contacts keep their kind even
-        // without a KG link (their person-type node may still be around; the link is just
-        // lost for this contact instance due to the collision).
+        const replacement = await this.mintAnchoredNodeForContact(contact, options.source);
+        kgNodeCreated = replacement !== null;
         this.logger?.warn(
-          { contactId: contact.id, kgNodeId: contact.kgNodeId, contactKind: contact.kind },
-          'KG node already claimed by another contact — creating contact without KG link; org kind downgraded to person',
+          {
+            contactId: contact.id,
+            claimedKgNodeId: contact.kgNodeId,
+            replacementKgNodeId: replacement,
+            contactKind: contact.kind,
+          },
+          replacement
+            ? 'KG node already claimed by another contact — minted a fresh anchored node for this contact'
+            : 'KG node already claimed by another contact and minting a replacement failed — creating contact without KG link',
         );
-        contact.kgNodeId = null;
+        contact.kgNodeId = replacement;
+        // Only downgrade kind when we genuinely ended up without a link: an org contact
+        // with no KG org node would violate the kind/type invariant migration 056 keeps.
+        // A contact that got a replacement person node is downgraded for the same reason.
         if (contact.kind === 'organization') {
           contact.kind = 'person';
         }
@@ -593,7 +1016,7 @@ export class ContactService {
       });
     }
 
-    return contact;
+    return { contact, kgNodeCreated };
   }
 
   /** Retrieve a contact by ID. Returns undefined if not found. */
@@ -652,6 +1075,97 @@ export class ContactService {
       this.logger?.error({ err }, 'findDuplicates() failed during contact scan');
       throw err;
     }
+  }
+
+  /**
+   * Contacts that an agent-entered contact or address may duplicate (#2041).
+   * contact-create and contact-link-identity call this before writing anything.
+   *
+   * - taken: an identifier is already on another contact on the same channel (email
+   *   ignoring case, numbers by digits). The write is refused outright.
+   * - candidates: the same number on a sibling phone channel, a near-miss identifier
+   *   (identifier-near-miss.ts), the same display name ignoring case and spacing, or a
+   *   near-miss display name (Jaro-Winkler at or above NAME_NEAR_MISS_THRESHOLD).
+   *   The write is refused until the agent names each one in distinct_from.
+   *
+   * `identities` must already be normalized (normalizeAgentIdentifier).
+   * `excludeContactId` is the contact being added to, which is never its own duplicate.
+   * Errors propagate: callers refuse the write rather than skip the check.
+   */
+  async findLikelyDuplicates(input: {
+    displayName?: string;
+    identities: ReadonlyArray<{ channel: string; identifier: string }>;
+    excludeContactId?: string;
+  }): Promise<DuplicateCheck> {
+    const channels = new Set(input.identities.flatMap((wanted) => comparableChannels(wanted.channel)));
+    const onFile = channels.size > 0 ? await this.backend.listIdentitiesOnChannels([...channels]) : [];
+
+    const takenChannel = new Map<string, string>();
+    const reasons = new Map<string, DuplicateReason[]>();
+    const addReason = (contactId: string, reason: DuplicateReason): void => {
+      const list = reasons.get(contactId) ?? [];
+      const key = (r: DuplicateReason): string => `${r.kind}:${'channel' in r ? r.channel : ''}`;
+      if (!list.some((existing) => key(existing) === key(reason))) list.push(reason);
+      reasons.set(contactId, list);
+    };
+
+    for (const wanted of input.identities) {
+      const family = comparableChannels(wanted.channel);
+      for (const held of onFile) {
+        if (held.contactId === input.excludeContactId || !family.includes(held.channel)) continue;
+        if (sameIdentifier(wanted.channel, wanted.identifier, held.channelIdentifier)) {
+          if (held.channel === wanted.channel) {
+            if (!takenChannel.has(held.contactId)) takenChannel.set(held.contactId, wanted.channel);
+          } else {
+            addReason(held.contactId, { kind: 'same_number', channel: held.channel });
+          }
+        } else if (isNearMiss(wanted.channel, wanted.identifier, held.channelIdentifier)) {
+          addReason(held.contactId, { kind: 'similar_address', channel: held.channel });
+        }
+      }
+    }
+
+    if (input.displayName !== undefined) {
+      const comparable = (name: string): string => name.toLowerCase().replace(/\s+/g, ' ').trim();
+      const wantedName = comparable(sanitizeDisplayName(input.displayName));
+      if (wantedName) {
+        // findContactByName is a substring match; keep exact (normalized) names only.
+        const sameName = new Set<string>();
+        for (const contact of await this.backend.findContactByName(wantedName)) {
+          if (contact.id !== input.excludeContactId && comparable(contact.displayName) === wantedName) {
+            addReason(contact.id, { kind: 'same_name' });
+            sameName.add(contact.id);
+          }
+        }
+
+        // A typo ("Priya Natrajan" for "Priya Natarajan") is not a substring of the real
+        // name, so it needs a scan. listContacts() with no filters reads every contact,
+        // and a principal's store is hundreds to low thousands, created at a low rate.
+        const wantedNormalized = normalizeDisplayName(sanitizeDisplayName(input.displayName));
+        if (wantedNormalized) {
+          for (const contact of await this.backend.listContacts()) {
+            if (contact.id === input.excludeContactId || sameName.has(contact.id)) continue;
+            if (jaroWinkler(wantedNormalized, normalizeDisplayName(contact.displayName)) >= NAME_NEAR_MISS_THRESHOLD) {
+              addReason(contact.id, { kind: 'similar_name' });
+            }
+          }
+        }
+      }
+    }
+
+    const taken: DuplicateCheck['taken'] = [];
+    for (const [contactId, channel] of takenChannel) {
+      // A taken contact is reported once, as taken.
+      reasons.delete(contactId);
+      const contact = await this.backend.getContact(contactId);
+      if (contact) taken.push({ contact, channel });
+    }
+    const candidates: DuplicateCandidate[] = [];
+    for (const [contactId, list] of reasons) {
+      const contact = await this.backend.getContact(contactId);
+      if (contact) candidates.push({ contact, reasons: list });
+    }
+    return { taken, candidates };
   }
 
   /**
@@ -758,9 +1272,9 @@ export class ContactService {
     }
 
     // Prevent force-verifying self-claimed identities — they must go through
-    // the CEO confirmation flow to become verified.
+    // the principal confirmation flow to become verified.
     if (options.source === 'self_claimed' && verified) {
-      throw new Error('Cannot force-verify a self_claimed identity — CEO confirmation required');
+      throw new Error('Cannot force-verify a self_claimed identity — principal confirmation required');
     }
 
     // Normalize email addresses to lowercase for case-insensitive matching.
@@ -788,22 +1302,18 @@ export class ContactService {
     await this.backend.createIdentity(identity);
 
     // Fire-and-forget: notify scoring pipeline when a verified identity is linked.
-    // The callback may return a promise (async pipeline update), so we handle both
-    // sync throws and async rejections. Scoring is non-blocking — must not fail
-    // the linkIdentity operation.
-    if (verified && this.onIdentityVerified) {
-      try {
-        const maybePromise = this.onIdentityVerified(options.contactId) as void | Promise<void>;
-        // Handle async callbacks — catch unhandled rejections
-        if (maybePromise instanceof Promise) {
-          maybePromise.catch(err => {
-            this.logger?.warn({ err, contactId: options.contactId }, 'onIdentityVerified callback rejected (non-fatal)');
-          });
-        }
-      } catch (err) {
-        this.logger?.warn({ err, contactId: options.contactId }, 'onIdentityVerified callback threw (non-fatal)');
-      }
+    // Scoring is non-blocking — must not fail the linkIdentity operation.
+    if (verified) {
+      this.invokeNonFatalCallback(
+        'onIdentityVerified',
+        this.onIdentityVerified
+          ? () => this.onIdentityVerified!(options.contactId)
+          : undefined,
+        { contactId: options.contactId },
+      );
     }
+
+    this.notifyIdentitiesChanged(options.contactId);
 
     return identity;
   }
@@ -818,6 +1328,106 @@ export class ContactService {
     channelIdentifier: string,
   ): Promise<ResolvedSender | null> {
     return this.backend.resolveByChannelIdentity(channel, channelIdentifier);
+  }
+
+  /**
+   * Resolve-or-create a contact for an inbound channel identity.
+   *
+   * Shared by Signal / Slack (and future Voice / SMS) adapters so each channel does
+   * not re-implement the create → link → orphan-cleanup dance (#1480).
+   *
+   * Design: best-effort create+link with orphan cleanup — not a single DB transaction.
+   * Neither `createContact` nor `createIdentity` accept a transaction client today, so
+   * a true create+link transaction would need a backend-interface refactor. Either
+   * approach leaves a KG-node orphan on a failed/raced create: `createContact` mints a
+   * person node via `entityMemory.createEntity` before the row insert, and cleanup is
+   * just `DELETE FROM contacts` (it never touches `kg_node_id`). We intentionally do
+   * not delete that node — `createEntity` returns `created: false` when a label already
+   * exists, so the node may be shared across contacts. Lifting the proven adapter
+   * cleanup path keeps contact-row behavior identical while closing the Signal 1:1
+   * contact-row leak (that path previously lacked cleanup on link race).
+   *
+   * Returns `{ contactId, tier, created }` from fields already on `ResolvedSender` /
+   * the created contact — no extra `getContact` round-trip on the known-sender hot path.
+   *
+   * `23505` on link is expected (concurrent create for the same identifier): the
+   * orphan contact row is deleted and the existing contact is resolved and returned with
+   * `created: false`. Non-duplicate link failures clean up the orphan and rethrow.
+   *
+   * Display-name resolution stays in the caller (channel-specific lookups). Auto-verify
+   * semantics are unchanged: `source` is passed through to `linkIdentity` so
+   * `signal_participant` / `slack_participant` remain in AUTO_VERIFIED_SOURCES.
+   *
+   * Note on naming: this is resolve-or-create-once, not upsert — `displayName` / `source`
+   * / `tier` are ignored when the identity already exists.
+   */
+  async ensureChannelContact(params: {
+    channel: string;
+    channelIdentifier: string;
+    source: IdentitySource;
+    displayName: string;
+    fallbackDisplayName?: string;
+    tier?: ContactTier;
+  }): Promise<{ contactId: string; tier: ContactTier; created: boolean }> {
+    const existing = await this.resolveByChannelIdentity(params.channel, params.channelIdentifier);
+    if (existing) {
+      // ResolvedSender already carries contactId + tier — avoid a second getContact query
+      // on every inbound message from a known sender (the common case).
+      return { contactId: existing.contactId, tier: existing.tier, created: false };
+    }
+
+    const { contact, kgNodeCreated } = await this.createContactWithKgOutcome({
+      displayName: params.displayName,
+      fallbackDisplayName: params.fallbackDisplayName,
+      source: params.source,
+      tier: params.tier ?? 'unknown',
+    });
+
+    try {
+      await this.linkIdentity({
+        contactId: contact.id,
+        channel: params.channel,
+        channelIdentifier: params.channelIdentifier,
+        source: params.source,
+      });
+      return { contactId: contact.id, tier: contact.tier, created: true };
+    } catch (linkErr) {
+      const isDuplicate = (linkErr as { code?: string }).code === '23505';
+      // Always clean up the newly created contact — linkIdentity failed regardless of reason.
+      // 23505: identity already belongs to an existing contact (concurrent create).
+      // Non-23505: unexpected failure. In both cases the new contact row is orphaned.
+      try {
+        // Orphan cleanup. Retire the node only if THIS call minted it: an adopted node may
+        // carry facts and edges accrued long before this failed attempt (ADR-040). A minted
+        // one is anchored and so never decays, which is why it cannot simply be left.
+        await this.deleteContact(contact.id, { archiveAnchoredNode: kgNodeCreated });
+      } catch (cleanupErr) {
+        this.logger?.warn(
+          {
+            cleanupErr,
+            orphanId: contact.id,
+            channel: params.channel,
+            channelIdentifier: params.channelIdentifier,
+          },
+          'ensureChannelContact: failed to clean up orphan contact after linkIdentity failure',
+        );
+      }
+
+      if (isDuplicate) {
+        this.logger?.debug(
+          { channel: params.channel, channelIdentifier: params.channelIdentifier },
+          'ensureChannelContact: identity already exists from a prior message — resolving existing contact',
+        );
+        const resolved = await this.resolveByChannelIdentity(params.channel, params.channelIdentifier);
+        if (resolved) {
+          return { contactId: resolved.contactId, tier: resolved.tier, created: false };
+        }
+        // Winner's contact vanished between link failure and re-resolve — surface original error.
+        throw linkErr;
+      }
+
+      throw linkErr;
+    }
   }
 
   /** Get a contact together with all its linked channel identities. */
@@ -903,6 +1513,10 @@ export class ContactService {
    * value untouched. If `fields.primaryEmail` is non-null, validates that the
    * email exists in `contact_channel_identities` for this contact (channel = 'email'),
    * case-insensitively. Throws with a descriptive message if not found.
+   *
+   * Callers that pass `client` must call `notePrimaryEmailChanged` after COMMIT
+   * when `fields` includes `primaryEmail`, `preferredName`, `title` or `pronouns`. The pool path (no client) notifies
+   * itself once the write commits.
    */
   async updateContactFields(
     contactId: string,
@@ -945,7 +1559,13 @@ export class ContactService {
       updatedAt: new Date(),
     };
 
-    return this.updateStoredContact(updated, client);
+    const stored = await this.updateStoredContact(updated, client);
+    // A caller-supplied client has not committed yet; that caller notifies
+    // after COMMIT. The pool path commits inside updateStoredContact.
+    if (!client && PRINCIPAL_PROMPT_FIELDS.some((key) => key in definedFields)) {
+      this.notePrimaryEmailChanged(contactId);
+    }
+    return stored;
   }
 
   /**
@@ -955,7 +1575,7 @@ export class ContactService {
    */
   async elevateTierToKnown(
     contactId: string,
-    reason: 'correspondence' | 'domain-validated' | 'judgment',
+    reason: TierElevationReason,
   ): Promise<boolean> {
     try {
       const elevated = await this.backend.elevateTierToKnown(contactId, reason);
@@ -981,14 +1601,43 @@ export class ContactService {
     return this.backend.getIdentitiesForContact(contactId);
   }
 
+  /** Look up a single channel identity by ID. Returns null if not found. */
+  async getIdentity(identityId: string): Promise<ChannelIdentity | null> {
+    return this.backend.getIdentity(identityId);
+  }
+
   /** Remove a channel identity by its ID. Returns true if found and removed, false if not found. */
   async unlinkIdentity(identityId: string): Promise<boolean> {
-    return this.backend.unlinkIdentity(identityId);
+    const existing = await this.backend.getIdentity(identityId);
+    if (!existing) return false;
+    const removed = await this.backend.unlinkIdentity(identityId);
+    if (removed) this.notifyIdentitiesChanged(existing.contactId);
+    return removed;
   }
 
   /** Update the status of a channel identity (active, defunct, bounced). */
   async setIdentityStatus(identityId: string, status: IdentityStatus): Promise<ChannelIdentity> {
-    return this.backend.setIdentityStatus(identityId, status);
+    const updated = await this.backend.setIdentityStatus(identityId, status);
+    this.notifyIdentitiesChanged(updated.contactId);
+    return updated;
+  }
+
+  /**
+   * Mark a channel identity as verified (principal confirmation). This is the console /
+   * agent path for verifying `self_claimed` identities and re-confirming any other
+   * identity so it counts toward the structural principal match (#1514).
+   */
+  async verifyIdentity(identityId: string): Promise<ChannelIdentity> {
+    const updated = await this.backend.verifyIdentity(identityId);
+    this.invokeNonFatalCallback(
+      'onIdentityVerified',
+      this.onIdentityVerified
+        ? () => this.onIdentityVerified!(updated.contactId)
+        : undefined,
+      { contactId: updated.contactId },
+    );
+    this.notifyIdentitiesChanged(updated.contactId);
+    return updated;
   }
 
   /** Get active (non-revoked) auth overrides for a contact. */
@@ -1029,19 +1678,15 @@ export class ContactService {
 
   /**
    * Create a new grant recommendation for a contact+permission pair.
-   * Returns false (no-op) when a recommendation already exists for this pair —
-   * the caller must check first if dedup is desired at the service layer.
+   * The insert is the source of truth: `created: true` is returned only when
+   * this call persisted a row. A concurrent (or sequential) duplicate for the
+   * same pair is conflict-skipped and returns the persisted winner.
    */
   async createGrantRecommendation(
     contactId: string,
     permission: string,
     reasoning: string,
   ): Promise<{ created: boolean; recommendation: GrantRecommendation }> {
-    const existing = await this.backend.findGrantRecommendation(contactId, permission);
-    if (existing) {
-      return { created: false, recommendation: existing };
-    }
-
     const rec: GrantRecommendation = {
       id: randomUUID(),
       contactId,
@@ -1052,7 +1697,22 @@ export class ContactService {
       resolvedAt: null,
       resolvedBy: null,
     };
-    await this.backend.createGrantRecommendation(rec);
+
+    const inserted = await this.backend.createGrantRecommendation(rec);
+    if (!inserted) {
+      const winner = await this.backend.findGrantRecommendation(contactId, permission);
+      if (!winner) {
+        this.logger?.error(
+          { contactId, permission },
+          'contacts: grant recommendation insert skipped but no existing row found',
+        );
+        throw new Error(
+          `Grant recommendation conflict for ${contactId}/${permission} but no existing row found`,
+        );
+      }
+      return { created: false, recommendation: winner };
+    }
+
     this.logger?.info({ contactId, permission }, 'contacts: grant recommendation created');
     return { created: true, recommendation: rec };
   }
@@ -1071,38 +1731,76 @@ export class ContactService {
 
   /**
    * Approve a pending grant recommendation.
-   * Also writes the contact_auth_overrides row so the permission takes effect immediately.
+   * Atomically claims the recommendation (status pending → approved) and writes the
+   * contact_auth_overrides row inside a single transaction. This prevents the race where
+   * a concurrent declineGrantRecommendation wins the status transition while the auth
+   * override written by approve is left behind (issue #1068).
    * Returns false if the recommendation was not found or not in 'pending' status.
    */
   async approveGrantRecommendation(id: string, actorId: string): Promise<boolean> {
+    // Fast path: bail early without starting a transaction if already resolved.
     const rec = await this.backend.getGrantRecommendation(id);
     if (!rec || rec.status !== 'pending') return false;
 
-    // Grant the permission before resolving the recommendation, so any failure
-    // here leaves the recommendation pending (retryable) rather than approved-but-not-granted.
-    await this.grantPermission(rec.contactId, rec.permission, true, actorId);
-    const resolved = await this.backend.resolveGrantRecommendation(id, 'approved', actorId);
-    if (resolved) {
+    // Validate the contact exists before entering the transaction (read-only, idempotent).
+    const contact = await this.backend.getContact(rec.contactId);
+    if (!contact) throw new Error(`Contact not found: ${rec.contactId}`);
+
+    const approved = await this.backend.withTransaction(async (client) => {
+      // Claim the recommendation inside the transaction. For Postgres, the UPDATE holds
+      // a row-level lock until the transaction commits — a concurrent decline blocks
+      // until we commit or roll back, then finds status ≠ 'pending' and returns false.
+      const claimed = await this.backend.resolveGrantRecommendation(id, 'approved', actorId, client);
+      if (!claimed) {
+        // A concurrent call already resolved this recommendation; produce no side effects.
+        this.logger?.debug({ id, actorId }, 'contacts: approveGrantRecommendation lost concurrent race — recommendation already resolved');
+        return false;
+      }
+
+      // Write the auth override inside the same transaction so both writes are atomic.
+      // A failure here rolls back both, leaving the recommendation pending (retryable).
+      const override: AuthOverride = {
+        id: randomUUID(),
+        contactId: rec.contactId,
+        permission: rec.permission,
+        granted: true,
+        grantedBy: actorId,
+        createdAt: new Date(),
+        revokedAt: null,
+      };
+      await this.backend.createAuthOverride(override, client);
+      return true;
+    });
+
+    // Log AFTER withTransaction resolves so the audit entry only fires on committed state.
+    if (approved) {
       this.logger?.info({ id, contactId: rec.contactId, permission: rec.permission, actorId }, 'contacts: grant recommendation approved');
     }
-    return resolved;
+    return approved;
   }
 
   /**
    * Decline a pending grant recommendation.
+   * Wrapped in a transaction for parity with approveGrantRecommendation so that both
+   * operations participate in the same serialization guarantee (issue #1068).
    * The row is permanently retained in 'declined' state as an anti-nag ledger entry —
    * the recommendation engine must check for declined rows before suggesting again.
    * Returns false if the recommendation was not found or not in 'pending' status.
    */
   async declineGrantRecommendation(id: string, actorId: string): Promise<boolean> {
+    // Fast path: bail early without starting a transaction if already resolved.
     const rec = await this.backend.getGrantRecommendation(id);
     if (!rec || rec.status !== 'pending') return false;
 
-    const resolved = await this.backend.resolveGrantRecommendation(id, 'declined', actorId);
-    if (resolved) {
+    const declined = await this.backend.withTransaction(async (client) => {
+      return this.backend.resolveGrantRecommendation(id, 'declined', actorId, client);
+    });
+
+    // Log AFTER withTransaction resolves so the audit entry only fires on committed state.
+    if (declined) {
       this.logger?.info({ id, contactId: rec.contactId, permission: rec.permission, actorId }, 'contacts: grant recommendation declined (anti-nag recorded)');
     }
-    return resolved;
+    return declined;
   }
 
   /**
@@ -1165,7 +1863,13 @@ export class ContactService {
    * - tier: blocked-on-either-side wins (most restrictive); otherwise the higher TIER_RANK
    * - channel identities: union (duplicates discarded)
    * - auth overrides: union (primary wins on same-permission conflict)
-   * - KG nodes: merged via entityMemory.mergeEntities() (Phase 1: scalar + facts)
+   * - canonical attributes: primary's, else the secondary's (#2233)
+   * - scoring counters: confidence / last-seen max, message counts summed (#2233)
+   * - every other reference (calendars, grant recommendations, task waits, originator
+   *   lineage, …): re-pointed by reattachContactReferences (#2233)
+   * - KG nodes: merged via entityMemory.mergeEntities() after the secondary
+   *   contact row is deleted, so the node delete is not blocked by the
+   *   contacts.kg_node_id foreign key (#1711)
    *
    * @param dryRun - if true, return proposal without writing (default: false)
    */
@@ -1179,9 +1883,9 @@ export class ContactService {
     }
 
     const primary = await this.backend.getContact(primaryId);
-    if (!primary) throw new Error(`Contact not found: ${primaryId}`);
+    if (!primary) throw new ContactNotFoundError(primaryId);
     const secondary = await this.backend.getContact(secondaryId);
-    if (!secondary) throw new Error(`Contact not found: ${secondaryId}`);
+    if (!secondary) throw new ContactNotFoundError(secondaryId);
 
     // Structural-contact guard. A merge writes the golden record onto the primary and
     // deletes the secondary, but it only copies scalar fields (tier/displayName/role/
@@ -1191,11 +1895,10 @@ export class ContactService {
     // of the primary — a structural→structural merge is just as destructive as
     // structural→non-structural. If two rows really are the same structural entity, the
     // structural one must be the primary (the survivor).
+    // notifyIdentitiesChanged(primaryId) after merge relies on this: the principal can
+    // never be the deleted secondary, so refreshing the survivor is sufficient (#1514).
     if (isStructuralContact(secondary)) {
-      throw new Error(
-        `Cannot merge structural contact ${secondaryId} (principal/agent/system-role) — a merge ` +
-          `deletes the secondary, which would destroy the structural row. Make it the primary instead.`,
-      );
+      throw new StructuralContactMergeError(secondaryId);
     }
 
     const primaryIdentities = await this.backend.getIdentitiesForContact(primaryId);
@@ -1212,53 +1915,122 @@ export class ContactService {
       return { primaryContactId: primaryId, secondaryContactId: secondaryId, goldenRecord, dryRun: true };
     }
 
-    // Merge KG nodes (best-effort — failure does not abort the contact merge)
+    // A recorded exclusion means the principal ruled these are different people. Merging is
+    // still allowed — every merge path has a human confirming it, and people change
+    // their minds — but the ruling is about to be discarded by reattachDedupExclusions,
+    // so it must not happen silently (#1625). Best-effort: a lookup failure must not
+    // abort a merge the principal already confirmed.
+    try {
+      if (await this.backend.hasDedupExclusion(normalizeExclusionPair(primaryId, secondaryId))) {
+        this.logger?.warn(
+          { primaryId, secondaryId },
+          'contacts: merging a pair with a recorded dedup exclusion — overriding an earlier "not the same person" ruling',
+        );
+      }
+    } catch (err) {
+      this.logger?.warn({ err, primaryId, secondaryId }, 'contacts: dedup exclusion check failed before merge (non-fatal)');
+    }
+
+    // The whole write sequence runs on one client inside one transaction (#1695).
+    // Before that it was five independent pool queries, so a failure part-way could
+    // leave the secondary alive with its identities, auth overrides and principal dedup
+    // rulings already re-pointed onto the survivor — the next sweep would then see the
+    // secondary again with none of its "not the same person" rulings attached.
+    //
+    // Deliberately outside the transaction: KG mergeEntities (a different store,
+    // documented as best-effort) and the notifications below, which must describe
+    // committed state only. mergeEntities runs AFTER this commit — it ends by
+    // hard-deleting the secondary node, and contacts.kg_node_id is a NO ACTION
+    // foreign key, so the delete raises 23503 while the secondary contact still
+    // points at that node (#1711). Waiting until the contact row is gone unblocks
+    // the node delete, and a rolled-back contact merge cannot have already
+    // collapsed the two KG nodes.
+    // Write the golden record fields onto the primary contact. The surviving tier
+    // is computed by computeGoldenRecord (blocked-on-either-side wins; else higher
+    // TIER_RANK) — the single source of survivorship truth. Rationale: tier
+    // represents a principal grant (e.g. the principal explicitly trusted a secondary contact).
+    // Merging should never silently downgrade that grant — losing a 'trusted' tier
+    // because the primary happened to be 'known' is incorrect, especially since
+    // #944's dedup calls mergeContacts. A 'blocked' tier on either side always wins
+    // so a merge can never un-block a contact.
+    //
+    // Canonical attributes the primary lacks are taken from the secondary (#2233): before,
+    // a secondary's title/organization/timezone/… vanished with its row. A value set on
+    // both sides keeps the primary's — this API has no conflict prompt.
+    //
+    // The row is computed from the rows mergeContactRowsInTx locks inside the transaction,
+    // not from the reads above: a message scored (atomic counter increment) or a tier
+    // changed between those reads and the write would otherwise be overwritten by values
+    // computed from stale data.
+    const mergedRowFrom = (locked: { primary: Contact; secondary: Contact }): MergedContactRow => {
+      const golden = this.computeGoldenRecord(locked.primary, [], [], locked.secondary, [], []);
+      return {
+        ...mergedCounters(locked.primary, locked.secondary),
+        kgNodeId: locked.primary.kgNodeId,
+        displayName: golden.displayName,
+        role: golden.role,
+        notes: golden.notes,
+        tier: golden.tier,
+        kind: locked.primary.kind,
+        ...fillCanonicalAttributes(locked.primary, locked.secondary),
+      };
+    };
+
+    let exclusions: ReattachExclusionsResult;
+    let references: ContactReferenceCounts;
+    try {
+      ({ exclusions, references } = await this.backend.withTransaction(
+        (client) => this.mergeContactRowsInTx(client, primaryId, secondaryId, mergedRowFrom),
+      ));
+    } catch (err) {
+      // One transaction, so the failure rolled the whole sequence back: both contacts,
+      // their identities, auth overrides and exclusion rows are exactly as they were and
+      // the merge can simply be retried. KG nodes are untouched — mergeEntities runs
+      // only after this commit (#1711).
+      this.logger?.error(
+        { err, primaryId, secondaryId },
+        'Contact merge rolled back — no contact rows changed; KG nodes were not touched (#1695)',
+      );
+      throw err;
+    }
+
+    // Merge KG nodes (best-effort — failure does not abort the already-committed
+    // contact merge). Track the outcome: since ADR-040 the secondary's node is
+    // anchored, and an anchored node excluded from every decay and archival pass
+    // would otherwise survive forever with no contact pointing at it. Two
+    // same-label person nodes make resolveOrCreate return 'ambiguous', so
+    // extract-facts would then drop every fact about that name.
+    //
+    // Node ids were captured on the Contact objects loaded before the
+    // transaction; the secondary contact row is now gone, so the FK no longer
+    // blocks deleteNode (#1711).
+    let kgMerged = false;
     if (primary.kgNodeId && secondary.kgNodeId && this.entityMemory) {
       try {
         await this.entityMemory.mergeEntities(primary.kgNodeId, secondary.kgNodeId);
+        kgMerged = true;
       } catch (err) {
         this.logger?.warn({ err, primaryId, secondaryId, primaryKgNodeId: primary.kgNodeId, secondaryKgNodeId: secondary.kgNodeId }, 'KG node merge failed (non-fatal)');
       }
     }
 
-    try {
-      await this.backend.reattachIdentities(secondaryId, primaryId);
-      await this.backend.reattachAuthOverrides(secondaryId, primaryId);
-
-      // Write the golden record fields onto the primary contact. The surviving tier
-      // is computed by computeGoldenRecord (blocked-on-either-side wins; else higher
-      // TIER_RANK) — the single source of survivorship truth. Rationale: tier
-      // represents a CEO grant (e.g. the CEO explicitly trusted a secondary contact).
-      // Merging should never silently downgrade that grant — losing a 'trusted' tier
-      // because the primary happened to be 'known' is incorrect, especially since
-      // #944's dedup calls mergeContacts. A 'blocked' tier on either side always wins
-      // so a merge can never un-block a contact.
-      const updatedPrimary: Contact = {
-        ...primary,
-        displayName: goldenRecord.displayName,
-        role: goldenRecord.role,
-        notes: goldenRecord.notes,
-        tier: goldenRecord.tier,
-        updatedAt: new Date(),
-      };
-      await this.backend.updateContact(updatedPrimary);
-      await this.backend.deleteContact(secondaryId);
-    } catch (err) {
-      this.logger?.error({ err, primaryId, secondaryId }, 'Contact merge write failed — DB may be in partial state');
-      throw err;
+    // The secondary contact row is now gone. If the KG merge did not fold its node into the
+    // survivor's, that node is orphaned — and anchored, so nothing will ever retire it.
+    // Archive it here, which is what deleteContact would have done had this path used it.
+    // Runs after commit so it can never claim to have retired a node for a merge that
+    // rolled back, and guarded so it cannot touch the survivor's own node.
+    if (!kgMerged && secondary.kgNodeId && secondary.kgNodeId !== primary.kgNodeId) {
+      await this.archiveAnchoredNode(secondaryId, secondary.kgNodeId);
     }
+
+    this.logMergeOutcome(primaryId, secondaryId, { exclusions, references });
 
     const mergedAt = new Date();
 
-    if (this.onContactMerged) {
-      try {
-        this.onContactMerged(primaryId, secondaryId, mergedAt);
-      } catch (callbackErr) {
-        // The merge is already fully committed at this point — swallow the callback error
-        // so the caller sees a successful merge result rather than a spurious failure.
-        this.logger?.warn({ err: callbackErr }, 'onContactMerged callback threw (non-fatal, merge already committed)');
-      }
-    }
+    // Primary absorbs the secondary's identities — refresh principal cache if either side
+    // was (or is) the principal contact. Secondary is already deleted; notifying primary
+    // is enough when the principal was the survivor.
+    this.announceContactsMerged(primaryId, [secondaryId], mergedAt);
 
     this.logger?.info({ primaryId, secondaryId }, 'Contacts merged');
 
@@ -1272,15 +2044,285 @@ export class ContactService {
   }
 
   /**
+   * Fold `secondaryId` into `primaryId` inside the caller's transaction (spec §6.5).
+   *
+   * The one place that knows how to fold a contact: mergeContacts (Contacts page, dedup)
+   * and the KG node merge (src/kg-merge) both call it. Order matters only at the end —
+   * every reference is re-pointed before the secondary row is deleted, so no FK cascade
+   * or SET NULL fires on data the merge meant to keep.
+   *
+   * `overridesPreferSecondary` lists permissions where the secondary's active override
+   * must win: the primary's is revoked first, so reattachAuthOverrides (primary wins on
+   * a same-permission pair) carries the secondary's across.
+   *
+   * Both contact rows are locked first (SELECT … FOR UPDATE, ordered by id) and re-read.
+   * `row` may be a function of those locked rows — mergeContacts computes its counters and
+   * tier that way, so a concurrent atomic increment is never overwritten by a stale read.
+   * The KG node merge passes a precomputed row: its snapshot already locked every contact
+   * and its plan token proves the values unchanged under that lock.
+   *
+   * Refuses a structural secondary (StructuralContactMergeError) regardless of what the
+   * caller checked: the fold deletes the secondary row, and a structural row (principal,
+   * agent, system role) must never be deleted by a merge.
+   *
+   * Writes nothing outside the transaction and fires no callbacks — the caller does that
+   * after COMMIT (announceContactsMerged). For the in-memory backend `client` is
+   * undefined and every write applies directly.
+   */
+  async mergeContactRowsInTx(
+    client: DbPoolClient | undefined,
+    primaryId: string,
+    secondaryId: string,
+    row: MergedContactRow | ((locked: { primary: Contact; secondary: Contact }) => MergedContactRow),
+    options?: { overridesPreferSecondary?: string[] },
+  ): Promise<ContactRowMergeOutcome> {
+    if (primaryId === secondaryId) {
+      throw new Error('mergeContactRowsInTx: primary and secondary must be different contacts');
+    }
+    const locked = await this.backend.lockContactsForMerge([primaryId, secondaryId], client);
+    const primary = locked.find(c => c.id === primaryId);
+    if (!primary) throw new ContactNotFoundError(primaryId);
+    const secondary = locked.find(c => c.id === secondaryId);
+    if (!secondary) throw new ContactNotFoundError(secondaryId);
+    if (isStructuralContact(secondary)) throw new StructuralContactMergeError(secondaryId);
+    const mergedRow = typeof row === 'function' ? row({ primary, secondary }) : row;
+
+    for (const permission of options?.overridesPreferSecondary ?? []) {
+      await this.backend.revokeAuthOverride(primaryId, permission, client);
+    }
+    await this.backend.reattachIdentities(secondaryId, primaryId, client);
+    await this.backend.reattachAuthOverrides(secondaryId, primaryId, client);
+    // Exclusions the secondary held move to the survivor, renormalized into stored
+    // pair order. The exclusion between the merging pair itself (if any) is dropped:
+    // merging is the decision that they ARE the same person (#1625, ADR-039).
+    const exclusions = await this.backend.reattachDedupExclusions(secondaryId, primaryId, client);
+    const references = await this.backend.reattachContactReferences(secondaryId, primaryId, client);
+    await this.backend.writeMergedContact(
+      primaryId,
+      { ...mergedRow, displayName: sanitizeDisplayName(mergedRow.displayName) },
+      client,
+    );
+    await this.backend.deleteContact(secondaryId, client);
+    return { exclusions, references };
+  }
+
+  /**
+   * Post-commit notifications for contacts folded by mergeContactRowsInTx: one
+   * `onContactMerged` per merged-away contact (→ contact.merged on the bus), then an
+   * identity refresh for the survivor. Never throws — the merge is already committed.
+   *
+   * `identitiesChanged: false` skips the refresh (nothing was folded, e.g. a re-point).
+   */
+  announceContactsMerged(
+    survivingContactId: string,
+    mergedContactIds: string[],
+    mergedAt: Date,
+    options?: { identitiesChanged?: boolean },
+  ): void {
+    if (this.onContactMerged) {
+      for (const secondaryId of mergedContactIds) {
+        try {
+          this.onContactMerged(survivingContactId, secondaryId, mergedAt);
+        } catch (callbackErr) {
+          // The merge is already fully committed at this point — swallow the callback error
+          // so the caller sees a successful merge result rather than a spurious failure.
+          this.logger?.warn(
+            { err: callbackErr, survivingContactId, secondaryId },
+            'onContactMerged callback threw (non-fatal, merge already committed)',
+          );
+        }
+      }
+    }
+    if (options?.identitiesChanged !== false) {
+      this.notifyIdentitiesChanged(survivingContactId);
+    }
+  }
+
+  /** Log what a committed fold moved or discarded. Call after COMMIT only. */
+  logMergeOutcome(primaryId: string, secondaryId: string, outcome: ContactRowMergeOutcome): void {
+    const { exclusions, references } = outcome;
+    if (exclusions.dropped > 0) {
+      // A dropped row is a principal ruling leaving the ledger. Both causes are expected and
+      // benign, but an operator asking "why was this pair re-proposed months later"
+      // needs the event in the log, not only in a code comment. Logged after commit so
+      // a rolled-back merge never claims rulings were dropped.
+      this.logger?.info(
+        { primaryId, secondaryId, ...exclusions },
+        'contacts: dedup exclusions dropped during merge (superseded by the merge, or already held by the survivor)',
+      );
+    }
+    const repointed = countRepointedReferences(references);
+    if (repointed > 0 || references.grant_recommendations_dropped > 0 || references.conversation_resolved_entities_dropped > 0) {
+      this.logger?.info(
+        { primaryId, secondaryId, repointed, references },
+        'contacts: merge re-pointed contact references onto the survivor',
+      );
+    }
+  }
+
+  // -- Dedup exclusions (#1625, ADR-039) --
+
+  /**
+   * Record that two contacts are NOT the same person, so dedup sweeps stop
+   * proposing the pair. Order-independent and idempotent: re-excluding an
+   * already-excluded pair returns `created: false` rather than failing.
+   *
+   * Unlike the KG-fact implementation this replaces, this works for contacts with
+   * `kg_node_id = NULL` — which is exactly the same-display-name population that
+   * generates the most duplicate proposals (#1623).
+   *
+   * @param decidedBy Provenance for the decision — an agent memory-write source key,
+   *                  or an operator/principal identifier for manual excludes. Must be non-blank:
+   *                  it is the row's only audit trail and the row is never revisited.
+   * @throws InvalidExclusionPairError when either ID is not a UUID or both are the same contact.
+   * @throws ContactValidationError when decidedBy is blank.
+   * @throws ContactNotFoundError when either contact does not exist.
+   */
+  async addDedupExclusion(
+    contactAId: string,
+    contactBId: string,
+    decidedBy: string,
+  ): Promise<{ pair: ExclusionPair; created: boolean }> {
+    const pair = normalizeExclusionPair(contactAId, contactBId);
+
+    // Reject blank provenance here rather than letting the CHECK constraint do it, so
+    // direct callers (ops scripts, future console routes) get a named error instead of a
+    // raw constraint violation. Store the trimmed value so ' ceo ' and 'ceo' are one source.
+    const provenance = decidedBy.trim();
+    if (provenance === '') {
+      throw new ContactValidationError('decidedBy is required — a dedup exclusion must record who decided it');
+    }
+
+    // Check existence up front so callers get ContactNotFoundError rather than an
+    // opaque FK violation from Postgres.
+    const [a, b] = await Promise.all([
+      this.backend.getContact(pair.contactAId),
+      this.backend.getContact(pair.contactBId),
+    ]);
+    if (!a) throw new ContactNotFoundError(pair.contactAId);
+    if (!b) throw new ContactNotFoundError(pair.contactBId);
+
+    const created = await this.backend.addDedupExclusion(pair, provenance);
+    this.logger?.info(
+      { contactAId: pair.contactAId, contactBId: pair.contactBId, decidedBy: provenance, created },
+      created ? 'contacts: dedup exclusion recorded' : 'contacts: dedup exclusion already present',
+    );
+    return { pair, created };
+  }
+
+  /**
+   * True when the pair has been ruled "not the same person". Order-independent.
+   *
+   * Errors propagate — a caller that treated a DB failure as "not excluded" would
+   * re-file review tasks for pairs the principal already ruled on.
+   */
+  async hasDedupExclusion(contactAId: string, contactBId: string): Promise<boolean> {
+    return this.backend.hasDedupExclusion(normalizeExclusionPair(contactAId, contactBId));
+  }
+
+  /**
+   * Every exclusion as a canonical pair key (`canonicalPairKey` format), for sweeps
+   * that check many pairs in one run. One query instead of one lookup per pair.
+   *
+   * Deliberately unpaginated: the table holds one row per pair a human has ruled on,
+   * so it is bounded by review throughput, not by contact count. If that ever stops
+   * being true, the fix is a per-pair `hasDedupExclusion` in the sweep loop, not a
+   * silently truncated set — a partial set would re-file pairs already ruled on.
+   */
+  async listDedupExclusionPairKeys(): Promise<Set<string>> {
+    const rows = await this.backend.listDedupExclusions();
+    return new Set(rows.map(pair => canonicalPairKey(pair.contactAId, pair.contactBId)));
+  }
+
+  /**
    * Delete a contact by ID. Should only be called after any FK-referenced rows
    * (identities, auth overrides) have been re-pointed or deleted, otherwise the
    * DB will reject with a foreign-key constraint error.
    *
    * Primarily used during contact merge (to remove the secondary) and during
    * error recovery (to remove orphaned contacts created by a failed identify).
+   *
+   * By default also archives the contact's KG node when that node was its identity
+   * (ADR-040). An anchored node means nothing without the contact it anchors, and archiving
+   * rather than deleting frees the label for reuse (idx_kg_nodes_unique already excludes
+   * archived rows) while leaving the accumulated knowledge recoverable in SQL.
+   *
+   * `archiveAnchoredNode: false` is for ORPHAN CLEANUP — undoing a contact whose creation
+   * failed part-way (a lost `linkIdentity` race). Those callers must not archive, because
+   * `createContact` may have ADOPTED a pre-existing node carrying facts and edges accrued
+   * long before this failed attempt. Archiving cascades to incident edges, so the cleanup
+   * would destroy knowledge that was never this contact's to take. The cost of skipping it
+   * is an anchored node with no contact, which no longer decays — see
+   * `scripts/kg-node-linkage-report.ts` for the query that finds them.
+   *
+   * mergeContacts deletes the secondary through the backend directly and handles its own
+   * node disposal — mergeEntities after the contact row is gone, then archiveAnchoredNode
+   * if that fold fails (#1711).
    */
-  async deleteContact(id: string): Promise<void> {
+  async deleteContact(
+    id: string,
+    options?: { archiveAnchoredNode?: boolean },
+  ): Promise<void> {
+    // Read the link before the delete — afterwards there is no row to read it from.
+    const contact = await this.backend.getContact(id);
     await this.backend.deleteContact(id);
+    if (!contact?.kgNodeId) return;
+
+    if (options?.archiveAnchoredNode === false) {
+      this.logger?.warn(
+        { contactId: id, kgNodeId: contact.kgNodeId },
+        'contacts: contact removed without archiving its KG node (orphan cleanup) — '
+          + 'if the node was anchored it now has no contact and will not decay',
+      );
+      return;
+    }
+    await this.archiveAnchoredNode(id, contact.kgNodeId);
+  }
+
+  /**
+   * Archive a deleted contact's KG node, if that node was its identity and nothing else
+   * still points at it.
+   *
+   * Both guards matter:
+   *   - identity_source: a label-tier node (an organization, or a person Curia only knows
+   *     from an email body) outlives any one contact and must not be archived.
+   *   - no remaining referents: organization contacts are exempt from
+   *     idx_contacts_kg_node_unique, so several can share one node — including, after
+   *     migration 085's backfill, an anchored one. Deleting one of them must not archive
+   *     the node the others are still using.
+   *
+   * Best-effort by design. The contacts row is already gone and committed; a KG failure
+   * here leaves a recoverable orphan, whereas throwing would report a delete as failed
+   * that in fact succeeded.
+   */
+  private async archiveAnchoredNode(contactId: string, kgNodeId: string): Promise<void> {
+    if (!this.entityMemory) return;
+    try {
+      const node = await this.entityMemory.getEntity(kgNodeId);
+      if (!node || node.identitySource !== 'contact') return;
+
+      const stillReferenced = await this.backend.findContactByKgNodeId(kgNodeId);
+      if (stillReferenced) {
+        // info, not debug: prod runs at info, and this is the only line distinguishing
+        // "retired this contact's identity" from "left it in place for its siblings".
+        this.logger?.info(
+          { contactId, kgNodeId, remainingContactId: stillReferenced.id },
+          'contacts: anchored KG node still referenced by another contact — not archiving',
+        );
+        return;
+      }
+
+      await this.entityMemory.archiveEntity(kgNodeId);
+      this.logger?.info(
+        { contactId, kgNodeId },
+        'contacts: archived the deleted contact\'s anchored KG node (ADR-040)',
+      );
+    } catch (err) {
+      this.logger?.warn(
+        { err, contactId, kgNodeId, step: 'archiveAnchoredNode' },
+        'contacts: contact deleted but archiving its anchored KG node failed — node is now orphaned',
+      );
+    }
   }
 
   /**
@@ -1329,19 +2371,9 @@ export class ContactService {
     const noteParts = [primary.notes, secondary.notes].filter(Boolean);
     const notes = noteParts.length > 0 ? noteParts.join('\n---\n') : null;
 
-    // Tier survivorship. A structural primary (principal/agent/system-role) always keeps
-    // its own tier — a merge must never downgrade it, not even via blocked-wins: merging
-    // a 'blocked' duplicate into the principal must not lock the principal out. For
-    // ordinary contacts, a 'blocked' tier on either side wins (most restrictive, so a
-    // merge can never un-block a contact); otherwise the more-capable (higher TIER_RANK)
-    // tier survives, preserving any explicit CEO grant (trusted/principal).
-    const tier: ContactTier = isStructuralContact(primary)
-      ? primary.tier
-      : primary.tier === 'blocked' || secondary.tier === 'blocked'
-        ? 'blocked'
-        : TIER_RANK[primary.tier] >= TIER_RANK[secondary.tier]
-          ? primary.tier
-          : secondary.tier;
+    // Tier survivorship: the shared rule (survivingTier) — structural primary keeps its
+    // tier; otherwise blocked-on-either-side wins, else the higher TIER_RANK.
+    const tier: ContactTier = survivingTier(primary, [secondary]);
 
     // Union of identities — deduplicated by channel:channelIdentifier key
     const identityKeys = new Set<string>();
@@ -1365,6 +2397,37 @@ export class ContactService {
 
     return { displayName, role, notes, tier, identities, authOverrides };
   }
+}
+
+/**
+ * Scoring counters of a folded contact: confidence and last-seen take the max, message
+ * counts are summed (spec §5.1). Before #2233 a merge kept only the primary's.
+ */
+export function mergedCounters(
+  primary: Pick<Contact, 'contactConfidence' | 'lastSeenAt' | 'inboundMessageCount' | 'outboundMessageCount'>,
+  secondary: Pick<Contact, 'contactConfidence' | 'lastSeenAt' | 'inboundMessageCount' | 'outboundMessageCount'>,
+): Pick<MergedContactRow, 'contactConfidence' | 'lastSeenAt' | 'inboundMessageCount' | 'outboundMessageCount'> {
+  const lastSeenAt = primary.lastSeenAt && secondary.lastSeenAt
+    ? (primary.lastSeenAt.getTime() >= secondary.lastSeenAt.getTime() ? primary.lastSeenAt : secondary.lastSeenAt)
+    : (primary.lastSeenAt ?? secondary.lastSeenAt);
+  return {
+    contactConfidence: Math.max(primary.contactConfidence, secondary.contactConfidence),
+    lastSeenAt,
+    inboundMessageCount: primary.inboundMessageCount + secondary.inboundMessageCount,
+    outboundMessageCount: primary.outboundMessageCount + secondary.outboundMessageCount,
+  };
+}
+
+/** Canonical attributes: the primary's value, or the secondary's where the primary has none (§6.4). */
+export function fillCanonicalAttributes(
+  primary: Contact,
+  secondary: Contact,
+): Pick<MergedContactRow, (typeof CANONICAL_ATTRIBUTE_KEYS)[number]> {
+  const filled = {} as Pick<MergedContactRow, (typeof CANONICAL_ATTRIBUTE_KEYS)[number]>;
+  for (const key of CANONICAL_ATTRIBUTE_KEYS) {
+    filled[key] = primary[key] ?? secondary[key];
+  }
+  return filled;
 }
 
 // -- Postgres-specific row shape (all 28 columns as of migration 055) --
@@ -1611,6 +2674,28 @@ class PostgresContactBackend implements ContactServiceBackend {
     );
   }
 
+  async getIdentity(identityId: string): Promise<ChannelIdentity | null> {
+    const result = await this.pool.query<{
+      id: string;
+      contact_id: string;
+      channel: string;
+      channel_identifier: string;
+      label: string | null;
+      verified: boolean;
+      verified_at: Date | null;
+      status: string;
+      source: string;
+      created_at: Date;
+      updated_at: Date;
+    }>(
+      `SELECT id, contact_id, channel, channel_identifier, label, verified, verified_at, status, source, created_at, updated_at
+       FROM contact_channel_identities WHERE id = $1`,
+      [identityId],
+    );
+    const row = result.rows[0];
+    return row ? this.rowToIdentity(row) : null;
+  }
+
   async getIdentitiesForContact(contactId: string): Promise<ChannelIdentity[]> {
     const result = await this.pool.query<{
       id: string;
@@ -1630,6 +2715,28 @@ class PostgresContactBackend implements ContactServiceBackend {
       [contactId],
     );
 
+    return result.rows.map((row) => this.rowToIdentity(row));
+  }
+
+  async listIdentitiesOnChannels(channels: string[]): Promise<ChannelIdentity[]> {
+    if (channels.length === 0) return [];
+    const result = await this.pool.query<{
+      id: string;
+      contact_id: string;
+      channel: string;
+      channel_identifier: string;
+      label: string | null;
+      verified: boolean;
+      verified_at: Date | null;
+      status: string;
+      source: string;
+      created_at: Date;
+      updated_at: Date;
+    }>(
+      `SELECT id, contact_id, channel, channel_identifier, label, verified, verified_at, status, source, created_at, updated_at
+       FROM contact_channel_identities WHERE channel = ANY($1::text[])`,
+      [channels],
+    );
     return result.rows.map((row) => this.rowToIdentity(row));
   }
 
@@ -1764,6 +2871,37 @@ class PostgresContactBackend implements ContactServiceBackend {
     return this.rowToIdentity(row);
   }
 
+  async verifyIdentity(identityId: string): Promise<ChannelIdentity> {
+    this.logger.debug({ identityId }, 'contacts: verifying identity');
+    const result = await this.pool.query<{
+      id: string;
+      contact_id: string;
+      channel: string;
+      channel_identifier: string;
+      label: string | null;
+      verified: boolean;
+      verified_at: Date | null;
+      status: string;
+      source: string;
+      created_at: Date;
+      updated_at: Date;
+    }>(
+      `UPDATE contact_channel_identities
+       SET verified = true,
+           verified_at = COALESCE(verified_at, now()),
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, contact_id, channel, channel_identifier, label, verified, verified_at, status, source, created_at, updated_at`,
+      [identityId],
+    );
+
+    const row = result.rows[0];
+    if (!row) {
+      throw new IdentityNotFoundError(identityId);
+    }
+    return this.rowToIdentity(row);
+  }
+
   async getAuthOverrides(contactId: string): Promise<Array<{ permission: string; granted: boolean }>> {
     const result = await this.pool.query<{
       permission: string;
@@ -1780,17 +2918,18 @@ class PostgresContactBackend implements ContactServiceBackend {
     }));
   }
 
-  async createAuthOverride(override: AuthOverride): Promise<void> {
+  async createAuthOverride(override: AuthOverride, client?: DbPoolClient): Promise<void> {
     this.logger.debug(
       { contactId: override.contactId, permission: override.permission, granted: override.granted },
       'contacts: creating auth override',
     );
     // Upsert: if an active override exists for this contact+permission, update it.
-    // The UNIQUE(contact_id, permission) constraint on the table supports this.
-    await this.pool.query(
+    // Partial unique index contact_auth_overrides_active_unique supports this (#45).
+    const q = client ?? this.pool;
+    await q.query(
       `INSERT INTO contact_auth_overrides (id, contact_id, permission, granted, granted_by, created_at, revoked_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (contact_id, permission) DO UPDATE
+       ON CONFLICT (contact_id, permission) WHERE revoked_at IS NULL DO UPDATE
          SET granted = EXCLUDED.granted,
              granted_by = EXCLUDED.granted_by,
              created_at = EXCLUDED.created_at,
@@ -1799,9 +2938,9 @@ class PostgresContactBackend implements ContactServiceBackend {
     );
   }
 
-  async revokeAuthOverride(contactId: string, permission: string): Promise<boolean> {
+  async revokeAuthOverride(contactId: string, permission: string, client?: DbPoolClient): Promise<boolean> {
     this.logger.debug({ contactId, permission }, 'Revoking auth override');
-    const result = await this.pool.query(
+    const result = await (client ?? this.pool).query(
       `UPDATE contact_auth_overrides SET revoked_at = now()
        WHERE contact_id = $1 AND permission = $2 AND revoked_at IS NULL`,
       [contactId, permission],
@@ -1811,14 +2950,15 @@ class PostgresContactBackend implements ContactServiceBackend {
 
   // ---- Grant recommendations (issue #952) ----
 
-  async createGrantRecommendation(rec: GrantRecommendation): Promise<void> {
-    await this.pool.query(
+  async createGrantRecommendation(rec: GrantRecommendation): Promise<boolean> {
+    const result = await this.pool.query(
       `INSERT INTO grant_recommendations
          (id, contact_id, permission, reasoning, status, suggested_at, resolved_at, resolved_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (contact_id, permission) DO NOTHING`,
       [rec.id, rec.contactId, rec.permission, rec.reasoning, rec.status, rec.suggestedAt, rec.resolvedAt, rec.resolvedBy],
     );
+    return (result.rowCount ?? 0) > 0;
   }
 
   async getGrantRecommendation(id: string): Promise<GrantRecommendation | null> {
@@ -1877,14 +3017,37 @@ class PostgresContactBackend implements ContactServiceBackend {
     return result.rows.map(row => this.rowToGrantRecommendation(row));
   }
 
-  async resolveGrantRecommendation(id: string, status: 'approved' | 'declined', resolvedBy: string): Promise<boolean> {
-    const result = await this.pool.query(
+  async resolveGrantRecommendation(id: string, status: 'approved' | 'declined', resolvedBy: string, client?: DbPoolClient): Promise<boolean> {
+    const q = client ?? this.pool;
+    const result = await q.query(
       `UPDATE grant_recommendations
        SET status = $2, resolved_at = now(), resolved_by = $3
        WHERE id = $1 AND status = 'pending'`,
       [id, status, resolvedBy],
     );
     return (result.rowCount ?? 0) > 0;
+  }
+
+  async withTransaction<T>(fn: (client?: DbPoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await fn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      // Wrap ROLLBACK in its own try/catch: if ROLLBACK throws (e.g. connection severed),
+      // log and swallow that secondary error so the original err — the real root cause —
+      // is what propagates to the caller.
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        this.logger.error({ rollbackErr }, 'contacts: withTransaction ROLLBACK failed');
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   private rowToGrantRecommendation(row: {
@@ -1982,26 +3145,33 @@ class PostgresContactBackend implements ContactServiceBackend {
     return this.rowToCalendar(row);
   }
 
-  async reattachIdentities(fromContactId: string, toContactId: string): Promise<void> {
-    // Delete identities that would conflict with the primary's existing ones
-    await this.pool.query(
-      `DELETE FROM contact_channel_identities
-       WHERE contact_id = $1
-         AND (channel, channel_identifier) IN (
-           SELECT channel, channel_identifier
-           FROM contact_channel_identities
-           WHERE contact_id = $2
+  async reattachIdentities(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<void> {
+    const q = client ?? this.pool;
+    // Delete identities that would conflict with the primary's existing ones: an exact
+    // (channel, identifier) match, or — for email — a case-insensitive one, which
+    // idx_cci_email_lower_unique would otherwise reject on the re-point below.
+    await q.query(
+      `DELETE FROM contact_channel_identities s
+       WHERE s.contact_id = $1
+         AND EXISTS (
+           SELECT 1
+           FROM contact_channel_identities p
+           WHERE p.contact_id = $2
+             AND p.channel = s.channel
+             AND (p.channel_identifier = s.channel_identifier
+                  OR (s.channel = 'email' AND lower(p.channel_identifier) = lower(s.channel_identifier)))
          )`,
       [fromContactId, toContactId],
     );
-    await this.pool.query(
+    await q.query(
       `UPDATE contact_channel_identities SET contact_id = $1 WHERE contact_id = $2`,
       [toContactId, fromContactId],
     );
   }
 
-  async reattachAuthOverrides(fromContactId: string, toContactId: string): Promise<void> {
-    await this.pool.query(
+  async reattachAuthOverrides(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<void> {
+    const q = client ?? this.pool;
+    await q.query(
       `DELETE FROM contact_auth_overrides
        WHERE contact_id = $1
          AND revoked_at IS NULL
@@ -2013,15 +3183,238 @@ class PostgresContactBackend implements ContactServiceBackend {
     );
     // Only re-point active (non-revoked) rows; revoked rows stay on the secondary
     // and will be effectively deleted when the secondary contact is deleted.
-    await this.pool.query(
+    await q.query(
       `UPDATE contact_auth_overrides SET contact_id = $1 WHERE contact_id = $2 AND revoked_at IS NULL`,
       [toContactId, fromContactId],
     );
   }
 
-  async deleteContact(id: string): Promise<void> {
+  async addDedupExclusion(pair: ExclusionPair, decidedBy: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `INSERT INTO contact_dedup_exclusions (contact_a_id, contact_b_id, decided_by)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (contact_a_id, contact_b_id) DO NOTHING
+       RETURNING contact_a_id`,
+      [pair.contactAId, pair.contactBId, decidedBy],
+    );
+    // An empty result means ON CONFLICT swallowed the insert — the pair was already
+    // excluded. That is a successful no-op, not a failure: re-excluding a pair the
+    // principal already ruled on must stay idempotent.
+    return result.rows.length > 0;
+  }
+
+  async hasDedupExclusion(pair: ExclusionPair): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT 1 FROM contact_dedup_exclusions
+       WHERE contact_a_id = $1 AND contact_b_id = $2`,
+      [pair.contactAId, pair.contactBId],
+    );
+    return result.rows.length > 0;
+  }
+
+  async listDedupExclusions(): Promise<ExclusionPair[]> {
+    const result = await this.pool.query(
+      `SELECT contact_a_id, contact_b_id FROM contact_dedup_exclusions`,
+    );
+    return result.rows.map((row: { contact_a_id: string; contact_b_id: string }) => ({
+      contactAId: row.contact_a_id,
+      contactBId: row.contact_b_id,
+    }));
+  }
+
+  async reattachDedupExclusions(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<ReattachExclusionsResult> {
+    const q = client ?? this.pool;
+    // Copy the loser's exclusions onto the survivor, renormalizing each pair with
+    // LEAST/GREATEST so the ordered-pair CHECK still holds after the swap.
+    //
+    // WHERE other <> $1 drops the exclusion between the two contacts being merged:
+    // merging them is a decision that they ARE the same person, which supersedes the
+    // earlier "not the same person" ruling. Keeping it would produce a self-pair.
+    //
+    // ON CONFLICT DO NOTHING drops rows the survivor already holds for the same
+    // counterparty; the survivor's own decided_at / decided_by provenance wins.
+    const moved = await q.query(
+      `INSERT INTO contact_dedup_exclusions (contact_a_id, contact_b_id, decided_at, decided_by)
+       SELECT LEAST($1::uuid, other), GREATEST($1::uuid, other), decided_at, decided_by
+       FROM (
+         SELECT CASE WHEN contact_a_id = $2::uuid THEN contact_b_id ELSE contact_a_id END AS other,
+                decided_at,
+                decided_by
+         FROM contact_dedup_exclusions
+         WHERE contact_a_id = $2::uuid OR contact_b_id = $2::uuid
+       ) AS loser_pairs
+       WHERE other <> $1::uuid
+       ON CONFLICT (contact_a_id, contact_b_id) DO NOTHING
+       RETURNING contact_a_id`,
+      [toContactId, fromContactId],
+    );
+
+    // Delete the loser's rows explicitly rather than relying on the FK cascade that
+    // fires when the secondary contact row is deleted — reattach must leave a
+    // consistent table even when called outside the merge write sequence.
+    const removed = await q.query(
+      `DELETE FROM contact_dedup_exclusions
+       WHERE contact_a_id = $1::uuid OR contact_b_id = $1::uuid
+       RETURNING contact_a_id`,
+      [fromContactId],
+    );
+
+    // The caller logs any drop. Reporting removed vs moved (rather than just "done")
+    // also surfaces a future divergence between what the INSERT carried across and what
+    // the DELETE removed, which would otherwise be silent data loss.
+    return {
+      removed: removed.rows.length,
+      moved: moved.rows.length,
+      dropped: removed.rows.length - moved.rows.length,
+    };
+  }
+
+  async reattachContactReferences(fromContactId: string, toContactId: string, client?: DbPoolClient): Promise<ContactReferenceCounts> {
+    const q = client ?? this.pool;
+    const counts = emptyContactReferenceCounts();
+    const params = [fromContactId, toContactId];
+    const run = async (sql: string): Promise<number> => (await q.query(sql, params)).rowCount ?? 0;
+
+    // contact_calendars — idx_contact_calendars_primary allows one primary per contact.
+    // When the survivor already has one, the moved calendars stop being primary first.
+    counts.contact_calendars_demoted = await run(
+      `UPDATE contact_calendars SET is_primary = false, updated_at = now()
+       WHERE contact_id = $1 AND is_primary
+         AND EXISTS (SELECT 1 FROM contact_calendars WHERE contact_id = $2 AND is_primary)`,
+    );
+    counts.contact_calendars = await run(
+      `UPDATE contact_calendars SET contact_id = $2, updated_at = now() WHERE contact_id = $1`,
+    );
+
+    // grant_recommendations — UNIQUE (contact_id, permission). The survivor's row for a
+    // permission wins; the secondary's duplicate is dropped.
+    counts.grant_recommendations_dropped = await run(
+      `DELETE FROM grant_recommendations s
+       WHERE s.contact_id = $1
+         AND EXISTS (SELECT 1 FROM grant_recommendations p WHERE p.contact_id = $2 AND p.permission = s.permission)`,
+    );
+    counts.grant_recommendations = await run(
+      `UPDATE grant_recommendations SET contact_id = $2 WHERE contact_id = $1`,
+    );
+
+    // conversation_resolved_entities — PK (conversation_id, agent_id, contact_id)
+    // (migration 088). On a collision the survivor's row keeps the later resolved_at, so
+    // "recently resolved in this conversation" stays true; the secondary's is dropped.
+    await run(
+      `UPDATE conversation_resolved_entities p
+       SET resolved_at = GREATEST(p.resolved_at, s.resolved_at)
+       FROM conversation_resolved_entities s
+       WHERE p.contact_id = $2 AND s.contact_id = $1
+         AND p.conversation_id = s.conversation_id AND p.agent_id = s.agent_id`,
+    );
+    counts.conversation_resolved_entities_dropped = await run(
+      `DELETE FROM conversation_resolved_entities s
+       WHERE s.contact_id = $1
+         AND EXISTS (
+           SELECT 1 FROM conversation_resolved_entities p
+           WHERE p.contact_id = $2 AND p.conversation_id = s.conversation_id AND p.agent_id = s.agent_id
+         )`,
+    );
+    counts.conversation_resolved_entities = await run(
+      `UPDATE conversation_resolved_entities SET contact_id = $2 WHERE contact_id = $1`,
+    );
+
+    // ON DELETE SET NULL columns (migrations 049, 082/089, 090). held_messages, also named
+    // in the spec, was dropped by migration 059 and has nothing left to re-point.
+    counts.tasks_waiting_on = await run(
+      `UPDATE tasks SET waiting_on_contact_id = $2 WHERE waiting_on_contact_id = $1`,
+    );
+    counts.voice_sessions = await run(
+      `UPDATE voice_sessions SET caller_contact_id = $2 WHERE caller_contact_id = $1`,
+    );
+    counts.working_memory = await run(
+      `UPDATE working_memory SET sender_contact_id = $2 WHERE sender_contact_id = $1`,
+    );
+
+    // originator JSONB lineage (migrations 040, 041, 054, 065, 086). No FK, so a deleted
+    // contact id would linger there forever. One literal statement per table: no SQL is
+    // assembled from strings.
+    counts.originator_tasks = await run(
+      `UPDATE tasks SET originator = jsonb_set(originator, '{contactId}', to_jsonb($2::text))
+       WHERE originator->>'contactId' = $1::text`,
+    );
+    counts.originator_scheduled_jobs = await run(
+      `UPDATE scheduled_jobs SET originator = jsonb_set(originator, '{contactId}', to_jsonb($2::text))
+       WHERE originator->>'contactId' = $1::text`,
+    );
+    counts.originator_bullpen_threads = await run(
+      `UPDATE bullpen_threads SET originator = jsonb_set(originator, '{contactId}', to_jsonb($2::text))
+       WHERE originator->>'contactId' = $1::text`,
+    );
+    counts.originator_secret_capture_tokens = await run(
+      `UPDATE secret_capture_tokens SET originator = jsonb_set(originator, '{contactId}', to_jsonb($2::text))
+       WHERE originator->>'contactId' = $1::text`,
+    );
+    counts.originator_pending_delegations = await run(
+      `UPDATE pending_delegations SET originator = jsonb_set(originator, '{contactId}', to_jsonb($2::text))
+       WHERE originator->>'contactId' = $1::text`,
+    );
+
+    // outbound_context recipients (migration 104, #2261): a bare UUID[] with no FK, like the
+    // originator JSON above. Left alone, an answer from the merged person arrives without
+    // the question Curia sent the absorbed contact. The ids in recorded messages move too,
+    // so a contact-scoped read still finds the survivor's own words.
+    counts.outbound_context_recipients = await run(
+      `UPDATE outbound_context
+          SET recipient_contact_ids = ARRAY(
+                SELECT DISTINCT r FROM unnest(array_replace(recipient_contact_ids, $1::uuid, $2::uuid)) AS r),
+              recipient_messages = (
+                SELECT COALESCE(jsonb_agg(
+                         CASE WHEN m->>'contact_id' = $1::text
+                              THEN jsonb_set(m, '{contact_id}', to_jsonb($2::text)) ELSE m END
+                         ORDER BY ord), '[]'::jsonb)
+                  FROM jsonb_array_elements(recipient_messages) WITH ORDINALITY AS t(m, ord))
+        WHERE recipient_contact_ids @> ARRAY[$1::uuid]`,
+    );
+
+    this.logger.debug({ fromContactId, toContactId, counts }, 'contacts: reattached contact references');
+    return counts;
+  }
+
+  async writeMergedContact(id: string, row: MergedContactRow, client?: DbPoolClient): Promise<void> {
+    this.logger.debug({ contactId: id }, 'contacts: writing merged contact row');
+    await (client ?? this.pool).query(
+      `UPDATE contacts SET
+         kg_node_id = $2, display_name = $3, role = $4, notes = $5, tier = $6, kind = $7,
+         preferred_name = $8, title = $9, organization = $10, primary_email = $11,
+         primary_phone = $12, timezone = $13, locale = $14, location = $15,
+         pronouns = $16, linkedin_url = $17, bio = $18, birthday = $19,
+         contact_confidence = $20, last_seen_at = $21,
+         inbound_message_count = $22, outbound_message_count = $23,
+         updated_at = now()
+       WHERE id = $1`,
+      [
+        id, row.kgNodeId, row.displayName, row.role, row.notes, row.tier, row.kind,
+        row.preferredName, row.title, row.organization, row.primaryEmail,
+        row.primaryPhone, row.timezone, row.locale, row.location,
+        row.pronouns, row.linkedinUrl, row.bio, row.birthday,
+        row.contactConfidence, row.lastSeenAt,
+        row.inboundMessageCount, row.outboundMessageCount,
+      ],
+    );
+  }
+
+  async lockContactsForMerge(ids: string[], client?: DbPoolClient): Promise<Contact[]> {
+    if (!client) {
+      // FOR UPDATE outside a transaction releases the lock as soon as the statement ends,
+      // which would silently make the merge's read-modify-write unprotected again.
+      throw new Error('contacts: lockContactsForMerge needs the merge transaction client');
+    }
+    const result = await client.query<ContactRow>(
+      `SELECT ${CONTACT_COLS} FROM contacts WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
+      [ids],
+    );
+    return result.rows.map(row => this.rowToContact(row));
+  }
+
+  async deleteContact(id: string, client?: DbPoolClient): Promise<void> {
     this.logger.debug({ contactId: id }, 'contacts: deleting contact');
-    await this.pool.query(`DELETE FROM contacts WHERE id = $1`, [id]);
+    await (client ?? this.pool).query(`DELETE FROM contacts WHERE id = $1`, [id]);
   }
 
   // -- Row mapping helpers --
@@ -2155,12 +3548,18 @@ class InMemoryContactBackend implements ContactServiceBackend {
   private identities = new Map<string, ChannelIdentity>();
   private overrides = new Map<string, AuthOverride>();
   private calendars = new Map<string, ContactCalendar>();
+  /** Keyed "<contactAId>:<contactBId>" in normalized order — the in-memory analogue
+   *  of the contact_dedup_exclusions primary key + ordered-pair CHECK. */
+  private dedupExclusions = new Map<string, { pair: ExclusionPair; decidedAt: Date; decidedBy: string }>();
 
   async createContact(contact: Contact): Promise<void> {
     // Enforce the partial unique index idx_contacts_kg_node_unique to match Postgres.
-    if (contact.kgNodeId !== null) {
+    // Mirrors idx_contacts_kg_node_unique as narrowed by migration 085: organization
+    // contacts are exempt, because several role addresses at one domain legitimately
+    // share their organization's node (ADR-040).
+    if (contact.kgNodeId !== null && contact.kind !== 'organization') {
       for (const existing of this.contacts.values()) {
-        if (existing.kgNodeId === contact.kgNodeId) {
+        if (existing.kgNodeId === contact.kgNodeId && existing.kind !== 'organization') {
           const err = Object.assign(new Error('duplicate key value violates unique constraint "idx_contacts_kg_node_unique"'), {
             code: '23505',
             constraint: 'idx_contacts_kg_node_unique',
@@ -2315,6 +3714,10 @@ class InMemoryContactBackend implements ContactServiceBackend {
     this.identities.set(identity.id, identity);
   }
 
+  async getIdentity(identityId: string): Promise<ChannelIdentity | null> {
+    return this.identities.get(identityId) ?? null;
+  }
+
   async getIdentitiesForContact(contactId: string): Promise<ChannelIdentity[]> {
     const results: ChannelIdentity[] = [];
     for (const identity of this.identities.values()) {
@@ -2323,6 +3726,11 @@ class InMemoryContactBackend implements ContactServiceBackend {
       }
     }
     return results;
+  }
+
+  async listIdentitiesOnChannels(channels: string[]): Promise<ChannelIdentity[]> {
+    const wanted = new Set(channels);
+    return [...this.identities.values()].filter((identity) => wanted.has(identity.channel));
   }
 
   async resolveByChannelIdentity(
@@ -2377,6 +3785,22 @@ class InMemoryContactBackend implements ContactServiceBackend {
     return updated;
   }
 
+  async verifyIdentity(identityId: string): Promise<ChannelIdentity> {
+    const identity = this.identities.get(identityId);
+    if (!identity) {
+      throw new IdentityNotFoundError(identityId);
+    }
+    const now = new Date();
+    const updated: ChannelIdentity = {
+      ...identity,
+      verified: true,
+      verifiedAt: identity.verifiedAt ?? now,
+      updatedAt: now,
+    };
+    this.identities.set(identityId, updated);
+    return updated;
+  }
+
   async getAuthOverrides(contactId: string): Promise<Array<{ permission: string; granted: boolean }>> {
     const results: Array<{ permission: string; granted: boolean }> = [];
     for (const override of this.overrides.values()) {
@@ -2387,7 +3811,7 @@ class InMemoryContactBackend implements ContactServiceBackend {
     return results;
   }
 
-  async createAuthOverride(override: AuthOverride): Promise<void> {
+  async createAuthOverride(override: AuthOverride, _client?: DbPoolClient): Promise<void> {
     // Upsert: find and replace any existing active override for the same contact+permission
     for (const [key, existing] of this.overrides.entries()) {
       if (
@@ -2402,7 +3826,7 @@ class InMemoryContactBackend implements ContactServiceBackend {
     this.overrides.set(override.id, override);
   }
 
-  async revokeAuthOverride(contactId: string, permission: string): Promise<boolean> {
+  async revokeAuthOverride(contactId: string, permission: string, _client?: DbPoolClient): Promise<boolean> {
     for (const [id, override] of this.overrides) {
       if (override.contactId === contactId &&
           override.permission === permission &&
@@ -2475,18 +3899,21 @@ class InMemoryContactBackend implements ContactServiceBackend {
     return null;
   }
 
-  async reattachIdentities(fromContactId: string, toContactId: string): Promise<void> {
-    // Build set of channel:channelIdentifier keys already owned by the primary
+  async reattachIdentities(fromContactId: string, toContactId: string, _client?: DbPoolClient): Promise<void> {
+    // Build set of channel:channelIdentifier keys already owned by the primary. Email is
+    // compared case-insensitively, mirroring idx_cci_email_lower_unique in Postgres.
+    const keyOf = (identity: ChannelIdentity): string =>
+      `${identity.channel}:${identity.channel === 'email' ? identity.channelIdentifier.toLowerCase() : identity.channelIdentifier}`;
     const primaryKeys = new Set<string>();
     for (const identity of this.identities.values()) {
       if (identity.contactId === toContactId) {
-        primaryKeys.add(`${identity.channel}:${identity.channelIdentifier}`);
+        primaryKeys.add(keyOf(identity));
       }
     }
     // Re-point secondary's identities onto primary, discarding any that conflict
     for (const [id, identity] of this.identities) {
       if (identity.contactId !== fromContactId) continue;
-      const key = `${identity.channel}:${identity.channelIdentifier}`;
+      const key = keyOf(identity);
       if (primaryKeys.has(key)) {
         // Duplicate — would violate UNIQUE constraint in Postgres, so discard
         this.identities.delete(id);
@@ -2497,7 +3924,7 @@ class InMemoryContactBackend implements ContactServiceBackend {
     }
   }
 
-  async reattachAuthOverrides(fromContactId: string, toContactId: string): Promise<void> {
+  async reattachAuthOverrides(fromContactId: string, toContactId: string, _client?: DbPoolClient): Promise<void> {
     // Build set of permissions already held (active) by the primary
     const primaryPerms = new Set<string>();
     for (const override of this.overrides.values()) {
@@ -2517,7 +3944,108 @@ class InMemoryContactBackend implements ContactServiceBackend {
     }
   }
 
-  async deleteContact(id: string): Promise<void> {
+  private static exclusionKey(pair: ExclusionPair): string {
+    return `${pair.contactAId}:${pair.contactBId}`;
+  }
+
+  async addDedupExclusion(pair: ExclusionPair, decidedBy: string): Promise<boolean> {
+    const key = InMemoryContactBackend.exclusionKey(pair);
+    if (this.dedupExclusions.has(key)) return false;
+    this.dedupExclusions.set(key, { pair, decidedAt: new Date(), decidedBy });
+    return true;
+  }
+
+  async hasDedupExclusion(pair: ExclusionPair): Promise<boolean> {
+    return this.dedupExclusions.has(InMemoryContactBackend.exclusionKey(pair));
+  }
+
+  async listDedupExclusions(): Promise<ExclusionPair[]> {
+    return [...this.dedupExclusions.values()].map(row => row.pair);
+  }
+
+  async reattachDedupExclusions(fromContactId: string, toContactId: string, _client?: DbPoolClient): Promise<ReattachExclusionsResult> {
+    let removed = 0;
+    let moved = 0;
+
+    for (const [key, row] of this.dedupExclusions) {
+      const { contactAId, contactBId } = row.pair;
+      if (contactAId !== fromContactId && contactBId !== fromContactId) continue;
+
+      // Safe to mutate mid-iteration: entries appended below are always
+      // (toContactId, other) with other !== fromContactId, so if the iterator revisits
+      // one it exits at the guard above rather than re-processing it.
+      this.dedupExclusions.delete(key);
+      removed++;
+
+      const other = contactAId === fromContactId ? contactBId : contactAId;
+      // The exclusion between the two merged contacts is superseded by the merge.
+      if (other === toContactId) continue;
+
+      // Order the pair directly rather than via normalizeExclusionPair: the Postgres
+      // path uses LEAST/GREATEST, which does not validate UUID shape, and the two
+      // backends must agree on ids that came from the DB.
+      const renormalized: ExclusionPair = toContactId < other
+        ? { contactAId: toContactId, contactBId: other }
+        : { contactAId: other, contactBId: toContactId };
+      const newKey = InMemoryContactBackend.exclusionKey(renormalized);
+      // The survivor's own row wins when both sides excluded the same counterparty.
+      if (this.dedupExclusions.has(newKey)) continue;
+      this.dedupExclusions.set(newKey, { ...row, pair: renormalized });
+      moved++;
+    }
+
+    // Same accounting as the Postgres backend so both report the same event.
+    return { removed, moved, dropped: removed - moved };
+  }
+
+  async reattachContactReferences(fromContactId: string, toContactId: string, _client?: DbPoolClient): Promise<ContactReferenceCounts> {
+    // Only calendars and grant recommendations exist in memory; the other referencing
+    // tables are Postgres-only, so their counts stay 0 here.
+    const counts = emptyContactReferenceCounts();
+
+    const survivorHasPrimary = [...this.calendars.values()].some(c => c.contactId === toContactId && c.isPrimary);
+    for (const [id, cal] of this.calendars) {
+      if (cal.contactId !== fromContactId) continue;
+      let moved: ContactCalendar = { ...cal, contactId: toContactId, updatedAt: new Date() };
+      if (cal.isPrimary && survivorHasPrimary) {
+        moved = { ...moved, isPrimary: false };
+        counts.contact_calendars_demoted++;
+      }
+      this.calendars.set(id, moved);
+      counts.contact_calendars++;
+    }
+
+    const survivorPerms = new Set(
+      [...this.recommendations.values()].filter(r => r.contactId === toContactId).map(r => r.permission),
+    );
+    for (const [key, rec] of this.recommendations) {
+      if (rec.contactId !== fromContactId) continue;
+      this.recommendations.delete(key);
+      if (survivorPerms.has(rec.permission)) {
+        counts.grant_recommendations_dropped++;
+        continue;
+      }
+      this.recommendations.set(`${toContactId}:${rec.permission}`, { ...rec, contactId: toContactId });
+      counts.grant_recommendations++;
+    }
+    return counts;
+  }
+
+  async lockContactsForMerge(ids: string[], _client?: DbPoolClient): Promise<Contact[]> {
+    // Single-threaded: there is nothing to lock, only the current rows to return.
+    return [...new Set(ids)]
+      .sort()
+      .map(id => this.contacts.get(id))
+      .filter((c): c is Contact => c !== undefined);
+  }
+
+  async writeMergedContact(id: string, row: MergedContactRow, _client?: DbPoolClient): Promise<void> {
+    const existing = this.contacts.get(id);
+    if (!existing) return;
+    this.contacts.set(id, { ...existing, ...row, updatedAt: new Date() });
+  }
+
+  async deleteContact(id: string, _client?: DbPoolClient): Promise<void> {
     this.contacts.delete(id);
     // Cascade-delete related rows, matching Postgres ON DELETE CASCADE behavior.
     // Without this, deleted contacts leave dangling identities/overrides in the in-memory
@@ -2531,13 +4059,16 @@ class InMemoryContactBackend implements ContactServiceBackend {
     for (const [rk, rec] of this.recommendations) {
       if (rec.contactId === id) this.recommendations.delete(rk);
     }
+    for (const [ek, row] of this.dedupExclusions) {
+      if (row.pair.contactAId === id || row.pair.contactBId === id) this.dedupExclusions.delete(ek);
+    }
   }
 
   // ---- Grant recommendations (issue #952) — in-memory stubs ----
 
   private recommendations = new Map<string, GrantRecommendation>();
 
-  async createGrantRecommendation(rec: GrantRecommendation): Promise<void> {
+  async createGrantRecommendation(rec: GrantRecommendation): Promise<boolean> {
     // Mimic Postgres FK constraint: contact must exist
     if (!this.contacts.has(rec.contactId)) {
       throw new Error(`Foreign key violation: contact '${rec.contactId}' does not exist`);
@@ -2545,9 +4076,10 @@ class InMemoryContactBackend implements ContactServiceBackend {
     const key = `${rec.contactId}:${rec.permission}`;
     // Mimic ON CONFLICT DO NOTHING
     for (const r of this.recommendations.values()) {
-      if (r.contactId === rec.contactId && r.permission === rec.permission) return;
+      if (r.contactId === rec.contactId && r.permission === rec.permission) return false;
     }
     this.recommendations.set(key, rec);
+    return true;
   }
 
   async getGrantRecommendation(id: string): Promise<GrantRecommendation | null> {
@@ -2574,7 +4106,7 @@ class InMemoryContactBackend implements ContactServiceBackend {
     return results;
   }
 
-  async resolveGrantRecommendation(id: string, status: 'approved' | 'declined', resolvedBy: string): Promise<boolean> {
+  async resolveGrantRecommendation(id: string, status: 'approved' | 'declined', resolvedBy: string, _client?: DbPoolClient): Promise<boolean> {
     for (const [key, rec] of this.recommendations) {
       if (rec.id === id && rec.status === 'pending') {
         this.recommendations.set(key, { ...rec, status, resolvedAt: new Date(), resolvedBy });
@@ -2582,5 +4114,12 @@ class InMemoryContactBackend implements ContactServiceBackend {
       }
     }
     return false;
+  }
+
+  async withTransaction<T>(fn: (client?: DbPoolClient) => Promise<T>): Promise<T> {
+    // JS is single-threaded; no real database transaction is needed. Run the callback
+    // directly with no client so in-memory tests exercise the same code paths as
+    // Postgres without any pool machinery.
+    return fn(undefined);
   }
 }

@@ -44,43 +44,94 @@
 
 servers:
   # Community Google Workspace MCP server (taylorwilsdon/google_workspace_mcp).
-  # Covers Drive, Sheets, Docs, Gmail, Calendar, and more via OAuth 2.0 as Curia's
-  # Gmail user. The "complete" tier is required for load-bearing Sheets tools:
+  # Serves Drive, Docs and Sheets (see the allowlist below) via OAuth 2.0 as
+  # Curia's Gmail user. The "complete" tier is required for load-bearing Sheets tools:
   # create_sheet (new tab) and append_table_rows are both in the complete tier —
   # they were not promoted to extended in workspace-mcp's tool_tiers.yaml.
   #
-  # Prerequisites (one-time human setup — see docs/dev/google-drive.md):
-  #   1. Create a Google Cloud Project, enable Drive/Sheets/Docs/Gmail/Calendar APIs
-  #   2. Create an OAuth 2.0 Desktop App credential
-  #   3. Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET in .env
-  #   4. Run the OAuth flow once locally to cache tokens (~/.workspace-mcp/cli-tokens/)
+  # `--tools` is an allowlist, and it is the ONLY gate on which Google services
+  # Curia gets (#1957):
+  #   - Drive, Docs and Sheets only. Gmail overlaps the Nylas `email` bundle
+  #     (whole-thread reads: email-get-thread), Tasks overlaps task-create, and
+  #     Contacts belongs to the contacts specialist. Forms, Slides, Chat, Apps
+  #     Script and Search saw no use. Every extra service is tool definitions on
+  #     every coordinator call.
+  #   - Calendar must never be added (#1853). Those tools authenticate as Curia's
+  #     own Google identity, so a principal calendar read through them "succeeds"
+  #     with an empty calendar. Principal calendar work goes through the Nylas
+  #     `calendar` skill. Revisit only with #1330, which would also need to
+  #     restore the call-time identity guard (guardMcpCalendarIdentity) that
+  #     #1957 removed.
+  # There is no in-process holdback or call-time guard behind this list any
+  # more: what is listed here is what agents get. mcp-loader logs an error if a
+  # Calendar tool is ever advertised. tests/unit/config.google-workspace-allowlist.test.ts
+  # pins the exact set, so changing it means editing that test too.
   #
-  # Empty-string env values are resolved from process.env at runtime by
-  # mcp-client.ts's buildChildEnv() — only these two keys are passed to the
-  # subprocess (plus a safe base set: PATH, HOME, USER, etc.). This enforces
-  # least-privilege: DB_PASSWORD, ANTHROPIC_API_KEY, etc. never reach the
-  # third-party process.
+  # The allowlist also sets the OAuth scopes requested on a fresh consent
+  # (scripts/gdrive-auth.py passes the same --tools for that reason).
+  # Existing tokens keep any broader scopes they were granted until revoked (see
+  # docs/dev/google-drive.md); workspace-mcp only needs a subset.
+  #
+  # deploy overlays (e.g. curia-deploy's custom/config/skills.yaml) replace this
+  # file wholesale, so they must carry the same allowlist.
+  #
+  # The launcher runs the version pinned in scripts/workspace-mcp.pin (#2010): the
+  # Docker image's build-time install, or uvx at that pin elsewhere (pnpm dev). The
+  # path is relative to the working directory, which is the repo root under pnpm dev
+  # and /app in the image. Never launch a bare `uvx workspace-mcp`: it floats to PyPI
+  # latest and downloads on every boot.
+  #
+  # Secrets are declared in the `secrets:` block and resolved from the encrypted
+  # vault at spawn time. The `secrets:` list defines which credentials are required,
+  # and how they are injected into the process:
+  #   - `key:` vault key name (e.g. google_oauth_client_id)
+  #   - `label:` human-readable field label for the web console
+  #   - `required:` whether this secret must be present (if false, missing is OK)
+  #   - `secret:` whether the value is sensitive (should be masked in the web console)
+  #   - `inject:` how to pass it to the process:
+  #       - `env: VAR_NAME` → set as environment variable
+  #       - `fixed_input: tool_parameter_name` → inject into tool call as fixed_inputs
+  #
+  # A missing required secret skips this whole server. Only declared keys are passed
+  # to the subprocess (plus a safe base set: PATH, HOME, USER, etc.). This enforces
+  # least-privilege: DB_PASSWORD, ANTHROPIC_API_KEY, etc. never reach the third-party
+  # process.
   - name: google-workspace
     transport: stdio
-    command: uvx
+    command: scripts/workspace-mcp.sh
     args:
-      - workspace-mcp
       - --tool-tier
       - complete
+      # Allowlist, not a filter: see the comment above (#1957, #1853).
+      - --tools
+      - drive
+      - docs
+      - sheets
+    secrets:
+      - key: google_oauth_client_id
+        label: "Google OAuth client ID"
+        required: true
+        secret: false
+        inject:
+          env: GOOGLE_OAUTH_CLIENT_ID
+      - key: google_oauth_client_secret
+        label: "Google OAuth client secret"
+        required: true
+        secret: true
+        inject:
+          env: GOOGLE_OAUTH_CLIENT_SECRET
+      - key: curia_google_email
+        label: "Curia Google account email"
+        required: true
+        secret: false
+        inject:
+          fixed_input: user_google_email
     env:
-      GOOGLE_OAUTH_CLIENT_ID: ""
-      GOOGLE_OAUTH_CLIENT_SECRET: ""
       # Allow the workspace-mcp subprocess to read files from the TempFileStore
       # directory. Without this, create_drive_file rejects file:// URLs pointing
       # to /run/curia-tempfiles/ because validate_file_path only allows reads
       # from its own STORAGE_DIR by default.
       ALLOWED_FILE_DIRS: "/run/curia-tempfiles"
-    # Bind the Google Workspace user email at the tool layer so agents never see
-    # or reason about it. Resolved from CURIA_GOOGLE_EMAIL env var at startup.
-    # This replaces the system prompt injection approach (#387) which was fragile
-    # because LLMs could hallucinate different email addresses.
-    fixed_inputs:
-      user_google_email: "env:CURIA_GOOGLE_EMAIL"
     action_risk: low
     sensitivity: normal
     timeout_ms: 60000

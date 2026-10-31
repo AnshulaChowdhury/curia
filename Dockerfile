@@ -6,7 +6,7 @@
 # version and apply the "don't chase Current majors" ignore rule in
 # .github/dependabot.yml — a bare `node@sha256:…` pin would otherwise track `latest`.
 # Node 24 "Krypton" is the Active LTS (node 22 is Maintenance, node 26 is Current).
-FROM node:24-slim@sha256:2c87ef9bd3c6a3bd4b472b4bec2ce9d16354b0c574f736c476489d09f560a203 AS build
+FROM node:24-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS build
 
 WORKDIR /app
 
@@ -17,11 +17,18 @@ RUN corepack enable
 # Copy all workspace manifests so pnpm installs the full workspace in one shot.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/console/package.json ./apps/console/
-RUN pnpm install --frozen-lockfile
+COPY apps/antfarm/package.json ./apps/antfarm/
+COPY packages/shared-types/package.json ./packages/shared-types/
+# Retry wrapper: a dropped registry connection can abort the Node process outright
+# (unhandled stream error), which pnpm's own fetchRetries cannot catch. See
+# docker/pnpm-retry.sh for the incident and why both layers are needed (#1699).
+COPY docker/pnpm-retry.sh /usr/local/bin/pnpm-retry
+RUN pnpm-retry pnpm install --frozen-lockfile
 
 # Build backend
 COPY src/ ./src/
 COPY tsconfig.json ./
+COPY packages/ ./packages/
 # Skip --dts: type declarations are for library consumers, not the runtime image.
 # tsup's DTS build also trips a TS 6.0 deprecation error on any tsconfig with baseUrl.
 RUN pnpm exec tsup src/index.ts --format esm --no-dts
@@ -30,15 +37,24 @@ RUN pnpm exec tsup src/index.ts --format esm --no-dts
 COPY apps/console/ ./apps/console/
 RUN pnpm --filter @curia/console run build
 
+# Build Ant Farm frontend — output lands in apps/antfarm/dist/
+COPY apps/antfarm/ ./apps/antfarm/
+RUN pnpm --filter @curia/antfarm run build
+# The licensed art normally ships in-repo (apps/antfarm/assets-licensed/limezu/),
+# but it is optional: ensure the directory exists so the runtime COPY below never
+# fails on a checkout that stripped the art. An empty dir → the assets route 404s
+# → the Phaser scene falls back to procedural placeholders (graceful degradation).
+RUN mkdir -p /app/apps/antfarm/assets-licensed
+
 # Production stage: minimal runtime image.
 # Same node:24-slim digest pin as the build stage above (see that comment for the
 # Scorecard / Dependabot rationale). Both stages must stay on the same digest.
-FROM node:24-slim@sha256:2c87ef9bd3c6a3bd4b472b4bec2ce9d16354b0c574f736c476489d09f560a203
+FROM node:24-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
 
 # curl is needed for the HEALTHCHECK command
 # Copy uv/uvx binaries from the official signed image (Astral's recommended
 # Docker pattern — no curl|sh, cryptographically signed, version-pinned).
-# uvx is needed to spawn workspace-mcp as an MCP stdio subprocess.
+# uv installs workspace-mcp at build time (below); the server then runs without it.
 COPY --from=ghcr.io/astral-sh/uv:0.6.3 /uv /uvx /usr/local/bin/
 
 # apt-get upgrade pulls the latest Debian 12 security patches for packages baked
@@ -46,9 +62,19 @@ COPY --from=ghcr.io/astral-sh/uv:0.6.3 /uv /uvx /usr/local/bin/
 # image ships whatever versions were frozen when the base image was built, which
 # Trivy flags as known CVEs even though Debian has already published fixes.
 # Run upgrade before installing curl so curl is installed from the patched lists.
-RUN apt-get update \
- && apt-get upgrade -y \
- && apt-get install -y --no-install-recommends curl \
+# pulseaudio-utils provides parec/pacat, which SignalAudioTransport spawns to
+# move call PCM through the Pulse socket shared from the signal-cli container
+# (#1672). Client tools only — no PulseAudio daemon runs in this image.
+# python3 runs workspace-mcp, installed below (#2010). node:24-slim ships no Python,
+# so without it uv downloads its own CPython; the Debian one gets security fixes from
+# the `upgrade` on every rebuild. curia-deploy's image also installs into this Python.
+# Acquire::Retries covers a transient Debian mirror hiccup, the apt-side equivalent of
+# the npm registry drop that motivated #1699. Without it a single failed fetch fails the
+# whole publish — and for the curia-postgres image this apt call is the ONLY network step,
+# so it gets no benefit from the pnpm retry wrapper.
+RUN apt-get -o Acquire::Retries=3 update \
+ && apt-get -o Acquire::Retries=3 upgrade -y \
+ && apt-get -o Acquire::Retries=3 install -y --no-install-recommends curl pulseaudio-utils python3 \
  && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root system user/group for the runtime process.
@@ -62,43 +88,188 @@ WORKDIR /app
 
 RUN corepack enable
 
-# Upgrade npm to 11.17.0 to clear CVEs in npm's own bundled packages:
-#   - CVE-2026-53655: node-tar < 7.5.14 (PAX size override / file smuggling)
-#   - CVE-2026-45149: brace-expansion < 5.0.6 (arbitrary string generation)
-#   - CVE-2026-42338: ip-address < 10.1.1 (XSS via improper HTML escaping)
-# npm@11.17.0 bundles tar@7.5.16, brace-expansion@5.0.6, ip-address@10.2.0.
-# TODO: Dependabot does not track RUN-instruction version pins — bump this
-# manually when npm publishes a patch that addresses new bundled CVEs.
-RUN npm install -g npm@11.17.0
+# Remove the base image's global npm/npx. They are unused at runtime (installs
+# go through corepack→pnpm; CMD invokes tsx) and their bundled deps keep
+# accumulating Trivy HIGH/MEDIUM findings that no npm 11.x/12.x pin clears:
+#   - CVE-2026-14257 / GHSA-mh99-v99m-4gvg: brace-expansion < 5.0.8 (unbounded
+#     expansion length OOM DoS) — code-scanning alert #233
+#   - GHSA-r292-9mhp-454m: tar < 7.5.21 — code-scanning alert #235
+# node:24-slim ships npm@11.16.0 (brace-expansion@5.0.6, tar@7.5.15). The prior
+# bump to npm@11.18.0 cleared an earlier brace-expansion/tar batch but still
+# left 5.0.7 / 7.5.19. npm@12.0.1 (latest) bundles the same 5.0.7 / 7.5.19 —
+# verified 2026-07-27 — so the "bump npm to clear bundled CVEs" pattern is
+# exhausted. Stripping npm removes the recurring scan surface entirely;
+# corepack is bundled with Node and does not depend on the global npm package.
+# Fail closed: assert the global npm/npx are present before removal and
+# unreachable afterward. `rm -rf` alone exits 0 even when its targets are
+# already gone, so a future Node base image that relocates npm would leave the
+# vulnerable bundled deps (brace-expansion, tar) in place while the build stayed
+# green. These assertions turn that silent regression into a hard build failure.
+# `hash -r` after the rm is load-bearing, not cosmetic: the `command -v npm/npx`
+# pre-checks populate the shell's command-location hash table, and dash (this
+# image's /bin/sh) answers a later `command -v` from that cache without re-stat'ing
+# the filesystem. Without the flush, the post-removal checks report the now-deleted
+# npm/npx as "still resolvable" and fail the build on every run (a false positive).
+RUN set -e; \
+    test -e /usr/local/lib/node_modules/npm; \
+    command -v npm >/dev/null; \
+    command -v npx >/dev/null; \
+    rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx; \
+    hash -r; \
+    if command -v npm >/dev/null 2>&1; then echo 'npm still resolvable after removal' >&2; exit 1; fi; \
+    if command -v npx >/dev/null 2>&1; then echo 'npx still resolvable after removal' >&2; exit 1; fi
+
+# Same transient-network guard as the build stage (#1699). Copied here, ahead of the
+# workspace-mcp install, which pulls a whole dependency tree from PyPI.
+COPY docker/pnpm-retry.sh /usr/local/bin/pnpm-retry
+
+# Install the Google Workspace MCP server (workspace-mcp) at build time, so the
+# google-workspace server starts with no PyPI access at container start (#2010).
+# `uvx workspace-mcp` used to fetch the package and its dependency tree on every boot
+# (uv's cache lives under $HOME, which is not a volume), and one network error there
+# lost every Workspace tool until the next restart (curia-deploy#181).
+#
+# The version and the --exclude-newer cutoff come from scripts/workspace-mcp.pin, the
+# one place core defines them. scripts/workspace-mcp.sh, which config/skills.yaml
+# launches, runs this install whenever it is present. The cutoff freezes the whole
+# dependency tree, not just workspace-mcp.
+#
+# Fixed paths, not $HOME: the build runs as root and the server as curia, so
+# UV_TOOL_DIR/UV_TOOL_BIN_DIR put the venv and its shim under /opt/uv, root-owned and
+# world-readable. The shim execs the venv's python by absolute path, so it needs
+# neither uv nor the network. UV_PYTHON_DOWNLOADS=never fails the build rather than
+# quietly fetching a CPython if the Debian python3 above ever goes missing.
+#
+# Then fail the build, not the boot:
+#   - `test -x`: uv can exit 0 without the shim the launcher looks for.
+#   - the imports: workspace-mcp's main.py catches ModuleNotFoundError per service,
+#     logs it and starts without that service's tools. The MCP handshake still
+#     succeeds, so the zero-tool alert (#1500) never fires. Import main plus the module
+#     of every service in the `--tools` allowlist in config/skills.yaml;
+#     tests/unit/config.workspace-mcp-pin.test.ts keeps this list in step. Importing
+#     main creates $HOME/.google_workspace_mcp/logs, hence the throwaway HOME.
+# Only the install is wrapped in pnpm-retry: retrying an assertion defeats it.
+COPY scripts/workspace-mcp.pin /tmp/workspace-mcp.pin
+RUN set -eu; \
+    . /tmp/workspace-mcp.pin; \
+    UV_TOOL_DIR=/opt/uv/tools UV_TOOL_BIN_DIR=/opt/uv/bin UV_PYTHON_DOWNLOADS=never \
+      pnpm-retry uv tool install --python /usr/bin/python3 --compile-bytecode \
+        --exclude-newer "$WORKSPACE_MCP_EXCLUDE_NEWER" "workspace-mcp==$WORKSPACE_MCP_VERSION"; \
+    test -x /opt/uv/bin/workspace-mcp; \
+    HOME=/tmp/workspace-mcp-smoke /opt/uv/tools/workspace-mcp/bin/python -c \
+      "import main, gdrive.drive_tools, gdocs.docs_tools, gsheets.sheets_tools"; \
+    rm -rf /tmp/workspace-mcp-smoke /tmp/workspace-mcp.pin /root/.cache/uv
 
 # Copy manifest and lockfile, then install production deps only
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile --prod
+# Copy the @curia/shared-types workspace package (source-only: package.json +
+# index.ts) so the workspace graph is internally consistent. The root package.json
+# declares `@curia/shared-types: "workspace:*"` as a prod dependency and
+# pnpm-workspace.yaml declares `packages: [apps/*, packages/*]`; the `pnpm add tsx`
+# below re-resolves the FULL workspace and aborts with ERR_PNPM_WORKSPACE_PKG_NOT_FOUND
+# if the member isn't on disk. (--frozen-lockfile tolerates a dangling link; `pnpm add`
+# does a strict re-resolution.) shared-types is imported type-only (erased at build), so
+# it isn't required at runtime, but shipping the member keeps the manifest honest.
+COPY --from=build /app/packages/shared-types ./packages/shared-types
 
 # tsx is needed at runtime: skill handlers are .ts files loaded via dynamic
 # import(), and they use ESM .js extension mapping (e.g., import from './foo.js'
 # resolving to foo.ts). Node's --experimental-strip-types doesn't handle this;
 # tsx does, and it's already used for dev (pnpm dev).
-RUN pnpm add tsx
+RUN pnpm-retry pnpm install --frozen-lockfile --prod
 
-# Remove corepack's cached pnpm tarballs. Node 24's bundled corepack pre-caches
-# pnpm@11.0.8 (the version shipped with Node 24) during `corepack enable`, even
-# though this project uses pnpm@11.7.0. pnpm@11.0.8 bundles tar@7.5.13 which is
-# vulnerable to CVE-2026-53655 (PAX size override / tar parser interpretation
-# differential). Upgrading packageManager to pnpm@11.7.0 is not sufficient on
-# its own because the old cached tarball remains on disk and Trivy flags it.
-# pnpm is not used at runtime (CMD calls tsx directly), so the cache is safe to
-# remove entirely. Both paths are removed: Node 24's corepack writes to
-# /root/.cache/node/corepack (confirmed by the Trivy alert path); the alternate
-# layout /root/.cache/corepack (used by older corepack versions) is removed too
-# so this stays correct across future base-image bumps.
-RUN rm -rf /root/.cache/node/corepack /root/.cache/corepack
+# Three flags are load-bearing (verified against pnpm 11.7.0, the pinned pkg mgr).
+# Since packages/shared-types made this a real workspace, this dir is now a workspace
+# ROOT and a bare `pnpm add tsx` fails a chain of guards:
+#   -w: without it, a `pnpm add` at a workspace root is rejected with
+#     ERR_PNPM_ADDING_TO_ROOT. tsx is a genuine root-level runtime dep, so the root is
+#     the correct target (the shared-types member copied above lets it re-resolve).
+#   --prod: the frozen install above ran with --prod, so node_modules/.modules.yaml
+#     records a prod-only include set; a bare `pnpm add` also wants devDependencies,
+#     which pnpm 11 rejects with ERR_PNPM_INCLUDED_DEPS_CONFLICT. --prod keeps the add
+#     prod-only so the include sets match.
+#   --save-prod: tsx is declared as a *devDependency* in package.json, so --prod alone
+#     would leave it there and never install it — no ./node_modules/.bin/tsx, which the
+#     CMD below invokes. --save-prod promotes tsx into `dependencies` so it installs.
+RUN pnpm-retry pnpm add -w --save-prod --prod tsx
+
+# Remove build-only artifacts that are unreachable at runtime (CMD invokes
+# ./node_modules/.bin/tsx directly; no install ever runs inside the container):
+#   - /root/.cache/node/corepack and /root/.cache/corepack — corepack's cached pnpm
+#     tarballs. Node 24's bundled corepack pre-caches pnpm@11.0.8 during `corepack
+#     enable` even though this project pins pnpm@11.7.0, and 11.0.8 bundles tar@7.5.13
+#     (CVE-2026-53655, PAX size override / parser interpretation differential). Both
+#     paths are removed: Node 24's corepack writes the first (confirmed by the original
+#     Trivy alert path), the second is the older corepack layout, kept so this stays
+#     correct across base-image bumps.
+#
+# -- Three things are deliberately KEPT. Do not "clean them up". (#1758) --
+#
+# curia-deploy's thin downstream image (deploy/compose/Dockerfile.curia) builds FROM
+# this one, switches to root, and runs `pnpm add` to layer in its own extensions. That
+# `pnpm add` forces a strict re-resolution of the ENTIRE workspace — devDependencies
+# included — and then verifies all ~1300 lockfile entries against pnpm's supply-chain
+# policies. All three are what let it do that from disk instead of from the network,
+# and survive the network it still needs:
+#
+#   - /root/.cache/pnpm — the registry METADATA cache. Without it the downstream build
+#     fetches a packument per lockfile entry. drizzle-orm's alone is 64 MB (a promptfoo
+#     dev transitive), which on a saturated link exceeds fetchTimeout; trustPolicy
+#     verification is fail-closed, so "could not be checked" becomes
+#     ERR_PNPM_TRUST_DOWNGRADE and the deploy dies on a package that has nothing wrong
+#     with it. Verification measured 15m 44s on the VPS versus ~18s in CI.
+#   - /root/.local/share/pnpm — the content-addressable store. node_modules entries are
+#     hardlinks into it; without it the downstream re-downloads tarballs it already has.
+#   - /usr/local/bin/pnpm-retry — the retry wrapper the two installs above used. #1699
+#     deleted it here as build-only tooling, on the reasoning that this stage was its
+#     last use. That is no longer true. The downstream `pnpm add` goes to the registry
+#     too, and it is the step that died in curia-deploy#220 on an UND_ERR_SOCKET abort —
+#     the unhandled-stream failure that no `fetchRetries` value can catch, because Node
+#     kills the process before pnpm classifies anything (see docker/pnpm-retry.sh).
+#     Keeping it lets the downstream image wrap that command instead of vendoring a
+#     second copy that would drift from the one tests/docker/test-pnpm-retry.sh covers.
+#     The cost is ~4KB of POSIX sh that nothing at runtime invokes; the removal was
+#     image hygiene, never a security control.
+#
+# The metadata cache is why code-scanning #271-#282 exist: its v11/metadata-full/*.jsonl
+# files embed each package's README, and Trivy's secret scanner reads @octokit/auth-
+# token's `createTokenAuth("ghp_…")` documentation snippet as a leaked credential. Those
+# are false positives over public README text sitting in a build cache, so the scanner
+# is scoped past this path in .github/workflows/trivy.yml rather than the cache being
+# deleted out from under the deploy. Deleting it is only safe once Dockerfile.curia
+# stops re-resolving the whole workspace (curia-deploy#220).
+#
+# Fail closed, in both directions. `rm -rf` exits 0 whether or not it removed anything,
+# so a future pnpm or base-image change that relocated any of these paths would silently
+# turn this into a no-op while the build stayed green. Executing tsx afterwards proves
+# the runtime entry point still resolves — the one property this cleanup must not break
+# — and mirrors the assertions around the npm/npx removal above.
+#
+# The `test -x` on pnpm-retry is the mirror image, and is the only thing holding the
+# downstream contract: without it, re-adding the wrapper to that `rm -rf` (an easy and
+# plausible cleanup, since it is build tooling by every local signal) still builds green
+# here and surfaces as `pnpm-retry: not found`, exit 127, in curia-deploy's image build
+# — a different repo, hours later. Fail it here instead, where the cause is on screen.
+RUN set -e; \
+    rm -rf /root/.cache/node/corepack /root/.cache/corepack; \
+    test -x /usr/local/bin/pnpm-retry; \
+    ./node_modules/.bin/tsx --version
 
 # Copy compiled output from build stage
 COPY --from=build /app/dist ./dist
 
 # Copy console static bundle — served by Fastify at runtime
 COPY --from=build /app/apps/console/dist ./apps/console/dist
+
+# Copy Ant Farm static bundle — served under /antfarm/
+COPY --from=build /app/apps/antfarm/dist ./apps/antfarm/dist
+
+# Copy licensed LimeZu art — served ONLY behind auth by /api/antfarm/assets/*
+# (never under /antfarm/; the dir sits outside the Vite public/ web root). LimeZu
+# granted redistribution, so the art now lives in-repo (apps/antfarm/assets-licensed/)
+# and ships in the open-core image. Without this the route 404s and the Phaser
+# scene falls back to procedural placeholders.
+COPY --from=build /app/apps/antfarm/assets-licensed ./apps/antfarm/assets-licensed
 
 # Copy runtime data files loaded at startup
 # Full src/ is needed because skill handlers import from src/ (e.g., bus/events.ts)

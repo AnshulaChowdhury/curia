@@ -4,6 +4,7 @@ import { Sidebar } from '../components/Sidebar.js';
 import { Topbar } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
+import { EmailAccountsSection } from '../components/EmailAccountsSection.js';
 
 // ── Types (mirror src/channels/credential-resolver.ts CredentialFieldStatus and
 //    src/registry/channel-registry-types.ts ChannelRegistryEntry) ──────────────
@@ -218,6 +219,9 @@ function ChannelDrawer({ entry, onClose, onChanged }: {
           {!locked && entry.credentialFields.length > 0 && (
             <div className="form-field">
               <label>Credentials</label>
+              <p className="settings-page-sub" style={{ margin: '0 0 4px' }}>
+                Saved credentials take effect on the next restart.
+              </p>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {entry.credentialFields.map(field => (
                   <CredentialRow
@@ -230,6 +234,25 @@ function ChannelDrawer({ entry, onClose, onChanged }: {
               </div>
             </div>
           )}
+
+          {/* Principal identity binding reminder (#1514) — credentials alone do not
+              bind Slack/Signal to the principal contact for outbound principal detection. */}
+          {(entry.name === 'slack' || entry.name === 'signal') && entry.state === 'enabled' && (
+            <div className="form-field">
+              <label>Principal identity</label>
+              <p className="settings-page-sub" style={{ margin: 0 }}>
+                After enabling {entry.name === 'slack' ? 'Slack' : 'Signal'}, open{' '}
+                <a href="/contacts">Contacts</a> → your principal and add your{' '}
+                {entry.name === 'slack' ? 'Slack user ID (U…)' : 'Signal phone number'}{' '}
+                as a channel identity. Without that binding, outbound messages to you on this
+                channel may be blocked by the content filter.
+              </p>
+            </div>
+          )}
+
+          {/* Email accounts sub-section — only for the email channel.
+              Lets the operator manage Nylas-backed mailboxes the agent uses. */}
+          {entry.name === 'email' && <EmailAccountsSection />}
 
           <div className="form-field">
             <label>Installed</label>

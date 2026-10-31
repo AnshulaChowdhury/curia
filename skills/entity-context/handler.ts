@@ -7,11 +7,105 @@
 // For automatic pre-enrichment before skill invocation, use the
 // entity_enrichment manifest declaration instead — that runs the same
 // assembler without an extra LLM round-trip.
+//
+// Four buckets come back and all are surfaced: entities that assembled,
+// `unresolved` IDs that matched nothing, `nodeless` contacts that exist but
+// cannot hold knowledge — either they never had a stored profile or theirs
+// was retired (#1694 / ADR-040, #1707) — and `failed` IDs whose lookup errored
+// (#1702). The handler owns all LLM-facing wording for `nodeless` and `failed`.
 
-import type { SkillHandler, SkillContext, SkillResult } from '../../src/skills/types.js';
+import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
+import type { AssembleManyFailedEntry, AssembleManyResult, NodelessCause } from '../../src/entity-context/assembler.js';
 
-export class EntityContextHandler implements SkillHandler {
-  async execute(ctx: SkillContext): Promise<SkillResult> {
+// Shown to the LLM for every contact that resolved but holds no KG node.
+//
+// The wording is load-bearing. An empty result reads as "nothing is known about this
+// contact", which invites the agent to fill the gap by asking or by storing what it
+// learns — neither of which can work, because there is no node for a fact to attach
+// to. It has to read as a capability gap instead.
+//
+// Kept free of issue numbers and internal schema vocabulary: this goes into a prompt
+// and may be paraphrased to the principal, so "stored profile" rather than "KG node".
+// Kept kind-neutral too — nodeless contacts include organizations, not just people
+// (ADR-040's arm A exists precisely because org contacts are a large share of them).
+const NODELESS_MISSING_REASON =
+  'This contact exists but has no stored profile, so it cannot hold facts, '
+  + 'relationships, or background context. Having no context here does not mean the '
+  + 'contact is unknown to us. Do not try to store facts about them; report the gap instead.';
+
+// Same capability-gap shape, but the contact *had* a profile that was retired
+// (dream-engine decay, or contact deletion under ADR-040). Must not read as
+// "never had a profile" — that would send the agent looking for a backfill that
+// already happened and then got archived (#1707).
+const NODELESS_ARCHIVED_REASON =
+  'This contact\'s stored profile was retired, so it cannot hold facts, '
+  + 'relationships, or background context. Having no context here does not mean the '
+  + 'contact is unknown to us. Do not try to store facts about them; report the gap instead.';
+
+function formatNodelessReason(cause: NodelessCause): string {
+  return cause === 'archived' ? NODELESS_ARCHIVED_REASON : NODELESS_MISSING_REASON;
+}
+
+const NOT_UNKNOWN_SUFFIX =
+  'This is not evidence the contact or entity is unknown.';
+
+function formatFailedReason(retryable: boolean): string {
+  if (retryable) {
+    return `Entity context lookup failed due to a transient error. Retry the lookup; ${NOT_UNKNOWN_SUFFIX}`;
+  }
+  return `Entity context lookup failed due to a system error. Do not retry; report the failure. ${NOT_UNKNOWN_SUFFIX}`;
+}
+
+function formatTotalFailureError(failed: AssembleManyFailedEntry[]): string {
+  const retryableCount = failed.filter(f => f.retryable).length;
+  const nonRetryableCount = failed.length - retryableCount;
+  if (retryableCount > 0 && nonRetryableCount > 0) {
+    return 'Entity context lookup failed for all requested IDs. Some failures may be transient (retry those lookups); others are system errors (do not retry those). '
+      + NOT_UNKNOWN_SUFFIX;
+  }
+  if (retryableCount > 0) {
+    return `Entity context lookup failed for all requested IDs due to transient errors. Retry; ${NOT_UNKNOWN_SUFFIX}`;
+  }
+  return `Entity context lookup failed for all requested IDs due to a system error. Do not retry; report the failure. ${NOT_UNKNOWN_SUFFIX}`;
+}
+
+function isTotalFailure(result: AssembleManyResult): boolean {
+  return (
+    result.entities.length === 0
+    && result.failed.length > 0
+    && result.unresolved.length === 0
+    && result.nodeless.length === 0
+  );
+}
+
+function buildSuccessData(result: AssembleManyResult): Record<string, unknown> {
+  return {
+    ...(result.nodeless.length > 0
+      ? {
+          nodeless: result.nodeless.map(n => ({
+            inputId: n.inputId,
+            contactId: n.contactId,
+            displayName: n.displayName,
+            cause: n.cause,
+            reason: formatNodelessReason(n.cause),
+          })),
+        }
+      : {}),
+    ...(result.failed.length > 0
+      ? {
+          failed: result.failed.map(f => ({
+            inputId: f.inputId,
+            reason: formatFailedReason(f.retryable),
+          })),
+        }
+      : {}),
+    unresolved: result.unresolved,
+    entities: result.entities,
+  };
+}
+
+export class EntityContextHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
     const assembler = ctx.entityContextAssembler;
     if (!assembler) {
       return { success: false, error: 'Entity context assembler not available — database not configured' };
@@ -45,16 +139,39 @@ export class EntityContextHandler implements SkillHandler {
       });
 
       ctx.log.info(
-        { resolvedCount: result.entities.length, unresolvedCount: result.unresolved.length },
+        {
+          resolvedCount: result.entities.length,
+          unresolvedCount: result.unresolved.length,
+          nodelessCount: result.nodeless.length,
+          failedCount: result.failed.length,
+        },
         'entity-context: assembled context',
       );
 
+      if (result.failed.length > 0) {
+        const retryableCount = result.failed.filter(f => f.retryable).length;
+        ctx.log.warn(
+          { failedCount: result.failed.length, retryableCount },
+          'entity-context: some lookups failed — see failed bucket in result',
+        );
+      }
+
+      // Total failure: every ID errored and no other bucket has entries. A
+      // success-shaped result with only a retry hint has nothing to stop the
+      // agent retrying into a hard-down DB (#1702 review).
+      if (isTotalFailure(result)) {
+        return { success: false, error: formatTotalFailureError(result.failed) };
+      }
+
+      // Key order is deliberate. The execution layer enforces an aggregate size cap by
+      // JSON.stringify-ing this object and head-slicing it (see skillOutputMaxLength),
+      // and JSON.stringify preserves insertion order. Emitting the small diagnostic
+      // buckets first means a truncated payload sacrifices bulk entity data rather
+      // than the warning that some contacts cannot hold knowledge at all — which,
+      // being absent from `unresolved` too, would otherwise vanish without trace.
       return {
         success: true,
-        data: {
-          entities: result.entities,
-          unresolved: result.unresolved,
-        },
+        data: buildSuccessData(result),
       };
     } catch (err) {
       // Log the full error server-side but don't expose DB internals (table names,

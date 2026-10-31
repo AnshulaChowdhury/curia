@@ -61,11 +61,16 @@ Three approaches were considered:
 **C. Dedicated outbound-context registry with a scoped capability surface.**
    A single `outbound_context` table records every outbound message Curia sends:
    conversation, channel, originating agent, content preview, expected-reply
-   hint, delegation hint, structured metadata, TTL. The dispatcher injects
-   active entries into the coordinator's prompt on every inbound. Skills get
-   a narrow `outboundContext` capability (register + release, pre-scoped to
-   the current conversation) so any skill — not just send skills — can claim
-   a reply thread.
+   hint, delegation hint, structured metadata, TTL, and (since #2261) the
+   contact IDs it was sent to. The dispatcher injects all active entries into
+   the coordinator's prompt on every **dispatcher-routed principal** inbound
+   (`liveTurn: true` — #1848 / #1598), and only the entries sent to the sender
+   on a verified contact's one-to-one inbound (#2261, see Consequences). Voice inbounds
+   never reach this path (`channelId === 'voice'` returns early); `VoiceRuntime`
+   applies the same `liveTurn` gate on its own injection path. Skills get a
+   narrow `outboundContext` capability (register + release, pre-scoped to the
+   current conversation) so any skill — not just send skills — can claim a
+   reply thread.
 
 ## Decision
 
@@ -97,12 +102,22 @@ Three approaches were considered:
    metadata supplements the auto-registered fields; auto-registered entries
    carry only the agent ID and content preview.
 
-5. **Two-tier TTL.** Auto-registered entries expire in `defaultExpiryHours`
-   (6h default). Entries with explicit `context_bridge` metadata expire in
-   `explicitExpiryHours` (24h default). Caller-specified `expires_in_hours`
-   in the JSON overrides both. The meeting-debrief agent uses 48h via
-   `debrief.contextBridgeTtlHours`. Config keys live under `contextBridge.*`
-   in `config/default.yaml`.
+5. **Two-tier, channel-aware TTL.** Auto-registered entries expire after the
+   channel's default window — `channelDefaultExpiryHours[channelId]` (email:
+   72h) falling back to `defaultExpiryHours` (6h). Entries with explicit
+   `context_bridge` metadata expire in `explicitExpiryHours` (24h default),
+   raised to the channel default when that is longer. Caller-specified
+   `expires_in_hours` in the JSON overrides both, in either direction. The
+   meeting-debrief agent uses 48h via `debrief.contextBridgeTtlHours`. Config
+   keys live under `contextBridge.*` in `config/default.yaml`.
+
+   The per-channel tier was added in #1816: a flat 6h default was plausible for
+   a Signal ping to the principal but expired before any realistic email
+   correspondent could reply, so next-business-day answers arrived as
+   unrecognised cold inbounds. TTL is keyed on channel, not recipient. When this
+   was decided the registration path had no recipient in scope; it records
+   recipients since #2261, but the channel is still the better proxy, since
+   email is asynchronous for the principal and third parties alike.
 
 6. **Periodic cleanup.** A scheduled job runs `cleanupExpired()` on a fixed
    cadence to delete released and expired rows. The dispatcher's read query
@@ -144,10 +159,98 @@ Three approaches were considered:
   the query fast even with high write throughput, but the table requires
   periodic cleanup — handled by the scheduled `cleanupExpired()` job.
 - Unconditional registration means every outbound message writes a row,
-  including one-shot sends that will never receive a reply. The 6-hour TTL
-  on auto-registered entries plus cleanup keeps storage bounded, but the
+  including one-shot sends that will never receive a reply. The per-channel
+  TTL on auto-registered entries plus cleanup keeps storage bounded, but the
   write amplification is real. Accepted because the alternative
   (conditional registration) is exactly what caused #609.
+- **The injection window is a global newest-N, not a conversation scope — but only on principal turns.**
+  `getActive(limit = 10)` surfaces the ten most recent active entries system-wide
+  (`ORDER BY created_at DESC`), and correlation is LLM-driven off that block.
+  Conversation scoping was considered for #1817 and rejected: proactive sends
+  register under the *invoking* conversation (bullpen thread id, scheduler run
+  id), while replies arrive on a different conversation (`signal:<sender>`,
+  `email:<threadId>`, `voice:<sessionId>`). Scoping to the inbound conversation
+  would hide the bridge's primary correlation cases. Holding email entries alive
+  for 72h instead of 6h still grows the active population without widening the
+  window that shows it, so a three-day-old email whose reply finally lands can
+  sit outside the newest ten — arriving as an unrecognised cold inbound, the
+  #1816 symptom at a different threshold. Ten outbounds over three days is an
+  ordinary week for this workload. The #1817 fix for the UUID/`entry_id`
+  confusion is labelling + pre-fetch shape validation, not conversation scope.
+  Separately, #1848 gates injection on `liveTurn` (principal inbound only) on
+  both the dispatcher and the voice path (#1598): the block is principal-audience
+  content and must not appear on third-party or unknown sender turns (including
+  `http`, whose caller-supplied `sender_id` never resolves as principal).
+  **Fix B (#2261):** the gate had a cost — a third party's reply arrived without
+  the entry it answered, so `delegation_hint` could not route it and the answer
+  could be dropped (2026-10-21: "Thur Nov 5" from a contact asked to pick a lunch
+  date got `NO_REPLY`). Entries now record the contact IDs they were sent to, and
+  a verified non-principal sender's turn gets a block of only the entries sent to
+  them. Every gate on that block decides who can see what, and each fails closed:
+  - **Who:** a verified, non-blocked contact.
+  - **Authenticated channel:** Signal, Slack, and email that passed SPF/DKIM/DMARC;
+    never SMS or voice, whose sender ids are spoofable.
+  - **One-to-one:** a Signal 1:1, a Slack DM, or an email with nobody else on To
+    or CC (Curia's email replies go to everyone on the thread). A group, channel or
+    multi-party thread would show one person's entries to others.
+  - **What:** what the sender received, the owning agent's id and `bind_reply`.
+    Curia's own notes (`expected reply`, hint text, the `context` JSON with task
+    ids and resume tokens) stay on the principal's block.
+  Entries sent to anyone else stay withheld, so the #1848 confidentiality property
+  holds. The dispatcher also records the recipient's message on those entries (the
+  first three and the latest three). Principal turns now list those messages on the
+  entry, JSON-encoded and labelled untrusted, as a message back rather than an
+  answer, because the dispatcher cannot tell which entry it answers. Task wakes list
+  them too; a wake an outside contact started lists only entries sent to that
+  contact and only that contact's own messages. Tools refuse an entry_id not sent to
+  the outside sender of the turn, and refuse bulk clears on such a turn. A contact
+  merge re-points the recipient ids. Rows written before migration 104 carry no
+  recipients and are never shown to a non-principal.
+- An unrecognised channel id in `contextBridge.channelDefaultExpiryHours` is
+  accepted and silently inert — registration uses pseudo-channel ids
+  (`internal`, `scheduler`, `bullpen`) that are not in the channel catalog, so
+  rejecting unknown keys would break legitimate tuning. The startup
+  `Outbound context TTL policy resolved` line prints the merged map so a typo
+  is visible next to the value it failed to override.
+- **`delegation_hint` is platform-owned, not model-written (#1972).**
+  It used to be whatever the model put in a send skill's `context_bridge`.
+  Production had nine spellings of "ceo-inbox", hints naming agents that do not
+  exist, and relays that dropped the hint, so a principal reply to a specialist's
+  follow-up reached the coordinator unowned. `ScopedOutboundContext.register` now
+  applies three rules in order (`src/dispatch/delegation-hint.ts`). An entry whose
+  metadata carries a `resume_token` belongs to the agent the token was minted for,
+  with hint `<agent> clarification pending`. A send made on a bullpen wake where a
+  specialist opened the thread and mentioned the sender is a relay, attributed to
+  that specialist (`agent_id` and hint). Any other hint keeps only its leading word
+  when that word is a registered specialist, and is otherwise dropped with a warning.
+  Leading word only, because `calendar`, `contacts` and `diagnostics` are English
+  words too and the coordinator treats any hint as a binding hand-off. Outside the
+  first two rules the model-written `agent_id` passes through; it is display-only.
+  Trade-off: a hint the platform cannot route is lost rather than shown to the
+  model, which is the point — it would be a misroute waiting to happen.
+- **A hinted entry is released by the platform, not judged closed by the coordinator (#1972).**
+  The coordinator's "sweep on close" prompt rule asked it to read a specialist's prose
+  and decide whether the exchange had ended; on the production model it released
+  entries after interim results. Now the coordinator links the entry to the
+  delegation that routes its reply (`delegate`'s `outbound_entry_id`, or an owned
+  entry's id quoted in the brief), and `delegate` settles it from the result shape
+  (`skills/delegate/outbound-entry.ts`). The entry is kept only while the reply can
+  still be handled by routing it again: no specialist run started (in-flight
+  refusal, guard block, a brief rejected before dispatch) or the run failed
+  retryably. Every other outcome releases it — an answer, a clarification request
+  (the follow-up is relayed as a new entry carrying the new `resume_token`), a
+  paused long task, a decline, a non-retryable failure, and a wait timeout (the
+  specialist has the reply and late delivery carries its answer). A resume whose
+  token is unusable also releases the clarification entry, which would otherwise
+  route every later reply into the same dead resume. The specialist can hold a
+  release with `context-bridge-keep-open`, which stamps `metadata.exchange_open`
+  with its delegated task id; the release is one UPDATE that skips an entry stamped
+  by the same delegation. Task-wake bindings are never linked: the coordinator
+  closes those with `context-bridge-release` and `reply`.
+  `context-bridge-release` refuses an entry owned by another registered specialist
+  (task-wake bindings excepted), so the two paths cannot disagree. An entry whose
+  hint names no registered specialist — such as a free-text hint written before
+  this change — counts as unowned.
 - Metadata is JSONB capped at 16 KB. Oversize metadata is dropped at
   serialization time (text fields like `expected_reply` and `delegation_hint`
   are truncated to 500 chars with a marker). This protects against runaway

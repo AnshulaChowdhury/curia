@@ -1,0 +1,891 @@
+{
+  "_note": "Written by tests/scenarios/cli.ts after each case. unstubbed is the MAX over that measurement's runs: the worst run is the one that reveals a hole in the stub table. Checked by tests/unit/scenarios/cases.test.ts.",
+  "cases": {
+    "acquaintance asks for networking time": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T21:22:49.103Z"
+    },
+    "booking link on a cc thread books through it": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T21:35:04.828Z"
+    },
+    "bullpen mention stays on thread": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-13T23:51:44.517Z"
+    },
+    "bullpen send request": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-13T23:51:44.517Z"
+    },
+    "calendar answers a peer request without holding time": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-30T02:32:56.918Z"
+    },
+    "calendar consult confirms a proposed slot without a hold": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-30T02:28:59.349Z"
+    },
+    "calendar consult falls back to free time with holds disabled": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "calendar day brief reads the registered calendar": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "calendar day brief reports a failed read": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "calendar delegate failure": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-10T23:42:52.184Z"
+    },
+    "calendar flags an unregistered calendar": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "calendar invite consult accepts a stakeholder invite": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "calendar invite consult links and declines a sales invite": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "calendar nightly holds sweep does nothing else": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "calendar returns a scheduling email as a draft": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "calendar rule add stops when the rules cannot be read": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-30T02:29:29.173Z"
+    },
+    "calendar rule edit changes one section": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-30T02:29:54.689Z"
+    },
+    "calendar weekly meeting is one recurring event": {
+      "unstubbed": null,
+      "reason": "New in #2385; not yet run (paid suite). The first run records coverage."
+    },
+    "cc coffee follows standing rule (both)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-30T02:27:26.646Z"
+    },
+    "cc coffee follows standing rule (prefs)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T21:24:55.420Z"
+    },
+    "cc coffee follows standing rule (rules)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-30T02:18:37.440Z"
+    },
+    "cc coffee in a week or two": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T21:22:49.103Z"
+    },
+    "cc drinks follows standing rule (both)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-30T02:24:12.452Z"
+    },
+    "cc drinks follows standing rule (prefs)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T21:24:55.420Z"
+    },
+    "cc drinks follows standing rule (rules)": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-30T02:14:19.325Z"
+    },
+    "cc move things around asks first at approval band": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T21:15:23.461Z"
+    },
+    "cc move things around to make room": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T22:04:59.476Z"
+    },
+    "cold outreach creates a contact": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "colleague asks for time on a sensitive matter": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T21:22:49.103Z"
+    },
+    "contact answers Curia's question": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-23T21:08:25.728Z"
+    },
+    "contact answers one of two questions": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-23T21:12:14.617Z"
+    },
+    "contact writes without answering": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-23T21:12:59.680Z"
+    },
+    "contacts ambiguous name with a wrong role": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "contacts briefing before a meeting": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "contacts conflicting email is flagged": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "contacts dedup excluded closes the task": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "contacts dedup review previews without merging": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T21:29:30.378Z"
+    },
+    "contacts delegate failure": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-10T23:42:52.184Z"
+    },
+    "contacts grant answer approves and closes the task": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T21:30:58.417Z"
+    },
+    "contacts tier change to trusted": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "contacts unknown name is created": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "contacts weekly dedup scan reports counts": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "contacts weekly grant scan reports and files nothing itself": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "debrief detection schedules external meetings only": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "debrief preference is stored in memory": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "debrief reply drafts follow-ups and closes the debrief": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "debrief wake at expiry cancels without nagging": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T17:10:07.163Z"
+    },
+    "debrief wake delivers the prompt": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "debrief wake on a cancelled meeting stops": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "debrief wake sends one reminder": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T17:11:59.366Z"
+    },
+    "debrief wake with a failed guard write sets no wake": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "delegated draft not reported sent": {
+      "unstubbed": 0,
+      "runs": 9,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-09T01:03:19.474Z"
+    },
+    "direct email reply as text": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "email me after specialist relay": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-23T15:23:00.937Z"
+    },
+    "external reply first person": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "forward with no note schedules the meeting": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T21:22:49.103Z"
+    },
+    "forwarded google booking page books through it": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-21T21:45:02.966Z"
+    },
+    "google doc bare id read": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "google doc link read": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "google file filing after delegation": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-12T21:15:56.984Z"
+    },
+    "google file share named": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-09T12:14:59.910Z"
+    },
+    "inbox branch A no_slots offers nearest slots outside the window": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox branch A ok drafts held slots with stored link": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox cold compose addresses the contact by id": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox consult timeout finds a late consult reply": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox consult timeout writes the fallback draft": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox delegated rules request runs no triage": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-30T02:27:46.598Z"
+    },
+    "inbox delegated summary reads and ranks the unread mail": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox drain wake completes the drain task when empty": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox drain wake triages and re-arms the drain task": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox fixes a draft in place instead of recreating it": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox makes no promise it cannot back with a task": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox peer request answered on the thread": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox reports a failed drafts read as inconclusive": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox scheduling email parks behind a calendar consult": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox sent-observe job runs only sent-observe": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "inbox triage settles each message's end state": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T16:53:34.402Z"
+    },
+    "mid-turn correction switches the sign-in channel": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-26T15:59:35.644Z"
+    },
+    "no google file chat": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:24:30.033Z"
+    },
+    "no google file scheduled job": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "no tool booking takes a route": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-17T02:15:48.877Z"
+    },
+    "no-reply automated notification": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "no-reply calendar decline": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "non-principal note for principal": {
+      "unstubbed": 0,
+      "runs": 10,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-17T04:08:14.379Z"
+    },
+    "paused delegate no redelegate": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "pii forwarded authority claim for sin": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-27T23:58:57.132Z"
+    },
+    "pii forwarded request book it": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-27T23:58:57.132Z"
+    },
+    "pii incident replay web form reply": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-27T23:58:57.132Z"
+    },
+    "pii known contact ask then an unrelated yes": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-29T03:49:34.280Z"
+    },
+    "pii known contact ask then another address": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-29T03:47:10.270Z"
+    },
+    "pii known contact ask then no": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-29T03:42:17.284Z"
+    },
+    "pii known contact ask then yes": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-29T03:40:24.066Z"
+    },
+    "pii known contact ask yes on the approval thread": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-29T03:44:28.467Z"
+    },
+    "pii linked reply callback number at 74": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-28T02:51:15.503Z"
+    },
+    "pii linked reply callback number at 84": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-27T23:58:57.132Z"
+    },
+    "pii principal directive health card": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-27T23:58:57.132Z"
+    },
+    "pii quoted sin never reaches a newcomer": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-27T23:58:57.132Z"
+    },
+    "pii stranger asks to confirm sin": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-27T23:58:57.132Z"
+    },
+    "pii trusted directive sin at 74": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-28T03:01:16.803Z"
+    },
+    "pii trusted directive sin at 84": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-28T01:56:23.061Z"
+    },
+    "pii unsubscribe reply keeps the phone out": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-27T23:58:57.132Z"
+    },
+    "pii weak linked reply asks at 84": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-28T00:58:18.894Z"
+    },
+    "principal answers dedup task routes to contacts": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "principal answers grant task routes to contacts": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "principal backlog surfaced": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T20:17:18.967Z"
+    },
+    "principal pronouns unset email": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-25T02:34:29.474Z"
+    },
+    "principal reply no internals": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "pronoun your calendar": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "real delegation calendar borrow": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-09T18:29:18.221Z"
+    },
+    "real delegation calendar read fails": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-09T18:29:18.221Z"
+    },
+    "real delegation clarification resume": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-09T18:29:18.221Z"
+    },
+    "real delegation email identifiers reach specialist": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-09T18:29:18.221Z"
+    },
+    "real delegation one message per item": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-09T18:29:18.221Z"
+    },
+    "real delegation principal request over email": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-09T18:29:18.221Z"
+    },
+    "real delegation transfer ownership": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-09T18:29:18.221Z"
+    },
+    "relayed follow-up routes to owner": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "reply cc principal by alias": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T19:52:58.881Z"
+    },
+    "reply-shaped non-principal": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "reply-shaped principal no context": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "route debrief preference": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-12T16:05:24.579Z"
+    },
+    "route diagnostics question": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-12T16:03:54.159Z"
+    },
+    "route setup help": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-12T16:03:54.159Z"
+    },
+    "scheduled job tells principal": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-10T14:40:12.805Z"
+    },
+    "scheduled maintenance sends nothing": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-10T14:11:23.658Z"
+    },
+    "scheduler additive create": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "scheduler ambiguous asks": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "scheduler edit in place": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:24:07.450Z"
+    },
+    "send to contact by id": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "send to principal by alias": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "signal to contact by id": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "signin code never leaks": {
+      "unstubbed": 0,
+      "runs": 3,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:40:59.805Z"
+    },
+    "signin email code from inbox": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:39:20.723Z"
+    },
+    "signin session gone": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:41:52.048Z"
+    },
+    "signin sms code over signal": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-20T13:37:35.219Z"
+    },
+    "style debrief prompt": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style email reply third party": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style inbox draft keeps principal voice": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style morning brief email": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style scheduled recap signal": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style scheduled request email": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "style signal reply brief": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-18T14:56:38.044Z"
+    },
+    "sweep-on-close closing result": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "sweep-on-close interim result": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "task wake resumes from progress": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-14T13:52:36.604Z"
+    },
+    "transfer-ownership sounds good": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "transfer-ownership trivial yes": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "transfer-ownership yes thursday": {
+      "unstubbed": 0,
+      "runs": 5,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-08T17:20:23.923Z"
+    },
+    "wake keeps one contact's reason from another": {
+      "unstubbed": 0,
+      "runs": 2,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "recordedAt": "2026-10-24T14:11:23.608Z"
+    }
+  }
+}

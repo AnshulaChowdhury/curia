@@ -4,12 +4,12 @@
 
 import type { ActionRisk } from '../skills/types.js';
 
-export type RegistryKind = 'skill' | 'agent';
+export type RegistryKind = 'tool' | 'agent' | 'skill';
 
 /** Operational state of a registry item. Derived, not stored. */
 export type DerivedState = 'uninstalled' | 'installed' | 'enabled' | 'ghost';
 
-/** A row in skill_registry / agent_registry, mapped to camelCase. */
+/** A row in tool_registry / agent_registry, mapped to camelCase. */
 export interface RegistryRow {
   name: string;
   enabled: boolean;
@@ -30,14 +30,28 @@ export interface ManifestMetadata {
   actionRisk?: ActionRisk;
   sensitivity?: string;
   capabilities?: string[];
+  /** From `optional_capabilities` (#2024). Injected when the deployment has the
+   *  service; a missing one never refuses the call or blocks enrolment. */
+  optionalCapabilities?: string[];
   /** Vault keys the skill's install block declares it needs (install.requires_secrets).
    *  Surfaced to the registry UI and consulted by the install/enable secrets gate. */
   requiresSecrets?: string[];
+  /** Member tool names for a SKILL.md bundle. Sourced from on-disk discovery, NOT
+   *  SkillRegistry — a bundle that is disabled is never registered, so SkillRegistry
+   *  cannot report its members. Skills only; undefined for tools and agents. */
+  tools?: string[];
+  /** Names of agents whose `pinned_skills` reference this bundle. Static, read from
+   *  agent manifests on disk. The console cross-references each agent's own enabled
+   *  state (via /api/registry/agents) to decide which combinations are broken. */
+  pinnedBy?: string[];
   // agents
   role?: string;
   modelTier?: string;
-  /** Isolated memory scopes the agent reads/writes (agents/<name>.yaml → memory.scopes). */
-  memoryScopes?: string[];
+  /** Raw `pinned_skills` for an agent — a mix of bundle names and first-class tool
+   *  pins (ADR-032). Distinct from `tools`, which means bundle membership on a skill.
+   *  The console uses this to warn before a bundle disable strips a tool that some
+   *  other agent pins directly. Agents only. */
+  pinnedTools?: string[];
 }
 
 /** One on-disk item found during discovery. `metadata` is null when the manifest
@@ -86,10 +100,31 @@ export interface IRegistryRepo {
   getRow(name: string): Promise<RegistryRow | null>;
   /** Insert enabled=false if absent; no-op + return existing row if present. */
   install(name: string, actor: string): Promise<RegistryRow>;
+  /** Insert enabled=true if absent; no-op if present. Returns the new row, or null on conflict. */
+  installAndEnable(name: string, actor: string): Promise<RegistryRow | null>;
   /** Set enabled=true (+ enabled_at/by). Throws if no row exists. */
   enable(name: string, actor: string): Promise<RegistryRow>;
   /** Set enabled=false (+ clear enabled_at/by). Throws if no row exists. */
   disable(name: string, actor: string): Promise<RegistryRow>;
-  /** Delete the row. No error if absent. */
-  uninstall(name: string): Promise<void>;
+  /** Delete the row. No error if absent — the caller (RegistryService.uninstall)
+   *  decides whether a no-op delete is a guard rejection. Returns whether a row was
+   *  actually deleted so a route/UI action can't report success after deleting
+   *  nothing (finding #2). */
+  uninstall(name: string): Promise<boolean>;
+  /** Delete the row only while it is still disabled, in a single statement. Returns false
+   *  when nothing was deleted — either no row exists, or it is enabled.
+   *
+   *  Exists so RegistryService.uninstall's "refuse while enabled" guard cannot be raced: a
+   *  read-then-delete leaves a window in which a concurrent enable commits its bundle+member
+   *  cascade, after which the DELETE would strip the owning bundle row and strand its member
+   *  tools enabled. The predicate moves that check into the same statement as the delete. */
+  uninstallIfDisabled(name: string): Promise<boolean>;
+}
+
+/** Cross-table bundle operations. Separate from IRegistryRepo, which is deliberately
+ *  one-instance-per-table; enabling a bundle must write skill_registry and every
+ *  member's tool_registry row in a single transaction (#1724). */
+export interface IBundleCascadeRepo {
+  enableBundle(bundle: string, tools: string[], actor: string): Promise<void>;
+  disableBundle(bundle: string, tools: string[], actor: string): Promise<void>;
 }

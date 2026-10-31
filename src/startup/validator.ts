@@ -1,7 +1,7 @@
 // src/startup/validator.ts
 //
 // Centralized startup validation — runs before any services are initialized.
-// Validates config/default.yaml, all agents/*.yaml, and all skills/*/skill.json
+// Validates config/default.yaml, all agents/*.yaml, and all skills/*/tool.json
 // against JSON Schema using Ajv. Any failure throws with a descriptive message
 // and causes process.exit(1) in the bootstrap orchestrator (src/index.ts).
 //
@@ -13,8 +13,16 @@ import * as path from 'node:path';
 // Under ESM (nodenext), the named import `{ Ajv }` is the constructor; the default
 // import gives a non-constructable value in TypeScript 6 strict mode.
 import { Ajv, type ErrorObject } from 'ajv';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import type { Logger } from '../logger.js';
+
+// js-yaml v5 throws on empty or comment-only input (no actual YAML document) instead
+// of returning undefined. This helper restores the v4 contract: a file with no
+// non-comment, non-whitespace content is treated as null (= no document = skip).
+function loadYamlNullable(content: string): unknown {
+  const hasContent = content.split('\n').some(l => { const t = l.trim(); return t !== '' && !t.startsWith('#'); });
+  return hasContent ? yaml.load(content) : null;
+}
 
 // loadSchema takes the schemas dir as a parameter rather than computing it from
 // `import.meta.dirname`. The tsup bundle collapses every source file into a single
@@ -57,7 +65,7 @@ function formatErrors(errors: ErrorObject[]): string {
  *   1. config/default.yaml (or configFileName override)
  *   2. config/skills.yaml (absent file is OK — no MCP servers configured)
  *   3. all *.yaml and *.yml files in agentsDir
- *   4. all skill.json files in skillsDir (one per skill subdirectory)
+ *   4. all tool.json files in skillsDir (one per skill subdirectory)
  */
 export async function runStartupValidation(opts: {
   configDir: string;
@@ -78,12 +86,13 @@ export async function runStartupValidation(opts: {
   const validateConfig = ajv.compile(loadSchema(schemasDir, 'default-config.schema.json'));
   const validateSkillsConfig = ajv.compile(loadSchema(schemasDir, 'skills-config.json'));
   const validateAgent = ajv.compile(loadSchema(schemasDir, 'agent-config.schema.json'));
-  const validateSkill = ajv.compile(loadSchema(schemasDir, 'skill-manifest.schema.json'));
+  const validateSkill = ajv.compile(loadSchema(schemasDir, 'tool-manifest.schema.json'));
 
   // 1. Validate config/default.yaml (absent file is OK — all fields are optional)
   const configPath = path.join(configDir, configFileName);
   if (fs.existsSync(configPath)) {
-    const raw = yaml.load(fs.readFileSync(configPath, 'utf-8'));
+    const content = fs.readFileSync(configPath, 'utf-8');
+    const raw = loadYamlNullable(content);
     // null/empty YAML is valid (same as no config)
     if (raw != null) {
       if (!validateConfig(raw)) {
@@ -97,7 +106,8 @@ export async function runStartupValidation(opts: {
   // 2. Validate config/skills.yaml (absent file is OK — no MCP servers configured)
   const skillsConfigPath = path.join(configDir, 'skills.yaml');
   if (fs.existsSync(skillsConfigPath)) {
-    const raw = yaml.load(fs.readFileSync(skillsConfigPath, 'utf-8'));
+    const content = fs.readFileSync(skillsConfigPath, 'utf-8');
+    const raw = loadYamlNullable(content);
     if (raw != null) {
       if (!validateSkillsConfig(raw)) {
         throw new Error(
@@ -115,7 +125,8 @@ export async function runStartupValidation(opts: {
 
     for (const file of agentFiles) {
       const filePath = path.join(agentsDir, file);
-      const raw = yaml.load(fs.readFileSync(filePath, 'utf-8'));
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const raw = loadYamlNullable(content);
       if (raw == null) {
         throw new Error(`Startup validation failed: agent config file is empty: ${filePath}`);
       }
@@ -127,41 +138,51 @@ export async function runStartupValidation(opts: {
     }
   }
 
-  // 4. Validate all skills/*/skill.json (skipped when skillsDir is omitted)
+  // 4. Validate tool.json manifests under skillsDir (skipped when skillsDir is omitted)
   //
-  // Supports two layouts:
-  //   a) skillsDir is a parent containing multiple skill subdirectories (production):
-  //        skills/web-search/skill.json, skills/email-send/skill.json, ...
-  //   b) skillsDir is a single skill directory directly containing skill.json (tests):
-  //        skills/valid-skill/skill.json — tests pass path.join(F, 'skills/valid-skill')
+  // Supports three layouts:
+  //   a) skillsDir is a parent containing flat tools and/or skill bundles (production):
+  //        skills/web/tools/web-search/tool.json
+  //        skills/email/tools/email-send/tool.json
+  //   b) skillsDir is a single skill directory directly containing tool.json (tests):
+  //        skills/valid-skill/tool.json — tests pass path.join(F, 'skills/valid-skill')
   //
-  // In case (b), the directory is checked first for a direct skill.json, then
+  // In case (b), the directory is checked first for a direct tool.json, then
   // subdirectories are scanned as in case (a).
   if (skillsDir && fs.existsSync(skillsDir)) {
-    // Case (b): direct skill.json in skillsDir itself
-    const directManifest = path.join(skillsDir, 'skill.json');
-    if (fs.existsSync(directManifest)) {
-      const raw = JSON.parse(fs.readFileSync(directManifest, 'utf-8')) as unknown;
+    const validateManifestFile = (manifestPath: string) => {
+      const raw = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as unknown;
       if (!validateSkill(raw)) {
         throw new Error(
-          `Startup validation failed for ${directManifest}:\n  - ${formatErrors(validateSkill.errors ?? [])}`,
+          `Startup validation failed for ${manifestPath}:\n  - ${formatErrors(validateSkill.errors ?? [])}`,
         );
       }
+    };
+
+    // Case (b): direct tool.json in skillsDir itself
+    const directManifest = path.join(skillsDir, 'tool.json');
+    if (fs.existsSync(directManifest)) {
+      validateManifestFile(directManifest);
     } else {
-      // Case (a): parent directory — iterate subdirectories
+      // Case (a): parent directory — flat tools + nested skills/<bundle>/tools/<tool>/
       const skillEntries = fs
         .readdirSync(skillsDir, { withFileTypes: true })
         .filter(e => e.isDirectory());
 
       for (const entry of skillEntries) {
-        const manifestPath = path.join(skillsDir, entry.name, 'skill.json');
-        if (!fs.existsSync(manifestPath)) continue;
+        const flatManifest = path.join(skillsDir, entry.name, 'tool.json');
+        if (fs.existsSync(flatManifest)) {
+          validateManifestFile(flatManifest);
+        }
 
-        const raw = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as unknown;
-        if (!validateSkill(raw)) {
-          throw new Error(
-            `Startup validation failed for ${manifestPath}:\n  - ${formatErrors(validateSkill.errors ?? [])}`,
-          );
+        const nestedToolsDir = path.join(skillsDir, entry.name, 'tools');
+        if (!fs.existsSync(nestedToolsDir)) continue;
+        for (const toolEntry of fs.readdirSync(nestedToolsDir, { withFileTypes: true })) {
+          if (!toolEntry.isDirectory()) continue;
+          const nestedManifest = path.join(nestedToolsDir, toolEntry.name, 'tool.json');
+          if (fs.existsSync(nestedManifest)) {
+            validateManifestFile(nestedManifest);
+          }
         }
       }
     }

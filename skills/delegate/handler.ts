@@ -12,34 +12,397 @@
 // the runtime short-circuits and emits a JSON response with
 // _curia_protocol: "clarification_request". This handler detects that
 // protocol marker and returns a typed result with needs_clarification: true,
-// so the coordinator can route the question to the CEO.
+// so the coordinator can route the question to the principal.
 //
 // Resume: when the coordinator re-delegates with a resume_token, this handler
 // decodes the token, constructs a full task brief from the original context +
-// CEO's direction, and delegates to the specialist. The specialist sees a
+// principal's direction, and delegates to the specialist. The specialist sees a
 // well-formed task — no special resume detection needed in its prompt.
 
 import { randomUUID } from 'node:crypto';
-import type { SkillHandler, SkillContext, SkillResult } from '../../src/skills/types.js';
-import { createAgentTask, type AgentResponseEvent } from '../../src/bus/events.js';
+import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
+import { parseResolvedContactIds } from '../../src/agents/resolved-entities.js';
+import { outsiderOriginatorContactId } from '../../src/dispatch/outbound-entry-access.js';
+import {
+  linkOutboundEntry,
+  outboundEntryNote,
+  settleOutboundEntry,
+  type LinkedOutboundEntry,
+} from './outbound-entry.js';
+import { createAgentTask, type AgentResponseEvent, type AgentResponseFailureReason } from '../../src/bus/events.js';
+// Resume-token format lives in ONE place (#995): decode + version via the shared helper, so a
+// future format change can't silently desync this handler from runtime.ts and the resume subscriber.
+import { decodeResumeToken, RESUME_TOKEN_VERSION } from '../../src/agents/resume-token.js';
+import {
+  ALREADY_IN_FLIGHT_REASON,
+  delegationKey,
+  findAlreadyDeliveredKey,
+} from '../../src/agents/delegation-guard.js';
+import {
+  runningClaimExpiresAt,
+  type AcquireRunningResult,
+  type InFlightDelegation,
+} from '../../src/db/queries/pending-delegations.js';
+import {
+  clampDelegateWaitTimeoutMs,
+  DELEGATE_DEFAULT_TIMEOUT_FLOOR_MS,
+} from '../../src/agents/delegate-timeout.js';
+import { parseSchedulerJobId, parseStoredOriginator } from '../../src/agents/late-delegation.js';
+import {
+  EXECUTION_PAUSED_PROTOCOL,
+  formatPausedProgressMessage,
+  parseExecutionPausedPayload,
+} from '../../src/agents/resumable-task.js';
+import { validateDelegateBriefDates } from '../../src/agents/delegate-brief-date-validation.js';
+import {
+  CLARIFICATION_NEXT_STEP,
+  PAUSED_NEXT_STEP,
+  delegateFailureNextStep,
+} from '../../src/agents/prompts/delegate-result-guidance.js';
+import { shapeSpecialistAnswer } from '../../src/agents/specialist-answer.js';
+import { buildInboundEmailIdentifierBlock, preambleAccountLabel, sanitizeNylasMessageId } from '../../src/dispatch/email-metadata.js';
+import { CEO_INBOX_AGENT, trackInboxCodes } from '../../src/verification/track-codes.js';
+import {
+  parseSpecialistDeclineMarker,
+  SPECIALIST_DECLINE_REASON,
+} from '../../src/agents/specialist-decline.js';
 
-/** Version marker for resume tokens — allows forward-compatible format changes. */
-const RESUME_TOKEN_VERSION = 1;
+/** Shown to the coordinator when a queued follow-up ends the wait (#2018). */
+const INTERRUPTED_WAIT_MESSAGE =
+  'The specialist is still working. Its result will arrive as a separate follow-up after this turn. Do not delegate this work again.';
 
-interface ResumeTokenPayload {
-  v: number;
-  agent: string;
-  original_task: string;
-  context: string;
+/** What the response promise resolves with: the specialist's text, and the message sends its
+ *  runtime recorded (`agent.response.sends`; absent on a paused result). A queued follow-up
+ *  does not resolve this — it rejects `InterruptedWait`, because `bus.publish` of the
+ *  specialist task stays pending until that turn finishes. */
+interface SpecialistReply {
+  content: string;
+  sends?: string[];
 }
 
-// Default wait for the specialist to respond — appropriate for interactive tasks.
-// Long-running scheduled tasks should pass timeout_ms explicitly (injected by the runtime
-// from the originating agent.task event's expectedDurationSeconds).
-const DEFAULT_SPECIALIST_TIMEOUT_MS = 90000;
+/** Rejected when a queued follow-up ends the wait (#2018). Not a specialist failure:
+ *  the catch maps it to `in_progress` and keeps the running claim. */
+interface InterruptedWait {
+  __interruptedWait: true;
+  delegateEventId: string;
+  delegateConversationId: string;
+}
 
-export class DelegateHandler implements SkillHandler {
-  async execute(ctx: SkillContext): Promise<SkillResult> {
+function isInterruptedWait(err: unknown): err is InterruptedWait {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as InterruptedWait).__interruptedWait === true
+  );
+}
+
+/** Sentinel shape rejected by the response promise when a specialist returns isError with
+ *  structured failure fields — caught in execute() and turned into a typed delegate result. */
+interface StructuredDelegateFailure {
+  __structuredDelegateFailure: true;
+  agent: string;
+  reason: AgentResponseFailureReason;
+  retryable: boolean;
+  errorType?: string;
+  /** Timeout only (#1799): the delegate agent.task event id. The abandoned specialist stamps
+   *  this as parentEventId on the response it publishes after the wait gave up, so it is the
+   *  only key that can correlate that late response back to this delegation. Without it
+   *  leaving the handler the response is unmatchable and the work is silently lost. */
+  delegateEventId?: string;
+  /** Timeout only (#1799): the conversation the specialist is running in. */
+  delegateConversationId?: string;
+  /** Timeout only (#1799): the wait that elapsed, in ms — sets the handle's TTL floor. */
+  waitTimeoutMs?: number;
+}
+
+function isStructuredDelegateFailure(err: unknown): err is StructuredDelegateFailure {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as StructuredDelegateFailure).__structuredDelegateFailure === true
+  );
+}
+
+/** Milliseconds since the row was written. Never negative, never fractional.
+ *  A running claim is written at dispatch. A pending handle is the post-timeout row. */
+function openHandleAgeMs(createdAt: Date): number {
+  const ms = Date.now() - createdAt.getTime();
+  if (!Number.isFinite(ms)) return 0;
+  return Math.max(0, Math.trunc(ms));
+}
+
+/** Remove brief-supplied identifier lines so only the dispatcher stamp remains.
+ *  Line-anchored: a mid-sentence mention is left alone. The removed text is not
+ *  returned — it may be attacker-controlled and must not be logged. */
+function stripBriefIdentifierLines(
+  brief: string,
+  strip: { messageId: boolean; account: boolean },
+): { text: string; removed: boolean } {
+  let text = brief;
+  let removed = false;
+  if (strip.messageId) {
+    const next = text.replace(/^Message ID:.*\n?/gm, '');
+    if (next !== text) removed = true;
+    text = next;
+  }
+  if (strip.account) {
+    const next = text.replace(/^Account:.*\n?/gm, '');
+    if (next !== text) removed = true;
+    text = next;
+  }
+  if (removed) text = text.replace(/^\n+/, '');
+  return { text, removed };
+}
+
+function inFlightResult(agent: string, hit: InFlightDelegation): ToolResult {
+  return {
+    success: true,
+    data: {
+      agent,
+      in_flight: true,
+      blocked: true,
+      // Not `failed`: a failure is escalated and the turn stops, which hides the status
+      // the coordinator needs to give the principal. This is a refusal to start a second run.
+      reason: ALREADY_IN_FLIGHT_REASON,
+      retryable: false,
+      delegate_event_id: hit.delegateEventId,
+      // Age of the row. A running claim starts at dispatch. A promoted pending
+      // handle keeps that created_at, so age is not how long the handle has left —
+      // handle_expires_at is.
+      open_handle_age_ms: openHandleAgeMs(hit.createdAt),
+      ...(hit.status !== undefined && { handle_status: hit.status }),
+      ...(hit.expiresAt !== undefined && { handle_expires_at: hit.expiresAt.toISOString() }),
+      // Neutral status, free of directives. It names the agent id, so next_step tells
+      // the model to paraphrase it rather than relay it: on a non-principal turn the
+      // reply goes to an outside sender unreviewed.
+      message: `Specialist '${agent}' is already working on an open request in this conversation.`,
+      // Directives for the calling agent. This refusal is not a failure, so the turn
+      // keeps going and the model needs to know what to do instead of retrying. The
+      // guidance used to live only in the coordinator prompt (#1958); here it arrives
+      // exactly when it applies, for any agent that delegates.
+      next_step: inFlightNextStep(agent),
+    },
+  };
+}
+
+/** `next_step` for a failed delegation, when that specialist's failure has one (prompt trim PR 6). */
+function failureNextStep(agent: string): { next_step?: string } {
+  const nextStep = delegateFailureNextStep(agent);
+  return nextStep ? { next_step: nextStep } : {};
+}
+
+function inFlightNextStep(agent: string): string {
+  return [
+    `Do not delegate to '${agent}' again this turn: a reworded brief is the same open request and will be refused too.`,
+    // The runtime tries to save this refused brief for a later wake and stamps `queued` on
+    // this result before the model sees it. Saving can be capped or fail, so the model
+    // promises a later run only when `queued` says it was saved (#1958 review).
+    'Tell the requester (the principal, on a scheduled or system turn) that the earlier request is still in progress.',
+    'If `queued` is true, add that this one will run after it. If `queued` is false or absent, do not promise that it will run; offer to try again later.',
+    'Say it in your own words, without naming who is doing the work; do not relay `message`, which names an internal agent.',
+    'Do not quote delegate_event_id, and do not say how long the work has been running or when it will finish: open_handle_age_ms is the age of a tracking record, not a progress measure.',
+    'Do not send a second copy of a draft that request already produced.',
+  ].join(' ');
+}
+
+/**
+ * Refuse when this specialist already has an unresolved handle in the originating
+ * conversation (#1858). Returns null when the call may proceed.
+ *
+ * A resume_token continues a specialist that has already stopped (it paused to ask
+ * the principal). Blocking that resume because some other delegation to the same agent
+ * timed out is a deliberate fail-closed trade-off: the match is agent × conversation
+ * and cannot tell the parked task from the one still running. Starting the resume
+ * would be a second concurrent run beside the timed-out specialist. Call this only
+ * after a resume token has been validated, so a corrupt or cross-agent token still
+ * gets its specific error.
+ */
+async function refuseIfInFlight(ctx: ToolContext, agent: string): Promise<ToolResult | null> {
+  const originConversationId = ctx.conversationId;
+  if (!ctx.openDelegationLookup) {
+    // Intentionally unwired when late delivery is disabled. Proceeding is today's
+    // behaviour; consulting stranded rows with the subscriber and sweep off would
+    // block that agent in that conversation permanently. The boot log says so.
+    return null;
+  }
+  if (typeof originConversationId !== 'string' || originConversationId === '') {
+    ctx.log.warn(
+      { targetAgent: agent },
+      'Delegate call has no originating conversation — cannot match an in-flight handle',
+    );
+    return null;
+  }
+
+  let inFlight: InFlightDelegation | null;
+  try {
+    inFlight = await ctx.openDelegationLookup.findInFlight(agent, originConversationId);
+  } catch (err) {
+    // Fail closed. Starting the run when we could not prove the specialist is idle is
+    // how the duplicate principal message happens. A database outage is tracked apart from
+    // the consecutive-error budget.
+    ctx.log.error(
+      { err, targetAgent: agent, originConversationId },
+      'In-flight delegation check failed — refusing to start another specialist run',
+    );
+    return {
+      success: false,
+      error: `Could not check whether '${agent}' is already running in this conversation. Not starting another run.`,
+      errorType: 'DATABASE_UNAVAILABLE',
+    };
+  }
+  if (!inFlight) return null;
+
+  ctx.log.warn(
+    {
+      targetAgent: agent,
+      originConversationId,
+      delegateEventId: inFlight.delegateEventId,
+      openHandleAgeMs: openHandleAgeMs(inFlight.createdAt),
+    },
+    'Blocked delegate — specialist already has an unresolved handle in this conversation',
+  );
+  return inFlightResult(agent, inFlight);
+}
+
+/**
+ * Claim the specialist for this conversation before the run is published (#1893).
+ *
+ * Three outcomes, and no other:
+ * - `{ ok: true, delegateEventId }` — this call holds the running row.
+ * - `{ ok: true }` with no id — nothing was written. Late delivery is off, or the
+ *   turn has no origin to store (voice, an approval re-invoke). Dispatch anyway.
+ * - `{ ok: false, result }` — do not dispatch. The insert threw, or another turn
+ *   already holds this specialist.
+ */
+async function acquireDispatchClaim(
+  ctx: ToolContext,
+  agent: string,
+  delegateEventId: string,
+  effectiveTask: string,
+  conversationId: string,
+  specialistTimeoutMs: number,
+): Promise<{ ok: true; delegateEventId?: string } | { ok: false; result: ToolResult }> {
+  if (!ctx.openDelegationLookup?.acquireRunning) return { ok: true };
+
+  const originAgentId = ctx.agentId;
+  const originConversationId = ctx.conversationId;
+  const originChannelId = ctx.channelId;
+  const originSenderId = ctx.senderId;
+  if (
+    typeof originAgentId !== 'string' || originAgentId === ''
+    || typeof originConversationId !== 'string' || originConversationId === ''
+    || typeof originChannelId !== 'string' || originChannelId === ''
+    || typeof originSenderId !== 'string' || originSenderId === ''
+  ) {
+    // A missing sender is a caller that never plumbed InvokeOptions.senderId.
+    // origin_sender_id is NOT NULL, so the claim cannot be written. Refusing
+    // here turns delegation off for that caller.
+    ctx.log.warn(
+      { targetAgent: agent, hasSender: typeof originSenderId === 'string' && originSenderId !== '' },
+      'Delegate call has no origin for a dispatch claim — starting the specialist without overlap protection',
+    );
+    return { ok: true };
+  }
+
+  const rawOriginator = ctx.taskMetadata?.['originator'];
+  const originator = typeof rawOriginator === 'object' && rawOriginator !== null && !Array.isArray(rawOriginator)
+    ? parseStoredOriginator(rawOriginator as Record<string, unknown>)
+    : undefined;
+  let acquired: AcquireRunningResult;
+  try {
+    const schedulerJobId = parseSchedulerJobId(originConversationId);
+    acquired = await ctx.openDelegationLookup.acquireRunning({
+      delegateEventId,
+      delegateConversationId: conversationId,
+      targetAgent: agent,
+      delegateTask: effectiveTask,
+      originAgentId,
+      originConversationId,
+      originChannelId,
+      originSenderId,
+      ...(ctx.taskEventId !== undefined && { originTaskEventId: ctx.taskEventId }),
+      ...(schedulerJobId !== undefined && { schedulerJobId }),
+      ...(originator !== undefined && { originator }),
+      expiresAt: runningClaimExpiresAt(new Date(), specialistTimeoutMs),
+    });
+  } catch (err) {
+    ctx.log.error(
+      { err, targetAgent: agent, originConversationId },
+      'Dispatch claim failed — refusing to start another specialist run',
+    );
+    return {
+      ok: false,
+      result: {
+        success: false,
+        error: `Could not claim the in-flight slot for '${agent}'. Not starting another run.`,
+        errorType: 'DATABASE_UNAVAILABLE',
+      },
+    };
+  }
+  if (!acquired.acquired) {
+    ctx.log.warn(
+      {
+        targetAgent: agent,
+        originConversationId,
+        delegateEventId: acquired.inFlight.delegateEventId,
+      },
+      'Blocked delegate — another turn claimed this specialist in this conversation',
+    );
+    return { ok: false, result: inFlightResult(agent, acquired.inFlight) };
+  }
+  return { ok: true, delegateEventId: acquired.claim.delegateEventId };
+}
+
+function formatStructuredFailureMessage(agent: string, reason: AgentResponseFailureReason): string {
+  switch (reason) {
+    case 'maxTurns':
+      return `Specialist '${agent}' exceeded its turn budget and could not complete the task`;
+    case 'maxConsecutiveErrors':
+      return `Specialist '${agent}' exceeded its consecutive error budget and could not complete the task`;
+    case 'tool_error':
+      return `Specialist '${agent}' failed due to a tool error`;
+    case 'api_error':
+      return `Specialist '${agent}' failed due to an API error`;
+    case 'blocked':
+      return `Specialist '${agent}' was blocked from completing the task`;
+    case 'timeout':
+      return `Specialist '${agent}' did not respond within the delegate wait window — the task may still be running`;
+    default:
+      return `Specialist '${agent}' could not complete the task`;
+  }
+}
+
+
+export class DelegateHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
+    // The outbound-context entry this delegation answers, if any (#1972). Linked
+    // before the run so the specialist's brief can name it, settled after from the
+    // result shape. See ./outbound-entry.ts.
+    const { agent, task, outbound_entry_id, resume_token } = ctx.input as {
+      agent?: unknown; task?: unknown; outbound_entry_id?: unknown; resume_token?: unknown;
+    };
+    const { link, report: linkReport } = typeof agent === 'string' && typeof task === 'string'
+      ? await linkOutboundEntry(ctx, agent, task, outbound_entry_id)
+      : { link: null, report: undefined };
+    let delegatedTaskId: string | undefined;
+    const result = await this.run(ctx, link, (id) => { delegatedTaskId = id; });
+    const report = link
+      ? await settleOutboundEntry(ctx, link, result, { delegatedTaskId, resumeToken: resume_token })
+      : linkReport;
+    // Tell the coordinator what happened to the entry it named, so a wrong id or
+    // owner is visible to the model that chose it rather than only in the logs.
+    // A failed result has no data object; its error text already leads.
+    if (report && result.success) {
+      return { ...result, data: { ...(result.data as Record<string, unknown>), outbound_entry: report } };
+    }
+    return result;
+  }
+
+  private async run(
+    ctx: ToolContext,
+    link: LinkedOutboundEntry | null,
+    onTaskCreated: (taskEventId: string) => void,
+  ): Promise<ToolResult> {
     const { agent, task, conversation_id, timeout_ms, resume_token } = ctx.input as {
       agent?: string;
       task?: string;
@@ -56,16 +419,24 @@ export class DelegateHandler implements SkillHandler {
       return { success: false, error: 'Missing required input: task (string)' };
     }
 
-    // Use caller-supplied timeout if it's a valid positive finite integer; fall back to default.
-    // Invalid values fall back silently so a bad LLM-supplied value never breaks the call.
-    // When the runtime injects timeout_ms from expectedDurationSeconds (scheduled tasks), the
-    // value should always be valid — a warn here helps distinguish LLM garbage from a runtime bug.
+    // timeout_ms is NOT part of this skill's LLM-facing input schema — the runtime is its only
+    // source, and it discards anything the model emits before the call reaches here (#1797).
+    // Use the caller-supplied timeout if it's a valid positive finite integer; fall back to the
+    // configured default otherwise. Invalid values fall back silently rather than failing the
+    // call, and the warn below flags a runtime bug (the injected value should always be valid).
     const isValidTimeout =
       typeof timeout_ms === 'number' &&
       Number.isInteger(timeout_ms) &&
       timeout_ms > 0 &&
       Number.isFinite(timeout_ms);
-    const specialistTimeoutMs = isValidTimeout ? (timeout_ms as number) : (ctx.defaultDelegateTimeoutMs ?? DEFAULT_SPECIALIST_TIMEOUT_MS);
+    // No valid timeout_ms and no configured default: use the shipped floor
+    // (config/default.yaml's delegate.defaultTimeoutMs, #1857). Long-running
+    // work still gets its window from the runtime, which resolves timeout_ms
+    // from the task's expectedDurationSeconds or the target agent's
+    // expected_duration_seconds (#1797).
+    const specialistTimeoutMs = clampDelegateWaitTimeoutMs(
+      isValidTimeout ? (timeout_ms as number) : (ctx.defaultDelegateTimeoutMs ?? DELEGATE_DEFAULT_TIMEOUT_FLOOR_MS),
+    );
 
     if (timeout_ms !== undefined && !isValidTimeout) {
       ctx.log.warn(
@@ -86,6 +457,12 @@ export class DelegateHandler implements SkillHandler {
     // Validate target agent exists and isn't the coordinator
     if (!ctx.agentRegistry.has(agent)) {
       const available = ctx.agentRegistry.listSpecialists().map(a => a.name).join(', ');
+      // The tool result is all the model sees. Log it too — a transcript is not
+      // an error signal, and historical threads keep re-teaching the bad name. (#1898)
+      ctx.log.error(
+        { agent, available: available || 'none' },
+        'delegate: target agent not found',
+      );
       return {
         success: false,
         error: `Agent '${agent}' not found. Available specialists: ${available || 'none'}`,
@@ -102,167 +479,390 @@ export class DelegateHandler implements SkillHandler {
 
     const conversationId = conversation_id ?? `delegate-${randomUUID()}`;
 
+    const hasResumeToken = typeof resume_token === 'string' && resume_token !== '';
+    if (!hasResumeToken) {
+      const briefValidation = validateDelegateBriefDates({
+        agent,
+        task,
+        priorDateResolves: ctx.turnDateResolveResults ?? [],
+      });
+      if (!briefValidation.ok) {
+        ctx.log.warn(
+          { targetAgent: agent, priorDates: (ctx.turnDateResolveResults ?? []).map(r => r.isoDate) },
+          'Rejected calendar delegate brief — date handoff validation failed',
+        );
+        return { success: false, error: briefValidation.error };
+      }
+    }
+
+    // Identical-delegation guard (#1171): resume continuations are exempt — they carry new
+    // principal direction and a different effective brief. Without a resume_token, block when the
+    // runtime has already recorded a non-retryable failure for this agent+task pair.
+    //
+    // One reason overrides that exemption: `already_delivered` (#1799). The runtime seeds it when
+    // this turn was woken with a late result already in hand, and a resume of finished work would
+    // re-run its side effects. This handler is the second gate — it is what actually publishes the
+    // specialist task, and it validates only the token's agent, never the task — so the check has
+    // to live here too, not only in the runtime.
+    const dKey = delegationKey(agent, task);
+    if (ctx.delegationGuard) {
+      // The delivered record is keyed on the ORIGINAL task. A resume's `task` is the principal's new
+      // direction, so the key has to be resolved from the token too — otherwise the block misses
+      // exactly the shape a resume normally takes and this handler publishes the work again.
+      const deliveredKey = findAlreadyDeliveredKey(
+        ctx.delegationGuard,
+        agent,
+        task,
+        hasResumeToken ? resume_token : undefined,
+      );
+      const blockKey = deliveredKey
+        ?? (!hasResumeToken && !ctx.delegationGuard.canAttempt(dKey) ? dKey : undefined);
+      if (blockKey !== undefined) {
+        const prior = ctx.delegationGuard.getFailure(blockKey);
+        ctx.log.warn(
+          { targetAgent: agent, reason: prior?.reason, viaResumeToken: hasResumeToken },
+          'Blocked identical re-delegation at delegate handler',
+        );
+        return {
+          success: true,
+          data: {
+            agent,
+            failed: true,
+            blocked: true,
+            reason: prior?.reason ?? 'blocked',
+            retryable: false,
+            message: prior?.message ?? formatStructuredFailureMessage(agent, 'blocked'),
+            escalated: ctx.delegationGuard.isEscalated(blockKey),
+          },
+        };
+      }
+    }
+
     // Resume flow: when resume_token is provided, decode it and construct a
-    // full task brief from the original context + the CEO's direction (the
+    // full task brief from the original context + the principal's direction (the
     // `task` parameter). The specialist receives a self-contained task —
     // no special resume detection logic needed in its prompt.
     let effectiveTask = task;
     if (resume_token && typeof resume_token === 'string') {
-      try {
-        const decoded = JSON.parse(
-          Buffer.from(resume_token, 'base64').toString('utf-8'),
-        ) as Record<string, unknown>;
-
-        if (decoded.v !== RESUME_TOKEN_VERSION) {
-          ctx.log.warn(
-            { targetAgent: agent, tokenVersion: decoded.v, expectedVersion: RESUME_TOKEN_VERSION },
-            'resume_token version mismatch — attempting to use anyway',
-          );
-        }
-
-        // Runtime validation: the token is opaque to the LLM, so a corrupted
-        // token must not silently produce a broken task brief.
-        const payload = decoded as unknown as ResumeTokenPayload;
-        if (!payload.original_task || !payload.context) {
-          const versionNote = decoded.v !== RESUME_TOKEN_VERSION
-            ? ` Token version ${String(decoded.v)} does not match expected version ${RESUME_TOKEN_VERSION} — this may be the cause.`
-            : '';
-          return {
-            success: false,
-            error: `resume_token is missing required fields (original_task, context).${versionNote} The token may be corrupted — ask the CEO to repeat their request.`,
-          };
-        }
-
-        // Guard against cross-agent token misuse: if the coordinator passes a
-        // resume_token generated for one specialist but targets a different one,
-        // the task brief would contain another agent's context. Reject early.
-        if (payload.agent && payload.agent !== agent) {
-          ctx.log.warn(
-            { targetAgent: agent, tokenAgent: payload.agent },
-            'resume_token was generated for a different agent — possible cross-agent token misuse',
-          );
-          return {
-            success: false,
-            error: `resume_token was generated for agent '${payload.agent}' but is being used to delegate to '${agent}'. Re-delegate to the correct specialist or ask the CEO to repeat their request.`,
-          };
-        }
-
-        effectiveTask = [
-          'You are continuing a task that was paused to get the CEO\'s direction.',
-          '',
-          '## Original Task',
-          payload.original_task,
-          '',
-          '## Your Progress So Far',
-          payload.context,
-          '',
-          '## CEO\'s Direction',
-          task,
-          '',
-          'Continue from where you left off.',
-        ].join('\n');
-
-        ctx.log.info(
-          { targetAgent: agent, originalAgent: payload.agent },
-          'Resuming task with resume_token — constructed task brief from original context + CEO direction',
-        );
-      } catch (err) {
-        ctx.log.error({ err, targetAgent: agent }, 'Failed to decode resume_token');
+      // Decode via the shared helper, which returns null (never throws) for malformed base64/JSON
+      // or non-string required fields. The token is opaque to the LLM, so an undecodable one must
+      // not silently produce a broken task brief.
+      const payload = decodeResumeToken(resume_token);
+      if (!payload) {
+        // decodeResumeToken absorbs the parse error (returns null rather than throwing), so the
+        // specific decode reason isn't surfaced here. The token is opaque names+NL, so the target
+        // agent is the actionable signal; a malformed token is unrecoverable regardless of reason.
+        ctx.log.error({ targetAgent: agent }, 'Failed to decode resume_token');
         return {
           success: false,
-          error: 'resume_token could not be decoded. The token may be corrupted — ask the CEO to repeat their request.',
+          error: 'resume_token could not be decoded. The token may be corrupted — ask the principal to repeat their request.',
         };
       }
+
+      // The helper is lenient on version; warn (but proceed) so a future format change surfaces in
+      // logs rather than silently misbehaving.
+      if (payload.v !== RESUME_TOKEN_VERSION) {
+        ctx.log.warn(
+          { targetAgent: agent, tokenVersion: payload.v, expectedVersion: RESUME_TOKEN_VERSION },
+          'resume_token version mismatch — attempting to use anyway',
+        );
+      }
+
+      // Even with valid types, empty original_task/context can't form a usable brief — reject so a
+      // corrupted token never yields a degenerate task.
+      if (!payload.original_task || !payload.context) {
+        const versionNote = payload.v !== RESUME_TOKEN_VERSION
+          ? ` Token version ${String(payload.v)} does not match expected version ${RESUME_TOKEN_VERSION} — this may be the cause.`
+          : '';
+        return {
+          success: false,
+          error: `resume_token is missing required fields (original_task, context).${versionNote} The token may be corrupted — ask the principal to repeat their request.`,
+        };
+      }
+
+      // Guard against cross-agent token misuse: if the coordinator passes a
+      // resume_token generated for one specialist but targets a different one,
+      // the task brief would contain another agent's context. Reject early.
+      // Use strict equality (not payload.agent && payload.agent !== agent) so that a
+      // malformed token with agent: "" cannot bypass the guard via a falsy agent field.
+      if (payload.agent !== agent) {
+        ctx.log.warn(
+          { targetAgent: agent, tokenAgent: payload.agent || '(empty)' },
+          'resume_token agent mismatch — possible cross-agent token misuse or corrupted token',
+        );
+        return {
+          success: false,
+          error: payload.agent
+            ? `resume_token was generated for agent '${payload.agent}' but is being used to delegate to '${agent}'. Re-delegate to the correct specialist or ask the principal to repeat their request.`
+            : `resume_token has an empty agent field and cannot be validated. The token may be corrupted — ask the principal to repeat their request.`,
+        };
+      }
+
+      effectiveTask = [
+        'You are continuing a task that was paused to get the principal\'s direction.',
+        '',
+        '## Original Task',
+        payload.original_task,
+        '',
+        '## Your Progress So Far',
+        payload.context,
+        '',
+        '## Principal\'s Direction',
+        task,
+        '',
+        'Continue from where you left off.',
+      ].join('\n');
+
+      ctx.log.info(
+        { targetAgent: agent, originalAgent: payload.agent },
+        'Resuming task with resume_token — constructed task brief from original context + principal direction',
+      );
     }
+
+    // After resume-token validation (#995). A bad token must still get its decode or
+    // agent-mismatch error; an open handle must not replace that with already_in_flight.
+    const inFlightRefusal = await refuseIfInFlight(ctx, agent);
+    if (inFlightRefusal) return inFlightRefusal;
+
+    // The dispatcher stamps a sanitized Nylas message id and mailbox on email
+    // inbounds (#1909). Re-sanitize before interpolation. A raw channel
+    // `nylasMessageId` is not read — only the trusted fields — and a failed
+    // sanitize omits the line without logging the value.
+    const inboundMessageId = sanitizeNylasMessageId(ctx.taskMetadata?.['inboundNylasMessageId']);
+    const stampedAccount = ctx.taskMetadata?.['inboundEmailAccount'];
+    const hasAccount = typeof stampedAccount === 'string';
+    const accountLabel = hasAccount ? preambleAccountLabel(stampedAccount) : undefined;
+    // Drop every brief-supplied identifier line before writing the trusted ones.
+    // An exact-string check leaves a different `Message ID:` (quoted from the
+    // inbound body, or guessed) sitting under the trusted line.
+    const identifierStrip = stripBriefIdentifierLines(effectiveTask, {
+      messageId: inboundMessageId.ok,
+      account: hasAccount,
+    });
+    if (identifierStrip.removed) {
+      ctx.log.warn(
+        { targetAgent: agent },
+        'delegate: stripped a brief-supplied Message ID or Account line — only the dispatcher-stamped identifiers are trusted (#1909)',
+      );
+    }
+    const identifierBlock = buildInboundEmailIdentifierBlock(
+      inboundMessageId.ok ? inboundMessageId.value : undefined,
+      accountLabel,
+    );
+    effectiveTask = identifierBlock ? identifierBlock + identifierStrip.text : identifierStrip.text;
 
     ctx.log.info(
       { targetAgent: agent, task: effectiveTask.slice(0, 100), timeoutMs: specialistTimeoutMs },
       'Delegating task to specialist',
     );
 
+    // Forward the coordinator's relay context so that if the specialist mints a secret-capture
+    // link, the capture origin can re-enter the COORDINATOR (a deliverable channel) and re-delegate
+    // back to this specialist via resume_token (#995). originalTask is the specialist's brief, used
+    // to build that resume_token. Only `delegate` sets delegationOrigin — it is the structural
+    // signal that a task is running as a delegated specialist.
+    const delegationMetadata: Record<string, unknown> = {
+      delegationOrigin: {
+        conversationId: ctx.conversationId,
+        channelId: ctx.channelId,
+        agentId: ctx.agentId,
+        originalTask: effectiveTask,
+        // The coordinator task whose relay this specialist's sends may lock (#1860).
+        ...(typeof ctx.taskEventId === 'string' && ctx.taskEventId.length > 0
+          ? { taskEventId: ctx.taskEventId }
+          : {}),
+      },
+      ...(inboundMessageId.ok ? { inboundNylasMessageId: inboundMessageId.value } : {}),
+      ...(accountLabel ? { inboundEmailAccount: accountLabel } : {}),
+    };
+    // Preserve the originator forwarding (#972) — without it the specialist loses the chain's
+    // TaskOriginator and isPrincipalOriginated() goes false for every skill in its turn.
+    if (ctx.taskMetadata?.originator) {
+      delegationMetadata.originator = ctx.taskMetadata.originator;
+    }
+
     // Publish an agent.task event for the specialist.
     // parentEventId uses a delegate-prefixed UUID. Ideally this would trace back
-    // to the Coordinator's skill.invoke event, but SkillContext doesn't currently
-    // carry the invoking event's ID. TODO: Add invokeEventId to SkillContext so
+    // to the Coordinator's tool.invoke event, but ToolContext doesn't currently
+    // carry the invoking event's ID. TODO: Add invokeEventId to ToolContext so
     // capability-gated skills can maintain the full audit causal chain.
-    //
-    // Forward the parent task's originator so the specialist inherits the original
-    // TaskOriginator. Without this, a CEO-initiated task delegated to a specialist
-    // would lose its originator at the delegation boundary and isPrincipalOriginated()
-    // would return false for all skill calls inside the specialist's turn.
     const taskEvent = createAgentTask({
       agentId: agent,
       conversationId,
       channelId: 'internal',
       senderId: 'coordinator',
-      content: effectiveTask,
-      // Forward only the originator field, not the full taskMetadata. Other metadata fields
-      // (e.g. future billing context, routing hints) are coordinator-internal and should
-      // not propagate transitively down the delegation chain unless explicitly designed to.
-      metadata: ctx.taskMetadata?.originator
-        ? { originator: ctx.taskMetadata.originator }
-        : undefined,
+      // The entry note goes on this run's content only, not on delegationOrigin's
+      // originalTask, which seeds a later resume_token for a different exchange.
+      content: link
+        ? effectiveTask + outboundEntryNote(link.entryId, outsiderOriginatorContactId(ctx.taskMetadata) !== null)
+        : effectiveTask,
+      metadata: delegationMetadata,
+      // Forward the live-principal-turn signal (#1126) across this SYNCHRONOUS delegation: a
+      // specialist acting inside the principal's live turn (e.g. the contacts specialist running
+      // contact-set-tier, or the setup-wizard minting a secret-capture link) inherits live-ness
+      // and can satisfy the elevated gate. This is safe precisely because delegation is
+      // ephemeral request/response — the sub-task is a bus event, never a persisted/wakeable row,
+      // and `liveTurn` is a distinct field no persistence skill copies. It is "live" only for the
+      // duration of this synchronous call; the moment work crosses an async boundary
+      // (scheduler-create, task wake_at, a persisted bullpen thread) the signal is gone.
+      liveTurn: ctx.liveTurn,
+      // When this wait ends (#2371): the reasoning watchdog positions its time trigger
+      // against it. A distinct field, never cancelling the specialist's turn.
+      turnDeadlineAt: Date.now() + specialistTimeoutMs,
       parentEventId: `delegate-${randomUUID()}`,
     });
+    onTaskCreated(taskEvent.id);
 
-    // Set up a one-time listener for the specialist's response BEFORE
-    // publishing the task, so we don't miss a fast response.
-    // TODO: The EventBus has no unsubscribe mechanism, so this subscriber
-    // persists after the delegation completes. The settled guard makes it
-    // a near-zero-cost no-op after resolution. Phase 5 should add
-    // bus.unsubscribe() or a one-shot subscription pattern.
-    let timeoutHandle: NodeJS.Timeout;
-    const responsePromise = new Promise<string>((resolve, reject) => {
-      let settled = false;
+    // Claim before subscribing. A refusal returns before the response listener
+    // and its timer exist, so a busy conversation does not accumulate subscribers
+    // that never settle. The call stays inside the try: a throw while arming the
+    // listener still releases a claim this call acquired.
+    let acquiredDelegateEventId: string | undefined;
+    let retainRunningClaim = false;
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    try {
+      const claim = await acquireDispatchClaim(
+        ctx,
+        agent,
+        taskEvent.id,
+        effectiveTask,
+        conversationId,
+        specialistTimeoutMs,
+      );
+      if (!claim.ok) return claim.result;
+      acquiredDelegateEventId = claim.delegateEventId;
 
-      timeoutHandle = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          reject(new Error(`Specialist '${agent}' did not respond within ${specialistTimeoutMs}ms`));
-        }
-      }, specialistTimeoutMs);
+      // Record only once this call holds the claim (or no claim is wired). An
+      // in-flight refusal did not start a specialist, so it must not consume an
+      // attempt. A resume continuation still does not consume one (#1171).
+      if (ctx.delegationGuard && !hasResumeToken) {
+        ctx.delegationGuard.recordInvocation(dKey);
+      }
 
-      ctx.bus!.subscribe('agent.response', 'system', async (event) => {
-        if (settled) return; // Skip processing after settlement — prevents double-resolve
-        try {
-          const responseEvent = event as AgentResponseEvent;
-          // Match on the task event ID — the specialist sets parentEventId to the task ID
-          if (responseEvent.parentEventId === taskEvent.id) {
-            settled = true;
-            clearTimeout(timeoutHandle);
-            // isError means the specialist hit an unrecoverable error (context overflow,
-            // LLM failure, budget exhaustion). Reject so the catch block returns
-            // { success: false } instead of forwarding the fallback message as a result.
-            if (responseEvent.payload.isError) {
-              reject(new Error(`Specialist '${agent}' encountered an error and could not complete the task`));
-            } else {
-              resolve(responseEvent.payload.content);
-            }
-          }
-        } catch (err) {
-          // Fail fast on malformed events rather than silently hanging until timeout
+      // Set up a one-time listener for the specialist's response BEFORE
+      // publishing the task, so we don't miss a fast response.
+      // TODO: The EventBus has no unsubscribe mechanism, so this subscriber
+      // persists after the delegation completes. The settled guard makes it
+      // a near-zero-cost no-op after resolution. Phase 5 should add
+      // bus.unsubscribe() or a one-shot subscription pattern.
+      const responsePromise = new Promise<SpecialistReply>((resolve, reject) => {
+        let settled = false;
+
+        timeoutHandle = setTimeout(() => {
           if (!settled) {
             settled = true;
-            clearTimeout(timeoutHandle);
-            reject(err instanceof Error ? err : new Error(String(err)));
+            reject({
+              __structuredDelegateFailure: true,
+              agent,
+              reason: 'timeout',
+              // Non-retryable: the specialist may still be running (possibly_succeeded below).
+              // A second delegation risks concurrent duplicate side effects — worse than
+              // escalating a task that turned out dead. Auto-retry would only help the rare
+              // "specialist actually died" case at the cost of duplicate emails in prod.
+              retryable: false,
+              // Correlation ids for late delivery (#1799) — the run we are abandoning here keeps
+              // going, so hand the runtime what it needs to recognise its eventual response.
+              delegateEventId: taskEvent.id,
+              delegateConversationId: conversationId,
+              waitTimeoutMs: specialistTimeoutMs,
+            } satisfies StructuredDelegateFailure);
           }
-        }
-      });
-    });
+        }, specialistTimeoutMs);
 
-    // Publish the task to the bus — the specialist will pick it up.
-    // We publish as 'dispatch' layer because only dispatch can publish agent.task
-    // per the permission model. Infrastructure skills are trusted to impersonate layers.
-    //
-    // IMPORTANT: await both concurrently via Promise.all rather than sequentially.
-    // The EventBus awaits subscriber handlers in sequence, so publish() does not resolve
-    // until the specialist's full processing chain completes (which can take 60–90s).
-    // If we awaited publish() first and then responsePromise, the 90s timeout could fire
-    // while responsePromise had no rejection handler yet — causing an unhandledRejection
-    // that crashes the process. Promise.all attaches handlers to both promises immediately,
-    // closing that window. See: https://github.com/josephfung/curia/issues/73
-    try {
-      const [response] = await Promise.all([
+        // A queued same-contact follow-up ends the wait. Reject, the way the
+        // timer does. Resolving would not release Promise.all: bus.publish of
+        // the specialist task stays pending until that turn finishes, so the
+        // late-delivery handle would be written only after the response it
+        // should catch. The claim stays so the late result can be matched.
+        // This is not the timeout reason (#2018).
+        const endForInput = (): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutHandle);
+          reject({
+            __interruptedWait: true,
+            delegateEventId: taskEvent.id,
+            delegateConversationId: conversationId,
+          } satisfies InterruptedWait);
+        };
+        const inputSignal = ctx.inputSignal;
+        if (inputSignal) {
+          if (inputSignal.aborted) endForInput();
+          else inputSignal.addEventListener('abort', endForInput, { once: true });
+        }
+
+        ctx.bus!.subscribe('agent.response', 'system', async (event) => {
+          if (settled) return; // Skip processing after settlement — prevents double-resolve
+          try {
+            const responseEvent = event as AgentResponseEvent;
+            // Match on the task event ID — the specialist sets parentEventId to the task ID
+            if (responseEvent.parentEventId === taskEvent.id) {
+              settled = true;
+              clearTimeout(timeoutHandle);
+              // isError means the specialist hit an unrecoverable error (context overflow,
+              // LLM failure, budget exhaustion). Reject so the catch block returns
+              // { success: false } or a structured failure result when reason is present.
+              if (responseEvent.payload.isError) {
+                const { errorType, reason, retryable } = responseEvent.payload;
+                if (reason !== undefined && retryable !== undefined) {
+                  reject({
+                    __structuredDelegateFailure: true,
+                    agent,
+                    reason,
+                    retryable,
+                    ...(errorType !== undefined && { errorType }),
+                  } satisfies StructuredDelegateFailure);
+                  return;
+                }
+                reject(new Error(`Specialist '${agent}' encountered an error and could not complete the task`));
+              } else {
+                const pausedPayload = parseExecutionPausedPayload(responseEvent.payload.content, ctx.log);
+                if (pausedPayload) {
+                  resolve({ content: JSON.stringify({
+                    _curia_protocol: EXECUTION_PAUSED_PROTOCOL,
+                    agent,
+                    task_id: pausedPayload.task_id,
+                    done: pausedPayload.done,
+                    total: pausedPayload.total,
+                    next: pausedPayload.next,
+                    message: formatPausedProgressMessage({
+                      done: pausedPayload.done,
+                      total: pausedPayload.total,
+                      next: pausedPayload.next,
+                    }),
+                  }) });
+                  return;
+                }
+                resolve({ content: responseEvent.payload.content, sends: responseEvent.payload.sends });
+              }
+            }
+          } catch (err) {
+            // Fail fast on malformed events rather than silently hanging until timeout
+            if (!settled) {
+              settled = true;
+              clearTimeout(timeoutHandle);
+              reject(err instanceof Error ? err : new Error(String(err)));
+            }
+          }
+        });
+      });
+
+      // Publish the task to the bus — the specialist will pick it up.
+      // We publish as 'dispatch' layer because only dispatch can publish agent.task
+      // per the permission model. Infrastructure skills are trusted to impersonate layers.
+      //
+      // IMPORTANT: await both concurrently via Promise.all rather than sequentially.
+      // The EventBus awaits subscriber handlers in sequence, so publish() does not resolve
+      // until the specialist's full processing chain completes (which can take 60–90s).
+      // If we awaited publish() first and then responsePromise, the 90s timeout could fire
+      // while responsePromise had no rejection handler yet — causing an unhandledRejection
+      // that crashes the process. Promise.all attaches handlers to both promises immediately,
+      // closing that window. See: https://github.com/josephfung/curia/issues/73
+      // retainRunningClaim for a timeout or an interrupted wait is set in the
+      // catch. Both leave the specialist running. A specialist that reports
+      // reason 'timeout' does not, and retaining the claim would block the
+      // conversation until the sweep re-delivered the answer.
+      const [{ content: response, sends }] = await Promise.all([
         responsePromise,
         ctx.bus.publish('dispatch', taskEvent),
       ]);
@@ -304,6 +904,46 @@ export class DelegateHandler implements SkillHandler {
                 question,
                 context: ctxValue,
                 resume_token: resumeToken,
+                // What to do with it, delivered with the result rather than kept in the
+                // always-on coordinator prompt (#1959).
+                next_step: CLARIFICATION_NEXT_STEP,
+              },
+            };
+          }
+        }
+
+        if (parsed._curia_protocol === EXECUTION_PAUSED_PROTOCOL) {
+          const done = parsed.done;
+          const total = parsed.total;
+          const next = parsed.next;
+          const message = parsed.message;
+          if (
+            typeof done !== 'number' ||
+            typeof total !== 'number' ||
+            typeof next !== 'string' ||
+            typeof message !== 'string'
+          ) {
+            ctx.log.warn(
+              { targetAgent: agent },
+              'Execution paused protocol marker present but payload fields are invalid — falling back to raw response',
+            );
+          } else {
+            ctx.log.info(
+              { targetAgent: agent, done, total },
+              'Specialist paused mid-task — returning typed paused result to coordinator',
+            );
+            return {
+              success: true,
+              data: {
+                agent,
+                paused: true,
+                done,
+                total,
+                next,
+                message,
+                ...(typeof parsed.task_id === 'string' && { task_id: parsed.task_id }),
+                // Not a failure: tells the caller not to re-delegate (#1959).
+                next_step: PAUSED_NEXT_STEP,
               },
             };
           }
@@ -319,20 +959,133 @@ export class DelegateHandler implements SkillHandler {
         }
       }
 
+      // Prose replies are not JSON. A structured decline is an XML marker in that
+      // prose (#1871) — distinguishable from a successful answer so the coordinator
+      // does not reword the brief and retry.
+      const decline = parseSpecialistDeclineMarker(response);
+      if (decline) {
+        ctx.log.info(
+          { targetAgent: agent, declineReason: decline.reason },
+          'Specialist declined the delegated task',
+        );
+        return {
+          success: true,
+          data: {
+            agent,
+            declined: true,
+            failed: true,
+            reason: SPECIALIST_DECLINE_REASON,
+            retryable: false,
+            message: decline.message,
+          },
+        };
+      }
+
+      // A sign-in code the principal's inbox specialist read out of an email is tracked
+      // here, before the result reaches the coordinator or any store (#2017).
+      if (agent === CEO_INBOX_AGENT && ctx.verification) {
+        await trackInboxCodes(ctx.verification, response, ctx.log, { targetAgent: agent });
+      }
+
+      // Pull contact IDs out before the execution layer strips the
+      // <resolved_entities> tags. The structured field survives sanitization;
+      // the markup in `response` does not (#1818).
+      const resolvedContactIds = parseResolvedContactIds(response);
+      // What it actually sent, and any composed email, as facts beside the prose (#2055).
+      const answer = shapeSpecialistAnswer(response, sends, task);
+      if (answer.next_step !== undefined) {
+        ctx.log.info(
+          { targetAgent: agent, sent: answer.sent, draftEmails: answer.draft_emails?.length ?? 0 },
+          'Specialist result carries composed text that was not sent — attaching next_step',
+        );
+      }
       return {
         success: true,
         data: {
-          response,
+          ...answer,
           agent,
+          ...(resolvedContactIds.length > 0 ? { resolvedContactIds } : {}),
         },
       };
     } catch (err) {
+      if (isInterruptedWait(err)) {
+        retainRunningClaim = true;
+        ctx.log.info(
+          { targetAgent: agent, delegateEventId: err.delegateEventId },
+          'Delegate wait ended because a follow-up was queued; the specialist keeps running',
+        );
+        return {
+          success: true,
+          data: {
+            agent,
+            in_progress: true,
+            reason: 'interrupted',
+            delegate_event_id: err.delegateEventId,
+            delegate_conversation_id: err.delegateConversationId,
+            message: INTERRUPTED_WAIT_MESSAGE,
+          },
+        };
+      }
+      if (isStructuredDelegateFailure(err)) {
+        // The wait timer started the specialist and set delegateEventId. Keep
+        // the claim so the timeout subscriber can promote it. A specialist
+        // failure that merely uses the reason 'timeout' has no id to promote.
+        if (err.reason === 'timeout' && err.delegateEventId !== undefined) retainRunningClaim = true;
+        const message = formatStructuredFailureMessage(err.agent, err.reason);
+        ctx.log.error(
+          {
+            targetAgent: err.agent,
+            reason: err.reason,
+            retryable: err.retryable,
+            errorType: err.errorType,
+            delegateEventId: err.delegateEventId,
+          },
+          'Delegation failed with structured specialist error',
+        );
+        return {
+          success: true,
+          data: {
+            agent: err.agent,
+            failed: true,
+            reason: err.reason,
+            retryable: err.retryable,
+            ...(err.errorType !== undefined && { errorType: err.errorType }),
+            message,
+            ...(err.reason === 'timeout' && { possibly_succeeded: true }),
+            // #1799: only the timeout branch sets these — they let the runtime open a pending
+            // delegation handle so the specialist's late response is not orphaned.
+            ...(err.delegateEventId !== undefined && { delegate_event_id: err.delegateEventId }),
+            ...(err.delegateConversationId !== undefined && {
+              delegate_conversation_id: err.delegateConversationId,
+            }),
+            ...(err.waitTimeoutMs !== undefined && { wait_timeout_ms: err.waitTimeoutMs }),
+            // Only a failure the coordinator may retry; the rest are escalated (#1860).
+            ...(err.retryable && err.reason !== 'timeout' ? failureNextStep(err.agent) : {}),
+          },
+        };
+      }
       const message = err instanceof Error ? err.message : String(err);
       ctx.log.error({ err, targetAgent: agent }, 'Delegation failed');
-      return { success: false, error: message };
+      // A failed tool result has only the error text, so the next step rides in it.
+      const nextStep = delegateFailureNextStep(agent);
+      return { success: false, error: nextStep ? `${message.replace(/[.\s]+$/, '')}. ${nextStep}` : message };
     } finally {
-      // Always clean up the timeout on any exit path
-      clearTimeout(timeoutHandle!);
+      // Always clean up the timeout on any exit path. Unset when we returned
+      // before the listener was armed (claim conflict, acquire failure).
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (acquiredDelegateEventId && !retainRunningClaim && ctx.openDelegationLookup?.releaseRunning) {
+        try {
+          await ctx.openDelegationLookup.releaseRunning(acquiredDelegateEventId);
+        } catch (err) {
+          // releaseRunning marks the row delivered when the delete throws, so the
+          // sweep cannot re-send a result this caller already has. This log is the
+          // case where that mark failed too — the row stays running until expires_at.
+          ctx.log.error(
+            { err, targetAgent: agent, delegateEventId: acquiredDelegateEventId },
+            'Failed to release the running delegation claim',
+          );
+        }
+      }
     }
   }
 }

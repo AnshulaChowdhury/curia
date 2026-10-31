@@ -5,8 +5,14 @@ PASS=0
 FAIL=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Capture the test dir before sourcing setup.sh, which re-assigns SCRIPT_DIR to scripts/.
+TEST_DIR="$SCRIPT_DIR"
 # Source the script under test without running main (guarded by BASH_SOURCE check at script bottom)
 source "$SCRIPT_DIR/../../scripts/setup.sh"
+# Source the shared helpers explicitly so this file documents its direct dependency.
+# setup.sh already sources setup-common.sh at load time, so this is a no-op in practice;
+# we use TEST_DIR here because SCRIPT_DIR was re-assigned by setup.sh's sourcing.
+source "$TEST_DIR/../../scripts/setup-common.sh"
 
 # --- Helpers ---
 
@@ -60,8 +66,76 @@ assert_invalid_key() {
     fi
 }
 
+run_check_prerequisites_with_node() {
+    local node_version="$1"
+    local out_file="$2"
+    local tmp_bin
+    tmp_bin=$(mktemp -d)
+
+    cat > "$tmp_bin/docker" <<'DOCKER_EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "info" ]]; then
+    exit 0
+fi
+if [[ "${1:-}" == "compose" && "${2:-}" == "version" ]]; then
+    exit 0
+fi
+echo "unexpected docker invocation: $*" >&2
+exit 1
+DOCKER_EOF
+
+    cat > "$tmp_bin/node" <<NODE_EOF
+#!/usr/bin/env bash
+echo "v${node_version}"
+NODE_EOF
+
+    cat > "$tmp_bin/pnpm" <<'PNPM_EOF'
+#!/usr/bin/env bash
+exit 0
+PNPM_EOF
+
+    chmod +x "$tmp_bin/docker" "$tmp_bin/node" "$tmp_bin/pnpm"
+
+    local rc
+    set +e
+    (PATH="$tmp_bin:$PATH"; check_prerequisites) > "$out_file" 2>&1
+    rc=$?
+    set -e
+
+    rm -rf "$tmp_bin"
+    return "$rc"
+}
+
+# --- check_prerequisites tests ---
+
+echo "=== check_prerequisites ==="
+_node_out=$(mktemp)
+if run_check_prerequisites_with_node "22.19.0" "$_node_out"; then
+    echo "  ✗ rejects Node 22"
+    FAIL=$((FAIL + 1))
+else
+    assert_true "rejects Node 22 with >= 24 message" "$_node_out" ">= 24 is required"
+fi
+
+if run_check_prerequisites_with_node "23.11.0" "$_node_out"; then
+    echo "  ✗ rejects Node 23"
+    FAIL=$((FAIL + 1))
+else
+    assert_true "rejects Node 23 with >= 24 message" "$_node_out" ">= 24 is required"
+fi
+
+if run_check_prerequisites_with_node "24.0.0" "$_node_out"; then
+    echo "  ✓ accepts Node 24"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ accepts Node 24"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$_node_out"
+
 # --- validate_anthropic_key tests ---
 
+echo ""
 echo "=== validate_anthropic_key ==="
 assert_valid_key   "accepts sk-ant-api03-..." "sk-ant-api03-abc123XYZ"
 assert_valid_key   "accepts key with hyphens in suffix" "sk-ant-abc-def-123"
@@ -250,6 +324,230 @@ _assert_output "contains password manager instruction"      "save this to a pass
 _assert_output "contains login instruction"                 "Enter it on the login page"
 _assert_output "contains box top-left corner"               "╔"
 _assert_output "contains box bottom-right corner"           "╝"
+
+# --- setup-common: secret generator tests ---
+
+echo ""
+echo "=== setup-common: secret generators ==="
+key_b64="$(gen_secret_b64)"
+# base64 of 32 bytes is 44 chars ending in '='
+if [[ "${#key_b64}" -eq 44 ]]; then echo "  ✓ gen_secret_b64 length 44"; PASS=$((PASS+1)); else echo "  ✗ gen_secret_b64 length ${#key_b64}"; FAIL=$((FAIL+1)); fi
+key_hex="$(gen_secret_hex)"
+if [[ "${#key_hex}" -eq 64 ]]; then echo "  ✓ gen_secret_hex length 64"; PASS=$((PASS+1)); else echo "  ✗ gen_secret_hex length ${#key_hex}"; FAIL=$((FAIL+1)); fi
+
+# --- install.sh: source-checkout detection ---
+# Source install.sh (guarded: defines functions, does not run main).
+# Suppress setup-common.sh re-sourcing output; the helpers are already loaded.
+source "$TEST_DIR/../../install.sh" 2>/dev/null
+
+echo ""
+echo "=== install.sh: detect_source_checkout ==="
+
+# A directory with .git + src/ + package.json naming the curia project.
+tmp_src=$(mktemp -d)
+mkdir -p "$tmp_src/src" "$tmp_src/.git"
+printf '{"name":"curia"}' > "$tmp_src/package.json"
+if detect_source_checkout "$tmp_src"; then
+    echo "  ✓ detects a curia source tree"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ missed a curia source tree"
+    FAIL=$((FAIL+1))
+fi
+
+# A bare directory: no .git, no src/, no package.json.
+tmp_bare=$(mktemp -d)
+if ! detect_source_checkout "$tmp_bare"; then
+    echo "  ✓ bare dir is not a source tree"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ false-positive on bare dir"
+    FAIL=$((FAIL+1))
+fi
+
+# A directory with .git + src but a different package name (not curia).
+tmp_other=$(mktemp -d)
+mkdir -p "$tmp_other/src" "$tmp_other/.git"
+printf '{"name":"other-project"}' > "$tmp_other/package.json"
+if ! detect_source_checkout "$tmp_other"; then
+    echo "  ✓ non-curia package.json is not a source tree"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ false-positive on non-curia package.json"
+    FAIL=$((FAIL+1))
+fi
+
+rm -rf "$tmp_src" "$tmp_bare" "$tmp_other"
+
+# --- install.sh: set_env_var ---
+
+echo ""
+echo "=== install.sh: set_env_var ==="
+
+# set_env_var replaces an existing uncommented key.
+_sv_env=$(mktemp)
+printf 'FOO=old\nBAR=keep\n' > "$_sv_env"
+set_env_var "$_sv_env" FOO new_value
+if grep -qF "FOO=new_value" "$_sv_env"; then
+    echo "  ✓ replaces existing key"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ did not replace existing key"
+    FAIL=$((FAIL+1))
+fi
+if grep -qF "BAR=keep" "$_sv_env"; then
+    echo "  ✓ preserves unrelated key"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ unrelated key was clobbered"
+    FAIL=$((FAIL+1))
+fi
+# Old value must not remain.
+if ! grep -qF "FOO=old" "$_sv_env"; then
+    echo "  ✓ old value removed"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ old value still present"
+    FAIL=$((FAIL+1))
+fi
+
+# set_env_var replaces a commented-out key (e.g. # FOO=placeholder).
+printf '# FOO=placeholder\nBAR=keep\n' > "$_sv_env"
+set_env_var "$_sv_env" FOO activated
+if grep -qF "FOO=activated" "$_sv_env"; then
+    echo "  ✓ activates commented key"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ did not activate commented key"
+    FAIL=$((FAIL+1))
+fi
+
+# set_env_var appends when the key is entirely absent.
+printf 'BAR=keep\n' > "$_sv_env"
+set_env_var "$_sv_env" NEWKEY newval
+if grep -qF "NEWKEY=newval" "$_sv_env"; then
+    echo "  ✓ appends missing key"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ did not append missing key"
+    FAIL=$((FAIL+1))
+fi
+
+rm -f "$_sv_env"
+
+# --- install.sh: install_is_complete ---
+
+echo ""
+echo "=== install.sh: install_is_complete ==="
+
+# Returns true (0) when .env has the SETUP_COMPLETE marker.
+_ic_env=$(mktemp)
+printf 'DB_PASSWORD=abc123\n# SETUP_COMPLETE\n' > "$_ic_env"
+if install_is_complete "$_ic_env"; then
+    echo "  ✓ SETUP_COMPLETE marker → complete"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ SETUP_COMPLETE marker should return complete"
+    FAIL=$((FAIL+1))
+fi
+
+# Returns false (1) when .env has a real DB_PASSWORD but NO marker: this is a
+# partial/interrupted install (DB creds written, vault not yet seeded). It must
+# route through fresh_install (which preserves the DB password) so the missing
+# vault secrets still get seeded — not the verify-only upgrade path.
+printf 'DB_PASSWORD=realhexvalue0011aabbccdd\n' > "$_ic_env"
+if ! install_is_complete "$_ic_env"; then
+    echo "  ✓ real DB_PASSWORD, no marker → not complete (partial install)"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ real DB_PASSWORD without marker should NOT be treated as complete"
+    FAIL=$((FAIL+1))
+fi
+
+# Returns false (1) for a brand-new .env with the placeholder DB_PASSWORD.
+printf 'DB_PASSWORD=replace-with-a-strong-password\n' > "$_ic_env"
+if ! install_is_complete "$_ic_env"; then
+    echo "  ✓ placeholder DB_PASSWORD → not complete"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ placeholder DB_PASSWORD should return not complete"
+    FAIL=$((FAIL+1))
+fi
+
+# Returns false (1) when DB_PASSWORD is absent entirely.
+printf 'DB_USER=curia\n' > "$_ic_env"
+if ! install_is_complete "$_ic_env"; then
+    echo "  ✓ absent DB_PASSWORD → not complete"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ absent DB_PASSWORD should return not complete"
+    FAIL=$((FAIL+1))
+fi
+
+# Returns false (1) when DB_PASSWORD is empty (key present, value blank).
+printf 'DB_PASSWORD=\n' > "$_ic_env"
+if ! install_is_complete "$_ic_env"; then
+    echo "  ✓ empty DB_PASSWORD → not complete"
+    PASS=$((PASS+1))
+else
+    echo "  ✗ empty DB_PASSWORD should return not complete"
+    FAIL=$((FAIL+1))
+fi
+
+rm -f "$_ic_env"
+
+# --- install.sh: resolve_version ---
+
+echo ""
+echo "=== install.sh: resolve_version ==="
+
+_assert_var() {
+    local desc="$1" got="$2" want="$3"
+    if [[ "$got" == "$want" ]]; then
+        echo "  ✓ $desc"; PASS=$((PASS+1))
+    else
+        echo "  ✗ $desc — got '$got' want '$want'"; FAIL=$((FAIL+1))
+    fi
+}
+
+# latest (default): release assets + image tag "latest".
+CURIA_REF=""; CURIA_VERSION="latest"; resolve_version
+_assert_var "latest → release mode" "$ASSET_MODE" "release"
+_assert_var "latest → latest/download base" "$ASSET_BASE" "https://github.com/josephfung/curia/releases/latest/download"
+_assert_var "latest → image tag latest" "$CURIA_IMAGE_TAG_RESOLVED" "latest"
+
+# vX.Y.Z: that release's assets + matching image tag.
+CURIA_REF=""; CURIA_VERSION="v0.41.0"; resolve_version
+_assert_var "v0.41.0 → release mode" "$ASSET_MODE" "release"
+_assert_var "v0.41.0 → download/<tag> base" "$ASSET_BASE" "https://github.com/josephfung/curia/releases/download/v0.41.0"
+_assert_var "v0.41.0 → image tag v0.41.0" "$CURIA_IMAGE_TAG_RESOLVED" "v0.41.0"
+
+# Bare X.Y.Z is normalized to vX.Y.Z.
+CURIA_REF=""; CURIA_VERSION="0.41.0"; resolve_version
+_assert_var "0.41.0 normalized → image tag v0.41.0" "$CURIA_IMAGE_TAG_RESOLVED" "v0.41.0"
+_assert_var "0.41.0 normalized → download/v0.41.0 base" "$ASSET_BASE" "https://github.com/josephfung/curia/releases/download/v0.41.0"
+
+# edge: config from raw main + image tag "edge".
+CURIA_REF=""; CURIA_VERSION="edge"; resolve_version
+_assert_var "edge → raw mode" "$ASSET_MODE" "raw"
+_assert_var "edge → raw main base" "$RAW_BASE" "https://raw.githubusercontent.com/josephfung/curia/main"
+_assert_var "edge → image tag edge" "$CURIA_IMAGE_TAG_RESOLVED" "edge"
+
+# CURIA_REF override: raw mode at that ref, no image-tag pin (empty).
+CURIA_REF="my-branch"; CURIA_VERSION="latest"; resolve_version
+_assert_var "CURIA_REF override → raw mode" "$ASSET_MODE" "raw"
+_assert_var "CURIA_REF override → raw base at ref" "$RAW_BASE" "https://raw.githubusercontent.com/josephfung/curia/my-branch"
+_assert_var "CURIA_REF override → no image-tag pin" "$CURIA_IMAGE_TAG_RESOLVED" ""
+
+# Invalid version errors (subshell so exit 1 doesn't kill the suite).
+if ( CURIA_REF=""; CURIA_VERSION="nope"; resolve_version ) 2>/dev/null; then
+    echo "  ✗ invalid version should error"; FAIL=$((FAIL+1))
+else
+    echo "  ✓ invalid version errors out"; PASS=$((PASS+1))
+fi
+
+# Reset globals so nothing downstream inherits test state.
+CURIA_REF=""; CURIA_VERSION="latest"; resolve_version
 
 # --- Results ---
 

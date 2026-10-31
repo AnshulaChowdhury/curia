@@ -3,8 +3,11 @@
 // Shared utility for parsing the context_bridge JSON input in send skills.
 // Extracted to avoid duplication across signal-send, email-send, email-reply.
 
+import type { BoundTaskContext } from '../agents/resumable-task.js';
 import type { Logger } from '../logger.js';
 import type { OutboundContextCapability } from './outbound-context.js';
+import { recordSendOutreach, type SendOutreach } from './task-outreach-capability.js';
+import { buildTaskWakeAutoBridge, TASK_WAKE_BIND_REPLY_KEY, TASK_WAKE_TASK_ID_KEY, TASK_WAKE_REPLY_TTL_HOURS } from './task-wake-reply.js';
 
 export interface ContextBridgeInput {
   agent_id: string;
@@ -67,15 +70,33 @@ export function parseContextBridge(raw: unknown, log: Logger): ContextBridgeInpu
 }
 
 
+/** Whether a live verification suppresses task binding. A lookup error binds (today's behaviour). */
+async function taskBindSuppressed(
+  outboundContext: OutboundContextCapability,
+  taskId: string,
+  log: Logger,
+): Promise<boolean> {
+  if (!outboundContext.taskAutoBindSuppressed) return false;
+  try {
+    return await outboundContext.taskAutoBindSuppressed(taskId);
+  } catch (err) {
+    log.warn({ err, taskId }, 'outbound context: verification lookup failed — binding the task reply as usual');
+    return false;
+  }
+}
+
 /**
  * Single-call outbound context registration that replaces the two-step
  * parse+conditional-register pattern in send skills.
  *
  * - If `outboundContext` is undefined → no-op (graceful when capability unavailable)
  * - If `contextBridgeRaw` parses successfully → registers with explicit metadata;
- *   TTL = bridge.expires_in_hours ?? outboundContext.explicitExpiryHours
+ *   TTL = bridge.expires_in_hours, else the larger of explicitExpiryHours and
+ *   the channel's default window
  * - If absent/null/malformed → registers minimal entry (agentId + channelId + content);
- *   TTL = outboundContext.defaultExpiryHours
+ *   TTL = the channel's default window (defaultExpiryHoursFor)
+ * - With `outreach`, also records the send as task outreach on a task-bound turn (#2312),
+ *   independently of the outbound-context entry
  * - Never throws — logs warnings on failure
  */
 export async function registerOutboundContext(
@@ -86,19 +107,80 @@ export async function registerOutboundContext(
     content: string;
     agentId: string;
     log: Logger;
+    /** When present (task-wake turns), auto-bind principal replies to this task (#1299). */
+    boundTask?: BoundTaskContext | null;
+    /**
+     * Contact IDs the message went to (#2261). Lets the dispatcher show the entry on a
+     * reply from one of them; omitted, the entry is shown on principal turns only.
+     */
+    recipientContactIds?: readonly string[];
+    /** The turn and recipients, so a task-bound send leaves a task_outreach row (#2312). */
+    outreach?: SendOutreach;
   },
 ): Promise<void> {
+  const { channelId, content, agentId, log, boundTask, recipientContactIds, outreach } = opts;
+
+  // Before the early return: a deployment without outbound context still records outreach.
+  // recordSendOutreach never throws.
+  if (outreach) await recordSendOutreach(outreach, { recipientContactIds, log });
+
   if (!outboundContext) return;
 
-  const { channelId, content, agentId, log } = opts;
+  const recipients = recipientContactIds && recipientContactIds.length > 0 ? { recipientContactIds } : {};
 
   try {
-    const bridge = parseContextBridge(contextBridgeRaw, log);
+    let bridge = parseContextBridge(contextBridgeRaw, log);
+    // Captured before the task-wake branches below can inject a TTL of their
+    // own — afterwards there is no way to tell an agent's chosen window from
+    // one the system supplied, and the log would credit the agent for both.
+    const agentChoseTtl = bridge?.expires_in_hours != null;
+
+    // A live sign-in verification for the task (pending, or expired within the recent
+    // window: a late code can still work) skips binding altogether (#2017): the
+    // principal's reply is the code, and it must reach the coordinator, not be persisted
+    // onto the task. Covers both branches below — an explicit bridge would otherwise have
+    // the binding merged into it. A failed lookup falls back to today's behaviour (bind).
+    const skipTaskBind = boundTask ? await taskBindSuppressed(outboundContext, boundTask.taskId, log) : false;
+
+    if (!bridge && boundTask && !skipTaskBind) {
+      // Task-wake send without explicit context_bridge — attach durable task binding.
+      bridge = buildTaskWakeAutoBridge({
+        taskId: boundTask.taskId,
+        agentId,
+        messageContent: content,
+      });
+      log.debug({ taskId: boundTask.taskId }, 'outbound context: auto-bound task-wake reply');
+    } else if (bridge && boundTask && !skipTaskBind && !bridge.metadata?.[TASK_WAKE_TASK_ID_KEY]) {
+      bridge = {
+        ...bridge,
+        metadata: {
+          ...(bridge.metadata ?? {}),
+          [TASK_WAKE_BIND_REPLY_KEY]: true,
+          [TASK_WAKE_TASK_ID_KEY]: boundTask.taskId,
+        },
+        expires_in_hours: bridge.expires_in_hours ?? TASK_WAKE_REPLY_TTL_HOURS,
+      };
+    }
+
+    const channelDefaultHours = outboundContext.defaultExpiryHoursFor(channelId);
 
     if (bridge) {
       // Explicit registration — skill provided structured context_bridge metadata.
-      // TTL: use the caller-specified expires_in_hours, falling back to the
-      // capability's explicitExpiryHours (longer TTL for well-structured entries).
+      //
+      // TTL, in order of authority:
+      //   1. The agent's own expires_in_hours wins outright, including when it
+      //      is shorter than the channel default — a deliberate short window is
+      //      a legitimate choice.
+      //   2. A system-injected task-wake TTL is a floor, not a ceiling: raise it
+      //      to the channel default if that is longer, so the binding cannot
+      //      expire before a bare entry on the same channel would.
+      //   3. Otherwise the explicit tier, likewise floored at the channel default.
+      //
+      // Both floors exist for the same reason: an entry carrying MORE context
+      // must never expire sooner than a bare one on the same channel (#1816).
+      // Only the task-wake branches above inject a TTL the agent did not ask
+      // for, so a bridge TTL that is present but not the agent's is theirs.
+      const systemInjectedTtl = !agentChoseTtl && bridge.expires_in_hours != null;
       await outboundContext.register({
         channelId,
         agentId: bridge.agent_id,
@@ -106,19 +188,36 @@ export async function registerOutboundContext(
         ...(bridge.expected_reply != null ? { expectedReply: bridge.expected_reply } : {}),
         ...(bridge.delegation_hint != null ? { delegationHint: bridge.delegation_hint } : {}),
         ...(bridge.metadata != null ? { metadata: bridge.metadata } : {}),
-        expiresInHours: bridge.expires_in_hours ?? outboundContext.explicitExpiryHours,
+        expiresInHours: agentChoseTtl
+          ? bridge.expires_in_hours
+          : systemInjectedTtl
+            ? Math.max(bridge.expires_in_hours!, channelDefaultHours)
+            : Math.max(outboundContext.explicitExpiryHours, channelDefaultHours),
+        ttlSource: agentChoseTtl ? 'agent' : systemInjectedTtl ? 'task-wake' : 'explicit-tier',
+        ...recipients,
       });
     } else {
       // Auto-registration — context_bridge was absent, null, or malformed.
       // Register a minimal entry so inbound replies can still be correlated.
+      // TTL follows the channel's reply rhythm, not a flat 6h (#1816).
       await outboundContext.register({
         channelId,
         agentId,
         content,
-        expiresInHours: outboundContext.defaultExpiryHours,
+        expiresInHours: channelDefaultHours,
+        ttlSource: 'channel-default',
+        ...recipients,
       });
     }
   } catch (err) {
-    log.warn({ err, channelId }, 'Failed to register outbound context — send succeeded');
+    // Swallowed by design: the message already went out, so failing the skill
+    // would report a failure for a send that shipped. But the consequence is
+    // not degraded service — it is a guaranteed future cold inbound, so name
+    // it, and carry enough identity to tell which message will come back
+    // unrecognised (#1816).
+    log.warn(
+      { err, channelId, agentId, hadBridge: contextBridgeRaw != null },
+      'Failed to register outbound context — send succeeded, but any reply will arrive with no record of this message',
+    );
   }
 }

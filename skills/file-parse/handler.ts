@@ -5,16 +5,19 @@
 // - Image: InfraLlm vision (passes base64 image blocks)
 // - PDF: pdf-parse text extraction, then optional LLM structuring
 // - HTML: tag stripping, then optional LLM structuring
+// - ICS: deterministic calendar invite field extraction
+// - XML, plain text, Markdown: UTF-8 decode, no XML parser (external entities stay inert)
 //
 // All LLM calls go through the constrained InfraLlm service (classify + extract
 // only) so costs and latency are tracked by the telemetry infrastructure.
 
 import fs from 'node:fs/promises';
-import path from 'node:path';
 import { createRequire } from 'node:module';
 import type { Node, HTMLElement as HtmlElement } from 'node-html-parser';
-import type { SkillHandler, SkillContext, SkillResult } from '../../src/skills/types.js';
+import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
 import type { InfraLlm } from '../../src/skills/infra-llm.js';
+import { DOCUMENT_MIME_TYPES, effectiveDocumentMime, filenameExtension } from '../_shared/document-types.js';
+import { resolveTempFileUrl } from '../_shared/temp-file-url.js';
 
 // CJS-only deps: load via createRequire so the CJS build is used reliably under
 // Node ESM + tsx/vitest (Vite's ESM/CJS interop can lose named exports).
@@ -24,24 +27,12 @@ const { parse, NodeType } = require('node-html-parser') as typeof import('node-h
 import { parseCsv } from './csv.js';
 import { getExtractionPrompt, type ExtractAs } from './prompts.js';
 
-// MIME types we support, mapped to our internal content categories.
-const MIME_MAP: Record<string, 'csv' | 'pdf' | 'image' | 'html'> = {
-  'text/csv': 'csv',
-  'application/pdf': 'pdf',
-  'image/jpeg': 'image',
-  'image/jpg': 'image',
-  'image/png': 'image',
-  'image/webp': 'image',
-  'image/gif': 'image',
-  'text/html': 'html',
-};
-
 // extract_as is open-ended: 'receipt', 'bank_statement', 'invoice' have tailored prompts;
 // 'raw' opts out of LLM extraction; any other non-empty string gets a generic prompt.
 // See prompts.ts — agents can define new document types without modifying this file.
 
-export class FileParseHandler implements SkillHandler {
-  async execute(ctx: SkillContext): Promise<SkillResult> {
+export class FileParseHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
     if (!ctx.infraLlm) {
       ctx.log.error('file-parse: infraLlm capability missing — execution layer misconfigured');
       return { success: false, error: 'file-parse requires infraLlm capability' };
@@ -54,7 +45,8 @@ export class FileParseHandler implements SkillHandler {
     const tempFileUrl = typeof ctx.input.temp_file_url === 'string'
       ? ctx.input.temp_file_url.trim() : '';
     const mimeType = typeof ctx.input.mime_type === 'string'
-      ? ctx.input.mime_type.trim().toLowerCase() : '';
+      ? ctx.input.mime_type.trim().toLowerCase().split(';')[0]!.trim() : '';
+    const filename = typeof ctx.input.filename === 'string' ? ctx.input.filename.trim() : '';
     const extractAs = typeof ctx.input.extract_as === 'string'
       ? ctx.input.extract_as.trim().toLowerCase() as ExtractAs : 'raw';
 
@@ -62,7 +54,7 @@ export class FileParseHandler implements SkillHandler {
     // disk. This bridges the gap with ceo-inbox-download-attachment which omits
     // content_base64 when temp storage is available (to avoid output size limits).
     if (!contentBase64 && tempFileUrl) {
-      const resolved = await this.resolveTempFileUrl(tempFileUrl);
+      const resolved = await resolveTempFileUrl(tempFileUrl);
       if (!resolved) {
         ctx.log.warn({ tempFileUrl }, 'file-parse: rejected temp_file_url — must be file:// under allowed prefix');
         return { success: false, error: 'Invalid temp_file_url: must be a file:// URL under the temp store directory' };
@@ -91,13 +83,19 @@ export class FileParseHandler implements SkillHandler {
     if (!contentBase64) {
       return { success: false, error: 'Missing required input: content_base64 (or provide temp_file_url)' };
     }
-    if (!mimeType) {
-      return { success: false, error: 'Missing required input: mime_type' };
-    }
 
-    const contentType = MIME_MAP[mimeType];
+    // A specific reported type wins. Extension is only a fallback for the generic
+    // or missing type mail clients put on .md / .txt / .xml attachments.
+    const effectiveMime = effectiveDocumentMime(mimeType, filename);
+    const contentType = DOCUMENT_MIME_TYPES[effectiveMime];
     if (!contentType) {
-      return { success: false, error: `Unsupported mime_type: ${mimeType}. Supported: ${Object.keys(MIME_MAP).join(', ')}` };
+      const shownMime = mimeType || '(none)';
+      const ext = filenameExtension(filename) || '(none)';
+      const supported = Object.keys(DOCUMENT_MIME_TYPES).join(', ');
+      return {
+        success: false,
+        error: `Unsupported mime_type: ${shownMime} (filename extension: ${ext}). Supported: ${supported}`,
+      };
     }
     // Only reject empty strings — any non-empty extract_as is valid.
     // Known schemas get tailored prompts; unknown strings get a generic prompt.
@@ -112,11 +110,17 @@ export class FileParseHandler implements SkillHandler {
         case 'csv':
           return this.handleCsv(buffer);
         case 'image':
-          return await this.handleImage(ctx, infraLlm, contentBase64, mimeType, extractAs);
+          return await this.handleImage(ctx, infraLlm, contentBase64, effectiveMime, extractAs);
         case 'pdf':
           return await this.handlePdf(ctx, infraLlm, buffer, extractAs);
         case 'html':
           return await this.handleHtml(ctx, infraLlm, buffer, extractAs);
+        case 'ics':
+          return this.handleIcs(buffer, extractAs);
+        case 'text':
+        case 'xml':
+        case 'markdown':
+          return await this.handleText(ctx, infraLlm, buffer, contentType, extractAs);
       }
     } catch (err) {
       ctx.log.error({ err, mimeType }, 'file-parse: unexpected error');
@@ -126,7 +130,7 @@ export class FileParseHandler implements SkillHandler {
 
   // --- CSV: deterministic, no LLM ---
 
-  private handleCsv(buffer: Buffer): SkillResult {
+  private handleCsv(buffer: Buffer): ToolResult {
     const text = buffer.toString('utf-8');
     const rows = parseCsv(text);
     return {
@@ -140,15 +144,54 @@ export class FileParseHandler implements SkillHandler {
     };
   }
 
+  // --- XML, plain text, Markdown: UTF-8 bytes, no parser, no LLM when raw ---
+  //
+  // XML is returned as text on purpose. A parser that resolved DTDs or external
+  // entities would turn a DMARC report into an XXE read; the model can read the
+  // markup itself.
+
+  private async handleText(
+    ctx: ToolContext,
+    infraLlm: InfraLlm,
+    buffer: Buffer,
+    kind: 'text' | 'xml' | 'markdown',
+    extractAs: ExtractAs,
+  ): Promise<ToolResult> {
+    let rawText = buffer.toString('utf-8');
+    if (rawText.charCodeAt(0) === 0xfeff) rawText = rawText.slice(1);
+
+    if (extractAs === 'raw') {
+      return { success: true, data: { type: kind, raw_text: rawText, structured: null, confidence: 1.0 } };
+    }
+
+    return await this.extractStructured(ctx, infraLlm, kind, rawText, extractAs);
+  }
+
+  // --- ICS: deterministic calendar invite parsing ---
+
+  private handleIcs(buffer: Buffer, extractAs: ExtractAs): ToolResult {
+    const text = buffer.toString('utf-8');
+    const structured = extractAs === 'raw' ? null : parseIcsInvite(text);
+    return {
+      success: true,
+      data: {
+        type: 'calendar_invite',
+        raw_text: text,
+        structured,
+        confidence: 1.0,
+      },
+    };
+  }
+
   // --- Image: InfraLlm vision ---
 
   private async handleImage(
-    ctx: SkillContext,
+    ctx: ToolContext,
     infraLlm: InfraLlm,
     contentBase64: string,
     mimeType: string,
     extractAs: ExtractAs,
-  ): Promise<SkillResult> {
+  ): Promise<ToolResult> {
     const prompt = getExtractionPrompt(extractAs);
 
     // For 'raw', ask for a plain text transcription of the image
@@ -159,8 +202,11 @@ export class FileParseHandler implements SkillHandler {
     // The Anthropic API only accepts the canonical MIME types.
     const normalizedMimeType = mimeType === 'image/jpg' ? 'image/jpeg' : mimeType;
 
+    // Fast tier: on a model that thinks, the 4000 tokens can all go to thinking and the
+    // parse comes back empty (#2224).
     const result = await infraLlm.extract(textPrompt, {
       maxTokens: 4000,
+      tier: 'fast',
       image: { base64: contentBase64, mediaType: normalizedMimeType },
     });
 
@@ -180,11 +226,11 @@ export class FileParseHandler implements SkillHandler {
   // --- PDF: text extraction + optional LLM structuring ---
 
   private async handlePdf(
-    ctx: SkillContext,
+    ctx: ToolContext,
     infraLlm: InfraLlm,
     buffer: Buffer,
     extractAs: ExtractAs,
-  ): Promise<SkillResult> {
+  ): Promise<ToolResult> {
     let rawText: string;
     try {
       const parser = new PDFParse({ data: buffer });
@@ -236,11 +282,11 @@ export class FileParseHandler implements SkillHandler {
   // --- HTML: tag stripping + optional LLM structuring ---
 
   private async handleHtml(
-    ctx: SkillContext,
+    ctx: ToolContext,
     infraLlm: InfraLlm,
     buffer: Buffer,
     extractAs: ExtractAs,
-  ): Promise<SkillResult> {
+  ): Promise<ToolResult> {
     const html = buffer.toString('utf-8');
     const rawText = stripHtmlTags(html);
 
@@ -254,21 +300,22 @@ export class FileParseHandler implements SkillHandler {
   // --- Shared: LLM-based structured extraction from text ---
 
   private async extractStructured(
-    ctx: SkillContext,
+    ctx: ToolContext,
     infraLlm: InfraLlm,
-    type: 'pdf' | 'html',
+    type: 'pdf' | 'html' | 'text' | 'xml' | 'markdown',
     rawText: string,
     extractAs: ExtractAs,
-  ): Promise<SkillResult> {
+  ): Promise<ToolResult> {
     const prompt = getExtractionPrompt(extractAs);
     if (!prompt) {
       // Should not happen — 'raw' is handled before this call
       return { success: true, data: { type, raw_text: rawText, structured: null, confidence: 1.0 } };
     }
 
+    // Fast tier, for the same reason as the image path (#2224).
     const result = await infraLlm.extract(
       `${prompt}\n\nDocument text:\n${rawText}`,
-      { maxTokens: 4000 },
+      { maxTokens: 4000, tier: 'fast' },
     );
 
     if (!result.ok) {
@@ -287,13 +334,13 @@ export class FileParseHandler implements SkillHandler {
   // --- Result builder: parse LLM output into structured data ---
 
   private buildResult(
-    ctx: SkillContext,
-    type: 'csv' | 'pdf' | 'image' | 'html',
+    ctx: ToolContext,
+    type: 'csv' | 'pdf' | 'image' | 'html' | 'text' | 'xml' | 'markdown',
     llmText: string,
     extractAs: ExtractAs,
     isStructured: boolean,
     rawTextOverride?: string,
-  ): SkillResult {
+  ): ToolResult {
     if (!isStructured) {
       // raw text extraction (e.g. image transcription)
       return { success: true, data: { type, raw_text: llmText, structured: null, confidence: 0.8 } };
@@ -334,69 +381,123 @@ export class FileParseHandler implements SkillHandler {
     }
   }
 
-  /**
-   * Validate and resolve a file:// URL to an absolute filesystem path.
-   * Only allows paths under known temp store directories to prevent path traversal.
-   * Resolves symlinks to prevent symlink-based escape from the allowed directory.
-   * Returns null if the URL is invalid or points outside the allowed directories.
-   */
-  private async resolveTempFileUrl(url: string): Promise<string | null> {
-    if (!url.startsWith('file://')) return null;
+}
 
-    const filePath = path.resolve(url.slice('file://'.length));
+interface IcsProperty {
+  name: string;
+  params: Record<string, string>;
+  value: string;
+}
 
-    // Allow paths under the production tmpfs mount or the /tmp fallback (local dev).
-    // Both are restricted directories where only TempFileStore writes.
-    // Include CURIA_TEMPFILE_DIR if set, so this stays in sync with TempFileStore config.
-    const allowedPrefixes = ['/run/curia-tempfiles/', '/tmp/curia-tempfiles/'];
-    const customDir = process.env.CURIA_TEMPFILE_DIR;
-    if (customDir) {
-      const normalized = path.resolve(customDir);
-      allowedPrefixes.push(normalized.endsWith('/') ? normalized : normalized + '/');
-    }
-    const logicallyAllowed = allowedPrefixes.some((prefix) => filePath.startsWith(prefix));
-    if (!logicallyAllowed) return null;
+function parseIcsInvite(text: string): Record<string, unknown> {
+  const properties = unfoldIcsLines(text).map(parseIcsProperty).filter((prop): prop is IcsProperty => prop !== null);
+  const method = firstValue(properties, 'METHOD');
+  const eventProperties = firstEventProperties(properties);
+  const uid = firstValue(eventProperties, 'UID');
+  const summary = firstValue(eventProperties, 'SUMMARY');
+  const status = firstValue(eventProperties, 'STATUS');
+  const sequence = firstValue(eventProperties, 'SEQUENCE');
+  const startProp = firstProperty(eventProperties, 'DTSTART');
+  const endProp = firstProperty(eventProperties, 'DTEND');
+  const organizerProp = firstProperty(eventProperties, 'ORGANIZER');
+  const attendees = eventProperties
+    .filter((prop) => prop.name === 'ATTENDEE')
+    .map((prop) => ({
+      email: mailtoValue(prop.value),
+      name: prop.params.CN ?? null,
+      participationStatus: prop.params.PARTSTAT ?? null,
+      role: prop.params.ROLE ?? null,
+    }));
 
-    // Resolve symlinks to prevent a symlink inside the allowed directory from
-    // pointing to files outside it (e.g. ln -s /etc/shadow /tmp/curia-tempfiles/x).
-    let realPath: string;
-    try {
-      realPath = await fs.realpath(filePath);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        // File doesn't exist — return the logical path and let the
-        // caller's fs.readFile produce the "expired" error message.
-        return filePath;
-      }
-      // EACCES, EIO, etc. — can't verify the real path, reject the URL.
-      // Don't fall back to the logical path since that would bypass the
-      // symlink check on a path we couldn't resolve.
-      return null;
-    }
-
-    // Resolve the prefix directories too — on macOS /tmp is a symlink to
-    // /private/tmp, so both sides of the comparison must be resolved.
-    const resolvedPrefixes = await Promise.all(
-      allowedPrefixes.map(async (prefix) => {
-        try {
-          // realpath the directory (without trailing slash), then re-add it
-          return await fs.realpath(prefix.slice(0, -1)) + '/';
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-            // Unexpected error resolving a prefix dir — fall back to the
-            // original string rather than failing the entire validation.
-            // This is less security-critical since we control the prefix values.
-          }
-          return prefix;
+  return {
+    method: method ?? null,
+    uid: uid ?? null,
+    summary: summary ?? null,
+    status: status ?? null,
+    sequence: sequence ?? null,
+    start: startProp ? parseIcsDate(startProp.value) : null,
+    end: endProp ? parseIcsDate(endProp.value) : null,
+    startTimezone: startProp?.params.TZID ?? null,
+    endTimezone: endProp?.params.TZID ?? null,
+    organizer: organizerProp
+      ? {
+          email: mailtoValue(organizerProp.value),
+          name: organizerProp.params.CN ?? null,
         }
-      }),
-    );
-    const allPrefixes = [...new Set([...allowedPrefixes, ...resolvedPrefixes])];
-    const reallyAllowed = allPrefixes.some((prefix) => realPath.startsWith(prefix));
-    if (!reallyAllowed) return null;
+      : null,
+    attendees,
+  };
+}
 
-    return realPath;
+function unfoldIcsLines(text: string): string[] {
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const unfolded: string[] = [];
+  for (const line of lines) {
+    if ((line.startsWith(' ') || line.startsWith('\t')) && unfolded.length > 0) {
+      const previous = unfolded[unfolded.length - 1]!;
+      unfolded[unfolded.length - 1] = previous + line.slice(1);
+    } else if (line.trim()) {
+      unfolded.push(line);
+    }
   }
+  return unfolded;
+}
+
+function parseIcsProperty(line: string): IcsProperty | null {
+  const colon = line.indexOf(':');
+  if (colon === -1) return null;
+  const head = line.slice(0, colon);
+  const value = unescapeIcsText(line.slice(colon + 1));
+  const [rawName, ...rawParams] = head.split(';');
+  if (!rawName) return null;
+  const params: Record<string, string> = {};
+  for (const rawParam of rawParams) {
+    const eq = rawParam.indexOf('=');
+    if (eq === -1) continue;
+    const key = rawParam.slice(0, eq).toUpperCase();
+    const paramValue = rawParam.slice(eq + 1).replace(/^"|"$/g, '');
+    params[key] = unescapeIcsText(paramValue);
+  }
+  return { name: rawName.toUpperCase(), params, value };
+}
+
+function firstEventProperties(properties: IcsProperty[]): IcsProperty[] {
+  const begin = properties.findIndex((prop) => prop.name === 'BEGIN' && prop.value.toUpperCase() === 'VEVENT');
+  if (begin === -1) return properties;
+  const end = properties.findIndex((prop, index) => index > begin && prop.name === 'END' && prop.value.toUpperCase() === 'VEVENT');
+  return properties.slice(begin + 1, end === -1 ? undefined : end);
+}
+
+function firstProperty(properties: IcsProperty[], name: string): IcsProperty | null {
+  return properties.find((prop) => prop.name === name) ?? null;
+}
+
+function firstValue(properties: IcsProperty[], name: string): string | null {
+  return firstProperty(properties, name)?.value ?? null;
+}
+
+function parseIcsDate(value: string): string {
+  const dateMatch = /^(\d{4})(\d{2})(\d{2})$/.exec(value);
+  if (dateMatch) {
+    return `${dateMatch[1]!}-${dateMatch[2]!}-${dateMatch[3]!}`;
+  }
+  const dateTimeMatch = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$/.exec(value);
+  if (!dateTimeMatch) return value;
+  const hasUtcSuffix = dateTimeMatch[7] === 'Z';
+  const iso = `${dateTimeMatch[1]!}-${dateTimeMatch[2]!}-${dateTimeMatch[3]!}T${dateTimeMatch[4]!}:${dateTimeMatch[5]!}:${dateTimeMatch[6]!}${hasUtcSuffix ? 'Z' : ''}`;
+  return hasUtcSuffix ? new Date(iso).toISOString() : iso;
+}
+
+function mailtoValue(value: string): string {
+  return value.replace(/^mailto:/i, '').trim();
+}
+
+function unescapeIcsText(value: string): string {
+  return value
+    .replace(/\\n/gi, '\n')
+    .replace(/\\,/g, ',')
+    .replace(/\\;/g, ';')
+    .replace(/\\\\/g, '\\');
 }
 
 const BLOCK_ELEMENTS = new Set([

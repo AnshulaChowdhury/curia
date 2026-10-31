@@ -1,0 +1,270 @@
+// Unit tests for the console chat endpoints:
+//   POST /api/chat/messages — publish a message and ack 202 (reply arrives over SSE)
+//   GET  /api/chat/stream  — SSE event stream
+//
+// Focuses on the auth guard and the ack contract. The reply delivery is covered
+// by the SSE stream (see event-router tests); here we only need to verify that
+// the routes are wired up correctly and enforce the session/secret auth.
+
+import Fastify from 'fastify';
+import cookie from '@fastify/cookie';
+import type { Pool } from 'pg';
+import type { Logger } from '../../../../src/logger.js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { chatRoutes } from '../../../../src/channels/http/routes/chat.js';
+import type { EventBus } from '../../../../src/bus/bus.js';
+import { type EventRouter } from '../../../../src/channels/http/event-router.js';
+import type { SessionStore } from '../../../../src/channels/http/session-auth.js';
+
+function createLogger(): Logger {
+  return {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    fatal: vi.fn(),
+    child: vi.fn(),
+  } as unknown as Logger;
+}
+
+// Minimal pool mock — the chat endpoints never touch the DB.
+function createPool(): Pick<Pool, 'query'> {
+  return { query: vi.fn() } as unknown as Pick<Pool, 'query'>;
+}
+
+// The ack-and-stream POST no longer calls waitForResponse; it only publishes and
+// returns 202. We keep addSseClient/setupSubscriptions for the stream route wiring.
+function createMockEventRouter(): EventRouter {
+  return {
+    waitForResponse: vi.fn(),
+    cancelPending: vi.fn(),
+    addSseClient: vi.fn().mockReturnValue(() => { /* cleanup noop */ }),
+    setupSubscriptions: vi.fn(),
+  } as unknown as EventRouter;
+}
+
+function createMockBus(): EventBus {
+  return {
+    publish: vi.fn().mockResolvedValue(undefined),
+    subscribe: vi.fn(),
+  } as unknown as EventBus;
+}
+
+describe('chatRoutes', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // ── Auth: unauthenticated requests must be rejected ────────────────────
+
+  it('POST /api/chat/messages — 401 with no auth', async () => {
+    const app = Fastify();
+    await app.register(cookie);
+    await app.register(chatRoutes, {
+      pool: createPool() as Pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'test-secret',
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+      sessions: new Map() as unknown as SessionStore,
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/chat/messages',
+      payload: { message: 'hello' },
+    });
+
+    expect(response.statusCode).toBe(401);
+    await app.close();
+  });
+
+  it('GET /api/chat/stream — 401 with no auth', async () => {
+    const app = Fastify();
+    await app.register(cookie);
+    await app.register(chatRoutes, {
+      pool: createPool() as Pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'test-secret',
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+      sessions: new Map() as unknown as SessionStore,
+    });
+
+    // inject() can't hold an SSE connection open, but the auth guard fires
+    // before hijack(), so we get a normal 401 response.
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/chat/stream',
+    });
+
+    expect(response.statusCode).toBe(401);
+    await app.close();
+  });
+
+  // ── Happy path: authenticated via x-web-bootstrap-secret header ───────
+
+  it('POST /api/chat/messages — 202 ack with valid bootstrap-secret header', async () => {
+    const bus = createMockBus();
+    const eventRouter = createMockEventRouter();
+
+    const app = Fastify();
+    await app.register(cookie);
+    await app.register(chatRoutes, {
+      pool: createPool() as Pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'test-secret',
+      bus,
+      eventRouter,
+      sessions: new Map() as unknown as SessionStore,
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/chat/messages',
+      headers: { 'x-web-bootstrap-secret': 'test-secret' },
+      payload: { message: 'What is on the agenda?', conversationId: 'test-convo-1' },
+    });
+
+    expect(response.statusCode).toBe(202);
+    const body = response.json();
+    expect(body.conversationId).toBe('test-convo-1');
+    // The reply now arrives over SSE, not in the POST body.
+    expect(body.reply).toBeUndefined();
+
+    // The inbound message was published; the handler does NOT block on a reply.
+    expect(bus.publish).toHaveBeenCalledOnce();
+    expect(eventRouter.waitForResponse).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  it('POST /api/chat/messages — 400 when message is empty', async () => {
+    const app = Fastify();
+    await app.register(cookie);
+    await app.register(chatRoutes, {
+      pool: createPool() as Pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'test-secret',
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+      sessions: new Map() as unknown as SessionStore,
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/chat/messages',
+      headers: { 'x-web-bootstrap-secret': 'test-secret' },
+      payload: { message: '   ' },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toMatch(/message/);
+    await app.close();
+  });
+
+  it('POST /api/chat/messages — 500 when publish fails synchronously', async () => {
+    const bus = {
+      publish: vi.fn().mockRejectedValue(new Error('bus down')),
+      subscribe: vi.fn(),
+    } as unknown as EventBus;
+
+    const app = Fastify();
+    await app.register(cookie);
+    await app.register(chatRoutes, {
+      pool: createPool() as Pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'test-secret',
+      bus,
+      eventRouter: createMockEventRouter(),
+      sessions: new Map() as unknown as SessionStore,
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/chat/messages',
+      headers: { 'x-web-bootstrap-secret': 'test-secret' },
+      payload: { message: 'hello', conversationId: 'c-fail' },
+    });
+
+    expect(response.statusCode).toBe(500);
+    await app.close();
+  });
+
+  it('POST /api/chat/messages — auto-generates conversationId when omitted', async () => {
+    const bus = createMockBus();
+    const eventRouter = createMockEventRouter();
+
+    const app = Fastify();
+    await app.register(cookie);
+    await app.register(chatRoutes, {
+      pool: createPool() as Pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'test-secret',
+      bus,
+      eventRouter,
+      sessions: new Map() as unknown as SessionStore,
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/chat/messages',
+      headers: { 'x-web-bootstrap-secret': 'test-secret' },
+      payload: { message: 'hi' },
+    });
+
+    expect(response.statusCode).toBe(202);
+    const body = response.json();
+    expect(typeof body.conversationId).toBe('string');
+    expect(body.conversationId.length).toBeGreaterThan(0);
+    expect(eventRouter.waitForResponse).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  // ── 503 when the secret is not configured ─────────────────────────────
+
+  it('POST /api/chat/messages — 503 when webAppBootstrapSecret is undefined', async () => {
+    const app = Fastify();
+    await app.register(cookie);
+    await app.register(chatRoutes, {
+      pool: createPool() as Pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: undefined,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+      sessions: new Map() as unknown as SessionStore,
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/chat/messages',
+      payload: { message: 'hello' },
+    });
+
+    // assertSecret returns 503 when the secret is not configured (feature disabled).
+    expect(response.statusCode).toBe(503);
+    await app.close();
+  });
+});
+
+describe('console shell routes', () => {
+  it('GET /old — chatRoutes no longer defines this route (returns 404 in isolation; the SPA catch-all is not registered here)', async () => {
+    const app = Fastify();
+    await app.register(cookie);
+    await app.register(chatRoutes, {
+      pool: createPool() as Pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'test-secret',
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+      sessions: new Map() as unknown as SessionStore,
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/old' });
+
+    expect(response.statusCode).toBe(404);
+
+    await app.close();
+  });
+});

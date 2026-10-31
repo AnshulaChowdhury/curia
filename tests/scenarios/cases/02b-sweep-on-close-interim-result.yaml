@@ -1,0 +1,71 @@
+# Case 2 (#1956, rewritten for #1972): the "interim" half of the old sweep-on-close rule.
+# The original stub had ceo-inbox say "I've emailed Dana… waiting on her reply", which
+# ceo-inbox cannot do: it has no send tools and only drafts. Its real result is a draft
+# in the principal's mailbox. Waiting on Dana does not keep the principal-facing entry
+# open either — Dana's reply reaches ceo-inbox through inbox triage, not through this
+# entry (the [ACTIVE OUTBOUND CONTEXT] block is injected on principal turns only).
+# Whether the entry stays open is now the platform's call (delegate's result shape plus
+# the specialist's context-bridge-keep-open), so the coordinator's job here is to route,
+# link, leave the release alone, and report the result honestly.
+name: sweep-on-close interim result
+description: >
+  ceo-inbox asked the principal whether to accept Dana's proposed meeting time. The
+  principal says to counter-propose. ceo-inbox drafts a reply to Dana suggesting
+  another time and leaves it in the principal's Drafts. The coordinator routes and links
+  the entry, does not release it itself, and does not claim the meeting is set.
+tags: [outbound-context, lifecycle]
+seed:
+  outbound_context:
+    - key: dana
+      channel: email
+      agent: ceo-inbox
+      content: >
+        Dana Whitfield proposed Tuesday 8am for the partnership call. Accept, or should I
+        suggest another time?
+      expected_reply: accept or counter-propose
+      delegation_hint: ceo-inbox
+      sent_minutes_ago: 20
+inbound:
+  from: principal
+  content: 8am is too early — suggest Tuesday at 11 instead.
+tool_stubs:
+  delegate:
+    - match: {}
+      return:
+        agent: ceo-inbox
+        response: >
+          Drafted a reply to Dana suggesting Tuesday at 11am instead. It's in your Drafts,
+          ready to send.
+  # A coordinator release of a hinted entry is refused in production (#1972). The stub
+  # succeeds only so that path stays available for leaves_release_to_platform to test.
+  context-bridge-release:
+    - match: {}
+      return: { released: "{{entry:dana}}" }
+expected_behaviors:
+  - id: routes_and_links
+    weight: critical
+    description: >
+      Delegates to ceo-inbox, linking the entry as outbound_entry_id or by quoting its id
+      in the brief.
+    check:
+      any_of:
+        - called: delegate
+          with: { agent: ceo-inbox, outbound_entry_id: "{{entry:dana}}" }
+        - called: delegate
+          with: { agent: ceo-inbox }
+          contains: { task: "{{entry:dana}}" }
+  - id: leaves_release_to_platform
+    weight: important
+    description: Does not call context-bridge-release for the entry itself.
+    check:
+      not_called: [context-bridge-release]
+  - id: honest_status
+    weight: important
+    description: >
+      If it replies, it says a reply suggesting Tuesday at 11 was drafted for the
+      principal to send — not that it was sent, that Dana agreed, or that the call is
+      booked.
+failure_modes:
+  - Tells the principal the call is confirmed or that Dana has agreed
+  - Says the email to Dana was sent when it was only drafted
+  - Answers the principal itself instead of routing to ceo-inbox

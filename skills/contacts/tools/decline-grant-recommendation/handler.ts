@@ -1,0 +1,66 @@
+import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
+import type { TaskOriginator } from '../../../../src/contacts/types.js';
+import { isUuid } from '../../../../src/util/uuid.js';
+
+// SECURITY: sensitivity: "elevated" — authorization is enforced solely by the execution-layer
+// live-principal gate (#1126). No handler-level re-check.
+export class DeclineGrantRecommendationHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
+    const { recommendation_id } = ctx.input as { recommendation_id?: string };
+    if (!recommendation_id || !isUuid(recommendation_id)) {
+      return { success: false, error: 'Missing or invalid required input: recommendation_id (UUID)' };
+    }
+    if (!ctx.contactService) {
+      return { success: false, error: 'decline-grant-recommendation: contactService not available' };
+    }
+
+    const originator = ctx.taskMetadata?.originator as TaskOriginator | undefined;
+    const actorId = ctx.caller?.contactId ?? originator?.contactId;
+    if (!actorId || !isUuid(actorId)) {
+      return { success: false, error: 'Cannot determine valid actor identity for audit trail' };
+    }
+
+    try {
+      const rec = await ctx.contactService.getGrantRecommendation(recommendation_id);
+      if (!rec) {
+        return { success: false, error: `Grant recommendation '${recommendation_id}' not found.` };
+      }
+      // Already declined: report success so a retry after a failed task-complete can go
+      // on to close the recommendation's task instead of dead-ending here (#2129).
+      if (rec.status === 'declined') {
+        return {
+          success: true,
+          data: {
+            recommendation_id,
+            contact_id: rec.contactId,
+            permission: rec.permission,
+            status: 'declined',
+            already_resolved: true,
+          },
+        };
+      }
+      if (rec.status !== 'pending') {
+        return { success: false, error: `Recommendation is already ${rec.status} — cannot decline.` };
+      }
+
+      const declined = await ctx.contactService.declineGrantRecommendation(recommendation_id, actorId);
+      if (!declined) {
+        return { success: false, error: 'Decline failed — recommendation may have been concurrently resolved.' };
+      }
+      ctx.log.info({ recommendationId: recommendation_id, contactId: rec.contactId, permission: rec.permission, actorId }, 'decline-grant-recommendation: declined (anti-nag recorded)');
+      return {
+        success: true,
+        data: {
+          recommendation_id,
+          contact_id: rec.contactId,
+          permission: rec.permission,
+          status: 'declined',
+        },
+      };
+    } catch (err) {
+      ctx.log.error({ err, recommendationId: recommendation_id, actorId }, 'decline-grant-recommendation: failed');
+      const message = err instanceof Error ? err.message : String(err);
+      return { success: false, error: `Failed to decline recommendation: ${message}` };
+    }
+  }
+}

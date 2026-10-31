@@ -1,39 +1,12 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, Fragment } from 'react';
 import { MobileMenuContext } from '../context/MobileMenu.js';
 import { Sidebar } from '../components/Sidebar.js';
 import { Topbar, TopbarSearch } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
-
-// ── Types (mirror src/registry/types.ts RegistryEntry) ──────────────────────
-type DerivedState = 'uninstalled' | 'installed' | 'enabled' | 'ghost';
-
-interface ManifestMetadata {
-  name: string;
-  description: string;
-  version: string;
-  actionRisk?: string | number;
-  sensitivity?: string;
-  capabilities?: string[];
-  role?: string;
-  modelTier?: string;
-  memoryScopes?: string[];
-  // PR2 (#939): vault keys a skill declares in install.requires_secrets. Cross-referenced
-  // against GET /api/vault/status to show configured/missing status and gate install/enable.
-  requiresSecrets?: string[];
-}
-
-interface RegistryEntry {
-  name: string;
-  kind: 'skill' | 'agent';
-  state: DerivedState;
-  metadata: ManifestMetadata | null;
-  manifestError?: string;
-  installedAt: string | null;
-  installedBy: string | null;
-  enabledAt: string | null;
-  enabledBy: string | null;
-}
+// Types + row-tree builder live in registry-rows.ts, shared with its unit tests
+// (mirrors src/registry/types.ts RegistryEntry).
+import { buildRows, collateralPins, formatCapabilities, registryPathSegment, uninstallBlockedReason, type RegistryEntry, type DerivedState, type Row } from './registry-rows.js';
 
 // Map each DerivedState to one of the existing .status-pill modifier classes
 // (app.css) so no new CSS is needed:
@@ -130,9 +103,12 @@ function SecretRow({ name, configured, onSaved }: {
 
 // ── Detail drawer ────────────────────────────────────────────────────────────
 
-function RegistryDrawer({ entry, kindPath, onClose, onChanged }: {
+function RegistryDrawer({ entry, row, agents, onClose, onChanged }: {
   entry: RegistryEntry;
-  kindPath: 'skills' | 'agents';
+  // Only populated on the /tools path — used to warn before a bundle disable strips a
+  // tool that some other agent pins directly (#1724).
+  row?: Row;
+  agents: RegistryEntry[];
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -140,7 +116,7 @@ function RegistryDrawer({ entry, kindPath, onClose, onChanged }: {
   const [err, setErr] = useState<string | null>(null);
 
   // PR2 (#939): required-secrets gate. Only skills declare install.requires_secrets.
-  const required = entry.kind === 'skill' ? (entry.metadata?.requiresSecrets ?? []) : [];
+  const required = entry.kind === 'tool' ? (entry.metadata?.requiresSecrets ?? []) : [];
   const [configured, setConfigured] = useState<Set<string>>(new Set());
   const [secretsErr, setSecretsErr] = useState<string | null>(null);
 
@@ -177,7 +153,10 @@ function RegistryDrawer({ entry, kindPath, onClose, onChanged }: {
     setErr(null);
     try {
       const res = await apiFetch(
-        `/api/registry/${kindPath}/${encodeURIComponent(entry.name)}${suffix}`,
+        // Route by the entry's own kind, not the page it's rendered on — a bundle
+        // (`kind: 'skill'`) must hit /api/registry/skills/..., even though bundle rows
+        // render on the /tools page alongside standalone tools (finding #1).
+        `/api/registry/${registryPathSegment(entry.kind)}/${encodeURIComponent(entry.name)}${suffix}`,
         { method },
       );
       if (!res.ok) throw new Error(await errorMessage(res));
@@ -187,13 +166,70 @@ function RegistryDrawer({ entry, kindPath, onClose, onChanged }: {
     } finally {
       setBusy(false);
     }
-  }, [entry.name, kindPath, onChanged]);
+  }, [entry.name, entry.kind, onChanged]);
+
+  // Non-null when the server would refuse this uninstall (an enabled bundle). Drives both
+  // the disabled state and the explanatory copy below the action row.
+  const uninstallBlocked = uninstallBlockedReason(entry);
 
   const confirmUninstall = () => {
+    // Belt and braces: the button is already disabled in this state, but a stray caller
+    // must not be able to fire a delete the server will reject.
+    if (uninstallBlocked !== null) return;
     if (window.confirm(`Uninstall "${entry.name}"? This removes its registry row.`)) {
       void act('DELETE', '');
     }
   };
+
+  // Disabling a bundle cascades to its member tools. Some of those tools may be pinned
+  // directly by a different agent that never asked for the bundle at all — silently
+  // stripping them from that agent's function list (the real-world case: T2125-expense-tracker
+  // pins ceo-inbox-search/ceo-inbox-download-attachment, both ceo-inbox members). Warn the
+  // operator with the affected agents before letting the disable through. Non-bundle rows
+  // (or rows we weren't given, e.g. the /agents page) skip straight to true — nothing cascades.
+  const confirmDisable = useCallback((): boolean => {
+    // Key the guard on the entry's own kind, not `row?.rowKind` — `row` is only
+    // populated on the /tools page (see prop comment above), so `row?.rowKind !==
+    // 'bundle'` used to default to true (skip the warning entirely) whenever `row` was
+    // undefined. `entry.kind` is authoritative and always present (finding #3).
+    if (entry.kind !== 'skill') return true;
+
+    if (!row || row.rowKind !== 'bundle') {
+      // We know this is a bundle but don't have its member-tool row data to list what
+      // will be affected — still confirm, with a generic warning rather than silently
+      // letting the cascade through unwarned.
+      return window.confirm(
+        [
+          `Disable the "${entry.name}" bundle?`,
+          '',
+          'This also disables its member tools, but the exact list could not be determined.',
+          '',
+          'Takes effect on the next restart.',
+        ].join('\n'),
+      );
+    }
+
+    const collateral = collateralPins(row, agents);
+    const lines = [
+      `Disable the "${entry.name}" bundle?`,
+      '',
+      `This also disables ${row.members.length} member tool${row.members.length === 1 ? '' : 's'}.`,
+    ];
+    if (collateral.length > 0) {
+      lines.push(
+        '',
+        'These member tools are pinned directly by other agents, which will lose them:',
+        ...collateral.map(c => `  • ${c.tool} — ${c.agents.join(', ')}`),
+      );
+    }
+    lines.push('', 'Takes effect on the next restart.');
+    return window.confirm(lines.join('\n'));
+  }, [row, agents, entry.name, entry.kind]);
+
+  const capabilityLine = formatCapabilities(
+    entry.metadata?.capabilities,
+    entry.metadata?.optionalCapabilities,
+  );
 
   return (
     <aside className="drawer">
@@ -240,7 +276,7 @@ function RegistryDrawer({ entry, kindPath, onClose, onChanged }: {
                 <label>Version</label>
                 <div>{entry.metadata.version}</div>
               </div>
-              {entry.kind === 'skill' && (
+              {entry.kind === 'tool' && (
                 <>
                   <div className="form-field">
                     <label>Action risk</label>
@@ -258,16 +294,12 @@ function RegistryDrawer({ entry, kindPath, onClose, onChanged }: {
                     <label>Role / model</label>
                     <div>{entry.metadata.role ?? '—'} / {entry.metadata.modelTier ?? '—'}</div>
                   </div>
-                  <div className="form-field">
-                    <label>Memory scopes</label>
-                    <div>{entry.metadata.memoryScopes?.join(', ') || '—'}</div>
-                  </div>
                 </>
               )}
-              {entry.metadata.capabilities && (
+              {capabilityLine !== null && (
                 <div className="form-field">
                   <label>Capabilities</label>
-                  <div>{entry.metadata.capabilities.join(', ') || '—'}</div>
+                  <div>{capabilityLine}</div>
                 </div>
               )}
             </>
@@ -353,22 +385,32 @@ function RegistryDrawer({ entry, kindPath, onClose, onChanged }: {
             type="button"
             className="btn btn-secondary btn-sm"
             disabled={busy}
-            onClick={() => void act('POST', '/disable')}
+            onClick={() => { if (confirmDisable()) void act('POST', '/disable'); }}
           >
             Disable
           </button>
         )}
 
-        {/* Uninstall — available for any entry that has a registry row */}
+        {/* Uninstall — available for any entry that has a registry row. Kept visible but
+            inert for an enabled bundle: the server refuses that delete, so offering a live
+            button would invite a click that can only end in a 400. The tooltip carries the
+            reason and the remedy, which is more useful than hiding the control and leaving
+            the operator to wonder where it went. */}
         {entry.state !== 'uninstalled' && (
           <button
             type="button"
             className="btn btn-danger btn-sm"
-            disabled={busy}
+            disabled={busy || uninstallBlocked !== null}
+            title={uninstallBlocked ?? undefined}
             onClick={confirmUninstall}
           >
             Uninstall
           </button>
+        )}
+        {uninstallBlocked && (
+          <p style={{ margin: 0, fontSize: 12, color: 'var(--app-fg-muted)' }}>
+            {uninstallBlocked}
+          </p>
         )}
       </div>
     </aside>
@@ -424,7 +466,7 @@ function Pagination({ total, page, pageSize, totalPages, onPage, onPageSize }: P
 
 // Sort key covers columns from both kinds; kind-specific ones only appear
 // in the table when the relevant kind is active.
-type SortKey = 'name' | 'state' | 'version' | 'modelTier' | 'memoryScopes' | 'actionRisk' | 'sensitivity';
+type SortKey = 'name' | 'state' | 'version' | 'modelTier' | 'actionRisk' | 'sensitivity';
 
 function actionRiskToSortKey(v: string | number | null | undefined): string {
   // Normalize to a zero-padded 3-digit number string so lexicographic sort = numeric sort.
@@ -441,7 +483,6 @@ function getSortValue(entry: RegistryEntry, key: SortKey): string {
     case 'state':        return entry.state;
     case 'version':      return entry.metadata?.version ?? '';
     case 'modelTier':    return entry.metadata?.modelTier ?? '';
-    case 'memoryScopes': return entry.metadata?.memoryScopes?.join(', ') ?? '';
     case 'actionRisk':   return actionRiskToSortKey(entry.metadata?.actionRisk);
     case 'sensitivity':  return entry.metadata?.sensitivity ?? '';
     default:             return '';
@@ -455,12 +496,16 @@ function getSortValue(entry: RegistryEntry, key: SortKey): string {
 // settings shell; they are now top-level pages reachable directly from the
 // sidebar's Settings group.
 
-function RegistryPage({ kind }: { kind: 'skill' | 'agent' }) {
-  const kindPath = kind === 'skill' ? 'skills' : 'agents';
+function RegistryPage({ kind }: { kind: 'tool' | 'agent' }) {
+  const kindPath = kind === 'tool' ? 'tools' : 'agents';
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const [entries, setEntries] = useState<RegistryEntry[]>([]);
+  const [rows, setRows] = useState<Row[]>([]);
+  // Retained on the /tools path so the drawer can warn which enabled agents pin a
+  // bundle's member tools directly, without a second round-trip to /api/registry/agents.
+  const [agents, setAgents] = useState<RegistryEntry[]>([]);
   const [selected, setSelected] = useState<RegistryEntry | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
@@ -468,6 +513,16 @@ function RegistryPage({ kind }: { kind: 'skill' | 'agent' }) {
   const [pageSize, setPageSize] = useState(10);
   const [sort, setSort] = useState<{ key: SortKey; dir: 'asc' | 'desc' }>({ key: 'name', dir: 'asc' });
   const [stateFilter, setStateFilter] = useState<'all' | DerivedState>('all');
+  // Bundle rows collapse by default — a bundle with 14 members would otherwise
+  // dominate the first page.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggleExpanded = useCallback((name: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset['mobileSidebar'] = mobileOpen ? 'open' : '';
@@ -475,21 +530,54 @@ function RegistryPage({ kind }: { kind: 'skill' | 'agent' }) {
 
   const load = useCallback(async () => {
     try {
-      const res = await apiFetch(`/api/registry/${kindPath}`);
-      if (!res.ok) throw new Error(await errorMessage(res));
-      const data = await res.json() as Record<string, RegistryEntry[]>;
-      const list = data[kindPath] ?? [];
-      setEntries(list);
-      setLoadError(null); // clear any prior error on successful reload
-      // Keep the drawer in sync with the freshly-loaded state so action
-      // buttons reflect the true current state after a transition.
+      if (kind === 'agent') {
+        const res = await apiFetch('/api/registry/agents');
+        if (!res.ok) throw new Error(await errorMessage(res));
+        const data = await res.json() as { agents?: RegistryEntry[] };
+        const list = data.agents ?? [];
+        setEntries(list);
+        // Read here, unused on this path (only /tools's drawer needs the agent
+        // list) — set it anyway so `agents` never carries stale data from a
+        // previous /tools load.
+        setAgents(list);
+        setRows(list.map(e => ({
+          entry: e, rowKind: 'tool' as const, members: [], pinnedBy: [], unresolvedFor: [],
+        })));
+        setLoadError(null);
+        setSelected(prev => (prev ? list.find(e => e.name === prev.name) ?? null : null));
+        return;
+      }
+
+      // /tools merges three endpoints: bundles, tools, and agents (agents only so an
+      // unresolved pin can be flagged against agents that are actually enabled).
+      const [skillsRes, toolsRes, agentsRes] = await Promise.all([
+        apiFetch('/api/registry/skills'),
+        apiFetch('/api/registry/tools'),
+        apiFetch('/api/registry/agents'),
+      ]);
+      for (const res of [skillsRes, toolsRes, agentsRes]) {
+        if (!res.ok) throw new Error(await errorMessage(res));
+      }
+      const skills = (await skillsRes.json() as { skills?: RegistryEntry[] }).skills ?? [];
+      const tools = (await toolsRes.json() as { tools?: RegistryEntry[] }).tools ?? [];
+      const agentList = (await agentsRes.json() as { agents?: RegistryEntry[] }).agents ?? [];
+
+      const built = buildRows(skills, tools, agentList);
+      setRows(built);
+      // `entries` stays the flat list the search/sort/filter/pagination code already uses.
+      setEntries(built.map(r => r.entry));
+      setAgents(agentList);
+      setLoadError(null);
       setSelected(prev =>
-        prev ? list.find(e => e.name === prev.name) ?? null : null,
+        prev ? built.map(r => r.entry).find(e => e.name === prev.name) ?? null : null,
       );
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : 'Failed to load');
     }
-  }, [kindPath]);
+  }, [kind]);
+
+  // Lookup so the render can find a row (bundle members, pin state) for a paged entry.
+  const rowByName = useMemo(() => new Map(rows.map(r => [r.entry.name, r])), [rows]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -533,9 +621,10 @@ function RegistryPage({ kind }: { kind: 'skill' | 'agent' }) {
   const safePage = Math.min(page, totalPages);
   const pageRows = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
 
-  const title = kind === 'skill' ? 'Skills' : 'Agents';
-  // Name, State, two kind-specific columns, Version.
-  const colCount = 5;
+  const title = kind === 'tool' ? 'Tools' : 'Agents';
+  // Name, State, kind-specific columns, Version. Agents have one kind-specific
+  // column (Model tier); tools have four (Type, Action risk, Sensitivity, Pinned by).
+  const colCount = kind === 'agent' ? 4 : 7;
 
   return (
     <MobileMenuContext.Provider value={{ open: mobileOpen, setOpen: setMobileOpen }}>
@@ -602,6 +691,7 @@ function RegistryPage({ kind }: { kind: 'skill' | 'agent' }) {
                               Name <span className="sort-arrow">{sortArrow('name')}</span>
                             </button>
                           </th>
+                          {kind === 'tool' && <th>Type</th>}
                           <th className="sortable" aria-sort={sort.key === 'state' ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none'}>
                             <button className="sort-btn" onClick={() => toggleSort('state')}>
                               State <span className="sort-arrow">{sortArrow('state')}</span>
@@ -612,11 +702,6 @@ function RegistryPage({ kind }: { kind: 'skill' | 'agent' }) {
                               <th className="sortable" aria-sort={sort.key === 'modelTier' ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none'}>
                                 <button className="sort-btn" onClick={() => toggleSort('modelTier')}>
                                   Model tier <span className="sort-arrow">{sortArrow('modelTier')}</span>
-                                </button>
-                              </th>
-                              <th className="sortable" aria-sort={sort.key === 'memoryScopes' ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none'}>
-                                <button className="sort-btn" onClick={() => toggleSort('memoryScopes')}>
-                                  Memory scopes <span className="sort-arrow">{sortArrow('memoryScopes')}</span>
                                 </button>
                               </th>
                             </>
@@ -632,6 +717,7 @@ function RegistryPage({ kind }: { kind: 'skill' | 'agent' }) {
                                   Sensitivity <span className="sort-arrow">{sortArrow('sensitivity')}</span>
                                 </button>
                               </th>
+                              <th>Pinned by</th>
                             </>
                           )}
                           <th className="sortable" aria-sort={sort.key === 'version' ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none'}>
@@ -642,36 +728,98 @@ function RegistryPage({ kind }: { kind: 'skill' | 'agent' }) {
                         </tr>
                       </thead>
                       <tbody>
-                        {pageRows.map(e => (
-                          <tr
-                            key={e.name}
-                            className={selected?.name === e.name ? 'active' : undefined}
-                            onClick={() => setSelected(e)}
-                            style={{ cursor: 'pointer' }}
-                          >
-                            {/* Warn icon if the manifest failed to parse */}
-                            <td>{e.name}{e.manifestError ? ' ⚠' : ''}</td>
-                            <td>
-                              <span className={`status-pill ${STATE_PILL[e.state]}`}>
-                                {/* Extra warning on ghost: manifest is gone but DB row lingers */}
-                                {e.state}{e.state === 'ghost' ? ' ⚠' : ''}
-                              </span>
-                            </td>
-                            {kind === 'agent' ? (
-                              <>
-                                <td>{e.metadata?.modelTier ?? '—'}</td>
-                                <td>{e.metadata?.memoryScopes?.join(', ') || '—'}</td>
-                              </>
-                            ) : (
-                              <>
-                                {/* actionRisk may be 0 (a valid risk score), so guard on null, not falsy. */}
-                                <td>{e.metadata?.actionRisk != null ? String(e.metadata.actionRisk) : '—'}</td>
-                                <td>{e.metadata?.sensitivity ?? '—'}</td>
-                              </>
-                            )}
-                            <td>{e.metadata?.version ?? '—'}</td>
-                          </tr>
-                        ))}
+                        {pageRows.map(e => {
+                          const row = rowByName.get(e.name);
+                          const isBundle = row?.rowKind === 'bundle';
+                          const isOpen = expanded.has(e.name);
+                          // A bundle is "broken" when it's pinned by at least one enabled
+                          // agent but the bundle itself isn't enabled — those tools are
+                          // silently missing from that agent's function list.
+                          const broken = (row?.unresolvedFor.length ?? 0) > 0;
+                          return (
+                            <Fragment key={e.name}>
+                              <tr
+                                className={selected?.name === e.name ? 'active' : undefined}
+                                onClick={() => setSelected(e)}
+                                style={{ cursor: 'pointer' }}
+                              >
+                                <td>
+                                  {isBundle && (
+                                    <button
+                                      type="button"
+                                      aria-label={`${isOpen ? 'Collapse' : 'Expand'} ${e.name}`}
+                                      aria-expanded={isOpen}
+                                      onClick={ev => { ev.stopPropagation(); toggleExpanded(e.name); }}
+                                      style={{
+                                        background: 'none', border: 'none', cursor: 'pointer',
+                                        padding: '0 6px 0 0', color: 'inherit', font: 'inherit',
+                                      }}
+                                    >
+                                      {isOpen ? '▾' : '▸'}
+                                    </button>
+                                  )}
+                                  {/* Warn icon if the manifest failed to parse */}
+                                  {e.name}{e.manifestError ? ' ⚠' : ''}
+                                </td>
+                                {kind === 'tool' && (
+                                  <td>
+                                    <span className="status-pill">
+                                      {isBundle ? 'bundle' : 'tool'}
+                                    </span>
+                                  </td>
+                                )}
+                                <td>
+                                  <span className={`status-pill ${STATE_PILL[e.state]}`}>
+                                    {/* Extra warning on ghost: manifest is gone but DB row lingers */}
+                                    {e.state}{e.state === 'ghost' ? ' ⚠' : ''}
+                                  </span>
+                                </td>
+                                {kind === 'agent' ? (
+                                  <>
+                                    <td>{e.metadata?.modelTier ?? '—'}</td>
+                                  </>
+                                ) : (
+                                  <>
+                                    {/* actionRisk may be 0 (a valid risk score), so guard on null, not falsy. */}
+                                    <td>{e.metadata?.actionRisk != null ? String(e.metadata.actionRisk) : '—'}</td>
+                                    <td>{e.metadata?.sensitivity ?? '—'}</td>
+                                    <td>
+                                      {broken ? (
+                                        <span
+                                          className="status-pill blocked"
+                                          title={
+                                            `${row!.unresolvedFor.join(', ')} pin${row!.unresolvedFor.length === 1 ? 's' : ''} ` +
+                                            `this bundle. It is not enabled, so ${row!.members.length} ` +
+                                            `tool${row!.members.length === 1 ? '' : 's'} are missing from ` +
+                                            `${row!.unresolvedFor.length === 1 ? 'that agent' : 'those agents'}' function list.`
+                                          }
+                                        >
+                                          ⚠ {row!.unresolvedFor.join(', ')}
+                                        </span>
+                                      ) : (
+                                        row?.pinnedBy.length ? row.pinnedBy.join(', ') : '—'
+                                      )}
+                                    </td>
+                                  </>
+                                )}
+                                <td>{e.metadata?.version ?? '—'}</td>
+                              </tr>
+                              {isBundle && isOpen && row!.members.map(m => (
+                                <tr key={`${e.name}:${m.name}`} style={{ opacity: 0.75 }}>
+                                  <td style={{ paddingLeft: 28 }}>{m.name}</td>
+                                  <td />
+                                  <td>
+                                    <span className={`status-pill ${STATE_PILL[m.state]}`}>{m.state}</span>
+                                  </td>
+                                  <td colSpan={3} style={{ fontSize: 12, color: 'var(--app-fg-muted)' }}>
+                                    managed by {e.name}
+                                  </td>
+                                  <td>{m.metadata?.version ?? '—'}</td>
+                                </tr>
+                              ))}
+                            </Fragment>
+                          );
+                        })}
                         {pageRows.length === 0 && (
                           <tr>
                             <td colSpan={colCount} style={{ textAlign: 'center', padding: 40, color: 'var(--app-fg-muted)' }}>
@@ -696,7 +844,8 @@ function RegistryPage({ kind }: { kind: 'skill' | 'agent' }) {
                   <RegistryDrawer
                     key={selected.name}
                     entry={selected}
-                    kindPath={kindPath}
+                    row={rowByName.get(selected.name)}
+                    agents={agents}
                     onClose={() => setSelected(null)}
                     onChanged={() => { void load(); }}
                   />
@@ -712,8 +861,8 @@ function RegistryPage({ kind }: { kind: 'skill' | 'agent' }) {
 
 // ── Exported page components (one per route) ─────────────────────────────────
 
-export function SkillsPage() {
-  return <RegistryPage kind="skill" />;
+export function ToolsPage() {
+  return <RegistryPage kind="tool" />;
 }
 
 export function AgentsPage() {

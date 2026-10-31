@@ -1,4 +1,6 @@
 // action-log-types.ts — TypeScript types for the autonomy_action_log table.
+import type { SendRecipientPin } from '../skills/_shared/recipient-reference.js';
+import type { DisclosureAsk } from './disclosure-decisions.js';
 //
 // These mirror the Postgres schema from migration 031. The scoring engine,
 // approval lifecycle skills (#427/#428), and the DreamEngine scoring pass
@@ -13,6 +15,7 @@ export const TERMINAL_OUTCOMES = [
   'denied',
   'expired',
   'resolved_externally',
+  'shadow_evaluated', // ADR-029 / #1426 — pre-scored by shadow-reconciler
 ] as const;
 
 /** Outcomes that require an LLM judge call (not deterministically scorable). */
@@ -27,14 +30,15 @@ export type ActionLogOutcome =
   | 'approved'
   | 'denied'
   | 'expired'
-  | 'resolved_externally';
+  | 'resolved_externally'
+  | 'shadow_evaluated';
 
 /** A row from autonomy_action_log. */
 export interface ActionLogRow {
   id: number;
   taskId: string;
   conversationId: string | null;
-  skillName: string;
+  toolName: string;
   actionRisk: string;
   outcome: ActionLogOutcome;
   taskSummary: string | null;
@@ -52,16 +56,44 @@ export interface ActionLogRow {
   expiresAt: Date | null;
   parentActionId: number | null;
   shortRef: string | null;
+  /**
+   * The small number the principal types to answer a pending approval ("approve 3"), in place
+   * of shortRef (#2159 Phase 3). Allocated at insert, unique among rows of the last 7 days.
+   * Null on non-approval rows, on approvals raised before migration 098, and when all 999
+   * numbers were in use (the approval then falls back to its shortRef).
+   */
+  approvalNumber: number | null;
   description: string | null;
+  /**
+   * Hinted recipients pinned at approval time. Null on older rows and on
+   * approvals that did not use a label hint. Not skill input (#2047).
+   */
+  sendResolution?: SendRecipientPin[] | null;
+  /**
+   * The personal-data ask a held send carries (#2312): approving the row records the
+   * principal's yes, denying it their no. Null on every other row. Not skill input.
+   */
+  disclosureAsk?: DisclosureAsk | null;
 
   createdAt: Date;
+}
+
+/**
+ * How a pending approval is named back to the principal: `Approval <n>` when the row has a number
+ * (#2159 Phase 3, the only identifier its notification showed), otherwise its short_ref (what an
+ * unnumbered notification showed; approval-delivery renders `shortRef ?? id`, mirrored here).
+ * Confirmations and errors must never name a reference the principal was not shown.
+ */
+export function approvalLabel(row: Pick<ActionLogRow, 'approvalNumber' | 'shortRef' | 'id'>): string {
+  if (row.approvalNumber != null) return `Approval ${row.approvalNumber}`;
+  return row.shortRef ?? String(row.id);
 }
 
 /** Fields required to insert a new autonomy_action_log row. */
 export interface ActionLogInsert {
   taskId: string;
   conversationId?: string;
-  skillName: string;
+  toolName: string;
   actionRisk: string;
   outcome: ActionLogOutcome;
   taskSummary?: string;
@@ -73,6 +105,18 @@ export interface ActionLogInsert {
   description?: string;
   /** Links a re-execution row back to the approved row. Used by approve-action (#428). */
   parentActionId?: number;
+  /** Hinted-recipient pin. Stored beside the skill payload, never inside it. */
+  sendResolution?: SendRecipientPin[] | null;
+  /** A held send's personal-data ask (#2312). Stored beside the skill payload, never inside it. */
+  disclosureAsk?: DisclosureAsk;
+
+  /**
+   * Pre-scored flags (shadow-reconciler / #1426). When scoredBy is set, findUnscoredTerminal
+   * skips the row. Only competenceFlag is set at insert time; commitment_flag / compatibility
+   * are populated later by the Phase 3 scoring-pass update, never at insert.
+   */
+  competenceFlag?: 0 | 1 | null;
+  scoredBy?: string;
 }
 
 /** Scoring flags written by the scoring pass or deterministic scorer. */
@@ -85,7 +129,7 @@ export interface ScoringFlags {
 
 /**
  * Deterministic scoring table for approval/gate outcomes.
- * These outcomes carry inherent trust signals from the CEO's decision
+ * These outcomes carry inherent trust signals from the principal's decision
  * (or the gate's decision) and do not need LLM interpretation.
  *
  * null means "no signal for this dimension" — the row is excluded from
@@ -94,10 +138,27 @@ export interface ScoringFlags {
 export const DETERMINISTIC_SCORES: Record<string, ScoringFlags> = {
   approved:            { competenceFlag: 1, commitmentFlag: 1, compatibility: 1,    scoredBy: 'deterministic' },
   denied:              { competenceFlag: 0, commitmentFlag: null, compatibility: 0, scoredBy: 'deterministic' },
-  expired:             { competenceFlag: null, commitmentFlag: 1, compatibility: 0, scoredBy: 'deterministic' },
+  // An approval that lapsed says nothing about Curia's judgement: the principal may simply not have seen it (#2159 Phase 3).
+  expired:             { competenceFlag: null, commitmentFlag: null, compatibility: null, scoredBy: 'deterministic' },
   resolved_externally: { competenceFlag: 1, commitmentFlag: 1, compatibility: null, scoredBy: 'deterministic' },
   rejected:            { competenceFlag: 0, commitmentFlag: 1, compatibility: null, scoredBy: 'deterministic' },
 };
+
+/**
+ * Who resolved a pending approval (autonomy_action_log.resolved_by). Only `principal`
+ * counts as the principal's own feedback in the scoring pass (#2159). Rows written
+ * before #2159 carry 'ceo' for every tool and reaction resolution.
+ */
+export const RESOLVED_BY = {
+  /** The principal acted directly, e.g. a 👍/👎 reaction on the approval message. */
+  principal: 'principal',
+  /** An agent called a resolve tool on its own reading of the conversation. */
+  coordinator: 'coordinator',
+  /** The principal acted in the console (Waiting on you). Same signal as `principal`. */
+  console: 'console',
+  /** Expiry sweep or gate rejection. */
+  system: 'system',
+} as const;
 
 /** Result of resolving a short_ref to a pending_approval row. */
 export type ResolveResult =
@@ -106,3 +167,11 @@ export type ResolveResult =
   | { found: false; reason: 'ambiguous'; error: string; pending: ActionLogRow[] }
   | { found: false; reason: 'expired'; error: string }
   | { found: false; reason: 'already_resolved'; error: string };
+
+/**
+ * Appended to every error for a reference that matched nothing usable (not found, expired,
+ * already resolved), and by approve-/deny-/dismiss-action to an unusable reference. A retry
+ * with no reference falls back to the sole pending approval, which may not be the one the
+ * principal named, so the coordinator is told to ask instead.
+ */
+export const NO_REF_RETRY_GUIDANCE = 'Do not retry without a reference; ask the principal which approval they meant.';

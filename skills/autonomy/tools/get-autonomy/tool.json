@@ -1,0 +1,22 @@
+{
+  "name": "get-autonomy",
+  "description": "Report the agent's current global autonomy score, band, and recent change history. Use this when the principal asks about autonomy level, trust level, or how independently the agent is operating.",
+  "version": "1.0.1",
+  "sensitivity": "normal",
+  "inputs": {},
+  "outputs": {
+    "score": "number",
+    "band": "string",
+    "lastSetBy": "string",
+    "trend": "string | null",
+    "scoredActionCount": "number",
+    "summary": "string"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 10000,
+  "action_risk": "none",
+  "capabilities": [
+    "autonomyService"
+  ]
+}

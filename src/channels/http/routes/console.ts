@@ -11,9 +11,9 @@
 
 import type { FastifyPluginAsync } from 'fastify';
 import fastifyStatic from '@fastify/static';
-import { join, resolve, relative } from 'node:path';
+import { join } from 'node:path';
 import { existsSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { containedStaticFile } from './static-path-guard.js';
 
 export const consoleRoutes: FastifyPluginAsync = async (app) => {
   const consoleDist = join(process.cwd(), 'apps', 'console', 'dist');
@@ -27,8 +27,7 @@ export const consoleRoutes: FastifyPluginAsync = async (app) => {
         .type('text/html; charset=utf-8')
         .send(
           '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Curia</title></head>' +
-          '<body style="font-family:system-ui;padding:2rem">' +
-          '<p>Console not built. Run: <code>pnpm build:console</code></p></body></html>',
+          '<body><p>Console not built. Run: <code>pnpm build:console</code></p></body></html>',
         );
     });
     return;
@@ -48,25 +47,15 @@ export const consoleRoutes: FastifyPluginAsync = async (app) => {
 
     // Try to serve a real file (assets, favicon, manifest, etc.).
     if (urlPath) {
-      // Normalize the path and reject anything that escapes consoleDist (e.g. "../../etc").
-      // path.resolve collapses ".." segments; path.relative confirms containment.
-      const absPath = resolve(consoleDist, urlPath);
-      if (relative(consoleDist, absPath).startsWith('..')) {
-        // Path traversal attempt — treat as a SPA route rather than probing the filesystem.
-        return reply.sendFile('index.html');
-      }
-      try {
-        const s = await stat(absPath);
-        if (s.isFile()) return reply.sendFile(urlPath);
-      } catch (err) {
-        // ENOENT = path doesn't exist in dist/ — expected, fall through to SPA fallback.
-        // Any other error (EACCES, EMFILE, etc.) is a real filesystem problem; re-throw
-        // so Fastify's error handler returns a 500 and logs it.
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      // Lexical + realpath containment (rejects .. and symlink escapes). Null means
+      // missing / not a file / escape — all become SPA fallback rather than probing.
+      const contained = await containedStaticFile(consoleDist, urlPath);
+      if (contained) {
+        return reply.sendFile(contained.safeRel, contained.rootReal);
       }
     }
 
     // Serve index.html for root and all client-side routes.
-    return reply.sendFile('index.html');
+    return reply.sendFile('index.html', consoleDist);
   });
 };

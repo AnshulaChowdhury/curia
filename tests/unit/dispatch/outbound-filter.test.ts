@@ -1,8 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { OutboundContentFilter } from '../../../src/dispatch/outbound-filter.js';
+import { OutboundContentFilter, PRINCIPAL_NOTE_MARKUP_DETAIL } from '../../../src/dispatch/outbound-filter.js';
 import type { OutboundJudge } from '../../../src/dispatch/outbound-judge.js';
 import type { FilterRecipient } from '../../../src/dispatch/outbound-filter.js';
 import type { EscalationJudge, EscalationVerdict } from '../../../src/autonomy/escalation-judge.js';
+import { applyDisclosurePolicy } from '../../../src/autonomy/escalation-policy.js';
+import { createSilentLogger } from '../../../src/logger.js';
 
 const armin: FilterRecipient = { email: 'armin@external.com', isPrincipal: false };
 const principalRcpt: FilterRecipient = { email: 'ceo@example.com', isPrincipal: true };
@@ -34,6 +36,34 @@ const BASE_INPUT = {
 };
 
 describe('OutboundContentFilter', () => {
+  describe('principal-note-markup rule (prompt trim PR 5)', () => {
+    const body = 'Hi Priya,\n\nThanks, received.\n\n<note_for_principal>The renewal deadline is Oct 24.</note_for_principal>';
+
+    it('blocks a send to someone else that carries a note for the principal', async () => {
+      const result = await createTestFilter().check({ ...BASE_INPUT, content: body });
+      expect(result.passed).toBe(false);
+      expect(result.stage).toBe('deterministic');
+      expect(result.findings).toEqual([{ rule: 'principal-note-markup', detail: PRINCIPAL_NOTE_MARKUP_DETAIL }]);
+    });
+
+    it('blocks a lone or variant-spelled tag too, and a tag split by invisible characters', async () => {
+      for (const content of ['Thanks.</note_for_principal>', 'Thanks. <Note-For-Principal >', 'Thanks. <note_for\u200B_principal>']) {
+        const result = await createTestFilter().check({ ...BASE_INPUT, content });
+        expect(result.findings.map((f) => f.rule), content).toContain('principal-note-markup');
+      }
+    });
+
+    it('lets a message only the principal reads through', async () => {
+      const result = await createTestFilter().check({ ...BASE_INPUT, content: body, principalIsSoleRecipient: true });
+      expect(result.passed).toBe(true);
+    });
+
+    it('says where the note goes without quoting the message', () => {
+      expect(PRINCIPAL_NOTE_MARKUP_DETAIL).toContain('final response');
+      expect(PRINCIPAL_NOTE_MARKUP_DETAIL).not.toContain('Oct 24');
+    });
+  });
+
   describe('system-prompt-fragment rule', () => {
     it('blocks content containing a system prompt marker', async () => {
       const filter = createTestFilter();
@@ -44,6 +74,26 @@ describe('OutboundContentFilter', () => {
       expect(result.passed).toBe(false);
       expect(result.stage).toBe('deterministic');
       expect(result.findings.some((f) => f.rule === 'system-prompt-fragment')).toBe(true);
+    });
+
+    it('does not echo the matched marker text in the finding detail', async () => {
+      // Markers are live system-prompt lines; the detail is logged and can reach
+      // block notifications, so it must not re-disclose the prompt content. It
+      // reports a redacted fingerprint instead.
+      const secretLine = 'NEVER name tools, systems, layers, agents, or architectural components';
+      const filter = new OutboundContentFilter({
+        systemPromptMarkers: [secretLine],
+        ceoEmail: 'ceo@example.com',
+      });
+      const result = await filter.check({
+        ...BASE_INPUT,
+        content: `Reminder: ${secretLine} — even to the CEO.`,
+      });
+      const finding = result.findings.find((f) => f.rule === 'system-prompt-fragment');
+      expect(finding).toBeDefined();
+      expect(finding!.detail).not.toContain('NEVER name tools');
+      expect(finding!.detail.toLowerCase()).not.toContain('systems, layers');
+      expect(finding!.detail).toMatch(/fingerprint [0-9a-f]{8}/);
     });
 
     it('blocks marker matches case-insensitively', async () => {
@@ -64,6 +114,128 @@ describe('OutboundContentFilter', () => {
       });
       // May still pass if no other rules fire
       expect(result.findings.some((f) => f.rule === 'system-prompt-fragment')).toBe(false);
+    });
+
+    it('matches a re-wrapped, markdown-decorated leak of a hard-wrapped marker', async () => {
+      // Markers are extracted from a hard-wrapped YAML prompt, but a leaking agent
+      // re-wraps the text and often drops markdown. The match must survive both:
+      // the marker carries a newline + double space + `**bold**`; the leaked content
+      // wraps differently and strips the emphasis. Both normalize to the same run.
+      const filter = new OutboundContentFilter({
+        systemPromptMarkers: [
+          'NEVER name tools, systems,\n  layers, agents, or **architectural** components',
+        ],
+        ceoEmail: 'ceo@example.com',
+      });
+      const result = await filter.check({
+        ...BASE_INPUT,
+        content:
+          'For reference: NEVER name tools, systems, layers, agents, or architectural components — even to the CEO.',
+      });
+      expect(result.passed).toBe(false);
+      expect(result.findings.some((f) => f.rule === 'system-prompt-fragment')).toBe(true);
+    });
+
+    it('blocks verbatim constraint phrases for non-principal recipients', async () => {
+      const filter = createTestFilter();
+      const result = await filter.check({
+        ...BASE_INPUT,
+        content: 'Reminder: professional but approachable is our standard.',
+      });
+      expect(result.passed).toBe(false);
+      expect(result.findings.some((f) => f.rule === 'system-prompt-fragment')).toBe(true);
+    });
+
+    it('blocks instruction-prefix patterns for non-principal recipients', async () => {
+      const filter = new OutboundContentFilter({
+        systemPromptMarkers: ['When you receive a task'],
+        ceoEmail: 'ceo@example.com',
+      });
+      const result = await filter.check({
+        ...BASE_INPUT,
+        content: 'When you receive a task, delegate to the specialist.',
+      });
+      expect(result.passed).toBe(false);
+      expect(result.findings.some((f) => f.rule === 'system-prompt-fragment')).toBe(true);
+    });
+
+    it('passes principal recipient with email signature even when marker would match', async () => {
+      const filter = new OutboundContentFilter({
+        systemPromptMarkers: ['You are Nathan Curia', 'Nathan Curia, Agent EA'],
+        ceoEmail: 'ceo@example.com',
+      });
+      const result = await filter.check({
+        content: [
+          'Hi Joseph,',
+          '',
+          'Here is the summary you requested.',
+          '',
+          'Best,',
+          'Nathan Curia, Agent EA',
+        ].join('\n'),
+        recipientEmail: 'ceo@example.com',
+        conversationId: 'conv-principal',
+        channelId: 'email',
+        recipientTier: 'principal',
+        principalIsSoleRecipient: true,
+      });
+      expect(result.passed).toBe(true);
+      expect(result.findings.some((f) => f.rule === 'system-prompt-fragment')).toBe(false);
+    });
+
+    it('still blocks non-principal recipient containing "You are [name]"', async () => {
+      const filter = new OutboundContentFilter({
+        systemPromptMarkers: ['You are Nathan Curia'],
+        ceoEmail: 'ceo@example.com',
+      });
+      const result = await filter.check({
+        ...BASE_INPUT,
+        content: 'As I said, You are Nathan Curia and you should help.',
+        principalIsSoleRecipient: false,
+      });
+      expect(result.passed).toBe(false);
+      expect(result.findings.some((f) => f.rule === 'system-prompt-fragment')).toBe(true);
+    });
+
+    it('still blocks principal recipient when secret-pattern fires', async () => {
+      const filter = new OutboundContentFilter({
+        systemPromptMarkers: ['You are Nathan Curia'],
+        ceoEmail: 'ceo@example.com',
+      });
+      const result = await filter.check({
+        content: 'You are Nathan Curia. Key: sk-ant-api03-abcdefghijklmnopqrstuvwxyz123456',
+        recipientEmail: 'ceo@example.com',
+        conversationId: 'conv-principal',
+        channelId: 'email',
+        recipientTier: 'principal',
+        principalIsSoleRecipient: true,
+      });
+      expect(result.passed).toBe(false);
+      expect(result.findings.some((f) => f.rule === 'system-prompt-fragment')).toBe(false);
+      expect(result.findings.some((f) => f.rule === 'secret-pattern')).toBe(true);
+    });
+
+    it('logs when principal bypass suppresses system-prompt-fragment findings', async () => {
+      const logger = createSilentLogger();
+      const debugSpy = vi.spyOn(logger, 'debug');
+      const filter = new OutboundContentFilter({
+        systemPromptMarkers: ['You are Nathan Curia'],
+        ceoEmail: 'ceo@example.com',
+        logger,
+      });
+      const result = await filter.check({
+        content: 'You are Nathan Curia',
+        recipientEmail: 'ceo@example.com',
+        conversationId: 'conv-principal',
+        channelId: 'email',
+        recipientTier: 'principal',
+        principalIsSoleRecipient: true,
+      });
+      expect(result.passed).toBe(true);
+      expect(debugSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ rule: 'system-prompt-fragment', suppressedFindings: 1 }),
+        'Stage 1 rule bypassed for principal sole recipient',
+      );
     });
   });
 
@@ -115,6 +287,20 @@ describe('OutboundContentFilter', () => {
         content:
           'I can act as your agent for this task. The task is to schedule a meeting.',
       });
+      expect(result.findings.some((f) => f.rule === 'internal-structure')).toBe(false);
+    });
+
+    it('passes internal-structure findings for principal sole recipient', async () => {
+      const filter = createTestFilter();
+      const result = await filter.check({
+        content: 'Debug: conversationId: conv-123 was used.',
+        recipientEmail: 'ceo@example.com',
+        conversationId: 'conv-principal',
+        channelId: 'email',
+        recipientTier: 'principal',
+        principalIsSoleRecipient: true,
+      });
+      expect(result.passed).toBe(true);
       expect(result.findings.some((f) => f.rule === 'internal-structure')).toBe(false);
     });
   });
@@ -208,6 +394,23 @@ describe('OutboundContentFilter', () => {
         content: 'You can reach the CEO at ceo@example.com for follow-ups.',
       });
       expect(result.findings.some((f) => f.rule === 'contact-data-leak')).toBe(false);
+    });
+
+    // Prompt trim PR 6: a draft sent with send-draft is filtered with its signature, which
+    // may carry the assistant's own address. It is the sender's, not a third party's.
+    it('allows the assistant\'s own mailbox addresses', async () => {
+      const filter = new OutboundContentFilter({
+        systemPromptMarkers: [],
+        ceoEmail: 'ceo@example.com',
+        ownEmails: ['Assistant@Office.example'],
+      });
+      const allowed = await filter.check({
+        ...BASE_INPUT,
+        content: 'Thanks!\n\n--\nAlex Curia | assistant@office.example',
+      });
+      expect(allowed.findings.some((f) => f.rule === 'contact-data-leak')).toBe(false);
+      const other = await filter.check({ ...BASE_INPUT, content: 'Reach me at someone@office.example' });
+      expect(other.findings.some((f) => f.rule === 'contact-data-leak')).toBe(true);
     });
 
     it('blocks a third-party email even when recipient and CEO emails are also present', async () => {
@@ -642,11 +845,219 @@ describe('Stage 2.5 escalation judge delegation', () => {
     const filter = filterWithEscalationJudge(judge);
     await filter.check({
       ...BASE_INPUT,
-      recipientTier: 'trusted',
+      recipientTier: 'known',
       content: 'Here is the contract draft.',
     });
     expect(judge.classifyDisclosure).toHaveBeenCalledWith(
-      expect.objectContaining({ recipientTier: 'trusted' }),
+      expect.objectContaining({ recipientTier: 'known' }),
     );
+  });
+
+  it.each(['principal', 'trusted'] as const)(
+    'does not call the judge for %s recipients — the policy allows every class, so the LLM call can only add a fail-closed block (#1225, #1870)',
+    async (recipientTier) => {
+      // A fail-closed LLM failure in classifyDisclosure() returns decision='escalate' without
+      // reaching applyDisclosurePolicy. For these tiers the policy allows all classes, so the
+      // guard short-circuits before the call.
+      const judge = makeEscalationJudge({ decision: 'escalate', reason: 'would block if called' });
+      const filter = filterWithEscalationJudge(judge);
+      const result = await filter.check({
+        ...BASE_INPUT,
+        recipientTier,
+        content: 'Here is your daily recap: 3 open tasks, 1 pending approval.',
+      });
+      expect(result.passed).toBe(true);
+      expect(judge.classifyDisclosure).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not call the judge when the principal is the sole recipient, even if the tier lookup failed (#1870)', async () => {
+    // principalIsSoleRecipient is structural (verified channel identities), so it holds
+    // when a contact-DB failure left recipientTier at 'unknown'.
+    const judge = makeEscalationJudge({ decision: 'escalate', reason: 'would block if called' });
+    const filter = filterWithEscalationJudge(judge);
+    const result = await filter.check({
+      ...BASE_INPUT,
+      recipientTier: 'unknown',
+      recipientTierUnresolved: true,
+      principalIsSoleRecipient: true,
+      content: 'Your 3pm moved to 4pm.',
+    });
+    expect(result.passed).toBe(true);
+    expect(judge.classifyDisclosure).not.toHaveBeenCalled();
+  });
+
+  describe('principal-directed sends (#1870)', () => {
+    // The 2026-09-17 case: over Signal, the principal told Curia to give an external
+    // `known` contact a third party's surname. The judge here applies the REAL policy
+    // table to a third-party classification, so it escalates for `known`.
+    const THIRD_PARTY_TO_KNOWN = "Sarah's surname is Okafor — she'll be joining the call.";
+    function thirdPartyJudge(): EscalationJudge {
+      return {
+        isEnabled: vi.fn(() => true),
+        classifyDisclosure: vi.fn(async ({ recipientTier }: { recipientTier: Parameters<typeof applyDisclosurePolicy>[0] }) => ({
+          decision: applyDisclosurePolicy(recipientTier, 'third-party'),
+          disclosureClass: 'third-party' as const,
+          reason: 'names another contact',
+        })),
+      } as unknown as EscalationJudge;
+    }
+
+    it('does not block a third-party disclosure to a known contact that the principal directed', async () => {
+      const judge = thirdPartyJudge();
+      const filter = filterWithEscalationJudge(judge);
+      const result = await filter.check({
+        ...BASE_INPUT,
+        recipientTier: 'known',
+        principalDirected: true,
+        content: THIRD_PARTY_TO_KNOWN,
+      });
+      expect(result.passed).toBe(true);
+      expect(judge.classifyDisclosure).not.toHaveBeenCalled();
+    });
+
+    it('blocks the same disclosure when it is autonomous (not principal-directed)', async () => {
+      const judge = thirdPartyJudge();
+      const filter = filterWithEscalationJudge(judge);
+      const result = await filter.check({
+        ...BASE_INPUT,
+        recipientTier: 'known',
+        content: THIRD_PARTY_TO_KNOWN,
+      });
+      expect(result.passed).toBe(false);
+      expect(result.stage).toBe('disclosure-gate');
+      expect(result.findings).toEqual([{
+        rule: 'disclosure-tier-gate',
+        detail: "Disclosure class 'third-party' not permitted for tier 'known'",
+      }]);
+    });
+  });
+
+  it('labels a block whose unknown tier came from a failed contact lookup (#1870)', async () => {
+    // Decision: an unresolved tier is evaluated as 'unknown' (fail-closed). The finding
+    // says so, so the audit trail can tell an outage-caused block from one on the merits.
+    const judge = makeEscalationJudge({
+      decision: 'escalate',
+      disclosureClass: 'principal-context',
+      reason: 'availability to an unknown recipient',
+    });
+    const filter = filterWithEscalationJudge(judge);
+    const result = await filter.check({
+      ...BASE_INPUT,
+      recipientTier: 'unknown',
+      recipientTierUnresolved: true,
+      content: 'Joseph is free on Thursday afternoon.',
+    });
+    expect(result.passed).toBe(false);
+    expect(result.findings[0]!.detail).toBe(
+      "Disclosure class 'principal-context' not permitted for tier 'unknown' (recipient tier unresolved: contact lookup failed)",
+    );
+  });
+
+  describe('disclosureGateStatus()', () => {
+    it("is 'no-judge' when no escalation judge is wired", () => {
+      expect(createTestFilter().disclosureGateStatus()).toBe('no-judge');
+    });
+
+    it("is 'judge-disabled' when the judge's kill switch is off", () => {
+      const judge = makeEscalationJudge({ decision: 'allow', reason: 'x' }, false);
+      expect(filterWithEscalationJudge(judge).disclosureGateStatus()).toBe('judge-disabled');
+    });
+
+    it("is 'active' when an enabled judge is wired", () => {
+      const judge = makeEscalationJudge({ decision: 'allow', reason: 'x' });
+      expect(filterWithEscalationJudge(judge).disclosureGateStatus()).toBe('active');
+    });
+  });
+
+  it('still calls the judge and blocks for non-principal recipients when the judge escalates', async () => {
+    // Belt-and-suspenders: confirm the principal short-circuit does not weaken
+    // the gate for non-principal recipients.
+    const judge = makeEscalationJudge({
+      decision: 'escalate',
+      disclosureClass: 'principal-context',
+      reason: 'CEO availability should not reach unknown contacts',
+    });
+    const filter = filterWithEscalationJudge(judge);
+    const result = await filter.check({
+      ...BASE_INPUT,
+      recipientTier: 'unknown',
+      content: 'Joseph is free on Thursday afternoon.',
+    });
+    expect(result.passed).toBe(false);
+    expect(result.stage).toBe('disclosure-gate');
+    expect(judge.classifyDisclosure).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('band gating (#2159)', () => {
+  it('passes a third-party address to a known recipient under band', async () => {
+    const filter = new OutboundContentFilter({ systemPromptMarkers: [], ceoEmail: 'principal@example.com', gating: 'band' });
+    const result = await filter.check({
+      content: 'Adam is copied at adam@example.com.', recipientEmail: 'joel@example.com',
+      conversationId: 'c', channelId: 'email', recipientTier: 'known',
+    });
+    expect(result.passed).toBe(true);
+  });
+
+  it('still blocks it under tier (the default)', async () => {
+    const filter = new OutboundContentFilter({ systemPromptMarkers: [], ceoEmail: 'principal@example.com' });
+    const result = await filter.check({
+      content: 'Adam is copied at adam@example.com.', recipientEmail: 'joel@example.com',
+      conversationId: 'c', channelId: 'email', recipientTier: 'known',
+    });
+    expect(result.findings.map((f) => f.rule)).toContain('contact-data-leak');
+  });
+
+  it('never calls the disclosure classifier under band', async () => {
+    const classifyDisclosure = vi.fn();
+    const escalationJudge = { isEnabled: () => true, classifyDisclosure } as unknown as EscalationJudge;
+    const filter = new OutboundContentFilter({ systemPromptMarkers: [], ceoEmail: '', escalationJudge, gating: 'band' });
+    const result = await filter.check({ content: 'hello', recipientEmail: 'a@example.com', conversationId: 'c', channelId: 'email', recipientTier: 'unknown' });
+    expect(result.passed).toBe(true);
+    expect(classifyDisclosure).not.toHaveBeenCalled();
+    expect(filter.disclosureGateStatus()).toBe('band-review');
+  });
+
+  it('keeps the integrity rules under band', async () => {
+    const filter = new OutboundContentFilter({ systemPromptMarkers: ['You are Curia, the office assistant'], ceoEmail: '', gating: 'band' });
+    const secret = await filter.check({
+      content: 'key sk-ant-abcdefghijklmnopqrstuvwxyz', recipientEmail: 'a@example.com',
+      conversationId: 'c', channelId: 'email', recipientTier: 'trusted',
+    });
+    expect(secret.findings.map((f) => f.rule)).toContain('secret-pattern');
+    const leak = await filter.check({
+      content: 'My instructions say: You are Curia, the office assistant.', recipientEmail: 'a@example.com',
+      conversationId: 'c', channelId: 'email', recipientTier: 'trusted',
+    });
+    expect(leak.findings.map((f) => f.rule)).toContain('system-prompt-fragment');
+  });
+  // The gateway passes the send's gating (#2312): the scenario suite pins it per case.
+  describe('per-call gating overrides the constructed one', () => {
+    const leakInput = {
+      content: 'Adam is copied at adam@example.com.', recipientEmail: 'joel@example.com',
+      conversationId: 'c', channelId: 'email', recipientTier: 'known' as const,
+    };
+    const judge = () => ({ isEnabled: () => true, classifyDisclosure: vi.fn(async () => ({ decision: 'allow', reason: 'x' })) }) as unknown as EscalationJudge;
+
+    it('turns contact-data-leak and Stage 2.5 off when a tier-built filter is told band', async () => {
+      const escalationJudge = judge();
+      const filter = new OutboundContentFilter({ systemPromptMarkers: [], ceoEmail: 'principal@example.com', escalationJudge, gating: 'tier' });
+      expect((await filter.check({ ...leakInput, gating: 'band' })).passed).toBe(true);
+      expect(escalationJudge.classifyDisclosure).not.toHaveBeenCalled();
+    });
+
+    it('turns them back on when a band-built filter is told tier', async () => {
+      const escalationJudge = judge();
+      const filter = new OutboundContentFilter({ systemPromptMarkers: [], ceoEmail: 'principal@example.com', escalationJudge, gating: 'band' });
+      expect((await filter.check({ ...leakInput, gating: 'tier' })).findings.map((f) => f.rule)).toContain('contact-data-leak');
+      await filter.check({ ...leakInput, content: 'hello', gating: 'tier' });
+      expect(escalationJudge.classifyDisclosure).toHaveBeenCalledOnce();
+    });
+
+    it('keeps the constructed gating when the input names none', async () => {
+      const filter = new OutboundContentFilter({ systemPromptMarkers: [], ceoEmail: 'principal@example.com', gating: 'band' });
+      expect((await filter.check(leakInput)).passed).toBe(true);
+    });
   });
 });

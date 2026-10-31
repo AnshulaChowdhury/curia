@@ -44,11 +44,61 @@ When an error occurs during agent execution:
      <message>Nylas API request timed out after 30s</message>
      <attempt>2 of 3</attempt>
      <suggestion>Consider using a different mailbox or retrying later</suggestion>
+     <reporting_constraint>This call did not succeed. Do not state or imply to the user that this action was completed unless a later attempt at it succeeds. Work that did succeed in this turn may be reported normally.</reporting_constraint>
    </task_error>
    ```
    <!-- TODO: Evaluate TOON (Token-Oriented Object Notation) as a more token-efficient
         alternative to XML for this structured block. See #55. -->
 3. **Resume, don't restart** — the LLM sees the full history including the error, and can make an informed decision: retry with different parameters, try an alternative skill, or report to the user.
+
+### Action-reporting honesty (#1546)
+
+A failed tool call must not be reported to the user as a completed action. In the
+incident behind #1546 the coordinator called `resolve-learning-digest`, got
+`success: false`, and thirteen seconds later told the CEO "Got it — I've noted the
+dismissal." The item stayed pending.
+
+**This was not a missing-information failure.** The `<task_error>` block was in
+context with `is_error: true` when the reply was written. The model had the
+evidence and did not weight it — an attention failure, not a knowledge gap.
+
+**Mechanism: `<reporting_constraint>`, carried by every `<task_error>`.** The
+constraint states the rule at the point of maximum salience — the last line of the
+error block, immediately before generation resumes — instead of relying on a rule
+several hundred lines up in the system prompt. It is scoped in two directions: a
+later successful attempt at the same action is reportable as success, and other
+work in the same turn is unaffected. Both carve-outs matter; a blanket "never
+claim success" rule suppresses honest reporting of the work that did land.
+
+`coordinator.yaml` carries a matching prose rule. Prompt and constraint are the
+same control at two altitudes, not a primary and a backstop.
+
+**There is no outbound truthfulness gate, by design.** The two-stage outbound
+filter (`src/dispatch/outbound-filter.ts`) is a *disclosure* control — Stage 2
+returns `{"leak": true|false}` and Stage 2.5 classifies tier-sensitive disclosure.
+Neither evaluates whether a claim is true, for any recipient. Its
+principal-sole-recipient bypass is correct for that purpose and is not a coverage
+gap in honesty.
+
+A runtime guard that inspected the finished reply and rewrote suspected
+success-claims was built and rejected (#1579). Detecting a false success claim
+means classifying English prose, and the words that carry the claim — "noted",
+"done", "confirmed", "completed" — are also ordinary state description ("standup
+confirmed", "4 tasks completed") and plain acknowledgement ("noted — I'll hold
+off"). A keyword rule fired on roughly 40% of honest replies in a turn that had
+any tool failure, and because the guard replaced the whole reply it destroyed
+correct content on every false positive: a turn that returned the CEO's schedule
+and honestly flagged one failed sync became "I wasn't able to complete that."
+Prevention at generation time is cheaper and has no such failure mode. Revisit
+only with production evidence that the constraint is insufficient, and prefer
+a correction that adds to the reply over one that replaces it.
+
+**Root cause of the incident itself** was a skill contract violation, fixed
+separately in #1545: `resolve-learning-digest`'s manifest advertised
+`task_id` as "full UUID or unique prefix", but the handler did an exact-key
+lookup. The coordinator supplied the documented short prefix and the call failed.
+
+Prod forensic: conversation `email:19f843bdadc2eb85`, `2026-07-21T13:11Z`.
 
 ### Progress Extraction
 
@@ -100,14 +150,14 @@ A `known_failures` table records tool + error-type combinations that consistentl
 
 - Skills return structured results: `{ success: true, data }` or `{ success: false, error }`
 - The agent LLM sees the error and decides how to proceed (retry, alternative skill, or report)
-- Skill timeouts (from `skill.json`) trigger an automatic failure result — no hanging
+- Skill timeouts (from `tool.json`) trigger an automatic failure result — no hanging
 - MCP server disconnections: mark the server's tools as unavailable, notify agent, try reconnecting in background
 
 ### Channel Adapter Failures
 
 - Each adapter implements reconnection with exponential backoff (see [04-channels.md](04-channels.md))
 - If an adapter can't reconnect: publishes `channel.disconnected`, stops, health endpoint reports it
-- Outbound messages to a disconnected channel are queued in Postgres (max 100 per channel). When the channel reconnects, queued messages are delivered in order.
+- Outbound messages for queueable channels (Signal, Slack, SMS, email — `Channel.supportsOutboundQueue`) are queued in Postgres (max 100 per channel, 24h TTL) both when the transport is unavailable and when a send hits a transient provider failure (timeout, HTTP 429/5xx, network error — `queueable: true`). Queued messages flush in order on `channel.reconnect`; when the channel is still up, a scheduled timer retry (~30s, notably SMS) drains them (#1380). Voice does not queue.
 
 ### Scheduled Job Failures
 
@@ -119,9 +169,12 @@ A `known_failures` table records tool + error-type combinations that consistentl
 ### Database Unavailable
 
 - The framework requires Postgres at startup — fails fast with a clear error if unreachable
-- During operation: DB failures in non-critical paths (e.g., audit write) are retried with backoff
-- DB failures in critical paths (e.g., loading agent config, reading working memory) bubble up as `agent.error`
-- The health endpoint detects DB connectivity issues immediately
+- During operation:
+  - **Critical paths** (write-ahead audit insert, working-memory load/persist, bus publish that depends on audit) fail fast with a retryable `DATABASE_UNAVAILABLE` `AgentError` — no silent hangs (`connectionTimeoutMillis` on the pool)
+  - **Non-critical paths** (audit acknowledgement, working-memory summary *persistence*) retry with bounded exponential backoff via `withDbRetry`. Skill handlers are **not** retried wholesale (side-effect duplication risk) — they classify the fault and return `{ success: false, errorType: 'DATABASE_UNAVAILABLE' }`
+- Task error budgets track DB failures on a separate `dbFailures` counter — temporary outages do **not** burn `consecutiveErrors`
+- The health endpoint detects DB connectivity issues immediately (`checkDb`)
+- `DbAvailabilityMonitor` probes every 30s; after **>5 minutes** of continuous unavailability it escalates to the CEO via `outbound.notification` (`database_unavailable`), retrying until delivery succeeds (typically once Postgres recovers)
 
 ---
 
@@ -142,10 +195,83 @@ loop becomes visible to operators. See [spec 04 — Channels](04-channels.md).
 ### Duplicate outbound suppression (#847)
 
 When an agent's `agent.response` would translate into an outbound message, the dispatcher
-suppresses it if a human-facing reply (`email-reply` / `email-send`) has already shipped for the
-same routing task. The suppression emits an `outbound.suppressed_duplicate` audit event with
-reason `'human_reply_already_sent'`, preventing the principal (or an external recipient) from
-receiving the same content twice.
+suppresses it if a human-facing reply (`email-reply`, `email-send`, `signal-send`, `sms-send`,
+or `slack-send`) has already shipped to the same person on this task. `tool.result.routingTaskId`
+is that task, so a second pending task in the same conversation still relays. A delegated
+specialist's send counts: `originConversationId` is the principal conversation, and
+`routingTaskId` is the coordinator task that delegated. A direct task uses its own
+id. Inbound metadata cannot supply `delegationOrigin`, so a forged task id cannot
+skip the lock. The recipient matches the inbound
+sender or another verified active identity of that contact, so a Signal send can lock an
+email task for the same person. A send to someone else does not lock. The suppression emits
+`outbound.suppressed_duplicate` with reason `'human_reply_already_sent'`. The withheld text is
+filed on a closed bullpen thread instead of the principal's channel — the agent that did not
+own the send keeps its note internal. (#847, #1860)
+
+### Explicit no-reply (#1732, #1734)
+
+Silence is a first-class outcome. Dispatch publishes `outbound.no_reply` instead of
+`outbound.message` when:
+
+- the agent's entire response is the sentinel `NO_REPLY` (optional wrapping quotes,
+  backticks, markdown fence, or trailing punctuation), or
+- `AgentResponsePayload.suppressDelivery` is set (the runtime lifts the sentinel out of
+  `content` before publish so scheduler summaries and working-memory turns never store
+  a control token), or
+- the response is whitespace-only (`empty_response` — a blank email is not a reply), or
+- the response is a near-miss (starts with the token plus prose, or contains it as a
+  standalone word) — `ambiguous_decline`, send suppressed, email draft salvaged, or
+- inbound email was classified as **auto-generated** from message signals (headers,
+  explicit calendar `method=REPLY`/`CANCEL`, OOO subject, etc.) and the agent still
+  produced relay text — `auto_generated`. Dispatch always creates `agent.task` for
+  non-principal auto-generated mail (so bounce/payment/security/deadline can still
+  escalate) but suppresses the relay **and** stamps `autoGeneratedSuppress` /
+  `autoGeneratedSenderId` on task metadata so `email-reply` / `email-send` cannot
+  mail the machine sender either (principal escalation to a different recipient
+  stays open). Principal-originated mail that merely *looks* auto-generated
+  (e.g. a forwarded OOO) is dispatched normally. Body-keyword "carve-outs" do not
+  select a privileged path at dispatch. When the agent returns `NO_REPLY`, the
+  audit reason is `agent_declined` (preamble worked); when it narrates a reply the
+  backstop catches, the reason is `auto_generated` with the narrated body on
+  `abandonedContent` — so "how often does the coordinator ignore the preamble" is
+  answerable from the audit log.
+
+A **scheduler-channel turn** has no dispatcher routing at all: it never came through
+`handleInbound`, so its reply text goes nowhere, and the only way to reach the principal
+is a send skill. The runtime tells the agent so on those turns, and to send only when the
+task asks it to tell, notify or remind the principal (the `scheduler-delivery`
+turn guidance). When the turn ends with anything but an empty or exact `NO_REPLY` (prose
+around a stray token counts as reply text), dispatch
+publishes `outbound.no_reply` with reason `scheduler_undelivered` and the text on
+`abandonedContent`, whether or not the turn also sent something: the response's `sends`
+names skills, not recipients, so a send to a third party says nothing about whether the
+principal heard. The log line is at info and carries the text's length, not the text: most
+such replies are a maintenance run's summary, already kept as the job's
+`last_run_summary`, and the text can hold message bodies (#2091).
+
+This is distinct from `outbound.suppressed_duplicate`: the reply-lock fires after a
+human-facing skill already succeeded; no-reply means this turn sent nothing.
+
+The content-block rewrite prompt (#1355) offers the same sentinel as an abandon-send
+option. Exact `NO_REPLY` on a rewrite task does **not** salvage a draft: a draft is an
+invitation to send the blocked text, and the point of abandon is that the message should
+not exist. The blocked body is copied into `outbound.no_reply.abandonedContent` so it is
+recoverable from the audit row without a log dig. The `outbound.blocked` CEO notification
+at block time remains the human-visible signal.
+
+The sentinel is interpreted by the agent runtime (to set `suppressDelivery` and blank
+content) and by dispatch (to skip the send). Other `agent.response` subscribers must not
+parse `content` for the token.
+
+A live principal turn that declines is still honoured (the CEO saying "thanks" and Curia
+correctly saying nothing is a real case). Silence is reconstructible from the
+`outbound.no_reply` audit row and the dispatcher log line — there is no inbox
+interrupt for a deliberate decline (#1908). Prompt-only "do not use NO_REPLY with
+the CEO" remains as guidance.
+
+Use `NO_REPLY` when nothing should go out (automated notification, archive-only FYI).
+Do not narrate that decision — narration that does not start with the token is still
+payload. Near-miss narration that *does* start with the token is salvaged, not sent.
 
 ### Triage watermark moved to code (#866)
 
@@ -159,6 +285,35 @@ The provisional-contact promotion sweep is batched to 10 contacts per run using 
 with the cursor persisted in `last_run_context` so successive runs advance through the backlog
 without re-scanning. The contacts agent's `error_budget` is raised to 30 turns to accommodate the
 batched work. See [spec 09 — Contacts & Identity](09-contacts-and-identity.md).
+
+### Provider model fallback (#813)
+
+When OpenRouter (or another provider) removes a model from its catalog, every agent
+using that tier starts returning `NOT_FOUND` errors until the operator manually remaps
+the tier — typically hours later, with silent `agent.error` accumulation in between.
+
+The runtime handles this transparently: on a `NOT_FOUND` response from the primary
+model, it automatically re-routes to the **fallback tier's** model before surfacing
+the error. Fallback rules are fixed and require no configuration:
+
+| Primary tier | Fallback tier |
+|---|---|
+| `fast` | `standard` |
+| `standard` | `powerful` |
+| `powerful` | `standard` |
+
+When the fallback succeeds, the agent completes normally and the caller sees no error.
+If the fallback also fails, the fallback's error is surfaced (not the original NOT_FOUND).
+
+Fallback engagement is always logged: a pino `warn` fires immediately, and a durable
+`model.fallback` bus event is written to the audit log with the agent ID, tier, failed
+model, fallback model, and reason. This gives operators a grep-able signal without
+requiring an emergency page. The `model.fallback` event appears in the audit dashboard
+alongside `llm.call` events so the pattern is visible at a glance.
+
+**Out of scope:** only `NOT_FOUND` triggers fallback. `AUTH_FAILURE`, `VALIDATION_ERROR`,
+and other non-retryable errors still fail hard — they indicate caller or config problems,
+not model availability.
 
 ---
 
@@ -185,12 +340,14 @@ type ErrorType =
   | 'NOT_FOUND'
   | 'VALIDATION_ERROR'
   | 'PROVIDER_ERROR'
+  | 'DATABASE_UNAVAILABLE'  // Postgres / pool unreachable — retryable (#1381)
   | 'SKILL_ERROR'
   | 'BUDGET_EXCEEDED'
+  | 'IDENTITY_MISMATCH'     // wrong subject on calendar (etc.) read — fail closed (#1854)
   | 'UNKNOWN';
 ```
 
-Provider-specific errors are mapped to `ErrorType` inside the provider implementation — never leaked as raw strings to the agent runtime. This prevents the fragile string-matching pattern Zora suffered from.
+Provider-specific errors are mapped to `ErrorType` inside the provider implementation — never leaked as raw strings to the agent runtime. This prevents the fragile string-matching pattern Zora suffered from. Database connection failures (pg SQLSTATE class `08` / `57P0x`, Node `ECONNREFUSED` / `ETIMEDOUT`, pool acquire timeouts) map to `DATABASE_UNAVAILABLE` rather than `PROVIDER_ERROR`. `IDENTITY_MISMATCH` is raised when a calendar read resolves to a non-principal identity while serving a principal-scoped task (e.g. `calendar-list-events` given a calendarId registered to the agent's own contact during a morning brief) — the runtime hard-fails the task so `scheduled_jobs.last_run_outcome` is not `completed` and the agent cannot report a silent empty day (#1854).
 
 ---
 
@@ -208,29 +365,12 @@ This is enforced by code review convention. A lint rule (`no-empty-catch` + cust
 
 ---
 
-## Implementation Status
+## Known Deficiencies
 
-| Item | Status |
-|---|---|
-| Error budget: `max_turns` tracking per task | Done |
-| Error budget: `max_errors` (consecutive errors) tracking per task | Done |
-| Error budget: `max_cost_usd` tracking per task | Not Done |
-| State continuity: structured `<task_error>` XML injection into conversation | Done |
-| Progress extraction before aborting (summary stored in task record) | Not Done |
-| Per-task error pattern detection (sliding window of last 10 tool invocations) | Not Done |
-| Cross-task `known_failures` table (data collection for future warnings) | Not Done |
-| LLM call failure handling: rate limit retry with backoff | Done |
-| LLM call failure handling: timeout retry, auth error no-retry | Done |
-| LLM call failure handling: server error retry, fallback provider | Done |
-| Skill invocation failure handling (structured results, timeout) | Done |
-| Channel adapter failure handling: reconnection with exponential backoff | Partial — Signal only; email uses polling model |
-| Channel adapter failure handling: outbound message queue (max 100) for disconnected channels | Not Done |
-| Scheduled job failure handling (suspension after 3 failures, user notification) | Done |
-| Channel poll watchdog — `channel.stalled` audit event when no poll succeeds within `5 × pollingIntervalMs` | Done |
-| Duplicate outbound suppression — `outbound.suppressed_duplicate` when a human reply already shipped (#847) | Done |
-| ceo-inbox triage watermark managed in code with future-timestamp clamping (#866) | Done |
-| Contacts promotion sweep batched to 10/run via offset cursor in `last_run_context`; `error_budget` raised to 30 (#884) | Done |
-| Database unavailable: fail-fast at startup | Done |
-| Database unavailable: in-operation handling (retry in non-critical paths, bubble up in critical) | Partial — health check detects it; path-specific handling not verified |
-| `AgentError` structured type with `ErrorType` discriminated union | Done |
-| "Never Swallow" rule enforced via ESLint rule (`no-empty-catch`) | Not Done — convention only; rule absent from `eslint.config.js` |
+- **`max_cost_usd` tracking** — error budget dimension for per-task cost is not yet implemented.
+- **Progress extraction before aborting** — summary stored in task record is not yet implemented.
+- **Per-task error pattern detection** — sliding window of last 10 tool invocations is not yet implemented.
+- **Cross-task `known_failures` table** — data collection for future warnings is not yet implemented.
+- **`no-empty-catch` ESLint rule** — the "Never Swallow" rule is enforced by convention only; the rule is absent from `eslint.config.js`.
+
+Outbound messages for queueable channels (Signal, Slack, SMS, email — see `Channel.supportsOutboundQueue`) are persisted in Postgres (max 100 per channel, 24h TTL) both while the transport is unavailable and on transient provider failures (timeout, HTTP 429/5xx, network error — `queueable: true`). They flush in order on `channel.reconnect`, or via a scheduled ~30s timer retry when the channel is still up (notably SMS) (#1380). Voice does not queue.

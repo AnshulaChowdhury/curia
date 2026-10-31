@@ -1,0 +1,496 @@
+// approval-notification.ts — shared body construction for principal approval alerts.
+//
+// Used by ApprovalTriggerService and OutboundGateway so the two notification
+// paths cannot drift. Detail rendering is gated on the notification recipient
+// meeting principal tier (issue #1300).
+//
+// OutboundGateway may pass incomplete partialPayload at gate time (e.g. send-draft
+// before draft_id is linked). Call enrichGatewayApprovalPayload() with the live
+// send request so recipient/content fields are available in the notification.
+
+import type { ContactService } from '../contacts/contact-service.js';
+import type { Logger } from '../logger.js';
+import { meetsMinimumTier, type ContactTier } from '../contacts/types.js';
+import { sanitizeOutput } from '../skills/sanitize.js';
+import { detectPii } from '../pii/scrubber.js';
+
+// ---------------------------------------------------------------------------
+// Constants — exported for tests
+// ---------------------------------------------------------------------------
+
+export const MAX_DETAIL_FIELD_LENGTH = 500;
+export const MAX_DETAIL_TOTAL_LENGTH = 2000;
+
+/** Refusal when an undelivered approval would send personal details (#2312). */
+export const UNSHOWN_PERSONAL_DETAILS_ERROR =
+  'The principal hasn\'t been shown this approval yet, and it contains personal details. Deliver it with deliver-approval first, then ask again.';
+
+// ---------------------------------------------------------------------------
+// Field allowlists — extend alongside VERB_RULES in approval-trigger.ts
+// ---------------------------------------------------------------------------
+
+type DetailFieldSpec = { key: string; label: string };
+
+const SKILL_DETAIL_FIELDS: Array<{ test: (name: string) => boolean; fields: DetailFieldSpec[] }> = [
+  {
+    test: (n) => n.startsWith('signal-'),
+    fields: [
+      { key: 'recipient', label: 'To' },
+      { key: 'group_id', label: 'Group' },
+      { key: 'message', label: 'Message' },
+    ],
+  },
+  {
+    test: (n) => n.startsWith('sms-'),
+    fields: [
+      { key: 'recipient', label: 'To' },
+      { key: 'message', label: 'Message' },
+    ],
+  },
+  {
+    test: (n) => n === 'email-reply',
+    fields: [
+      { key: 'reply_to_message_id', label: 'Reply to' },
+      { key: 'cc', label: 'Cc' },
+      { key: 'body', label: 'Message' },
+    ],
+  },
+  {
+    test: (n) => n === 'email-draft-save',
+    fields: [
+      { key: 'to', label: 'To' },
+      { key: 'subject', label: 'Subject' },
+      { key: 'body', label: 'Body' },
+    ],
+  },
+  {
+    test: (n) => n === 'send-draft',
+    fields: [
+      { key: 'draft_id', label: 'Draft' },
+      // partialPayload at gate time may omit draft_id; merge live send fields below.
+      { key: 'to', label: 'To' },
+      { key: 'cc', label: 'CC' },
+      { key: 'subject', label: 'Subject' },
+      { key: 'body', label: 'Body' },
+    ],
+  },
+  {
+    // Before the export rule below, which matched email-send and showed no message at all:
+    // an approved email goes out as written, so the principal is shown it (#2312).
+    test: (n) => n === 'email-send',
+    fields: [
+      { key: 'export_items', label: 'Export items' },
+      { key: 'to', label: 'To' },
+      { key: 'cc', label: 'CC' },
+      { key: 'subject', label: 'Subject' },
+      { key: 'body', label: 'Body' },
+    ],
+  },
+  {
+    test: (n) => n.startsWith('calendar-'),
+    fields: [
+      { key: 'title', label: 'Title' },
+      { key: 'start', label: 'Start' },
+      { key: 'end', label: 'End' },
+      { key: 'attendees', label: 'Attendees' },
+      { key: 'description', label: 'Description' },
+      { key: 'location', label: 'Location' },
+    ],
+  },
+  {
+    test: (n) => n === 'store-fact',
+    fields: [
+      { key: 'label', label: 'Label' },
+      { key: 'value', label: 'Value' },
+    ],
+  },
+  {
+    test: (n) => n === 'scheduler-create',
+    fields: [
+      { key: 'task', label: 'Task' },
+      { key: 'cron_expr', label: 'Schedule' },
+      { key: 'run_at', label: 'Run at' },
+      { key: 'agent_id', label: 'Agent' },
+      { key: 'intent_anchor', label: 'Intent' },
+    ],
+  },
+  {
+    test: (n) => n === 'scheduler-cancel',
+    fields: [
+      { key: 'job_id', label: 'Job' },
+    ],
+  },
+  {
+    test: (n) =>
+      n === 'create_drive_file' || n === 'create_sheet' || n === 'append_table_rows'
+      || n === 'email-send' || n === 'email-reply',
+    fields: [
+      { key: 'export_items', label: 'Export items' },
+      { key: 'folder_id', label: 'Drive folder' },
+      { key: 'spreadsheet_id', label: 'Spreadsheet' },
+      { key: 'to', label: 'To' },
+      // Every recipient the approver is agreeing to, not only To (#2033).
+      { key: 'cc', label: 'CC' },
+    ],
+  },
+];
+
+const GENERIC_DETAIL_FIELDS: DetailFieldSpec[] = [
+  { key: 'to', label: 'To' },
+  { key: 'recipient', label: 'To' },
+  { key: 'cc', label: 'CC' },
+  { key: 'phone', label: 'Phone' },
+  { key: 'email', label: 'Email' },
+  { key: 'subject', label: 'Subject' },
+  { key: 'title', label: 'Title' },
+  { key: 'body', label: 'Body' },
+  { key: 'message', label: 'Message' },
+  { key: 'text', label: 'Text' },
+  { key: 'content', label: 'Content' },
+  { key: 'description', label: 'Description' },
+  { key: 'start', label: 'Start' },
+  { key: 'end', label: 'End' },
+  { key: 'when', label: 'When' },
+  { key: 'attendees', label: 'Attendees' },
+  { key: 'name', label: 'Name' },
+  { key: 'query', label: 'Query' },
+  { key: 'label', label: 'Label' },
+];
+
+/** Representative payloads for allowlisted skills — used by tests to catch silent misses. */
+export const SKILL_DETAIL_FIXTURES: Array<{
+  toolName: string;
+  payload: Record<string, unknown>;
+  /** Skill-specific labels that must appear when the fixture payload is rendered. */
+  expectedLabels: string[];
+}> = [
+  {
+    toolName: 'signal-send',
+    payload: { recipient: '+15550142', message: 'Confirming Thursday at 3pm.' },
+    expectedLabels: ['To:', 'Message:'],
+  },
+  {
+    toolName: 'email-reply',
+    payload: { reply_to_message_id: 'msg-abc', body: 'Thanks — Thursday works.' },
+    expectedLabels: ['Reply to:', 'Message:'],
+  },
+  {
+    toolName: 'email-draft-save',
+    payload: { to: 'dana@example.com', subject: 'Re: Budget', body: 'Draft body text.' },
+    expectedLabels: ['To:', 'Subject:', 'Body:'],
+  },
+  {
+    toolName: 'send-draft',
+    payload: { to: 'dana@example.com', subject: 'Re: Budget', body: 'Approved send body.' },
+    expectedLabels: ['To:', 'Subject:', 'Body:'],
+  },
+  {
+    toolName: 'calendar-create-event',
+    payload: {
+      title: 'Board sync',
+      start: '2026-07-02T15:00:00Z',
+      end: '2026-07-02T16:00:00Z',
+    },
+    expectedLabels: ['Title:', 'Start:', 'End:'],
+  },
+  {
+    toolName: 'store-fact',
+    payload: { label: 'Dana prefers mornings', value: 'true' },
+    expectedLabels: ['Label:', 'Value:'],
+  },
+  {
+    toolName: 'scheduler-create',
+    payload: {
+      task: 'nightly-sweep',
+      cron_expr: '0 2 * * *',
+      agent_id: 'coordinator',
+    },
+    expectedLabels: ['Task:', 'Schedule:', 'Agent:'],
+  },
+  {
+    toolName: 'scheduler-cancel',
+    payload: { job_id: 'job-abc-123' },
+    expectedLabels: ['Job:'],
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Pure helpers — exported for testing
+// ---------------------------------------------------------------------------
+
+function formatExportItemsValue(value: unknown): string | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const lines = value
+    .map((item) => {
+      if (typeof item !== 'object' || item === null) return null;
+      const obj = item as Record<string, unknown>;
+      const label = typeof obj['label'] === 'string' ? obj['label'].trim() : '';
+      const sensitivity = typeof obj['sensitivity'] === 'string' ? obj['sensitivity'] : '';
+      if (!label && !sensitivity) return null;
+      return sensitivity ? `${label || 'item'} [${sensitivity}]` : label;
+    })
+    .filter((line): line is string => Boolean(line));
+  return lines.length ? lines.join('; ') : null;
+}
+
+function formatFieldValue(value: unknown, fieldKey?: string): string | null {
+  if (value === null || value === undefined) return null;
+  if (fieldKey === 'export_items') {
+    return formatExportItemsValue(value);
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    const parts = value
+      .map((item) => {
+        if (typeof item === 'string') {
+          const trimmed = item.trim();
+          return trimmed || null;
+        }
+        if (item && typeof item === 'object') {
+          const obj = item as Record<string, unknown>;
+          const email = typeof obj.email === 'string' ? obj.email : undefined;
+          const name =
+            typeof obj.name === 'string'
+              ? obj.name
+              : typeof obj.displayName === 'string'
+                ? obj.displayName
+                : undefined;
+          if (name && email) return `${name} (${email})`;
+          if (email) return email;
+          if (name) return name;
+        }
+        return null;
+      })
+      .filter((part): part is string => Boolean(part));
+    return parts.length ? parts.join(', ') : null;
+  }
+  // Skip plain objects — avoid leaking internal JSON shape into principal notifications.
+  return null;
+}
+
+function fieldSpecsForSkill(toolName: string): DetailFieldSpec[] {
+  for (const rule of SKILL_DETAIL_FIELDS) {
+    if (rule.test(toolName)) return rule.fields;
+  }
+  return GENERIC_DETAIL_FIELDS;
+}
+
+/**
+ * Merge live outbound-send fields into a partial gate-time payload.
+ * partialPayload wins when a key is already set (e.g. draft_id linked later).
+ */
+export function enrichGatewayApprovalPayload(
+  partialPayload: Record<string, unknown>,
+  sendFields: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...partialPayload };
+  for (const [key, value] of Object.entries(sendFields)) {
+    if (merged[key] !== undefined) continue;
+    if (value === null || value === undefined) continue;
+    if (typeof value === 'string' && value.trim().length === 0) continue;
+    merged[key] = value;
+  }
+  return merged;
+}
+
+/**
+ * Render a labeled detail block from a pending-action payload.
+ * Values pass through sanitizeOutput; per-field and total length caps apply.
+ */
+export function buildApprovalDetails(
+  toolName: string,
+  payload: Record<string, unknown>,
+): string {
+  const specs = fieldSpecsForSkill(toolName);
+  const seenLabels = new Set<string>();
+  const lines: string[] = [];
+  let totalLength = 0;
+
+  for (const { key, label } of specs) {
+    if (seenLabels.has(label)) continue;
+    const raw = formatFieldValue(payload[key], key);
+    if (!raw) continue;
+
+    const sanitized = sanitizeOutput(raw, { maxLength: MAX_DETAIL_FIELD_LENGTH });
+    const line = `${label}: ${sanitized}`;
+    if (totalLength + line.length > MAX_DETAIL_TOTAL_LENGTH) {
+      const remaining = MAX_DETAIL_TOTAL_LENGTH - totalLength;
+      if (remaining <= label.length + 2) break;
+      lines.push(sanitizeOutput(line, { maxLength: remaining }));
+      break;
+    }
+    lines.push(line);
+    totalLength += line.length + 1;
+    seenLabels.add(label);
+  }
+
+  // Outside the caps: an approved send goes out as written (#2312), so every personal detail
+  // in it is listed even when the field above is cut short.
+  const personal = buildPersonalDetailsLine(toolName, payload);
+  if (personal) lines.push(personal);
+
+  return lines.join('\n');
+}
+
+/** Send skills whose approval replays the message as written (#2312). */
+function isSendSkill(toolName: string): boolean {
+  return SEND_SKILLS.has(toolName)
+    || toolName.startsWith('signal-') || toolName.startsWith('sms-') || toolName.startsWith('slack-');
+}
+const SEND_SKILLS = new Set(['email-send', 'email-reply', 'send-draft', 'dispatcher-relay']);
+/** The payload fields a sent message's text lives in, in the order they are scanned. */
+const MESSAGE_FIELD_KEYS = ['subject', 'body', 'message', 'html_quote', 'htmlQuote'] as const;
+/**
+ * The personal details a send skill's approval would send, as `<label> <value>`, each once
+ * (#2312): the full, untruncated message fields scanned with the shared scrubber core. [] for
+ * other skills. Deliberately broader than what a channel would redact: an approved send goes
+ * out as written, so the principal sees every detail that leaves, allow-listed ones included.
+ */
+function findPersonalDetails(toolName: string, payload: Record<string, unknown>): string[] {
+  if (!isSendSkill(toolName)) return [];
+  const found = new Set<string>();
+  for (const key of MESSAGE_FIELD_KEYS) {
+    const text = payload[key];
+    if (typeof text !== 'string' || text.length === 0) continue;
+    for (const match of detectPii(text)) found.add(`${match.label} ${match.matched}`);
+  }
+  return [...found];
+}
+
+/**
+ * Whether approving this payload would send personal details (#2312): the same scan as the
+ * approval's personal details line. approve-action refuses such an approval until it is shown.
+ */
+export function hasPersonalDetails(toolName: string, payload: Record<string, unknown>): boolean {
+  return findPersonalDetails(toolName, payload).length > 0;
+}
+
+/**
+ * The line listing the personal details a send skill's approval would send (#2312), or null
+ * when there are none. Scans the full, untruncated message fields with the shared scrubber
+ * core. The approval goes only to the principal, so the values are shown, every one of them:
+ * approving sends them all, so none may be summarized away.
+ */
+export function buildPersonalDetailsLine(toolName: string, payload: Record<string, unknown>): string | null {
+  const found = findPersonalDetails(toolName, payload);
+  if (found.length === 0) return null;
+  return sanitizeOutput(`Personal details in this message (sent as written if you approve): ${found.join('; ')}`);
+}
+
+export interface BuildApprovalNotificationBodyOpts {
+  /** Opening paragraph — gate reason or short description. */
+  preamble: string;
+  shortRef: string;
+  /**
+   * The approval's number (#2159 Phase 3). When set, the body shows `Approval <n>` in place of
+   * the `Reference:` line: the principal answers "approve 3". Null or absent for approvals
+   * raised before migration 098 (or when all numbers were in use), which keep the reference.
+   */
+  approvalNumber?: number | null;
+  expiresAt: Date;
+  toolName: string;
+  payload: Record<string, unknown>;
+  /** When absent or below principal tier, detail block is omitted. */
+  recipientTier: ContactTier | null;
+  /** Optional lines between preamble and reference block (e.g. autonomy score). */
+  extraLines?: string[];
+  callToAction?: string;
+  /** When set, logs a warn if the detail block is omitted or empty. */
+  logger?: Logger;
+  /** Included in omission warnings for correlation. */
+  ceoEmail?: string;
+}
+
+function logDetailOmission(
+  logger: Logger | undefined,
+  reason: string,
+  context: Record<string, unknown>,
+): void {
+  logger?.warn(context, `approval notification: detail block omitted — ${reason}`);
+}
+
+/**
+ * Build the full principal approval notification body. Detail is included only when
+ * the recipient meets principal tier — defense-in-depth if the channel is repointed.
+ */
+export function buildApprovalNotificationBody(opts: BuildApprovalNotificationBodyOpts): string {
+  const lines: string[] = [opts.preamble, ''];
+
+  if (opts.extraLines && opts.extraLines.length > 0) {
+    lines.push(...opts.extraLines, '');
+  }
+
+  const includeDetail = Boolean(
+    opts.recipientTier && meetsMinimumTier(opts.recipientTier, 'principal'),
+  );
+
+  if (includeDetail) {
+    const details = buildApprovalDetails(opts.toolName, opts.payload);
+    if (details) {
+      lines.push(details, '');
+    } else {
+      logDetailOmission(opts.logger, 'no renderable fields in payload', {
+        toolName: opts.toolName,
+        ceoEmail: opts.ceoEmail,
+        payloadKeys: Object.keys(opts.payload),
+      });
+    }
+  } else if (opts.ceoEmail) {
+    logDetailOmission(opts.logger, 'recipient tier below principal or unresolved', {
+      toolName: opts.toolName,
+      ceoEmail: opts.ceoEmail,
+      recipientTier: opts.recipientTier,
+    });
+  }
+
+  // BINDING CONTRACT (#1479, #2159 Phase 3): the identifier line and the `Expires:` line directly
+  // under it are the notification's fingerprint. ReactionApprovalMapper binds a delivered message
+  // to its approval only when it finds exactly these two adjacent lines (APPROVAL_FINGERPRINT_RE:
+  // `Approval <n>` or `Reference: <8-hex>`, then `Expires: <toISOString()>`), and takes the LAST
+  // such pair, so they must stay below the detail block and above only fixed text. It binds only
+  // when the Expires value equals the approval row's own expiresAt.toISOString(), so callers must
+  // pass the row's expiresAt here. Changing their wording, spacing, order or the timestamp format
+  // silently stops reactions resolving approvals.
+  lines.push(
+    opts.approvalNumber != null ? `Approval ${opts.approvalNumber}` : `Reference: ${opts.shortRef}`,
+    `Expires: ${opts.expiresAt.toISOString()}`,
+    '',
+    opts.callToAction ?? 'Reply to approve, deny, or dismiss this request.',
+  );
+
+  return lines.join('\n');
+}
+
+/**
+ * Resolve the notification recipient's tier via the contacts service.
+ * Returns null when lookup is unavailable — callers treat that as "omit detail".
+ */
+export async function resolveNotificationRecipientTier(
+  contactService: ContactService | undefined,
+  ceoEmail: string,
+  logger?: Logger,
+): Promise<ContactTier | null> {
+  if (!ceoEmail) return null;
+  if (!contactService) {
+    logDetailOmission(logger, 'contactService not configured', { ceoEmail });
+    return null;
+  }
+  try {
+    const resolved = await contactService.resolveByChannelIdentity('email', ceoEmail);
+    if (!resolved?.tier) {
+      logDetailOmission(logger, 'recipient not found in contacts', { ceoEmail });
+      return null;
+    }
+    return resolved.tier;
+  } catch (err) {
+    logDetailOmission(logger, 'tier lookup failed', { err, ceoEmail });
+    return null;
+  }
+}

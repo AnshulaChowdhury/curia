@@ -1,36 +1,67 @@
-import { useState, useEffect, type JSX, type CSSProperties } from 'react';
+import { useState, useEffect, useRef, type JSX, type CSSProperties } from 'react';
 import { useNavigate, useSearch } from '@tanstack/react-router';
 import { apiFetch } from '../api.js';
+import { ToneStyleField, DetailSlider } from '../components/settings/ToneFields.js';
+import { AutonomyBandPicker } from '../components/settings/AutonomyBandPicker.js';
+import { BAND_META, bandForScore } from '../autonomy-bands.js';
 import {
   DEFAULT_WIZARD_STATE,
   PRINCIPAL_NAME_MAX_LENGTH,
-  TONE_OPTIONS,
-  toggleToneSelection,
-  verbosityBand,
-  directnessBand,
-  tonePreviewText,
   verbosityReviewDesc,
-  directnessReviewDesc,
-  postureReviewDesc,
+  styleReviewDesc,
+  validateToneStyle,
+  autonomyChange,
   validateNonEmptyName,
   validatePrincipalName,
   buildIdentityPayload,
+  assistantFullName,
+  defaultSignature,
+  DEFAULT_ASSISTANT_FIRST_NAME,
+  detectBrowserTimezone,
+  validateProfileEmail,
+  buildProfilePayload,
   type WizardState,
+  type WizardWorkingHours,
   type LocalIdentity,
+  type LengthLimits,
+  WIZARD_TOTAL_STEPS,
+  clampWizardStep,
 } from './wizard-utils.js';
-
-const TOTAL_STEPS = 5;
 
 // localStorage key consumed by useChatSession to fire the auto-kickoff message
 // on the first chat mount after the wizard completes. Must match the constant
 // in useChatSession.ts exactly.
 const ONBOARDING_KICKOFF_KEY = 'curia:onboarding:welcome-banner-pending';
 
+// ── Module-level constants ────────────────────────────────────────────────────
+
+// IANA timezone list. Intl.supportedValuesOf is available in ES2022+ browsers;
+// guard with typeof so the app still works in older environments that don't
+// support it (the small fallback list covers the most common zones).
+const IANA_ZONES: string[] = (typeof Intl !== 'undefined' && typeof (Intl as { supportedValuesOf?: (key: string) => string[] }).supportedValuesOf === 'function')
+  ? (Intl as { supportedValuesOf: (key: string) => string[] }).supportedValuesOf('timeZone')
+  : [
+      'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+      'America/Toronto', 'America/Vancouver', 'America/Sao_Paulo',
+      'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Amsterdam',
+      'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Singapore', 'Asia/Kolkata',
+      'Australia/Sydney', 'Australia/Melbourne', 'Pacific/Auckland', 'UTC',
+    ];
+
+// Weekday labels for the working-hours toggle buttons (0=Sun..6=Sat).
+const WEEKDAY_LABELS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'] as const;
+
 // ── Identity API types ────────────────────────────────────────────────────────
 
 interface IdentityResponse {
   identity: LocalIdentity;
   configured: boolean;
+  lengthLimits?: LengthLimits;
+}
+
+// GET /api/autonomy. `autonomy` is null before the autonomy migration has run.
+interface AutonomyResponse {
+  autonomy: { score: number } | null;
 }
 
 interface SetupStatusResponse {
@@ -38,6 +69,18 @@ interface SetupStatusResponse {
   identityConfigured: boolean;
   externalAdaptersPending: boolean;
   bootStartedAt: string;
+}
+
+// Response from GET /api/setup/principal — returns existing principal profile
+// data for pre-filling Step 2 on a wizard re-run (#392).
+interface PrincipalProfileResponse {
+  exists: boolean;
+  displayName: string | null;
+  timezone: string | null;
+  preferredName: string | null;
+  title: string | null;
+  email: string | null;
+  workingHours: string | null; // serialized string; the form keeps its own structured state
 }
 
 // State machine for the post-save restart flow. `idle` covers both "haven't
@@ -79,7 +122,7 @@ export default function WizardPage() {
   const navigate = useNavigate();
   // Read step from URL search params. strict:false avoids circular import with router.tsx.
   const search = useSearch({ strict: false }) as { step?: number };
-  const currentStep = Math.max(1, Math.min(TOTAL_STEPS, search.step ?? 1));
+  const currentStep = clampWizardStep(search.step);
 
   const [state, setState] = useState<WizardState>(DEFAULT_WIZARD_STATE);
   const [existingIdentity, setExistingIdentity] = useState<LocalIdentity | null>(null);
@@ -87,60 +130,163 @@ export default function WizardPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [principalError, setPrincipalError] = useState('');
   const [principalSubmitting, setPrincipalSubmitting] = useState(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
   const [assistantNameError, setAssistantNameError] = useState('');
+  // The saved autonomy score, from the required GET /api/autonomy. Step 5 pre-selects its
+  // band, and submit compares against it to skip an unchanged band.
+  const [autonomyScore, setAutonomyScore] = useState<number | null>(null);
+  const [lengthLimits, setLengthLimits] = useState<LengthLimits | null>(null);
   const [submitError, setSubmitError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [restartState, setRestartState] = useState<RestartState>({ kind: 'idle' });
+  // LLM-suggested starter first name (issue #799). Null until a successful
+  // suggestion lands; drives the signature placeholder and the one-time prefill
+  // of the assistant-name field. Stays null on any failure so the static
+  // placeholders remain. suggestFiredRef guarantees the call fires at most once
+  // per wizard mount, surviving the re-renders that step navigation triggers.
+  const [suggestedName, setSuggestedName] = useState<string | null>(null);
+  const suggestFiredRef = useRef(false);
+  // Whether the operator has saved an identity through the wizard/API (vs. the
+  // in-code seed that every fresh install boots with). null until the mount
+  // fetch resolves. This — NOT the presence of an assistant name — is the
+  // "fresh install" signal: the seed always carries a non-empty name, so a name
+  // check would wrongly suppress the suggestion on exactly the first-run case
+  // it exists for.
+  const [identityConfigured, setIdentityConfigured] = useState<boolean | null>(null);
 
-  // Pre-populate form from current identity and check setup status on mount.
-  // Run both fetches in parallel; setup status drives the Step 1 auto-skip
-  // (deployments that already have a principal — e.g. CEO_PRIMARY_EMAIL — go
-  // straight to step 2). identity drives the form's pre-fill so a wizard
-  // re-run shows the existing values instead of defaults.
+  // Pre-populate form from current identity, setup status, autonomy, and existing
+  // principal profile on mount. Identity, status and autonomy are required — errors
+  // bubble to the load-error render. Autonomy never falls back to a default band:
+  // submitting a guessed band could quietly lower a real score. The principal fetch is best-effort: a 404 or network
+  // blip falls back to browser-detected timezone and blank optionals (#392).
+  // It runs separately so a flaky /api/setup/principal never breaks the wizard.
   useEffect(() => {
     async function load() {
       try {
-        const [identityRes, statusRes] = await Promise.all([
+        const [identityRes, statusRes, autonomyRes] = await Promise.all([
           apiFetch('/api/identity'),
           apiFetch('/api/setup/status'),
+          apiFetch('/api/autonomy'),
         ]);
         if (!identityRes.ok) throw new Error(await extractError(identityRes));
         if (!statusRes.ok) throw new Error(await extractError(statusRes));
+        if (!autonomyRes.ok) throw new Error(`Could not load the autonomy level: ${await extractError(autonomyRes)}`);
         const data = await identityRes.json() as IdentityResponse;
         const status = await statusRes.json() as SetupStatusResponse;
+        const autonomy = (await autonomyRes.json() as AutonomyResponse).autonomy;
+        if (!autonomy) throw new Error('Autonomy settings have not been initialized on this instance.');
+        setAutonomyScore(autonomy.score);
+        setLengthLimits(data.lengthLimits ?? null);
         const id = data.identity;
         setExistingIdentity(id);
         setPrincipalExists(status.principalExists);
+        // `configured` is false until the operator saves through the wizard/API;
+        // it gates the one-shot name suggestion below.
+        setIdentityConfigured(data.configured);
         setState({
           principalName: DEFAULT_WIZARD_STATE.principalName,
           name: id.assistant.name || DEFAULT_WIZARD_STATE.name,
           title: id.assistant.title || DEFAULT_WIZARD_STATE.title,
-          signature: id.assistant.emailSignature || '',
-          toneBaseline:
-            id.tone.baseline.length > 0
-              ? id.tone.baseline
-              : DEFAULT_WIZARD_STATE.toneBaseline,
+          // Pre-populate the default signature on a fresh install so the field
+          // ships with a usable value (not just a placeholder). A wizard re-run
+          // with a saved signature keeps it.
+          signature: id.assistant.emailSignature || DEFAULT_WIZARD_STATE.signature,
+          toneStyle: id.tone.style ?? DEFAULT_WIZARD_STATE.toneStyle,
           verbosity: id.tone.verbosity ?? DEFAULT_WIZARD_STATE.verbosity,
-          directness: id.tone.directness ?? DEFAULT_WIZARD_STATE.directness,
-          posture: id.decisionStyle.externalActions || DEFAULT_WIZARD_STATE.posture,
+          autonomyBand: bandForScore(autonomy.score),
           preferences: '', // always blank on entry — append mode
+          // Step 2 profile fields — defaults until the principal fetch resolves below
+          timezone: DEFAULT_WIZARD_STATE.timezone,
+          email: DEFAULT_WIZARD_STATE.email,
+          preferredName: DEFAULT_WIZARD_STATE.preferredName,
+          principalTitle: DEFAULT_WIZARD_STATE.principalTitle,
+          workingHours: DEFAULT_WIZARD_STATE.workingHours,
         });
       } catch (err) {
         setLoadError(err instanceof Error ? err.message : 'Failed to load identity');
+      }
+
+      // Best-effort: merge existing principal profile into state.
+      // A 404 (no principal yet) or any network error falls back to browser
+      // timezone; it must NOT throw into the outer catch above.
+      try {
+        const principalRes = await apiFetch('/api/setup/principal');
+        if (principalRes.ok) {
+          const p = await principalRes.json() as PrincipalProfileResponse;
+          setState(s => ({
+            ...s,
+            principalName: p.displayName ?? s.principalName,
+            timezone: p.timezone ?? detectBrowserTimezone(),
+            email: p.email ?? '',
+            preferredName: p.preferredName ?? '',
+            principalTitle: p.title ?? '',
+            // workingHours stays structured in the form; a returning operator re-enters
+            // it if they want to change it.
+          }));
+        } else {
+          if (principalRes.status !== 404) {
+            console.warn('[WizardPage] GET /api/setup/principal returned', principalRes.status, '— falling back to browser timezone');
+          }
+          setState(s => ({ ...s, timezone: detectBrowserTimezone() }));
+        }
+      } catch {
+        setState(s => ({ ...s, timezone: detectBrowserTimezone() }));
       }
     }
     void load();
   }, []);
 
-  // Auto-skip Step 1 when the principal already exists. Runs after the mount
-  // fetch sets principalExists and on any subsequent step change. The route
-  // navigation updates `currentStep`, which re-runs this effect; the guard
-  // (`principalExists && currentStep === 1`) keeps it from looping.
+  // One-shot LLM name suggestion (issue #799). Fires once the mount fetch has
+  // resolved, and only on a fresh install — i.e. when the identity has NOT been
+  // configured yet. Gating on `identityConfigured === false` (not on whether an
+  // assistant name exists) is deliberate: every fresh install boots with the
+  // in-code seed, whose assistant name is already "Alex Curia", so a name check
+  // would suppress the suggestion in exactly the first-run scenario it's for.
+  //
+  // On success we prefill the assistant name and email signature, but only for a
+  // field still holding the value it loaded with (we compare against the loaded
+  // identity, so an edit the user already made — or a value that drifts from the
+  // wizard's static default — is never clobbered). Every failure path is silent:
+  // the loaded defaults stand and no error is surfaced here, since channel/key
+  // validation has its own surface later in the wizard.
   useEffect(() => {
-    if (principalExists && currentStep === 1) {
-      void navigate({ to: '/setup', search: { step: 2 } });
+    if (suggestFiredRef.current) return;            // at most once per mount
+    if (!existingIdentity || identityConfigured === null) return; // wait for the fetch
+    if (identityConfigured) return;                  // already configured (re-run) — skip
+    suggestFiredRef.current = true;
+
+    // Capture the just-loaded values as the "untouched" baseline. Comparing the
+    // current field against these (rather than a hardcoded default) keeps the
+    // no-clobber guard correct even if the seed/default values change.
+    const loadedName = existingIdentity.assistant.name;
+    const loadedSignature = existingIdentity.assistant.emailSignature;
+
+    let cancelled = false;
+    async function suggest() {
+      try {
+        const res = await apiFetch('/api/setup/suggest-name', { method: 'POST' });
+        if (!res.ok) return;                          // 4xx/5xx → keep loaded defaults
+        const data = await res.json() as { name?: unknown };
+        const name = typeof data.name === 'string' ? data.name : null;
+        if (!name || cancelled) return;
+        setSuggestedName(name);
+        // The LLM suggests only a first name; the full name and the signature
+        // both pair it with the "Curia" surname. Prefill each field only if it
+        // still holds the value it loaded with — never clobber a user edit.
+        setState(s => ({
+          ...s,
+          name: s.name === loadedName ? assistantFullName(name) : s.name,
+          signature: s.signature === loadedSignature ? defaultSignature(name) : s.signature,
+        }));
+      } catch (err) {
+        // Best-effort feature: a network error must not disrupt onboarding.
+        // Log at debug for diagnosability and keep the loaded defaults (#799).
+        console.debug('[WizardPage] name suggestion request failed:', err);
+      }
     }
-  }, [principalExists, currentStep, navigate]);
+    void suggest();
+    return () => { cancelled = true; };
+  }, [existingIdentity, identityConfigured]);
 
   // Post-restart polling loop. Runs only while restartState === 'waiting'.
   // Polls /api/setup/status every RESTART_POLL_INTERVAL_MS, tolerating
@@ -216,7 +362,7 @@ export default function WizardPage() {
 
   // Step 1 ("About you") writes through to the backend before advancing so the
   // principal contact exists by the time the assistant identity is saved at
-  // step 5. The endpoint is idempotent — a retry after a transient failure is
+  // step 6 (the review step). The endpoint is idempotent — a retry after a transient failure is
   // safe and will return alreadyExisted=true on success.
   async function handlePrincipalContinue() {
     const validationError = validatePrincipalName(state.principalName);
@@ -245,49 +391,108 @@ export default function WizardPage() {
     }
   }
 
+  // Step 2 ("Your details") validates timezone + optional email, then POSTs the
+  // profile to /api/setup/principal/profile and advances to Step 3.
+  async function handleProfileContinue(): Promise<void> {
+    const tzError = state.timezone.trim() ? null : 'Select your timezone.';
+    const emailError = validateProfileEmail(state.email);
+    if (tzError || emailError) {
+      setProfileError(tzError ?? emailError);
+      return;
+    }
+    setProfileError(null);
+    try {
+      const res = await apiFetch('/api/setup/principal/profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildProfilePayload(state)),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({})) as { error?: string };
+        setProfileError(data.error ?? 'Could not save your details. Please try again.');
+        return;
+      }
+      await goTo(3);
+    } catch (err) {
+      console.debug('[WizardPage] profile save failed:', err);
+      setProfileError(err instanceof Error ? err.message : 'Could not save your details. Please try again.');
+    }
+  }
+
   function handleContinue() {
-    // Step 2 is the assistant identity form (formerly step 1). Same non-empty
-    // assertion as before — the renamed validator is the only difference.
-    if (currentStep === 2) {
+    // Step 3 is the assistant identity form. Validate the name before advancing.
+    if (currentStep === 3) {
       if (!validateNonEmptyName(state.name)) {
         setAssistantNameError('Assistant name is required.');
         return;
       }
       setAssistantNameError('');
     }
-    if (currentStep < TOTAL_STEPS) goTo(currentStep + 1);
+    // Step 4 is tone & style: the identity requires a non-empty style of at most 800
+    // characters. The field shows why (it is never empty untouched: the seed and every
+    // stored style are non-empty).
+    if (currentStep === 4 && validateToneStyle(state.toneStyle) !== null) return;
+    if (currentStep < WIZARD_TOTAL_STEPS) void goTo(currentStep + 1);
   }
 
   function handleBack() {
-    // When the principal already exists, Step 1 is auto-skipped; going Back from
-    // Step 2 would bounce back to Step 2 via the auto-skip effect, so just no-op
-    // for clarity instead of flickering.
-    if (currentStep === 2 && principalExists) return;
-    if (currentStep > 1) goTo(currentStep - 1);
+    if (currentStep > 1) void goTo(currentStep - 1);
+  }
+
+  // One save-flow call. Any failure, a network error or an error status, throws an
+  // error that names the call, so the review step says which step failed.
+  async function call(label: string, run: () => Promise<Response>): Promise<Response> {
+    let res: Response;
+    try {
+      res = await run();
+    } catch (err) {
+      throw new Error(`${label} failed: ${err instanceof Error ? err.message : 'network error'}`);
+    }
+    return res;
+  }
+  async function okOrThrow(label: string, res: Response): Promise<Response> {
+    if (!res.ok) throw new Error(`${label} failed: ${await extractError(res)}`);
+    return res;
   }
 
   async function handleSubmit() {
-    if (!existingIdentity) return;
+    if (!existingIdentity || autonomyScore === null || !state.autonomyBand) return;
     setSubmitting(true);
     setSubmitError('');
     try {
+      // Autonomy first. Saving the identity (recorded as an 'api' version) marks the
+      // deployment configured, and the wizard never shows again; if identity went first and autonomy then failed,
+      // the operator could not get back here to fix it. A failure here leaves the
+      // deployment unconfigured, so the wizard runs again.
+      const change = autonomyChange(autonomyScore, state.autonomyBand);
+      if (change) {
+        const label = 'Saving the autonomy level';
+        await okOrThrow(label, await call(label, () => apiFetch('/api/autonomy', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(change),
+        })));
+        // A retry after a later failure must not save it again.
+        setAutonomyScore(change.score);
+      }
+
       const { identity, note } = buildIdentityPayload(state, existingIdentity);
-      const putRes = await apiFetch('/api/identity', {
+      const saveLabel = "Saving your assistant's identity";
+      await okOrThrow(saveLabel, await call(saveLabel, () => apiFetch('/api/identity', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ identity, note }),
-      });
-      if (!putRes.ok) throw new Error(await extractError(putRes));
-      const reloadRes = await apiFetch('/api/identity/reload', { method: 'POST' });
-      if (!reloadRes.ok) throw new Error(await extractError(reloadRes));
+      })));
+      const reloadLabel = 'Reloading the identity';
+      await okOrThrow(reloadLabel, await call(reloadLabel, () => apiFetch('/api/identity/reload', { method: 'POST' })));
 
       // Decide whether we need a restart. After PUT /api/identity, the server
       // recomputes externalAdaptersPending; if true, the process booted in
       // setup-required mode and email/Signal are not running yet. If false,
       // either the deployment never needed a restart (CEO_PRIMARY_EMAIL set
       // a principal at boot) or we already restarted in a previous attempt.
-      const statusRes = await apiFetch('/api/setup/status');
-      if (!statusRes.ok) throw new Error(await extractError(statusRes));
+      const statusLabel = 'Checking setup status';
+      const statusRes = await okOrThrow(statusLabel, await call(statusLabel, () => apiFetch('/api/setup/status')));
       const status = await statusRes.json() as SetupStatusResponse;
 
       if (!status.externalAdaptersPending) {
@@ -300,7 +505,8 @@ export default function WizardPage() {
       // the supervisor bringing a new process up. Trigger the restart, then
       // switch the wizard's render into the wait state — the polling effect
       // below picks it up from there.
-      const restartRes = await apiFetch('/api/setup/restart', { method: 'POST' });
+      const restartLabel = 'Restarting Curia';
+      const restartRes = await call(restartLabel, () => apiFetch('/api/setup/restart', { method: 'POST' }));
       if (restartRes.status === 409) {
         // 409 means the backend refused: either the process is already in
         // normal mode (a concurrent tab / earlier wizard run already restarted
@@ -312,7 +518,7 @@ export default function WizardPage() {
         await navigate({ to: '/chat' });
         return;
       }
-      if (!restartRes.ok) throw new Error(await extractError(restartRes));
+      await okOrThrow(restartLabel, restartRes);
       // Drop the submitting flag before swapping render states so the wizard
       // doesn't leak a permanently-true `submitting` value into any future
       // step view (e.g. via the retry-on-timeout path that returns the user
@@ -324,6 +530,7 @@ export default function WizardPage() {
         startedAt: Date.now(),
       });
     } catch (err) {
+      // Stay on the review step: no reload, restart or navigation after a failure.
       setSubmitError(err instanceof Error ? err.message : 'Save failed');
       setSubmitting(false);
     }
@@ -331,7 +538,7 @@ export default function WizardPage() {
 
   // ── Progress dots ───────────────────────────────────────────────────────────
 
-  const progressDots = Array.from({ length: TOTAL_STEPS }, (_, i) => (
+  const progressDots = Array.from({ length: WIZARD_TOTAL_STEPS }, (_, i) => (
     <div
       key={i}
       className={`wizard-dot${i < currentStep ? ' done' : ''}`}
@@ -359,7 +566,7 @@ export default function WizardPage() {
         <path d="M2548.08 582.644L2698.02 128.932L2862.72 128.932L3017.64 582.644L2912.44 582.644L2786.74 199.475L2818.9 212.527L2739.04 212.527L2772.13 199.475L2650.01 582.644L2548.08 582.644ZM2661.5 469.993L2692.73 385.465L2870.8 385.465L2902.03 469.993L2661.5 469.993Z" fillRule="nonzero" />
       </svg>
       <div className="wizard-progress">{progressDots}</div>
-      <span className="wizard-step-label">Step {currentStep} of {TOTAL_STEPS}</span>
+      <span className="wizard-step-label">Step {currentStep} of {WIZARD_TOTAL_STEPS}</span>
     </div>
   );
 
@@ -378,16 +585,12 @@ export default function WizardPage() {
     );
   }
 
-  // Wait for BOTH the identity prefill AND the setup-status snapshot before
-  // rendering any step. Without this gate:
-  //   - Step 1 was reachable before principalExists resolved, so the auto-skip
-  //     effect couldn't decide whether to bounce the user forward — they could
-  //     fill in their name and submit before the wizard knew they shouldn't be
-  //     on this step in the first place.
-  //   - The Step 2 Back button rendered with `principalExists === null` (falsy),
-  //     so a Back click went to Step 1 and immediately bounced back, producing
-  //     a flicker.
-  // Both go away once we hold the render until both pieces of state are known.
+  // Wait for the identity prefill AND the setup-status snapshot before rendering
+  // any step. The three fetches (identity, status, principal) all run in parallel
+  // inside load(); existingIdentity and principalExists (null until the status
+  // fetch resolves) serve as the gate. Without the gate, Step 1 could render
+  // before state.principalName and state.timezone are pre-populated from the
+  // principal response, leaving the fields momentarily blank on a re-run.
   if (!existingIdentity || principalExists === null) {
     return (
       <div className="wizard-page">
@@ -465,8 +668,8 @@ export default function WizardPage() {
   //
   // Captures the operator's own name and POSTs it to /api/setup/principal so
   // the principal contact exists before the assistant identity is saved on
-  // step 5. Auto-skipped (via the effect above) when a principal is already
-  // present — typically CEO_PRIMARY_EMAIL deployments that bootstrapped one.
+  // Step 6. The input is pre-populated from the loaded principal when one
+  // already exists (e.g. a wizard re-run). Step 1 is never auto-skipped.
 
   const step1 = (
     <div className="wizard-content">
@@ -508,9 +711,183 @@ export default function WizardPage() {
     </div>
   );
 
-  // ── Step 2: Assistant identity ─────────────────────────────────────────────
+  // ── Step 2: Your details (principal operational profile) ───────────────────
+  //
+  // Collects the operator's timezone (required), contact email, preferred name,
+  // title, and optional working hours. POSTs to /api/setup/principal/profile.
+  // All fields except timezone are optional — skipping them is fine (#392).
 
-  const step2Identity = (
+  // Working hours helpers — only assembled when the operator has set start/end times.
+  const wh = state.workingHours;
+
+  function setWorkingHoursStart(val: string): void {
+    setState(s => ({
+      ...s,
+      workingHours: s.workingHours
+        ? { ...s.workingHours, start: val }
+        : { start: val, end: '17:00', days: [1, 2, 3, 4, 5] },
+    }));
+  }
+
+  function setWorkingHoursEnd(val: string): void {
+    setState(s => ({
+      ...s,
+      workingHours: s.workingHours
+        ? { ...s.workingHours, end: val }
+        : { start: '09:00', end: val, days: [1, 2, 3, 4, 5] },
+    }));
+  }
+
+  function toggleWorkingHoursDay(day: number): void {
+    setState(s => {
+      // If workingHours is null, initialise with sensible defaults before toggling.
+      const existing: WizardWorkingHours = s.workingHours ?? { start: '09:00', end: '17:00', days: [1, 2, 3, 4, 5] };
+      const days = existing.days.includes(day)
+        ? existing.days.filter(d => d !== day)
+        : [...existing.days, day].sort((a, b) => a - b);
+      return { ...s, workingHours: { ...existing, days } };
+    });
+  }
+
+  const step2Profile = (
+    <div className="wizard-content">
+      <div className="wizard-heading">Your details</div>
+      <div className="wizard-subheading">
+        Help your assistant work in your context. Timezone is required; everything else is optional.
+      </div>
+
+      <div className="wizard-field">
+        <label htmlFor="w-timezone">Timezone *</label>
+        <select
+          id="w-timezone"
+          value={state.timezone}
+          onChange={e => setState(s => ({ ...s, timezone: e.target.value }))}
+        >
+          {state.timezone === '' && (
+            <option value="" disabled>Select a timezone…</option>
+          )}
+          {IANA_ZONES.map(tz => (
+            <option key={tz} value={tz}>{tz}</option>
+          ))}
+        </select>
+      </div>
+
+      <div className="wizard-field">
+        <label htmlFor="w-profile-email">
+          Email <span style={{ fontWeight: 400 }}>(Optional)</span>
+        </label>
+        <input
+          id="w-profile-email"
+          type="email"
+          value={state.email}
+          placeholder="you@example.com"
+          onChange={e => {
+            setState(s => ({ ...s, email: e.target.value }));
+            if (profileError) setProfileError(null);
+          }}
+        />
+      </div>
+
+      <div className="wizard-field">
+        <label htmlFor="w-preferred-name">
+          Preferred name <span style={{ fontWeight: 400 }}>(Optional — how your assistant addresses you)</span>
+        </label>
+        <input
+          id="w-preferred-name"
+          type="text"
+          value={state.preferredName}
+          placeholder="e.g. Jamie"
+          onChange={e => setState(s => ({ ...s, preferredName: e.target.value }))}
+        />
+      </div>
+
+      <div className="wizard-field">
+        <label htmlFor="w-principal-title">
+          Your title <span style={{ fontWeight: 400 }}>(Optional)</span>
+        </label>
+        <input
+          id="w-principal-title"
+          type="text"
+          value={state.principalTitle}
+          placeholder="e.g. Chief Executive Officer"
+          onChange={e => setState(s => ({ ...s, principalTitle: e.target.value }))}
+        />
+      </div>
+
+      <div className="wizard-label" style={{ marginTop: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+        Working hours{' '}
+        <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(Optional)</span>
+        {wh !== null && (
+          <button
+            type="button"
+            style={{ marginLeft: 'auto', fontSize: 12, fontWeight: 400, background: 'none', border: 'none', color: 'var(--color-muted)', cursor: 'pointer', textTransform: 'none', letterSpacing: 0 }}
+            onClick={() => setState(s => ({ ...s, workingHours: null }))}
+          >
+            Clear
+          </button>
+        )}
+      </div>
+      <div className="wizard-subheading" style={{ marginTop: 0, marginBottom: 12 }}>
+        Leave blank to skip — your assistant will work around the clock.
+      </div>
+
+      <div className="wizard-field">
+        <label htmlFor="w-wh-start">Start</label>
+        <input
+          id="w-wh-start"
+          type="time"
+          value={wh?.start ?? ''}
+          onChange={e => setWorkingHoursStart(e.target.value)}
+        />
+      </div>
+      <div className="wizard-field">
+        <label htmlFor="w-wh-end">End</label>
+        <input
+          id="w-wh-end"
+          type="time"
+          value={wh?.end ?? ''}
+          onChange={e => setWorkingHoursEnd(e.target.value)}
+        />
+      </div>
+
+      <div className="wizard-label" style={{ marginTop: 8 }}>Days</div>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+        {WEEKDAY_LABELS.map((label, idx) => {
+          const selected = wh?.days.includes(idx) ?? false;
+          return (
+            <button
+              key={label}
+              type="button"
+              className={`tone-pill${selected ? ' selected' : ''}`}
+              onClick={() => toggleWorkingHoursDay(idx)}
+              style={{ minWidth: 36 }}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
+
+      {profileError && <div className="wizard-step1-error">{profileError}</div>}
+
+      <div className="wizard-nav">
+        <button type="button" className="btn-wizard-back" onClick={handleBack}>
+          ← Back
+        </button>
+        <button
+          type="button"
+          className="btn-wizard-next"
+          onClick={() => void handleProfileContinue()}
+        >
+          Next →
+        </button>
+      </div>
+    </div>
+  );
+
+  // ── Step 3: Assistant identity ─────────────────────────────────────────────
+
+  const step3Identity = (
     <div className="wizard-content">
       <div className="wizard-heading">What should your assistant be called?</div>
       <div className="wizard-subheading">
@@ -522,7 +899,9 @@ export default function WizardPage() {
           id="w-name"
           type="text"
           value={state.name}
-          placeholder="Alex Curia"
+          // Name is pre-populated as a value; this placeholder is the fallback
+          // if the operator clears it. Tracks the LLM suggestion when one landed.
+          placeholder={assistantFullName(suggestedName ?? DEFAULT_ASSISTANT_FIRST_NAME)}
           onChange={e => {
             setState(s => ({ ...s, name: e.target.value }));
             if (assistantNameError) setAssistantNameError('');
@@ -545,85 +924,13 @@ export default function WizardPage() {
         <textarea
           id="w-signature"
           value={state.signature}
-          placeholder="Best regards, Alex"
+          // The signature is pre-populated as a value (above); this placeholder
+          // is the fallback if the operator clears the field. Tracks the LLM
+          // suggestion's first name when one landed, else "Alex" (#799).
+          placeholder={defaultSignature(suggestedName ?? DEFAULT_ASSISTANT_FIRST_NAME)}
           onChange={e => setState(s => ({ ...s, signature: e.target.value }))}
         />
       </div>
-      <div className="wizard-nav">
-        {principalExists ? (
-          <span />
-        ) : (
-          <button type="button" className="btn-wizard-back" onClick={handleBack}>
-            ← Back
-          </button>
-        )}
-        <button type="button" className="btn-wizard-next" onClick={handleContinue}>
-          Next →
-        </button>
-      </div>
-    </div>
-  );
-
-  // ── Step 3: Tone ───────────────────────────────────────────────────────────
-
-  const atToneMax = state.toneBaseline.length >= 3;
-
-  const step3Tone = (
-    <div className="wizard-content">
-      <div className="wizard-heading">How should your assistant communicate?</div>
-      <div className="wizard-subheading">Pick 1–3 words that describe the tone you want.</div>
-      <div className="wizard-label">
-        Tone <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>
-          (pick up to 3)
-        </span>
-      </div>
-      <div className="tone-pill-grid">
-        {TONE_OPTIONS.map(word => {
-          const selected = state.toneBaseline.includes(word);
-          const disabled = atToneMax && !selected;
-          return (
-            <button
-              key={word}
-              type="button"
-              className={`tone-pill${selected ? ' selected' : ''}`}
-              disabled={disabled}
-              onClick={() =>
-                setState(s => ({
-                  ...s,
-                  toneBaseline: toggleToneSelection(s.toneBaseline, word),
-                }))
-              }
-            >
-              {word}
-            </button>
-          );
-        })}
-      </div>
-      <div className="wizard-preview">{tonePreviewText(state.toneBaseline)}</div>
-      <label className="wizard-label" htmlFor="w-verbosity">Detail level</label>
-      <input
-        id="w-verbosity"
-        type="range"
-        min={0}
-        max={100}
-        value={state.verbosity}
-        style={{ width: '100%', marginBottom: 6 } as CSSProperties}
-        onChange={e => setState(s => ({ ...s, verbosity: Number(e.target.value) }))}
-      />
-      <div className="slider-labels"><span>Brief</span><span>Thorough</span></div>
-      <div className="wizard-sample">{verbosityBand(state.verbosity)}</div>
-      <label className="wizard-label" htmlFor="w-directness">Directness</label>
-      <input
-        id="w-directness"
-        type="range"
-        min={0}
-        max={100}
-        value={state.directness}
-        style={{ width: '100%', marginBottom: 6 } as CSSProperties}
-        onChange={e => setState(s => ({ ...s, directness: Number(e.target.value) }))}
-      />
-      <div className="slider-labels"><span>Measured</span><span>Direct</span></div>
-      <div className="wizard-sample">{directnessBand(state.directness)}</div>
       <div className="wizard-nav">
         <button type="button" className="btn-wizard-back" onClick={handleBack}>
           ← Back
@@ -635,43 +942,50 @@ export default function WizardPage() {
     </div>
   );
 
-  // ── Step 4: Posture & preferences ──────────────────────────────────────────
+  // ── Step 4: Tone & style ───────────────────────────────────────────────────
 
-  const POSTURE_OPTIONS: Array<{
-    value: WizardState['posture'];
-    title: string;
-    desc: string;
-  }> = [
-    { value: 'conservative', title: 'Conservative', desc: 'Verify before acting; flag ambiguity' },
-    { value: 'balanced',     title: 'Balanced',     desc: 'Act when confident, flag when uncertain' },
-    { value: 'proactive',    title: 'Proactive',    desc: 'Bias toward action; less checking in' },
-  ];
-
-  const step4Posture = (
+  const step4Tone = (
     <div className="wizard-content">
-      <div className="wizard-heading">How should your assistant decide?</div>
+      <div className="wizard-heading">How should your assistant sound?</div>
       <div className="wizard-subheading">
-        Choose a default posture for external actions. You can adjust this later via Autonomy settings.
+        Start from a template, then make it yours. A few lines on how it sounds and what it never does.
       </div>
-      <div className="wizard-label">
-        Decision posture{' '}
-        <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0, color: 'var(--app-fg-muted)' }}>
-          (for external actions)
-        </span>
+      <ToneStyleField
+        value={state.toneStyle}
+        onChange={toneStyle => setState(s => ({ ...s, toneStyle }))}
+        idPrefix="w-tone"
+      />
+      <DetailSlider
+        verbosity={state.verbosity}
+        lengthLimits={lengthLimits}
+        onChange={verbosity => setState(s => ({ ...s, verbosity }))}
+        idPrefix="w"
+      />
+      <div className="wizard-nav">
+        <button type="button" className="btn-wizard-back" onClick={handleBack}>
+          ← Back
+        </button>
+        <button type="button" className="btn-wizard-next" onClick={handleContinue}>
+          Next →
+        </button>
       </div>
-      <div className="posture-grid">
-        {POSTURE_OPTIONS.map(opt => (
-          <button
-            key={opt.value}
-            type="button"
-            className={`posture-card${state.posture === opt.value ? ' selected' : ''}`}
-            onClick={() => setState(s => ({ ...s, posture: opt.value }))}
-          >
-            <div className="posture-card-title">{opt.title}</div>
-            <div className="posture-card-desc">{opt.desc}</div>
-          </button>
-        ))}
+    </div>
+  );
+
+  // ── Step 5: Autonomy & preferences ─────────────────────────────────────────
+
+  const step5Autonomy = (
+    <div className="wizard-content">
+      <div className="wizard-heading">How independent should your assistant be?</div>
+      <div className="wizard-subheading">
+        Pick an autonomy level. You can fine-tune it later under Settings → Autonomy.
       </div>
+      {state.autonomyBand && (
+        <AutonomyBandPicker
+          value={state.autonomyBand}
+          onChange={autonomyBand => setState(s => ({ ...s, autonomyBand }))}
+        />
+      )}
       <div className="wizard-label" style={{ marginTop: 4 }}>
         Anything else? <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(Optional)</span>
       </div>
@@ -695,31 +1009,25 @@ export default function WizardPage() {
     </div>
   );
 
-  // ── Step 5: Review ─────────────────────────────────────────────────────────
-
-  const words = state.toneBaseline;
-  const tonePhrase =
-    words.length === 1
-      ? words[0]!
-      : words.length === 2
-        ? `${words[0]} and ${words[1]}`
-        : `${words[0]}, ${words[1]} and ${words[2]}`;
+  // ── Step 6: Review ─────────────────────────────────────────────────────────
 
   const reviewRows: Array<{ label: string; value: string }> = [
     {
       label: 'Assistant',
       value: state.name.trim() + (state.title.trim() ? ` — ${state.title.trim()}` : ''),
     },
-    { label: 'Tone',       value: `Your tone is ${tonePhrase}.` },
-    { label: 'Detail',     value: verbosityReviewDesc(state.verbosity) },
-    { label: 'Directness', value: directnessReviewDesc(state.directness) },
-    { label: 'Posture',    value: postureReviewDesc(state.posture) },
+    { label: 'Tone & style', value: styleReviewDesc(state.toneStyle) },
+    { label: 'Detail',       value: verbosityReviewDesc(state.verbosity) },
+    {
+      label: 'Autonomy',
+      value: state.autonomyBand ? `${BAND_META[state.autonomyBand].label}. ${BAND_META[state.autonomyBand].description}` : '',
+    },
   ];
   if (state.preferences.trim()) {
     reviewRows.push({ label: 'Preference', value: `"${state.preferences.trim()}"` });
   }
 
-  const step5Review = (
+  const step6Review = (
     <div className="wizard-content">
       <div className="wizard-heading">Does everything look right?</div>
       <div className="wizard-subheading">Go back to change anything, or save to get started.</div>
@@ -752,10 +1060,11 @@ export default function WizardPage() {
 
   const steps: Record<number, JSX.Element> = {
     1: step1,
-    2: step2Identity,
-    3: step3Tone,
-    4: step4Posture,
-    5: step5Review,
+    2: step2Profile,
+    3: step3Identity,
+    4: step4Tone,
+    5: step5Autonomy,
+    6: step6Review,
   };
 
   return (

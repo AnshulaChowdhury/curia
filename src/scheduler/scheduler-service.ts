@@ -6,6 +6,7 @@ import type { Logger } from '../logger.js';
 import { createScheduleCreated } from '../bus/events.js';
 import type { TaskOriginator } from '../contacts/types.js';
 import { makeSystemOriginator } from '../contacts/principal.js';
+import { validateTaskErrorBudget } from '../tasks/task-error-budget.js';
 
 // -- Public types --
 
@@ -56,6 +57,8 @@ export interface JobRow {
   agentTaskId: string | null;
   intentAnchor: string | null;
   progress: Record<string, unknown> | null;
+  taskErrorBudget: Record<string, unknown> | null;
+  taskTags: string[] | null;
   /** Human-readable task title — included in the content bundle so receiving agents have context. */
   taskTitle: string | null;
   runStartedAt: string | null;
@@ -72,6 +75,10 @@ export interface JobRow {
 export interface ListJobsFilters {
   status?: string;
   agentId?: string;
+  /** Cap the number of rows returned (most recent first). Omitted → no cap.
+   *  Callers that feed results to an LLM must set this — an unbounded listing over
+   *  a large jobs table overflows the model context window. (#1487) */
+  limit?: number;
 }
 
 // -- Internal DB row shape (snake_case) --
@@ -93,17 +100,19 @@ interface DbJobRow {
   agent_task_id: string | null;
   intent_anchor: string | null;
   progress: Record<string, unknown> | null;
+  task_error_budget: Record<string, unknown> | null;
+  task_tags: string[] | null;
   task_title: string | null;
   run_started_at: string | null;          // set when job enters 'running'; cleared on completion
   expected_duration_seconds: number | null; // per-job timeout hint; NULL → system default (600s)
   last_run_outcome: 'completed' | 'failed' | 'timed_out' | null;
-  last_run_summary: string | null;   // agent-written summary; null until first scheduler-report call
-  last_run_context: Record<string, unknown> | null; // opaque agent context; null until first scheduler-report call
+  last_run_summary: string | null;   // cleared at claim; set by scheduler-report or completeJobRun auto-summary
+  last_run_context: Record<string, unknown> | null; // survives claim; scheduler-report + completeJobRun failedSkills (#1830)
   originator: Record<string, unknown> | null; // JSONB — cast to TaskOriginator when mapping
 }
 
 // Threshold for auto-suspending jobs after consecutive failures.
-const SUSPEND_THRESHOLD = 3;
+export const SUSPEND_THRESHOLD = 3;
 
 export class SchedulerService {
   private pool: Pool;
@@ -124,6 +133,11 @@ export class SchedulerService {
     this.bus = bus;
     this.logger = logger;
     this.timezone = timezone;
+  }
+
+  /** The timezone createJob gives a job when the caller passes none. */
+  get defaultTimezone(): string {
+    return this.timezone;
   }
 
   // -- Cron helpers --
@@ -162,6 +176,12 @@ export class SchedulerService {
 
   async createJob(params: CreateJobParams): Promise<CreateJobResult> {
     const { agentId, cronExpr, runAt, taskPayload, createdBy, intentAnchor, errorBudget } = params;
+    if (errorBudget !== undefined) {
+      const budgetError = validateTaskErrorBudget(errorBudget);
+      if (budgetError) {
+        throw new Error(budgetError);
+      }
+    }
     // Per-job timezone: use caller's override, fall back to service default.
     // Validate LLM-supplied overrides — cron-parser accepts some invalid zone strings
     // (e.g. "UTC+99") without throwing, which would silently schedule jobs at wrong times.
@@ -221,18 +241,12 @@ export class SchedulerService {
       insertParams.push(rawDuration);
     }
 
-    const { rows } = await this.pool.query(insertSql, insertParams);
-    const jobId = (rows[0] as { id: string }).id;
-
-    // If an intentAnchor is provided, create a linked task row and bind it to the job.
-    // The FK direction is scheduled_jobs.task_id → tasks.id, so we INSERT the task
-    // first and then UPDATE the job row with the new task's id.
-    //
-    // The CTE surfaces both the task id and the job id from the UPDATE so that a
-    // silent UPDATE failure (scheduled_jobs row disappeared in a race) is detectable —
-    // link_job with 0 matched rows returns job_id=null via the LEFT JOIN.
+    let jobId: string;
     let agentTaskId: string | undefined;
+
     if (intentAnchor) {
+      // Wrap scheduled_jobs INSERT + tasks link CTE in one transaction so a failure
+      // on the second step cannot leave an orphaned job row with drift detection disabled.
       const taskSql = `
         WITH new_task AS (
           INSERT INTO tasks (agent_id, title, intent_anchor, status, error_budget, source_agent_id)
@@ -256,23 +270,57 @@ export class SchedulerService {
         'active',
         JSON.stringify(errorBudget ?? {}),
         agentId,        // source_agent_id
-        jobId,
+        null as string | null, // placeholder — jobId substituted after INSERT
       ];
-      const taskResult = await this.pool.query(taskSql, taskParams);
-      const taskRow = taskResult.rows[0] as { task_id: string; job_id: string | null } | undefined;
-      if (!taskRow?.task_id) {
-        throw new Error(`createJob: INSERT into tasks returned no row for job ${jobId}`);
+
+      const client = await this.pool.connect();
+      try {
+        await client.query('BEGIN');
+
+        const { rows } = await client.query(insertSql, insertParams);
+        jobId = (rows[0] as { id: string }).id;
+        taskParams[6] = jobId;
+
+        const taskResult = await client.query(taskSql, taskParams);
+        const taskRow = taskResult.rows[0] as { task_id: string; job_id: string | null } | undefined;
+        if (!taskRow?.task_id) {
+          throw new Error(`createJob: INSERT into tasks returned no row for job ${jobId}`);
+        }
+        if (!taskRow.job_id) {
+          // The INSERT succeeded but the UPDATE found no scheduled_jobs row.
+          // This means a concurrent cancel removed the job between the INSERT above and this CTE.
+          this.logger.error(
+            { agentId, jobId, taskId: taskRow.task_id },
+            'createJob: task row created but scheduled_jobs.task_id link failed — orphaned task',
+          );
+          throw new Error(`createJob: scheduled_jobs row ${jobId} not found when linking task`);
+        }
+        agentTaskId = taskRow.task_id;
+
+        await client.query('COMMIT');
+      } catch (err) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+          this.logger.error(
+            { err: rollbackErr, agentId },
+            'createJob: ROLLBACK failed after transaction error — connection may be in bad state',
+          );
+        }
+        throw err;
+      } finally {
+        try {
+          client.release();
+        } catch (releaseErr) {
+          this.logger.error(
+            { err: releaseErr, agentId },
+            'createJob: pg client release failed — connection may leak from pool',
+          );
+        }
       }
-      if (!taskRow.job_id) {
-        // The INSERT succeeded but the UPDATE found no scheduled_jobs row.
-        // This means a concurrent cancel removed the job between the INSERT above and this CTE.
-        this.logger.error(
-          { agentId, jobId, taskId: taskRow.task_id },
-          'createJob: task row created but scheduled_jobs.task_id link failed — orphaned task',
-        );
-        throw new Error(`createJob: scheduled_jobs row ${jobId} not found when linking task`);
-      }
-      agentTaskId = taskRow.task_id;
+    } else {
+      const { rows } = await this.pool.query(insertSql, insertParams);
+      jobId = (rows[0] as { id: string }).id;
     }
 
     // Publish schedule.created event for audit trail.
@@ -297,6 +345,8 @@ export class SchedulerService {
              t.id AS agent_task_id,
              t.intent_anchor,
              t.progress,
+             t.error_budget AS task_error_budget,
+             t.tags AS task_tags,
              t.title AS task_title
         FROM scheduled_jobs sj
         LEFT JOIN tasks t ON sj.task_id = t.id
@@ -325,21 +375,36 @@ export class SchedulerService {
       paramIndex++;
     }
 
-    // Suppress unused-variable warning — paramIndex is incremented to stay ready for future filters.
-    void paramIndex;
-
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    // Optional row cap, applied in SQL so a large jobs table never loads fully into
+    // memory. Only added when the caller asks for one, so existing callers (HTTP
+    // /api/jobs, setup-status) keep their full-list behaviour unchanged. (#1487)
+    let limitClause = '';
+    if (filters?.limit !== undefined && Number.isFinite(filters.limit) && filters.limit > 0) {
+      limitClause = `LIMIT $${paramIndex}`;
+      // Math.max(1, …) so a fractional limit in (0, 1) becomes LIMIT 1, not LIMIT 0
+      // (Math.floor(0.5) === 0 would silently return zero rows).
+      params.push(Math.max(1, Math.floor(filters.limit)));
+      paramIndex++;
+    }
+
+    // Suppress unused-variable warning — paramIndex stays incremented for future filters.
+    void paramIndex;
 
     const sql = `
       SELECT sj.*,
              t.id AS agent_task_id,
              t.intent_anchor,
              t.progress,
+             t.error_budget AS task_error_budget,
+             t.tags AS task_tags,
              t.title AS task_title
         FROM scheduled_jobs sj
         LEFT JOIN tasks t ON sj.task_id = t.id
        ${whereClause}
        ORDER BY sj.created_at DESC
+       ${limitClause}
     `;
     const { rows } = await this.pool.query(sql, params);
     return (rows as DbJobRow[]).map(mapJobRow);
@@ -362,29 +427,69 @@ export class SchedulerService {
   }
 
   /**
-   * Pause a job and its linked task due to intent drift detection.
-   * Sets status = 'paused' on both tables in a single query.
-   * The CEO must review and resume or cancel the job manually.
+   * Set a job and its linked task to 'paused' in a single round-trip, returning the
+   * number of job rows actually transitioned (0 when the job is missing or terminal).
+   * Shared by the drift-pause and operator-pause paths so the SQL stays in one place.
+   *
+   * The scheduled_jobs UPDATE is the OUTER statement so result.rowCount reflects the
+   * job (a CTE-wrapped final UPDATE would report the tasks row count instead, which is
+   * 0 for jobs without a linked task). The task UPDATE runs in the CTE against the same
+   * snapshot, so both see the pre-update status.
+   *
+   * The terminal-state guard prevents re-arming a job the principal already ended: without it,
+   * pausing a 'cancelled'/'completed' job then resuming it (unsuspendJob accepts 'paused')
+   * would resurrect it. Drift only ever pauses active jobs, so the guard is a no-op there.
    */
-  async pauseJobForDrift(jobId: string): Promise<void> {
-    // Update both tables atomically: pause the job and its linked task.
-    // Uses a CTE so both updates happen in one round-trip and stay consistent.
-    // The FK is now scheduled_jobs.task_id → tasks.id, so we join through scheduled_jobs.
-    await this.pool.query(
-      `WITH paused_job AS (
-         UPDATE scheduled_jobs
-            SET status = 'paused'
-          WHERE id = $1
+  private async setPaused(jobId: string): Promise<number> {
+    const result = await this.pool.query(
+      `WITH paused_task AS (
+         UPDATE tasks t
+            SET status     = 'paused',
+                updated_at = now()
+           FROM scheduled_jobs sj
+          WHERE sj.id = $1
+            AND t.id = sj.task_id
+            AND sj.status NOT IN ('cancelled', 'completed')
        )
-       UPDATE tasks t
-          SET status     = 'paused',
-              updated_at = now()
-         FROM scheduled_jobs sj
-        WHERE sj.id = $1 AND t.id = sj.task_id`,
+       UPDATE scheduled_jobs
+          SET status = 'paused'
+        WHERE id = $1
+          AND status NOT IN ('cancelled', 'completed')`,
       [jobId],
     );
+    return result.rowCount ?? 0;
+  }
 
+  /**
+   * Pause a job and its linked task due to intent drift detection.
+   * Sets status = 'paused' on both tables.
+   * The principal must review and resume or cancel the job manually.
+   */
+  async pauseJobForDrift(jobId: string): Promise<void> {
+    const count = await this.setPaused(jobId);
+    if (count === 0) {
+      // Drift only targets active jobs, so a miss here means the job vanished or was
+      // ended concurrently — log rather than throw to keep the detector's flow intact.
+      this.logger.warn({ jobId }, 'Drift pause matched no active job (already ended?)');
+      return;
+    }
     this.logger.info({ jobId }, 'Job paused due to intent drift detection');
+  }
+
+  /**
+   * Pause a job and its linked task at an operator's explicit request
+   * (e.g. the principal asking Curia to pause a schedule via the scheduler-update skill).
+   * Neutral counterpart to pauseJobForDrift — same state transition, no drift semantics.
+   * Released by unsuspendJob(), which accepts both 'suspended' and 'paused' states.
+   * Throws when the job is missing or already terminal so callers don't report a
+   * silent no-op as success.
+   */
+  async pauseJob(jobId: string): Promise<void> {
+    const count = await this.setPaused(jobId);
+    if (count === 0) {
+      throw new Error(`Job ${jobId} not found or already cancelled/completed`);
+    }
+    this.logger.info({ jobId }, 'Job paused by operator request');
   }
 
   async unsuspendJob(jobId: string): Promise<void> {
@@ -408,12 +513,17 @@ export class SchedulerService {
       nextRunAt = new Date(run_at!);
     }
 
+    // One-shot rows may hold a deferred_wake_at from a reschedule that landed
+    // while the job was running and then paused (#1938). Prefer that column over
+    // the pre-pause run_at, including when it is written after this SELECT.
     await this.pool.query(
       `UPDATE scheduled_jobs
          SET status = 'pending',
              consecutive_failures = 0,
              last_error = NULL,
-             next_run_at = $2
+             run_at = CASE WHEN cron_expr IS NULL THEN COALESCE(deferred_wake_at, run_at) ELSE run_at END,
+             next_run_at = CASE WHEN cron_expr IS NULL THEN COALESCE(deferred_wake_at, $2) ELSE $2 END,
+             deferred_wake_at = CASE WHEN cron_expr IS NULL THEN NULL ELSE deferred_wake_at END
        WHERE id = $1`,
       [jobId, nextRunAt],
     );
@@ -478,7 +588,15 @@ export class SchedulerService {
 
     params.push(jobId);
     const sql = `UPDATE scheduled_jobs SET ${setClauses.join(', ')} WHERE id = $${params.length}`;
-    await this.pool.query(sql, params);
+    const result = await this.pool.query(sql, params);
+
+    // A 0-row update means the job_id doesn't exist. Throw rather than return silently
+    // so callers (e.g. the scheduler-update skill) surface a real failure instead of
+    // reporting a no-op edit as success. The web PATCH route already checks existence
+    // via getJob() before calling this, so this only bites genuinely-missing jobs.
+    if (result.rowCount === 0) {
+      throw new Error(`Job ${jobId} not found`);
+    }
 
     this.logger.info({ jobId, updates: Object.keys(updates) }, 'Scheduled job updated');
   }
@@ -602,78 +720,17 @@ export class SchedulerService {
       JSON.stringify(originator),
     ];
 
-    const { rows } = await this.pool.query(sql, params);
-    const resultRow = rows[0] as
-      | {
-          id: string;
-          prior_status?: string | null;
-          prior_failures?: number | null;
-          prior_error?: string | null;
-        }
-      | undefined;
-    // An INSERT ... ON CONFLICT DO UPDATE with no DO UPDATE WHERE always returns exactly
-    // one row (the inserted or the updated row), so an empty result means the statement or
-    // connection is fundamentally broken. Fail loudly rather than dereferencing undefined —
-    // loadDeclarativeJobs() catches this and logs it on the per-schedule error path.
-    if (!resultRow) {
-      throw new Error(
-        `upsertDeclarativeJob: upsert returned no row for ${sourceAgentId}/${agentId} (${schedule.cron})`,
-      );
-    }
-    const jobId = resultRow.id;
+    let jobId: string;
+    let upsertResultRow: {
+      id: string;
+      prior_status?: string | null;
+      prior_failures?: number | null;
+      prior_error?: string | null;
+    };
 
-    const revivedFromCancelled = resultRow.prior_status === 'cancelled';
-
-    // Reviving overrides a terminal 'cancelled' state, so surface it loudly — the
-    // symmetric cancellation path (cancelStaleDeclarativeJobs) logs per row, and a
-    // resurrection must be at least as visible. Include the failure bookkeeping the
-    // upsert just wiped so the prior context survives in the logs. warn (not info)
-    // because this silently undoes a deliberate cancelJob() if one was issued.
-    if (revivedFromCancelled) {
-      this.logger.warn(
-        {
-          jobId,
-          sourceAgentId,
-          agentId,
-          cron: schedule.cron,
-          priorConsecutiveFailures: resultRow.prior_failures ?? null,
-          priorLastError: resultRow.prior_error ?? null,
-        },
-        'Declarative job revived from cancelled — its YAML declaration still exists. ' +
-          'If this job was deliberately stopped, remove its schedule entry from the agent YAML instead of cancelling it.',
-      );
-
-      // cancelJob() cancels a job AND cascades 'cancelled' onto its linked task (see
-      // cancelJob above). Reviving only the job would leave an intent_anchor schedule
-      // pointing at a terminal 'cancelled' task, which the task-update guards
-      // (TERMINAL_STATUSES) then reject — an inconsistent, un-editable state. So when we
-      // revive, also reactivate the linked task. Scoped to status = 'cancelled' so a task
-      // left 'active' by the stale-cleanup path, or one legitimately 'done', is untouched.
-      // (No declarative schedule sets intent_anchor today, so this is a no-op in practice,
-      // but it keeps revival symmetric with cancelJob's cascade for when they do.)
-      await this.pool.query(
-        `UPDATE tasks
-            SET status = 'active', updated_at = now()
-           FROM scheduled_jobs sj
-          WHERE sj.id = $1
-            AND tasks.id = sj.task_id
-            AND tasks.status = 'cancelled'`,
-        [jobId],
-      );
-    }
-
-    // If intent_anchor is set, create a linked tasks row so the drift detector can
-    // fire for this job — same pattern as createJob(). The WHERE NOT EXISTS guard ensures
-    // this is a no-op on restart (preserving accumulated progress in the existing row).
-    //
-    // The CTE surfaces both outcomes via a SELECT at the end:
-    //   - rows = [] (empty): WHERE NOT EXISTS fired — existing task preserved (idempotent)
-    //   - rows = [{ task_id, job_id }]: new task created and job linked
-    //   - rows = [{ task_id, job_id: null }]: INSERT succeeded but link_job UPDATE returned
-    //     no rows — either the job was deleted concurrently, or a parallel startup already
-    //     set task_id (AND task_id IS NULL guard prevents overwriting). The cleanup_orphan
-    //     CTE deletes the just-inserted task so no orphan accumulates; treated as a hard error.
     if (schedule.intent_anchor) {
+      // Wrap scheduled_jobs UPSERT + tasks link CTE in one transaction so a failure
+      // on the link step cannot leave an orphaned job row with drift detection disabled.
       const taskSql = `
         WITH new_task AS (
           INSERT INTO tasks (agent_id, title, intent_anchor, status, error_budget, source_agent_id)
@@ -698,45 +755,132 @@ export class SchedulerService {
           FROM new_task
           LEFT JOIN link_job ON true
       `;
-      let taskResult: { rows: unknown[] };
+      const taskParams = [
+        agentId,
+        schedule.intent_anchor,   // title
+        schedule.intent_anchor,   // intent_anchor
+        'active',
+        JSON.stringify({}),
+        agentId,                  // source_agent_id
+        null as string | null,    // placeholder — jobId substituted after upsert
+      ];
+
+      const client = await this.pool.connect();
       try {
-        taskResult = await this.pool.query(taskSql, [
-          agentId,
-          schedule.intent_anchor,   // title
-          schedule.intent_anchor,   // intent_anchor
-          'active',
-          JSON.stringify({}),
-          agentId,                  // source_agent_id
-          jobId,
-        ]);
+        await client.query('BEGIN');
+
+        const { rows } = await client.query(sql, params);
+        const row = rows[0] as typeof upsertResultRow | undefined;
+        if (!row) {
+          throw new Error(
+            `upsertDeclarativeJob: upsert returned no row for ${sourceAgentId}/${agentId} (${schedule.cron})`,
+          );
+        }
+        upsertResultRow = row;
+        jobId = upsertResultRow.id;
+        taskParams[6] = jobId;
+
+        if (upsertResultRow.prior_status === 'cancelled') {
+          await client.query(
+            `UPDATE tasks
+                SET status = 'active', updated_at = now()
+               FROM scheduled_jobs sj
+              WHERE sj.id = $1
+                AND tasks.id = sj.task_id
+                AND tasks.status = 'cancelled'`,
+            [jobId],
+          );
+        }
+
+        const taskResult = await client.query(taskSql, taskParams);
+        const taskRow = taskResult.rows[0] as { task_id: string; job_id: string | null } | undefined;
+        if (taskRow && !taskRow.job_id) {
+          this.logger.error(
+            { agentId, jobId, intentAnchor: schedule.intent_anchor, taskId: taskRow.task_id },
+            'upsertDeclarativeJob: tasks row created but scheduled_jobs.task_id link failed — orphaned task',
+          );
+          throw new Error(`upsertDeclarativeJob: scheduled_jobs row ${jobId} not found when linking task`);
+        }
+
+        await client.query('COMMIT');
+
+        const anchorCreated = taskRow != null;
+        this.logger.info(
+          { agentId, jobId, intentAnchor: schedule.intent_anchor, anchorCreated },
+          anchorCreated
+            ? 'upsertDeclarativeJob: tasks row created for intent_anchor (drift detection enabled)'
+            : 'upsertDeclarativeJob: tasks row already exists — skipped (restart idempotency)',
+        );
       } catch (err) {
-        // Re-throw so loadDeclarativeJobs treats the whole upsert as failed.
-        // The scheduled_jobs row was already written, but without the tasks
-        // link the drift detector cannot fire — running silently in a degraded state
-        // is worse than a loud failure that prompts operator attention.
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+          this.logger.error(
+            { err: rollbackErr, agentId, sourceAgentId },
+            'upsertDeclarativeJob: ROLLBACK failed after transaction error — connection may be in bad state',
+          );
+        }
         this.logger.error(
-          { err, agentId, jobId, intentAnchor: schedule.intent_anchor },
-          'upsertDeclarativeJob: failed to create tasks row — job will run without drift detection until this is resolved',
+          { err, agentId, sourceAgentId, intentAnchor: schedule.intent_anchor },
+          'upsertDeclarativeJob: failed to upsert job or create tasks row — transaction rolled back',
         );
         throw err;
+      } finally {
+        try {
+          client.release();
+        } catch (releaseErr) {
+          this.logger.error(
+            { err: releaseErr, agentId, sourceAgentId },
+            'upsertDeclarativeJob: pg client release failed — connection may leak from pool',
+          );
+        }
       }
-      const resultRow = taskResult.rows[0] as { task_id: string; job_id: string | null } | undefined;
-      if (resultRow && !resultRow.job_id) {
-        // INSERT succeeded but the UPDATE found no scheduled_jobs row.
-        // This is a race: the job was cancelled between the upsert above and this CTE.
-        this.logger.error(
-          { agentId, jobId, intentAnchor: schedule.intent_anchor, taskId: resultRow.task_id },
-          'upsertDeclarativeJob: tasks row created but scheduled_jobs.task_id link failed — orphaned task',
+    } else {
+      const { rows } = await this.pool.query(sql, params);
+      const row = rows[0] as typeof upsertResultRow | undefined;
+      if (!row) {
+        throw new Error(
+          `upsertDeclarativeJob: upsert returned no row for ${sourceAgentId}/${agentId} (${schedule.cron})`,
         );
-        throw new Error(`upsertDeclarativeJob: scheduled_jobs row ${jobId} not found when linking task`);
       }
-      const anchorCreated = resultRow != null;
-      this.logger.info(
-        { agentId, jobId, intentAnchor: schedule.intent_anchor, anchorCreated },
-        anchorCreated
-          ? 'upsertDeclarativeJob: tasks row created for intent_anchor (drift detection enabled)'
-          : 'upsertDeclarativeJob: tasks row already exists — skipped (restart idempotency)',
+      upsertResultRow = row;
+      jobId = upsertResultRow.id;
+    }
+
+    const revivedFromCancelled = upsertResultRow.prior_status === 'cancelled';
+
+    // Reviving overrides a terminal 'cancelled' state, so surface it loudly — the
+    // symmetric cancellation path (cancelStaleDeclarativeJobs) logs per row, and a
+    // resurrection must be at least as visible. Include the failure bookkeeping the
+    // upsert just wiped so the prior context survives in the logs. warn (not info)
+    // because this silently undoes a deliberate cancelJob() if one was issued.
+    if (revivedFromCancelled) {
+      this.logger.warn(
+        {
+          jobId,
+          sourceAgentId,
+          agentId,
+          cron: schedule.cron,
+          priorConsecutiveFailures: upsertResultRow.prior_failures ?? null,
+          priorLastError: upsertResultRow.prior_error ?? null,
+        },
+        'Declarative job revived from cancelled — its YAML declaration still exists. ' +
+          'If this job was deliberately stopped, remove its schedule entry from the agent YAML instead of cancelling it.',
       );
+
+      // When intent_anchor is set, revival reactivation runs inside the transaction above.
+      // For schedules without intent_anchor, reactivate the linked task here.
+      if (!schedule.intent_anchor) {
+        await this.pool.query(
+          `UPDATE tasks
+              SET status = 'active', updated_at = now()
+             FROM scheduled_jobs sj
+            WHERE sj.id = $1
+              AND tasks.id = sj.task_id
+              AND tasks.status = 'cancelled'`,
+          [jobId],
+        );
+      }
     }
 
     return jobId;
@@ -815,16 +959,48 @@ export class SchedulerService {
   }
 
   /**
+   * A completion write matched no 'running' row: the job was paused or cancelled while the
+   * run was in flight. Log and report not-suspended rather than resurrecting the job.
+   */
+  private skippedCompletion(jobId: string): { suspended: boolean } {
+    this.logger.info({ jobId }, 'Job completion skipped — job no longer running (paused/cancelled concurrently)');
+    return { suspended: false };
+  }
+
+  /**
    * Complete a job run.
    * - On success: if recurring (has cron_expr), advance next_run_at and reset failures;
    *   if one-shot, mark as completed.
    * - On failure: increment consecutive_failures. If it reaches SUSPEND_THRESHOLD, auto-suspend.
+   *
+   * All completion writes are fenced on status NOT IN ('paused','cancelled') so a run that
+   * finishes after a concurrent pause/cancel does not overwrite that state (see
+   * skippedCompletion). Wake jobs completed straight from 'pending' still pass the fence.
+   *
+   * On success, `last_run_summary = COALESCE(last_run_summary, autoSummary)` so an
+   * explicit mid-run `scheduler-report` wins. Claim clears the column first (#1829), so
+   * a completed prior run's summary no longer blocks the auto path. (A late report from
+   * an abandoned earlier run can still land while the next run is `running` —
+   * `reportJobRun` is not claim-stamp fenced; that race is separate from #1829.)
+   *
+   * On success, `failedSkills` from the agent response is merged into `last_run_context`
+   * (or the key is removed when absent) so tool failures are visible without flipping
+   * job health (#1830). Continuity keys written by scheduler-report are preserved.
+   * On failure the same merge/clear applies when the paired isError response carried
+   * `failedSkills`; otherwise the keys are cleared so a failed run does not inherit
+   * the previous run's tool-failure attribution.
+   *
+   * `jsonb_typeof` guards both branches: `scheduler-report` can store a scalar/array
+   * (manifest input is not type-checked at invoke), and `||` / `-` on a non-object
+   * would throw and leave the job stuck in `running`.
    */
   async completeJobRun(
     jobId: string,
     success: boolean,
     error?: string,
     autoSummary?: string,
+    failedSkills?: Array<{ name: string; error: string }>,
+    failedSkillsOmitted?: number,
   ): Promise<{ suspended: boolean }> {
     // Fetch the current job state to decide how to handle the completion.
     // Include timezone so nextRunFromCron() uses the per-job zone, not the system default.
@@ -841,8 +1017,41 @@ export class SchedulerService {
     }
 
     if (success) {
+      // Merge or clear failedSkills in last_run_context without clobbering agent continuity
+      // state. Strip both keys before merge so a prior omitted-count cannot linger when the
+      // new run has none. Non-object JSONB falls through without throwing (#1830 review).
+      // One-shot wakes may carry deferred_wake_at (#1938): the task rescheduled itself
+      // while this row was running. Arm that time on the same row instead of completing it.
+      let rearmed = false;
+      const hasFailedSkills = failedSkills !== undefined && failedSkills.length > 0;
+      const failedSkillsJson = hasFailedSkills
+        ? JSON.stringify({
+            failedSkills,
+            ...(failedSkillsOmitted !== undefined && failedSkillsOmitted > 0
+              ? { failedSkillsOmitted }
+              : {}),
+          })
+        : undefined;
+      const contextSetClause = (paramIndex: number): string =>
+        hasFailedSkills
+          ? `, last_run_context = CASE
+               WHEN jsonb_typeof(last_run_context) = 'object'
+                 THEN (last_run_context - 'failedSkills' - 'failedSkillsOmitted') || $${paramIndex}::jsonb
+               ELSE $${paramIndex}::jsonb
+             END`
+          : `, last_run_context = CASE
+               WHEN jsonb_typeof(last_run_context) = 'object'
+                 THEN last_run_context - 'failedSkills' - 'failedSkillsOmitted'
+               ELSE last_run_context
+             END`;
+
       if (job.cron_expr) {
         // Recurring job: advance to next run using the per-job timezone, reset failure counter.
+        // Fence the completion on the job NOT being in an operator-intervention state:
+        // if a pause or cancel landed while the run was in flight, this write matches 0
+        // rows and is skipped, so the completion can't stamp 'pending'/'completed' back
+        // over the pause/cancel. We exclude only 'paused'/'cancelled' (not "= running")
+        // because wake jobs in the plan frontier are completed straight from 'pending'.
         const nextRunAt = this.nextRunFromCron(job.cron_expr, job.timezone);
         const updateSql = `
           UPDATE scheduled_jobs
@@ -854,53 +1063,112 @@ export class SchedulerService {
                  status = $2,
                  last_run_outcome = $4,
                  last_run_summary = COALESCE(last_run_summary, $5)
-           WHERE id = $3
+                 ${contextSetClause(6)}
+           WHERE id = $3 AND status NOT IN ('paused', 'cancelled')
         `;
-        await this.pool.query(updateSql, [nextRunAt, 'pending', jobId, 'completed', autoSummary ?? null]);
+        const params: unknown[] = [nextRunAt, 'pending', jobId, 'completed', autoSummary ?? null];
+        if (failedSkillsJson !== undefined) params.push(failedSkillsJson);
+        const res = await this.pool.query(updateSql, params);
+        if (res.rowCount === 0) return this.skippedCompletion(jobId);
       } else {
-        // One-shot job: mark as completed.
+        // One-shot job: mark as completed (same pause/cancel fence), unless a
+        // self-reschedule stored deferred_wake_at while the row was running.
+        // SET expressions read the pre-update column, so the CASE can both arm
+        // and clear it. RETURNING status is 'pending' only on that arm.
         const updateSql = `
           UPDATE scheduled_jobs
              SET last_run_at = now(),
-                 status = $1,
+                 status = CASE WHEN deferred_wake_at IS NOT NULL THEN 'pending' ELSE $1 END,
+                 run_at = COALESCE(deferred_wake_at, run_at),
+                 next_run_at = COALESCE(deferred_wake_at, next_run_at),
+                 deferred_wake_at = NULL,
                  consecutive_failures = 0,
                  last_error = NULL,
                  run_started_at = NULL,
                  last_run_outcome = $3,
                  last_run_summary = COALESCE(last_run_summary, $4)
-           WHERE id = $2
+                 ${contextSetClause(5)}
+           WHERE id = $2 AND status NOT IN ('paused', 'cancelled')
+           RETURNING status
         `;
-        await this.pool.query(updateSql, ['completed', jobId, 'completed', autoSummary ?? null]);
+        const params: unknown[] = ['completed', jobId, 'completed', autoSummary ?? null];
+        if (failedSkillsJson !== undefined) params.push(failedSkillsJson);
+        const res = await this.pool.query<{ status: string }>(updateSql, params);
+        if (res.rowCount === 0) return this.skippedCompletion(jobId);
+        rearmed = res.rows[0]?.status === 'pending';
       }
 
-      this.logger.info({ jobId }, 'Job run completed successfully');
+      this.logger.info({ jobId, rearmed }, 'Job run completed successfully');
       return { suspended: false };
     }
 
     // Failure path: increment consecutive_failures and possibly auto-suspend.
+    // Merge failedSkills when the paired isError response carried them; otherwise
+    // clear so a failed run does not inherit the previous run's tool failures (#1830).
     const newFailures = job.consecutive_failures + 1;
     const shouldSuspend = newFailures >= SUSPEND_THRESHOLD;
     const newStatus = shouldSuspend ? 'suspended' : 'failed';
 
+    const hasFailedSkills = failedSkills !== undefined && failedSkills.length > 0;
+    const failedSkillsJson = hasFailedSkills
+      ? JSON.stringify({
+          failedSkills,
+          ...(failedSkillsOmitted !== undefined && failedSkillsOmitted > 0
+            ? { failedSkillsOmitted }
+            : {}),
+        })
+      : undefined;
+    const failureContextSql = hasFailedSkills
+      ? `, last_run_context = CASE
+           WHEN jsonb_typeof(last_run_context) = 'object'
+             THEN (last_run_context - 'failedSkills' - 'failedSkillsOmitted') || $6::jsonb
+           ELSE $6::jsonb
+         END`
+      : `, last_run_context = CASE
+           WHEN jsonb_typeof(last_run_context) = 'object'
+             THEN last_run_context - 'failedSkills' - 'failedSkillsOmitted'
+           ELSE last_run_context
+         END`;
+
+    // A self-reschedule stores deferred_wake_at while this row is running (#1938).
+    // The failure still counts: arm that time only while consecutive_failures stays
+    // under SUSPEND_THRESHOLD. At the threshold, suspend and keep the deferral so
+    // unsuspendJob can arm it. $1 is the already-incremented count.
+    const armDeferred = `cron_expr IS NULL AND deferred_wake_at IS NOT NULL AND $1 < ${SUSPEND_THRESHOLD}`;
     const updateSql = `
       UPDATE scheduled_jobs
          SET last_run_at = now(),
              consecutive_failures = $1,
              last_error = $2,
              run_started_at = NULL,
-             status = $3,
+             status = CASE WHEN ${armDeferred} THEN 'pending' ELSE $3 END,
+             run_at = CASE WHEN ${armDeferred} THEN deferred_wake_at ELSE run_at END,
+             next_run_at = CASE WHEN ${armDeferred} THEN deferred_wake_at ELSE next_run_at END,
+             deferred_wake_at = CASE WHEN ${armDeferred} THEN NULL ELSE deferred_wake_at END,
              last_run_outcome = $5
-       WHERE id = $4
+             ${failureContextSql}
+       WHERE id = $4 AND status NOT IN ('paused', 'cancelled')
+       RETURNING status
     `;
-    await this.pool.query(updateSql, [newFailures, error ?? null, newStatus, jobId, 'failed']);
+    const params: unknown[] = [newFailures, error ?? null, newStatus, jobId, 'failed'];
+    if (failedSkillsJson !== undefined) params.push(failedSkillsJson);
+    const res = await this.pool.query<{ status: string }>(updateSql, params);
+    if (res.rowCount === 0) return this.skippedCompletion(jobId);
 
-    if (shouldSuspend) {
+    const wroteStatus = res.rows[0]!.status;
+    if (wroteStatus === 'pending') {
+      this.logger.info({ jobId, consecutiveFailures: newFailures }, 'Failed job run re-armed from deferred_wake_at');
+      return { suspended: false };
+    }
+
+    const suspended = wroteStatus === 'suspended';
+    if (suspended) {
       this.logger.warn({ jobId, consecutiveFailures: newFailures }, 'Job auto-suspended after consecutive failures');
     } else {
       this.logger.info({ jobId, consecutiveFailures: newFailures, error }, 'Job run failed');
     }
 
-    return { suspended: shouldSuspend };
+    return { suspended };
   }
 
   /**
@@ -912,7 +1180,7 @@ export class SchedulerService {
   async recoverStuckJob(
     jobId: string,
     timeoutSeconds: number,
-  ): Promise<{ noOp: boolean; suspended: boolean; consecutiveFailures: number }> {
+  ): Promise<{ noOp: boolean; suspended: boolean; consecutiveFailures: number; rearmed: boolean }> {
     const { rows } = await this.pool.query(
       `SELECT id, cron_expr, run_at, consecutive_failures, timezone
          FROM scheduled_jobs WHERE id = $1`,
@@ -946,57 +1214,164 @@ export class SchedulerService {
     // Guard against a race where the job completed normally between our SELECT above
     // and this UPDATE. The AND status = 'running' check ensures we only overwrite jobs
     // that are still genuinely stuck — if rowCount is 0, the job already finished cleanly.
-    const result = await this.pool.query(
-      `UPDATE scheduled_jobs
-          SET status = $1,
+    // prev locks the row and reads deferred_wake_at in this statement, so a reschedule
+    // that landed after the SELECT is still visible. Same policy as the failure path:
+    // always increment, arm the deferral only under SUSPEND_THRESHOLD, and keep it
+    // when suspending so unsuspendJob can apply it. rearmed is explicit — it is not
+    // inferred from the failure count (#1938).
+    const result = await this.pool.query<{ status: string; consecutive_failures: number; rearmed: boolean }>(
+      `WITH prev AS (
+         SELECT deferred_wake_at
+           FROM scheduled_jobs
+          WHERE id = $5 AND status = 'running'
+          FOR UPDATE
+       )
+       UPDATE scheduled_jobs sj
+          SET status = CASE
+                WHEN prev.deferred_wake_at IS NOT NULL AND $1 <> 'suspended' AND sj.cron_expr IS NULL THEN 'pending'
+                ELSE $1
+              END,
               consecutive_failures = $2,
               last_error = $3,
               run_started_at = NULL,
-              next_run_at = $4,
+              run_at = CASE
+                WHEN prev.deferred_wake_at IS NOT NULL AND $1 <> 'suspended' AND sj.cron_expr IS NULL
+                  THEN prev.deferred_wake_at
+                ELSE sj.run_at
+              END,
+              next_run_at = CASE
+                WHEN prev.deferred_wake_at IS NOT NULL AND $1 <> 'suspended' AND sj.cron_expr IS NULL
+                  THEN prev.deferred_wake_at
+                ELSE $4
+              END,
+              deferred_wake_at = CASE
+                WHEN prev.deferred_wake_at IS NOT NULL AND $1 <> 'suspended' AND sj.cron_expr IS NULL
+                  THEN NULL
+                ELSE sj.deferred_wake_at
+              END,
               last_run_outcome = $6
-        WHERE id = $5
-          AND status = 'running'`,
+         FROM prev
+        WHERE sj.id = $5
+          AND sj.status = 'running'
+       RETURNING sj.status, sj.consecutive_failures,
+         (prev.deferred_wake_at IS NOT NULL AND sj.status = 'pending') AS rearmed`,
       [newStatus, newFailures, lastError, nextRunAt, jobId, 'timed_out'],
     );
 
     if (result.rowCount === 0) {
       // The job completed normally between our SELECT and this UPDATE — no recovery needed.
       this.logger.debug({ jobId }, 'recoverStuckJob: job completed before recovery ran — no-op');
-      return { noOp: true, suspended: false, consecutiveFailures: 0 };
+      return { noOp: true, suspended: false, consecutiveFailures: 0, rearmed: false };
     }
 
-    if (shouldSuspend) {
-      this.logger.warn({ jobId, consecutiveFailures: newFailures }, 'Stuck job suspended after consecutive recovery failures');
+    const wrote = result.rows[0]!;
+    const suspended = wrote.status === 'suspended';
+    const rearmed = wrote.rearmed === true;
+    if (suspended) {
+      this.logger.warn({ jobId, consecutiveFailures: wrote.consecutive_failures }, 'Stuck job suspended after consecutive recovery failures');
+    } else if (rearmed) {
+      this.logger.info({ jobId, consecutiveFailures: wrote.consecutive_failures }, 'Stuck job re-armed from deferred_wake_at');
     } else {
-      this.logger.warn({ jobId, consecutiveFailures: newFailures, timeoutMinutes }, 'Stuck job recovered — reset to pending');
+      this.logger.warn({ jobId, consecutiveFailures: wrote.consecutive_failures, timeoutMinutes }, 'Stuck job recovered — reset to pending');
     }
 
-    return { noOp: false, suspended: shouldSuspend, consecutiveFailures: newFailures };
+    return { noOp: false, suspended, consecutiveFailures: wrote.consecutive_failures, rearmed };
   }
 
-  /** Enqueue a one-shot wake for an EXISTING task. Inserts a pending scheduled_jobs
-   *  row with task_id preset so the dispatcher routes it to `agentId` with full task
-   *  context. Used by the BacklogHeartbeat. Does not create a new task. */
+  /** Enqueue a one-shot wake for an EXISTING task. Revives the task's most-recent terminal
+   *  wake row back to `pending` (or inserts one if none exists) with task_id preset so the
+   *  dispatcher routes it to `agentId` with full task context, and touches the task's
+   *  updated_at. Does not create a new task. See #1410 for the reuse + backoff rationale.
+   *
+   *  Three callers, all of which now get the revive + updated_at touch: the BacklogHeartbeat
+   *  (backlog-heartbeat.ts), resumable continuation (resumable-continuation.ts), and the
+   *  plan frontier (plan-frontier.ts). The continuation/frontier callers pre-guard with
+   *  taskHasPendingWake and catch 23505, so on their paths the touch is redundant-but-harmless.
+   *
+   *  `originator` (the task's lineage, #1125) is persisted on the wake row so the woken task
+   *  fires with provenance — previously it fired with metadata: undefined and lost all
+   *  authorization standing. `derived` is carried in task_payload.standing and replayed by
+   *  fireJob into the agent.task `wakeContext`, which drives the bypass ladder: the score can
+   *  only ever DOWNGRADE the lineage's standing for this open-ended backlog wake, never grant it. */
   async enqueueTaskWake(params: {
     taskId: string;
     agentId: string;
     runAt: Date;
     createdBy?: string;
+    originator?: TaskOriginator | null;
+    /** True when the woken task is an agent-spawned child / side-effect (posture-D ladder column). */
+    derived?: boolean;
   }): Promise<{ jobId: string }> {
-    const { taskId, agentId, runAt, createdBy = 'heartbeat' } = params;
+    const { taskId, agentId, runAt, createdBy = 'heartbeat', originator = null, derived = false } = params;
+    const payload = JSON.stringify({ type: 'task-wake', task_id: taskId, standing: { derived } });
+    const originatorJson = originator ? JSON.stringify(originator) : null;
+    const args = [agentId, runAt, payload, createdBy, this.timezone, taskId, originatorJson];
+
+    // Fix 3 (#1410): reuse the task's existing terminal wake row instead of inserting a fresh
+    // row every cycle. Left unbounded this accreted thousands of completed rows for a single
+    // looping task; reusing keeps one scheduled_jobs row per task so the table stays searchable.
+    // Failure bookkeeping is preserved when reviving a 'failed'/'suspended' row (mirrors
+    // upsertDeclarativeJob) so the SUSPEND_THRESHOLD circuit-breaker accumulates across reuse
+    // cycles for a persistently-failing wake. A 'completed' row also keeps last_run_outcome
+    // (and the summary/context columns, which this UPDATE never clears) so the next fire
+    // still gets [Prior run context] (#1951). consecutive_failures still resets on a clean
+    // completed/cancelled row. A 'cancelled' row drops the outcome — that run was abandoned.
+    // Fix 1 (#1410): the _touch CTE bumps the task's updated_at so an *attended* task leaves the
+    // heartbeat's idle window for a full idleThresholdHours rather than being re-selected on the
+    // next tick (a no-op wake previously never bumped updated_at, so the task looped forever).
+    // Safety rests on two invariants: the partial unique index
+    // scheduled_jobs_one_active_wake_per_task_uq (migration 067) means only terminal rows are
+    // revived and a racing insert loses with 23505; and the FK scheduled_jobs.task_id ON DELETE
+    // SET NULL (migration 049) means a deleted task nulls the link, so a revive/insert for a gone
+    // task fails with 23503 rather than ever touching a phantom task row.
+    const revive = await this.pool.query(
+      `WITH revived AS (
+         UPDATE scheduled_jobs
+            SET status = 'pending', run_at = $2, next_run_at = $2, run_started_at = NULL,
+                consecutive_failures = CASE WHEN status IN ('failed','suspended') THEN consecutive_failures ELSE 0 END,
+                last_error = CASE WHEN status IN ('failed','suspended') THEN last_error ELSE NULL END,
+                last_run_outcome = CASE WHEN status IN ('failed','suspended','completed') THEN last_run_outcome ELSE NULL END,
+                agent_id = $1, created_by = $4, timezone = $5,
+                task_payload = $3::jsonb, originator = $7::jsonb
+          WHERE id = (
+            SELECT id FROM scheduled_jobs
+             WHERE task_id = $6 AND task_payload->>'type' = 'task-wake'
+               AND status IN ('completed', 'failed', 'suspended', 'cancelled')
+             ORDER BY created_at DESC
+             LIMIT 1
+          )
+          -- Re-check the status on the target row itself, not just its id. Under READ COMMITTED
+          -- two concurrent revives can both pick the same terminal row; without this predicate the
+          -- second UPDATE (whose qual is only id = X) still matches after the first commits and
+          -- silently re-revives the now-pending row. With it, the loser's UPDATE matches 0 rows,
+          -- falls through to the INSERT, and loses cleanly on the one-active-wake index (23505).
+          AND status IN ('completed', 'failed', 'suspended', 'cancelled')
+         RETURNING id
+       ),
+       _touch AS (
+         UPDATE tasks SET updated_at = now() WHERE id = $6 AND EXISTS (SELECT 1 FROM revived)
+       )
+       SELECT id FROM revived`,
+      args,
+    );
+    if (revive.rows.length > 0) {
+      return { jobId: (revive.rows[0] as { id: string }).id };
+    }
+
+    // No terminal wake row to reuse (first wake for this task) — insert a new one, touching
+    // the task's updated_at in the same statement so the backoff applies to first wakes too.
     const { rows } = await this.pool.query(
-      `INSERT INTO scheduled_jobs
-         (agent_id, cron_expr, run_at, task_payload, status, next_run_at, created_by, timezone, task_id)
-       VALUES ($1, NULL, $2, $3, 'pending', $2, $4, $5, $6)
-       RETURNING id`,
-      [
-        agentId,
-        runAt,
-        JSON.stringify({ type: 'task-wake', task_id: taskId }),
-        createdBy,
-        this.timezone,
-        taskId,
-      ],
+      `WITH j AS (
+         INSERT INTO scheduled_jobs
+           (agent_id, cron_expr, run_at, task_payload, status, next_run_at, created_by, timezone, task_id, originator)
+         VALUES ($1, NULL, $2, $3::jsonb, 'pending', $2, $4, $5, $6, $7::jsonb)
+         RETURNING id
+       ),
+       _touch AS (
+         UPDATE tasks SET updated_at = now() WHERE id = $6
+       )
+       SELECT id FROM j`,
+      args,
     );
     return { jobId: (rows[0] as { id: string }).id };
   }
@@ -1063,6 +1438,8 @@ function mapJobRow(row: DbJobRow): JobRow {
     agentTaskId: row.agent_task_id,
     intentAnchor: row.intent_anchor ?? null,
     progress: row.progress,
+    taskErrorBudget: row.task_error_budget ?? null,
+    taskTags: row.task_tags ?? null,
     taskTitle: row.task_title ?? null,
     runStartedAt: row.run_started_at,
     expectedDurationSeconds: row.expected_duration_seconds,

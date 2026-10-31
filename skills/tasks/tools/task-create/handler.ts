@@ -1,0 +1,313 @@
+// handler.ts — task-create skill.
+//
+// Creates a new task row. Auto-fills agent_id and source_agent_id from the caller context.
+// When wake_at is provided, creates a linked one-shot scheduled_jobs row atomically.
+//
+// Cross-agent scheduling (target_agent_id) — DECISION (issue #880):
+// By default a task is owned by, and its wake fires back to, the creating agent
+// (self-routing). When `target_agent_id` is supplied, the task is instead OWNED by
+// the target: tasks.agent_id and tasks.source_agent_id both become the target, and
+// because the linked scheduled_jobs row inherits agent_id from the task (see
+// TaskRepo.createTask), the wake fires to the target. `created_by` still records the
+// real creator for audit. Owning the task — not merely redirecting the first wake —
+// is what makes re-wakes correct: when the target later reschedules via task-update,
+// that path routes off source_agent_id, which now points at the target.
+//
+// Gating: OPEN model. Any agent may target any *registered* agent. The only gate is
+// existence — the target must be a known agent, otherwise the wake would fire to a
+// dead agent_id that no runtime consumes. A stricter per-agent allowlist
+// (`schedulable_by` in agent YAML) was considered and deliberately deferred; revisit
+// if a compromised-agent threat model warrants restricting who can schedule into whom.
+
+import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
+import type { TaskOriginator } from '../../../../src/contacts/types.js';
+import type { TaskEscalation } from '../../../../src/agents/task-escalation.js';
+import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import {
+  BLOCKED_BY_TASK_ID_ERROR,
+  PARENT_TASK_ID_ERROR,
+  WAITING_ON_CONTACT_ID_ERROR,
+  contactNotFoundError,
+  foreignKeyReferenceError,
+  resolveOptionalId,
+  taskNotFoundError,
+} from '../../optional-ref.js';
+
+const VALID_OWNERS = new Set(['curia', 'ceo', 'external']);
+const VALID_SOURCES = new Set(['ceo', 'agent', 'scheduler', 'coordinator']);
+
+// Strict ISO-8601 datetime with timezone offset. Rejects loose strings like
+// "June 10 2026" or "2026/06/10" that new Date() would silently accept.
+const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+// Validate the required TaskEscalation fields before trusting an escalation_json blob (#1267).
+// A bare `{}` or arbitrary object would otherwise pass an is-object check and land permanently
+// in progress.escalation, leaving downstream readers a swamp of inconsistent shapes. Optional
+// fields (progress, throughput, blocker, costUsd) are intentionally not checked.
+function isValidEscalationShape(value: unknown): value is TaskEscalation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.failureMode === 'string'
+    && typeof v.reason === 'string'
+    && typeof v.source === 'string'
+    && typeof v.headline === 'string'
+    && Array.isArray(v.suggestedActions);
+}
+
+export class TaskCreateHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
+    const input = ctx.input as {
+      title?: string;
+      description?: string;
+      owner?: string;
+      parent_task_id?: string | null;
+      blocked_by_task_id?: string | null;
+      priority?: number;
+      due_at?: string;
+      wake_at?: string;
+      tags?: string[];
+      waiting_on_contact_id?: string | null;
+      waiting_on_text?: string;
+      intent_anchor?: string;
+      source?: string;
+      target_agent_id?: string;
+      resumable?: boolean;
+      progress_note?: string;
+      escalation_json?: string;
+    };
+
+    if (!input.title || typeof input.title !== 'string' || !input.title.trim()) {
+      return { success: false, error: 'Missing required input: title (string)' };
+    }
+    if (input.title.length > 500) {
+      return { success: false, error: 'title must be 500 characters or fewer' };
+    }
+    if (input.description && input.description.length > 5000) {
+      return { success: false, error: 'description must be 5000 characters or fewer' };
+    }
+    if (input.owner && !VALID_OWNERS.has(input.owner)) {
+      return { success: false, error: `owner must be one of: curia, ceo, external` };
+    }
+    if (input.source && !VALID_SOURCES.has(input.source)) {
+      return { success: false, error: `source must be one of: ceo, agent, scheduler, coordinator` };
+    }
+    if (input.priority !== undefined) {
+      if (typeof input.priority !== 'number' || input.priority < 0 || input.priority > 100) {
+        return { success: false, error: 'priority must be a number between 0 and 100' };
+      }
+    }
+    if (input.tags && !Array.isArray(input.tags)) {
+      return { success: false, error: 'tags must be an array of strings' };
+    }
+    if (input.progress_note !== undefined && typeof input.progress_note !== 'string') {
+      return { success: false, error: 'progress_note must be a string' };
+    }
+    if (input.progress_note && input.progress_note.length > 5000) {
+      return { success: false, error: 'progress_note must be 5000 characters or fewer' };
+    }
+
+    // Optional ids are omitted when the model fills them with "null" / "none" / blank.
+    // A raw Postgres uuid error teaches the next attempt to invent an id (#2328).
+    const parentRef = resolveOptionalId('parent_task_id', input.parent_task_id, PARENT_TASK_ID_ERROR);
+    if (!parentRef.ok) return { success: false, error: parentRef.error };
+    const blockedRef = resolveOptionalId('blocked_by_task_id', input.blocked_by_task_id, BLOCKED_BY_TASK_ID_ERROR);
+    if (!blockedRef.ok) return { success: false, error: blockedRef.error };
+    const waitingRef = resolveOptionalId(
+      'waiting_on_contact_id',
+      input.waiting_on_contact_id,
+      WAITING_ON_CONTACT_ID_ERROR,
+    );
+    if (!waitingRef.ok) return { success: false, error: waitingRef.error };
+
+    // Optional structured escalation block (#1267) — seeded onto progress.escalation. Carried
+    // as a JSON string to keep the input schema primitive. Malformed JSON is non-fatal: the
+    // task still gets created (and the progress note still surfaces), we just skip the block.
+    let escalation: TaskEscalation | undefined;
+    if (input.escalation_json) {
+      try {
+        const parsed: unknown = JSON.parse(input.escalation_json);
+        if (isValidEscalationShape(parsed)) {
+          escalation = parsed;
+        } else {
+          ctx.log.warn({ title: input.title }, 'task-create: escalation_json missing required fields — ignoring');
+        }
+      } catch (err) {
+        ctx.log.warn({ err, title: input.title }, 'task-create: failed to parse escalation_json — ignoring');
+      }
+    }
+
+    if (!ctx.taskRepo) {
+      return {
+        success: false,
+        error: 'task-create: taskRepo not available — check ExecutionLayer configuration.',
+      };
+    }
+
+    // Derive source from the calling agent name when not supplied.
+    const derivedSource = (input.source as 'ceo' | 'agent' | 'scheduler' | 'coordinator' | undefined)
+      ?? (ctx.agentId === 'coordinator' ? 'coordinator' : 'agent');
+
+    // Resolve the OWNING agent for this task (see the cross-agent scheduling note at
+    // the top of this file). Defaults to the creator; `target_agent_id` redirects
+    // ownership — and therefore the wake — to another registered agent.
+    const creatorAgentId = ctx.agentId ?? 'system';
+    let owningAgentId = creatorAgentId;
+    if (input.target_agent_id !== undefined) {
+      if (typeof input.target_agent_id !== 'string' || !input.target_agent_id.trim()) {
+        return { success: false, error: 'target_agent_id must be a non-empty string' };
+      }
+      const target = input.target_agent_id.trim();
+      // Self-targeting is just self-routing — always allowed, no registry needed.
+      if (target !== creatorAgentId) {
+        if (!ctx.agentRegistry) {
+          return {
+            success: false,
+            error: 'task-create: agentRegistry not available — cannot validate target_agent_id. '
+              + 'Check that the skill manifest declares the agentRegistry capability.',
+          };
+        }
+        if (!ctx.agentRegistry.has(target)) {
+          return {
+            success: false,
+            error: `target_agent_id '${target}' is not a registered agent — `
+              + 'a wake scheduled to an unknown agent would never fire.',
+          };
+        }
+        owningAgentId = target;
+        // Cross-agent authority operation — one agent scheduling work onto
+        // another agent's queue. Log it explicitly so an unexpected wake on the
+        // target can be traced to its creator without DB archaeology.
+        ctx.log.info(
+          { creatorAgentId, owningAgentId, title: input.title },
+          'task-create: redirecting task ownership to target agent',
+        );
+      }
+    }
+
+    let dueAt: Date | undefined;
+    if (input.due_at) {
+      if (!ISO_DATETIME_RE.test(input.due_at)) {
+        return { success: false, error: 'due_at must be a valid ISO 8601 date string' };
+      }
+      dueAt = new Date(input.due_at);
+      if (isNaN(dueAt.getTime())) {
+        return { success: false, error: 'due_at must be a valid ISO 8601 date string' };
+      }
+    }
+    let wakeAt: Date | undefined;
+    if (input.wake_at) {
+      if (!ISO_DATETIME_RE.test(input.wake_at)) {
+        return { success: false, error: 'wake_at must be a valid ISO 8601 date string' };
+      }
+      wakeAt = new Date(input.wake_at);
+      if (isNaN(wakeAt.getTime())) {
+        return { success: false, error: 'wake_at must be a valid ISO 8601 date string' };
+      }
+    }
+
+    // Past-due milestones at creation should run immediately, not be silently skipped (#1299).
+    // The note is what the immediate wake reads, so it says what to do; the tasks SKILL.md
+    // no longer does (prompt trim PR 9). task-complete refuses the shortcut for five minutes.
+    let pastDueNote: string | undefined;
+    let extraTags = input.tags ?? [];
+    if (dueAt && dueAt.getTime() < Date.now()) {
+      if (!wakeAt) {
+        wakeAt = new Date();
+      }
+      pastDueNote = 'Its due date had already passed at creation: do its work now, or escalate if you cannot. Complete it only once the work is done.';
+      if (!extraTags.includes('past-due-at-creation')) {
+        extraTags = [...extraTags, 'past-due-at-creation'];
+      }
+    }
+
+    const seededProgressNote = [input.progress_note, pastDueNote].filter(Boolean).join(' ').trim() || undefined;
+
+    try {
+      // The three lookups are independent. Run them together, then report the
+      // first missing row in a stable field order.
+      const [parent, blocker, contact] = await Promise.all([
+        parentRef.id ? ctx.taskRepo.getTask(parentRef.id) : null,
+        blockedRef.id ? ctx.taskRepo.getTask(blockedRef.id) : null,
+        waitingRef.id && ctx.contactService ? ctx.contactService.getContact(waitingRef.id) : undefined,
+      ]);
+      if (parentRef.id && !parent) {
+        return { success: false, error: taskNotFoundError('parent_task_id', parentRef.id) };
+      }
+      if (blockedRef.id && !blocker) {
+        return { success: false, error: taskNotFoundError('blocked_by_task_id', blockedRef.id) };
+      }
+      if (waitingRef.id && ctx.contactService && !contact) {
+        return { success: false, error: contactNotFoundError(waitingRef.id) };
+      }
+
+      ctx.log.info(
+        { title: input.title, owner: input.owner ?? 'curia', owningAgentId, creatorAgentId },
+        'Creating task',
+      );
+
+      const task = await ctx.taskRepo.createTask({
+        // owningAgentId == creatorAgentId for the default (self-routing) case;
+        // a valid target_agent_id redirects ownership (and the linked wake) to it.
+        agentId: owningAgentId,
+        title: input.title.trim(),
+        description: input.description,
+        owner: (input.owner as 'curia' | 'ceo' | 'external') ?? 'curia',
+        parentTaskId: parentRef.id,
+        // The row just loaded. createTask uses it for originator capping and
+        // does not read the parent a second time.
+        ...(parent ? { parentTask: parent } : {}),
+        blockedByTaskId: blockedRef.id,
+        priority: input.priority,
+        dueAt,
+        wakeAt,
+        tags: extraTags,
+        waitingOnContactId: waitingRef.id,
+        waitingOnText: input.waiting_on_text,
+        intentAnchor: input.intent_anchor,
+        source: derivedSource,
+        // source_agent_id tracks the owning specialist (drives re-wake routing in
+        // TaskRepo.updateTask); created_by always records the actual creator.
+        sourceAgentId: owningAgentId,
+        createdBy: creatorAgentId,
+        // Copy the creating turn's lineage onto the task (#1125). TaskRepo caps it to the
+        // parent's lineage when parent_task_id is set, so a child never exceeds its parent.
+        originator: (ctx.taskMetadata?.originator as TaskOriginator | undefined) ?? null,
+        resumable: input.resumable === true,
+        // Seed the first progress note + structured escalation block (#1267) so the row's
+        // last_progress_note is non-empty and the digest renders real content.
+        progressNote: seededProgressNote,
+        escalation,
+      });
+
+      const tz = ctx.timezone;
+      const dueAtDisplay = task.dueAt
+        ? toLocalIso(Math.floor(new Date(task.dueAt).getTime() / 1000), tz)
+        : null;
+      const createdAtDisplay = toLocalIso(
+        Math.floor(new Date(task.createdAt).getTime() / 1000),
+        tz,
+      );
+
+      return {
+        success: true,
+        data: {
+          task_id: task.id,
+          title: task.title,
+          status: task.status,
+          owner: task.owner,
+          priority: task.priority,
+          due_at: dueAtDisplay,
+          tags: task.tags,
+          created_at: createdAtDisplay,
+          displayTimezone: tz ? formatDisplayTimezone(tz, new Date()) : 'UTC',
+        },
+      };
+    } catch (err) {
+      const referenced = foreignKeyReferenceError(err);
+      ctx.log.error({ err, title: input.title }, 'Failed to create task');
+      if (referenced) return { success: false, error: referenced };
+      const message = err instanceof Error ? err.message : String(err);
+      return { success: false, error: `Failed to create task: ${message}` };
+    }
+  }
+}

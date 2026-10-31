@@ -4,16 +4,21 @@ import { useMobileMenu } from '../context/MobileMenu';
 import { apiFetch } from '../api.js';
 import {
   CuriaWordmark,
+  IconHome,
   IconChat,
   IconMemory,
   IconGraph,
+  IconDocument,
   IconPerson,
   IconChecklist,
   IconClock,
   IconSettings,
   IconWand,
   IconAutonomy,
+  IconPlug,
   IconChevron,
+  IconServer,
+  IconBrain,
 } from './Icons';
 
 type Theme = 'light' | 'system' | 'dark';
@@ -25,15 +30,19 @@ interface SidebarProps {
 }
 
 const ROUTES: Record<string, string> = {
+  dashboard: '/',
   chat:     '/chat',
   kg:       '/kg',
+  documents: '/documents',
   contacts: '/contacts',
   tasks:    '/tasks',
   jobs:     '/jobs',
-  skills:   '/skills',
+  tools: '/tools',
   agents:   '/agents',
-  channels: '/channels',
-  settings: '/settings/workspace',
+  channels:   '/channels',
+  'mcp-skills': '/mcp-skills',
+  system:     '/system',
+  settings:   '/settings',
 };
 
 function ThemeToggle({ theme, onChange }: { theme: Theme; onChange: (t: Theme) => void }) {
@@ -74,17 +83,21 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
   // Expand the Settings group when on any of its pages (Skills/Agents are now
   // standalone pages but still live under the sidebar's Settings group).
   const [settingsOpen, setSettingsOpen] = useState(
-    activeView === 'settings' || activeView === 'skills' || activeView === 'agents' || activeView === 'channels',
+    activeView === 'settings' || activeView === 'tools' || activeView === 'agents' || activeView === 'channels' || activeView === 'mcp-skills' || activeView === 'system',
   );
   const [principalName, setPrincipalName] = useState<string | null>(null);
+  // Real Curia release version from GET /api/system. The build-time __APP_VERSION__
+  // is the console package's own 0.0.x and does not track the app release; we only
+  // fall back to it if the fetch fails.
+  const [version, setVersion] = useState<string | null>(null);
   const { setOpen } = useMobileMenu();
   const navigate = useNavigate();
 
   useEffect(() => {
     const controller = new AbortController();
-    apiFetch('/api/kg/contacts', { signal: controller.signal })
+    apiFetch('/api/contacts', { signal: controller.signal })
       .then(r => {
-        if (!r.ok) throw new Error(`/api/kg/contacts returned ${r.status}`);
+        if (!r.ok) throw new Error(`/api/contacts returned ${r.status}`);
         return r.json();
       })
       .then((data: { contacts: Array<{ displayName: string; systemRole?: string | null }> }) => {
@@ -95,6 +108,25 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
         if (err instanceof DOMException && err.name === 'AbortError') return;
         // Non-fatal: sidebar degrades to placeholders, but log so the cause is visible.
         console.error('[Sidebar] Failed to load principal contact:', err);
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    apiFetch('/api/system', { signal: controller.signal })
+      .then(r => {
+        if (!r.ok) throw new Error(`/api/system returned ${r.status}`);
+        return r.json();
+      })
+      .then((data: { system?: { version?: string } }) => {
+        if (typeof data.system?.version === 'string') setVersion(data.system.version);
+      })
+      .catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        // Non-fatal: fall back to the build-time console version so the footer isn't blank.
+        console.error('[Sidebar] Failed to load system version:', err);
+        setVersion(__APP_VERSION__);
       });
     return () => controller.abort();
   }, []);
@@ -119,6 +151,14 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
 
       <div className="nav-group">
         <button
+          className={`nav-item${activeView === 'dashboard' ? ' active' : ''}`}
+          onClick={() => go('dashboard')}
+        >
+          <IconHome />
+          Home
+        </button>
+
+        <button
           className={`nav-item${activeView === 'chat' ? ' active' : ''}`}
           onClick={() => go('chat')}
         >
@@ -140,6 +180,13 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
               >
                 <IconGraph />
                 Knowledge Graph
+              </button>
+              <button
+                className={`nav-sub-item${activeView === 'documents' ? ' active' : ''}`}
+                onClick={() => go('documents')}
+              >
+                <IconDocument />
+                Documents
               </button>
               <button
                 className={`nav-sub-item${activeView === 'contacts' ? ' active' : ''}`}
@@ -175,11 +222,11 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
           {settingsOpen && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 2 }}>
               <button
-                className={`nav-sub-item${activeView === 'skills' ? ' active' : ''}`}
-                onClick={() => go('skills')}
+                className={`nav-sub-item${activeView === 'tools' ? ' active' : ''}`}
+                onClick={() => go('tools')}
               >
                 <IconWand />
-                Skills
+                Tools
               </button>
               <button
                 className={`nav-sub-item${activeView === 'agents' ? ' active' : ''}`}
@@ -196,11 +243,25 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
                 Channels
               </button>
               <button
+                className={`nav-sub-item${activeView === 'mcp-skills' ? ' active' : ''}`}
+                onClick={() => go('mcp-skills')}
+              >
+                <IconPlug />
+                MCP Skills
+              </button>
+              <button
                 className={`nav-sub-item${activeView === 'settings' ? ' active' : ''}`}
                 onClick={() => go('settings')}
               >
-                <IconSettings />
-                Workspace
+                <IconBrain />
+                Personality
+              </button>
+              <button
+                className={`nav-sub-item${activeView === 'system' ? ' active' : ''}`}
+                onClick={() => go('system')}
+              >
+                <IconServer />
+                System
               </button>
             </div>
           )}
@@ -213,7 +274,7 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
           <span className="sidebar-user-avatar">{getInitials(principalName)}</span>
           <span className="sidebar-user-meta">
             <span className="sidebar-user-name">{principalName ?? 'Setting up…'}</span>
-            <span className="sidebar-user-org">v{__APP_VERSION__}</span>
+            <span className="sidebar-user-org">{version ? `v${version}` : ''}</span>
           </span>
         </button>
       </div>

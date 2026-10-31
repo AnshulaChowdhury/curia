@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { validateBearerToken } from '../../../../src/channels/http/auth.js';
+import { bypassesBearerAuth, validateBearerToken } from '../../../../src/channels/http/auth.js';
 
 describe('validateBearerToken', () => {
   it('returns true for a valid token', () => {
@@ -32,5 +32,42 @@ describe('validateBearerToken', () => {
 
   it('returns false for "Bearer " with no token value', () => {
     expect(validateBearerToken('Bearer ', 'my-secret-token')).toBe(false);
+  });
+});
+
+describe('bypassesBearerAuth', () => {
+  // Every console route that authenticates with the session cookie must be here, or the
+  // adapter's hook 401s the browser before assertSecret runs (#2285 shipped /api/activity without it).
+  it.each([
+    '/api/health',
+    '/api/activity',
+    '/api/dashboard/waiting',
+    '/api/jobs',
+    '/api/jobs/:jobId',
+    '/api/antfarm/timeline',
+    '/api/kg/nodes',
+    '/api/tasks',
+    '/api/contacts',
+    '/api/chat/messages',
+    '/api/grant-recommendations',
+    '/api/identity/me',
+    '/api/setup/status',
+    '/api/secret-capture/:token',
+    '/api/webhooks/telnyx/sms',
+  ])('lets %s through to its own auth', (url) => {
+    expect(bypassesBearerAuth(url)).toBe(true);
+  });
+
+  it.each([
+    '/api/agents/status',
+    '/api/healthz',
+    '/api/nonexistent',
+    // Prefixes must not match on a shared leading substring (#872 review).
+    '/api/chat-export',
+    '/api/tasks-summary',
+    '/api/contacts.csv',
+    '/*',
+  ])('enforces bearer auth on %s', (url) => {
+    expect(bypassesBearerAuth(url)).toBe(false);
   });
 });

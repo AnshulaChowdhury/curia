@@ -1,16 +1,17 @@
-// registry-repo.ts — Postgres-backed CRUD over skill_registry / agent_registry.
-// One instance per table (the table name is validated against an allowlist so it can
-// never be attacker-influenced). All queries parameterized. Mirrors the SecretsService
-// / AutonomyService injection pattern: constructor takes (pool, table).
+// registry-repo.ts — Postgres-backed CRUD over tool_registry / agent_registry /
+// skill_registry. One instance per table (the table name is validated against an
+// allowlist so it can never be attacker-influenced). All queries parameterized.
+// Mirrors the SecretsService / AutonomyService injection pattern: constructor
+// takes (pool, table).
 
 import type { DbPool } from '../db/connection.js';
 import type { IRegistryRepo, RegistryRow } from './types.js';
 
-// Only these two tables are valid — validated in the constructor.
+// Only these tables are valid — validated in the constructor.
 // SQL strings use literal table names (never runtime concatenation) so the
 // parameterized-queries rule is satisfied: data values use $1/$2, table names
 // are compile-time string literals selected via this map.
-const ALLOWED_TABLES = ['skill_registry', 'agent_registry'] as const;
+const ALLOWED_TABLES = ['tool_registry', 'agent_registry', 'skill_registry'] as const;
 type RegistryTable = typeof ALLOWED_TABLES[number];
 
 interface DbRegistryRow {
@@ -42,26 +43,33 @@ const SQL: Record<RegistryTable, {
   list: string;
   get: string;
   install: string;
+  installAndEnable: string;
   enable: string;
   disable: string;
   uninstall: string;
+  uninstallIfDisabled: string;
 }> = {
-  skill_registry: {
-    list: `SELECT ${COLS} FROM skill_registry`,
-    get: `SELECT ${COLS} FROM skill_registry WHERE name = $1`,
-    install: `INSERT INTO skill_registry (name, enabled, installed_by)
+  tool_registry: {
+    list: `SELECT ${COLS} FROM tool_registry`,
+    get: `SELECT ${COLS} FROM tool_registry WHERE name = $1`,
+    install: `INSERT INTO tool_registry (name, enabled, installed_by)
               VALUES ($1, false, $2)
               ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
               RETURNING ${COLS}`,
-    enable: `UPDATE skill_registry
+    installAndEnable: `INSERT INTO tool_registry (name, enabled, installed_by, enabled_at, enabled_by)
+                       VALUES ($1, true, $2, now(), $2)
+                       ON CONFLICT (name) DO NOTHING
+                       RETURNING ${COLS}`,
+    enable: `UPDATE tool_registry
                SET enabled = true, enabled_at = now(), enabled_by = $2, updated_at = now()
              WHERE name = $1
              RETURNING ${COLS}`,
-    disable: `UPDATE skill_registry
+    disable: `UPDATE tool_registry
                 SET enabled = false, enabled_at = NULL, enabled_by = NULL, updated_at = now()
               WHERE name = $1
               RETURNING ${COLS}`,
-    uninstall: `DELETE FROM skill_registry WHERE name = $1`,
+    uninstall: `DELETE FROM tool_registry WHERE name = $1`,
+    uninstallIfDisabled: `DELETE FROM tool_registry WHERE name = $1 AND enabled = false`,
   },
   agent_registry: {
     list: `SELECT ${COLS} FROM agent_registry`,
@@ -70,6 +78,10 @@ const SQL: Record<RegistryTable, {
               VALUES ($1, false, $2)
               ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
               RETURNING ${COLS}`,
+    installAndEnable: `INSERT INTO agent_registry (name, enabled, installed_by, enabled_at, enabled_by)
+                       VALUES ($1, true, $2, now(), $2)
+                       ON CONFLICT (name) DO NOTHING
+                       RETURNING ${COLS}`,
     enable: `UPDATE agent_registry
                SET enabled = true, enabled_at = now(), enabled_by = $2, updated_at = now()
              WHERE name = $1
@@ -79,6 +91,31 @@ const SQL: Record<RegistryTable, {
               WHERE name = $1
               RETURNING ${COLS}`,
     uninstall: `DELETE FROM agent_registry WHERE name = $1`,
+    uninstallIfDisabled: `DELETE FROM agent_registry WHERE name = $1 AND enabled = false`,
+  },
+  skill_registry: {
+    list: `SELECT ${COLS} FROM skill_registry`,
+    get: `SELECT ${COLS} FROM skill_registry WHERE name = $1`,
+    // DO NOTHING on conflict so we do not fire skill_registry_updated_at.
+    // install() falls back to SELECT when RETURNING is empty.
+    install: `INSERT INTO skill_registry (name, enabled, installed_by)
+              VALUES ($1, false, $2)
+              ON CONFLICT (name) DO NOTHING
+              RETURNING ${COLS}`,
+    installAndEnable: `INSERT INTO skill_registry (name, enabled, installed_by, enabled_at, enabled_by)
+                       VALUES ($1, true, $2, now(), $2)
+                       ON CONFLICT (name) DO NOTHING
+                       RETURNING ${COLS}`,
+    enable: `UPDATE skill_registry
+               SET enabled = true, enabled_at = now(), enabled_by = $2, updated_at = now()
+             WHERE name = $1
+             RETURNING ${COLS}`,
+    disable: `UPDATE skill_registry
+                SET enabled = false, enabled_at = NULL, enabled_by = NULL, updated_at = now()
+              WHERE name = $1
+              RETURNING ${COLS}`,
+    uninstall: `DELETE FROM skill_registry WHERE name = $1`,
+    uninstallIfDisabled: `DELETE FROM skill_registry WHERE name = $1 AND enabled = false`,
   },
 };
 
@@ -105,10 +142,21 @@ export class RegistryRepo implements IRegistryRepo {
 
   async install(name: string, actor: string): Promise<RegistryRow> {
     // Insert a disabled row; if it already exists, leave it untouched and return it.
-    // ON CONFLICT DO UPDATE requires at least one SET clause, so we use a no-op
-    // (name = EXCLUDED.name) to trigger RETURNING without modifying any columns.
+    // skill_registry uses ON CONFLICT DO NOTHING (avoids updated_at trigger).
+    // tool/agent still use a no-op DO UPDATE so RETURNING always yields a row.
     const { rows } = await this.pool.query<DbRegistryRow>(this.sql.install, [name, actor]);
-    return mapRow(rows[0]!);
+    if (rows[0]) return mapRow(rows[0]);
+    const existing = await this.getRow(name);
+    if (!existing) {
+      throw new Error(`Registry install failed for '${name}': insert returned no row`);
+    }
+    return existing;
+  }
+
+  async installAndEnable(name: string, actor: string): Promise<RegistryRow | null> {
+    const { rows } = await this.pool.query<DbRegistryRow>(this.sql.installAndEnable, [name, actor]);
+    const row = rows[0];
+    return row ? mapRow(row) : null;
   }
 
   async enable(name: string, actor: string): Promise<RegistryRow> {
@@ -126,7 +174,17 @@ export class RegistryRepo implements IRegistryRepo {
     return mapRow(rows[0]);
   }
 
-  async uninstall(name: string): Promise<void> {
-    await this.pool.query(this.sql.uninstall, [name]);
+  /** Delete only while still disabled — the predicate lives in the statement so the
+   *  "refuse to uninstall an enabled bundle" guard cannot be raced by a concurrent enable. */
+  async uninstallIfDisabled(name: string): Promise<boolean> {
+    const result = await this.pool.query(this.sql.uninstallIfDisabled, [name]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async uninstall(name: string): Promise<boolean> {
+    const result = await this.pool.query(this.sql.uninstall, [name]);
+    // rowCount is null for statement types that don't report it (never DELETE in
+    // practice, but pg's types allow it) — treat that as "nothing confirmed deleted".
+    return (result.rowCount ?? 0) > 0;
   }
 }

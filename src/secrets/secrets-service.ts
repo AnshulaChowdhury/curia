@@ -8,6 +8,7 @@
 import type { DbPool } from '../db/connection.js';
 import type { Logger } from '../logger.js';
 import { encrypt, decrypt } from './crypto.js';
+import type { UserSecretDetails } from './user-secret-details.js';
 
 export type ValueFormat = 'string' | 'json';
 
@@ -67,6 +68,55 @@ export class SecretsService {
   async list(): Promise<string[]> {
     const result = await this.pool.query<{ name: string }>('SELECT name FROM secrets ORDER BY name');
     return result.rows.map(r => r.name);
+  }
+
+  /** Names of `user.*` secrets only — never values, never system/channel keys.
+   *  Ordered oldest-first so capture dedup reuses the original key (#1497).
+   *  Uses a prefix predicate (not list()+filter) so the full keyspace never
+   *  enters this path. */
+  async listUserNames(): Promise<string[]> {
+    const result = await this.pool.query<{ name: string }>(
+      `SELECT name FROM secrets
+        WHERE starts_with(name, 'user.')
+        ORDER BY created_at ASC, name ASC`,
+    );
+    // Defense in depth: the SQL predicate is the real filter; this drop-guard
+    // keeps a mismatched driver/mock from leaking a non-user name.
+    return result.rows.map(r => r.name).filter(n => n.startsWith('user.'));
+  }
+
+  /** Non-secret sign-in details (login URL, username) per `user.*` key (#2201). Keys with
+   *  no row are absent from the map. Never reads the secrets table. */
+  async listUserDetails(): Promise<Map<string, UserSecretDetails>> {
+    const result = await this.pool.query<{ name: string; login_url: string | null; username: string | null }>(
+      `SELECT name, login_url, username FROM user_secret_details
+        WHERE starts_with(name, 'user.')`,
+    );
+    const out = new Map<string, UserSecretDetails>();
+    for (const row of result.rows) {
+      if (!row.name.startsWith('user.')) continue;
+      out.set(row.name, {
+        ...(row.login_url ? { loginUrl: row.login_url } : {}),
+        ...(row.username ? { username: row.username } : {}),
+      });
+    }
+    return out;
+  }
+
+  /** Record sign-in details for a `user.*` key. Only the fields given are overwritten. */
+  async upsertUserDetails(name: string, details: UserSecretDetails): Promise<void> {
+    if (!name.startsWith('user.')) {
+      throw new Error(`Sign-in details are only stored for user.* keys, not '${name}'`);
+    }
+    await this.pool.query(
+      `INSERT INTO user_secret_details (name, login_url, username)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (name) DO UPDATE SET
+         login_url  = COALESCE(EXCLUDED.login_url, user_secret_details.login_url),
+         username   = COALESCE(EXCLUDED.username, user_secret_details.username),
+         updated_at = now()`,
+      [name, details.loginUrl ?? null, details.username ?? null],
+    );
   }
 
   /** Remove a secret. No error if it does not exist. */

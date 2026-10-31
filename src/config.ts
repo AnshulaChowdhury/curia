@@ -1,36 +1,27 @@
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
+import { parseSensitivityRules, type SensitivityRule } from './memory/sensitivity.js';
+import { parseEmbeddingProfiles, type EmbeddingProfile } from './memory/embedding-profiles.js';
+import { parseProxyConfig } from './browser/proxy-config.js';
+import { AUTONOMY_GATINGS, type AutonomyGating } from './autonomy/band-policy.js';
+import type { VerificationConfig } from './verification/types.js';
+import { registrableDomain } from './verification/domain.js';
+import type { TierConfig } from './agents/llm/model-router.js';
 
 // ---------------------------------------------------------------------------
 // Multi-account email config types
 // ---------------------------------------------------------------------------
 
 /**
- * Raw per-account email entry as read from config/default.yaml.
- * Values may be literal strings or "env:VAR_NAME" env-var references.
- */
-export interface RawEmailAccountConfig {
-  nylas_grant_id: string;
-  self_email: string;
-  /**
-   * Additional sender email addresses to suppress from this account's inbox,
-   * beyond the account's own selfEmail. Supports env:VAR_NAME references.
-   */
-  excluded_sender_emails?: string[];
-}
-
-/**
- * Fully resolved per-account email config with env-var references expanded
- * to their actual values. This is the shape passed to NylasClient and EmailAdapter.
+ * Fully resolved per-account email config. Account identity comes from the
+ * email_accounts table; the grant is read from the vault. (#1101)
  */
 export interface ResolvedEmailAccount {
-  /** Logical name for this account as declared in the YAML (e.g. "curia"). */
+  /** Logical account name (e.g. "curia"). */
   name: string;
   nylasGrantId: string;
   selfEmail: string;
-  /** Resolved sender addresses to suppress in addition to selfEmail. */
-  excludedSenderEmails: string[];
 }
 
 export interface Config {
@@ -38,6 +29,18 @@ export interface Config {
   anthropicApiKey: string | undefined;
   openaiApiKey: string | undefined;
   openrouterApiKey: string | undefined;
+  // AWS Bedrock — credentials are vault-only (ADR-021), resolved by applyVaultSecrets()
+  // after the vault is constructed, same as anthropicApiKey. Region and timeout are
+  // non-secret operational config read straight from env, like TIMEZONE/HTTP_PORT.
+  awsAccessKeyId: string | undefined;
+  awsSecretAccessKey: string | undefined;
+  awsRegion: string | undefined;
+  awsBedrockTimeoutMs: number;
+  // OpenAI-compatible embeddings endpoint (EMBEDDING_BASE_URL, e.g. a local llama.cpp
+  // server). Unset means OpenAI with openaiApiKey. embeddingApiKey comes from the vault.
+  embeddingBaseUrl: string | undefined;
+  embeddingModel: string | undefined;
+  embeddingApiKey: string | undefined;
   logLevel: string;
   httpPort: number;
   apiToken: string | undefined;
@@ -51,13 +54,8 @@ export interface Config {
   nylasGrantId: string | undefined;
   nylasPollingIntervalMs: number;
   nylasSelfEmail: string;
-  // CEO's primary email address. When set, the startup bootstrap ensures this
-  // contact exists with status=confirmed and verified=true before any email arrives.
-  // Without this, the first inbound email from the CEO creates them as provisional,
-  // causing their messages to be held.
-  ceoPrimaryEmail: string | undefined;
-  // CEO's Signal phone number in E.164 format (e.g. "+14155551234").
-  // Used by OutboundGateway to exempt CEO-bound Signal messages from the autonomy gate.
+  // principal's Signal phone number in E.164 format (e.g. "+14155551234").
+  // Used by OutboundGateway to exempt principal-bound Signal messages from the autonomy gate.
   ceoSignalNumber: string | undefined;
   // Signal channel config. Both must be set to enable the Signal adapter.
   // signalSocketPath: path to the signal-cli daemon Unix socket (e.g. /run/signal-cli/socket).
@@ -66,13 +64,114 @@ export interface Config {
   //   that was registered via `signal-cli register` + `signal-cli verify`.
   signalSocketPath: string | undefined;
   signalPhoneNumber: string | undefined;
+  // Signal voice calls (#1672) — dark by default. Requires the Signal channel
+  // AND the full voice channel enabled. Signal calls never use LiveKit rooms at
+  // runtime (they carry audio over the shared PulseAudio socket), but the
+  // bridge reuses the VoiceRuntime that today is only constructed inside the
+  // LiveKit-gated voice-adapter block — so LiveKit creds are currently a
+  // prerequisite too, alongside Deepgram/Cartesia. See index.ts.
+  signalVoiceCallsEnabled: boolean;
+  // PulseAudio native socket shared from the signal-cli container.
+  signalPulseSocketPath: string | undefined;
+  // Hard per-call duration cap (answer-everyone guardrail).
+  signalVoiceMaxCallSeconds: number;
+  // Slack channel config (Socket Mode). Both must be set to enable the Slack adapter.
+  // slackBotToken: Bot User OAuth Token (xoxb-…).
+  // slackAppToken: App-Level Token (xapp-…) with connections:write for Socket Mode.
+  slackBotToken: string | undefined;
+  slackAppToken: string | undefined;
+  // SMS channel config (Telnyx Messaging). All three must be set to enable the SMS adapter.
+  // smsApiKey: Telnyx API v2 key.
+  // smsFromNumber: office DID in E.164 (voice+SMS capable preferred).
+  // smsWebhookPublicKey: account public key for Ed25519 webhook verify (base64).
+  smsApiKey: string | undefined;
+  smsFromNumber: string | undefined;
+  smsWebhookPublicKey: string | undefined;
+  // Voice channel config (LiveKit + STT/TTS). Vault-only provider credentials.
+  voiceLivekitUrl: string | undefined;
+  voiceLivekitApiKey: string | undefined;
+  voiceLivekitApiSecret: string | undefined;
+  /**
+   * HTTP(S) base for LiveKit RoomService admin calls (DeleteRoom, etc.). Distinct from
+   * `voiceLivekitUrl` (browser WebSocket signaling). Compose default: `http://livekit:7880`.
+   * Plain YAML config (`channels.voice.livekit_management_url`), not vault.
+   */
+  voiceLivekitManagementUrl: string;
+  voiceDeepgramApiKey: string | undefined;
+  voiceCartesiaApiKey: string | undefined;
+  /** Cartesia voice to synthesize with (a voice id from the Cartesia library). Not a
+   * secret, but lives alongside the other voice credentials so it is console-settable.
+   * TTS cannot synthesize without it, so the voice channel treats it as required. */
+  voiceCartesiaVoiceId: string | undefined;
+  /** Optional model override for voice turns; defaults to the fast tier when unset. */
+  voiceModel?: string;
 }
+
+/** Kill switch for the outbound identity gate (#1818). */
+export type IdentityGateMode = 'off' | 'shadow' | 'enforce';
+
+/**
+ * `enforce` blocks a non-principal send that has an unconfirmed-name hedge or
+ * an unresolved name next to an invitation or attendance cue. `shadow` logs that block and sends.
+ * `off` does not inspect the text. Default `enforce`.
+ */
+export function resolveIdentityGateMode(filter: YamlConfig['filter']): IdentityGateMode {
+  const mode = filter?.identityGate ?? 'enforce';
+  if (mode !== 'off' && mode !== 'shadow' && mode !== 'enforce') {
+    throw new Error(`filter.identityGate must be "off", "shadow", or "enforce", got: ${String(mode)}`);
+  }
+  return mode;
+}
+
+/** Per-resumable-task aggregate ceilings — progress-based circuit breaker (#1176). */
+export interface ResumableCeilingsConfig {
+  /** Consecutive paused slices with no forward progress before fail/escalate (K). */
+  maxStalls: number;
+  maxIterations: number;
+  maxWallclockHours: number;
+  maxCostUsd: number;
+  /** Max plan-decomposition depth per subtree (#1266). */
+  maxPlanDepth: number;
+  /** Max adaptive re-plans per planned task (#1266). */
+  maxReplansPerSubtree: number;
+  /** Hours a child may stay blocked before a divergence signal (#1266). */
+  blockedStepHours: number;
+  /** Measured units/slice below this fraction of implied pace triggers divergence (#1266). */
+  throughputDivergenceRatio: number;
+}
+
+/**
+ * Default LiveKit RoomService base URL for the self-hosted compose topology
+ * (`livekit` service on the internal Docker network). Browser signaling uses a
+ * separate public `wss://` URL from the vault (`channel.voice.livekit_url`).
+ */
+/** Default `documentWorkspace.consoleEditMaxBytes` — sits in the gap between prod's 53 KiB and 211 kB documents (#1822). */
+export const DEFAULT_CONSOLE_EDIT_MAX_BYTES = 64 * 1024;
+/** Upper bound for `documentWorkspace.consoleEditMaxBytes`; the save route sizes its body limit from the cap. */
+export const MAX_CONSOLE_EDIT_BYTES = 4 * 1024 * 1024;
+
+export const DEFAULT_VOICE_LIVEKIT_MANAGEMENT_URL = 'http://livekit:7880';
+
+export const DEFAULT_RESUMABLE_CEILINGS: ResumableCeilingsConfig = {
+  maxStalls: 3,
+  maxIterations: 100,
+  maxWallclockHours: 24,
+  maxCostUsd: 10,
+  maxPlanDepth: 3,
+  maxReplansPerSubtree: 5,
+  blockedStepHours: 48,
+  throughputDivergenceRatio: 0.5,
+};
 
 export interface TasksConfig {
   heartbeatIntervalMinutes: number;
   heartbeatMaxWakesPerTick: number;
   idleThresholdHours: number;
   staleWaitThresholdHours: number;
+  /** Seconds until a paused resumable task's self-continuation wake fires. */
+  resumableContinuationSeconds: number;
+  /** Progress-based circuit-breaker defaults for resumable tasks (#1176). */
+  resumableCeilings: ResumableCeilingsConfig;
 }
 
 export const DEFAULT_TASKS_CONFIG: TasksConfig = {
@@ -80,7 +179,284 @@ export const DEFAULT_TASKS_CONFIG: TasksConfig = {
   heartbeatMaxWakesPerTick: 5,
   idleThresholdHours: 4,
   staleWaitThresholdHours: 48,
+  resumableContinuationSeconds: 30,
+  resumableCeilings: DEFAULT_RESUMABLE_CEILINGS,
 };
+
+function resolveResumableCeilings(yaml: YamlConfig['tasks']): ResumableCeilingsConfig {
+  const r = yaml?.resumableCeilings;
+  return {
+    maxStalls: r?.maxStalls ?? DEFAULT_RESUMABLE_CEILINGS.maxStalls,
+    maxIterations: r?.maxIterations ?? DEFAULT_RESUMABLE_CEILINGS.maxIterations,
+    maxWallclockHours: r?.maxWallclockHours ?? DEFAULT_RESUMABLE_CEILINGS.maxWallclockHours,
+    maxCostUsd: r?.maxCostUsd ?? DEFAULT_RESUMABLE_CEILINGS.maxCostUsd,
+    maxPlanDepth: r?.maxPlanDepth ?? DEFAULT_RESUMABLE_CEILINGS.maxPlanDepth,
+    maxReplansPerSubtree: r?.maxReplansPerSubtree ?? DEFAULT_RESUMABLE_CEILINGS.maxReplansPerSubtree,
+    blockedStepHours: r?.blockedStepHours ?? DEFAULT_RESUMABLE_CEILINGS.blockedStepHours,
+    throughputDivergenceRatio: r?.throughputDivergenceRatio ?? DEFAULT_RESUMABLE_CEILINGS.throughputDivergenceRatio,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Late delegation delivery config (#1799)
+// ---------------------------------------------------------------------------
+
+export interface LateDeliveryConfig {
+  enabled: boolean;
+  ttlMinutes: number;
+  sweepIntervalMinutes: number;
+  maxResultChars: number;
+}
+
+const DEFAULT_LATE_DELIVERY_CONFIG: LateDeliveryConfig = {
+  enabled: true,
+  ttlMinutes: 60,
+  sweepIntervalMinutes: 5,
+  maxResultChars: 8000,
+};
+
+/** Resolve the optional delegate.lateDelivery block to a fully-populated config. */
+export function resolveLateDeliveryConfig(yaml: YamlConfig['delegate']): LateDeliveryConfig {
+  const l = yaml?.lateDelivery;
+  return {
+    enabled: l?.enabled ?? DEFAULT_LATE_DELIVERY_CONFIG.enabled,
+    ttlMinutes: l?.ttlMinutes ?? DEFAULT_LATE_DELIVERY_CONFIG.ttlMinutes,
+    sweepIntervalMinutes: l?.sweepIntervalMinutes ?? DEFAULT_LATE_DELIVERY_CONFIG.sweepIntervalMinutes,
+    maxResultChars: l?.maxResultChars ?? DEFAULT_LATE_DELIVERY_CONFIG.maxResultChars,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Turn lanes + mid-turn injection (#2018, ADR-053)
+// ---------------------------------------------------------------------------
+
+export interface TurnInjectionConfig {
+  enabled: boolean;
+  maxInjectionsPerTurn: number;
+  extraRoundsPerInjection: number;
+  laneWaitTimeoutMs: number;
+}
+
+const DEFAULT_TURN_INJECTION_CONFIG: TurnInjectionConfig = {
+  enabled: false,
+  maxInjectionsPerTurn: 5,
+  extraRoundsPerInjection: 2,
+  laneWaitTimeoutMs: 1_200_000,
+};
+
+/** Resolve the optional dispatch.turnInjection block. Missing fields keep the defaults. */
+export function resolveTurnInjectionConfig(yaml: YamlConfig['dispatch']): TurnInjectionConfig {
+  const t = yaml?.turnInjection;
+  return {
+    enabled: t?.enabled ?? DEFAULT_TURN_INJECTION_CONFIG.enabled,
+    maxInjectionsPerTurn: t?.maxInjectionsPerTurn ?? DEFAULT_TURN_INJECTION_CONFIG.maxInjectionsPerTurn,
+    extraRoundsPerInjection: t?.extraRoundsPerInjection ?? DEFAULT_TURN_INJECTION_CONFIG.extraRoundsPerInjection,
+    laneWaitTimeoutMs: t?.laneWaitTimeoutMs ?? DEFAULT_TURN_INJECTION_CONFIG.laneWaitTimeoutMs,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Delegated sign-in verification config (#2017)
+// ---------------------------------------------------------------------------
+
+/** Channels the principal can be asked on for a sign-in code. */
+export const VERIFICATION_ASK_CHANNELS = ['signal', 'sms', 'slack', 'email'] as const;
+
+const VERIFICATION_NUMERIC_KEYS = [
+  'defaultExpiryMinutes',
+  'recentWindowMinutes',
+  'codeTtlMinutesAfterClose',
+  'emailWaitSeconds',
+] as const;
+
+/**
+ * Identity providers whose embedded sign-in frame may receive a sign-in code. Deliberately
+ * short and well-known; a deployment extends it with verification.identityProviderDomains.
+ */
+export const DEFAULT_IDENTITY_PROVIDER_DOMAINS = [
+  'b2clogin.com',
+  'ciamlogin.com',
+  'microsoftonline.com',
+  'okta.com',
+  'auth0.com',
+  'onelogin.com',
+  'pingidentity.com',
+  'pingone.com',
+  'duosecurity.com',
+] as const;
+
+const DEFAULT_VERIFICATION_CONFIG: VerificationConfig = {
+  askChannelOrder: [...VERIFICATION_ASK_CHANNELS],
+  defaultExpiryMinutes: 10,
+  recentWindowMinutes: 120,
+  codeTtlMinutesAfterClose: 120,
+  emailWaitSeconds: 180,
+  identityProviderDomains: [...DEFAULT_IDENTITY_PROVIDER_DOMAINS],
+};
+
+/** Resolve the optional YAML verification block to a fully-populated config. */
+export function resolveVerificationConfig(yaml: YamlConfig['verification']): VerificationConfig {
+  return {
+    askChannelOrder: [...(yaml?.askChannelOrder ?? DEFAULT_VERIFICATION_CONFIG.askChannelOrder)],
+    defaultExpiryMinutes: yaml?.defaultExpiryMinutes ?? DEFAULT_VERIFICATION_CONFIG.defaultExpiryMinutes,
+    recentWindowMinutes: yaml?.recentWindowMinutes ?? DEFAULT_VERIFICATION_CONFIG.recentWindowMinutes,
+    codeTtlMinutesAfterClose: yaml?.codeTtlMinutesAfterClose ?? DEFAULT_VERIFICATION_CONFIG.codeTtlMinutesAfterClose,
+    emailWaitSeconds: yaml?.emailWaitSeconds ?? DEFAULT_VERIFICATION_CONFIG.emailWaitSeconds,
+    identityProviderDomains: (yaml?.identityProviderDomains ?? DEFAULT_VERIFICATION_CONFIG.identityProviderDomains)
+      .map((d) => d.toLowerCase()),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Approval expiry sweep config (#2013)
+// ---------------------------------------------------------------------------
+
+export interface ApprovalExpiryConfig {
+  sweepIntervalMinutes: number;
+}
+
+const DEFAULT_APPROVAL_EXPIRY_CONFIG: ApprovalExpiryConfig = {
+  // Every 15 minutes since #2159: the sweep is also the safety net that delivers approvals no
+  // agent delivered within 15 minutes, so an hourly tick would stretch that to 75. Each tick
+  // is two or three queries.
+  sweepIntervalMinutes: 15,
+};
+
+/** Resolve the optional autonomy.approval_expiry block to a fully-populated config. */
+export function resolveApprovalExpiryConfig(yaml: YamlConfig['autonomy']): ApprovalExpiryConfig {
+  return {
+    sweepIntervalMinutes:
+      yaml?.approval_expiry?.sweep_interval_minutes ?? DEFAULT_APPROVAL_EXPIRY_CONFIG.sweepIntervalMinutes,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Weekly fallback digest config (#2159)
+// ---------------------------------------------------------------------------
+
+export interface ReportFallbackConfig {
+  /** Send the fallback summary once the oldest unreported item is older than this. */
+  maxAgeDays: number;
+  checkIntervalHours: number;
+}
+
+const DEFAULT_REPORT_FALLBACK_CONFIG: ReportFallbackConfig = {
+  maxAgeDays: 7,
+  checkIntervalHours: 24,
+};
+
+/** Resolve the optional autonomy.report_fallback block to a fully-populated config. */
+export function resolveReportFallbackConfig(yaml: YamlConfig['autonomy']): ReportFallbackConfig {
+  return {
+    maxAgeDays: yaml?.report_fallback?.max_age_days ?? DEFAULT_REPORT_FALLBACK_CONFIG.maxAgeDays,
+    checkIntervalHours:
+      yaml?.report_fallback?.check_interval_hours ?? DEFAULT_REPORT_FALLBACK_CONFIG.checkIntervalHours,
+  };
+}
+
+/** Resolve autonomy.gating. Ships as 'tier' (#2159); prod flips it, then the default changes. */
+export function resolveAutonomyGating(yaml: YamlConfig['autonomy']): AutonomyGating {
+  return yaml?.gating ?? 'tier';
+}
+
+// ---------------------------------------------------------------------------
+// Relay budget (#1320)
+// ---------------------------------------------------------------------------
+
+export interface RelayBudgetConfig {
+  /** Immediate relays to the principal one outside contact may cause per hour. 0 = off. */
+  perHour: number;
+}
+
+const DEFAULT_RELAY_BUDGET_PER_HOUR = 3;
+
+/** Resolve autonomy.relay_budget. Validated in loadYamlConfig. */
+export function resolveRelayBudgetConfig(yaml: YamlConfig['autonomy']): RelayBudgetConfig {
+  return { perHour: yaml?.relay_budget?.per_hour ?? DEFAULT_RELAY_BUDGET_PER_HOUR };
+}
+
+/** The outbound content filter's Stage 2 judge settings (filter.llmJudge), defaults applied. */
+export interface OutboundJudgeSettings {
+  enabled: boolean;
+  model: string;
+  timeoutMs: number;
+  failMode: 'split' | 'open' | 'closed';
+}
+
+/** Thrown for a filter.llmJudge value production refuses to boot on (the timeout). */
+export class OutboundConfigError extends Error {
+  constructor(message: string, readonly detail: Record<string, unknown>) {
+    super(message);
+    this.name = 'OutboundConfigError';
+  }
+}
+
+/**
+ * Resolve filter.llmJudge (#547). local.yaml overrides are deep-merged but not schema-checked,
+ * so the timeout is validated here: with the default 'split' failMode a 0, negative or tiny
+ * timeout would make every judge call time out and fail open, silently disabling Stage 2.
+ * The 250ms floor rejects values too low for any real model round-trip, and is fatal. An
+ * unknown failMode on an enabled judge is reported through `warn` and read as the default
+ * 'split', as an unvalidated value was before. The model is checked against the registry by the
+ * caller, which holds it. Shared by src/index.ts and test mode.
+ */
+export function resolveOutboundJudgeConfig(
+  yaml: YamlConfig['filter'],
+  warn: ConfigWarn = () => {},
+): OutboundJudgeSettings {
+  const judge = yaml?.llmJudge;
+  const settings: OutboundJudgeSettings = {
+    enabled: judge?.enabled ?? true,
+    model: judge?.model ?? 'claude-haiku-5-5',
+    timeoutMs: judge?.timeout_ms ?? 5000,
+    failMode: judge?.failMode ?? 'split',
+  };
+  if (!settings.enabled) return settings;
+  if (!Number.isInteger(settings.timeoutMs) || settings.timeoutMs < 250) {
+    throw new OutboundConfigError(
+      'filter.llmJudge.timeout_ms must be an integer >= 250 (ms) — fix config (default.yaml or local.yaml)',
+      { timeoutMs: settings.timeoutMs },
+    );
+  }
+  if (!['split', 'open', 'closed'].includes(settings.failMode)) {
+    warn({ failMode: settings.failMode }, "filter.llmJudge.failMode must be split, open or closed — using 'split'");
+    settings.failMode = 'split';
+  }
+  return settings;
+}
+
+/** Where a resolver reports a value it replaced with its default (logger.warn's shape). */
+export type ConfigWarn = (detail: Record<string, unknown>, message: string) => void;
+
+/** The outbound PII redaction policy (pii.outbound_redaction), defaults applied. */
+export interface OutboundRedactionSettings {
+  enabled: boolean;
+  default: 'block' | 'allow';
+  channel_policies: Record<string, { allow: string[] }>;
+}
+
+/**
+ * Resolve pii.outbound_redaction: enabled and 'block' by default, each channel's allow list
+ * defaulting to []. An unknown default is reported through `warn` and read as 'block', the
+ * fail-safe choice. Shared by src/index.ts and test mode.
+ */
+export function resolveOutboundRedactionConfig(yaml: YamlConfig['pii'], warn: ConfigWarn = () => {}): OutboundRedactionSettings {
+  const redaction = yaml?.outbound_redaction;
+  const configured: string = redaction?.default ?? 'block';
+  let fallback: OutboundRedactionSettings['default'] = 'block';
+  if (configured === 'block' || configured === 'allow') {
+    fallback = configured;
+  } else {
+    warn({ default: configured }, "pii.outbound_redaction.default must be 'block' or 'allow' — using 'block'");
+  }
+  return {
+    enabled: redaction?.enabled ?? true,
+    default: fallback,
+    channel_policies: Object.fromEntries(
+      Object.entries(redaction?.channel_policies ?? {}).map(([ch, policy]) => [ch, { allow: policy.allow ?? [] }]),
+    ),
+  };
+}
 
 /** Resolve the optional YAML tasks block to a fully-populated config with defaults. */
 export function resolveTasksConfig(yaml: YamlConfig['tasks']): TasksConfig {
@@ -89,6 +465,108 @@ export function resolveTasksConfig(yaml: YamlConfig['tasks']): TasksConfig {
     heartbeatMaxWakesPerTick: yaml?.heartbeatMaxWakesPerTick ?? DEFAULT_TASKS_CONFIG.heartbeatMaxWakesPerTick,
     idleThresholdHours: yaml?.idleThresholdHours ?? DEFAULT_TASKS_CONFIG.idleThresholdHours,
     staleWaitThresholdHours: yaml?.staleWaitThresholdHours ?? DEFAULT_TASKS_CONFIG.staleWaitThresholdHours,
+    resumableContinuationSeconds: yaml?.resumableContinuationSeconds ?? DEFAULT_TASKS_CONFIG.resumableContinuationSeconds,
+    resumableCeilings: resolveResumableCeilings(yaml),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Health observability config types
+// ---------------------------------------------------------------------------
+
+export interface HealthLivenessConfig {
+  /** Fail email check if last poll is older than N × pollingIntervalMs. */
+  emailStallFactor: number;
+  /** Fail scheduler check if watchdog last ticked more than N seconds ago. */
+  schedulerMaxTickS: number;
+}
+
+export interface HealthHeartbeats {
+  llm_fast: string | null;
+  llm_standard: string | null;
+  llm_powerful: string | null;
+  embeddings: string | null;
+  image_gen: string | null;
+  nylas: string | null;
+  /** Principal calendar grant (`ceo_nylas_grant_id`), distinct from email `nylas`. */
+  nylas_calendar: string | null;
+  signal: string | null;
+  google_workspace: string | null;
+  tavily: string | null;
+}
+
+export interface HealthConfig {
+  liveness: HealthLivenessConfig;
+  canarySchedule: string;
+  heartbeats: HealthHeartbeats;
+}
+
+export const DEFAULT_HEALTH_CONFIG: HealthConfig = {
+  liveness: {
+    emailStallFactor: 3,
+    schedulerMaxTickS: 120,
+  },
+  canarySchedule: '0 6 * * *',
+  heartbeats: {
+    llm_fast: null,
+    llm_standard: null,
+    llm_powerful: null,
+    embeddings: null,
+    image_gen: null,
+    nylas: null,
+    nylas_calendar: null,
+    signal: null,
+    google_workspace: null,
+    tavily: null,
+  },
+};
+
+/**
+ * Validate a heartbeat URL: must be https:// to be safe to ping.
+ * Returns null (without throwing) for empty, non-https, or malformed URLs.
+ * The `key` parameter is reserved for future caller-side logging — this
+ * function intentionally has no logger access.
+ */
+function validateHeartbeatUrl(raw: string | undefined | null, _key: string): string | null {
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    // Non-https URLs are not safe to ping — discard them silently.
+    if (url.protocol !== 'https:') return null;
+    return raw;
+  } catch {
+    // Malformed URL — not parseable by the URL constructor.
+    return null;
+  }
+}
+
+/** Resolve the optional YAML health block to a fully-populated config with defaults. */
+export function resolveHealthConfig(
+  yamlHealth: YamlConfig['health'] | undefined,
+): HealthConfig {
+  const hb = yamlHealth?.heartbeats;
+  return {
+    liveness: {
+      emailStallFactor:
+        yamlHealth?.liveness?.email_stall_factor ??
+        DEFAULT_HEALTH_CONFIG.liveness.emailStallFactor,
+      schedulerMaxTickS:
+        yamlHealth?.liveness?.scheduler_max_tick_s ??
+        DEFAULT_HEALTH_CONFIG.liveness.schedulerMaxTickS,
+    },
+    canarySchedule: yamlHealth?.canary_schedule ?? DEFAULT_HEALTH_CONFIG.canarySchedule,
+    heartbeats: {
+      llm_fast: validateHeartbeatUrl(hb?.llm_fast, 'llm_fast'),
+      llm_standard: validateHeartbeatUrl(hb?.llm_standard, 'llm_standard'),
+      llm_powerful: validateHeartbeatUrl(hb?.llm_powerful, 'llm_powerful'),
+      embeddings: validateHeartbeatUrl(hb?.embeddings, 'embeddings'),
+      image_gen: validateHeartbeatUrl(hb?.image_gen, 'image_gen'),
+      nylas: validateHeartbeatUrl(hb?.nylas, 'nylas'),
+      nylas_calendar: validateHeartbeatUrl(hb?.nylas_calendar, 'nylas_calendar'),
+      signal: validateHeartbeatUrl(hb?.signal, 'signal'),
+      google_workspace: validateHeartbeatUrl(hb?.google_workspace, 'google_workspace'),
+      tavily: validateHeartbeatUrl(hb?.tavily, 'tavily'),
+    },
   };
 }
 
@@ -98,10 +576,9 @@ export function resolveTasksConfig(yaml: YamlConfig['tasks']): TasksConfig {
  * All fields are optional — the file may be partially populated or entirely
  * absent in test/CI environments. Callers must supply their own defaults.
  *
- * NOTE: Several fields in this interface are not yet wired up in index.ts
- * (browser, channels, agents). Those values are read with hardcoded defaults
- * instead of from the YAML. This is tracked in:
- * https://github.com/josephfung/curia/issues/204
+ * NOTE: Not every field here is sourced from the YAML yet — some are still read
+ * with hardcoded defaults in index.ts rather than from config. Verify a field is
+ * actually consumed before relying on it being configurable.
  */
 export interface YamlConfig {
   channels?: {
@@ -109,27 +586,27 @@ export interface YamlConfig {
     /** Max inbound message content size in bytes. Default: 102400 (100KB).
      *  Messages exceeding this are rejected by the dispatcher before routing. */
     max_message_bytes?: number;
-  };
-  /**
-   * Multi-account channel config (spec 03 - #3).
-   *
-   * Defines N named accounts per channel type, each with its own credentials.
-   * When this block is absent, the system falls back to the legacy single-account
-   * env-var config (NYLAS_GRANT_ID + NYLAS_SELF_EMAIL).
-   *
-   * Values may be literal strings or "env:VAR_NAME" references resolved at startup.
-   * The Nylas API key (NYLAS_API_KEY) is shared across all email accounts —
-   * it is the application key, not per-account.
-   *
-   * Example:
-   *   channel_accounts:
-   *     email:
-   *       curia:
-   *         nylas_grant_id: env:NYLAS_GRANT_ID
-   *         self_email: env:NYLAS_SELF_EMAIL
-   */
-  channel_accounts?: {
-    email?: Record<string, RawEmailAccountConfig>;
+    slack?: {
+      /** Slack channel ids (C…) where @mentions are accepted. Empty/absent = all. */
+      allowed_channel_ids?: string[];
+    };
+    email?: {
+      /**
+       * Max inbound email turns in flight per account. Same-thread messages stay
+       * serial; further threads wait for a slot. Default: 4 (#2254).
+       */
+      max_concurrent_turns?: number;
+    };
+    voice?: {
+      /** Optional concrete model override for voice turns. Empty/absent = fast tier. */
+      model?: string;
+      /**
+       * HTTP(S) base URL for LiveKit RoomService (DeleteRoom, etc.). Server→LiveKit
+       * only — not the browser signaling URL. Empty/absent → compose default
+       * `http://livekit:7880`.
+       */
+      livekit_management_url?: string;
+    };
   };
   browser?: {
     sessionTtlMs?: number;
@@ -141,8 +618,25 @@ export interface YamlConfig {
     profileDir?: string;
     /** Browser channel, e.g. "chrome" for real Chrome. Empty/absent → bundled Chromium. */
     channel?: string;
+    /**
+     * Optional egress proxy for browser traffic (full URL or bare host:port, e.g.
+     * "http://browser-proxy:8888"). Empty/absent → direct egress. Set per-deployment to
+     * route the browser through a residential exit and avoid a datacenter-IP bot signal.
+     */
+    proxy?: string;
     /** Context locale (BCP 47). Default "en-US". */
     locale?: string;
+    /**
+     * Ordered languages for navigator.languages and Accept-Language, e.g.
+     * ["en-CA", "en-US", "en"]. `locale` is always first. Empty/absent → [locale].
+     */
+    languages?: string[];
+    /**
+     * Longest the web-browser skill waits for a page to finish redirecting (a single-sign-on
+     * chain) before reading it, in ms (#2244). Default 35000. At most 90000, so a call
+     * stays inside the skill's 120s timeout.
+     */
+    settleCapMs?: number;
   };
   agents?: {
     coordinator?: { config_path?: string };
@@ -157,6 +651,27 @@ export interface YamlConfig {
       keepWindow?: number;
     };
   };
+  documentWorkspace?: {
+    /** Days of inactivity before `/scratch/<conversation-id>/…` documents are archived by DreamEngine. Default: 7. */
+    scratchTtlDays?: number;
+    /**
+     * Largest document (serialized OKF bytes) the console edits in place (#1822). Larger
+     * documents are read-only in the console and edited offline via download + import.
+     * Default: 65536 (64 KiB).
+     */
+    consoleEditMaxBytes?: number;
+    /**
+     * Characters above which an injected `pinned_context` item logs a warning (#2338).
+     * Never truncates. Default: 16000.
+     */
+    pinnedContextWarnChars?: number;
+    /** KG promotion when a planned parent completes (#1241). */
+    kgPromotion?: {
+      enabled?: boolean;
+      maxFacts?: number;
+      maxRelationships?: number;
+    };
+  };
   skillOutput?: {
     /** Max character length for skill results before truncation. Default: 200_000. */
     maxLength?: number;
@@ -165,6 +680,21 @@ export interface YamlConfig {
     /** Milliseconds of inactivity before a conversation.checkpoint event is published.
      *  Defaults to 600000 (10 minutes). */
     conversationCheckpointDebounceMs?: number;
+    /**
+     * Turn lanes and mid-turn injection (#2018, ADR-053). Absent fields use
+     * {@link DEFAULT_TURN_INJECTION_CONFIG}. The shipped config sets `enabled` true.
+     * An absent field stays false.
+     */
+    turnInjection?: {
+      /** Master switch. Absent means false. The shipped config sets it true. */
+      enabled?: boolean;
+      /** Live same-sender follow-ups drained into one turn before the rest wait. Default: 5. */
+      maxInjectionsPerTurn?: number;
+      /** Added to the host's maxTurns for each drained follow-up. Default: 2. */
+      extraRoundsPerInjection?: number;
+      /** How long a waiter blocks on a busy lane before it runs anyway, in ms. Default: 1200000. */
+      laneWaitTimeoutMs?: number;
+    };
     rate_limit?: {
       /** Duration of each rate-limit window in milliseconds. Default: 60000 (1 minute). */
       window_ms?: number;
@@ -175,6 +705,10 @@ export interface YamlConfig {
     };
   };
   security?: {
+    /** Operator-supplied prompt-injection patterns, parsed by parseExtraInjectionPatterns()
+     *  (src/dispatch/security-config-loader.ts). Overridable via config/local.yaml; like
+     *  every other array in this config, an override REPLACES this list rather than
+     *  extending it (see deepMerge below) (#1397). */
     extra_injection_patterns?: Array<{ regex: string; label: string }>;
     trust_score?: {
       /** Weight for the channel trust component (0–1). Default: 0.4 */
@@ -193,6 +727,8 @@ export interface YamlConfig {
       data_export: number;
       financial: number;
     };
+    /** The principal's organization email domains (#2227); a verified sender at one is elevated to known. */
+    principal_org_domains?: string[];
   };
   pii?: {
     /**
@@ -237,7 +773,7 @@ export interface YamlConfig {
       /**
        * Model the judge runs on. A dedicated model string (NOT a tier reference)
        * so the judge can use a different vendor independently of the agent tiers.
-       * Validated against the model registry at startup. Default: 'claude-haiku-4-5'.
+       * Validated against the model registry at startup. Default: 'claude-haiku-5-5'.
        */
       model?: string;
       /** Hard timeout for the judge call in ms. Default: 5000. */
@@ -250,6 +786,41 @@ export interface YamlConfig {
        */
       failMode?: 'split' | 'open' | 'closed';
     };
+    /**
+     * Identity gate for non-principal sends (#1818). Default: 'enforce'.
+     *   'enforce' — block an unconfirmed-name hedge or a name beside an attendance cue
+     *   'shadow'  — log the block and send
+     *   'off'     — do not inspect the text
+     */
+    identityGate?: IdentityGateMode;
+  };
+  /** Bulk export gates for attachments and MCP record exports (#201). */
+  exportControls?: {
+    confidentialThreshold?: number;
+    allowedDestinations?: {
+      driveFolderIds?: string[];
+      urls?: string[];
+      filePaths?: string[];
+    };
+  };
+  /**
+   * KG node sensitivity classification rules, used for bulk-export gating (#200).
+   * Each entry maps a category + keyword pattern list to a sensitivity level;
+   * the most restrictive matching rule wins (see SensitivityClassifier).
+   *
+   * Merge semantics: like every other array in this config, an override in
+   * config/local.yaml REPLACES the shipped default list wholesale rather than
+   * extending it (see deepMerge below) — an operator who only wants to add a
+   * category must copy the full shipped list into local.yaml and append to it (#1369).
+   */
+  sensitivity_rules?: SensitivityRule[];
+  /**
+   * Embedding settings that do not fit env (ADR-051). `profiles` is keyed by the exact
+   * EMBEDDING_MODEL value; loadYamlConfig() validates each entry and resolves its `base`,
+   * so after loading every entry is a complete profile.
+   */
+  embedding?: {
+    profiles?: Record<string, EmbeddingProfile>;
   };
   /**
    * Escalation-line policy judge (issue #948).
@@ -264,11 +835,16 @@ export interface YamlConfig {
       /**
        * Model for the judge. A dedicated string (NOT a tier reference) so it can
        * differ from the coordinator model. Validated against the registry at startup.
-       * Default: 'claude-haiku-4-5'.
+       * Default: 'claude-haiku-5-5'.
        */
       model?: string;
       /** Hard timeout per call in ms. Default: 5000. */
       timeout_ms?: number;
+      /** Timeout for the band brief (#2159), which reads the drafting turn's evidence. Default: 15000. */
+      review_timeout_ms?: number;
+      // No failMode — EscalationJudge is hard-coded fail-closed. A local.yaml
+      // `failMode` key is deep-merged into the object but ignored by the type and
+      // constructor (see #1911). Do not add it here.
     };
   };
   intentDrift?: {
@@ -304,9 +880,29 @@ export interface YamlConfig {
       batchSize?: number;
       minScoredActions?: number;
       halfLifeDays?: number;
-      weakExpiredWeight?: number;
       ceoCooldownDays?: number;
       errorRateThreshold?: number;
+      /** Oldest row, in days, the error-rate guard's last-30 window may reach. Default: 90. */
+      errorRateWindowDays?: number;
+      /** Days a parse failure may retry before null-flag dead-letter. Default: 3. */
+      unparseableAfterDays?: number;
+    };
+  };
+  /**
+   * Audit log hardening (spec 10 / #1383). Controls the llm_call_archive side
+   * table — kill-switch + hot retention TTL for the plaintext prompt store.
+   */
+  audit?: {
+    llmCallArchive?: {
+      /** When false, skip archive writes even if llm.call carries archive content. Default true. */
+      enabled?: boolean;
+      /** Delete archive rows older than this many days (DreamEngine decay pass). Default 90. */
+      hotRetentionDays?: number;
+      /**
+       * When false, archive rows omit the reasoning string. Token counts still
+       * store, and the rest of the archive still writes. Default true.
+       */
+      includeReasoning?: boolean;
     };
   };
   contact_creation_limits?: {
@@ -320,18 +916,46 @@ export interface YamlConfig {
    *  Agents declare a tier in their YAML; the operator controls which model each tier resolves to. */
   model_routing?: {
     tiers: {
-      fast: { model: string };
-      standard: { model: string };
-      powerful: { model: string };
+      fast: TierConfig;
+      standard: TierConfig;
+      powerful: TierConfig;
     };
     default_tier: 'fast' | 'standard' | 'powerful';
   };
 
   contextBridge?: {
-    /** TTL in hours for auto-registered entries (no explicit context_bridge param). Default: 6. */
+    /**
+     * TTL in hours for auto-registered entries on channels with no
+     * `channelDefaultExpiryHours` entry. Default: 6.
+     */
     defaultExpiryHours?: number;
     /** TTL in hours for entries with explicit context_bridge metadata. Default: 24. */
     explicitExpiryHours?: number;
+    /**
+     * Per-channel auto-registration TTL in hours, keyed by channel id. Overrides
+     * the built-in per-channel defaults (email: 72). Channels named neither here
+     * nor in the built-ins use `defaultExpiryHours`.
+     */
+    channelDefaultExpiryHours?: Record<string, number>;
+  };
+
+  /** Delegated sign-in verification (#2017). Every field optional; see resolveVerificationConfig. */
+  verification?: {
+    /** Channels to ask the principal on, in preference order. Default: signal, sms, slack, email. */
+    askChannelOrder?: string[];
+    /** Minutes until a pending verification is treated as expired (a hint, not a cliff). Default: 10. */
+    defaultExpiryMinutes?: number;
+    /** Minutes a closed verification still counts as recent. Default: 120. */
+    recentWindowMinutes?: number;
+    /** Minutes a tracked code value lives after its verification closes. Default: 120. */
+    codeTtlMinutesAfterClose?: number;
+    /** Seconds to wait for an emailed code before asking the principal. Default: 180. */
+    emailWaitSeconds?: number;
+    /**
+     * Registrable domains of identity providers whose embedded frame may receive a sign-in
+     * code. Replaces the default list (DEFAULT_IDENTITY_PROVIDER_DOMAINS).
+     */
+    identityProviderDomains?: string[];
   };
 
   /** Meeting debrief agent configuration (spec §17-meeting-debrief.md). */
@@ -345,14 +969,34 @@ export interface YamlConfig {
   };
 
   delegate?: {
-    /** Default timeout in ms for specialist delegations when no timeout_ms is passed. Default: 90000.
-     *  Override in local.yaml to match your deployment's standard-tier model latency. */
+    /** Default timeout in ms for specialist delegations when the runtime resolves no
+     *  expected duration (neither a scheduled task's expectedDurationSeconds nor the target
+     *  agent's expected_duration_seconds). Default: 450000 — pooled p99 of delegate
+     *  runs before 2026-09-20, rounded up (#1857).
+     *  Override in local.yaml to match your deployment's standard-tier model latency.
+     *  A value below 450000 warns at startup. */
     defaultTimeoutMs?: number;
+    /** Late delivery of specialist responses that arrive after the wait timed out (#1799). */
+    lateDelivery?: {
+      /** Master switch. When false no handles are opened, matched, or swept — the pre-#1799
+       *  behaviour, where a late response is simply orphaned. Default: true. */
+      enabled?: boolean;
+      /** Minutes a pending handle stays open before it is abandoned. The effective window is
+       *  at least twice the delegate wait that elapsed. Default: 60. */
+      ttlMinutes?: number;
+      /** Sweep interval in minutes (restart recovery + expiry). Default: 5. */
+      sweepIntervalMinutes?: number;
+      /** Cap on how much of a late result is copied into the review task note. Default: 8000. */
+      maxResultChars?: number;
+    };
   };
   scheduler?: {
     /** Default assumed duration in seconds for scheduled jobs that declare no expectedDurationSeconds.
      *  Used by the watchdog to compute recovery timeouts. Default: 600. */
     defaultExpectedDurationSeconds?: number;
+    /** Max agent runs the scheduler will execute at once. Further due jobs stay
+     *  pending until a slot frees. Default: 8 (headroom above the observed peak of 6). */
+    maxInFlight?: number;
   };
   tasks?: {
     /** BacklogHeartbeat tick interval in minutes. Default 60. */
@@ -365,6 +1009,88 @@ export interface YamlConfig {
     /** Hours a waiting/blocked task with no pending wake may sit before the
      *  heartbeat surfaces it as an orphaned wait. Default 48. */
     staleWaitThresholdHours?: number;
+    /** Seconds until a paused resumable task's self-continuation wake fires. Default 30. */
+    resumableContinuationSeconds?: number;
+    /** Progress-based circuit-breaker ceilings for resumable tasks (#1176). */
+    resumableCeilings?: {
+      /** Consecutive no-progress pauses before fail/escalate (K). Default 3. */
+      maxStalls?: number;
+      /** Max continuation slices. Default 100. */
+      maxIterations?: number;
+      /** Max wallclock hours from first pause. Default 24. */
+      maxWallclockHours?: number;
+      /** Max aggregate LLM cost (USD) across slices. Default 10. */
+      maxCostUsd?: number;
+      /** Max plan-decomposition depth per subtree. Default 3. */
+      maxPlanDepth?: number;
+      /** Max adaptive re-plans per planned task. Default 5. */
+      maxReplansPerSubtree?: number;
+      /** Hours a blocked child may sit before a divergence signal. Default 48. */
+      blockedStepHours?: number;
+      /** Throughput divergence ratio threshold (0–1). Default 0.5. */
+      throughputDivergenceRatio?: number;
+    };
+  };
+  health?: {
+    liveness?: {
+      email_stall_factor?: number;
+      scheduler_max_tick_s?: number;
+    };
+    canary_schedule?: string;
+    heartbeats?: {
+      llm_fast?: string;
+      llm_standard?: string;
+      llm_powerful?: string;
+      embeddings?: string;
+      image_gen?: string;
+      nylas?: string;
+      nylas_calendar?: string;
+      signal?: string;
+      google_workspace?: string;
+      tavily?: string;
+    };
+  };
+  autonomy?: {
+    /** band: the score decides and the judge reviews sends; tier: the pre-#2159 contact-tier gates. Default tier. */
+    gating?: AutonomyGating;
+    /**
+     * Bypass-ladder thresholds (#1125) — raw autonomy scores governing how much LINEAGE
+     * standing a heartbeat-woken task inherits. The live score can only ever DOWNGRADE
+     * inherited standing, never grant it. Defaults: same_task 70, derived_child 90.
+     */
+    bypass_ladder?: {
+      /** Min live score for a same-task heartbeat wake to keep lineage standing (posture B).
+       *  Should not drop below 60 (see effective-standing.ts). Default 70. */
+      same_task?: number;
+      /** Min live score for a freshly-derived child task to keep lineage standing (posture D).
+       *  Default 90. */
+      derived_child?: number;
+    };
+    /**
+     * Emoji sets mapped to approve/reject for inbound.reaction (#1479).
+     * Channel-agnostic — include Slack shortcodes and unicode glyphs.
+     */
+    reaction_intents?: {
+      approve?: string[];
+      reject?: string[];
+    };
+    /** System-interval sweep that expires stale pending approvals (#2013). */
+    approval_expiry?: {
+      /** Sweep interval in minutes. Default 60. */
+      sweep_interval_minutes?: number;
+    };
+    /** Weekly summary of unreported principal.report items for installs with no digest (#2159). */
+    report_fallback?: {
+      /** Send once the oldest unreported item is older than this many days. Default 7. */
+      max_age_days?: number;
+      /** How often to check, in hours. Default 24. */
+      check_interval_hours?: number;
+    };
+    /** Cap on immediate relays to the principal that one outside contact can cause (#1320). */
+    relay_budget?: {
+      /** Relays per originator per hour; over it, relays go to the digest. 0 turns it off. Default 3. */
+      per_hour?: number;
+    };
   };
 }
 
@@ -406,6 +1132,41 @@ function deepMerge(
   return result;
 }
 
+// Node stores a timer delay in a signed 32-bit int: setTimeout/setInterval silently
+// truncate anything past 2^31-1 ms and then fire almost immediately, forever. An operator
+// who raises an interval to slow a background pass down would get the fastest possible pass
+// instead, with nothing in the logs to say why (#1797, #1799, #1807).
+const NODE_MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * Reject an operator-set interval or timeout large enough to overflow a Node timer.
+ *
+ * Only for values that reach setTimeout/setInterval. Keys that feed date arithmetic or SQL
+ * intervals (tasks.idleThresholdHours, delegate.lateDelivery.ttlMinutes, ...) have no such
+ * ceiling and must not be passed here.
+ *
+ * @param key - Dotted config key, reproduced verbatim in the error so an operator reading a
+ *   startup failure knows which line of YAML to edit.
+ * @param value - The configured value, or undefined (no-op). Callers check that it is a
+ *   positive integer first; this only enforces the upper bound.
+ * @param msPerUnit - Milliseconds per unit of `value`: 1 for a `...Ms` key, 60_000 for a
+ *   `...Minutes` one. The ceiling is reported in the key's own unit, not in milliseconds.
+ * @param unit - Name of that unit, for the error message.
+ * @throws If `value` exceeds what Node can hold as a timer delay.
+ */
+function assertFitsNodeTimer(
+  key: string,
+  value: number | undefined,
+  msPerUnit = 1,
+  unit = 'ms',
+): void {
+  if (value === undefined) return;
+  const max = Math.floor(NODE_MAX_TIMER_MS / msPerUnit);
+  if (value > max) {
+    throw new Error(`${key} exceeds the Node.js timer limit (${max} ${unit}), got: ${value}`);
+  }
+}
+
 /**
  * Load and parse config/default.yaml, then deep-merge config/local.yaml on
  * top if it exists. local.yaml is gitignored in this repo and supplied by
@@ -439,15 +1200,21 @@ export function loadYamlConfig(configDir: string): YamlConfig {
     );
   }
   let defaultParsed: unknown;
-  try {
-    defaultParsed = yaml.load(defaultRaw);
-  } catch (err) {
-    throw new Error(
-      `Failed to load config/default.yaml: ${err instanceof Error ? err.message : String(err)}`,
-    );
+  // js-yaml v5 throws on empty input instead of returning undefined; guard here
+  // to preserve the "empty file = no config" contract.
+  if (defaultRaw.trim() === '') {
+    defaultParsed = undefined;
+  } else {
+    try {
+      defaultParsed = yaml.load(defaultRaw);
+    } catch (err) {
+      throw new Error(
+        `Failed to load config/default.yaml: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   if (defaultParsed === undefined) {
-    // Empty file (yaml.load returns undefined for '') — treat as no config.
+    // Empty file — treat as no config.
     base = {};
   } else if (defaultParsed === null || typeof defaultParsed !== 'object' || Array.isArray(defaultParsed)) {
     // Explicit YAML null, a scalar, or a sequence — all invalid for a config root.
@@ -475,15 +1242,20 @@ export function loadYamlConfig(configDir: string): YamlConfig {
   }
   if (localRaw !== null) {
     let localParsed: unknown;
-    try {
-      localParsed = yaml.load(localRaw);
-    } catch (err) {
-      throw new Error(
-        `Failed to load config/local.yaml: ${err instanceof Error ? err.message : String(err)}`,
-      );
+    // js-yaml v5 throws on empty input; guard here to preserve the "empty file = no override" contract.
+    if (localRaw.trim() === '') {
+      localParsed = undefined;
+    } else {
+      try {
+        localParsed = yaml.load(localRaw);
+      } catch (err) {
+        throw new Error(
+          `Failed to load config/local.yaml: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
     if (localParsed === undefined) {
-      // Empty file (yaml.load returns undefined for '') — treat as no override.
+      // Empty file — treat as no override.
     } else if (localParsed === null || typeof localParsed !== 'object' || Array.isArray(localParsed)) {
       // Explicit YAML null, a scalar, or a sequence — all invalid for a config root.
       throw new Error('config/local.yaml must contain a YAML mapping at the root');
@@ -505,21 +1277,51 @@ export function loadYamlConfig(configDir: string): YamlConfig {
     throw new Error(`skillOutput.maxLength must be a positive integer, got: ${maxLength}`);
   }
 
+  resolveIdentityGateMode(config.filter);
+
   // Validate the browser block. config/local.yaml is deep-merged above but not
   // schema-validated, so a bad override (e.g. sweepIntervalMs: 0 or -1) would otherwise
   // reach BrowserService and schedule near-continuous sweeps. Reject malformed values here.
   const browser = config.browser;
   if (browser !== undefined) {
-    const { sessionTtlMs, sweepIntervalMs, profileDir, channel, locale } = browser;
+    const { sessionTtlMs, sweepIntervalMs, profileDir, channel, proxy, locale, languages, settleCapMs } = browser;
     if (sessionTtlMs !== undefined && (!Number.isInteger(sessionTtlMs) || sessionTtlMs <= 0)) {
       throw new Error(`browser.sessionTtlMs must be a positive integer, got: ${sessionTtlMs}`);
     }
     if (sweepIntervalMs !== undefined && (!Number.isInteger(sweepIntervalMs) || sweepIntervalMs <= 0)) {
       throw new Error(`browser.sweepIntervalMs must be a positive integer, got: ${sweepIntervalMs}`);
     }
-    for (const [key, value] of [['profileDir', profileDir], ['channel', channel], ['locale', locale]] as const) {
+    // Bounded above so one settle can't use up the web-browser skill's 120s timeout.
+    if (settleCapMs !== undefined && (!Number.isInteger(settleCapMs) || settleCapMs <= 0 || settleCapMs > 90_000)) {
+      throw new Error(`browser.settleCapMs must be a positive integer of at most 90000, got: ${settleCapMs}`);
+    }
+    // Reaches BrowserService's sweep timer directly. sessionTtlMs needs no such ceiling:
+    // it is only compared against elapsed time, never used as a timer delay.
+    assertFitsNodeTimer('browser.sweepIntervalMs', sweepIntervalMs);
+    for (const [key, value] of [['profileDir', profileDir], ['channel', channel], ['proxy', proxy], ['locale', locale]] as const) {
       if (value !== undefined && typeof value !== 'string') {
         throw new Error(`browser.${key} must be a string, got: ${typeof value}`);
+      }
+    }
+    // Joined into Chrome's --accept-lang flag, so a comma inside one entry would split it.
+    if (languages !== undefined && (
+      !Array.isArray(languages)
+      || !languages.every(l => typeof l === 'string' && /^[A-Za-z0-9-]+$/.test(l))
+    )) {
+      throw new Error('browser.languages must be a list of language tags (e.g. ["en-CA", "en-US", "en"])');
+    }
+    // Fail closed on a misconfigured proxy: browser.proxy exists so the web-browser skill
+    // egresses through a residential exit instead of the datacenter IP. A non-empty but
+    // unparseable value must abort boot loudly — NOT silently resolve to "no proxy" and let
+    // the browser leak the real IP. parseProxyConfig throws on a bad non-empty value.
+    if (typeof proxy === 'string' && proxy.trim().length > 0) {
+      try {
+        parseProxyConfig(proxy);
+      } catch (err) {
+        throw new Error(
+          `browser.proxy is set but invalid — refusing to start (an unparseable proxy would ` +
+          `egress directly and leak the real IP): ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
   }
@@ -554,6 +1356,26 @@ export function loadYamlConfig(configDir: string): YamlConfig {
         `dispatch.rate_limit.max_global (${effectiveMaxGlobal}) must be >= max_per_sender (${effectiveMaxPerSender})`,
       );
     }
+  }
+
+  // Turn lanes (#2018). A mis-shaped block must fail at boot. laneWaitTimeoutMs reaches
+  // setTimeout, so an overflowed value would fire the fail-open path immediately.
+  const turnInjection = config.dispatch?.turnInjection;
+  if (turnInjection !== undefined) {
+    if (typeof turnInjection !== 'object' || turnInjection === null || Array.isArray(turnInjection)) {
+      throw new Error(`dispatch.turnInjection must be a YAML mapping, got: ${typeof turnInjection}`);
+    }
+    if (turnInjection.enabled !== undefined && typeof turnInjection.enabled !== 'boolean') {
+      throw new Error(`dispatch.turnInjection.enabled must be a boolean, got: ${typeof turnInjection.enabled}`);
+    }
+    for (const field of ['maxInjectionsPerTurn', 'extraRoundsPerInjection', 'laneWaitTimeoutMs'] as const) {
+      const value = turnInjection[field];
+      if (value === undefined) continue;
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(`dispatch.turnInjection.${field} must be a positive integer, got: ${value}`);
+      }
+    }
+    assertFitsNodeTimer('dispatch.turnInjection.laneWaitTimeoutMs', turnInjection.laneWaitTimeoutMs);
   }
 
   const workingMemory = config.workingMemory;
@@ -595,34 +1417,57 @@ export function loadYamlConfig(configDir: string): YamlConfig {
     }
   }
 
-  // Validate channel_accounts if present
-  const channelAccounts = config.channel_accounts?.email;
-  if (channelAccounts !== undefined) {
-    if (channelAccounts === null || typeof channelAccounts !== 'object' || Array.isArray(channelAccounts)) {
-      throw new Error('channel_accounts.email must be a YAML mapping');
+  const documentWorkspace = config.documentWorkspace;
+  if (documentWorkspace !== undefined) {
+    if (documentWorkspace === null || typeof documentWorkspace !== 'object' || Array.isArray(documentWorkspace)) {
+      throw new Error('documentWorkspace must be a YAML mapping');
     }
-    for (const [accountName, rawAccount] of Object.entries(channelAccounts)) {
-      if (typeof rawAccount !== 'object' || rawAccount === null || Array.isArray(rawAccount)) {
-        throw new Error(`channel_accounts.email.${accountName} must be a YAML mapping`);
+
+    if (documentWorkspace.scratchTtlDays !== undefined) {
+      const scratchTtlDays = documentWorkspace.scratchTtlDays;
+      if (!Number.isInteger(scratchTtlDays) || scratchTtlDays < 1 || scratchTtlDays > 36500) {
+        throw new Error(
+          `documentWorkspace.scratchTtlDays must be a positive integer no greater than 36500, got: ${scratchTtlDays}`,
+        );
       }
-      if (typeof rawAccount.nylas_grant_id !== 'string' || !rawAccount.nylas_grant_id) {
-        throw new Error(`channel_accounts.email.${accountName}.nylas_grant_id must be a non-empty string`);
+    }
+
+    if (documentWorkspace.consoleEditMaxBytes !== undefined) {
+      const cap = documentWorkspace.consoleEditMaxBytes;
+      if (!Number.isInteger(cap) || cap < 1024 || cap > MAX_CONSOLE_EDIT_BYTES) {
+        throw new Error(
+          `documentWorkspace.consoleEditMaxBytes must be an integer from 1024 to ${MAX_CONSOLE_EDIT_BYTES}, got: ${String(cap)}`,
+        );
       }
-      if (typeof rawAccount.self_email !== 'string' || !rawAccount.self_email) {
-        throw new Error(`channel_accounts.email.${accountName}.self_email must be a non-empty string`);
+    }
+
+    if (documentWorkspace.pinnedContextWarnChars !== undefined) {
+      const warnChars = documentWorkspace.pinnedContextWarnChars;
+      if (!Number.isInteger(warnChars) || warnChars < 1) {
+        throw new Error(
+          `documentWorkspace.pinnedContextWarnChars must be a positive integer, got: ${String(warnChars)}`,
+        );
       }
-      if (rawAccount.excluded_sender_emails !== undefined) {
-        if (!Array.isArray(rawAccount.excluded_sender_emails)) {
-          throw new Error(
-            `channel_accounts.email.${accountName}.excluded_sender_emails must be a list of strings`,
-          );
+    }
+
+    const kgPromotion = documentWorkspace.kgPromotion;
+    if (kgPromotion !== undefined) {
+      if (kgPromotion === null || typeof kgPromotion !== 'object' || Array.isArray(kgPromotion)) {
+        throw new Error('documentWorkspace.kgPromotion must be a YAML mapping');
+      }
+      if (kgPromotion.enabled !== undefined && typeof kgPromotion.enabled !== 'boolean') {
+        throw new Error(`documentWorkspace.kgPromotion.enabled must be a boolean, got: ${String(kgPromotion.enabled)}`);
+      }
+      if (kgPromotion.maxFacts !== undefined) {
+        if (!Number.isInteger(kgPromotion.maxFacts) || kgPromotion.maxFacts < 0) {
+          throw new Error(`documentWorkspace.kgPromotion.maxFacts must be a non-negative integer, got: ${String(kgPromotion.maxFacts)}`);
         }
-        for (const entry of rawAccount.excluded_sender_emails) {
-          if (typeof entry !== 'string' || !entry) {
-            throw new Error(
-              `channel_accounts.email.${accountName}.excluded_sender_emails entries must be non-empty strings`,
-            );
-          }
+      }
+      if (kgPromotion.maxRelationships !== undefined) {
+        if (!Number.isInteger(kgPromotion.maxRelationships) || kgPromotion.maxRelationships < 0) {
+          throw new Error(
+            `documentWorkspace.kgPromotion.maxRelationships must be a non-negative integer, got: ${String(kgPromotion.maxRelationships)}`,
+          );
         }
       }
     }
@@ -671,6 +1516,8 @@ export function loadYamlConfig(configDir: string): YamlConfig {
       if (decay.intervalMs !== undefined && (!Number.isInteger(decay.intervalMs) || decay.intervalMs <= 0)) {
         throw new Error(`dreaming.decay.intervalMs must be a positive integer, got: ${decay.intervalMs}`);
       }
+      // Reaches DreamEngine.start()'s decay interval directly.
+      assertFitsNodeTimer('dreaming.decay.intervalMs', decay.intervalMs);
       if (decay.archiveThreshold !== undefined && (typeof decay.archiveThreshold !== 'number' || decay.archiveThreshold < 0 || decay.archiveThreshold > 1)) {
         throw new Error(`dreaming.decay.archiveThreshold must be a number between 0 and 1, got: ${decay.archiveThreshold}`);
       }
@@ -715,6 +1562,8 @@ export function loadYamlConfig(configDir: string): YamlConfig {
       if (autonomyScoring.intervalMs !== undefined && (!Number.isInteger(autonomyScoring.intervalMs) || autonomyScoring.intervalMs <= 0)) {
         throw new Error(`dreaming.autonomy_scoring.intervalMs must be a positive integer, got: ${autonomyScoring.intervalMs}`);
       }
+      // Reaches DreamEngine.start()'s scoring interval directly.
+      assertFitsNodeTimer('dreaming.autonomy_scoring.intervalMs', autonomyScoring.intervalMs);
       if (autonomyScoring.model_tier !== undefined && (typeof autonomyScoring.model_tier !== 'string' || autonomyScoring.model_tier.trim().length === 0)) {
         throw new Error(`dreaming.autonomy_scoring.model_tier must be a non-empty string, got: ${String(autonomyScoring.model_tier)}`);
       }
@@ -727,26 +1576,158 @@ export function loadYamlConfig(configDir: string): YamlConfig {
       if (autonomyScoring.halfLifeDays !== undefined && (typeof autonomyScoring.halfLifeDays !== 'number' || autonomyScoring.halfLifeDays <= 0)) {
         throw new Error(`dreaming.autonomy_scoring.halfLifeDays must be a positive number, got: ${autonomyScoring.halfLifeDays}`);
       }
-      if (autonomyScoring.weakExpiredWeight !== undefined && (typeof autonomyScoring.weakExpiredWeight !== 'number' || autonomyScoring.weakExpiredWeight < 0 || autonomyScoring.weakExpiredWeight > 1)) {
-        throw new Error(`dreaming.autonomy_scoring.weakExpiredWeight must be a number between 0 and 1, got: ${autonomyScoring.weakExpiredWeight}`);
-      }
       if (autonomyScoring.ceoCooldownDays !== undefined && (!Number.isInteger(autonomyScoring.ceoCooldownDays) || autonomyScoring.ceoCooldownDays < 0)) {
         throw new Error(`dreaming.autonomy_scoring.ceoCooldownDays must be a non-negative integer, got: ${autonomyScoring.ceoCooldownDays}`);
       }
       if (autonomyScoring.errorRateThreshold !== undefined && (typeof autonomyScoring.errorRateThreshold !== 'number' || autonomyScoring.errorRateThreshold < 0 || autonomyScoring.errorRateThreshold > 1)) {
         throw new Error(`dreaming.autonomy_scoring.errorRateThreshold must be a number between 0 and 1, got: ${autonomyScoring.errorRateThreshold}`);
       }
+      if (autonomyScoring.errorRateWindowDays !== undefined && (!Number.isInteger(autonomyScoring.errorRateWindowDays) || autonomyScoring.errorRateWindowDays <= 0)) {
+        throw new Error(`dreaming.autonomy_scoring.errorRateWindowDays must be a positive integer, got: ${autonomyScoring.errorRateWindowDays}`);
+      }
+      if (autonomyScoring.unparseableAfterDays !== undefined && (!Number.isInteger(autonomyScoring.unparseableAfterDays) || autonomyScoring.unparseableAfterDays < 0)) {
+        throw new Error(`dreaming.autonomy_scoring.unparseableAfterDays must be a non-negative integer, got: ${autonomyScoring.unparseableAfterDays}`);
+      }
+    }
+  }
+
+  const audit = config.audit;
+  if (audit !== undefined) {
+    if (typeof audit !== 'object' || audit === null || Array.isArray(audit)) {
+      throw new Error('audit must be a YAML mapping');
+    }
+    const llmCallArchive = audit.llmCallArchive;
+    if (llmCallArchive !== undefined) {
+      if (typeof llmCallArchive !== 'object' || llmCallArchive === null || Array.isArray(llmCallArchive)) {
+        throw new Error('audit.llmCallArchive must be a YAML mapping');
+      }
+      if (llmCallArchive.enabled !== undefined && typeof llmCallArchive.enabled !== 'boolean') {
+        throw new Error(`audit.llmCallArchive.enabled must be a boolean, got: ${String(llmCallArchive.enabled)}`);
+      }
+      if (
+        llmCallArchive.hotRetentionDays !== undefined &&
+        (!Number.isInteger(llmCallArchive.hotRetentionDays) || llmCallArchive.hotRetentionDays < 1)
+      ) {
+        throw new Error(
+          `audit.llmCallArchive.hotRetentionDays must be a positive integer, got: ${llmCallArchive.hotRetentionDays}`,
+        );
+      }
+      if (
+        llmCallArchive.includeReasoning !== undefined &&
+        typeof llmCallArchive.includeReasoning !== 'boolean'
+      ) {
+        throw new Error(
+          `audit.llmCallArchive.includeReasoning must be a boolean, got: ${String(llmCallArchive.includeReasoning)}`,
+        );
+      }
     }
   }
 
   // Validate contextBridge if present
-  if (config.contextBridge != null && typeof config.contextBridge === 'object') {
-    const { defaultExpiryHours, explicitExpiryHours } = config.contextBridge;
+  if (config.contextBridge !== undefined) {
+    // Validate the root before reading fields. `typeof [] === 'object'` and a
+    // scalar root skips an `=== 'object'` guard entirely, so `contextBridge: []`
+    // and `contextBridge: 5` both used to boot clean and silently fall back to
+    // defaults — a TTL nobody set, which is the failure mode #1816 is about.
+    if (
+      config.contextBridge === null ||
+      typeof config.contextBridge !== 'object' ||
+      Array.isArray(config.contextBridge)
+    ) {
+      throw new Error(
+        `contextBridge must be a YAML mapping, got: ${Array.isArray(config.contextBridge) ? 'list' : typeof config.contextBridge}`,
+      );
+    }
+    const { defaultExpiryHours, explicitExpiryHours, channelDefaultExpiryHours } = config.contextBridge;
     if (defaultExpiryHours !== undefined && (!Number.isInteger(defaultExpiryHours) || defaultExpiryHours < 1)) {
       throw new Error(`contextBridge.defaultExpiryHours must be a positive integer, got: ${defaultExpiryHours}`);
     }
     if (explicitExpiryHours !== undefined && (!Number.isInteger(explicitExpiryHours) || explicitExpiryHours < 1)) {
       throw new Error(`contextBridge.explicitExpiryHours must be a positive integer, got: ${explicitExpiryHours}`);
+    }
+    if (channelDefaultExpiryHours !== undefined) {
+      if (
+        typeof channelDefaultExpiryHours !== 'object' ||
+        channelDefaultExpiryHours === null ||
+        Array.isArray(channelDefaultExpiryHours)
+      ) {
+        throw new Error('contextBridge.channelDefaultExpiryHours must be a YAML mapping of channel id to hours');
+      }
+      for (const [channelId, hours] of Object.entries(channelDefaultExpiryHours)) {
+        if (!Number.isInteger(hours) || hours < 1) {
+          throw new Error(
+            `contextBridge.channelDefaultExpiryHours.${channelId} must be a positive integer, got: ${hours}`,
+          );
+        }
+      }
+    }
+  }
+
+  // Validate verification if present
+  if (config.verification !== undefined) {
+    // Same root guard as contextBridge: `verification: []` or `verification: 5` must
+    // fail at boot, not fall back to defaults nobody chose.
+    if (
+      config.verification === null ||
+      typeof config.verification !== 'object' ||
+      Array.isArray(config.verification)
+    ) {
+      throw new Error(
+        `verification must be a YAML mapping, got: ${Array.isArray(config.verification) ? 'list' : typeof config.verification}`,
+      );
+    }
+    const { askChannelOrder, identityProviderDomains, ...numeric } = config.verification;
+    if (identityProviderDomains !== undefined) {
+      if (!Array.isArray(identityProviderDomains)) {
+        throw new Error(
+          `verification.identityProviderDomains must be a list of domains, got: ${typeof identityProviderDomains}`,
+        );
+      }
+      for (const entry of identityProviderDomains as unknown[]) {
+        // A bare registrable domain only (okta.com): not a URL, a subdomain, a public
+        // suffix or an IP, so the entry means exactly the provider it names.
+        if (typeof entry !== 'string' || registrableDomain(entry) !== entry.toLowerCase()) {
+          throw new Error(
+            `verification.identityProviderDomains entry ${JSON.stringify(entry)} must be a registrable domain such as okta.com`,
+          );
+        }
+      }
+    }
+    if (askChannelOrder !== undefined) {
+      if (!Array.isArray(askChannelOrder)) {
+        throw new Error(`verification.askChannelOrder must be a list of channel names, got: ${typeof askChannelOrder}`);
+      }
+      if (askChannelOrder.length === 0) {
+        throw new Error('verification.askChannelOrder must not be empty');
+      }
+      for (const channel of askChannelOrder) {
+        if (!(VERIFICATION_ASK_CHANNELS as readonly unknown[]).includes(channel)) {
+          throw new Error(
+            `verification.askChannelOrder contains unknown channel ${JSON.stringify(channel)}; valid: ${VERIFICATION_ASK_CHANNELS.join(', ')}`,
+          );
+        }
+      }
+    }
+    for (const key of VERIFICATION_NUMERIC_KEYS) {
+      const value: unknown = numeric[key];
+      if (value !== undefined && (typeof value !== 'number' || !Number.isInteger(value) || value < 1)) {
+        throw new Error(`verification.${key} must be a positive integer, got: ${String(value)}`);
+      }
+    }
+  }
+
+  // Validate channels.email if present. A zero cap would queue every inbound
+  // message forever; a fraction is not a slot count (#2254).
+  const emailChannel = config.channels?.email;
+  if (emailChannel !== undefined) {
+    if (typeof emailChannel !== 'object' || emailChannel === null || Array.isArray(emailChannel)) {
+      throw new Error('channels.email must be a YAML mapping');
+    }
+    const maxConcurrentTurns = emailChannel.max_concurrent_turns;
+    if (maxConcurrentTurns !== undefined && (!Number.isInteger(maxConcurrentTurns) || maxConcurrentTurns < 1)) {
+      throw new Error(
+        `channels.email.max_concurrent_turns must be a positive integer, got: ${String(maxConcurrentTurns)}`,
+      );
     }
   }
 
@@ -795,13 +1776,92 @@ export function loadYamlConfig(configDir: string): YamlConfig {
     if (!Number.isInteger(delegateTimeoutMs) || delegateTimeoutMs <= 0) {
       throw new Error(`delegate.defaultTimeoutMs must be a positive integer (milliseconds), got: ${delegateTimeoutMs}`);
     }
-    // Node.js setTimeout silently overflows values > 2^31-1, treating them as ~0 ms.
-    const NODE_MAX_TIMER_MS = 2_147_483_647;
-    if (delegateTimeoutMs > NODE_MAX_TIMER_MS) {
+    assertFitsNodeTimer('delegate.defaultTimeoutMs', delegateTimeoutMs);
+  }
+
+  // Validate delegate.lateDelivery if present (#1799). Same scalar-config guard as above: a
+  // mis-shaped block must fail loudly rather than silently dropping the override.
+  const lateDelivery = config.delegate?.lateDelivery;
+  if (lateDelivery !== undefined) {
+    if (typeof lateDelivery !== 'object' || Array.isArray(lateDelivery) || lateDelivery === null) {
+      throw new Error(`delegate.lateDelivery must be a YAML mapping, got: ${typeof lateDelivery}`);
+    }
+    if (lateDelivery.enabled !== undefined && typeof lateDelivery.enabled !== 'boolean') {
+      throw new Error(`delegate.lateDelivery.enabled must be a boolean, got: ${typeof lateDelivery.enabled}`);
+    }
+    for (const field of ['ttlMinutes', 'sweepIntervalMinutes', 'maxResultChars'] as const) {
+      const value = lateDelivery[field];
+      if (value === undefined) continue;
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new Error(`delegate.lateDelivery.${field} must be a positive integer, got: ${value}`);
+      }
+    }
+    // sweepIntervalMinutes reaches setInterval as minutes × 60000; an overflowed delay would
+    // hammer pending_delegations. ttlMinutes and maxResultChars need no ceiling: they feed
+    // date arithmetic and slice(), never a timer.
+    assertFitsNodeTimer(
+      'delegate.lateDelivery.sweepIntervalMinutes',
+      lateDelivery.sweepIntervalMinutes,
+      60_000,
+      'minutes',
+    );
+  }
+
+  // Validate autonomy.approval_expiry if present (#2013). Same scalar-config guard as
+  // lateDelivery above: a mis-shaped block must fail loudly, not silently fall back to hourly.
+  const approvalExpiry = config.autonomy?.approval_expiry;
+  if (approvalExpiry !== undefined) {
+    if (typeof approvalExpiry !== 'object' || Array.isArray(approvalExpiry) || approvalExpiry === null) {
+      throw new Error(`autonomy.approval_expiry must be a YAML mapping, got: ${typeof approvalExpiry}`);
+    }
+    const interval = approvalExpiry.sweep_interval_minutes;
+    if (interval !== undefined && (!Number.isInteger(interval) || interval <= 0)) {
       throw new Error(
-        `delegate.defaultTimeoutMs exceeds Node.js timer limit (${NODE_MAX_TIMER_MS} ms), got: ${delegateTimeoutMs}`,
+        `autonomy.approval_expiry.sweep_interval_minutes must be a positive integer, got: ${String(interval)}`,
       );
     }
+    // Reaches setInterval as minutes × 60000; an overflowed delay would fire in a tight loop.
+    assertFitsNodeTimer('autonomy.approval_expiry.sweep_interval_minutes', interval, 60_000, 'minutes');
+  }
+
+  // autonomy.gating (#2159): a typo must fail at boot, not silently keep the tier gates.
+  const gating = config.autonomy?.gating;
+  if (gating !== undefined && !AUTONOMY_GATINGS.includes(gating)) {
+    throw new Error(`autonomy.gating must be one of ${AUTONOMY_GATINGS.join(', ')}, got: ${String(gating)}`);
+  }
+  // autonomy.relay_budget (#1320): a bad value must fail at boot, not silently drop the cap.
+  const relayBudget = config.autonomy?.relay_budget;
+  if (relayBudget !== undefined) {
+    if (typeof relayBudget !== 'object' || Array.isArray(relayBudget) || relayBudget === null) {
+      throw new Error(`autonomy.relay_budget must be a YAML mapping, got: ${typeof relayBudget}`);
+    }
+    const perHour = relayBudget.per_hour;
+    if (perHour !== undefined && (!Number.isInteger(perHour) || perHour < 0)) {
+      throw new Error(`autonomy.relay_budget.per_hour must be a non-negative integer, got: ${String(perHour)}`);
+    }
+  }
+  // Band gating reviews every send with the escalation judge. With the judge off, every
+  // review is a failure: up to 5 unreviewed sends an hour at 80+, every send held below.
+  // That is never what an operator means, so refuse the combination at boot.
+  if (gating === 'band' && config.escalation?.judge?.enabled === false) {
+    throw new Error('autonomy.gating: band needs the escalation judge — set escalation.judge.enabled: true, or use autonomy.gating: tier');
+  }
+
+  // Validate autonomy.report_fallback if present (#2159). Same guard: a mis-shaped block
+  // must fail loudly rather than fall back to the defaults.
+  const reportFallback = config.autonomy?.report_fallback;
+  if (reportFallback !== undefined) {
+    if (typeof reportFallback !== 'object' || Array.isArray(reportFallback) || reportFallback === null) {
+      throw new Error(`autonomy.report_fallback must be a YAML mapping, got: ${typeof reportFallback}`);
+    }
+    for (const key of ['max_age_days', 'check_interval_hours'] as const) {
+      const value = reportFallback[key];
+      if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
+        throw new Error(`autonomy.report_fallback.${key} must be a positive integer, got: ${String(value)}`);
+      }
+    }
+    // Reaches setInterval as hours × 3,600,000; an overflowed delay would fire in a tight loop.
+    assertFitsNodeTimer('autonomy.report_fallback.check_interval_hours', reportFallback.check_interval_hours, 3_600_000, 'hours');
   }
 
   // Validate scheduler if present.
@@ -814,6 +1874,13 @@ export function loadYamlConfig(configDir: string): YamlConfig {
     // A zero or negative duration would make the watchdog immediately flag all jobs as stuck.
     throw new Error(
       `scheduler.defaultExpectedDurationSeconds must be a positive integer (seconds), got: ${schedulerDefaultDuration}`,
+    );
+  }
+  const schedulerMaxInFlight = config.scheduler?.maxInFlight;
+  if (schedulerMaxInFlight !== undefined && (!Number.isInteger(schedulerMaxInFlight) || schedulerMaxInFlight < 1)) {
+    // Zero would claim nothing on every poll; a fraction is not a slot count.
+    throw new Error(
+      `scheduler.maxInFlight must be a positive integer, got: ${String(schedulerMaxInFlight)}`,
     );
   }
 
@@ -830,6 +1897,12 @@ export function loadYamlConfig(configDir: string): YamlConfig {
     )) {
       throw new Error(`tasks.heartbeatIntervalMinutes must be a positive integer, got: ${String(t.heartbeatIntervalMinutes)}`);
     }
+    // BacklogHeartbeat.start() multiplies this by 60_000 and hands it to setInterval. A
+    // truncated delay here is the worst of the four: every tick enqueues task wakes, so an
+    // overflowed interval is a wake-enqueue loop, not just a wasted query. The other tasks.*
+    // durations (idleThresholdHours, staleWaitThresholdHours, resumableContinuationSeconds)
+    // feed date arithmetic and SQL intervals, so they take no ceiling.
+    assertFitsNodeTimer('tasks.heartbeatIntervalMinutes', t.heartbeatIntervalMinutes, 60_000, 'minutes');
     if (t.heartbeatMaxWakesPerTick !== undefined && (
       !Number.isInteger(t.heartbeatMaxWakesPerTick) || t.heartbeatMaxWakesPerTick < 1
     )) {
@@ -845,6 +1918,61 @@ export function loadYamlConfig(configDir: string): YamlConfig {
     )) {
       throw new Error(`tasks.staleWaitThresholdHours must be a non-negative finite number, got: ${String(t.staleWaitThresholdHours)}`);
     }
+    if (t.resumableContinuationSeconds !== undefined && (
+      !Number.isInteger(t.resumableContinuationSeconds) || t.resumableContinuationSeconds < 1
+    )) {
+      throw new Error(`tasks.resumableContinuationSeconds must be a positive integer, got: ${String(t.resumableContinuationSeconds)}`);
+    }
+    if (t.resumableCeilings !== undefined) {
+      const c = t.resumableCeilings;
+      if (typeof c !== 'object' || c === null || Array.isArray(c)) {
+        throw new Error(`tasks.resumableCeilings must be an object, got: ${String(c)}`);
+      }
+      if (c.maxStalls !== undefined && (!Number.isInteger(c.maxStalls) || c.maxStalls < 1)) {
+        throw new Error(`tasks.resumableCeilings.maxStalls must be a positive integer, got: ${String(c.maxStalls)}`);
+      }
+      if (c.maxIterations !== undefined && (!Number.isInteger(c.maxIterations) || c.maxIterations < 1)) {
+        throw new Error(`tasks.resumableCeilings.maxIterations must be a positive integer, got: ${String(c.maxIterations)}`);
+      }
+      if (c.maxWallclockHours !== undefined && (!Number.isFinite(c.maxWallclockHours) || c.maxWallclockHours <= 0)) {
+        throw new Error(`tasks.resumableCeilings.maxWallclockHours must be a positive number, got: ${String(c.maxWallclockHours)}`);
+      }
+      if (c.maxCostUsd !== undefined && (!Number.isFinite(c.maxCostUsd) || c.maxCostUsd <= 0)) {
+        throw new Error(`tasks.resumableCeilings.maxCostUsd must be a positive number, got: ${String(c.maxCostUsd)}`);
+      }
+      if (c.maxPlanDepth !== undefined && (!Number.isInteger(c.maxPlanDepth) || c.maxPlanDepth < 1)) {
+        throw new Error(`tasks.resumableCeilings.maxPlanDepth must be a positive integer, got: ${String(c.maxPlanDepth)}`);
+      }
+      if (c.maxReplansPerSubtree !== undefined && (!Number.isInteger(c.maxReplansPerSubtree) || c.maxReplansPerSubtree < 1)) {
+        throw new Error(`tasks.resumableCeilings.maxReplansPerSubtree must be a positive integer, got: ${String(c.maxReplansPerSubtree)}`);
+      }
+      if (c.blockedStepHours !== undefined && (!Number.isFinite(c.blockedStepHours) || c.blockedStepHours <= 0)) {
+        throw new Error(`tasks.resumableCeilings.blockedStepHours must be a positive number, got: ${String(c.blockedStepHours)}`);
+      }
+      if (c.throughputDivergenceRatio !== undefined && (
+        !Number.isFinite(c.throughputDivergenceRatio) || c.throughputDivergenceRatio <= 0 || c.throughputDivergenceRatio > 1
+      )) {
+        throw new Error(`tasks.resumableCeilings.throughputDivergenceRatio must be in (0, 1], got: ${String(c.throughputDivergenceRatio)}`);
+      }
+    }
+  }
+
+  // Validate + normalize sensitivity_rules if present. This governs KG bulk-export
+  // gating, so a malformed override must fail startup loudly rather than being
+  // silently ignored (#1369) — same fail-fast contract as every other block above.
+  if (config.sensitivity_rules !== undefined) {
+    config.sensitivity_rules = parseSensitivityRules(
+      config.sensitivity_rules,
+      'sensitivity_rules (config/default.yaml merged with config/local.yaml)',
+    );
+  }
+
+  // A malformed profile must fail startup: wrong thresholds merge distinct people and facts.
+  if (config.embedding?.profiles !== undefined) {
+    config.embedding.profiles = parseEmbeddingProfiles(
+      config.embedding.profiles,
+      'embedding.profiles (config/default.yaml merged with config/local.yaml)',
+    );
   }
 
   return config;
@@ -873,93 +2001,6 @@ export function resolveEnvValue(value: string, context: string): string {
   return value;
 }
 
-/**
- * Resolve the final list of email accounts to bootstrap, merging YAML multi-account
- * config with the legacy env-var single-account fallback.
- *
- * Resolution order:
- *   1. If channel_accounts.email is present in YAML → use it (multi-account mode)
- *   2. Otherwise → fall back to NYLAS_GRANT_ID + NYLAS_SELF_EMAIL env vars with
- *      a synthetic "curia" account (single-account backward-compat mode)
- *
- * Returns an empty array when neither source provides credentials — in that case
- * the email channel is simply disabled at startup, matching existing behaviour.
- *
- * The Nylas API key (NYLAS_API_KEY) is always read from env and shared across all
- * accounts; it lives in Config, not per-account config.
- */
-export function resolveChannelAccounts(yamlConfig: YamlConfig, config: Config): ResolvedEmailAccount[] {
-  const emailAccounts = yamlConfig.channel_accounts?.email;
-
-  // Multi-account mode: YAML block is present (even if empty).
-  // An explicit empty mapping ({ }) means "no configured email accounts" — do NOT
-  // fall through to the legacy env-var path, so operators can intentionally
-  // disable email in YAML without the legacy account silently reappearing.
-  if (emailAccounts !== undefined) {
-    return Object.entries(emailAccounts).map(([name, raw]) => {
-      const nylasGrantId = resolveEnvValue(
-        raw.nylas_grant_id,
-        `channel_accounts.email.${name}.nylas_grant_id`,
-      );
-      const selfEmail = resolveEnvValue(
-        raw.self_email,
-        `channel_accounts.email.${name}.self_email`,
-      );
-      const excludedSenderEmails = (raw.excluded_sender_emails ?? []).map((entry, i) =>
-        resolveEnvValue(entry, `channel_accounts.email.${name}.excluded_sender_emails[${i}]`),
-      );
-      return {
-        name,
-        nylasGrantId,
-        selfEmail,
-        excludedSenderEmails,
-      };
-    });
-  }
-
-  // Backward-compat mode: fall back to the legacy single-account env vars.
-  // This path is only taken when channel_accounts.email is absent entirely,
-  // ensuring existing single-account deployments require no config changes.
-  if (config.nylasGrantId && config.nylasSelfEmail) {
-    return [{
-      name: 'curia',
-      nylasGrantId: config.nylasGrantId,
-      selfEmail: config.nylasSelfEmail,
-      excludedSenderEmails: [],
-    }];
-  }
-
-  // No credentials available — email channel will be disabled
-  return [];
-}
-
-/**
- * The literal placeholder shipped in `.env.example`. If the operator runs
- * `pnpm run setup` and never edits the generated `.env`, this string ends up
- * as a real env value at boot. Treat it as unset — the in-app wizard handles
- * principal creation now, so no boot-time bootstrap is needed for fresh installs.
- *
- * Exported for use by `loadConfig`'s telemetry hook below.
- */
-export const CEO_PRIMARY_EMAIL_PLACEHOLDER = 'you@yourdomain.com';
-
-function normalizeCeoPrimaryEmail(raw: string | undefined): string | undefined {
-  const trimmed = raw?.trim().toLowerCase();
-  if (!trimmed) return undefined;
-  if (trimmed === CEO_PRIMARY_EMAIL_PLACEHOLDER) return undefined;
-  return trimmed;
-}
-
-/**
- * Returns true if the raw `CEO_PRIMARY_EMAIL` env var was set to the literal
- * `.env.example` placeholder. Callers use this to log a warning once the
- * logger has been initialized — `loadConfig` itself runs before the logger
- * exists and cannot warn directly.
- */
-export function ceoPrimaryEmailIsPlaceholder(): boolean {
-  return process.env.CEO_PRIMARY_EMAIL?.trim().toLowerCase() === CEO_PRIMARY_EMAIL_PLACEHOLDER;
-}
-
 export function loadConfig(): Config {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
@@ -975,6 +2016,20 @@ export function loadConfig(): Config {
   if (isNaN(nylasPollingIntervalMs) || nylasPollingIntervalMs < 1000) {
     throw new Error(`NYLAS_POLL_INTERVAL_MS must be a number >= 1000, got: ${process.env.NYLAS_POLL_INTERVAL_MS}`);
   }
+
+  // AWS_BEDROCK_TIMEOUT is expressed in seconds (matching how it reads in .env,
+  // e.g. "120"), converted to ms for the request abort timer.
+  const awsBedrockTimeoutSeconds = parseInt(process.env.AWS_BEDROCK_TIMEOUT ?? '120', 10);
+  if (isNaN(awsBedrockTimeoutSeconds) || awsBedrockTimeoutSeconds < 1) {
+    throw new Error(`AWS_BEDROCK_TIMEOUT must be a positive number of seconds, got: ${process.env.AWS_BEDROCK_TIMEOUT}`);
+  }
+  // The value reaches setTimeout() in BedrockProvider; past Node's 32-bit limit the timer
+  // fires after ~1 ms and every Bedrock call aborts immediately.
+  assertFitsNodeTimer('AWS_BEDROCK_TIMEOUT', awsBedrockTimeoutSeconds, 1000, 'seconds');
+
+  // Parsed once into a local (rather than twice inline below) so the
+  // > 0 validity check and the value used on the valid branch can't drift.
+  const parsedSignalVoiceMaxCallSeconds = Number.parseInt(process.env.SIGNAL_VOICE_MAX_CALL_SECONDS ?? '', 10);
 
   // Validate IANA timezone before any consumer sees it — bad config should fail at
   // startup, not silently produce wrong timestamps at runtime.
@@ -993,6 +2048,13 @@ export function loadConfig(): Config {
     anthropicApiKey: undefined,
     openaiApiKey: undefined,
     openrouterApiKey: undefined,
+    awsAccessKeyId: undefined,
+    awsSecretAccessKey: undefined,
+    awsRegion: process.env.AWS_REGION?.trim() || undefined,
+    awsBedrockTimeoutMs: awsBedrockTimeoutSeconds * 1000,
+    embeddingBaseUrl: process.env.EMBEDDING_BASE_URL || undefined,
+    embeddingModel: process.env.EMBEDDING_MODEL || undefined,
+    embeddingApiKey: undefined,
     logLevel: process.env.LOG_LEVEL ?? 'info',
     httpPort,
     apiToken: undefined,
@@ -1003,17 +2065,29 @@ export function loadConfig(): Config {
     nylasGrantId: undefined,
     nylasPollingIntervalMs,
     nylasSelfEmail: '',
-    // Reject the literal `.env.example` placeholder so a user who runs
-    // `pnpm run setup` and never edits the generated .env doesn't get a phantom
-    // CEO contact named "CEO" bound to `you@yourdomain.com` created at boot —
-    // which then trips the wizard's principal-exists auto-skip and prevents the
-    // "About you" step from being shown. Lowercase comparison matches the
-    // .toLowerCase() normalization on real values.
-    ceoPrimaryEmail: normalizeCeoPrimaryEmail(process.env.CEO_PRIMARY_EMAIL),
     ceoSignalNumber: process.env.CEO_SIGNAL_NUMBER?.trim() || undefined,
     // .trim() prevents a whitespace-only value (e.g. "  ") from activating the
     // Signal adapter with a bogus socket path or phone number.
     signalSocketPath: process.env.SIGNAL_SOCKET_PATH?.trim() || undefined,
     signalPhoneNumber: undefined,
+    signalVoiceCallsEnabled: process.env.SIGNAL_VOICE_CALLS_ENABLED?.trim().toLowerCase() === 'true',
+    signalPulseSocketPath: process.env.SIGNAL_PULSE_SOCKET_PATH?.trim() || undefined,
+    signalVoiceMaxCallSeconds: parsedSignalVoiceMaxCallSeconds > 0 ? parsedSignalVoiceMaxCallSeconds : 600,
+    slackBotToken: process.env.SLACK_BOT_TOKEN?.trim() || undefined,
+    slackAppToken: process.env.SLACK_APP_TOKEN?.trim() || undefined,
+    // SMS (Telnyx) is vault-only — resolved from channel.sms.* in
+    // applyChannelVaultSecrets, never from TELNYX_* env vars.
+    smsApiKey: undefined,
+    smsFromNumber: undefined,
+    smsWebhookPublicKey: undefined,
+    voiceLivekitUrl: undefined,
+    voiceLivekitApiKey: undefined,
+    voiceLivekitApiSecret: undefined,
+    // Overwritten from channels.voice.livekit_management_url after loadYamlConfig.
+    voiceLivekitManagementUrl: DEFAULT_VOICE_LIVEKIT_MANAGEMENT_URL,
+    voiceDeepgramApiKey: undefined,
+    voiceCartesiaApiKey: undefined,
+    voiceCartesiaVoiceId: undefined,
+    voiceModel: undefined,
   };
 }

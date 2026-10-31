@@ -7,11 +7,16 @@ import type {
   EdgeType,
   DecayClass,
   Sensitivity,
+  IdentitySource,
   SearchResult,
   TraversalResult,
 } from './types.js';
 import { createNodeId, createEdgeId, SENSITIVITY_LEVELS } from './types.js';
 import { EmbeddingService } from './embedding.js';
+import { embeddingStamp, type EmbeddingPurpose } from './embedding-profiles.js';
+
+/** Longest withAdvisoryLock() waits for another holder before failing (Postgres interval). */
+const ADVISORY_LOCK_TIMEOUT = '10s';
 
 // -- Public option interfaces --
 
@@ -30,6 +35,11 @@ export interface CreateNodeOptions {
    *  this via SensitivityClassifier before calling createNode, so this should always
    *  be set. Defaults to 'internal' if somehow omitted. */
   sensitivity?: Sensitivity;
+  /** Identity tier (ADR-040). Defaults to 'label'. Pass 'contact' only when minting a
+   *  node that backs a specific contact — those are exempt from label uniqueness, so
+   *  createNode cannot fall back on ON CONFLICT to deduplicate them.
+   *  upsertNode ignores this field: it is the label-keyed path, exclusively. */
+  identitySource?: IdentitySource;
 }
 
 export interface CreateEdgeOptions {
@@ -44,6 +54,16 @@ export interface CreateEdgeOptions {
 
 export interface TraversalOptions {
   maxDepth?: number; // defaults to 3 per spec
+}
+
+/** What a backend semantic search may return. Any filter besides `embeddingModel` must be
+ *  applied before the result is limited, never to an already-limited candidate list (#2248). */
+export interface SemanticSearchFilters {
+  embeddingModel: string;
+  type?: NodeType;
+  /** Leave fact nodes out, so the limit counts entities only (fuzzy entity resolution). */
+  entitiesOnly?: boolean;
+  maxSensitivity?: Sensitivity;
 }
 
 /** Returned by listDecayWarnings — one entry per warned node. */
@@ -84,21 +104,47 @@ interface KnowledgeGraphBackend {
   addAlias(nodeId: string, alias: string): Promise<boolean>;
   createEdge(edge: KgEdge): Promise<void>;
   getEdgesForNode(nodeId: string): Promise<KgEdge[]>;
+  /**
+   * Fact nodes connected to `nodeId` by a non-archived edge (either direction).
+   * One round trip on Postgres (JOIN); used by exact-key upsert and getFacts
+   * so large config anchors do not issue N getNode queries (#2252).
+   */
+  getConnectedFacts(nodeId: string): Promise<KgNode[]>;
+  /**
+   * Connected facts that can match an exact-key lookup: `properties.key` equals
+   * `key`, or (legacy) no `properties.key` and `label` equals `key`. Narrows in
+   * the database so unrelated facts and their embeddings are never loaded.
+   */
+  getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]>;
+  /**
+   * Run `fn` while holding a database-wide mutex named `lockKey`, so callers in
+   * other processes serialize on the same name. `fn` may use any connection.
+   */
+  withAdvisoryLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T>;
   deleteEdge(id: string): Promise<void>;
   updateEdge(id: string, updates: { confidence: number; lastConfirmedAt: Date }): Promise<KgEdge>;
   // Atomic upsert: creates if no matching (src, tgt, type) pair exists in either
   // direction; otherwise raises confidence and refreshes lastConfirmedAt.
   upsertEdge(edge: KgEdge): Promise<{ edge: KgEdge; created: boolean }>;
-  // Idempotent node creation: matches on lower(label) + type for non-fact nodes.
-  // fact nodes always insert as new regardless of label collision.
+  // Idempotent node creation: matches on lower(label) + type for non-fact,
+  // label-tier nodes. fact nodes always insert as new regardless of label collision,
+  // and contact-anchored nodes are never matched (ADR-040 invariant 1).
   upsertNode(node: KgNode): Promise<{ node: KgNode; created: boolean }>;
+  /** Promote a label-tier node to contact-anchored (ADR-040). Compare-and-set: returns
+   *  false if the node is missing, archived, or already anchored to some contact, which
+   *  is what makes concurrent adoption safe without a transaction. */
+  anchorNode(id: string): Promise<boolean>;
   traverse(startNodeId: string, maxDepth: number): Promise<TraversalResult>;
   semanticSearch(
     queryEmbedding: number[],
     limit: number,
-    filters?: { type?: NodeType; maxSensitivity?: Sensitivity },
+    // embeddingModel is required: a vector from another model must never be ranked
+    // against this query, even while a re-embed has left the table mixed.
+    filters: SemanticSearchFilters,
   ): Promise<SearchResult[]>;
-  /** List all warned (warned_at IS NOT NULL), non-archived nodes, sorted oldest-first. */
+  /** List all warned (warned_at IS NOT NULL), non-archived, LABEL-TIER nodes, oldest-first.
+   *  Contact-anchored nodes are excluded: they cannot decay, so a "confirm this or lose it"
+   *  prompt for one is a question the system will never act on (ADR-040). */
   listDecayWarnings(): Promise<DecayWarningRow[]>;
   /** Confirm a warned node: reset last_confirmed_at = NOW(), confidence = 1.0, warned_at = NULL.
    *  Returns success: false if the node is not in a warned state. */
@@ -154,7 +200,7 @@ export class KnowledgeGraphStore {
     const now = new Date();
     // Use pre-computed embedding if provided (avoids redundant API call when
     // the validator already embedded the label during dedup checks).
-    const embedding = options.embedding ?? await this.embeddingService.embed(options.label);
+    const embedding = options.embedding ?? await this.embeddingService.embed(options.label, 'document');
 
     const node: KgNode = {
       id: createNodeId(),
@@ -162,6 +208,7 @@ export class KnowledgeGraphStore {
       label: options.label,
       properties: { ...options.properties },
       embedding,
+      embeddingModel: embeddingStamp(this.embeddingService.profile),
       temporal: {
         createdAt: now,
         lastConfirmedAt: now,
@@ -171,10 +218,24 @@ export class KnowledgeGraphStore {
       },
       sensitivity: options.sensitivity ?? 'internal',
       aliases: [],
+      identitySource: options.identitySource ?? 'label',
     };
 
     await this.backend.createNode(node);
     return node;
+  }
+
+  /**
+   * Promote a label-tier node to contact-anchored (ADR-040 adoption).
+   *
+   * Compare-and-set on identity_source, so two contacts racing to adopt the same
+   * unanchored node cannot both win: the loser gets false and mints its own node
+   * rather than silently sharing an identity.
+   *
+   * Returns false when the node does not exist, is archived, or is already anchored.
+   */
+  async anchorNode(id: string): Promise<boolean> {
+    return this.backend.anchorNode(id);
   }
 
   /**
@@ -187,11 +248,16 @@ export class KnowledgeGraphStore {
    *
    * fact nodes always create a new node regardless of label collision.
    *
+   * ADR-040 invariant 1: this is the label-keyed path, exclusively. It only ever inserts
+   * identity_source = 'label' rows and its ON CONFLICT predicate matches the narrowed
+   * idx_kg_nodes_unique, so no caller can accidentally upsert its way onto a node that
+   * already belongs to a contact. Anchored nodes are minted through createNode().
+   *
    * Returns the persisted node and whether it was newly created.
    */
   async upsertNode(options: CreateNodeOptions & { confidence: number }): Promise<{ node: KgNode; created: boolean }> {
     const now = new Date();
-    const embedding = options.embedding ?? await this.embeddingService.embed(options.label);
+    const embedding = options.embedding ?? await this.embeddingService.embed(options.label, 'document');
 
     const node: KgNode = {
       id: createNodeId(),
@@ -199,6 +265,7 @@ export class KnowledgeGraphStore {
       label: options.label,
       properties: { ...options.properties },
       embedding,
+      embeddingModel: embeddingStamp(this.embeddingService.profile),
       temporal: {
         createdAt: now,
         lastConfirmedAt: now,
@@ -208,6 +275,8 @@ export class KnowledgeGraphStore {
       },
       sensitivity: options.sensitivity ?? 'internal',
       aliases: [],
+      // Not options.identitySource — see the invariant above. upsertNode is label-tier only.
+      identitySource: 'label',
     };
 
     return this.backend.upsertNode(node);
@@ -216,6 +285,32 @@ export class KnowledgeGraphStore {
   /** Retrieve a node by ID, or undefined if not found */
   async getNode(id: string): Promise<KgNode | undefined> {
     return this.backend.getNode(id);
+  }
+
+  /**
+   * Fact nodes linked to an entity (either edge direction). Single JOIN on
+   * Postgres — prefer this over getEdges + N× getNode for large anchors (#2252).
+   */
+  async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
+    return this.backend.getConnectedFacts(nodeId);
+  }
+
+  /**
+   * Connected facts whose `properties.key` equals `key`, plus legacy facts with
+   * no `properties.key` whose label equals it. Exact-key upserts use this so a
+   * large config anchor does not load every fact (and embedding) per write.
+   */
+  async getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]> {
+    return this.backend.getConnectedFactsByKey(nodeId, key);
+  }
+
+  /**
+   * Run `fn` under a database-wide mutex named `lockKey` (a transaction-scoped
+   * Postgres advisory lock), so a check-then-create in `fn` is safe against the
+   * same call in another process. Locks are never nested; hold one only briefly.
+   */
+  async withAdvisoryLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+    return this.backend.withAdvisoryLock(lockKey, fn);
   }
 
   /**
@@ -248,8 +343,9 @@ export class KnowledgeGraphStore {
       aliases: updates.aliases ?? existing.aliases,
       // Re-embed if the label changed, otherwise keep existing embedding
       embedding: labelChanged
-        ? await this.embeddingService.embed(updates.label!)
+        ? await this.embeddingService.embed(updates.label!, 'document')
         : existing.embedding,
+      embeddingModel: labelChanged ? embeddingStamp(this.embeddingService.profile) : existing.embeddingModel,
       temporal: {
         ...existing.temporal,
         lastConfirmedAt: new Date(),
@@ -369,20 +465,32 @@ export class KnowledgeGraphStore {
   /**
    * Semantic search: embed the query, then find the most similar nodes.
    * Returns results sorted by similarity (highest first).
+   *
+   * `purpose` is 'query' for a question against stored labels, and 'similarity' when the
+   * text is itself a label being matched against stored labels (fuzzy entity resolution).
+   * `entitiesOnly` leaves fact nodes out before the limit applies.
    */
   async semanticSearch(
     query: string,
-    options?: { limit?: number; type?: NodeType; maxSensitivity?: Sensitivity },
+    options?: {
+      limit?: number;
+      type?: NodeType;
+      entitiesOnly?: boolean;
+      maxSensitivity?: Sensitivity;
+      purpose?: Exclude<EmbeddingPurpose, 'document'>;
+    },
   ): Promise<SearchResult[]> {
     const limit = options?.limit ?? 10;
-    const queryEmbedding = await this.embeddingService.embed(query);
+    const queryEmbedding = await this.embeddingService.embed(query, options?.purpose ?? 'query');
     return this.backend.semanticSearch(queryEmbedding, limit, {
+      embeddingModel: embeddingStamp(this.embeddingService.profile),
       type: options?.type,
+      entitiesOnly: options?.entitiesOnly,
       maxSensitivity: options?.maxSensitivity,
     });
   }
 
-  /** List all warned (warned_at IS NOT NULL), non-archived nodes for the CEO re-confirmation flow. */
+  /** List all warned (warned_at IS NOT NULL), non-archived nodes for the principal re-confirmation flow. */
   async listDecayWarnings(): Promise<DecayWarningRow[]> {
     return this.backend.listDecayWarnings();
   }
@@ -411,8 +519,8 @@ class PostgresBackend implements KnowledgeGraphBackend {
     this.logger.debug({ nodeId: node.id, type: node.type, sensitivity: node.sensitivity }, 'kg: creating node');
     const embeddingStr = node.embedding ? `[${node.embedding.join(',')}]` : null;
     await this.pool.query(
-      `INSERT INTO kg_nodes (id, type, label, properties, embedding, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity, aliases)
-       VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $10, $11, $12)`,
+      `INSERT INTO kg_nodes (id, type, label, properties, embedding, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity, aliases, identity_source, embedding_model)
+       VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
       [
         node.id,
         node.type,
@@ -426,17 +534,46 @@ class PostgresBackend implements KnowledgeGraphBackend {
         node.temporal.lastConfirmedAt,
         node.sensitivity,
         node.aliases,
+        node.identitySource,
+        embeddingModelFor(node),
       ],
     );
+  }
+
+  async anchorNode(id: string): Promise<boolean> {
+    // Compare-and-set: the identity_source = 'label' predicate is the whole point —
+    // it makes losing an adoption race observable (rowCount 0) instead of letting two
+    // contacts quietly share one identity.
+    //
+    // Clearing warned_at is the same reasoning as migration 085 step 2b: a node adopted
+    // while a decay warning was pending is a node we have just promised to keep, so the
+    // "confirm this or lose it" prompt is void. Leaving it set would strand the node in a
+    // permanently warned state now that Pass 2a skips anchored rows.
+    const result = await this.pool.query(
+      `UPDATE kg_nodes
+          SET identity_source = 'contact',
+              warned_at = NULL,
+              warn_reason = NULL
+        WHERE id = $1
+          AND archived_at IS NULL
+          AND identity_source = 'label'`,
+      [id],
+    );
+    const anchored = (result.rowCount ?? 0) > 0;
+    this.logger.debug({ nodeId: id, anchored }, 'kg: anchorNode');
+    return anchored;
   }
 
   async upsertNode(node: KgNode): Promise<{ node: KgNode; created: boolean }> {
     this.logger.debug({ type: node.type, label: node.label }, 'kg: upserting node');
     const embeddingStr = node.embedding ? `[${node.embedding.join(',')}]` : null;
     const result = await this.pool.query<PgNodeRow & { is_new: boolean }>(
-      `INSERT INTO kg_nodes (id, type, label, properties, embedding, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity, aliases)
-       VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $9, $10, $11)
-       ON CONFLICT (lower(label), type) WHERE type != 'fact' AND archived_at IS NULL
+      // identity_source is hardcoded 'label' rather than parameterised: the ON CONFLICT
+      // predicate below must match the narrowed idx_kg_nodes_unique, and an anchored row
+      // would not be in that index at all, so the upsert would silently always insert.
+      `INSERT INTO kg_nodes (id, type, label, properties, embedding, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity, aliases, identity_source, embedding_model)
+       VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $9, $10, $11, 'label', $12)
+       ON CONFLICT (lower(label), type) WHERE type != 'fact' AND archived_at IS NULL AND identity_source = 'label'
        DO UPDATE SET
          confidence = GREATEST(kg_nodes.confidence, EXCLUDED.confidence),
          last_confirmed_at = EXCLUDED.last_confirmed_at
@@ -453,6 +590,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
         node.temporal.createdAt,
         node.sensitivity,
         node.aliases,
+        embeddingModelFor(node),
       ],
     );
     const row = result.rows[0];
@@ -483,7 +621,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
     // via KnowledgeGraphStore.updateNode() are durably persisted to the DB.
     await this.pool.query(
       `UPDATE kg_nodes
-       SET label = $1, properties = $2, embedding = $3::vector, last_confirmed_at = $4, confidence = $5, sensitivity = $6, aliases = $7
+       SET label = $1, properties = $2, embedding = $3::vector, last_confirmed_at = $4, confidence = $5, sensitivity = $6, aliases = $7, embedding_model = $9
        WHERE id = $8`,
       [
         node.label,
@@ -494,6 +632,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
         node.sensitivity,
         node.aliases,
         id,
+        embeddingModelFor(node),
       ],
     );
   }
@@ -584,6 +723,86 @@ class PostgresBackend implements KnowledgeGraphBackend {
       [nodeId],
     );
     return result.rows.map(pgRowToEdge);
+  }
+
+  async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
+    // Dedup via IN (UNION …) so a fact with two edge types is returned once —
+    // matches InMemoryBackend. Each arm uses idx_kg_edges_source / _target.
+    const result = await this.pool.query<PgNodeRow>(
+      `SELECT n.*
+       FROM kg_nodes n
+       WHERE n.type = 'fact'
+         AND n.archived_at IS NULL
+         AND n.id IN (
+           SELECT target_node_id FROM kg_edges
+            WHERE source_node_id = $1 AND archived_at IS NULL
+           UNION
+           SELECT source_node_id FROM kg_edges
+            WHERE target_node_id = $1 AND archived_at IS NULL
+         )`,
+      [nodeId],
+    );
+    return result.rows.map(pgRowToNode);
+  }
+
+  async getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]> {
+    // Same connected-fact set as getConnectedFacts, narrowed to rows that can
+    // match the key. Callers still apply their own exact checks (string type,
+    // namespace) — this only keeps unrelated rows out of the result.
+    const result = await this.pool.query<PgNodeRow>(
+      `SELECT n.*
+       FROM kg_nodes n
+       WHERE n.type = 'fact'
+         AND n.archived_at IS NULL
+         AND (
+           n.properties->>'key' = $2
+           OR (NOT (n.properties ? 'key') AND n.label = $2)
+         )
+         AND n.id IN (
+           SELECT target_node_id FROM kg_edges
+            WHERE source_node_id = $1 AND archived_at IS NULL
+           UNION
+           SELECT source_node_id FROM kg_edges
+            WHERE target_node_id = $1 AND archived_at IS NULL
+         )`,
+      [nodeId, key],
+    );
+    return result.rows.map(pgRowToNode);
+  }
+
+  async withAdvisoryLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+    // The lock lives on its own connection inside a transaction that does no work:
+    // COMMIT (or ROLLBACK, or the connection dropping) releases it. `fn` runs its
+    // queries on other pool connections in autocommit, so its writes are durable
+    // before the lock is released and the next holder sees them.
+    const client = await this.pool.connect();
+    // Set when ROLLBACK fails: the connection may still be in the transaction and
+    // holding the lock, so it must be destroyed, not returned to the pool.
+    let discard: Error | undefined;
+    try {
+      await client.query('BEGIN');
+      // A stuck holder surfaces as a lock_timeout error rather than a silent hang.
+      // set_config(..., true) is SET LOCAL with a bind parameter.
+      await client.query(`SELECT set_config('lock_timeout', $1, true)`, [ADVISORY_LOCK_TIMEOUT]);
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [lockKey]);
+      const result = await fn();
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        discard = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+        this.logger.error(
+          { err: rollbackErr, lockKey },
+          'kg: advisory lock rollback failed — discarding the connection so it cannot keep the lock',
+        );
+      }
+      throw err;
+    } finally {
+      // A truthy argument makes pg destroy the client instead of pooling it.
+      client.release(discard);
+    }
   }
 
   async deleteEdge(id: string): Promise<void> {
@@ -694,15 +913,19 @@ class PostgresBackend implements KnowledgeGraphBackend {
   async semanticSearch(
     queryEmbedding: number[],
     limit: number,
-    filters?: { type?: NodeType; maxSensitivity?: Sensitivity },
+    filters: SemanticSearchFilters,
   ): Promise<SearchResult[]> {
     const embeddingStr = `[${queryEmbedding.join(',')}]`;
-    const params: unknown[] = [embeddingStr, limit];
+    const params: unknown[] = [embeddingStr, limit, filters.embeddingModel];
     const extraClauses: string[] = [];
 
     if (filters?.type) {
       params.push(filters.type);
       extraClauses.push(`AND type = $${params.length}`);
+    }
+
+    if (filters?.entitiesOnly) {
+      extraClauses.push(`AND type <> 'fact'`);
     }
 
     if (filters?.maxSensitivity !== undefined) {
@@ -721,16 +944,45 @@ class PostgresBackend implements KnowledgeGraphBackend {
       extraClauses.push(`AND sensitivity = ANY($${params.length}::text[])`);
     }
 
-    const result = await this.pool.query<PgNodeRow & { similarity: number }>(
-      `SELECT *, 1 - (embedding <=> $1::vector) AS similarity
-       FROM kg_nodes
-       WHERE embedding IS NOT NULL
-         AND archived_at IS NULL
-         ${extraClauses.join('\n         ')}
-       ORDER BY embedding <=> $1::vector
-       LIMIT $2`,
-      params,
-    );
+    // Unfiltered: order by the distance operator, so the planner can use the HNSW index
+    // (idx_kg_nodes_embedding). This is the plain memory-query path and must stay fast.
+    //
+    // Filtered: an exact scan. The HNSW index covers every node and hands back only its
+    // hnsw.ef_search (40) nearest before the WHERE clause runs, so when 40 nodes that fail the
+    // filter sit closer (facts that name their entity, mostly), the matching nodes never
+    // arrive (#2248). Ordering by the computed similarity rather than `embedding <=> $1`
+    // keeps the index out, as NodeMergeService.candidates does; the filter then runs before
+    // any distance is computed. hnsw.iterative_scan and a partial index over non-fact nodes
+    // were measured and rejected: both still approximate, they returned 78-82% of the true
+    // top-k on clustered vectors (#2248).
+    // TODO(#2248): the scan costs about 15 ms (entities only) and 27 ms (sensitivity ceiling
+    // alone, which passes most rows) at 7.5k nodes, but 170 / 330 ms at 50k. Revisit
+    // (halfvec storage, or iterative_scan for the permissive sensitivity-only case) before
+    // graphs grow that large.
+    const result = extraClauses.length === 0
+      ? await this.pool.query<PgNodeRow & { similarity: number }>(
+        `SELECT *, 1 - (embedding <=> $1::vector) AS similarity
+         FROM kg_nodes
+         WHERE embedding IS NOT NULL
+           AND embedding_model = $3
+           AND archived_at IS NULL
+         ORDER BY embedding <=> $1::vector
+         LIMIT $2`,
+        params,
+      )
+      : await this.pool.query<PgNodeRow & { similarity: number }>(
+        `SELECT * FROM (
+           SELECT *, 1 - (embedding <=> $1::vector) AS similarity
+           FROM kg_nodes
+           WHERE embedding IS NOT NULL
+             AND embedding_model = $3
+             AND archived_at IS NULL
+             ${extraClauses.join('\n             ')}
+         ) scored
+         ORDER BY similarity DESC, id
+         LIMIT $2`,
+        params,
+      );
 
     return result.rows.map((row) => ({
       node: pgRowToNode(row),
@@ -759,6 +1011,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
                                AND e.archived_at IS NULL
         WHERE n.warned_at IS NOT NULL
           AND n.archived_at IS NULL
+          AND n.identity_source = 'label'
         GROUP BY n.id, n.type, n.label, n.confidence, n.sensitivity,
                  n.warn_reason, n.warned_at
         ORDER BY n.warned_at ASC`,
@@ -795,6 +1048,11 @@ class PostgresBackend implements KnowledgeGraphBackend {
   }
 
   async dismissDecayWarning(nodeId: string): Promise<DecayWarningActionResult> {
+    // identity_source = 'label' matters here as much as it does in DreamEngine: this is an
+    // archival path OUTSIDE the decay passes. A contact-anchored node reaching it — via a
+    // warning raised before it was anchored — would be archived out from under a live
+    // contact, which is precisely what ADR-040 says nothing but contact deletion may do.
+    // Returns success: false rather than throwing, matching the not-warned case.
     const result = await this.pool.query<{ label: string }>(
       `UPDATE kg_nodes
           SET archived_at = now(),
@@ -803,6 +1061,7 @@ class PostgresBackend implements KnowledgeGraphBackend {
         WHERE id = $1
           AND warned_at IS NOT NULL
           AND archived_at IS NULL
+          AND identity_source = 'label'
         RETURNING label`,
       [nodeId],
     );
@@ -833,6 +1092,8 @@ interface PgNodeRow {
   sensitivity: string;
   archived_at: Date | null;
   aliases: string[];
+  identity_source: string;
+  embedding_model: string | null;
 }
 
 interface PgEdgeRow {
@@ -856,6 +1117,7 @@ function pgRowToNode(row: PgNodeRow): KgNode {
     label: row.label,
     properties: row.properties,
     embedding: row.embedding ? parseVector(row.embedding) : undefined,
+    embeddingModel: row.embedding_model ?? undefined,
     temporal: {
       createdAt: row.created_at,
       lastConfirmedAt: row.last_confirmed_at,
@@ -865,6 +1127,10 @@ function pgRowToNode(row: PgNodeRow): KgNode {
     },
     sensitivity: (row.sensitivity as Sensitivity) ?? 'internal',
     aliases: row.aliases ?? [],
+    // Default rather than cast-and-trust: a row read through a projection that omits the
+    // column must not be mistaken for an anchored node, or callers would skip decay and
+    // refuse adoption for a node that is in fact label-keyed. 'label' is the safe read.
+    identitySource: row.identity_source === 'contact' ? 'contact' : 'label',
   };
 }
 
@@ -883,6 +1149,11 @@ function pgRowToEdge(row: PgEdgeRow): KgEdge {
       source: row.source,
     },
   };
+}
+
+/** The stamp to store beside a node's vector: none without a vector (migration 103's CHECK). */
+function embeddingModelFor(node: KgNode): string | null {
+  return node.embedding ? (node.embeddingModel ?? null) : null;
 }
 
 /** Parse a pgvector string like "[0.1,0.2,0.3]" into a number array */
@@ -932,8 +1203,16 @@ class InMemoryBackend implements KnowledgeGraphBackend {
     const lowerLabel = node.label.toLowerCase();
     let existing: KgNode | undefined;
     for (const n of this.nodes.values()) {
-      // Archived nodes are treated as non-existent — don't merge with them
-      if (n.type !== 'fact' && n.label.toLowerCase() === lowerLabel && n.type === node.type && !this.archivedNodes.has(n.id)) {
+      // Mirrors the partial index idx_kg_nodes_unique: archived nodes are treated as
+      // non-existent, and contact-anchored nodes are outside the label-keyed tier
+      // entirely, so upsert must never merge onto one (ADR-040 invariant 1).
+      if (
+        n.type !== 'fact'
+        && n.label.toLowerCase() === lowerLabel
+        && n.type === node.type
+        && n.identitySource === 'label'
+        && !this.archivedNodes.has(n.id)
+      ) {
         existing = n;
         break;
       }
@@ -973,6 +1252,13 @@ class InMemoryBackend implements KnowledgeGraphBackend {
         this.edges.delete(edgeId);
       }
     }
+  }
+
+  async anchorNode(id: string): Promise<boolean> {
+    const node = this.nodes.get(id);
+    if (!node || this.archivedNodes.has(id) || node.identitySource !== 'label') return false;
+    this.nodes.set(id, { ...node, identitySource: 'contact' });
+    return true;
   }
 
   async archiveNode(id: string): Promise<void> {
@@ -1079,6 +1365,38 @@ class InMemoryBackend implements KnowledgeGraphBackend {
     return results;
   }
 
+  async getConnectedFacts(nodeId: string): Promise<KgNode[]> {
+    const facts: KgNode[] = [];
+    const seen = new Set<string>();
+    for (const edge of this.edges.values()) {
+      if (this.archivedEdges.has(edge.id)) continue;
+      if (edge.sourceNodeId !== nodeId && edge.targetNodeId !== nodeId) continue;
+      const otherId = edge.sourceNodeId === nodeId ? edge.targetNodeId : edge.sourceNodeId;
+      if (seen.has(otherId) || this.archivedNodes.has(otherId)) continue;
+      seen.add(otherId);
+      const node = this.nodes.get(otherId);
+      if (node?.type === 'fact') facts.push(node);
+    }
+    return facts;
+  }
+
+  async getConnectedFactsByKey(nodeId: string, key: string): Promise<KgNode[]> {
+    // Mirrors the Postgres filter: `->>'key'` yields text for any JSON scalar,
+    // so compare String(value) for keyed rows; legacy rows have no key at all
+    // (undefined counts as absent — JSON storage drops it).
+    const facts = await this.getConnectedFacts(nodeId);
+    return facts.filter((f) => {
+      const props = f.properties as Record<string, unknown>;
+      if (props.key === undefined) return f.label === key;
+      return props.key !== null && String(props.key) === key;
+    });
+  }
+
+  async withAdvisoryLock<T>(_lockKey: string, fn: () => Promise<T>): Promise<T> {
+    // One process owns an in-memory graph, so there is no other holder to exclude.
+    return fn();
+  }
+
   async deleteEdge(id: string): Promise<void> {
     this.edges.delete(id);
   }
@@ -1169,7 +1487,7 @@ class InMemoryBackend implements KnowledgeGraphBackend {
   async semanticSearch(
     queryEmbedding: number[],
     limit: number,
-    filters?: { type?: NodeType; maxSensitivity?: Sensitivity },
+    filters: SemanticSearchFilters,
   ): Promise<SearchResult[]> {
     const scored: SearchResult[] = [];
     // Pre-compute sensitivity ceiling rank once outside the loop.
@@ -1185,10 +1503,12 @@ class InMemoryBackend implements KnowledgeGraphBackend {
 
     for (const node of this.nodes.values()) {
       if (!node.embedding) continue;
+      if (node.embeddingModel !== filters.embeddingModel) continue;
       // Archived nodes must not appear in semantic search results
       if (this.archivedNodes.has(node.id)) continue;
       // Apply type filter
       if (filters?.type && node.type !== filters.type) continue;
+      if (filters?.entitiesOnly && node.type === 'fact') continue;
       // Apply sensitivity ceiling filter.
       // Nodes with unrecognized sensitivity values are treated as fail-closed:
       // indexOf returns -1, which is never <= any valid ceiling rank, so they
@@ -1217,6 +1537,9 @@ class InMemoryBackend implements KnowledgeGraphBackend {
       if (this.archivedNodes.has(nodeId)) continue;
       const node = this.nodes.get(nodeId);
       if (!node) continue;
+      // Mirrors the Postgres predicate: anchored nodes never decay, so they are never
+      // offered for re-confirmation (ADR-040).
+      if (node.identitySource !== 'label') continue;
       const edgeCount = Array.from(this.edges.values()).filter(
         e => !this.archivedEdges.has(e.id) && (e.sourceNodeId === nodeId || e.targetNodeId === nodeId),
       ).length;
@@ -1254,6 +1577,9 @@ class InMemoryBackend implements KnowledgeGraphBackend {
     }
     const node = this.nodes.get(nodeId);
     if (!node) return { success: false };
+    // Mirrors the Postgres predicate: dismissing archives, and nothing but contact
+    // deletion may archive an anchored node (ADR-040).
+    if (node.identitySource !== 'label') return { success: false };
     this.warnedNodes.delete(nodeId);
     // archiveNode handles both node and incident edge archival, keeping
     // behaviour consistent with the Postgres backend and archiveNode().

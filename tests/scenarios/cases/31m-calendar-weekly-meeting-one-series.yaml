@@ -1,0 +1,52 @@
+# calendar (#2385). calendar-create-event takes `recurrence`, and its description says a
+# standing meeting is one event with a rule, never a copy per week. Before #2385 the tool
+# silently dropped the rule; on 2026-10-31 the specialist then made nine single events
+# for a weekly sync and asked the principal to click "repeat weekly" themselves.
+name: calendar weekly meeting is one recurring event
+description: >
+  The coordinator hands calendar the principal's request for a standing weekly 15-minute
+  sync on Mondays at 9:00 AM, starting next Monday, titled Weekly Kick-Off with location
+  "Call Curia". calendar should create one event carrying a weekly RRULE on Mondays,
+  starting on next Monday at 9:00, and should not create one event per week.
+tags: [specialist-calendar, recurrence]
+agent: calendar
+stub_sets: [calendar-specialist, calendar-office]
+inbound:
+  from: delegate
+  content: >
+    The principal asked: "Set up a recurring weekly event on my calendar called Weekly
+    Kick-Off, Mondays 9:00-9:15 AM, location 'Call Curia', starting {{day:next-monday}}."
+    Resolved date: {{day:next-monday}} is {{date:next-monday}}.
+expected_behaviors:
+  - id: creates_one_series
+    weight: critical
+    description: Creates the event once, with a weekly Monday recurrence rule.
+    check:
+      called: calendar-create-event
+      contains: { recurrence: "FREQ=WEEKLY", title: "Weekly Kick-Off" }
+      min: 1
+      max: 1
+  - id: rule_is_on_mondays
+    weight: critical
+    description: The recurrence rule repeats on Mondays.
+    check:
+      called: calendar-create-event
+      contains: { recurrence: "BYDAY=MO" }
+  - id: no_per_week_copies
+    weight: critical
+    description: Makes exactly one calendar-create-event call in all, not one per week.
+    check:
+      called: calendar-create-event
+      max: 1
+  - id: starts_next_monday
+    weight: important
+    description: The series starts on next Monday at 9:00 AM local time, ending 9:15 AM.
+  - id: no_manual_repeat_ask
+    weight: important
+    description: >
+      Does not ask the principal to set "repeat weekly" by hand, and does not describe the
+      result as separate events or say recurrence is unsupported.
+failure_modes:
+  - Creates one event per week for the next several weeks
+  - Creates a single non-recurring event and asks the principal to set it to repeat
+  - Says the calendar tool cannot create recurring events

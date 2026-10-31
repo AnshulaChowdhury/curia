@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
-import { SchedulerCreateHandler } from '../../../skills/scheduler-create/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { SchedulerCreateHandler } from '../../../skills/scheduler/tools/scheduler-create/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import type { TaskOriginator } from '../../../src/contacts/types.js';
 
 import pino from 'pino';
@@ -9,9 +9,11 @@ const logger = pino({ level: 'silent' });
 
 function makeCtx(
   input: Record<string, unknown>,
-  overrides?: Partial<SkillContext>,
-): SkillContext {
+  overrides?: Partial<ToolContext>,
+): ToolContext {
   return {
+    toolName: 'scheduler-create',
+    toolVersion: '1.1.1',
     input,
     secret: () => { throw new Error('no secrets'); },
     log: logger,
@@ -31,7 +33,7 @@ describe('SchedulerCreateHandler', () => {
   });
 
   it('returns failure when task is missing', async () => {
-    const schedulerService = { createJob: vi.fn(), listJobs: vi.fn(), cancelJob: vi.fn() };
+    const schedulerService = { createJob: vi.fn(), listJobs: vi.fn().mockResolvedValue([]), cancelJob: vi.fn() };
     const result = await handler.execute(makeCtx(
       { cron_expr: '0 9 * * *' },
       { schedulerService: schedulerService as never },
@@ -43,7 +45,7 @@ describe('SchedulerCreateHandler', () => {
   });
 
   it('returns failure when neither cron_expr nor run_at is provided', async () => {
-    const schedulerService = { createJob: vi.fn(), listJobs: vi.fn(), cancelJob: vi.fn() };
+    const schedulerService = { createJob: vi.fn(), listJobs: vi.fn().mockResolvedValue([]), cancelJob: vi.fn() };
     const result = await handler.execute(makeCtx(
       { task: 'do something' },
       { schedulerService: schedulerService as never },
@@ -58,7 +60,7 @@ describe('SchedulerCreateHandler', () => {
     const createResult = { jobId: 'job-1' };
     const schedulerService = {
       createJob: vi.fn().mockResolvedValue(createResult),
-      listJobs: vi.fn(),
+      listJobs: vi.fn().mockResolvedValue([]),
       cancelJob: vi.fn(),
     };
 
@@ -88,7 +90,7 @@ describe('SchedulerCreateHandler', () => {
     const createResult = { jobId: 'job-2' };
     const schedulerService = {
       createJob: vi.fn().mockResolvedValue(createResult),
-      listJobs: vi.fn(),
+      listJobs: vi.fn().mockResolvedValue([]),
       cancelJob: vi.fn(),
     };
 
@@ -115,7 +117,7 @@ describe('SchedulerCreateHandler', () => {
     const createResult = { jobId: 'job-3', agentTaskId: 'at-1' };
     const schedulerService = {
       createJob: vi.fn().mockResolvedValue(createResult),
-      listJobs: vi.fn(),
+      listJobs: vi.fn().mockResolvedValue([]),
       cancelJob: vi.fn(),
     };
 
@@ -124,7 +126,7 @@ describe('SchedulerCreateHandler', () => {
         task: 'weekly report',
         cron_expr: '0 9 * * 1',
         intent_anchor: 'weekly-report-v1',
-        error_budget: { maxRetries: 3 },
+        error_budget: { resumable: true },
       },
       { schedulerService: schedulerService as never },
     ));
@@ -142,15 +144,65 @@ describe('SchedulerCreateHandler', () => {
       taskPayload: { task: 'weekly report' },
       createdBy: 'coordinator',
       intentAnchor: 'weekly-report-v1',
-      errorBudget: { maxRetries: 3 },
+      errorBudget: { resumable: true },
       originator: undefined,
     });
+  });
+
+  it('rejects per-invocation error_budget keys (#883)', async () => {
+    const schedulerService = {
+      createJob: vi.fn(),
+      listJobs: vi.fn().mockResolvedValue([]),
+      cancelJob: vi.fn(),
+    };
+
+    const result = await handler.execute(makeCtx(
+      {
+        task: 'weekly report',
+        cron_expr: '0 9 * * 1',
+        intent_anchor: 'weekly-report-v1',
+        error_budget: { maxTurns: 30 },
+      },
+      { schedulerService: schedulerService as never },
+    ));
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toMatch(/not supported on tasks/);
+    }
+    expect(schedulerService.createJob).not.toHaveBeenCalled();
+  });
+
+  it('rejects null and array error_budget values (#883)', async () => {
+    const schedulerService = {
+      createJob: vi.fn(),
+      listJobs: vi.fn().mockResolvedValue([]),
+      cancelJob: vi.fn(),
+    };
+
+    for (const error_budget of [null, []]) {
+      const result = await handler.execute(makeCtx(
+        {
+          task: 'weekly report',
+          cron_expr: '0 9 * * 1',
+          intent_anchor: 'weekly-report-v1',
+          error_budget: error_budget as never,
+        },
+        { schedulerService: schedulerService as never },
+      ));
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toMatch(/must be an object/);
+      }
+    }
+    expect(schedulerService.createJob).not.toHaveBeenCalled();
   });
 
   it('returns failure when createJob throws', async () => {
     const schedulerService = {
       createJob: vi.fn().mockRejectedValue(new Error('DB connection lost')),
-      listJobs: vi.fn(),
+      listJobs: vi.fn().mockResolvedValue([]),
       cancelJob: vi.fn(),
     };
 
@@ -175,7 +227,7 @@ describe('SchedulerCreateHandler', () => {
     const createResult = { jobId: 'job-4' };
     const schedulerService = {
       createJob: vi.fn().mockResolvedValue(createResult),
-      listJobs: vi.fn(),
+      listJobs: vi.fn().mockResolvedValue([]),
       cancelJob: vi.fn(),
     };
 
@@ -197,7 +249,7 @@ describe('SchedulerCreateHandler', () => {
     const createResult = { jobId: 'job-5' };
     const schedulerService = {
       createJob: vi.fn().mockResolvedValue(createResult),
-      listJobs: vi.fn(),
+      listJobs: vi.fn().mockResolvedValue([]),
       cancelJob: vi.fn(),
     };
 
@@ -211,5 +263,147 @@ describe('SchedulerCreateHandler', () => {
 
     const call = schedulerService.createJob.mock.calls[0]?.[0] as { originator?: unknown };
     expect(call?.originator).toBeUndefined();
+  });
+
+  // #1960: a change request routed to scheduler-create instead of scheduler-update
+  // would make the routine fire twice.
+  describe('duplicate check', () => {
+    function job(overrides: Record<string, unknown>) {
+      return {
+        id: 'existing-1',
+        agentId: 'coordinator',
+        cronExpr: '0 9 * * 1',
+        runAt: null,
+        taskPayload: { task: 'Send the weekly pipeline review' },
+        status: 'pending',
+        timezone: 'America/Toronto',
+        ...overrides,
+      };
+    }
+
+    /** listJobs returns `jobs` for the given status and nothing for the others. */
+    function serviceWith(jobs: Array<Record<string, unknown>>) {
+      return {
+        defaultTimezone: 'America/Toronto',
+        createJob: vi.fn().mockResolvedValue({ jobId: 'new-1' }),
+        listJobs: vi.fn(async (filters: { status?: string }) =>
+          jobs.filter((j) => j.status === filters.status)),
+        cancelJob: vi.fn(),
+      };
+    }
+
+    it('queries each active status for the target agent', async () => {
+      const schedulerService = serviceWith([]);
+      await handler.execute(makeCtx(
+        { task: 'x', cron_expr: '0 9 * * *', agent_id: 'research-analyst' },
+        { schedulerService: schedulerService as never },
+      ));
+      const statuses = schedulerService.listJobs.mock.calls.map((c) => c[0]);
+      expect(statuses).toEqual([
+        { status: 'pending', agentId: 'research-analyst' },
+        { status: 'running', agentId: 'research-analyst' },
+        { status: 'suspended', agentId: 'research-analyst' },
+        { status: 'paused', agentId: 'research-analyst' },
+      ]);
+    });
+
+    it('refuses an exact copy of an active job, ignoring case and spacing', async () => {
+      const schedulerService = serviceWith([job({ status: 'paused' })]);
+      const result = await handler.execute(makeCtx(
+        { task: '  send the weekly   pipeline review ', cron_expr: '0  9 * * 1' },
+        { schedulerService: schedulerService as never },
+      ));
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toContain('existing-1');
+        expect(result.error).toContain('scheduler-update');
+      }
+      expect(schedulerService.createJob).not.toHaveBeenCalled();
+    });
+
+    it('refuses a one-shot copy at the same run_at', async () => {
+      const schedulerService = serviceWith([
+        job({ cronExpr: null, runAt: '2026-11-02T14:00:00.000Z' }),
+      ]);
+      const result = await handler.execute(makeCtx(
+        { task: 'Send the weekly pipeline review', run_at: '2026-11-02T14:00:00Z' },
+        { schedulerService: schedulerService as never },
+      ));
+      expect(result.success).toBe(false);
+      expect(schedulerService.createJob).not.toHaveBeenCalled();
+    });
+
+    it('creates a same-task job on another schedule and lists the existing one', async () => {
+      const schedulerService = serviceWith([job({})]);
+      const result = await handler.execute(makeCtx(
+        { task: 'Send the weekly pipeline review', cron_expr: '0 16 * * 5' },
+        { schedulerService: schedulerService as never },
+      ));
+      expect(result.success).toBe(true);
+      expect(schedulerService.createJob).toHaveBeenCalledOnce();
+      if (result.success) {
+        const data = result.data as Record<string, unknown>;
+        expect(data.jobId).toBe('new-1');
+        expect(data.similar_active_jobs).toEqual([
+          {
+            jobId: 'existing-1',
+            status: 'pending',
+            cronExpr: '0 9 * * 1',
+            runAt: null,
+            timezone: 'America/Toronto',
+          },
+        ]);
+        expect(data.warning).toContain('scheduler-update');
+      }
+    });
+
+    // The same cron in another zone fires at a different instant (review on #2019).
+    it('treats the same cron in another timezone as a different schedule', async () => {
+      const schedulerService = serviceWith([job({ timezone: 'Europe/London' })]);
+      const result = await handler.execute(makeCtx(
+        { task: 'Send the weekly pipeline review', cron_expr: '0 9 * * 1' },
+        { schedulerService: schedulerService as never },
+      ));
+      expect(result.success).toBe(true);
+      expect(schedulerService.createJob).toHaveBeenCalledOnce();
+      if (result.success) {
+        const data = result.data as { similar_active_jobs?: Array<{ timezone: string }> };
+        expect(data.similar_active_jobs?.[0]?.timezone).toBe('Europe/London');
+      }
+    });
+
+    it('matches an explicit timezone input against the job timezone', async () => {
+      const schedulerService = serviceWith([job({ timezone: 'Europe/London' })]);
+      const result = await handler.execute(makeCtx(
+        { task: 'Send the weekly pipeline review', cron_expr: '0 9 * * 1', timezone: ' Europe/London ' },
+        { schedulerService: schedulerService as never },
+      ));
+      expect(result.success).toBe(false);
+      expect(schedulerService.createJob).not.toHaveBeenCalled();
+    });
+
+    it('ignores active jobs with a different task', async () => {
+      const schedulerService = serviceWith([job({ taskPayload: { task: 'Something else' } })]);
+      const result = await handler.execute(makeCtx(
+        { task: 'Send the weekly pipeline review', cron_expr: '0 9 * * 1' },
+        { schedulerService: schedulerService as never },
+      ));
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data).toEqual({ jobId: 'new-1' });
+    });
+
+    it('still creates the job when the lookup fails', async () => {
+      const schedulerService = {
+        createJob: vi.fn().mockResolvedValue({ jobId: 'new-1' }),
+        listJobs: vi.fn().mockRejectedValue(new Error('db down')),
+        cancelJob: vi.fn(),
+      };
+      const result = await handler.execute(makeCtx(
+        { task: 'x', cron_expr: '0 9 * * *' },
+        { schedulerService: schedulerService as never },
+      ));
+      expect(result.success).toBe(true);
+      expect(schedulerService.createJob).toHaveBeenCalledOnce();
+    });
   });
 });

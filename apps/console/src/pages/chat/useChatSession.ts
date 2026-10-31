@@ -130,7 +130,7 @@ export function useChatSession(): ChatSession {
       setLoadingHistory(true);
       try {
         const res = await apiFetch(
-          `/api/kg/chat/history?conversationId=${encodeURIComponent(convId)}&limit=${HISTORY_PAGE_SIZE}`,
+          `/api/chat/history?conversationId=${encodeURIComponent(convId)}&limit=${HISTORY_PAGE_SIZE}`,
         );
         if (!res.ok) {
           console.error('[useChatSession] initial history fetch returned non-ok status:', res.status);
@@ -156,12 +156,12 @@ export function useChatSession(): ChatSession {
 
     void load();
   // Run once on mount; conversationId.current is a ref, not a reactive dep.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Auto-send the onboarding kickoff message once on first mount.
-  // send is captured from this render; deps omitted intentionally (one-shot).
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // Auto-send the onboarding kickoff message once on first mount. The one-shot guarantee comes
+  // from the pendingKickoff ref below, not from the empty dep array. `send` reads only refs and
+  // uses functional setState, so it holds no render-varying value and exhaustive-deps does not
+  // flag its omission — no disable directive needed here.
   useEffect(() => {
     if (!pendingKickoff.current) return;
     void send(KICKOFF_TEXT);
@@ -178,7 +178,7 @@ export function useChatSession(): ChatSession {
         ? `&before=${encodeURIComponent(oldestTimestamp.current)}`
         : '';
       const res = await apiFetch(
-        `/api/kg/chat/history?conversationId=${encodeURIComponent(convId)}&limit=${HISTORY_PAGE_SIZE}${cursor}`,
+        `/api/chat/history?conversationId=${encodeURIComponent(convId)}&limit=${HISTORY_PAGE_SIZE}${cursor}`,
       );
       if (!res.ok) {
         // Treat non-ok as terminal to prevent the IntersectionObserver from
@@ -270,7 +270,7 @@ export function useChatSession(): ChatSession {
       let fetchOk = false;
       try {
         const res = await apiFetch(
-          `/api/kg/chat/history?conversationId=${encodeURIComponent(convId)}&limit=${HISTORY_PAGE_SIZE}`,
+          `/api/chat/history?conversationId=${encodeURIComponent(convId)}&limit=${HISTORY_PAGE_SIZE}`,
         );
         // A terminal SSE event may have settled the turn during the await — bail
         // before mutating state so we don't append a duplicate or stale notice.
@@ -319,7 +319,7 @@ export function useChatSession(): ChatSession {
       // reply broadcast can't race past an unregistered stream. withCredentials
       // sends the session cookie, matching apiFetch behavior.
       source = new EventSource(
-        `/api/kg/chat/stream?conversationId=${encodeURIComponent(convId)}`,
+        `/api/chat/stream?conversationId=${encodeURIComponent(convId)}`,
         { withCredentials: true },
       );
       sourceRef.current = source;
@@ -369,7 +369,7 @@ export function useChatSession(): ChatSession {
         source.onopen = () => { clearTimeout(to); resolve(); };
       });
 
-      const res = await apiFetch('/api/kg/chat/messages', {
+      const res = await apiFetch('/api/chat/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text, conversationId: convId }),

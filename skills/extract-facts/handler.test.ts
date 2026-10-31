@@ -11,7 +11,8 @@ import { EntityMemory } from '../../src/memory/entity-memory.js';
 import { MemoryValidator } from '../../src/memory/validation.js';
 import { createSilentLogger } from '../../src/logger.js';
 import { ExtractFactsHandler } from './handler.js';
-import type { SkillContext } from '../../src/skills/types.js';
+import { ContactValidationError } from '../../src/contacts/contact-service.js';
+import type { ToolContext } from '../../src/skills/types.js';
 import type { InfraLlm, InfraLlmResult } from '../../src/skills/infra-llm.js';
 
 // -- Test helpers --
@@ -45,14 +46,16 @@ function makeCtx(
   entityMemory: EntityMemory,
   input: Record<string, unknown>,
   infraLlm: InfraLlm,
-): SkillContext {
+  contactService?: unknown,
+): ToolContext {
   return {
     input,
     secret: () => 'test-api-key',
     log: pino({ level: 'silent' }),
     entityMemory,
     infraLlm,
-  } as unknown as SkillContext;
+    contactService,
+  } as unknown as ToolContext;
 }
 
 // -- Tests --
@@ -69,7 +72,7 @@ describe('ExtractFactsHandler', () => {
 
     const result = await handler.execute(ctx);
 
-    expect(result).toEqual({ success: true, data: { stored: 0, redirected: 0, skipped: true, failed: 0 } });
+    expect(result).toEqual({ success: true, data: { stored: 0, redirected: 0, skipped: true, failed: 0, ambiguous: 0 } });
     // Classifier was called; extraction was not
     expect(infraLlm.classify).toHaveBeenCalledTimes(1);
     expect(infraLlm.extract).not.toHaveBeenCalled();
@@ -89,7 +92,7 @@ describe('ExtractFactsHandler', () => {
 
     const result = await handler.execute(ctx);
 
-    expect(result).toEqual({ success: true, data: { stored: 1, redirected: 0, skipped: false, failed: 0 } });
+    expect(result).toEqual({ success: true, data: { stored: 1, redirected: 0, skipped: false, failed: 0, ambiguous: 0 } });
 
     // Fact node exists in the KG
     const josephNodes = await entityMemory.findEntities('Jane Doe');
@@ -173,14 +176,14 @@ describe('ExtractFactsHandler', () => {
     const handler1 = new ExtractFactsHandler();
     const ctx1 = makeCtx(entityMemory, { text: 'Bob lives in Toronto.', source: 'test' }, infraLlm1);
     const result1 = await handler1.execute(ctx1);
-    expect(result1).toEqual({ success: true, data: { stored: 1, redirected: 0, skipped: false, failed: 0 } });
+    expect(result1).toEqual({ success: true, data: { stored: 1, redirected: 0, skipped: false, failed: 0, ambiguous: 0 } });
 
     // Second invocation with semantically identical fact — storeFact deduplicates internally
     const infraLlm2 = makeMockInfraLlm(['yes', facts]);
     const handler2 = new ExtractFactsHandler();
     const ctx2 = makeCtx(entityMemory, { text: 'Bob lives in Toronto.', source: 'test' }, infraLlm2);
     const result2 = await handler2.execute(ctx2);
-    expect(result2).toEqual({ success: true, data: { stored: 1, redirected: 0, skipped: false, failed: 0 } });
+    expect(result2).toEqual({ success: true, data: { stored: 1, redirected: 0, skipped: false, failed: 0, ambiguous: 0 } });
 
     // Only one fact node should exist — storeFact merged the second call into the first
     const josephNodes = await entityMemory.findEntities('Jane Doe');
@@ -234,7 +237,7 @@ describe('ExtractFactsHandler', () => {
     const result = await handler.execute(ctx);
 
     // conflict is a semantic outcome — not counted as failed
-    expect(result).toEqual({ success: true, data: { stored: 0, redirected: 0, skipped: false, failed: 0 } });
+    expect(result).toEqual({ success: true, data: { stored: 0, redirected: 0, skipped: false, failed: 0, ambiguous: 0 } });
     expect(storeFact).toHaveBeenCalledOnce();
   });
 
@@ -256,11 +259,11 @@ describe('ExtractFactsHandler', () => {
       entityMemory,
       infraLlm,
       memoryWriteSource,
-    } as unknown as SkillContext;
+    } as unknown as ToolContext;
 
     const result = await handler.execute(ctx);
 
-    expect(result).toEqual({ success: true, data: { stored: 1, redirected: 0, skipped: false, failed: 0 } });
+    expect(result).toEqual({ success: true, data: { stored: 1, redirected: 0, skipped: false, failed: 0, ambiguous: 0 } });
     // storeFact should use memoryWriteSource (task-scoped), not the LLM-provided 'agent:ceo-inbox'
     expect(storeFact.mock.calls[0]![0].source).toBe(memoryWriteSource);
   });
@@ -278,13 +281,13 @@ describe('ExtractFactsHandler', () => {
 
     const storeFact = vi.spyOn(entityMemory, 'storeFact')
       .mockResolvedValueOnce({ stored: true, action: 'created' })
-      .mockResolvedValueOnce({ stored: false, action: 'rate_limited', conflict: '50-write limit reached' });
+      .mockResolvedValueOnce({ stored: false, action: 'rate_limited', reason: '50-write limit reached' });
 
     const ctx = makeCtx(entityMemory, { text: 'Jane Doe is the Canadian CEO based in Toronto.', source: 'test' }, infraLlm);
     const result = await handler.execute(ctx);
 
     // first fact stored, rate-limit counted as failed, loop stopped before fact 3
-    expect(result).toEqual({ success: true, data: { stored: 1, redirected: 0, skipped: false, failed: 1 } });
+    expect(result).toEqual({ success: true, data: { stored: 1, redirected: 0, skipped: false, failed: 1, ambiguous: 0 } });
     expect(storeFact).toHaveBeenCalledTimes(2);
   });
 
@@ -320,7 +323,7 @@ describe('ExtractFactsHandler', () => {
 
     const result = await handler.execute(ctx);
 
-    expect(result).toEqual({ success: true, data: { stored: 0, redirected: 0, skipped: false, failed: 1 } });
+    expect(result).toEqual({ success: true, data: { stored: 0, redirected: 0, skipped: false, failed: 1, ambiguous: 0 } });
 
     const malformedCall = warnSpy.mock.calls.find(
       (args) => typeof args[args.length - 1] === 'string' && (args[args.length - 1] as string).includes('skipping malformed fact'),
@@ -347,7 +350,7 @@ describe('ExtractFactsHandler', () => {
     const ctx = makeCtx(entityMemory, { text: 'Jane Doe lives in Toronto.', source: 'test' }, infraLlm);
     const result = await handler.execute(ctx);
 
-    expect(result).toEqual({ success: true, data: { stored: 0, redirected: 0, skipped: false, failed: 1 } });
+    expect(result).toEqual({ success: true, data: { stored: 0, redirected: 0, skipped: false, failed: 1, ambiguous: 0 } });
     expect(storeFact).toHaveBeenCalledTimes(1);
   });
 
@@ -360,7 +363,7 @@ describe('ExtractFactsHandler', () => {
       log: pino({ level: 'silent' }),
       entityMemory,
       // infraLlm intentionally omitted
-    } as unknown as SkillContext;
+    } as unknown as ToolContext;
 
     const result = await handler.execute(ctx);
 
@@ -393,5 +396,512 @@ describe('ExtractFactsHandler', () => {
     const result = await handler.execute(ctx);
 
     expect(result).toEqual({ success: false, error: 'Extraction LLM call failed: Context window exceeded' });
+  });
+
+  // -- Ambiguous subject resolution (#1694 / ADR-040) --
+  //
+  // This path used to take candidates[0] "to avoid stalling a batch job". Once two
+  // contacts named "Seth Berman" each hold their own person node, that is a coin flip
+  // that writes the fact onto whichever node sorted first. A dropped fact can be
+  // re-extracted later; one silently attached to the wrong person cannot be found
+  // again to correct. The only admissible tiebreaker is subject_contact_id, and only
+  // when one candidate IS that contact's node — the hint identifies the conversation's
+  // counterpart, not the subject of every sentence in it.
+  describe('ambiguous subject', () => {
+    // Needs the store as well as the memory wrapper, to seed colliding nodes directly
+    // (upsertNode would merge them).
+    function makeMemoryWithStore() {
+      const embeddingService = EmbeddingService.createForTesting();
+      const store = KnowledgeGraphStore.createInMemory(embeddingService);
+      const validator = new MemoryValidator(store, embeddingService);
+      return {
+        mem: new EntityMemory(store, validator, embeddingService, createSilentLogger()),
+        store,
+      };
+    }
+
+    const SETH_FACT = JSON.stringify([
+      { subject: 'Seth Berman', subjectType: 'person', attribute: 'home_city', value: 'Toronto', confidence: 0.9, decayClass: 'slow_decay' },
+    ]);
+
+    function makeContactService(contactsById: Record<string, { id: string; kgNodeId: string | null }>) {
+      return {
+        getContact: vi.fn(async (id: string) => contactsById[id]),
+        findContactByKgNodeId: vi.fn(async () => undefined),
+        updateContactFields: vi.fn(),
+      };
+    }
+
+    async function seedTwoSeths(store: KnowledgeGraphStore) {
+      const a = await store.createNode({ type: 'person', label: 'Seth Berman', properties: {}, source: 'test' });
+      const b = await store.createNode({ type: 'person', label: 'Seth Berman', properties: {}, source: 'test' });
+      return { a, b };
+    }
+
+    it('skips and counts the fact when ambiguous and no contact hint is given', async () => {
+      const { mem, store } = makeMemoryWithStore();
+      await seedTwoSeths(store);
+
+      const result = await new ExtractFactsHandler().execute(
+        makeCtx(mem, { text: 'Seth lives in Toronto.', source: 'test' }, makeMockInfraLlm(['yes', SETH_FACT])),
+      );
+
+      expect(result).toEqual({
+        success: true,
+        data: { stored: 0, redirected: 0, skipped: false, failed: 0, ambiguous: 1 },
+      });
+    });
+
+    it('resolves to the hinted contact node when it is one of the candidates', async () => {
+      const { mem, store } = makeMemoryWithStore();
+      const { a, b } = await seedTwoSeths(store);
+      const contactService = makeContactService({ 'contact-b': { id: 'contact-b', kgNodeId: b.id } });
+
+      const result = await new ExtractFactsHandler().execute(
+        makeCtx(
+          mem,
+          { text: 'Seth lives in Toronto.', source: 'test', subject_contact_id: 'contact-b' },
+          makeMockInfraLlm(['yes', SETH_FACT]),
+          contactService,
+        ),
+      );
+
+      expect(result).toEqual({
+        success: true,
+        data: { stored: 1, redirected: 0, skipped: false, failed: 0, ambiguous: 0 },
+      });
+      // The fact hangs off contact B's node specifically, and does not leak onto the namesake.
+      expect(await mem.getFacts(b.id)).toHaveLength(1);
+      expect(await mem.getFacts(a.id)).toHaveLength(0);
+    });
+
+    it('skips rather than guessing when the hinted contact is not among the candidates', async () => {
+      const { mem, store } = makeMemoryWithStore();
+      await seedTwoSeths(store);
+      const other = await store.createNode({ type: 'person', label: 'Dana Wu', properties: {}, source: 'test' });
+      const contactService = makeContactService({ 'contact-c': { id: 'contact-c', kgNodeId: other.id } });
+
+      const result = await new ExtractFactsHandler().execute(
+        makeCtx(
+          mem,
+          { text: 'Seth lives in Toronto.', source: 'test', subject_contact_id: 'contact-c' },
+          makeMockInfraLlm(['yes', SETH_FACT]),
+          contactService,
+        ),
+      );
+
+      expect(result).toEqual({
+        success: true,
+        data: { stored: 0, redirected: 0, skipped: false, failed: 0, ambiguous: 1 },
+      });
+    });
+
+    it('skips when the hinted contact holds no KG node', async () => {
+      // Exactly the #1694 population: a hint exists but cannot identify a node.
+      const { mem, store } = makeMemoryWithStore();
+      await seedTwoSeths(store);
+      const contactService = makeContactService({ 'contact-d': { id: 'contact-d', kgNodeId: null } });
+
+      const result = await new ExtractFactsHandler().execute(
+        makeCtx(
+          mem,
+          { text: 'Seth lives in Toronto.', source: 'test', subject_contact_id: 'contact-d' },
+          makeMockInfraLlm(['yes', SETH_FACT]),
+          contactService,
+        ),
+      );
+
+      expect(result).toEqual({
+        success: true,
+        data: { stored: 0, redirected: 0, skipped: false, failed: 0, ambiguous: 1 },
+      });
+    });
+
+    it('degrades to no-tiebreaker when the contact lookup throws', async () => {
+      // A contacts-table hiccup must not fail the whole extraction batch.
+      const { mem, store } = makeMemoryWithStore();
+      await seedTwoSeths(store);
+      const contactService = {
+        getContact: vi.fn().mockRejectedValue(new Error('pool timeout')),
+        findContactByKgNodeId: vi.fn(async () => undefined),
+        updateContactFields: vi.fn(),
+      };
+
+      const result = await new ExtractFactsHandler().execute(
+        makeCtx(
+          mem,
+          { text: 'Seth lives in Toronto.', source: 'test', subject_contact_id: 'contact-b' },
+          makeMockInfraLlm(['yes', SETH_FACT]),
+          contactService,
+        ),
+      );
+
+      expect(result).toEqual({
+        success: true,
+        data: { stored: 0, redirected: 0, skipped: false, failed: 0, ambiguous: 1 },
+      });
+    });
+
+    it('never logs the raw subject name on the ambiguous path (PII guard)', async () => {
+      // `subject` is an LLM-extracted entity name from a transcript — usually a person's
+      // name — and the pino redact list covers senderId/email/phoneNumber, not this.
+      // The handler already states the rule for malformed facts ("never the raw values");
+      // the ambiguity path has to hold to it too.
+      const { mem, store } = makeMemoryWithStore();
+      await seedTwoSeths(store);
+
+      const warn = vi.fn();
+      const ctx = makeCtx(mem, { text: 'Seth lives in Toronto.', source: 'test' }, makeMockInfraLlm(['yes', SETH_FACT]));
+      (ctx as unknown as { log: Record<string, unknown> }).log = {
+        warn, info: vi.fn(), debug: vi.fn(), error: vi.fn(), child: vi.fn(),
+      };
+
+      await new ExtractFactsHandler().execute(ctx);
+
+      const ambiguityWarn = warn.mock.calls.find(c => /ambiguous subject entity/.test(String(c[1])));
+      expect(ambiguityWarn).toBeDefined();
+      expect(JSON.stringify(ambiguityWarn![0])).not.toContain('Seth Berman');
+      // The node ids are the non-PII substitute, and identify the same entities.
+      expect(ambiguityWarn![0]).toHaveProperty('candidateIds');
+    });
+
+    it('leaves the unambiguous path untouched', async () => {
+      const { mem, store } = makeMemoryWithStore();
+      const only = await store.createNode({ type: 'person', label: 'Seth Berman', properties: {}, source: 'test' });
+
+      const result = await new ExtractFactsHandler().execute(
+        makeCtx(mem, { text: 'Seth lives in Toronto.', source: 'test' }, makeMockInfraLlm(['yes', SETH_FACT])),
+      );
+
+      expect(result).toEqual({
+        success: true,
+        data: { stored: 1, redirected: 0, skipped: false, failed: 0, ambiguous: 0 },
+      });
+      expect(await mem.getFacts(only.id)).toHaveLength(1);
+    });
+  });
+
+  // -- PII guard: remaining fact-loop logs (#1706) --
+  //
+  // The malformed-fact and ambiguity paths already omit the raw subject name.
+  // These ten pre-existing call sites still logged it. `subject` is an LLM-extracted
+  // entity name (usually a person's name) and the pino redact list does not cover it.
+  // Substitute: entityNodeId where a node is resolved; omit it when resolution has
+  // not completed. `attribute` is logged only when it is snake_case — the LLM can
+  // put a name in that field, and pino does not redact it.
+  describe('fact-loop logs never carry the raw subject name (PII guard)', () => {
+    const PII_SUBJECT = 'Priya Ramanathan';
+    const UNNORMALIZABLE_PHONE = '020 7946 0958';
+
+    function spyLog() {
+      const log = {
+        warn: vi.fn(),
+        info: vi.fn(),
+        debug: vi.fn(),
+        error: vi.fn(),
+        child: vi.fn(),
+      };
+      log.child.mockReturnValue(log);
+      return log;
+    }
+
+    function attachSpyLog(ctx: ToolContext) {
+      const log = spyLog();
+      (ctx as unknown as { log: typeof log }).log = log;
+      return log;
+    }
+
+    function findCall(fn: ReturnType<typeof vi.fn>, messageRe: RegExp) {
+      return fn.mock.calls.find(c => messageRe.test(String(c[c.length - 1])));
+    }
+
+    // JSON.stringify skips Error.message (non-enumerable). Pino does serialize it,
+    // so fold err.message/stack in or the guard is inert on the three `err` sites.
+    function serializeLogPayload(payload: unknown): string {
+      const obj = payload as Record<string, unknown> | null;
+      const err = obj?.err;
+      const errText = err instanceof Error
+        ? `${err.name} ${err.message} ${err.stack ?? ''}`
+        : '';
+      return `${JSON.stringify(payload)}\n${errText}`;
+    }
+
+    function expectNoPii(call: unknown[] | undefined, extraForbidden: string[] = []) {
+      expect(call).toBeDefined();
+      const serialized = serializeLogPayload(call![0]);
+      expect(serialized).not.toContain(PII_SUBJECT);
+      for (const s of extraForbidden) {
+        expect(serialized).not.toContain(s);
+      }
+      expect(call![0]).not.toHaveProperty('subject');
+    }
+
+    function factJson(attribute: string, value: string) {
+      return JSON.stringify([
+        { subject: PII_SUBJECT, subjectType: 'person', attribute, value, confidence: 0.9, decayClass: 'slow_decay' },
+      ]);
+    }
+
+    function makeContactService(overrides: {
+      findContactByKgNodeId?: ReturnType<typeof vi.fn>;
+      updateContactFields?: ReturnType<typeof vi.fn>;
+    } = {}) {
+      return {
+        getContact: vi.fn(async () => undefined),
+        findContactByKgNodeId: overrides.findContactByKgNodeId ?? vi.fn(async () => ({ id: 'contact-1' })),
+        updateContactFields: overrides.updateContactFields ?? vi.fn(async () => ({ id: 'contact-1' })),
+      };
+    }
+
+    it('canonical-normalization-failed warn', async () => {
+      const entityMemory = makeEntityMemory();
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} phone is ${UNNORMALIZABLE_PHONE}.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson('phone', UNNORMALIZABLE_PHONE)]),
+        makeContactService(),
+      );
+      const log = attachSpyLog(ctx);
+
+      await new ExtractFactsHandler().execute(ctx);
+
+      const call = findCall(log.warn, /canonical attribute normalization failed/);
+      expectNoPii(call, [UNNORMALIZABLE_PHONE, '7946 0958']);
+      const nodes = await entityMemory.findEntities(PII_SUBJECT);
+      expect(call![0]).toHaveProperty('entityNodeId', nodes[0]!.id);
+      expect(call![0]).toHaveProperty('attribute', 'phone');
+      expect(call![0]).toHaveProperty('reason', 'phone_normalization_failed');
+    });
+
+    it('findContactByKgNodeId-failed warn', async () => {
+      const entityMemory = makeEntityMemory();
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} timezone is America/Toronto.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson('timezone', 'America/Toronto')]),
+        makeContactService({
+          findContactByKgNodeId: vi.fn().mockRejectedValue(new Error('connection timeout')),
+        }),
+      );
+      const log = attachSpyLog(ctx);
+
+      await new ExtractFactsHandler().execute(ctx);
+
+      const call = findCall(log.warn, /findContactByKgNodeId failed/);
+      expectNoPii(call);
+      const nodes = await entityMemory.findEntities(PII_SUBJECT);
+      expect(call![0]).toHaveProperty('entityNodeId', nodes[0]!.id);
+      expect(call![0]).toHaveProperty('attribute', 'timezone');
+    });
+
+    it('canonical-redirected info', async () => {
+      const entityMemory = makeEntityMemory();
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} timezone is America/Toronto.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson('timezone', 'America/Toronto')]),
+        makeContactService(),
+      );
+      const log = attachSpyLog(ctx);
+
+      const result = await new ExtractFactsHandler().execute(ctx);
+
+      expect(result).toEqual({
+        success: true,
+        data: { stored: 0, redirected: 1, skipped: false, failed: 0, ambiguous: 0 },
+      });
+      const call = findCall(log.info, /canonical attribute redirected/);
+      expectNoPii(call);
+      const nodes = await entityMemory.findEntities(PII_SUBJECT);
+      expect(call![0]).toHaveProperty('entityNodeId', nodes[0]!.id);
+      expect(call![0]).toHaveProperty('attribute', 'timezone');
+      expect(call![0]).toHaveProperty('contactId', 'contact-1');
+    });
+
+    it('canonical-validation-failed warn', async () => {
+      const entityMemory = makeEntityMemory();
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} email is priya@example.com.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson('primary_email', 'priya@example.com')]),
+        makeContactService({
+          updateContactFields: vi.fn().mockRejectedValue(
+            new ContactValidationError('primaryEmail not found in contact_channel_identities'),
+          ),
+        }),
+      );
+      const log = attachSpyLog(ctx);
+
+      await new ExtractFactsHandler().execute(ctx);
+
+      const call = findCall(log.warn, /canonical attribute validation failed/);
+      expectNoPii(call);
+      const nodes = await entityMemory.findEntities(PII_SUBJECT);
+      expect(call![0]).toHaveProperty('entityNodeId', nodes[0]!.id);
+      expect(call![0]).toHaveProperty('attribute', 'primary_email');
+      expect(call![0]).toHaveProperty('contactId', 'contact-1');
+    });
+
+    it('canonical-redirect unexpected-error', async () => {
+      const entityMemory = makeEntityMemory();
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} timezone is America/Toronto.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson('timezone', 'America/Toronto')]),
+        makeContactService({
+          updateContactFields: vi.fn().mockRejectedValue(new Error('pool timeout')),
+        }),
+      );
+      const log = attachSpyLog(ctx);
+
+      const result = await new ExtractFactsHandler().execute(ctx);
+
+      expect(result).toEqual({
+        success: true,
+        data: { stored: 0, redirected: 0, skipped: false, failed: 1, ambiguous: 0 },
+      });
+      const call = findCall(log.error, /canonical attribute redirect failed with unexpected error/);
+      expectNoPii(call);
+      const nodes = await entityMemory.findEntities(PII_SUBJECT);
+      expect(call![0]).toHaveProperty('entityNodeId', nodes[0]!.id);
+      expect(call![0]).toHaveProperty('attribute', 'timezone');
+    });
+
+    it('auto-resolved info', async () => {
+      const entityMemory = makeEntityMemory();
+      vi.spyOn(entityMemory, 'storeFact').mockResolvedValueOnce({
+        stored: true,
+        action: 'auto_resolved',
+        nodeId: 'fact-1',
+      });
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} is vegetarian.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson('dietary_preference', 'vegetarian')]),
+      );
+      const log = attachSpyLog(ctx);
+
+      await new ExtractFactsHandler().execute(ctx);
+
+      const call = findCall(log.info, /fact auto-resolved/);
+      expectNoPii(call);
+      const nodes = await entityMemory.findEntities(PII_SUBJECT);
+      expect(call![0]).toHaveProperty('entityNodeId', nodes[0]!.id);
+      expect(call![0]).toHaveProperty('attribute', 'dietary_preference');
+    });
+
+    it('rate-limited error', async () => {
+      const entityMemory = makeEntityMemory();
+      vi.spyOn(entityMemory, 'storeFact').mockResolvedValueOnce({
+        stored: false,
+        action: 'rate_limited',
+        reason: '50-write limit reached',
+      });
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} is vegetarian.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson('dietary_preference', 'vegetarian')]),
+      );
+      const log = attachSpyLog(ctx);
+
+      await new ExtractFactsHandler().execute(ctx);
+
+      const call = findCall(log.error, /write rate limit exceeded/);
+      expectNoPii(call);
+      const nodes = await entityMemory.findEntities(PII_SUBJECT);
+      expect(call![0]).toHaveProperty('entityNodeId', nodes[0]!.id);
+      expect(call![0]).toHaveProperty('attribute', 'dietary_preference');
+      // Sourced from StoreFactResult.reason since #472 — asserting it keeps this test
+      // from passing vacuously if the handler ever reads the wrong carrier again.
+      expect(call![0]).toHaveProperty('reason', '50-write limit reached');
+    });
+
+    it('fact-not-stored warn', async () => {
+      const entityMemory = makeEntityMemory();
+      vi.spyOn(entityMemory, 'storeFact').mockResolvedValueOnce({
+        stored: false,
+        action: 'conflict',
+        conflict: 'contradicts existing value: London',
+      });
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} is vegetarian.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson('dietary_preference', 'vegetarian')]),
+      );
+      const log = attachSpyLog(ctx);
+
+      await new ExtractFactsHandler().execute(ctx);
+
+      const call = findCall(log.warn, /fact not stored/);
+      expectNoPii(call);
+      const nodes = await entityMemory.findEntities(PII_SUBJECT);
+      expect(call![0]).toHaveProperty('entityNodeId', nodes[0]!.id);
+      expect(call![0]).toHaveProperty('attribute', 'dietary_preference');
+    });
+
+    it('does not log a non-snake_case attribute (PII guard)', async () => {
+      // The extraction prompt asks for snake_case keys, but the model can ignore
+      // that and put a person's name in `attribute`. pino does not redact it.
+      const entityMemory = makeEntityMemory();
+      vi.spyOn(entityMemory, 'storeFact').mockResolvedValueOnce({
+        stored: false,
+        action: 'conflict',
+        conflict: 'contradicts existing value: London',
+      });
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} is vegetarian.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson(PII_SUBJECT, 'vegetarian')]),
+      );
+      const log = attachSpyLog(ctx);
+
+      await new ExtractFactsHandler().execute(ctx);
+
+      const call = findCall(log.warn, /fact not stored/);
+      expectNoPii(call);
+      expect(call![0]).not.toHaveProperty('attribute');
+    });
+
+    it('programming-error in fact loop', async () => {
+      const entityMemory = makeEntityMemory();
+      vi.spyOn(entityMemory, 'storeFact').mockRejectedValueOnce(
+        new TypeError("Cannot read properties of undefined (reading 'id')"),
+      );
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} is vegetarian.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson('dietary_preference', 'vegetarian')]),
+      );
+      const log = attachSpyLog(ctx);
+
+      await new ExtractFactsHandler().execute(ctx);
+
+      const call = findCall(log.error, /unexpected programming error in fact loop/);
+      expectNoPii(call);
+      const nodes = await entityMemory.findEntities(PII_SUBJECT);
+      expect(call![0]).toHaveProperty('entityNodeId', nodes[0]!.id);
+      expect(call![0]).not.toHaveProperty('hasSubject');
+      expect(call![0]).toHaveProperty('attribute', 'dietary_preference');
+    });
+
+    it('failed-to-persist error', async () => {
+      const entityMemory = makeEntityMemory();
+      vi.spyOn(entityMemory, 'storeFact').mockRejectedValueOnce(new Error('DB connection lost'));
+      const ctx = makeCtx(
+        entityMemory,
+        { text: `${PII_SUBJECT} is vegetarian.`, source: 'test' },
+        makeMockInfraLlm(['yes', factJson('dietary_preference', 'vegetarian')]),
+      );
+      const log = attachSpyLog(ctx);
+
+      await new ExtractFactsHandler().execute(ctx);
+
+      const call = findCall(log.error, /failed to persist fact/);
+      expectNoPii(call);
+      const nodes = await entityMemory.findEntities(PII_SUBJECT);
+      expect(call![0]).toHaveProperty('entityNodeId', nodes[0]!.id);
+      expect(call![0]).not.toHaveProperty('hasSubject');
+      expect(call![0]).toHaveProperty('attribute', 'dietary_preference');
+    });
   });
 });

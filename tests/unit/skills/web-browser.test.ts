@@ -4,8 +4,8 @@
 // Tests verify action dispatch, input validation, session_id threading, and error paths.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { WebBrowserHandler } from '../../../skills/web-browser/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { WebBrowserHandler } from '../../../skills/web/tools/web-browser/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import type { BrowserService } from '../../../src/browser/browser-service.js';
 import pino from 'pino';
 
@@ -14,17 +14,36 @@ const logger = pino({ level: 'silent' });
 const FAKE_SESSION_ID = 'test-session-123';
 const FAKE_URL = 'https://example.com';
 
+function makeMockLocator() {
+  const locator = {
+    count: vi.fn().mockResolvedValue(1),
+    first: vi.fn().mockReturnThis(),
+    nth: vi.fn().mockReturnThis(),
+    isVisible: vi.fn().mockResolvedValue(true),
+    boundingBox: vi.fn().mockResolvedValue({ x: 10, y: 20, width: 100, height: 40 }),
+    click: vi.fn().mockResolvedValue(undefined),
+    fill: vi.fn().mockResolvedValue(undefined),
+    selectOption: vi.fn().mockResolvedValue(undefined),
+    hover: vi.fn().mockResolvedValue(undefined),
+    scrollIntoViewIfNeeded: vi.fn().mockResolvedValue(undefined),
+    waitFor: vi.fn().mockResolvedValue(undefined),
+    locator: vi.fn().mockReturnThis(),
+  };
+  return locator;
+}
+
 // Minimal mock that satisfies what the handler calls on BrowserService
 function makeMockBrowserService(): BrowserService {
+  const locator = makeMockLocator();
   // The main frame supplies the cleaned content (getCleanedContent reads per-frame now).
   const mainFrame = {
     url: vi.fn().mockReturnValue(FAKE_URL),
     name: vi.fn().mockReturnValue(''),
     evaluate: vi.fn().mockResolvedValue('cleaned page content'),
-    getByText: vi.fn().mockReturnValue({ count: vi.fn().mockResolvedValue(0) }),
-    getByRole: vi.fn().mockReturnValue({ count: vi.fn().mockResolvedValue(0) }),
-    getByLabel: vi.fn().mockReturnValue({ count: vi.fn().mockResolvedValue(0) }),
-    locator: vi.fn().mockReturnValue({ count: vi.fn().mockResolvedValue(0) }),
+    getByText: vi.fn().mockReturnValue({ ...locator, count: vi.fn().mockResolvedValue(0) }),
+    getByRole: vi.fn().mockReturnValue({ ...locator, count: vi.fn().mockResolvedValue(0) }),
+    getByLabel: vi.fn().mockReturnValue({ ...locator, count: vi.fn().mockResolvedValue(0) }),
+    locator: vi.fn().mockReturnValue({ ...locator, count: vi.fn().mockResolvedValue(0) }),
   };
   const mockSession = {
     page: {
@@ -38,14 +57,14 @@ function makeMockBrowserService(): BrowserService {
       title: vi.fn().mockResolvedValue('Example'),
       waitForTimeout: vi.fn().mockResolvedValue(null),
       waitForLoadState: vi.fn().mockResolvedValue(null),
-      keyboard: { press: vi.fn().mockResolvedValue(null) },
+      keyboard: { press: vi.fn().mockResolvedValue(null), type: vi.fn().mockResolvedValue(null) },
       mouse: { wheel: vi.fn().mockResolvedValue(null) },
       frames: vi.fn().mockReturnValue([mainFrame]),
       mainFrame: vi.fn().mockReturnValue(mainFrame),
-      getByText: vi.fn().mockReturnValue({ click: vi.fn().mockResolvedValue(null), fill: vi.fn().mockResolvedValue(null), count: vi.fn().mockResolvedValue(0) }),
-      getByRole: vi.fn().mockReturnValue({ click: vi.fn().mockResolvedValue(null), fill: vi.fn().mockResolvedValue(null), count: vi.fn().mockResolvedValue(0) }),
-      getByLabel: vi.fn().mockReturnValue({ click: vi.fn().mockResolvedValue(null), fill: vi.fn().mockResolvedValue(null), count: vi.fn().mockResolvedValue(0) }),
-      locator: vi.fn().mockReturnValue({ click: vi.fn().mockResolvedValue(null), fill: vi.fn().mockResolvedValue(null), selectOption: vi.fn().mockResolvedValue(null), count: vi.fn().mockResolvedValue(1) }),
+      getByText: vi.fn().mockReturnValue({ ...locator, count: vi.fn().mockResolvedValue(0) }),
+      getByRole: vi.fn().mockReturnValue({ ...locator, count: vi.fn().mockResolvedValue(0) }),
+      getByLabel: vi.fn().mockReturnValue({ ...locator, count: vi.fn().mockResolvedValue(0) }),
+      locator: vi.fn().mockReturnValue(locator),
     },
     lastUsedAt: Date.now(),
     isExpired: vi.fn().mockReturnValue(false),
@@ -56,6 +75,14 @@ function makeMockBrowserService(): BrowserService {
     // sufficient for the non-secret paths exercised here.
     registerInjectedSecret: vi.fn(),
     redactInjectedSecrets: vi.fn((text: string) => text),
+    // Circuit-breaker surface: the handler calls isTripped() before an interaction action and
+    // records success/failure around every action. A never-tripped stub keeps these
+    // (non-breaker) tests on the normal path; the breaker's own behavior is covered in
+    // skills/web/tools/web-browser/handler.test.ts against a real BrowserSession.
+    consecutiveFailures: 0,
+    isTripped: vi.fn().mockReturnValue(false),
+    recordFailure: vi.fn(),
+    recordSuccess: vi.fn(),
   };
 
   return {
@@ -68,8 +95,10 @@ function makeMockBrowserService(): BrowserService {
   } as unknown as BrowserService;
 }
 
-function makeCtx(input: Record<string, unknown>, browserService?: BrowserService): SkillContext {
+function makeCtx(input: Record<string, unknown>, browserService?: BrowserService): ToolContext {
   return {
+    toolName: 'web-browser',
+    toolVersion: '1.5.0',
     input,
     secret: () => { throw new Error('no secrets needed'); },
     log: logger,
@@ -153,18 +182,18 @@ describe('WebBrowserHandler', () => {
       expect(data.url).toBe(FAKE_URL);
       expect(typeof data.content).toBe('string');
     }
-    expect(mockBrowserService.getOrCreateSession).toHaveBeenCalledWith(undefined, { incognito: false, blockAds: false });
+    expect(mockBrowserService.getOrCreateSession).toHaveBeenCalledWith(undefined, { incognito: false, blockAds: false, keepWarm: false });
   });
 
   it('navigate: passes existing session_id to getOrCreateSession', async () => {
     await handler.execute(makeCtx({ action: 'navigate', url: FAKE_URL, session_id: FAKE_SESSION_ID }, mockBrowserService));
-    expect(mockBrowserService.getOrCreateSession).toHaveBeenCalledWith(FAKE_SESSION_ID, { incognito: false, blockAds: false });
+    expect(mockBrowserService.getOrCreateSession).toHaveBeenCalledWith(FAKE_SESSION_ID, { incognito: false, blockAds: false, keepWarm: false });
   });
 
   it('click: calls getOrCreateSession with session_id', async () => {
     const result = await handler.execute(makeCtx({ action: 'click', selector: 'Sign up button', session_id: FAKE_SESSION_ID }, mockBrowserService));
     expect(result.success).toBe(true);
-    expect(mockBrowserService.getOrCreateSession).toHaveBeenCalledWith(FAKE_SESSION_ID, { incognito: false, blockAds: false });
+    expect(mockBrowserService.getOrCreateSession).toHaveBeenCalledWith(FAKE_SESSION_ID, { incognito: false, blockAds: false, keepWarm: false });
   });
 
   it('type: succeeds with selector and text', async () => {

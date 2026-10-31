@@ -22,6 +22,11 @@ export interface PiiPattern {
   regex: RegExp;
   /** Replacement string, e.g. "[EMAIL]". */
   replacement: string;
+  /**
+   * Optional post-match check. detectPii() drops a match when this returns
+   * false (e.g. a checksum failure), so structural regexes can stay loose.
+   */
+  validate?: (matched: string) => boolean;
 }
 
 /** A single PII match found by detectPii(). */
@@ -40,6 +45,11 @@ export interface PiiMatch {
 // output (conversation IDs, task IDs, contact IDs) and must be shielded from
 // PII pattern matching — some patterns (credit card, phone) false-positive on
 // UUID hex digit segments.
+//
+// Deliberately NOT src/util/uuid.ts's isUuid(): this one *finds* UUIDs inside
+// free-form log text, so it is \b-bounded and /g, where isUuid() is anchored
+// and stateless. Different job, different shape — do not consolidate the two
+// (#1879).
 const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 
 /**
@@ -74,6 +84,39 @@ function extractPattern(typeName: string): RegExp | null {
   }
 }
 
+/** Luhn checksum over the digits of `matched`; requires exactly 9 digits (SIN). */
+function isValidSin(matched: string): boolean {
+  const digits = matched.replace(/\D/g, '');
+  if (digits.length !== 9) return false;
+  let sum = 0;
+  for (let i = 0; i < 9; i++) {
+    let d = Number(digits[i]);
+    if (i % 2 === 1) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+  }
+  return sum % 10 === 0;
+}
+
+// Canadian SIN. Hand-written (not from openredaction). First digit 1-7 or 9 (0 is
+// unassigned, 8 is not issued). Two shapes, both Luhn-checked by validate:
+//   1. formatted NNN-NNN-NNN / NNN NNN NNN with one consistent separator, not
+//      embedded in a longer separator-joined digit run (e.g. 1-800-130-692-544);
+//   2. formatted (consistent separator) or bare 9 digits, only when a SIN keyword
+//      precedes them within 12 non-digit characters (lookbehind keeps the keyword
+//      out of the matched span). The keyword makes intent clear, so trailing
+//      separator+digit (e.g. a year) is allowed; only a directly adjacent digit
+//      is rejected. The acronym is case-sensitive (SIN, S.I.N.) so the English
+//      word "sin" never counts; "social insurance" matches in any case.
+const SIN_CA_PATTERN: PiiPattern = {
+  name: 'sin_ca',
+  regex: /(?<!\d[- ]?)[1-79]\d{2}([- ])\d{3}\1\d{3}(?![- ]?\d)|(?<=(?:\bSIN\b|\bS\.I\.N\.?|\b(?i:social insurance(?: number| no\.?)?)\b)[^\d\n]{0,12})[1-79]\d{2}(?:([- ])\d{3}\2\d{3}|\d{6})(?!\d)/g,
+  replacement: '[SIN]',
+  validate: isValidSin,
+};
+
 /**
  * Built-in PII patterns sourced from openredaction.
  *
@@ -85,8 +128,10 @@ function extractPattern(typeName: string): RegExp | null {
  *   - PHONE_UK: the openredaction v1.1 regex makes the +44/0 prefix optional,
  *     matching arbitrary 9-12 digit sequences (order IDs, reference numbers).
  *     PHONE_UK_MOBILE (requires 7xxx prefix) is specific enough for UK coverage.
- *   - CANADIAN_SIN: `\d{3}[-\s]?\d{3}[-\s]?\d{3}` matches too many 9-digit
- *     sequences in application data (order IDs, reference numbers, etc.)
+ *   - CANADIAN_SIN (the library's): `\d{3}[-\s]?\d{3}[-\s]?\d{3}` matches too many
+ *     9-digit sequences in application data (order IDs, reference numbers, etc.).
+ *     A hand-written `sin_ca` pattern is included instead, guarded by a Luhn
+ *     checksum plus a format/keyword requirement (see SIN_CA_PATTERN).
  *   - ADDRESS_*: high false-positive rate in log strings
  *   - NAME: extremely high false-positive rate
  *
@@ -106,7 +151,10 @@ function buildBuiltInPatterns(): PiiPattern[] {
     { typeName: 'SSN',             replacement: '[SSN]'         },
   ];
 
-  const result: PiiPattern[] = [];
+  // sin_ca goes first: pattern order is overlap precedence, and a keyword-led SIN
+  // followed by a year ("SIN 130 692 544 2024") would otherwise lose its last two
+  // groups to phone_us. Its Luhn check and boundaries keep phone-like strings out.
+  const result: PiiPattern[] = [SIN_CA_PATTERN];
   for (const { typeName, replacement } of entries) {
     const regex = extractPattern(typeName);
     if (regex) {
@@ -144,6 +192,15 @@ export function getBuiltInPatternCount(): number {
 const BUILT_IN_PATTERNS: PiiPattern[] = buildBuiltInPatterns();
 
 /**
+ * Whether `label` is one a detection can carry: a built-in pattern's name, or `extra_N` for the
+ * operator's Nth extra pattern. Lets a scenario case reject a misspelled label up front instead
+ * of silently never matching (#2312).
+ */
+export function isKnownPiiLabel(label: string): boolean {
+  return BUILT_IN_PATTERNS.some((p) => p.name === label) || /^extra_\d+$/.test(label);
+}
+
+/**
  * Detect PII in text and return an array of matches with position information.
  *
  * UUID protection: UUIDs are replaced in the scan buffer with null bytes of
@@ -174,13 +231,14 @@ export function detectPii(text: string, extraPatterns: PiiPattern[] = []): PiiMa
   const overlapsExisting = (start: number, end: number): boolean =>
     matches.some((m) => start < m.end && end > m.start);
 
-  for (const { name, regex } of allPatterns) {
+  for (const { name, regex, validate } of allPatterns) {
     // Reset lastIndex — global regexes retain state across calls if reused.
     regex.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = regex.exec(shielded)) !== null) {
       // Skip any match that covers shielded UUID territory.
       if (m[0].includes('\x00')) continue;
+      if (validate && !validate(m[0])) continue;
       const start = m.index;
       const end = m.index + m[0].length;
       // Skip if this span overlaps an already-accepted match.
@@ -225,7 +283,6 @@ export function scrubPii(text: string, extraPatterns: PiiPattern[] = []): string
   // string length changes with each substitution.
   let result = text;
   for (let i = matches.length - 1; i >= 0; i--) {
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const match = matches[i]!;  // safe: i is a valid index (0 ≤ i < matches.length)
     const replacement = replacementByName.get(match.label) ?? `[${match.label.toUpperCase()}]`;
     result = result.slice(0, match.start) + replacement + result.slice(match.end);

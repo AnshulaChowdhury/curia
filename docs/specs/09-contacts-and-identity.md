@@ -110,13 +110,19 @@ CREATE INDEX idx_cci_contact ON contact_channel_identities (contact_id);
 
 | Source | Meaning | Verified? |
 |---|---|---|
-| `ceo_stated` | CEO explicitly provided the identifier ("Jenna's email is jenna@acme.com") | Yes |
-| `email_participant` | Extracted from To/CC on an email the CEO sent or was part of | Yes |
+| `ceo_stated` | CEO explicitly provided the identifier, through the console or setup ("Jenna's email is jenna@acme.com") | Yes |
+| `agent_stated` | An agent entered the identifier with contact-create or contact-link-identity, after the duplicate check and the provenance check before the write (#2041, #2061, ADR-047) | Yes; an identifier with no source is refused, not stored |
+| `agent_called` | ceo-inbox registered a sender it read from the principal's mail, with contact-register (#2061, ADR-047) | Only when the identifier occurs in a message a person sent, a source-tool result (in practice the mail it was read from), or a write the principal approved; otherwise stored unverified |
+| `email_participant` | Extracted from To/CC on an email the CEO sent or was part of. Also the To of an `email-reply` or adapter reply copied from a From header, and only when that address is not an owned mailbox, the receiving provider's Authentication-Results header shows SPF, DKIM, and DMARC pass (a sender-supplied header does not count), and the duplicate check is clear (#2071, ADR-047) | Yes |
+| `signal_participant` | Extracted from a Signal sender (E.164) on inbound | Yes |
+| `slack_participant` | Extracted from a Slack user id (`U…`) on inbound DM/@mention/thread/reaction | Yes |
+| `sms_participant` | Extracted from an SMS sender (E.164) on inbound Telnyx webhook | No (spoofable From; ADR-036) |
 | `crm_import` | Pulled from the CEO's CRM during an action | Yes |
 | `calendar_attendee` | Extracted from a calendar event | Yes |
 | `self_claimed` | The sender identified themselves ("Hi, it's Jenna") | No |
+| `outbound_recipient` | First-time recipient of a send, recorded by the outbound gateway after delivery when the caller does not name another source: an address an agent typed into a raw send before #2041, a send-draft to an address with no contact, or an `email-reply` whose From failed the auth, ownership, or duplicate check. A later reply that passes those checks verifies this identity in place and keeps this source (ADR-047, #2071) | No; verified when the principal confirms it, an agent re-states it (after the duplicate check), or a later authenticated reply meets the `email-reply` bar |
 
-CEO statements, email participants, and authoritative external sources (CRM, calendar) are verified on creation — they represent the CEO's own data and actions. Self-claimed identities require explicit CEO confirmation before `verified` flips to `true`.
+CEO statements, email participants, and authoritative external sources (CRM, calendar) are verified on creation — they represent the CEO's own data and actions. An identifier an agent enters (`agent_stated`, `agent_called`) is verified only when it occurs in text the model did not write: a message a person sent in the conversation, or a result of a tool whose manifest sets `provenance_source` (a web page, a document, a mail listing). A write the principal approved also counts, since the approval showed them the identifier. An unsourced typo is never verified. Agent-stated identities also pass the duplicate check first; see ADR-047. Agents cannot change the principal's identities. Self-claimed identities require explicit CEO confirmation before `verified` flips to `true`. SMS participant identities also start unverified because carrier From can be spoofed; link a verified `sms` identity on the principal for Gate C (distinct from CRM `phone`).
 
 ### contact_auth_overrides
 
@@ -191,10 +197,10 @@ There are three write paths, all converging on `ContactService`:
 
 `EntityContext.contact` exposes all 12 fields as structured values (see
 [spec 11 — Entity Context Enrichment](11-entity-context-enrichment.md)), so an agent reads
-a typed field rather than reasoning over a scored fact list. `context-for-email` prefers
-`contact.primaryEmail` and surfaces `contact.preferredName` for salutations. Rich, non-
-canonical knowledge about a person (relationships, history, preferences) continues to live
-in the knowledge graph.
+a typed field rather than reasoning over a scored fact list — including
+`contact.primaryEmail` and `contact.preferredName` for outbound address and salutation.
+Rich, non-canonical knowledge about a person (relationships, history, preferences)
+continues to live in the knowledge graph.
 
 ---
 
@@ -257,7 +263,7 @@ The CEO mentions a person in conversation. The Coordinator extracts entities and
 **Full identifier provided:**
 > CEO: "Jenna Torres is my CFO. Her email is jenna@acme.com and she's on Signal at +15550001111."
 
-→ Creates KG person node, contact record, and two verified channel identities (source: `ceo_stated`).
+→ Creates KG person node, contact record, and two verified channel identities (source: `agent_stated`, after the duplicate check; both identifiers occur in the CEO's message, so the provenance check passes; ADR-047).
 
 **Partial mention (no identifiers):**
 > CEO: "My CFO Jenna attends all board meetings."
@@ -271,7 +277,7 @@ An unknown sender messages on a channel. Under the default `allow` policy the me
 **Flow:**
 1. Contact resolver finds no match for `(channel, sender_id)`
 2. Per-channel unknown sender policy applies (see [Unknown Sender Policy](#unknown-sender-policy)): `allow` auto-creates a `tier='unknown'` contact and routes to the coordinator; `ignore` drops the message
-3. The coordinator (or the CEO) identifies the sender → channel identity linked to existing or new contact (source: `ceo_stated`, verified: `true`)
+3. The coordinator (or the CEO) identifies the sender. Their identity is already on the auto-created contact: a new person's details go on that contact, and an existing contact is merged with it (`contact-merge`; into the principal, only in the console)
 4. Subsequent messages from that sender resolve to the now-known contact; the CEO can elevate the tier with `contact-set-tier`
 
 ### Path 3: External Source (CRM, calendar, address book)
@@ -294,7 +300,9 @@ The **principal** is the human Curia is built to serve — the CEO, founder, or 
 
 ### Bootstrap-time materialization
 
-At startup, `contactService.findContactBySystemRole('principal')` resolves the principal's `contacts.id` (a UUID) and the runtime caches it. The principal's contact ID is immutable for a deployment, so bootstrap-time resolution is correct — there is no per-turn refresh.
+The principal contact is created during the setup wizard's "About you" step (`POST /api/setup/principal`) and lives exclusively in the `contacts` table — there is no `CEO_PRIMARY_EMAIL` env var or YAML bootstrap path. `repairPrincipalMetadata` runs at every startup to fix any missing `tier='principal'` or `kind='principal'` flags on the principal row.
+
+At startup, `contactService.findContactBySystemRole('principal')` is the single source of truth for resolving the principal's `contacts.id` (a UUID). All components that need to know who the principal is — the `PiiRedactor` bypass, CEO notifiers, the outbound filter, and the email adapter — read from the principal contact row rather than from config or env. The runtime caches the ID once; the principal's contact ID is immutable for a deployment, so bootstrap-time resolution is always correct — there is no per-turn refresh.
 
 ### Exposure to agents: `${principal_contact_id}`
 
@@ -306,11 +314,12 @@ If `findContactBySystemRole('principal')` returns nothing (fresh deployment, bef
 
 ### What is injected and what is fetched on demand
 
-Three distinct things, with three distinct rules:
+Four distinct things, with four distinct rules:
 
 1. **The principal's `contacts.id`** — resolved once at bootstrap and cached. Exposed to agents as the opt-in `${principal_contact_id}` placeholder (above).
-2. **The principal's verified channel identities** (email, phone, Signal, loaded from `contact_channel_identities` at startup) — appended to **every** agent's system prompt on each task as a `## Principal Contact Details` block (`principalIdentities` in `src/agents/runtime.ts`, wired in `src/index.ts`; #786). This is an authoritative, always-present source for *reaching* the principal, added precisely because relying on opt-in plus convention let the coordinator hallucinate the principal's address. It is the one piece of principal data the platform does inject universally — see the note in the next section.
-3. **Everything else** — calendar IDs, `timezone`, and the other canonical/mutable [contact attributes](#canonical-attributes) — is **not** injected. It can change within a deployment lifetime, so an agent that needs it calls `entity-context` with `${principal_contact_id}` at the start of its run. As of v0.33 the canonical attributes come back as structured fields on `EntityContext.contact` rather than confidence-scored KG facts, so the agent reads a typed value instead of reasoning over a fact list. This keeps the live values fresh and consolidates "how do I reach the principal and what do I know about them?" into a single skill call per run.
+2. **The principal's verified channel identities** (email, phone, Signal, loaded from `contact_channel_identities` at startup) — rendered into **every** agent's system prompt on each task as `### Principal Contact Details`, inside a `## Who you serve` section near the top of the system string, ahead of the YAML body (`principalIdentities` in `src/agents/runtime.ts`, wired in `src/index.ts`; #786, #1950, coordinator prompt trim PR 11). The section first defines "the principal" as the person the agent works for. The block states that the list is complete: an address that is not listed is not the principal's. Each identity's `label` is shown when set. The email that matches `contacts.primary_email` is listed on its own under "Primary email", apart from the other addresses; a `primary_email` that matches no listed identity is not shown, and the identity refresh logs a warning. With no verified active identities the block is omitted rather than rendered empty; `## Who you serve` then carries the profile alone, and is omitted only when there is no profile either. It is injected universally, alongside the principal's profile (item 3) — see the note in the next section.
+3. **The principal's profile** — display name, `preferred_name`, `title` and `pronouns`, read from the principal's `contacts` row with the identities (`readPrincipalIdentitySnapshot`) and kept in the shared `principalProfile` holder (`PrincipalProfileRef`). It is rendered into every agent's prompt as `### Principal Profile`, inside `## Who you serve`, ahead of the contact details (`formatPrincipalProfileBlock` in `src/agents/principal-contact-block.ts`; #2226). Values are untrusted: control characters become spaces, whitespace collapses, each value is cut at 80 characters and rendered in quotes. The name line adds *goes by* only when the preferred name differs from the display name; nothing else in the prompt carries the principal's name. **When `pronouns` is unset the block says "not set"**, and an always-on rule tells the agent to use the pronouns on file for anyone, the principal included, and otherwise the name or they/them, never a guess from the name; agents were otherwise guessing "he" in emails to third parties. Unlike the identities, the profile renders even when the principal has no verified identity. A write to `preferred_name`, `title`, `pronouns` or the display name triggers the same refresh as an identity change, through `ContactService.updateContactFields` (`PRINCIPAL_PROMPT_FIELDS`) or the console's `PATCH /api/contacts/:id`, so a profile fact the principal states in chat shows from the next turn. To save one, an agent calls `contact-update` with `contact_id: "principal"`: the reserved alias resolves to the principal's contact server-side (as in the send skills, ADR-047), so the UUID handle stays opt-in. The setup wizard asks for all three (catalog task `principal_profile`, done once pronouns are set), and the console's Contacts page edits them.
+4. **Everything else** — calendar IDs, `timezone`, and the other canonical/mutable [contact attributes](#canonical-attributes) — is **not** injected. It can change within a deployment lifetime, so an agent that needs it calls `entity-context` with `${principal_contact_id}` at the start of its run. As of v0.33 the canonical attributes come back as structured fields on `EntityContext.contact` rather than confidence-scored KG facts, so the agent reads a typed value instead of reasoning over a fact list. This keeps the live values fresh and consolidates "how do I reach the principal and what do I know about them?" into a single skill call per run.
 
 ### Why the contact-ID *handle* is opt-in
 
@@ -319,7 +328,25 @@ The `${principal_contact_id}` placeholder (the UUID handle, item 1 above) is del
 1. **Attack surface.** Agents that have no business resolving the principal's calendar or attributes (specialist agents like research-analyst that should report through the coordinator) are not handed a key to do so. The opt-in pattern keeps the surface narrow.
 2. **Consistency.** The same opt-in pattern is established for `${agent_contact_id}`. Two handles with two different injection rules would be confusing.
 
-This is distinct from the `## Principal Contact Details` block (item 2 above), which **is** injected universally. The split is deliberate: the *reach-the-principal* channel identities are injected everywhere because hallucinated addresses are a correctness-and-safety problem the `Reaching the principal` convention alone did not prevent (#786), whereas the *contact-ID handle* that unlocks calendar lookups and arbitrary attribute reads stays opt-in to keep each agent's capability surface minimal.
+This is distinct from the `### Principal Contact Details` block (item 2 above), which **is** injected universally. The split is deliberate: the *reach-the-principal* channel identities are injected everywhere because hallucinated addresses are a correctness-and-safety problem the `Reaching the principal` convention alone did not prevent (#786), whereas the *contact-ID handle* that unlocks calendar lookups and arbitrary attribute reads stays opt-in to keep each agent's capability surface minimal.
+
+### Sending to the principal and other contacts (#2033)
+
+Send skills (`email-send`, `signal-send`, `sms-send`, `slack-send`) take a contact reference, not an address: a contact UUID, or the reserved alias `principal`. The address comes from that contact's verified, active identities on the skill's channel (the primary when it is one of them, otherwise the oldest). An optional `#label` hint on the reference (`principal#personal`, or a contact ID followed by `#work`, including each `cc` entry) selects that labelled identity when the hint identifies exactly one. A hint that matches none or more than one sends nothing, as does a hint when several addresses are unlabelled; a single unlabelled address still sends. A reference that matches no contact, or a contact with no verified identity on the channel, fails closed. See [ADR-047](../adr/047-send-skills-address-recipients-by-reference.md).
+
+The alias stays within the split above. It resolves only to the verified identities the `### Principal Contact Details` block already shows every agent, and the block tells agents to pass `principal` instead of typing an address. The contact-ID handle stays opt-in. For anyone else, the handle is the contact UUID from `<resolved_entities>` or the contacts specialist.
+
+There is no raw-address path (#2041). Someone with no contact record is added first with `contact-create`, which refuses an address another contact holds and lists contacts that may be the same person until the agent names them in `distinct_from`. The send skills then take the returned contact ID. `email-draft-save` takes a reference too.
+
+### Operating on the principal's calendar (#1217)
+
+Calendar actions are performed **as the CEO**, not as a shared office identity. The calendar
+client binds to the principal's Nylas grant (`ceo_nylas_grant_id`) rather than a generic
+coordinator grant, so RSVPs and event writes originate from the principal's own account (this
+fixes the Nylas `omittedAttendeesSpecified` RSVP failure that arose when acting under the wrong
+grant). The binding **fails closed**: when `ceo_nylas_grant_id` is unset, calendar operations
+error rather than silently falling back to a non-principal grant. The grant ID is a bootstrap
+identity handle, resolved once — not re-discovered per task.
 
 ---
 
@@ -460,14 +487,14 @@ When an action's trust requirement exceeds the channel's trust level, the Coordi
 Role, overrides, and channel trust gate *what a contact may ask for*. **Gate C** gates *whether the initiating contact is trusted enough to drive a consequential action at all* — independent of role. It keys on the originator's `tier`, which the dispatcher stamps onto every `TaskOriginator` (#950).
 
 - **Authorization Gate-1** (the deny-gate) now evaluates `meetsMinimumTier(tier, 'known')` instead of the legacy `status !== 'confirmed'` check. `unknown` and `blocked` contacts get zero permissions; this is behaviour-preserving under migration 055's mapping (`confirmed ⟺ tier ≥ known`) (#955).
-- **Gate C** escalates consequential, third-party-facing actions when the initiating tier doesn't deterministically permit them. When the tier × risk policy can't decide, an **escalation judge** (LLM classifier; see [15-outbound-safety.md](15-outbound-safety.md) and [06-audit-and-security.md](06-audit-and-security.md)) classifies the action and routes to the CEO. The gate is **fail-closed**: an external originator with no resolved tier escalates rather than bypassing the gate (#1059).
+- **Gate C** escalates consequential, third-party-facing actions when the initiating tier doesn't deterministically permit them. For outbound skills whose recipients are not literal inputs (`email-reply`), the execution layer resolves the recipient set **before** deciding: a `known` contact's reply to the initiating sender only is allowed; reply-all that includes anyone else escalates; resolution failure fails closed (#1815). When recipients cannot be determined structurally, an **escalation judge** (LLM classifier; see [15-outbound-safety.md](15-outbound-safety.md) and [06-audit-and-security.md](06-audit-and-security.md)) classifies the action — its description includes the initiating sender and resolved recipient set. The gate is **fail-closed**: an external originator with no resolved tier escalates rather than bypassing the gate (#1059). Gate C runs in the **execution layer** for skill invocations and again on the **dispatcher auto-reply relay** (`handleAgentResponse` → `outbound.message`) so a blocked reply skill cannot divert onto an ungated send (#1733). The relay uses `action: 'dispatcher-relay'`; approving that row re-invokes the `dispatcher-relay` skill to publish the withheld outbound. Gate C `authorization.decision` payloads include `recipientCount` when recipients were resolved.
 
 ### Auto-Elevation
 
 Contacts created at `tier='unknown'` are promoted to `tier='known'` automatically, without a CEO confirmation step, via three signals (#951):
 
 1. **Correspondence** — when Curia (or the CEO) sends an outbound message to an unknown contact, the outbound gateway elevates the contact to at least `'known'` before send. Mutual communication is sufficient grounds.
-2. **Domain / judgment** — a weekly LLM-judge scan and the dispatcher's scoring pipeline evaluate domain, relationship, and communication signals, elevating contacts that cross the confidence threshold.
+2. **Domain / judgment** — a weekly LLM-judge scan and the dispatcher's scoring pipeline evaluate domain, relationship, and communication signals, elevating contacts that cross the confidence threshold. The dispatcher elevates an email sender this way only on `senderVerified` mail (SPF, DKIM and DMARC pass), since a forged From address would otherwise earn `known` (#2227).
 3. **One-shot backfill** — `scripts/rederive-contact-tiers.ts` (`rederive:contact-tiers`) recomputes confidence and elevates eligible `unknown` contacts historically.
 
 This replaced the old daily provisional→confirmed promotion sweep (retired in #955). Elevation never raises a contact to `trusted`/`principal` automatically — those require an explicit CEO grant. The CEO can also set a tier directly with `contact-set-tier`, and a weekly `scan-grant-recommendations` job surfaces scheduling-access recommendations for CEO approve/decline (#952).
@@ -559,13 +586,36 @@ Contact CRUD operations are exposed as skills, invoked by the Coordinator during
 | `contact.lookup` | Look up a contact by name, role, or channel identifier |
 | `contact.list` | List contacts filtered by role, `tier`, or `kind`, with limit/offset. Default view excludes `automated` and `agent` contacts. Filtering is DB-level for performance. |
 | `contact.set-tier` | Set a contact's `tier` directly ("treat Dana as trusted"); principal-auth guarded, rejects `tier='principal'`. |
-| `contact.merge` | Merge two contacts into one (consolidates channel identities and overrides) |
+| `contact.merge` | Merge two contacts into one (channel identities, overrides, dedup exclusions, non-conflicting canonical attributes and all contact references always; KG memory fold is best-effort — on failure the merge stays committed and the secondary node is archived). See *Merging contacts*. |
 
 All contact mutations are audit-logged. The Coordinator confirms changes with the CEO before writing:
 
 > Coordinator: "I'll add Jenna's personal phone (+15550002222) to her contact. Confirmed?"
 > CEO: "Yes"
 > → `contact.link-identity` invoked
+
+### Merging contacts
+
+`ContactService.mergeContacts` folds a secondary contact into a primary in one transaction. Besides the primary's `displayName`, `role`, `notes` and `tier`, it:
+
+- re-attaches the secondary's **channel identities** (exact duplicates, and case-insensitive email duplicates, are dropped), **auth overrides** and **dedup exclusions** (ADR-039);
+- copies **non-conflicting canonical attributes**: any attribute that is null on the primary and set on the secondary (title, organization, timezone, locale, location, pronouns, and so on). A value set on both sides keeps the primary's;
+- re-points every **contact reference** with `reattachContactReferences`, so none is cascade-deleted, nulled or left stale (#2233):
+  - `contact_calendars` (moved rows are demoted from `is_primary` when the primary already has a primary calendar);
+  - `grant_recommendations` (a permission the primary already has is dropped);
+  - `conversation_resolved_entities`;
+  - `tasks.waiting_on_contact_id`, `voice_sessions.caller_contact_id` and `working_memory.sender_contact_id`;
+  - the `originator.contactId` field on `tasks`, `scheduled_jobs`, `bullpen_threads`, `secret_capture_tokens` and `pending_delegations`.
+
+A structural contact (principal, agent) is never deleted or downgraded (see *Tier & Kind*). After the commit, the KG nodes are folded best-effort through `EntityMemory.mergeEntities`, and the `contact.merged` event is published.
+
+**Node merge from the console.** Merging two KG nodes from the knowledge-graph explorer (spec 12, *Merging nodes*; [ADR-052](../adr/052-knowledge-graph-node-merge.md)) folds their contacts in the same transaction, by the survivor node's type:
+
+- `person` survivor: all contacts on both nodes fold into **one** contact (the survivor's contact if it has one, otherwise the earliest absorbed contact, re-pointed to the survivor node). The other contacts are merged into it with the same shared helper and `reattachContactReferences` as above, and the user resolves any field or auth-override conflicts in the preview (title, organization, `primary_email`, `timezone`, `bio`, `birthday`, and so on; an auth-override conflict defaults to the side that denies). When the survivor node has no contact, every folded contact is a peer and nothing is prompted: the earliest-created contact wins each field, a deny beats a grant, and a `contacts_disagree` warning lists each case.
+- `organization` survivor: absorbed contacts are re-pointed to the survivor node and become `kind='organization'`. They are not merged with each other, because several contacts can share one organization node (ADR-040).
+- any other survivor type: refused when the absorbed node has contacts.
+
+When the survivor is the principal's node, the absorbed contact's identities become principal identities and the user must acknowledge the transfer.
 
 ---
 
@@ -610,7 +660,7 @@ Both events are audit-logged before delivery (write-ahead, per [06-audit-and-sec
 | **03 — Skills & Execution** | Contact management operations (`contact.create`, `contact.link-identity`, etc.) are skills with manifests in `skills/contact/`. |
 | **04 — Channels** | Channel adapters produce `InboundMessage` with `sender_id`. The contact resolver in the dispatch layer enriches this before routing to the Coordinator. Email adapter extracts To/CC participants into `metadata.participants`. |
 | **05 — Error Recovery** | Contact resolution and authorization check failures are handled as `AgentError` types. If the contacts DB is unreachable, the resolver degrades gracefully: messages are tagged as `resolution_failed` and treated as unknown senders (safe default). Error budgets from spec 05 apply to contact management skills. |
-| **06 — Audit & Security** | Every identity resolution is audit-logged. Failed resolution attempts are logged for security review. Authorization decisions (allow/deny/escalate) are not yet audit-logged — the `AuthorizationService` is a pure function with no bus or logger access; logging is planned (see Implementation Status). The per-channel sender allowlist from spec 04 is fully superseded by contact resolution once the contacts system is deployed — all channels use the contact resolver, and the old allowlist config is ignored. Specs 04 and 06 should be updated to note this deprecation. |
+| **06 — Audit & Security** | Every identity resolution is audit-logged. Failed resolution attempts are logged for security review. Authorization decisions (allow/deny/escalate) are audit-logged via the `authorization.decision` bus event (#1379) — the dispatcher emits after `AuthorizationService.evaluate` (Gate-1 + three-layer), the execution layer emits for Gate C on skills, and the dispatch layer also emits Gate C for the auto-reply relay (`action: 'dispatcher-relay'`, #1733); all flow to `audit_log` through the write-ahead bus hook. The per-channel sender allowlist from spec 04 is fully superseded by contact resolution once the contacts system is deployed — all channels use the contact resolver, and the old allowlist config is ignored. |
 | **08 — Operations** | Contact tables added via migration. Role defaults and permissions registry added to `config/`. |
 
 ---
@@ -632,54 +682,12 @@ The migration depends on `kg_nodes` existing (for the foreign key), so it must r
 - **No PII in logs** — contact display names and channel identifiers are audit-logged (they're operational data), but raw message content from unknown senders is redacted per [06-audit-and-security.md](06-audit-and-security.md#redaction).
 - **Spoofing defense** — a spoofed email From header might match a known contact's email, but the email channel's low trust level prevents consequential actions. The Coordinator will ask for Signal/CLI confirmation before acting on sensitive requests from email.
 - **Impersonation on new channels** — someone claiming to be a known contact on a new channel identity is `self_claimed` (unverified) until the CEO confirms. The Coordinator never auto-promotes self-claimed identities.
-- **Auto-elevation of unknown contacts** — contacts created at `tier='unknown'` are elevated to `tier='known'` through correspondence (the outbound gateway bumps the tier on send), domain/judgment signals (a weekly LLM-judge scan plus the dispatcher scoring pipeline), and a one-shot `rederive:contact-tiers` backfill (#951). Elevation never reaches `trusted`/`principal` automatically — those require an explicit CEO grant. This replaced the old provisional→confirmed promotion sweep and the retired `contact-register` flow (#955). Self-claimed channel identities are still never auto-verified — elevation acts on the contact's tier, not on identity verification.
+- **Auto-elevation of unknown contacts** — contacts created at `tier='unknown'` are elevated to `tier='known'` through correspondence (the outbound gateway bumps the tier on send), domain/judgment signals (a weekly LLM-judge scan plus the dispatcher scoring pipeline), and a one-shot `rederive:contact-tiers` backfill (#951). Elevation never reaches `trusted`/`principal` automatically — those require an explicit CEO grant. This replaced the old provisional→confirmed promotion sweep and `contact-register`'s former auto-promotion (#955); the skill itself remains, for ceo-inbox's sender registration (see the source table above). Self-claimed channel identities are still never auto-verified — elevation acts on the contact's tier, not on identity verification.
 - **Contact deletion** — removing a contact also cascades to channel identities and auth overrides (ON DELETE CASCADE). The KG person node is not deleted — it retains historical facts even if the contact record is removed.
 - **Allowlist supersession** — once the contact system is deployed, it fully replaces the per-channel sender allowlist from [04-channels.md](04-channels.md#sender-allowlists). All channels use the contact resolver pipeline. Unknown senders follow the unknown sender policy defined in this spec. The old allowlist configuration is ignored. Specs 04 and 06 should be updated to mark the allowlist as deprecated.
 
 ---
 
-## Implementation Checklist
+## Known Deficiencies
 
-- [ ] Migration: `contacts`, `contact_channel_identities`, `contact_auth_overrides` tables
-- [ ] Contact resolver in dispatch layer (sender lookup + message enrichment)
-- [ ] Participant extraction from email headers (To/CC → metadata.participants)
-- [ ] Contact management skills (`contact.create`, `contact.link-identity`, etc.)
-- [ ] Bus event types: `contact.resolved`, `contact.unknown`
-- [ ] Role defaults config (`config/role-defaults.yaml`)
-- [ ] Permissions registry config (`config/permissions.yaml`)
-- [ ] Unknown sender policy config and enforcement
-- [ ] Authorization check in Coordinator context assembly (role → overrides → trust)
-- [ ] Audit logging for all identity resolution and authorization decisions
-- [ ] Integration tests: proactive identity establishment
-- [ ] Integration tests: reactive identity establishment (unknown sender flow)
-- [ ] Integration tests: external source enrichment (CRM/calendar → contact)
-- [ ] Integration tests: authorization check (role defaults + overrides + trust)
-
----
-
-## Implementation Status
-
-| Item | Status |
-|---|---|
-| Migration: `contacts`, `contact_channel_identities`, `contact_auth_overrides` tables | Done |
-| Contact resolver in dispatch layer (sender lookup + message enrichment) | Done |
-| Participant extraction from email headers (To/CC → metadata.participants) | Done |
-| Contact management skills (`contact.create`, `contact.link-identity`, `contact.unlink-identity`, `contact.set-role`, `contact.grant-permission`, `contact.revoke-permission`, `contact.lookup`, `contact.list`, `contact.merge`) | Done |
-| Bus event types: `contact.resolved`, `contact.unknown` | Done |
-| Role defaults config (`config/role-defaults.yaml`) | Done |
-| Permissions registry config (`config/permissions.yaml`) | Done |
-| Unknown sender policy config and enforcement | Done |
-| Authorization check in Coordinator context assembly (role → overrides → trust) | Done |
-| Audit logging for identity resolution decisions | Done |
-| Audit logging for authorization decisions (allow/deny/escalate) | Not Done |
-| Integration tests: proactive identity establishment | Not Done |
-| Integration tests: reactive identity establishment (unknown sender flow) | Not Done |
-| Integration tests: external source enrichment (CRM/calendar → contact) | Not Done |
-| Integration tests: authorization check (role defaults + overrides + trust) | Partial — three-layer logic unit-tested in `authorization.test.ts`; end-to-end integration test not covered |
-| Tier + kind capability model (migration 055); legacy `status`/`trust_level` columns dropped (migration 059) | Done |
-| Authorization Gate-1 keyed on `meetsMinimumTier(tier, 'known')`; Gate C tier enforcement on consequential actions (#950, #955) | Done |
-| Escalation judge wired into Gate C; fail-closed for unstamped external tiers (#948, #1059) | Done |
-| Auto-elevation `unknown→known` via correspondence, domain/judgment, and `rederive:contact-tiers` backfill (#951) | Done |
-| `contact-set-tier` skill (direct tier set, principal-auth guarded) and `scan-grant-recommendations` / approve-decline grant flow (#952) | Done |
-| Automated sender classification (`classifyEmailSender`) marks `kind=automated`; excluded from ceo-inbox escalation and default `contact-list` view (#953) | Done |
-| Case-insensitive email normalization — `contact-lookup` by email and `contact-merge` for delegated specialists tolerate case differences | Done |
+_(none currently — authorization decision audit logging shipped in #1379)_

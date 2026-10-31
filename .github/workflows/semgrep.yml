@@ -23,9 +23,18 @@ jobs:
       security-events: write  # required for SARIF upload
     container:
       image: semgrep/semgrep
+      # Authenticated pull (#2095): anonymous Docker Hub pulls are rate-limited per
+      # runner IP. Fork PRs get no secrets, and a literal `username:`/`password:`
+      # pair then fails template validation at job setup ("Unexpected value ''",
+      # #2153), so the whole block is one expression: the credentials when both
+      # secrets are set, else an empty map, which makes the runner skip the login
+      # and pull anonymously. toJSON escapes the values into the JSON. Same in
+      # ci.yml and dast.yml; tests/unit/ci/docker-publish-dockerhub-login.test.ts
+      # pins all three.
+      credentials: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN && fromJSON(format('{{"username":{0},"password":{1}}}', toJSON(secrets.DOCKERHUB_USERNAME), toJSON(secrets.DOCKERHUB_TOKEN))) || fromJSON('{}') }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run Semgrep
         # continue-on-error so Semgrep's issue-found exit code (1) doesn't
@@ -38,6 +47,7 @@ jobs:
             --config p/owasp-top-ten \
             --config p/command-injection \
             --config p/secrets \
+            --config p/dockerfile \
             --metrics=off \
             --sarif \
             --output semgrep.sarif \
@@ -46,8 +56,30 @@ jobs:
             --exclude 'pnpm-lock.yaml' \
             --exclude 'tests/**/*.snap'
 
+      # GitHub code scanning ignores SARIF `suppressions`. Semgrep honours an in-tree
+      # `# nosemgrep` comment — it drops the finding from its console output and emits it
+      # with `"suppressions": [{"state": "accepted"}]` — but upload-sarif surfaces it as an
+      # OPEN alert anyway. Every deliberately-accepted finding then has to be dismissed by
+      # hand in the Security tab, and that dismissal is keyed to the finding's fingerprint:
+      # editing a comment near the suppressed line resurrects it as a fresh, undismissed
+      # alert. Alert #192 came back as #262 on pnpm-workspace.yaml exactly that way, with
+      # the `# nosemgrep` comment sitting right above the line the whole time.
+      #
+      # Filtering here makes that comment the single source of truth for what is accepted:
+      # in the tree, in code review, next to the reason it was accepted. The step decides
+      # nothing on its own — Semgrep already classified these findings as suppressed, and
+      # this only forwards that classification to a consumer that would otherwise discard
+      # it. Each dropped finding is named in the job log.
+      #
+      # Deliberately NOT continue-on-error: a missing or malformed SARIF must fail the job.
+      # upload-sarif reads an empty result set as "everything was fixed" and would close
+      # real alerts across the repo.
+      - name: Drop nosemgrep-suppressed findings before upload
+        if: always()
+        run: python3 .github/scripts/filter-suppressed-sarif.py semgrep.sarif
+
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
         with:
           sarif_file: semgrep.sarif
         # Upload even when Semgrep finds issues so alerts appear in Security tab

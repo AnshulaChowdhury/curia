@@ -36,6 +36,34 @@
             "enabled": { "type": "boolean" }
           }
         },
+        "slack": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allowed_channel_ids": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "voice": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "model": { "type": "string" },
+            "livekit_management_url": {
+              "type": "string",
+              "description": "HTTP(S) base for LiveKit RoomService (DeleteRoom, etc.). Distinct from browser signaling URL. Compose default: http://livekit:7880."
+            }
+          }
+        },
+        "email": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_concurrent_turns": { "type": "integer", "minimum": 1 }
+          }
+        },
         "max_message_bytes": { "type": "integer", "minimum": 1 }
       }
     },
@@ -44,10 +72,13 @@
       "additionalProperties": false,
       "properties": {
         "sessionTtlMs": { "type": "integer", "minimum": 1 },
-        "sweepIntervalMs": { "type": "integer", "minimum": 1 },
+        "sweepIntervalMs": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
         "profileDir": { "type": "string" },
         "channel": { "type": "string" },
-        "locale": { "type": "string" }
+        "proxy": { "type": "string" },
+        "locale": { "type": "string" },
+        "languages": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9-]+$" } },
+        "settleCapMs": { "type": "integer", "minimum": 1, "maximum": 90000 }
       }
     },
     "agents": {
@@ -76,6 +107,16 @@
             "max_per_sender": { "type": "integer", "minimum": 1 },
             "max_global": { "type": "integer", "minimum": 1 }
           }
+        },
+        "turnInjection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxInjectionsPerTurn": { "type": "integer", "minimum": 1 },
+            "extraRoundsPerInjection": { "type": "integer", "minimum": 1 },
+            "laneWaitTimeoutMs": { "type": "integer", "minimum": 1 }
+          }
         }
       }
     },
@@ -90,6 +131,24 @@
           "properties": {
             "threshold": { "type": "integer", "minimum": 2 },
             "keepWindow": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "documentWorkspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scratchTtlDays": { "type": "integer", "minimum": 1, "maximum": 36500 },
+        "consoleEditMaxBytes": { "type": "integer", "minimum": 1024, "maximum": 4194304 },
+        "pinnedContextWarnChars": { "type": "integer", "minimum": 1 },
+        "kgPromotion": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxFacts": { "type": "integer", "minimum": 0 },
+            "maxRelationships": { "type": "integer", "minimum": 0 }
           }
         }
       }
@@ -138,6 +197,27 @@
             "data_export":       { "type": "number", "minimum": 0, "maximum": 1 },
             "financial":         { "type": "number", "minimum": 0, "maximum": 1 }
           }
+        },
+        "principal_org_domains": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$" }
+        }
+      }
+    },
+    "exportControls": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "confidentialThreshold": { "type": "integer", "minimum": 1 },
+        "allowedDestinations": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "driveFolderIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "urls": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "filePaths": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+          }
         }
       }
     },
@@ -163,7 +243,8 @@
             "timeout_ms": { "type": "integer", "minimum": 250 },
             "failMode": { "type": "string", "enum": ["split", "open", "closed"] }
           }
-        }
+        },
+        "identityGate": { "type": "string", "enum": ["off", "shadow", "enforce"] }
       }
     },
     "escalation": {
@@ -176,7 +257,23 @@
           "properties": {
             "enabled": { "type": "boolean" },
             "model": { "type": "string" },
-            "timeout_ms": { "type": "integer", "minimum": 250 }
+            "timeout_ms": { "type": "integer", "minimum": 250 },
+            "review_timeout_ms": { "type": "integer", "minimum": 250 }
+          }
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "llmCallArchive": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "hotRetentionDays": { "type": "integer", "minimum": 1 },
+            "includeReasoning": { "type": "boolean" }
           }
         }
       }
@@ -189,7 +286,7 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "intervalMs": { "type": "integer", "minimum": 1 },
+            "intervalMs": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
             "archiveThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
             "halfLifeDays": {
               "type": "object",
@@ -209,14 +306,16 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "intervalMs": { "type": "integer", "minimum": 1 },
+            "intervalMs": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
             "model_tier": { "type": "string", "enum": ["fast", "standard", "powerful"] },
             "batchSize": { "type": "integer", "minimum": 1 },
             "minScoredActions": { "type": "integer", "minimum": 1 },
             "halfLifeDays": { "type": "number", "minimum": 1 },
-            "weakExpiredWeight": { "type": "number", "minimum": 0, "maximum": 1 },
+            "weakExpiredWeight": { "description": "Retired in #2159: accepted and ignored, so configs that still set it keep booting. Safe to remove." },
             "ceoCooldownDays": { "type": "integer", "minimum": 0 },
-            "errorRateThreshold": { "type": "number", "minimum": 0, "maximum": 1 }
+            "errorRateThreshold": { "type": "number", "minimum": 0, "maximum": 1 },
+            "errorRateWindowDays": { "type": "integer", "minimum": 1 },
+            "unparseableAfterDays": { "type": "integer", "minimum": 0 }
           }
         }
       }
@@ -309,7 +408,31 @@
       "additionalProperties": false,
       "properties": {
         "defaultExpiryHours": { "type": "integer", "minimum": 1 },
-        "explicitExpiryHours": { "type": "integer", "minimum": 1 }
+        "explicitExpiryHours": { "type": "integer", "minimum": 1 },
+        "channelDefaultExpiryHours": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "askChannelOrder": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["signal", "sms", "slack", "email"] },
+          "uniqueItems": true
+        },
+        "defaultExpiryMinutes": { "type": "integer", "minimum": 1 },
+        "recentWindowMinutes": { "type": "integer", "minimum": 1 },
+        "codeTtlMinutesAfterClose": { "type": "integer", "minimum": 1 },
+        "emailWaitSeconds": { "type": "integer", "minimum": 1 },
+        "identityProviderDomains": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
       }
     },
     "debrief": {
@@ -325,24 +448,136 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "defaultTimeoutMs": { "type": "integer", "minimum": 1 }
+        "defaultTimeoutMs": { "type": "integer", "minimum": 1 },
+        "lateDelivery": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "ttlMinutes": { "type": "integer", "minimum": 1 },
+            "sweepIntervalMinutes": { "type": "integer", "minimum": 1, "maximum": 35791 },
+            "maxResultChars": { "type": "integer", "minimum": 1 }
+          }
+        }
       }
     },
     "scheduler": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "defaultExpectedDurationSeconds": { "type": "integer", "minimum": 1 }
+        "defaultExpectedDurationSeconds": { "type": "integer", "minimum": 1 },
+        "maxInFlight": { "type": "integer", "minimum": 1 }
       }
     },
     "tasks": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "heartbeatIntervalMinutes": { "type": "integer", "minimum": 1 },
+        "heartbeatIntervalMinutes": { "type": "integer", "minimum": 1, "maximum": 35791 },
         "heartbeatMaxWakesPerTick": { "type": "integer", "minimum": 1 },
         "idleThresholdHours": { "type": "number", "minimum": 0 },
-        "staleWaitThresholdHours": { "type": "number", "minimum": 0 }
+        "staleWaitThresholdHours": { "type": "number", "minimum": 0 },
+        "resumableContinuationSeconds": { "type": "integer", "minimum": 1 },
+        "resumableCeilings": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxStalls": { "type": "integer", "minimum": 1 },
+            "maxIterations": { "type": "integer", "minimum": 1 },
+            "maxWallclockHours": { "type": "number", "exclusiveMinimum": 0 },
+            "maxCostUsd": { "type": "number", "exclusiveMinimum": 0 },
+            "maxPlanDepth": { "type": "integer", "minimum": 1 },
+            "maxReplansPerSubtree": { "type": "integer", "minimum": 1 },
+            "blockedStepHours": { "type": "number", "exclusiveMinimum": 0 },
+            "throughputDivergenceRatio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    },
+    "autonomy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gating": { "type": "string", "enum": ["band", "tier"] },
+        "bypass_ladder": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "same_task": { "type": "integer", "minimum": 60, "maximum": 100 },
+            "derived_child": { "type": "integer", "minimum": 0, "maximum": 100 }
+          }
+        },
+        "reaction_intents": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Emoji → approve/reject for inbound.reaction (#1479). Channel-agnostic.",
+          "properties": {
+            "approve": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "reject": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "approval_expiry": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "System-interval sweep that expires stale pending approvals (#2013).",
+          "properties": {
+            "sweep_interval_minutes": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "report_fallback": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Weekly summary of unreported digest items for installs with no digest job (#2159).",
+          "properties": {
+            "max_age_days": { "type": "integer", "minimum": 1 },
+            "check_interval_hours": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "relay_budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Cap on immediate relays to the principal that one outside contact can cause (#1320).",
+          "properties": {
+            "per_hour": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "liveness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "email_stall_factor": { "type": "integer", "minimum": 1 },
+            "scheduler_max_tick_s": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "canary_schedule": { "type": "string", "minLength": 1 },
+        "heartbeats": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "llm_fast":         { "type": "string" },
+            "llm_standard":     { "type": "string" },
+            "llm_powerful":     { "type": "string" },
+            "embeddings":       { "type": "string" },
+            "image_gen":        { "type": "string" },
+            "nylas":            { "type": "string" },
+            "nylas_calendar":   { "type": "string" },
+            "signal":           { "type": "string" },
+            "google_workspace": { "type": "string" },
+            "tavily":           { "type": "string" }
+          }
+        }
       }
     }
   },
@@ -352,7 +587,16 @@
       "required": ["model"],
       "additionalProperties": false,
       "properties": {
-        "model": { "type": "string", "minLength": 1 }
+        "model": { "type": "string", "minLength": 1 },
+        "reasoning": {
+          "description": "Reasoning effort for agent turns on this tier (ADR-048). Unset means the provider default. The effort must be one the model's registry entry lists; boot fails otherwise.",
+          "type": "object",
+          "required": ["effort"],
+          "additionalProperties": false,
+          "properties": {
+            "effort": { "type": "string", "enum": ["none", "low", "medium", "high", "max"] }
+          }
+        }
       }
     }
   }

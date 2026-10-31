@@ -13,6 +13,7 @@
 // Verdict parsers are exported for direct testing without constructing the full judge.
 
 import type { DisclosureClass, ActionConsequenceClass } from './escalation-policy.js';
+import { extractFirstJsonObject, stripCodeFence } from '../util/json-extract.js';
 
 // ---------------------------------------------------------------------------
 // Disclosure classifier prompts
@@ -148,46 +149,4 @@ export function parseActionVerdict(raw: string): ActionVerdict | null {
     isThirdPartyFacing: obj.isThirdPartyFacing,
     reason: typeof obj.reason === 'string' ? obj.reason : '',
   };
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-function stripCodeFence(raw: string): string {
-  const trimmed = raw.trim();
-  const fence = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
-  return fence ? fence[1]!.trim() : trimmed;
-}
-
-/**
- * Return the first balanced top-level JSON object substring in `text`, or null.
- * Tracks string literals and escape sequences so braces inside strings don't
- * affect the nesting depth.
- *
- * Intentionally not shared with outbound-judge.ts — the two security boundaries
- * must remain independent so a change to one cannot silently weaken the other.
- */
-function extractFirstJsonObject(text: string): string | null {
-  const start = text.indexOf('{');
-  if (start === -1) return null;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i]!;
-    if (inString) {
-      if (escaped) { escaped = false; continue; }
-      if (ch === '\\') { escaped = true; continue; }
-      if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') inString = true;
-    else if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) return text.slice(start, i + 1);
-    }
-  }
-  return null;
 }

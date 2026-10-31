@@ -8,49 +8,107 @@
 // Each instance owns a single Nylas grant.
 
 import type { EventBus } from '../../bus/bus.js';
+import type { TurnLanes } from '../../dispatch/turn-lanes.js';
 import type { Logger } from '../../logger.js';
-import type { OutboundGateway, EmailSendRequest } from '../../skills/outbound-gateway.js';
+import type { OutboundGateway } from '../../skills/outbound-gateway.js';
+import type { EmailSendRequest } from './outbound-request.js';
+import { replyDisplayName, replyRecipientSource } from './reply-recipient-provenance.js';
+import { deriveEmailReplyRecipientSet } from './reply-recipients.js';
 import type { ContactService } from '../../contacts/contact-service.js';
+import type { PrincipalEmailRef } from '../../contacts/types.js';
+import { resolvePrincipalEmail } from '../../contacts/types.js';
 import type { ConfigStore } from '../../memory/config-store.js';
-import { convertNylasMessage } from './message-converter.js';
+import { convertNylasMessage, normalizeForComparison } from './message-converter.js';
 import {
   createInboundMessage,
   createChannelPoll,
   createChannelStalled,
+  createChannelDisconnected,
+  createChannelReconnect,
+  type InboundMessageEvent,
   type OutboundMessageEvent,
   type OutboundNotificationEvent,
 } from '../../bus/events.js';
+import { isDbUnavailableError } from '../../db/resilience.js';
+import { INBOUND_REPLAY_LIMIT, INBOUND_REPLAY_MAX_AGE_HOURS } from '../../audit/inbound-replay.js';
 import { sanitizeOutput } from '../../skills/sanitize.js';
-import { buildReplyQuote } from '../../skills/_shared/reply-quote.js';
+import { buildReplyQuote, quoteParticipants } from '../../skills/_shared/reply-quote.js';
+import {
+  EMAIL_INBOUND_TURN_STALL_MS,
+  EMAIL_POLL_PAGE_SIZE,
+  MAX_STAGED_INBOUND_IDS,
+  WRITE_AHEAD_POLL_FAIL_LIMIT,
+  WRITE_AHEAD_RETRY_LIMIT,
+} from './inbound-stall.js';
 import type { Channel } from '../channel.js';
 
-// Mirrors MAX_BODY_LENGTH in skills/email-send/handler.ts and skills/email-reply/handler.ts.
+// Mirrors MAX_BODY_LENGTH in skills/email/tools/email-send/handler.ts and skills/email/tools/email-reply/handler.ts.
 // When the agent's response plus the quoted original would exceed this, the quote
 // is silently dropped so the reply still sends.
 const MAX_REPLY_BODY_LENGTH = 50_000;
+
+/** How long stop() waits for turns already running before shutdown continues. */
+const STOP_DRAIN_MS = 5_000;
+
+/**
+ * One inbound message whose write-ahead succeeded. Delivery starts only when
+ * the thread is idle and a concurrency slot is free.
+ */
+interface QueuedInboundEmail {
+  event: InboundMessageEvent;
+  /** Starts subscriber delivery. Write-ahead already finished in the poll. */
+  deliver: () => Promise<void>;
+  messageId: string;
+  threadId: string;
+  /** From address as on the message; absent when the sender was missing. */
+  senderEmail: string | undefined;
+  /** Converter sender id (`unknown` when From was missing). */
+  senderId: string;
+  subject: string;
+  senderVerified: boolean;
+  /** Epoch ms when the poll queued this message. */
+  queuedAt: number;
+  /** True when this item was loaded from an unacknowledged audit row. */
+  replayed?: boolean;
+}
+
+function nylasMessageIdOf(event: InboundMessageEvent): string {
+  const id = event.payload.metadata?.nylasMessageId;
+  return typeof id === 'string' && id.length > 0 ? id : event.id;
+}
+
+function queuedFromReplay(
+  event: InboundMessageEvent,
+  messageId: string,
+  deliver: () => Promise<void>,
+): QueuedInboundEmail {
+  const metadata = event.payload.metadata;
+  const threadFromMeta = metadata?.nylasThreadId;
+  const threadId = typeof threadFromMeta === 'string' && threadFromMeta.length > 0
+    ? threadFromMeta
+    : event.payload.conversationId.startsWith('email:')
+      ? event.payload.conversationId.slice('email:'.length)
+      : event.payload.conversationId;
+  const subject = typeof metadata?.subject === 'string' ? metadata.subject : '';
+  const senderId = event.payload.senderId;
+  return {
+    event,
+    deliver,
+    messageId,
+    threadId,
+    senderEmail: senderId.includes('@') ? senderId : undefined,
+    senderId,
+    subject,
+    senderVerified: metadata?.senderVerified === true,
+    queuedAt: Date.now(),
+    replayed: true,
+  };
+}
 
 // KG namespace and key pattern for persisting the poll high-water mark.
 const POLL_STATE_NAMESPACE = 'system:email-poll-state';
 function lastSeenKey(accountId: string): string {
   return `${accountId}.last_seen_at`;
-}
-
-// ---------------------------------------------------------------------------
-// Address normalization helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Normalize an email address for self-identity comparison.
- * Strips plus-addressing (local+tag@domain → local@domain) and lowercases.
- * This catches send-as alias variations and plus-address routing tricks that
- * could otherwise bypass the self-email loop filter.
- */
-function normalizeForComparison(email: string): string {
-  const at = email.lastIndexOf('@');
-  if (at === -1) return email.toLowerCase();
-  const local = email.slice(0, at).replace(/\+.*$/, '');
-  const domain = email.slice(at);
-  return local.toLowerCase() + domain.toLowerCase();
 }
 
 export interface EmailAdapterConfig {
@@ -68,15 +126,17 @@ export interface EmailAdapterConfig {
   /** This account's own email address — used to filter out self-sent messages */
   selfEmail: string;
   /**
-   * Additional sender addresses to suppress, beyond selfEmail.
-   * Case-insensitive.
+   * Addresses to suppress on inbound, in addition to this account's own selfEmail.
+   * Auto-derived (#1101) from the union of every configured account's self_email, so the
+   * agent never replies to a mailbox it owns. Case-insensitive.
    */
-  excludedSenderEmails: string[];
+  suppressedSenderEmails: string[];
   /**
-   * CEO's email address — used as the recipient for rate-limit notification emails.
-   * When absent, rate-limit notifications are logged but not emailed.
+   * principal's email address — used as the recipient for rate-limit notification emails.
+   * When absent/empty, rate-limit notifications are logged but not emailed.
+   * Accepts a mutable PrincipalEmailRef so post-boot binds hot-reload (#1514).
    */
-  ceoEmail?: string;
+  ceoEmail?: string | PrincipalEmailRef;
   /**
    * Maximum new contacts to auto-create from a single email's participant list.
    * Existing contacts (already in DB) don't count. Default: 10.
@@ -88,9 +148,16 @@ export interface EmailAdapterConfig {
    */
   contactCreationMaxPerHour: number;
   /**
+   * Max inbound turns in flight at once for this account (#2254).
+   * Required. Bootstrap applies `channels.email.max_concurrent_turns` (default 4).
+   * Messages on one thread stay strictly ordered and never run together.
+   * Further threads wait for a free slot. The cap does not bound the queue.
+   */
+  maxConcurrentTurns: number;
+  /**
    * IANA timezone (e.g. "America/Toronto") used when rendering the Date line in
    * appended reply quotes. Sourced from the global `TIMEZONE` env var to match
-   * the timezone the skills receive via SkillContext.
+   * the timezone the skills receive via ToolContext.
    */
   timezone: string;
   /**
@@ -99,11 +166,32 @@ export interface EmailAdapterConfig {
    * to Date.now() on each restart, which is the legacy behaviour).
    */
   configStore?: ConfigStore;
+  /**
+   * Unacknowledged `inbound.message` rows for this account. On start, each
+   * one is delivered again through `deliverPersisted` before the first poll,
+   * so a restart cannot leave write-ahead mail behind the watermark (#2254).
+   * Absent in tests that do not exercise replay.
+   */
+  unacknowledgedInbound?: {
+    listUnacknowledgedInbound(accountId: string): Promise<InboundMessageEvent[]>;
+  };
+  /**
+   * When the flag is on, the next same-thread message is released once the
+   * dispatcher has decided the inbound, so it can join the turn still running.
+   * Absent, or with the flag off, the thread stays locked until delivery ends.
+   */
+  turnLanes?: TurnLanes;
 }
 
 export class EmailAdapter implements Channel {
   readonly name = 'email';
   readonly isToggleable = true;
+  /**
+   * Email is HTTP (Nylas). Queueable like SMS (#1380): readiness tracks adapter
+   * start/stop; the gateway also enqueues on transient Nylas/network failures.
+   * Auth/grant failures stay non-queueable.
+   */
+  readonly supportsOutboundQueue = true;
   private config: EmailAdapterConfig;
   // Existing setInterval handle — cleared in stop() to halt the poll loop. The
   // overlap guard (`processing`) plus clearing this interval are sufficient to
@@ -111,7 +199,38 @@ export class EmailAdapter implements Channel {
   // by a single repeating interval rather than per-poll re-scheduling.
   private pollTimer?: ReturnType<typeof setInterval>;
   private lastSeenTimestamp: number = 0;
+  /**
+   * Overlap guard for the Nylas fetch and pre-publish work only. Inbound turns
+   * run on the detached runner below (#2254), so a long coordinator turn must
+   * not skip the next poll.
+   */
   private processing = false;
+  private readonly maxConcurrentTurns: number;
+  /** Deliveries that have started and have not settled. */
+  private inFlightTurns = 0;
+  /** Settling handles so stop() and tests can wait out a detached delivery. */
+  private inFlightRuns = new Set<Promise<void>>();
+  /** messageId → when that delivery started. Two messages on one thread can overlap once injection is on. */
+  private readonly inFlightStartedAt = new Map<string, { conversationId: string; startedAt: number }>();
+  /** messageIds already warned for the delivery currently in flight. */
+  private readonly stallWarned = new Set<string>();
+  /** conversationId → messages waiting to deliver, in message-date order. */
+  private readonly pendingByThread = new Map<string, QueuedInboundEmail[]>();
+  /** conversationIds whose delivery is in flight. At most one each until intake settles (#2018). */
+  private readonly runningThreads = new Set<string>();
+  /** conversationId → messageId that currently owns the thread lock. */
+  private readonly threadOwner = new Map<string, string>();
+  /**
+   * Threads that have a queued head and no free slot, oldest first.
+   * A Set keeps insertion order: membership is O(1), and moving a thread to
+   * the back is delete + add. A thread that just finished goes to the back,
+   * so one busy thread cannot hold the only slot while other threads wait.
+   */
+  private readonly slotWaiters = new Set<string>();
+  /** True between start() and stop() — outbound-queue readiness (#1380). */
+  private running = false;
+  /** subscribeOutbound() ran: the bus has no unsubscribe, so a second call would double every send. */
+  private outboundSubscribed = false;
 
   // ── Watchdog state ─────────────────────────────────────────────────────────
   // Tracks the last successful poll completion time for stall detection.
@@ -120,8 +239,11 @@ export class EmailAdapter implements Channel {
 
   /** Epoch ms when the adapter was started — used to compute initial stall window. */
   private startedAt: number | null = null;
-  /** Epoch ms of the most recent poll cycle that reached completion (no throw). */
-  private lastSuccessfulPollAt: number | null = null;
+  /**
+   * Epoch ms of the most recent poll whose Nylas fetch succeeded.
+   * Stamped when the fetch and handoff finish, not when agent turns finish (#2254).
+   */
+  private _lastSuccessfulPollAt: number | null = null;
   /** True once channel.stalled has been successfully published this lifecycle. */
   private stalledEmitted = false;
   /** Number of channel.stalled publish attempts this lifecycle (bounds retries on bus failure). */
@@ -138,12 +260,31 @@ export class EmailAdapter implements Channel {
   private readonly recentlySentIds = new Set<string>();
   private static readonly MAX_SENT_IDS = 200;
 
+  /**
+   * Nylas ids whose `inbound.message` row already exists in this process
+   * (this poll, or replay on start). A watermark rollback re-fetches them;
+   * they must not be written ahead again. Bounded like {@link recentlySentIds}.
+   */
+  private readonly stagedInboundIds = new Set<string>();
+  /** Consecutive write-ahead failures per Nylas message id. */
+  private readonly writeAheadFailures = new Map<string, number>();
+  /** Polls in a row that stopped on a retryable write-ahead failure. */
+  private writeAheadPollFailures = 0;
+
   private trackSentId(id: string): void {
     this.recentlySentIds.add(id);
     // Set preserves insertion order, so values().next() is the oldest entry.
     if (this.recentlySentIds.size > EmailAdapter.MAX_SENT_IDS) {
       const oldest = this.recentlySentIds.values().next().value;
       if (oldest !== undefined) this.recentlySentIds.delete(oldest);
+    }
+  }
+
+  private rememberStagedId(id: string): void {
+    this.stagedInboundIds.add(id);
+    if (this.stagedInboundIds.size > MAX_STAGED_INBOUND_IDS) {
+      const oldest = this.stagedInboundIds.values().next().value;
+      if (oldest !== undefined) this.stagedInboundIds.delete(oldest);
     }
   }
 
@@ -161,10 +302,110 @@ export class EmailAdapter implements Channel {
 
   constructor(config: EmailAdapterConfig) {
     this.config = config;
+    if (!Number.isInteger(config.maxConcurrentTurns) || config.maxConcurrentTurns < 1) {
+      throw new Error(
+        `email maxConcurrentTurns must be a positive integer, got: ${String(config.maxConcurrentTurns)}`,
+      );
+    }
+    this.maxConcurrentTurns = config.maxConcurrentTurns;
   }
 
-  async start(): Promise<void> {
-    const { bus, logger, pollingIntervalMs, configStore, accountId } = this.config;
+  // ── Public health-probe getters ──────────────────────────────────────────
+  // The watchdog state fields are private to prevent external mutation, but the
+  // health module needs to read them without resorting to `any` casts. These
+  // getters expose just enough surface for the liveness probe.
+
+  /**
+   * Epoch ms of the most recent successful poll, converted to Date for the
+   * health probe. Null means no successful poll since start() was last called.
+   */
+  get lastSuccessfulPollAt(): Date | null {
+    return this._lastSuccessfulPollAt !== null ? new Date(this._lastSuccessfulPollAt) : null;
+  }
+
+  /** Polling interval in ms — used by the health probe to compute the stall threshold. */
+  get pollingIntervalMs(): number {
+    return this.config.pollingIntervalMs;
+  }
+
+  /** Deliveries started and not yet settled. */
+  get inboundInFlight(): number {
+    return this.inFlightTurns;
+  }
+
+  /** Messages written ahead and still waiting for a slot or their thread. */
+  get inboundPending(): number {
+    let pending = 0;
+    for (const queue of this.pendingByThread.values()) pending += queue.length;
+    return pending;
+  }
+
+  /** Cap applied to {@link inboundInFlight}. */
+  get inboundMaxConcurrentTurns(): number {
+    return this.maxConcurrentTurns;
+  }
+
+  /** Age of the oldest in-flight turn, or null when nothing is running. */
+  get oldestInboundInFlightAgeMs(): number | null {
+    let oldestStart = Number.POSITIVE_INFINITY;
+    for (const entry of this.inFlightStartedAt.values()) {
+      if (entry.startedAt < oldestStart) oldestStart = entry.startedAt;
+    }
+    return oldestStart === Number.POSITIVE_INFINITY ? null : Date.now() - oldestStart;
+  }
+
+  /** Age of the oldest queued message, or null when the queues are empty. */
+  get oldestInboundPendingAgeMs(): number | null {
+    let oldestQueuedAt = Number.POSITIVE_INFINITY;
+    for (const queue of this.pendingByThread.values()) {
+      for (const item of queue) {
+        if (item.queuedAt < oldestQueuedAt) oldestQueuedAt = item.queuedAt;
+      }
+    }
+    return oldestQueuedAt === Number.POSITIVE_INFINITY ? null : Date.now() - oldestQueuedAt;
+  }
+
+  /** In-flight turns older than the stall bound. */
+  get inboundStalledTurns(): number {
+    const now = Date.now();
+    let stalled = 0;
+    for (const entry of this.inFlightStartedAt.values()) {
+      if (now - entry.startedAt >= EMAIL_INBOUND_TURN_STALL_MS) stalled++;
+    }
+    return stalled;
+  }
+
+  /** True once repeated polls have been unable to write inbound mail ahead. */
+  get inboundWriteAheadDegraded(): boolean {
+    return this.writeAheadPollFailures >= WRITE_AHEAD_POLL_FAIL_LIMIT;
+  }
+
+  /**
+   * Resolves when every detached inbound delivery has settled.
+   * `stop()` waits on this for {@link STOP_DRAIN_MS}, then continues so a hung
+   * turn cannot block process exit (#2254).
+   */
+  async drainInFlight(): Promise<void> {
+    while (this.inFlightRuns.size > 0) {
+      await Promise.allSettled([...this.inFlightRuns]);
+    }
+  }
+
+  isOutboundReady(): boolean {
+    return this.running;
+  }
+
+  /**
+   * Subscribe this account's outbound side: replies the dispatcher relays (outbound.message)
+   * and system notifications (outbound.notification). start() calls it before polling. The
+   * test-mode recording stack (#2312) calls it alone, against recording clients, so a
+   * scenario's relayed reply takes this exact path without an inbox, a poll or a real client.
+   * Safe to call twice: the second call is a no-op, so a reply is never sent twice.
+   */
+  subscribeOutbound(): void {
+    if (this.outboundSubscribed) return;
+    this.outboundSubscribed = true;
+    const { bus, logger } = this.config;
 
     // Subscribe to outbound messages for this specific email account.
     // When the coordinator responds to an email-triggered conversation, the dispatcher
@@ -203,7 +444,7 @@ export class EmailAdapter implements Channel {
 
       const notification = event as OutboundNotificationEvent;
       try {
-        // isSystemNotification bypasses the autonomy gate so the CEO still receives
+        // isSystemNotification bypasses the autonomy gate so the principal still receives
         // alerts (e.g. approval_requested) even when the score is below the send
         // threshold — the notification must not be silenced by the gate it's reporting.
         // skipNotificationOnBlock prevents infinite recursion if the content filter
@@ -230,7 +471,7 @@ export class EmailAdapter implements Channel {
               originalChannel: notification.payload.originalChannel,
               ceoEmail: notification.payload.ceoEmail,
             },
-            'EmailAdapter: failed to deliver outbound.notification — CEO will NOT receive this alert',
+            'EmailAdapter: failed to deliver outbound.notification — principal will NOT receive this alert',
           );
         }
       } catch (err) {
@@ -244,6 +485,12 @@ export class EmailAdapter implements Channel {
         );
       }
     });
+  }
+
+  async start(): Promise<void> {
+    const { bus, logger, pollingIntervalMs, configStore, accountId } = this.config;
+
+    this.subscribeOutbound();
 
     // Restore the persisted high-water mark so restarts resume from where we left off
     // rather than silently dropping messages that arrived during downtime.
@@ -283,16 +530,27 @@ export class EmailAdapter implements Channel {
     }
 
     this.startedAt = Date.now();
-    this.lastSuccessfulPollAt = null;
+    this._lastSuccessfulPollAt = null;
     this.stalledEmitted = false;
     this.stalledEmitAttempts = 0;
+    this.running = true;
+    // Replay before the interval and the first poll, so a re-fetch of mail
+    // already written ahead is skipped instead of delivered twice.
+    await this.replayUnacknowledgedInbound();
 
     // Poll on interval; also run the watchdog check each tick.
     this.pollTimer = setInterval(() => {
       void this.poll();
       void this.checkWatchdog();
+      this.warnLongRunningTurns();
     }, pollingIntervalMs);
     logger.info({ pollingIntervalMs }, 'Email adapter started — polling Nylas');
+
+    // Flush any messages queued while adapters were stopped (#1380). Multiple
+    // account adapters may each publish reconnect — flush is idempotent.
+    void bus.publish('channel', createChannelReconnect({ channel: 'email' })).catch((err) => {
+      logger.error({ err, accountId }, 'Failed to publish channel.reconnect');
+    });
 
     // Do an initial poll immediately and await it so callers that await start()
     // can be confident the first poll has completed before they assert results.
@@ -301,17 +559,89 @@ export class EmailAdapter implements Channel {
   }
 
   async stop(): Promise<void> {
+    // Gate the runner before dropping queues. A turn that settles while stop()
+    // is in progress must not start the next one.
+    this.running = false;
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = undefined;
     }
+    this.dropPendingInbound();
+    await this.drainInFlightBounded();
     this.startedAt = null;
+    // Await the disconnect publication before returning so a graceful stop() does
+    // not resolve (or lose the event during immediate shutdown) while the readiness
+    // transition is still in flight — the publish is a shutdown side effect, not
+    // fire-and-forget (#1380 review).
+    try {
+      await this.config.bus.publish(
+        'channel',
+        createChannelDisconnected({
+          channel: 'email',
+          reason: `Email adapter stopped (account=${this.config.accountId})`,
+        }),
+      );
+    } catch (err) {
+      this.config.logger.error({ err }, 'Failed to publish channel.disconnected');
+    }
     this.config.logger.info('Email adapter stopped');
   }
 
+  /**
+   * Deliver this account's recent unacknowledged inbound rows before the first poll.
+   *
+   * Only the last {@link INBOUND_REPLAY_MAX_AGE_HOURS} hours are loaded, and a
+   * row is omitted when a later `inbound.message` in that window has the same
+   * Nylas message id. A turn that was mid-flight when the process died may
+   * already have sent its reply. Replay is at-least-once for that case, the
+   * same as the re-fetch it replaces. A load failure is logged and startup
+   * continues; the rows stay unacknowledged for the next start.
+   */
+  private async replayUnacknowledgedInbound(): Promise<void> {
+    const source = this.config.unacknowledgedInbound;
+    if (!source) return;
+    let events: InboundMessageEvent[];
+    try {
+      events = await source.listUnacknowledgedInbound(this.config.accountId);
+    } catch (err) {
+      this.config.logger.error(
+        { err, accountId: this.config.accountId },
+        'Email adapter: failed to load unacknowledged inbound mail — replay skipped',
+      );
+      return;
+    }
+    if (events.length === 0) return;
+    this.config.logger.info(
+      {
+        accountId: this.config.accountId,
+        count: events.length,
+        maxAgeHours: INBOUND_REPLAY_MAX_AGE_HOURS,
+      },
+      'Email adapter: replaying unacknowledged inbound mail',
+    );
+    if (events.length === INBOUND_REPLAY_LIMIT) {
+      this.config.logger.warn(
+        { accountId: this.config.accountId, count: events.length, limit: INBOUND_REPLAY_LIMIT },
+        'Email adapter: inbound replay hit its limit — further rows in the window wait for the next start',
+      );
+    }
+    for (const event of events) {
+      if (!this.running) break;
+      const messageId = nylasMessageIdOf(event);
+      this.rememberStagedId(messageId);
+      const queued = queuedFromReplay(
+        event,
+        messageId,
+        () => this.config.bus.deliverPersisted(event),
+      );
+      if (this.enqueueInbound(queued)) this.logInboundQueued(queued);
+    }
+  }
+
   private async poll(): Promise<void> {
-    // Guard against overlapping polls — if a previous poll is still running
-    // (e.g. slow Nylas response or many messages to process), skip this cycle.
+    // Guard against overlapping fetches. A previous poll still inside Nylas or
+    // pre-publish work skips this cycle. An in-flight agent turn does not —
+    // those run on the detached runner and must not stall the inbox (#2254).
     if (this.processing) return;
     this.processing = true;
 
@@ -320,7 +650,15 @@ export class EmailAdapter implements Channel {
     const prevWatermark = this.lastSeenTimestamp;
 
     // Per-filter skip counters for the channel.poll audit event.
-    const skipped = { sent_folder: 0, recently_sent: 0, self: 0, excluded: 0, failed: 0 };
+    const skipped = {
+      sent_folder: 0,
+      recently_sent: 0,
+      self: 0,
+      excluded: 0,
+      failed: 0,
+      deferred: 0,
+      already_staged: 0,
+    };
     let fetched = 0;
     let processed = 0;
 
@@ -331,7 +669,7 @@ export class EmailAdapter implements Channel {
       messages = await this.config.outboundGateway.listEmailMessages({
         receivedAfter: this.lastSeenTimestamp,
         unread: true,
-        limit: 25,
+        limit: EMAIL_POLL_PAGE_SIZE,
         // Request raw headers so the converter can extract Authentication-Results
         // and compute senderVerified (SPF/DKIM/DMARC). Without this flag, Nylas
         // omits headers from the response entirely and senderVerified will be false.
@@ -343,16 +681,56 @@ export class EmailAdapter implements Channel {
       return;
     }
 
-    fetched = messages.length;
+    // Defensive: a misbehaving gateway mock/client must not throw an unhandled
+    // rejection mid-poll (Vitest treats those as suite failures).
+    if (!Array.isArray(messages)) {
+      this.config.logger.error(
+        { messagesType: typeof messages },
+        'Email polling returned a non-array — will retry',
+      );
+      this.processing = false;
+      return;
+    }
+
+    // Nylas returns newest-first. Same-thread mail must run oldest-first, so
+    // sort by date before the loop. The watermark does not depend on order.
+    const ordered = messages
+      .map((msg, index) => ({ msg, index }))
+      .sort((a, b) => a.msg.date - b.msg.date || a.index - b.index)
+      .map((entry) => entry.msg);
+
+    // Last watermark that is safe to persist: intentional skips and successful
+    // write-aheads. A retryable write-ahead failure rolls the in-memory mark
+    // back to include that message and stops the batch (#2254).
+    let durableWatermark = prevWatermark;
+    let endedOnWriteAheadRetry = false;
 
     try {
-      for (const msg of messages) {
-        // Advance the high-water mark BEFORE processing so a permanently broken
-        // message (e.g. malformed payload) is never retried on the next poll cycle.
-        // +1 ensures the next poll's receivedAfter excludes this exact timestamp
-        // (Nylas timestamps are Unix seconds integers).
+      for (let index = 0; index < ordered.length; index++) {
+        const msg = ordered[index]!;
+        if (!this.running) {
+          this.lastSeenTimestamp = durableWatermark;
+          skipped.deferred += ordered.length - index;
+          break;
+        }
+        // Advance the in-memory mark before processing so a permanently broken
+        // message (malformed payload, or write-ahead past its retry budget) is
+        // not retried. A retryable write-ahead failure rolls the mark back.
+        // +1 excludes this exact Unix second: receivedAfter is inclusive.
         if (msg.date >= this.lastSeenTimestamp) {
           this.lastSeenTimestamp = msg.date + 1;
+        }
+
+        // Already persisted in this process (replay, or a previous poll that
+        // rolled the watermark back over a same-second neighbour).
+        if (this.stagedInboundIds.has(msg.id)) {
+          this.config.logger.debug(
+            { messageId: msg.id, accountId: this.config.accountId },
+            'Email skipped — inbound message was already written ahead',
+          );
+          skipped.already_staged++;
+          durableWatermark = this.lastSeenTimestamp;
+          continue;
         }
 
         // ── Layer 1: folder-based detection ──────────────────────────────────
@@ -370,6 +748,7 @@ export class EmailAdapter implements Channel {
             'Email skipped — message is in sent/drafts folder',
           );
           skipped.sent_folder++;
+          durableWatermark = this.lastSeenTimestamp;
           continue;
         }
 
@@ -386,6 +765,7 @@ export class EmailAdapter implements Channel {
             'Email skipped — matches recently-sent message ID (loop guard)',
           );
           skipped.recently_sent++;
+          durableWatermark = this.lastSeenTimestamp;
           continue;
         }
 
@@ -409,27 +789,30 @@ export class EmailAdapter implements Channel {
           normalizeForComparison(fromEmail) === normalizeForComparison(this.config.selfEmail)
         ) {
           skipped.self++;
+          durableWatermark = this.lastSeenTimestamp;
           continue;
         }
 
-        // Skip emails from any additionally-excluded sender addresses (e.g. Curia's
-        // outbound address on a monitored inbox, to prevent self-reply loops).
+        // Skip emails from any suppressed sender addresses (auto-derived union of all
+        // owned mailbox addresses per #1101, to prevent cross-account reply loops).
         if (
           fromEmail &&
-          this.config.excludedSenderEmails.some(
-            (excluded) => normalizeForComparison(excluded) === normalizeForComparison(fromEmail),
+          this.config.suppressedSenderEmails.some(
+            (suppressed) => normalizeForComparison(suppressed) === normalizeForComparison(fromEmail),
           )
         ) {
           this.config.logger.debug(
             { fromEmail, accountId: this.config.accountId },
-            'Email skipped — sender is in excludedSenderEmails',
+            'Email skipped — sender is in suppressedSenderEmails',
           );
           skipped.excluded++;
+          durableWatermark = this.lastSeenTimestamp;
           continue;
         }
 
+        let converted;
         try {
-          const converted = convertNylasMessage(msg, this.config.selfEmail);
+          converted = convertNylasMessage(msg, this.config.selfEmail);
 
           // Auto-create contacts from participants before publishing the inbound
           // event, so the contact resolver in the dispatch layer can find them.
@@ -438,62 +821,150 @@ export class EmailAdapter implements Channel {
             converted.metadata.subject,
             converted.senderId,
           );
-
-          // Sanitize email content to mitigate prompt injection from external senders.
-          // This strips known injection patterns (system/instruction/prompt tags) before
-          // the content reaches the LLM's context window.
-          const sanitizedContent = sanitizeOutput(converted.content, {
-            // Use a large limit here — body truncation already happened in the converter.
-            // We pass maxLength large enough to never double-truncate; the converter's
-            // 50KB cap + subject prefix keeps us well under this ceiling.
-            maxLength: 60_000,
-          });
-
-          // Publish inbound message to the bus.
-          const event = createInboundMessage({
-            conversationId: converted.conversationId,
-            channelId: converted.channelId,
-            accountId: this.config.accountId,
-            senderId: converted.senderId,
-            content: sanitizedContent,
-            metadata: {
-              ...(converted.metadata as unknown as Record<string, unknown>),
-            },
-          });
-          await this.config.bus.publish('channel', event);
-          processed++;
-
-          // Warn when the provider's SPF/DKIM/DMARC checks did not all pass.
-          // This is an audit signal — the message is still processed, but the
-          // Coordinator's system prompt instructs it to apply extra skepticism.
-          if (!converted.metadata.senderVerified) {
-            this.config.logger.warn(
-              { senderEmail: converted.senderId, messageId: msg.id },
-              'Email received with senderVerified: false — SPF/DKIM/DMARC did not all pass or headers were absent',
-            );
-          }
-
-          this.config.logger.info(
-            { senderEmail: converted.senderId, subject: msg.subject, threadId: msg.threadId, senderVerified: converted.metadata.senderVerified },
-            'Email received and published to bus',
-          );
         } catch (err) {
-          // Log and skip — the high-water mark was already advanced above,
-          // so this message will not be retried on the next poll cycle.
+          // Conversion and contact extraction are not retried. The watermark
+          // advanced above on purpose so a permanently broken payload cannot
+          // wedge the inbox.
           this.config.logger.error(
             { err, messageId: msg.id, threadId: msg.threadId, senderEmail: fromEmail },
             'Failed to process inbound email — skipping message',
           );
           skipped.failed++;
+          durableWatermark = this.lastSeenTimestamp;
+          continue;
         }
+
+        // A sanitize throw is a pre-handoff skip. It must not abort the poll.
+        let sanitizedContent: string;
+        try {
+          // Strips known injection patterns before the content reaches the LLM.
+          // The converter already capped the body; this ceiling only prevents a
+          // second truncation.
+          sanitizedContent = sanitizeOutput(converted.content, { maxLength: 60_000 });
+        } catch (err) {
+          this.config.logger.error(
+            { err, messageId: msg.id, threadId: msg.threadId, senderEmail: fromEmail },
+            'Failed to process inbound email — skipping message',
+          );
+          skipped.failed++;
+          durableWatermark = this.lastSeenTimestamp;
+          continue;
+        }
+
+        const event = createInboundMessage({
+          conversationId: converted.conversationId,
+          channelId: converted.channelId,
+          accountId: this.config.accountId,
+          senderId: converted.senderId,
+          content: sanitizedContent,
+          metadata: {
+            ...(converted.metadata as unknown as Record<string, unknown>),
+          },
+        });
+
+        // Write-ahead before the watermark may move past this message. Delivery
+        // of the agent turn stays on the runner (#2254).
+        let deliver: () => Promise<void>;
+        try {
+          const staged = await this.config.bus.stagePublish('channel', event);
+          deliver = staged.deliver;
+        } catch (err) {
+          // A database outage fails every write-ahead. Counting it toward the
+          // per-message budget would skip real mail after about 90s, and
+          // replay cannot recover a row that was never written. Outages still
+          // end the poll on a write-ahead failure, so health goes red.
+          const outage = isDbUnavailableError(err);
+          const attempts = outage
+            ? (this.writeAheadFailures.get(msg.id) ?? 0)
+            : (this.writeAheadFailures.get(msg.id) ?? 0) + 1;
+          if (!outage) this.writeAheadFailures.set(msg.id, attempts);
+          if (!outage && attempts >= WRITE_AHEAD_RETRY_LIMIT) {
+            this.writeAheadFailures.delete(msg.id);
+            this.config.logger.error(
+              {
+                err,
+                messageId: msg.id,
+                threadId: msg.threadId,
+                senderEmail: fromEmail,
+                attempts,
+              },
+              'Inbound email write-ahead failed — skipping message after repeated failures',
+            );
+            skipped.failed++;
+            durableWatermark = this.lastSeenTimestamp;
+            continue;
+          }
+          this.config.logger.error(
+            {
+              err,
+              messageId: msg.id,
+              threadId: msg.threadId,
+              senderEmail: fromEmail,
+              attempts,
+              outage,
+              remainingInBatch: ordered.length - index - 1,
+            },
+            'Inbound email write-ahead failed — will retry next poll',
+          );
+          // Same-second neighbours share `date`. Rolling back only to the
+          // previous success's date+1 would leave this message below the next
+          // receivedAfter. Include its own second; already-staged ids skip
+          // the neighbours this process has written ahead.
+          this.lastSeenTimestamp = Math.min(durableWatermark, msg.date);
+          skipped.deferred += ordered.length - index;
+          endedOnWriteAheadRetry = true;
+          break;
+        }
+
+        this.writeAheadFailures.delete(msg.id);
+        this.rememberStagedId(msg.id);
+
+        const queued: QueuedInboundEmail = {
+          event,
+          deliver,
+          messageId: msg.id,
+          threadId: msg.threadId,
+          senderEmail: fromEmail,
+          senderId: converted.senderId,
+          subject: msg.subject,
+          senderVerified: converted.metadata.senderVerified,
+          queuedAt: Date.now(),
+        };
+        // stop() during stagePublish drops the message. Leave the watermark
+        // behind it so the row is replayed on the next start, and do not
+        // count it as processed.
+        if (!this.enqueueInbound(queued)) {
+          this.lastSeenTimestamp = durableWatermark;
+          skipped.deferred += ordered.length - index;
+          break;
+        }
+        this.logInboundQueued(queued);
+        processed++;
+        durableWatermark = this.lastSeenTimestamp;
       }
     } finally {
       this.processing = false;
     }
 
-    // ── Post-poll accounting (only reached when listEmailMessages succeeded) ──
+    fetched = messages.length;
 
-    this.lastSuccessfulPollAt = Date.now();
+    // stop() landed during this poll. Queued mail was dropped, and a message
+    // this cycle already wrote ahead must stay behind the persisted watermark.
+    // Skip the health stamp and channel.poll too: disconnected already fired.
+    if (!this.running) return;
+
+    if (endedOnWriteAheadRetry) {
+      this.writeAheadPollFailures += 1;
+    } else {
+      this.writeAheadPollFailures = 0;
+    }
+
+    // ── Post-poll accounting (only reached when listEmailMessages succeeded) ──
+    // Stamped when the fetch and write-ahead finish. A coordinator turn still
+    // running on the detached runner must not age this out (#2254).
+
+    this._lastSuccessfulPollAt = Date.now();
+    this.warnLongRunningTurns();
 
     // Emit one channel.poll audit event per cycle so operators can verify the
     // adapter is alive and measure throughput over time.
@@ -517,11 +988,22 @@ export class EmailAdapter implements Channel {
     // poll loop — the in-memory watermark remains correct for the current run.
     if (this.lastSeenTimestamp !== prevWatermark && this.config.configStore) {
       try {
-        await this.config.configStore.set(
+        const { stored } = await this.config.configStore.set(
           POLL_STATE_NAMESPACE,
           lastSeenKey(this.config.accountId),
           String(this.lastSeenTimestamp),
         );
+        if (!stored) {
+          // Soft-reject (storeFact dedup 'conflict'/'auto_rejected' — no throw, so the catch below
+          // never fires). The durable watermark stayed at its prior value: a restart would re-fetch
+          // from there and reprocess already-seen mail. That's harmless (message processing dedups by
+          // id) but wasteful, and otherwise entirely silent. Warn so operators can spot a stuck
+          // watermark; the in-memory value remains correct for this run and the next advance retries.
+          this.config.logger.warn(
+            { accountId: this.config.accountId, lastSeenTimestamp: this.lastSeenTimestamp },
+            'Email adapter: poll watermark write soft-rejected — durable watermark not advanced (in-memory value still current)',
+          );
+        }
       } catch (err) {
         this.config.logger.error(
           { err, accountId: this.config.accountId, lastSeenTimestamp: this.lastSeenTimestamp },
@@ -529,6 +1011,273 @@ export class EmailAdapter implements Channel {
         );
       }
     }
+  }
+
+  /**
+   * Accept one inbound message whose write-ahead already succeeded. Starts
+   * delivery when the thread is idle and a slot is free; otherwise queues it.
+   * Same-thread messages stay in queue order and never run concurrently
+   * (#2018, #2254). Returns false when the adapter is stopped and the message
+   * was dropped.
+   */
+  private enqueueInbound(item: QueuedInboundEmail): boolean {
+    if (!this.running) {
+      this.logDroppedInbound(item);
+      return false;
+    }
+    const conversationId = item.event.payload.conversationId;
+    const queue = this.pendingByThread.get(conversationId);
+    if (queue) {
+      queue.push(item);
+      if (this.runningThreads.has(conversationId)) {
+        this.config.logger.debug(
+          { accountId: this.config.accountId, messageId: item.messageId, threadId: item.threadId },
+          'Email adapter: inbound message queued behind the in-flight turn on this thread',
+        );
+      }
+    } else {
+      this.pendingByThread.set(conversationId, [item]);
+    }
+    this.scheduleThread(conversationId);
+    return true;
+  }
+
+  private scheduleThread(conversationId: string): void {
+    if (!this.running) return;
+    if (this.runningThreads.has(conversationId)) return;
+    const queue = this.pendingByThread.get(conversationId);
+    if (!queue || queue.length === 0) return;
+    if (this.inFlightTurns >= this.maxConcurrentTurns) {
+      if (!this.slotWaiters.has(conversationId)) {
+        this.slotWaiters.add(conversationId);
+        const head = queue[0];
+        this.config.logger.info(
+          {
+            accountId: this.config.accountId,
+            messageId: head?.messageId,
+            threadId: head?.threadId,
+            inFlight: this.inFlightTurns,
+            pending: this.inboundPending,
+            maxConcurrentTurns: this.maxConcurrentTurns,
+          },
+          'Email adapter: in-flight cap reached; inbound message queued',
+        );
+      }
+      return;
+    }
+    this.startThread(conversationId);
+  }
+
+  private startThread(conversationId: string): void {
+    if (!this.running) return;
+    this.slotWaiters.delete(conversationId);
+    const queue = this.pendingByThread.get(conversationId);
+    const item = queue?.shift();
+    if (!queue || !item) {
+      this.pendingByThread.delete(conversationId);
+      return;
+    }
+    if (queue.length === 0) this.pendingByThread.delete(conversationId);
+
+    this.runningThreads.add(conversationId);
+    this.threadOwner.set(conversationId, item.messageId);
+    this.inFlightTurns += 1;
+    const startedAt = Date.now();
+    this.inFlightStartedAt.set(item.messageId, { conversationId, startedAt });
+
+    // Flag on only. intakeSettled resolves immediately when the lane is off,
+    // and releasing the thread then would let the next message pass the one
+    // still running. The in-flight count stays tied to `run` either way.
+    const lanes = this.config.turnLanes;
+    if (lanes?.enabled) {
+      void lanes.intakeSettled(item.event.id).then(() => {
+        this.releaseRunningThread(conversationId, item.messageId);
+      });
+    }
+
+    // One chain for a sync throw and a rejection. Bookkeeping lives in finally
+    // so the two paths cannot drift.
+    const run = Promise.resolve()
+      .then(() => item.deliver())
+      .then(
+        () => {
+          this.logInboundCompleted(item, Date.now() - startedAt);
+        },
+        (err: unknown) => {
+          this.logInboundTurnFailure(err, item);
+        },
+      )
+      .finally(() => {
+        // The dispatcher settles intake after it accepts the inbound. A
+        // write-ahead failure never gets there, and this call is idempotent.
+        if (lanes?.enabled) lanes.markIntakeSettled(item.event.id);
+        this.releaseRunningThread(conversationId, item.messageId);
+        this.inFlightTurns -= 1;
+        this.inFlightStartedAt.delete(item.messageId);
+        this.stallWarned.delete(item.messageId);
+        this.inFlightRuns.delete(run);
+        if (!this.running) return;
+        // Behind threads that were already waiting on the cap, so a burst on
+        // one thread does not keep every other thread queued.
+        if (this.pendingByThread.has(conversationId)) {
+          this.slotWaiters.delete(conversationId);
+          this.slotWaiters.add(conversationId);
+        }
+        this.drainSlotWaiters();
+      });
+    this.inFlightRuns.add(run);
+  }
+
+  /**
+   * Drop the thread lock if this delivery still owns it. A later message may
+   * already own it once intake settled early; that owner's lock stays.
+   */
+  private releaseRunningThread(conversationId: string, messageId: string): void {
+    if (this.threadOwner.get(conversationId) !== messageId) return;
+    this.threadOwner.delete(conversationId);
+    this.runningThreads.delete(conversationId);
+    if (!this.running) return;
+    if (this.pendingByThread.has(conversationId)) {
+      this.slotWaiters.delete(conversationId);
+      this.slotWaiters.add(conversationId);
+    }
+    this.drainSlotWaiters();
+  }
+
+  private drainSlotWaiters(): void {
+    if (!this.running) return;
+    while (this.inFlightTurns < this.maxConcurrentTurns && this.slotWaiters.size > 0) {
+      const conversationId = this.slotWaiters.values().next().value;
+      if (conversationId === undefined) break;
+      this.slotWaiters.delete(conversationId);
+      if (this.runningThreads.has(conversationId)) continue;
+      if (!this.pendingByThread.has(conversationId)) continue;
+      this.startThread(conversationId);
+    }
+  }
+
+  /** Wait for in-flight turns, but only up to STOP_DRAIN_MS. */
+  private async drainInFlightBounded(): Promise<void> {
+    if (this.inFlightRuns.size === 0) return;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timeoutId = setTimeout(() => {
+        this.config.logger.warn(
+          { accountId: this.config.accountId, inFlight: this.inFlightTurns },
+          'Email adapter stop: in-flight turns still running after drain timeout',
+        );
+        resolve();
+      }, STOP_DRAIN_MS);
+    });
+    await Promise.race([this.drainInFlight(), timeout]);
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
+
+  private dropPendingInbound(): void {
+    for (const queue of this.pendingByThread.values()) {
+      for (const item of queue) this.logDroppedInbound(item);
+    }
+    this.pendingByThread.clear();
+    this.slotWaiters.clear();
+  }
+
+  private logDroppedInbound(item: QueuedInboundEmail): void {
+    this.config.logger.error(
+      {
+        accountId: this.config.accountId,
+        messageId: item.messageId,
+        threadId: item.threadId,
+        conversationId: item.event.payload.conversationId,
+      },
+      'Email adapter stopped with inbound mail still queued — message dropped',
+    );
+  }
+
+  private warnLongRunningTurns(): void {
+    const now = Date.now();
+    for (const [messageId, entry] of this.inFlightStartedAt) {
+      const ageMs = now - entry.startedAt;
+      if (ageMs < EMAIL_INBOUND_TURN_STALL_MS) continue;
+      if (this.stallWarned.has(messageId)) continue;
+      this.stallWarned.add(messageId);
+      this.config.logger.warn(
+        {
+          accountId: this.config.accountId,
+          conversationId: entry.conversationId,
+          messageId,
+          ageMs,
+          thresholdMs: EMAIL_INBOUND_TURN_STALL_MS,
+          inFlight: this.inFlightTurns,
+          pending: this.inboundPending,
+        },
+        'Email adapter: inbound turn still running past the stall bound',
+      );
+    }
+  }
+
+  /** Receipt signal. Fires at handoff, including when delivery later rejects. */
+  private logInboundQueued(item: QueuedInboundEmail): void {
+    if (item.replayed) {
+      this.config.logger.info(
+        {
+          senderEmail: item.senderId,
+          subject: item.subject,
+          threadId: item.threadId,
+          messageId: item.messageId,
+          senderVerified: item.senderVerified,
+          replayed: true,
+          inFlight: this.inFlightTurns,
+          pending: this.inboundPending,
+        },
+        'Unacknowledged inbound mail queued for replay',
+      );
+      return;
+    }
+    if (!item.senderVerified) {
+      this.config.logger.warn(
+        { senderEmail: item.senderId, messageId: item.messageId },
+        'Email received with senderVerified: false — SPF/DKIM/DMARC did not all pass or headers were absent',
+      );
+    }
+    this.config.logger.info(
+      {
+        senderEmail: item.senderId,
+        subject: item.subject,
+        threadId: item.threadId,
+        messageId: item.messageId,
+        senderVerified: item.senderVerified,
+        inFlight: this.inFlightTurns,
+        pending: this.inboundPending,
+      },
+      'Email received and queued',
+    );
+  }
+
+  private logInboundCompleted(item: QueuedInboundEmail, durationMs: number): void {
+    this.config.logger.info(
+      {
+        senderEmail: item.senderId,
+        subject: item.subject,
+        threadId: item.threadId,
+        messageId: item.messageId,
+        conversationId: item.event.payload.conversationId,
+        durationMs,
+      },
+      'Inbound email turn completed',
+    );
+  }
+
+  private logInboundTurnFailure(err: unknown, item: QueuedInboundEmail): void {
+    this.config.logger.error(
+      {
+        err,
+        messageId: item.messageId,
+        threadId: item.threadId,
+        conversationId: item.event.payload.conversationId,
+        senderEmail: item.senderEmail,
+      },
+      'Inbound email turn failed after handoff — not retried',
+    );
   }
 
   /**
@@ -547,14 +1296,14 @@ export class EmailAdapter implements Channel {
 
     // Use the last successful poll time when available; fall back to startedAt
     // so a never-successful adapter (first poll already failing) is also detected.
-    const reference = this.lastSuccessfulPollAt ?? this.startedAt;
+    const reference = this._lastSuccessfulPollAt ?? this.startedAt;
     if (now - reference <= threshold) return;
 
     this.stalledEmitAttempts++;
     this.config.logger.error(
       {
         accountId: this.config.accountId,
-        lastSuccessfulPollAt: this.lastSuccessfulPollAt,
+        lastSuccessfulPollAt: this._lastSuccessfulPollAt,
         stallThresholdMs: threshold,
       },
       'Email adapter stall detected — no successful poll within threshold',
@@ -564,7 +1313,7 @@ export class EmailAdapter implements Channel {
       await this.config.bus.publish('channel', createChannelStalled({
         accountId: this.config.accountId,
         channel: 'email',
-        lastSuccessfulPollAt: this.lastSuccessfulPollAt,
+        lastSuccessfulPollAt: this._lastSuccessfulPollAt,
         stallThresholdMs: threshold,
       }));
       // Set stalledEmitted only after confirmed publish — if publish fails we retry
@@ -604,63 +1353,49 @@ export class EmailAdapter implements Channel {
       // latest. If Curia was the last sender (a prior turn in the conversation),
       // messages[0].from is Curia's own address — we must NOT reply to ourselves.
       // In that case, look at messages[0].to to find the human recipient.
-      const messages = await outboundGateway.listEmailMessages({ limit: 1, threadId }, this.config.accountId);
+      // include_headers so Authentication-Results is present for reply provenance (#2071).
+      const messages = await outboundGateway.listEmailMessages(
+        { limit: 1, threadId, fields: 'include_headers' },
+        this.config.accountId,
+      );
       const threadMessage = messages[0];
       if (!threadMessage) {
         logger.warn({ threadId }, 'Cannot find message to reply to in thread');
         return;
       }
 
-      const latestFromEmail = threadMessage.from[0]?.email;
-
-      // If the latest message was sent BY us, the human's address is in 'to'.
-      // normalizeForComparison handles casing and plus-addressing variations.
-      const latestIsOurs =
-        latestFromEmail !== undefined &&
-        normalizeForComparison(latestFromEmail) === normalizeForComparison(this.config.selfEmail);
-
-      // When the latest message is ours, find the first non-self address in 'to'.
-      // to[] can contain multiple recipients (e.g. a thread with a CC'd third party);
-      // picking the first non-self address is best-effort for 1:1 conversations.
-      // TODO: proper group-email support would need to track the original sender from
-      // the inbound message rather than inferring the recipient from the thread.
-      const recipientEmail = latestIsOurs
-        ? threadMessage.to.find(
-            (r) => normalizeForComparison(r.email) !== normalizeForComparison(this.config.selfEmail),
-          )?.email
-        : latestFromEmail;
-
-      if (!recipientEmail) {
+      // Reply-all, the same derivation the email-reply skill uses (#2273): a received
+      // message goes to its sender plus its other To, CC to its CC; when the latest
+      // message is ours, the reply goes to the people it was addressed to. Our own
+      // address is dropped everywhere, so a self-addressed thread resolves to null
+      // rather than looping a reply into our own inbox.
+      // Every owned mailbox, not just this account's: a latest message sent
+      // from another of our accounts is still ours.
+      const ownedMailboxes = [this.config.selfEmail, ...this.config.suppressedSenderEmails];
+      const recipientSet = deriveEmailReplyRecipientSet({
+        originalFrom: threadMessage.from[0]?.email,
+        originalTo: threadMessage.to,
+        originalCc: threadMessage.cc,
+        ccInput: undefined,
+        selfEmails: ownedMailboxes,
+      });
+      if (!recipientSet) {
         logger.warn(
-          { threadId, messageId: threadMessage.id, latestIsOurs },
-          'Cannot reply — could not resolve human recipient from thread',
+          { threadId, messageId: threadMessage.id },
+          'Cannot reply — no recipient outside our own mailbox in the latest thread message',
         );
         return;
       }
+      const latestIsOurs = !recipientSet.toIsOriginalSender;
+      const recipientEmail = recipientSet.to;
+      const additionalTo = recipientSet.additionalTo;
+      const ccAddresses = recipientSet.cc;
 
-      // Guard: if the resolved recipient is still our own address (e.g. a self-addressed
-      // thread or malformed to[] list), bail out rather than looping a reply to our own
-      // inbox. This would produce a misleading "sent" log with no human ever receiving it.
-      if (normalizeForComparison(recipientEmail) === normalizeForComparison(this.config.selfEmail)) {
-        logger.error(
-          { threadId, messageId: threadMessage.id, latestIsOurs },
-          'Cannot reply — resolved recipient is selfEmail; thread may be self-addressed or to[] is malformed',
+      if (additionalTo.length > 0 || ccAddresses.length > 0) {
+        logger.debug(
+          { additionalTo, ccAddresses, latestIsOurs },
+          'sendOutboundReply: reply-all including further To and CC recipients',
         );
-        return;
-      }
-
-      // Reply-all: include To and CC recipients from the thread message, excluding self and the primary recipient.
-      // Both to[] and cc[] are candidates — mirrors the email-reply skill's reply-all logic.
-      const ccAddresses = [...(threadMessage.to ?? []), ...(threadMessage.cc ?? [])]
-        .map((r) => r.email)
-        .filter(
-          (email) =>
-            normalizeForComparison(email) !== normalizeForComparison(this.config.selfEmail) &&
-            normalizeForComparison(email) !== normalizeForComparison(recipientEmail),
-        );
-
-      if (ccAddresses.length > 0) {
-        logger.debug({ ccAddresses, count: ccAddresses.length }, 'sendOutboundReply: reply-all including CC recipients');
       }
 
       // Strip any existing "Re:" prefix before prepending our own to avoid
@@ -692,17 +1427,50 @@ export class EmailAdapter implements Channel {
         channel: 'email' as const,
         accountId: this.config.accountId,
         to: recipientEmail,
+        ...(additionalTo.length > 0 ? { additionalTo } : {}),
+        // These people never wrote to us: no known-tier contact for them (#2273, ADR-047).
+        ...(latestIsOurs ? { toFromOwnMessage: true } : {}),
         subject: `Re: ${baseSubject}`,
         body,
         replyToMessageId: threadMessage.id,
         htmlQuote,
+        // Who already has the quoted message: its details are not a disclosure to them (#2312).
+        ...(htmlQuote ? { quoteParticipants: quoteParticipants(threadMessage) } : {}),
         ...(ccAddresses.length > 0 ? { cc: ccAddresses } : {}),
       };
+
+      if (outbound.payload.contentBlockSalvage) {
+        await this.saveContentBlockSalvageDraft(sendRequest, {
+          conversationId: outbound.payload.conversationId,
+          taskEventId: outbound.payload.taskEventId,
+        });
+        return;
+      }
+
+      // Provenance is a send option, not a field on sendRequest. A gated send
+      // falls back to a draft, and send-draft must stay outbound_recipient.
+      // addressFromHeader is false when To came from the thread's To list
+      // (the latest message is ours), so that reply does not opt in.
+      const provenance = replyRecipientSource({
+        addressFromHeader: !latestIsOurs,
+        recipient: recipientEmail,
+        selfEmails: ownedMailboxes,
+        headers: threadMessage.headers,
+      });
+      const fromName = provenance
+        ? replyDisplayName(latestIsOurs ? undefined : threadMessage.from[0]?.name, recipientEmail)
+        : undefined;
 
       await this.sendWithGatedDraftFallback(sendRequest, {
         taskEventId: outbound.payload.taskEventId,
         conversationId: outbound.payload.conversationId,
         parentEventId: outbound.id,   // link the outbound.delivered row back to the outbound.message event
+        ...(provenance ? { recipientSource: provenance } : {}),
+        ...(fromName ? { recipientDisplayName: fromName } : {}),
+        // The principal approved this text (dispatcher-relay): do not hold it for review again (#2159).
+        ...(outbound.payload.principalApproved === true ? { humanApproved: true } : {}),
+        // The note queued for the principal from this reply: evidence for the send review (#2312).
+        ...(outbound.payload.reportedToPrincipal ? { reportedToPrincipal: outbound.payload.reportedToPrincipal } : {}),
       });
     } catch (err) {
       logger.error({ err, threadId }, 'Failed to send email reply');
@@ -713,30 +1481,49 @@ export class EmailAdapter implements Channel {
    * Send the reply through the gateway (autonomy gate + blocked-contact +
    * content filter all run inside gateway.send). If the gateway returns
    * gated (autonomy blocked), fall back to creating a draft and linking
-   * the action_log row so the CEO can approve-and-send from the digest.
+   * the action_log row so the principal can approve-and-send from the digest.
    */
   private async sendWithGatedDraftFallback(
     sendRequest: EmailSendRequest,
-    context: { taskEventId?: string; conversationId?: string; parentEventId?: string },
+    context: {
+      taskEventId?: string;
+      conversationId?: string;
+      parentEventId?: string;
+      recipientSource?: 'email_participant';
+      recipientDisplayName?: string;
+      /** The principal approved this exact text (#2159). */
+      humanApproved?: boolean;
+      reportedToPrincipal?: string;
+    },
   ): Promise<void> {
     const { outboundGateway, logger, accountId } = this.config;
 
     // Send through gateway, handle gated fallback.
-    // Pass reExecRecipe so the gateway knows how to re-execute this send on CEO approval:
-    //   skillName: 'send-draft' — the registered skill approve-action will invoke
+    // Pass reExecRecipe so the gateway knows how to re-execute this send on principal approval:
+    //   toolName: 'send-draft' — the registered skill approve-action will invoke
     //   partialPayload: { account } — the draft's account; draft_id is filled in by
     //                                 linkGatedAction() after the draft is created below
     //   description: human-readable label for the pending_approval row + notification
-    const recipientLabel = sendRequest.to;
+    //   askDescription: the same for a personal-data ask (#2312), where either tool records the
+    //                   principal's yes for the thread
+    const recipientLabel = [sendRequest.to, ...(sendRequest.additionalTo ?? [])].join(', ');
     const subjectLabel = sendRequest.subject;
+    const draftLabel = `Draft reply to ${recipientLabel}${subjectLabel ? ` — "${subjectLabel}"` : ''}.`;
     const result = await outboundGateway.send(sendRequest, {
       taskEventId: context.taskEventId,
       conversationId: context.conversationId,
       parentEventId: context.parentEventId,
+      // A relayed reply: the agent's turn is over, so a held approval wakes the coordinator (#2159).
+      postTurn: true,
+      ...(context.humanApproved ? { humanApproved: true } : {}),
+      ...(context.reportedToPrincipal ? { reportedToPrincipal: context.reportedToPrincipal } : {}),
+      ...(context.recipientSource ? { recipientSource: context.recipientSource } : {}),
+      ...(context.recipientDisplayName ? { recipientDisplayName: context.recipientDisplayName } : {}),
       reExecRecipe: {
-        skillName: 'send-draft',
+        toolName: 'send-draft',
         partialPayload: { account: accountId },
-        description: `Draft reply to ${recipientLabel}${subjectLabel ? ` — "${subjectLabel}"` : ''}. Use send-draft to approve.`,
+        description: `${draftLabel} Use send-draft to approve.`,
+        askDescription: `${draftLabel} Approve it with approve-action or send-draft; either records the principal's yes.`,
       },
     });
 
@@ -779,10 +1566,13 @@ export class EmailAdapter implements Channel {
           // linkGatedAction is internally guarded (no-throw), so no outer try/catch needed here.
           // Pass context.taskEventId so linkPayload can scope the update to this specific task,
           // preventing short_ref collisions across tasks from smearing draft_id onto the wrong row.
-          // Only draft_id needs linking — account was already stored in reExecRecipe.partialPayload
-          // at gate time, so the merged payload matches send-draft's expected inputs exactly.
+          // account was already stored in reExecRecipe.partialPayload at gate time. The draft's
+          // subject and body, as created, ride along (#2312): send-draft counts a replay as
+          // principal-approved only when the draft still matches them, and the approval and
+          // approve-action's unseen-details check read the text from them.
           await outboundGateway.linkGatedAction(result.actionRef, context.taskEventId, {
             draft_id: draftResult.draftId,
+            ...(draftResult.draft ? { subject: draftResult.draft.subject, body: draftResult.draft.body } : {}),
           });
         } else {
           // actionRef is absent either because taskEventId was not passed, or because
@@ -812,6 +1602,39 @@ export class EmailAdapter implements Channel {
   }
 
   /**
+   * Save a blocked dispatcher-relayed reply as a draft after rewrite retries are exhausted (#1355).
+   * Skips the send path entirely — createEmailDraft still runs blocked-contact and content-filter checks.
+   */
+  private async saveContentBlockSalvageDraft(
+    sendRequest: EmailSendRequest,
+    context: { taskEventId?: string; conversationId?: string },
+  ): Promise<void> {
+    const { outboundGateway, logger, accountId } = this.config;
+    let draftResult: Awaited<ReturnType<typeof outboundGateway.createEmailDraft>> | undefined;
+    try {
+      draftResult = await outboundGateway.createEmailDraft(sendRequest);
+    } catch (err) {
+      logger.error(
+        { err, accountId, conversationId: context.conversationId },
+        'email-adapter: unexpected error creating content-block salvage draft',
+      );
+      return;
+    }
+
+    if (draftResult?.success && draftResult.draftId) {
+      logger.info(
+        { accountId, draftId: draftResult.draftId, conversationId: context.conversationId },
+        'email-adapter: content-block salvage draft created',
+      );
+    } else if (draftResult && !draftResult.success) {
+      logger.error(
+        { accountId, conversationId: context.conversationId, reason: draftResult.blockedReason },
+        'email-adapter: content-block salvage draft creation failed',
+      );
+    }
+  }
+
+  /**
    * Auto-create contacts from email participants (From/To/CC).
    * Uses source 'email_participant' which is auto-verified per spec.
    * Skips participants that already have a contact record, and skips
@@ -820,7 +1643,7 @@ export class EmailAdapter implements Channel {
    * Rate limits (#36):
    *   - Per-message: at most contactCreationMaxPerMessage new contacts per email
    *   - Per-hour:    at most contactCreationMaxPerHour new contacts per sliding window
-   * When a limit is hit, remaining participants are skipped and a CEO
+   * When a limit is hit, remaining participants are skipped and a principal
    * notification is sent (deduplicated to one per limit type per hour).
    */
   private async extractParticipants(
@@ -886,7 +1709,7 @@ export class EmailAdapter implements Channel {
         // sanitizes to empty (e.g., pure injection text), the email is used instead.
         // primaryEmail is passed so createContact() can route business senders to an
         // existing or new organization KG node instead of minting a person node.
-        const contact = await contactService.createContact({
+        const { contact, kgNodeCreated } = await contactService.createContactWithKgOutcome({
           displayName: p.name || p.email,
           fallbackDisplayName: p.email,
           source: 'email_participant',
@@ -912,7 +1735,11 @@ export class EmailAdapter implements Channel {
         } catch (linkErr) {
           const pgCode = (linkErr as { code?: string }).code;
           try {
-            await contactService.deleteContact(contact.id);
+            // Orphan cleanup. Retire the node only if THIS call minted it: an adopted node
+            // carries facts accrued long before this attempt (ADR-040), and this path runs
+            // per participant on every inbound email — archiving indiscriminately here
+            // would be the highest-traffic way to lose knowledge in the system.
+            await contactService.deleteContact(contact.id, { archiveAnchoredNode: kgNodeCreated });
           } catch (deleteErr) {
             // Include linkErr so both failure modes are co-located in the log entry.
             logger.warn(
@@ -939,7 +1766,7 @@ export class EmailAdapter implements Channel {
       }
     }
 
-    // Send a deduplicated CEO notification for each rate limit type that was hit.
+    // Send a deduplicated principal notification for each rate limit type that was hit.
     // Both caps can fire simultaneously (e.g. per-hour was already at limit when the email
     // arrived and per-message is also reached), so notify for each independently so that
     // the dedup timestamps are updated correctly.
@@ -954,7 +1781,7 @@ export class EmailAdapter implements Channel {
   }
 
   /**
-   * Send a deduplicated CEO notification when contact auto-creation rate limits
+   * Send a deduplicated principal notification when contact auto-creation rate limits
    * are hit. At most one notification per limit type per hour to avoid notification
    * spam during a sustained flood.
    */
@@ -964,7 +1791,8 @@ export class EmailAdapter implements Channel {
     emailSubject: string,
     emailSender: string,
   ): Promise<void> {
-    const { outboundGateway, logger, ceoEmail } = this.config;
+    const { outboundGateway, logger } = this.config;
+    const ceoEmail = resolvePrincipalEmail(this.config.ceoEmail);
     const now = Date.now();
 
     // Dedup: skip if we already sent a notification for this limit type within the last hour
@@ -1001,7 +1829,7 @@ export class EmailAdapter implements Channel {
         ].join('\n'),
       });
       // Commit the dedup timestamp only after a successful send — if the send fails we
-      // allow a retry on the next limit hit rather than silencing the CEO for an hour.
+      // allow a retry on the next limit hit rather than silencing the principal for an hour.
       if (limitType === 'per_message') {
         this.lastNotifiedPerMessage = now;
       } else {

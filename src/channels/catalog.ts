@@ -47,6 +47,58 @@ export const CHANNEL_CATALOG: ChannelDescriptor[] = [
     requiredSecretKeys: ['socket_path', 'phone_number'],
   },
   {
+    name: 'slack',
+    description: 'Slack bot via Socket Mode. DMs and @mentions in the principal\'s workspace.',
+    isToggleable: true,
+    credentialFields: [
+      { key: 'bot_token', label: 'Bot User OAuth Token', secret: true, envFallback: 'SLACK_BOT_TOKEN' },
+      { key: 'app_token', label: 'App-Level Token', secret: true, envFallback: 'SLACK_APP_TOKEN' },
+    ],
+    requiredSecretKeys: ['bot_token', 'app_token'],
+  },
+  {
+    name: 'sms',
+    description: 'SMS via Telnyx Messaging on a dedicated office DID (1:1 text).',
+    isToggleable: true,
+    // Vault-only (no envFallback): Telnyx credentials must live in the encrypted
+    // vault, not .env. The gate resolver and the config overlay both honor this.
+    credentialFields: [
+      { key: 'api_key', label: 'Telnyx API key', secret: true },
+      { key: 'from_number', label: 'Office DID (E.164)', secret: false },
+      {
+        key: 'webhook_public_key',
+        label: 'Telnyx webhook public key',
+        secret: true,
+      },
+    ],
+    requiredSecretKeys: ['api_key', 'from_number', 'webhook_public_key'],
+  },
+  {
+    name: 'voice',
+    description: 'Duplex voice via console WebRTC (LiveKit + STT/TTS).',
+    isToggleable: true,
+    // Vault-only (no envFallback): voice provider credentials must live in the
+    // encrypted vault, not .env.
+    credentialFields: [
+      { key: 'livekit_url', label: 'LiveKit signaling URL (browser ws:// or wss://)', secret: false },
+      { key: 'livekit_api_key', label: 'LiveKit API key', secret: true },
+      { key: 'livekit_api_secret', label: 'LiveKit API secret', secret: true },
+      { key: 'deepgram_api_key', label: 'Deepgram API key', secret: true },
+      { key: 'cartesia_api_key', label: 'Cartesia API key', secret: true },
+      // Not a secret — a voice id from the Cartesia library (play.cartesia.ai).
+      // Required: Cartesia TTS cannot synthesize a reply without it.
+      { key: 'cartesia_voice_id', label: 'Cartesia voice ID', secret: false },
+    ],
+    requiredSecretKeys: [
+      'livekit_url',
+      'livekit_api_key',
+      'livekit_api_secret',
+      'deepgram_api_key',
+      'cartesia_api_key',
+      'cartesia_voice_id',
+    ],
+  },
+  {
     name: 'http',
     description: 'HTTP API channel. Always on — serves the web console and API.',
     isToggleable: false,

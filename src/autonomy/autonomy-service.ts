@@ -4,13 +4,14 @@
 // It maps to one of five bands, each with a behavioral description that is
 // injected into the coordinator's system prompt on every task.
 //
-// Phase 1: CEO-controlled via get-autonomy / set-autonomy skills.
+// Phase 1: principal-controlled via get-autonomy / set-autonomy skills.
 // Phase 2: Hard gates in the execution layer driven by action_risk vs. live score (future).
 // Phase 3: Automatic adjustment based on action log data (future).
 
 import type { Pool } from 'pg';
 import type { Logger } from '../logger.js';
 import type { ActionRisk } from '../skills/types.js';
+import type { AutonomyGating } from './band-policy.js';
 
 export type AutonomyBand =
   | 'full'
@@ -24,6 +25,8 @@ export interface AutonomyConfig {
   band: AutonomyBand;
   updatedAt: Date;
   updatedBy: string;
+  /** Set to 'band' when band gating is live (#2159): the prompt block then describes the band table. */
+  gating?: AutonomyGating;
 }
 
 export interface AutonomyHistoryEntry {
@@ -45,20 +48,58 @@ const BAND_DESCRIPTIONS: Record<AutonomyBand, string> = {
     'checking outweighs the cost of the pause.',
   'spot-check':
     'Proceed on routine tasks. For consequential actions — sending external communications, ' +
-    'creating commitments, or acting on behalf of the CEO — note what you are doing in your ' +
-    'response so the CEO maintains visibility. No need to stop and ask.',
+    'creating commitments, or acting on behalf of the principal — note what you are doing in your ' +
+    'response so the principal maintains visibility. No need to stop and ask.',
   'approval-required':
-    'For any consequential action, present your plan and explicitly ask for confirmation ' +
-    'before proceeding. Routine reporting, summarization, and information retrieval can ' +
-    'proceed without approval. When in doubt, draft and ask.',
+    'A direct instruction from the principal is your approval: carry it out, taking the ' +
+    'conservative default for any detail it leaves open (view-only access, the latest version) ' +
+    'and saying which you chose. Ask first only when the context cannot tell you which of ' +
+    'several things the principal means, such as two equally likely files or people. For ' +
+    'consequential actions you take on your own initiative, present your plan and explicitly ' +
+    'ask for confirmation before proceeding. Routine reporting, summarization, and information ' +
+    'retrieval can proceed without approval.',
   'draft-only':
     'Prepare drafts, plans, and analysis, but do not send, publish, schedule, or act on ' +
-    'behalf of the CEO without an explicit instruction to do so. Surface your work for review; ' +
+    'behalf of the principal without an explicit instruction to do so. Surface your work for review; ' +
     'execution requires a direct go-ahead.',
   'restricted':
     'Present options and analysis only. Take no independent action. All outputs are advisory. ' +
-    'Every step that would have an external effect requires explicit CEO instruction.',
+    'Every step that would have an external effect requires explicit principal instruction.',
 };
+
+// The same bands under `autonomy.gating: band` (#2159, ADR-049), matching the spec's
+// "Behavior by band" table. Injected instead of the descriptions above when band gating is
+// live, so the agent's guidance matches what the gates actually do.
+const BAND_DESCRIPTIONS_BAND_GATING: Record<AutonomyBand, string> = {
+  'full':
+    'Act on the principal\'s behalf, including speaking and committing for them. Put notable ' +
+    'actions in the digest. Ask first only when an outsider seems to be steering you.',
+  'spot-check':
+    'Take on work, coordinate, and speak or commit for the principal without asking. Every ' +
+    'claim about the principal is fact-checked against what you looked up before it is sent, so ' +
+    'look things up rather than recall them. Report what you did in the digest.',
+  'approval-required':
+    'Take on work and coordinate (logistics, confirmations, replies, bringing people in) without ' +
+    'asking. Ask the principal first before you speak for them or commit them to anything.',
+  'draft-only':
+    'Draft rather than send. The principal confirms new work with one tap; internal logistics ' +
+    'within confirmed work can proceed. Surface drafts and asks in the digest.',
+  'restricted':
+    'Propose and draft only. Take no action with an external effect.',
+};
+
+// Under band gating the outbound gateway rules on each personal detail a send carries (#2312,
+// ADR-054), so the drafter writes what was asked and the gateway decides. Without this the
+// LOW-TRUST and trust-score rules have the drafter withhold the detail before review sees it.
+// The LOW-TRUST block (src/agents/runtime.ts) and the trust-score table
+// (src/security/security-context.ts) point here by this heading.
+export const PERSONAL_DETAILS_RULE =
+  '**Personal details.** When someone asks for the principal\'s details (a phone number, email ' +
+  'address, home address, SIN, health card or similar), or the principal or a trusted contact ' +
+  'tells you to send them, write the details asked for in your message, as they are. Do not ' +
+  'decline, withhold or paraphrase them because of the sender\'s tier or trust score: the ' +
+  'outbound gateway reviews each detail against who authorized it, and sends it, holds it for ' +
+  'the principal\'s yes, or returns your draft with a reason. Follow that reason.';
 
 // Human-readable band labels for display.
 const BAND_LABELS: Record<AutonomyBand, string> = {
@@ -73,15 +114,17 @@ export class AutonomyService {
   constructor(
     private readonly pool: Pool,
     private readonly logger: Logger,
+    /** Band gating (#2159): stamped on every config read so the prompt block follows it. Default tier. */
+    private readonly opts: { gating?: AutonomyGating } = {},
   ) {}
 
   /**
    * Resolve an action_risk label (or raw number) to the minimum autonomy score
-   * required before that skill may run without explicit CEO approval.
+   * required before that skill may run without explicit principal approval.
    *
    * Used by Phase 2 gate wiring in the execution layer to enforce autonomy-aware
    * skill access. Callers should validate numeric values are in [0, 100] at
-   * skill load time (see SkillRegistry.register) before calling this.
+   * skill load time (see ToolRegistry.register) before calling this.
    */
   static minScoreForActionRisk(risk: ActionRisk): number {
     if (typeof risk === 'number') return risk;
@@ -91,7 +134,7 @@ export class AutonomyService {
       case 'medium':   return 70;
       case 'high':     return 80;
       case 'critical': return 90;
-      // Defense in depth: SkillRegistry.register() should reject unknown labels at load
+      // Defense in depth: ToolRegistry.register() should reject unknown labels at load
       // time, but guard here in case this helper is called outside the registry path.
       default: throw new Error(`Unknown action_risk label: "${String(risk)}"`);
     }
@@ -106,9 +149,19 @@ export class AutonomyService {
     return 'restricted';
   }
 
-  /** Return the behavioral description for a band. */
-  static bandDescription(band: AutonomyBand): string {
-    return BAND_DESCRIPTIONS[band];
+  /** Return the behavioral description for a band, under the given gating (default tier). */
+  static bandDescription(band: AutonomyBand, gating: AutonomyGating = 'tier'): string {
+    return gating === 'band' ? BAND_DESCRIPTIONS_BAND_GATING[band] : BAND_DESCRIPTIONS[band];
+  }
+
+  /**
+   * Which agents receive the autonomy service (and therefore per-task band injection).
+   * The coordinator needs it for delegation/approval gating; ceo-inbox needs it so its
+   * draft-vs-punt aggressiveness tracks the live band (spec 14 checklist / ADR-029).
+   * Single source of truth so src/index.ts wiring and its test can't drift apart.
+   */
+  static receivesInjection(agent: { name: string; role?: string }): boolean {
+    return agent.role === 'coordinator' || agent.name === 'ceo-inbox';
   }
 
   /**
@@ -117,7 +170,7 @@ export class AutonomyService {
    */
   static formatPromptBlock(config: AutonomyConfig): string {
     const label = BAND_LABELS[config.band];
-    const description = BAND_DESCRIPTIONS[config.band];
+    const description = AutonomyService.bandDescription(config.band, config.gating);
     if (!label || !description) {
       // Unknown band — fail safe rather than injecting 'undefined' into the system prompt.
       throw new Error(`Unknown autonomy band: '${config.band}'`);
@@ -128,6 +181,7 @@ export class AutonomyService {
       `Your current autonomy score is ${config.score} (${label}).`,
       '',
       description,
+      ...(config.gating === 'band' ? ['', PERSONAL_DETAILS_RULE] : []),
     ].join('\n');
   }
 
@@ -149,6 +203,8 @@ export class AutonomyService {
         band: row.band as AutonomyBand,
         updatedAt: row.updated_at,
         updatedBy: row.updated_by,
+        // Only under band, so a tier config reads exactly as it did before #2159.
+        ...(this.opts.gating === 'band' ? { gating: 'band' as const } : {}),
       };
     } catch (err) {
       // Only swallow missing-table errors (pg code 42P01) — the expected pre-migration state.
@@ -213,7 +269,10 @@ export class AutonomyService {
 
     this.logger.info({ score, band, changedBy, previousScore }, 'Autonomy score updated');
 
-    return { score, band, updatedAt: new Date(), updatedBy: changedBy, previousScore };
+    return {
+      score, band, updatedAt: new Date(), updatedBy: changedBy, previousScore,
+      ...(this.opts.gating === 'band' ? { gating: 'band' as const } : {}),
+    };
   }
 
   /** Return the most recent history entries, newest first. */
@@ -249,7 +308,10 @@ export class AutonomyService {
   async getScoredActionCount(): Promise<number> {
     try {
       const result = await this.pool.query<{ count: string }>(
-        `SELECT COUNT(*) AS count FROM autonomy_action_log WHERE scored_by IS NOT NULL`,
+        // Sample-pool rows carry scored_by from the moment they are written but have no verdict
+        // until the principal gives one (#2159 Phase 3); they are not scored actions yet.
+        `SELECT COUNT(*) AS count FROM autonomy_action_log
+         WHERE scored_by IS NOT NULL AND scored_by <> 'sample-pool'`,
       );
       return parseInt(result.rows[0]!.count, 10);
     } catch (err) {

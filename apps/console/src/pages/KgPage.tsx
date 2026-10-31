@@ -7,24 +7,22 @@ import { Sidebar } from '../components/Sidebar.js';
 import { Topbar, TopbarSearch, TopbarDivider } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
+import {
+  emptyFilter, filterOptions, isFilterActive, matchesFilter, normalizeSensitivity, toggleFilterValue,
+} from './kg-filters.js';
+import type { KgFilter, KgFilterAxis, KgFilterable } from './kg-filters.js';
+import { TYPE_BADGE, SENS_BADGE } from './kg-types.js';
+import type { ApiKgNode } from './kg-types.js';
+import { MergeNodesDialog } from './MergeNodesDialog.js';
+import type { NodeMergeResult } from './kg-merge-types.js';
+import {
+  applyMergeToNodeList, mergeAvailability, mergedIntoFrom, mergedIntoNotice, mergeResultNotes, mergeSuccessMessage,
+} from './kg-merge-utils.js';
 
 // Register fcose layout plugin once at module scope.
 cytoscape.use(fcose);
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-
-interface ApiKgNode {
-  id: string;
-  label: string;
-  type: string;
-  confidence: number;
-  decayClass: string;
-  sensitivity: string;
-  properties: Record<string, unknown>;
-  source: string;
-  createdAt: string;
-  lastConfirmedAt: string;
-}
 
 interface ApiKgEdge {
   id: string;
@@ -35,6 +33,13 @@ interface ApiKgEdge {
 }
 
 type ColorMode = 'type' | 'sensitivity' | 'decay';
+
+/** The page banner after a merge or a merged-node redirect. */
+interface KgBanner {
+  text: string;
+  /** Follow-up notes (post-commit merge warnings); the banner turns amber when present. */
+  notes?: string[];
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -49,25 +54,6 @@ const DECAY_COLORS: Record<string, string> = {
   permanent:  '#5E9E6B',
   slow_decay: '#4174C8',
   fast_decay: '#E86040',
-};
-
-// Badge CSS classes for node type in the detail drawer.
-const TYPE_BADGE: Record<string, string> = {
-  person:       'badge badge-kg-person',
-  organization: 'badge badge-kg-organization',
-  project:      'badge badge-kg-project',
-  decision:     'badge badge-kg-decision',
-  event:        'badge badge-kg-event',
-  concept:      'badge badge-kg-concept',
-  fact:         'badge badge-kg-fact',
-};
-
-// Badge CSS classes for sensitivity level in the detail drawer.
-const SENS_BADGE: Record<string, string> = {
-  public:       'badge badge-kg-public',
-  internal:     'badge badge-kg-internal',
-  confidential: 'badge badge-kg-confidential',
-  restricted:   'badge badge-kg-restricted',
 };
 
 // Edge types that represent close structural relationships — their pairs should
@@ -91,19 +77,20 @@ const DECAY_SCORE: Record<string, number> = {
 // nearby. High-traffic entity types need more space to avoid crowding.
 function nodeRepulsionFn(node: cytoscape.NodeSingular): number {
   const type = node.data('type') as string;
-  if (type === 'fact') return 1_000;
-  if (type === 'person' || type === 'organization' || type === 'event') return 7_500;
-  return 4_500; // project, decision, concept — fCoSE default
+  if (type === 'fact') return 3_000;
+  if (type === 'person' || type === 'organization' || type === 'event') return 20_000;
+  return 12_000; // project, decision, concept
 }
 
 // Fact edges stay short so attributes cluster against their parent entity.
-// Strong relationship pairs sit visually adjacent; generic edges settle at 80px.
+// Strong relationship pairs sit visually adjacent; generic edges settle at 150px.
+// Lengths are sized against the 90px label width so neighbours' labels don't collide.
 function idealEdgeLengthFn(edge: cytoscape.EdgeSingular): number {
   const srcType = edge.source().data('type') as string;
   const tgtType = edge.target().data('type') as string;
-  if (srcType === 'fact' || tgtType === 'fact') return 40;
-  if (STRONG_EDGES.has(edge.data('label') as string)) return 60;
-  return 80;
+  if (srcType === 'fact' || tgtType === 'fact') return 70;
+  if (STRONG_EDGES.has(edge.data('label') as string)) return 110;
+  return 150;
 }
 
 // Strong relationships attract hard (0.9). For others: weight by confidence
@@ -117,12 +104,25 @@ function edgeElasticityFn(edge: cytoscape.EdgeSingular): number {
   return Math.max(0.1, conf * Math.min(srcScore, tgtScore) * 0.7);
 }
 
+// Shared spacing options. nodeDimensionsIncludeLabels makes fCoSE treat each
+// node's label as part of its footprint, which is what stops labels overlapping;
+// the lower gravity lets components spread instead of being pulled into a ball.
+// 'proof' quality is the documented requirement for both
+// nodeDimensionsIncludeLabels and the expansion layout's randomize: false;
+// its slower cooling also settles the spread-out layout more fully.
+const FCOSE_SPACING = {
+  quality: 'proof',
+  nodeDimensionsIncludeLabels: true,
+  nodeSeparation: 120,
+  gravity: 0.1,
+};
+
 // fcose layout options per the issue spec.
 const FCOSE_FULL = {
   name: 'fcose',
   animate: false,
   fit: true,
-  nodeSeparation: 80,
+  ...FCOSE_SPACING,
   randomize: true,
   idealEdgeLength: idealEdgeLengthFn,
   nodeRepulsion: nodeRepulsionFn,
@@ -133,7 +133,7 @@ const FCOSE_EXPAND = {
   name: 'fcose',
   animate: true,
   fit: false,
-  nodeSeparation: 80,
+  ...FCOSE_SPACING,
   randomize: false,
   animationDuration: 400,
   idealEdgeLength: idealEdgeLengthFn,
@@ -181,6 +181,8 @@ const CY_STYLE = [
   { selector: 'node[type="fact"]:selected', style: { 'font-size': 9 } },
   // Focal node: white border on the most recently tapped node.
   { selector: 'node.focal', style: { 'border-width': 3, 'border-color': '#FAFAFA', 'border-opacity': 0.9 } },
+  // Filter panel (#351): display:none also hides every edge touching the node.
+  { selector: 'node.filtered-out', style: { display: 'none' } },
   {
     selector: 'edge',
     style: {
@@ -210,11 +212,16 @@ function nodeToElement(n: ApiKgNode): cytoscape.ElementDefinition {
       type: n.type,
       confidence: n.confidence ?? 0.5,
       decayClass: n.decayClass || 'permanent',
-      sensitivity: n.sensitivity || 'internal',
+      sensitivity: normalizeSensitivity(n.sensitivity),
       properties: n.properties ?? {},
       source: n.source ?? '',
       createdAt: n.createdAt ?? '',
       lastConfirmedAt: n.lastConfirmedAt ?? '',
+      // Carried so a tapped node (whose data() becomes selectedNode) still has
+      // them for the drawer and the merge dialog.
+      aliases: n.aliases ?? [],
+      archived: n.archived === true,
+      ...(n.identitySource ? { identitySource: n.identitySource } : {}),
       degree: 0, // updated by updateDegrees()
     },
   };
@@ -256,6 +263,36 @@ function applyColorMode(cy: cytoscape.Core, mode: ColorMode) {
   }
 }
 
+// Hide nodes that don't match the filter (their edges follow) and show the
+// rest. Runs after every cy.add() so expanded nodes respect active filters.
+function applyFilter(cy: cytoscape.Core, filter: KgFilter) {
+  cy.batch(() => {
+    cy.nodes().forEach(node => {
+      const visible = matchesFilter(
+        { type: node.data('type') as string, sensitivity: node.data('sensitivity') as string },
+        filter,
+      );
+      node.toggleClass('filtered-out', !visible);
+    });
+  });
+}
+
+// Re-apply the active filter and report the canvas's type/sensitivity mix for
+// the checklist options. Call after every add/remove of elements.
+function syncFilter(cy: cytoscape.Core, filter: KgFilter, setFacets: (f: KgFilterable[]) => void) {
+  applyFilter(cy, filter);
+  setFacets(cy.nodes().map(n => ({
+    type: n.data('type') as string,
+    sensitivity: n.data('sensitivity') as string,
+  })));
+}
+
+function graphStatus(cy: cytoscape.Core): string {
+  const hidden = cy.nodes('.filtered-out').length;
+  const base = `${cy.nodes().length} nodes · ${cy.edges().length} edges`;
+  return hidden > 0 ? `${base} · ${hidden} hidden by filters` : base;
+}
+
 async function errorMessage(res: Response): Promise<string> {
   const ct = res.headers.get('content-type') ?? '';
   if (ct.includes('application/json')) {
@@ -269,6 +306,28 @@ async function errorMessage(res: Response): Promise<string> {
   return `HTTP ${res.status}`;
 }
 
+// A /api/kg/graph 404 body: the message to show, and the survivor when the node
+// was merged away (`code: 'node_merged'`, design §10.4).
+async function notFoundInfo(res: Response): Promise<{ message: string; merged: ReturnType<typeof mergedIntoFrom> }> {
+  const ct = res.headers.get('content-type') ?? '';
+  if (ct.includes('application/json')) {
+    try {
+      const d = await res.json() as { error?: unknown };
+      return {
+        message: typeof d.error === 'string' && d.error ? d.error : `HTTP ${res.status}`,
+        merged: mergedIntoFrom(d),
+      };
+    } catch (err) {
+      console.error('[notFoundInfo] failed to parse JSON error body:', err);
+    }
+  }
+  return { message: `HTTP ${res.status}`, merged: null };
+}
+
+// How many merged-into redirects a single load follows before giving up — a
+// guard against a (corrupt) merged_into cycle.
+const MAX_MERGE_REDIRECTS = 3;
+
 function fmtDate(iso: string): string {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -281,12 +340,14 @@ function fmtDate(iso: string): string {
 interface NodeDetailDrawerProps {
   node: ApiKgNode;
   onClose: () => void;
+  onMerge: () => void;
 }
 
-function NodeDetailDrawer({ node, onClose }: NodeDetailDrawerProps) {
+function NodeDetailDrawer({ node, onClose, onMerge }: NodeDetailDrawerProps) {
   const typeBadgeClass = TYPE_BADGE[node.type] ?? 'badge badge-kg-fact';
   const sensBadgeClass = SENS_BADGE[node.sensitivity] ?? 'badge badge-kg-internal';
   const propEntries = Object.entries(node.properties ?? {});
+  const merge = mergeAvailability(node);
 
   return (
     <div className="kg-detail-drawer">
@@ -358,6 +419,19 @@ function NodeDetailDrawer({ node, onClose }: NodeDetailDrawerProps) {
           </div>
         )}
       </div>
+
+      {merge.visible && (
+        <div className="drawer-footer">
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={onMerge}
+            disabled={merge.disabled}
+            title={merge.reason ?? 'Merge this node with a duplicate'}
+          >
+            Merge…
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -384,12 +458,22 @@ export default function KgPage() {
   const [search, setSearch] = useState(initialQ ?? '');
   const [selectedNode, setSelectedNode] = useState<ApiKgNode | null>(null);
   const [colorMode, setColorMode] = useState<ColorMode>('type');
+  const [filter, setFilter] = useState<KgFilter>(emptyFilter);
+  // type/sensitivity of every node on the canvas — feeds the filter checklists.
+  const [canvasFacets, setCanvasFacets] = useState<KgFilterable[]>([]);
   const [status, setStatus] = useState('');
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Node merge (#2233): the node the dialog was opened from, and the page banner
+  // shown after a merge or a merged-node redirect.
+  const [mergeFrom, setMergeFrom] = useState<ApiKgNode | null>(null);
+  const [banner, setBanner] = useState<KgBanner | null>(null);
 
   // Track color mode in a ref so the cytoscape event handlers can read the
   // latest value without capturing a stale closure.
   const colorModeRef = useRef<ColorMode>('type');
+  // Same reason for the filter: renderGraph/expandNeighborhood run from the
+  // mount-time tap handler and must apply the current filter to new nodes.
+  const filterRef = useRef<KgFilter>(emptyFilter());
 
   // Mirror search state in a ref so the single-mount Cytoscape tap handler
   // can always read the current value without a stale closure.
@@ -447,7 +531,7 @@ export default function KgPage() {
       const data = await res.json() as { nodes: ApiKgNode[]; edges: ApiKgEdge[] };
       if (cy.destroyed()) return;
       renderGraph(cy, data);
-      setStatus(`${data.nodes.length} nodes · ${data.edges.length} edges`);
+      setStatus(graphStatus(cy));
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error('[KgPage] hero graph load failed:', err);
@@ -468,16 +552,26 @@ export default function KgPage() {
     cy.resize();
     cy.layout(FCOSE_FULL as unknown as cytoscape.LayoutOptions).run();
     applyColorMode(cy, colorModeRef.current);
+    syncFilter(cy, filterRef.current, setCanvasFacets);
   }
 
   // ── Load a node's neighborhood and replace canvas ─────────────────────────
 
-  async function loadNeighborhood(nodeId: string) {
+  type NeighborhoodLoadResult =
+    | { ok: true }
+    | { ok: false; aborted: true }
+    | { ok: false; aborted?: false; notFoundMessage?: string };
+
+  /**
+   * Returns ok:false when the node was not found (or the load failed before render).
+   * A node that was merged away is followed to its survivor (§10.4).
+   */
+  async function loadNeighborhood(nodeId: string, redirects = 0): Promise<NeighborhoodLoadResult> {
     const cy = cyRef.current;
     if (!cy) {
       console.error('[KgPage] loadNeighborhood called before Cytoscape was initialized');
       setStatus('Graph not ready — please refresh');
-      return;
+      return { ok: false };
     }
     neighborhoodAbortRef.current?.abort();
     const controller = new AbortController();
@@ -488,9 +582,28 @@ export default function KgPage() {
         `/api/kg/graph?node_id=${encodeURIComponent(nodeId)}&depth=2`,
         { signal: controller.signal },
       );
+      if (res.status === 404) {
+        // Drop the dead deep-link so refresh does not re-hit the same 404 (#1881).
+        const { message: notFoundMessage, merged } = await notFoundInfo(res);
+        // Body read can lose a race with a newer click that aborted this controller.
+        if (controller.signal.aborted) return { ok: false, aborted: true };
+        if (merged && merged.mergedInto !== nodeId && redirects < MAX_MERGE_REDIRECTS) {
+          // Name the node the user opened, not an intermediate hop of a chain
+          // (expandNeighborhood sets its own notice before redirecting).
+          if (redirects === 0) {
+            const label = merged.label ?? (cy.getElementById(nodeId).data('label') as string | undefined) ?? null;
+            setBanner({ text: mergedIntoNotice(label) });
+          }
+          return loadNeighborhood(merged.mergedInto, redirects + 1);
+        }
+        setSelectedNode(null);
+        syncUrl(searchRef.current, undefined);
+        setStatus(notFoundMessage);
+        return { ok: false, notFoundMessage };
+      }
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as { nodes: ApiKgNode[]; edges: ApiKgEdge[] };
-      if (cy.destroyed()) return;
+      if (cy.destroyed()) return { ok: false };
       renderGraph(cy, data);
       // Animate the viewport to center on the focal node after the layout settles.
       const focalEl = cy.getElementById(nodeId);
@@ -506,11 +619,16 @@ export default function KgPage() {
       syncUrl(searchRef.current, focused?.id);
       cy.elements().removeClass('focal');
       if (focused) cy.getElementById(focused.id).addClass('focal');
-      setStatus(`${data.nodes.length} nodes · ${data.edges.length} edges`);
+      setStatus(graphStatus(cy));
+      return { ok: true };
     } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') return;
+      // Another load took over neighborhoodAbortRef — do not hero-fallback (#1881 review).
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return { ok: false, aborted: true };
+      }
       console.error('[KgPage] neighborhood load failed:', err);
       setStatus(`Failed to load: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      return { ok: false };
     }
   }
 
@@ -528,6 +646,28 @@ export default function KgPage() {
         `/api/kg/graph?node_id=${encodeURIComponent(nodeId)}&depth=1`,
         { signal: controller.signal },
       );
+      if (res.status === 404) {
+        // onetap already selected this node and wrote ?node= — clear the stale
+        // element, selection, and URL so the user cannot re-tap the same dead id (#1881).
+        const { message: notFoundMessage, merged } = await notFoundInfo(res);
+        if (controller.signal.aborted) return;
+        const staleLabel = cy.destroyed() ? null : (cy.getElementById(nodeId).data('label') as string | undefined) ?? null;
+        if (!cy.destroyed()) {
+          cy.getElementById(nodeId).remove();
+          updateDegrees(cy);
+          syncFilter(cy, filterRef.current, setCanvasFacets);
+        }
+        if (merged && merged.mergedInto !== nodeId) {
+          // Merged since the canvas loaded: follow it to the survivor.
+          setBanner({ text: mergedIntoNotice(merged.label ?? staleLabel) });
+          void loadNeighborhood(merged.mergedInto, 1);
+          return;
+        }
+        setSelectedNode(null);
+        syncUrl(searchRef.current, undefined);
+        setStatus(notFoundMessage);
+        return;
+      }
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as { nodes: ApiKgNode[]; edges: ApiKgEdge[] };
 
@@ -541,6 +681,7 @@ export default function KgPage() {
         cy.add(newElements);
         updateDegrees(cy);
         applyColorMode(cy, colorModeRef.current);
+        syncFilter(cy, filterRef.current, setCanvasFacets);
         // randomize: false warms fCoSE from current positions without hard-pinning
         // existing nodes, so the graph re-settles globally instead of squeezing
         // new nodes into whatever gaps remain.
@@ -550,7 +691,7 @@ export default function KgPage() {
       cy.elements().removeClass('focal');
       cy.getElementById(nodeId).addClass('focal');
 
-      setStatus(`${cy.nodes().length} nodes · ${cy.edges().length} edges`);
+      setStatus(graphStatus(cy));
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error('[KgPage] expand failed:', err);
@@ -573,6 +714,9 @@ export default function KgPage() {
     cyRef.current = cy;
 
     cy.on('onetap', 'node', evt => {
+      // A merge/redirect notice describes the node it was shown for — drop it when the
+      // user opens another one. A redirect from this tap sets its own notice afterwards.
+      setBanner(null);
       const nodeData = evt.target.data() as ApiKgNode;
       void expandNeighborhood(evt.target.id());
       setSelectedNode(nodeData);
@@ -609,15 +753,25 @@ export default function KgPage() {
 
     if (initialNode) {
       // Restore ?node= from URL via loadNeighborhood, which handles render,
-      // focal class, viewport centering, and URL sync in one shot.
-      void loadNeighborhood(initialNode);
+      // focal class, viewport centering, and URL sync in one shot. On 404 the
+      // dead id is cleared from the URL; fall back to the hero graph so the
+      // user sees a graph with the not-found status rather than a blank canvas (#1881).
+      // Skip fallback when this load was aborted by a newer click (do not steal the canvas).
+      void (async () => {
+        const result = await loadNeighborhood(initialNode);
+        if (!result.ok && !result.aborted && result.notFoundMessage) {
+          await loadHeroGraph();
+          // loadHeroGraph overwrites status — restore the actionable not-found message.
+          setStatus(result.notFoundMessage);
+        }
+      })();
     } else {
       // Default view: focus on the principal's KG node so the graph opens on
       // a meaningful starting point. Falls back to the hero graph if the
       // principal has no linked KG node or the contacts fetch fails.
       void (async () => {
         try {
-          const res = await apiFetch('/api/kg/contacts');
+          const res = await apiFetch('/api/contacts');
           if (res.ok) {
             const { contacts } = await res.json() as { contacts: Array<{
               systemRole: string | null;
@@ -625,8 +779,9 @@ export default function KgPage() {
             }> };
             const principal = contacts.find(c => c.systemRole === 'principal');
             if (principal?.kgNodeId) {
-              await loadNeighborhood(principal.kgNodeId);
-              return;
+              const result = await loadNeighborhood(principal.kgNodeId);
+              // Success, or aborted because the user already started another load — leave it.
+              if (result.ok || result.aborted) return;
             }
           } else {
             console.error('[KgPage] principal node lookup: contacts fetch failed with status', res.status);
@@ -650,6 +805,44 @@ export default function KgPage() {
     if (cy) applyColorMode(cy, mode);
   }
 
+  // ── Filter panel ───────────────────────────────────────────────────────────
+
+  function updateFilter(next: KgFilter) {
+    setFilter(next);
+    filterRef.current = next;
+    const cy = cyRef.current;
+    if (cy) {
+      applyFilter(cy, next);
+      setStatus(graphStatus(cy));
+    }
+  }
+
+  const options = filterOptions(canvasFacets, filter);
+  const filterActive = isFilterActive(filter);
+  // Search results respect the filter too, so the list never offers a node
+  // the canvas would hide.
+  const visibleSidebarNodes = sidebarNodes.filter(n =>
+    matchesFilter({ type: n.type, sensitivity: normalizeSensitivity(n.sensitivity) }, filter));
+
+  function renderFilterAxis(axis: KgFilterAxis, legend: string, opts: typeof options.types) {
+    return (
+      <fieldset className="kg-filter-axis">
+        <legend>{legend}</legend>
+        {opts.map(opt => (
+          <label key={opt.value} className="kg-filter-option">
+            <input
+              type="checkbox"
+              checked={filter[axis].has(opt.value)}
+              onChange={() => updateFilter(toggleFilterValue(filterRef.current, axis, opt.value))}
+            />
+            <span className="kg-filter-option-name">{opt.value}</span>
+            <span className="kg-filter-option-count">{opt.count}</span>
+          </label>
+        ))}
+      </fieldset>
+    );
+  }
+
   // ── Sidebar search ─────────────────────────────────────────────────────────
 
   function handleSearch(q: string) {
@@ -660,6 +853,41 @@ export default function KgPage() {
   function submitSearch() {
     syncUrl(search, selectedNode?.id);
     void loadSidebarNodes(search);
+  }
+
+  // ── Node merge (#2233) ─────────────────────────────────────────────────────
+
+  async function handleMerged(result: NodeMergeResult, labels: { absorbed: string; survivor: string }) {
+    setMergeFrom(null);
+    setSidebarNodes(prev => applyMergeToNodeList(prev, result));
+    const notes = mergeResultNotes(result.warnings);
+    setBanner({ text: mergeSuccessMessage(labels.absorbed, labels.survivor), ...(notes.length > 0 ? { notes } : {}) });
+    // Take the archived node off the canvas now (its edges go with it), so it
+    // is gone even if the reload below fails.
+    const cy = cyRef.current;
+    if (cy && !cy.destroyed()) {
+      cy.getElementById(result.absorbedId).remove();
+      cy.getElementById(result.survivorId).data('label', result.node.label);
+      updateDegrees(cy);
+      syncFilter(cy, filterRef.current, setCanvasFacets);
+      setStatus(graphStatus(cy));
+    }
+    // Re-render around the survivor; this also selects it and syncs ?node=.
+    const loaded = await loadNeighborhood(result.survivorId);
+    if (!loaded.ok && !loaded.aborted) {
+      // The merge committed even if the reload failed — still show the survivor.
+      setSelectedNode(result.node);
+      syncUrl(searchRef.current, result.survivorId);
+    }
+  }
+
+  // The apply request may or may not have committed (network or gateway
+  // error). Refresh the list and the canvas so the user can see which: if it
+  // did, the reload follows the absorbed node's redirect to the survivor.
+  function handleMergeOutcomeUnknown() {
+    void loadSidebarNodes(searchRef.current);
+    const focusId = selectedNode?.id ?? mergeFrom?.id;
+    if (focusId) void loadNeighborhood(focusId);
   }
 
   // ── Drawer close ───────────────────────────────────────────────────────────
@@ -722,21 +950,36 @@ export default function KgPage() {
                   />
                   <button onClick={submitSearch}>Search</button>
                 </div>
+                <details className="kg-filters" open>
+                  <summary>
+                    Filters{filterActive ? ` (${filter.types.size + filter.sensitivities.size})` : ''}
+                    {filterActive && (
+                      <button
+                        className="kg-filters-clear"
+                        onClick={e => { e.preventDefault(); updateFilter(emptyFilter()); }}
+                      >
+                        Clear filters
+                      </button>
+                    )}
+                  </summary>
+                  {renderFilterAxis('types', 'Type', options.types)}
+                  {renderFilterAxis('sensitivities', 'Sensitivity', options.sensitivities)}
+                </details>
                 <div className="kg-sidebar-list">
                   {loadError ? (
                     <p style={{ fontSize: 12, color: 'var(--app-destructive)', margin: 0 }}>
                       {loadError}
                     </p>
-                  ) : sidebarNodes.length === 0 ? (
+                  ) : visibleSidebarNodes.length === 0 ? (
                     <p style={{ fontSize: 12, color: 'var(--app-fg-muted)', margin: 0 }}>
-                      No matching nodes.
+                      {sidebarNodes.length > 0 ? 'No nodes match the active filters.' : 'No matching nodes.'}
                     </p>
                   ) : (
-                    sidebarNodes.map(node => (
+                    visibleSidebarNodes.map(node => (
                       <button
                         key={node.id}
                         className="kg-node-card"
-                        onClick={() => void loadNeighborhood(node.id)}
+                        onClick={() => { setBanner(null); void loadNeighborhood(node.id); }}
                         title={`Load ${node.label}'s neighborhood`}
                       >
                         <div className="kg-node-card-label">{node.label}</div>
@@ -776,6 +1019,28 @@ export default function KgPage() {
                   </button>
                   {status && <span className="kg-status">{status}</span>}
                 </div>
+                {banner && (
+                  <div className={`kg-merge-banner${banner.notes?.length ? ' is-warn' : ''}`} role="status">
+                    <div className="kg-merge-banner-body">
+                      <span>{banner.text}</span>
+                      {banner.notes && banner.notes.length > 0 && (
+                        <ul className="kg-merge-banner-notes">
+                          {banner.notes.map(n => <li key={n}>{n}</li>)}
+                        </ul>
+                      )}
+                    </div>
+                    <button
+                      className="kg-merge-banner-close"
+                      onClick={() => setBanner(null)}
+                      aria-label="Dismiss"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                        <line x1="6" y1="6" x2="18" y2="18" />
+                        <line x1="18" y1="6" x2="6" y2="18" />
+                      </svg>
+                    </button>
+                  </div>
+                )}
                 <div className="kg-canvas" ref={containerRef} />
               </div>
 
@@ -785,6 +1050,16 @@ export default function KgPage() {
                   key={selectedNode.id}
                   node={selectedNode}
                   onClose={handleDrawerClose}
+                  onMerge={() => setMergeFrom(selectedNode)}
+                />
+              )}
+              {mergeFrom && (
+                <MergeNodesDialog
+                  key={mergeFrom.id}
+                  node={mergeFrom}
+                  onClose={() => setMergeFrom(null)}
+                  onMerged={(result, labels) => void handleMerged(result, labels)}
+                  onOutcomeUnknown={handleMergeOutcomeUnknown}
                 />
               )}
             </div>

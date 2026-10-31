@@ -1,0 +1,382 @@
+import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
+import { ConfigStore } from '../../../../src/memory/config-store.js';
+import type { Logger } from '../../../../src/logger.js';
+import { CONFIG_NAMESPACE as VOICE_NS, DISMISSED_KEY } from '../voice-learn/handler.js';
+import {
+  readVoiceProposal,
+  writeVoiceProposal,
+  readNumberedCompletionDigest,
+  writeCompletionDigest,
+  writeDigestHighWater,
+  maxDigestNumber,
+  pruneExpiredCompletionDigest,
+  type CompletionDigestItem,
+  type CompletionDigestMap,
+} from '../../../_shared/learning-state.js';
+
+const ACTIONS = [
+  'approve_voice',
+  'dismiss_voice',
+  'undo_completion',
+  'confirm_completion',
+  'dismiss_completion',
+] as const;
+type DigestAction = (typeof ACTIONS)[number];
+
+function isDigestAction(action: string): action is DigestAction {
+  return (ACTIONS as readonly string[]).includes(action);
+}
+
+/**
+ * Resolve a completion-digest task id. Exact key wins; otherwise a unique
+ * prefix of a digest map key is accepted (humans/LLMs often relay the first
+ * 8 chars of the UUID). Ambiguous prefixes fail closed with the candidates
+ * named — never a silent pick.
+ */
+export function resolveDigestTaskId(
+  digestMap: CompletionDigestMap,
+  taskId: string,
+): { ok: true; taskId: string } | { ok: false; error: string } {
+  if (Object.hasOwn(digestMap, taskId)) {
+    return { ok: true, taskId };
+  }
+
+  const matches = Object.keys(digestMap).filter((key) => key.startsWith(taskId));
+  if (matches.length === 1) {
+    return { ok: true, taskId: matches[0]! };
+  }
+  if (matches.length > 1) {
+    const named = matches
+      .map((id) => {
+        const title = digestMap[id]?.taskTitle?.trim();
+        return title ? `${id} (${title})` : id;
+      })
+      .join(', ');
+    return {
+      ok: false,
+      error: `Ambiguous task_id prefix '${taskId}' matches multiple digest items: ${named}`,
+    };
+  }
+
+  // No prefix hit — keep the caller id so the existing "No actionable …" path fires.
+  return { ok: true, taskId };
+}
+
+/**
+ * Resolve a completion-digest item by the number the principal replied with ("confirm task 2").
+ * `digestMap` must already be numbered (assignDigestNumbers). An unknown number fails closed and
+ * names the valid ones, so the coordinator can ask the principal instead of guessing.
+ */
+export function resolveDigestNumber(
+  digestMap: CompletionDigestMap,
+  n: number,
+): { ok: true; taskId: string } | { ok: false; error: string } {
+  const hit = Object.entries(digestMap).find(([, item]) => item.n === n);
+  if (hit) return { ok: true, taskId: hit[0] };
+  const valid = Object.values(digestMap)
+    .map((item) => item.n)
+    .filter((v): v is number => v !== undefined)
+    .sort((a, b) => a - b);
+  return {
+    ok: false,
+    error:
+      valid.length > 0
+        ? `No digest item is numbered ${n}. Valid numbers: ${valid.join(', ')}. Ask the principal which one they meant.`
+        : `No digest item is numbered ${n}: no completion items are pending. Ask the principal what they meant.`,
+  };
+}
+
+/**
+ * How a success `detail` names the item acted on: its task title, or the note when the title is
+ * blank. Numbers are reused only once the digest empties (the high-water mark covers a resolved top
+ * item until then), so a stale "confirm task 2" can still land on a newer item 2 after that; naming it lets the coordinator read back WHICH task it acted on (review fix F3, #2159).
+ */
+function itemName(item: CompletionDigestItem): string {
+  const title = typeof item.taskTitle === 'string' ? item.taskTitle.trim() : '';
+  return `"${title || item.note.trim()}"`;
+}
+
+/** The `number` input as a positive integer. Accepts a digit string because models relay "2" as text. */
+/**
+ * Drop one resolved item and persist the rest. The mark is advanced to the full numbered map's top
+ * number FIRST: legacy items get their numbers on read and no writer has recorded them yet, so
+ * resolving the derived top item would otherwise free its number for the next new item. A mark that
+ * won't store fails the clear (the item is kept for a retry), so nothing leaves the digest under a
+ * number the writer could hand out again.
+ */
+async function clearDigestItem(
+  store: ConfigStore,
+  digestMap: CompletionDigestMap,
+  highWater: number,
+  taskId: string,
+  log: Logger,
+): Promise<boolean> {
+  const top = maxDigestNumber(digestMap);
+  if (top > highWater && !(await writeDigestHighWater(store, top))) {
+    log.warn({ highWater: top }, 'resolve-learning-digest: high-water mark write soft-rejected — digest item kept for retry');
+    return false;
+  }
+  const { [taskId]: _removed, ...rest } = digestMap;
+  void _removed;
+  return writeCompletionDigest(store, pruneExpiredCompletionDigest(rest, Date.now(), log));
+}
+
+function parseItemNumber(raw: unknown): number | null {
+  if (typeof raw === 'number') return Number.isInteger(raw) && raw > 0 ? raw : null;
+  if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) {
+    const n = Number(raw.trim());
+    return n > 0 ? n : null;
+  }
+  return null;
+}
+
+export class ResolveLearningDigestHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
+    // Skill contract: never throw — a rejected profile/config/task/document call becomes
+    // a failure result rather than escaping the handler.
+    try {
+      return await this.runResolve(ctx);
+    } catch (err) {
+      ctx.log.error({ err }, 'resolve-learning-digest: unexpected failure');
+      return {
+        success: false,
+        error: `resolve-learning-digest failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  private async runResolve(ctx: ToolContext): Promise<ToolResult> {
+    if (!ctx.taskRepo || !ctx.entityMemory || !ctx.executiveProfileService) {
+      return {
+        success: false,
+        error: 'resolve-learning-digest requires taskRepo, entityMemory, executiveProfileService',
+      };
+    }
+
+    const input =
+      ctx.input && typeof ctx.input === 'object' ? (ctx.input as Record<string, unknown>) : {};
+    const actionRaw = typeof input.action === 'string' ? input.action : '';
+    if (!isDigestAction(actionRaw)) {
+      return {
+        success: false,
+        error: `action must be one of: ${ACTIONS.join(', ')}`,
+      };
+    }
+    const action: DigestAction = actionRaw;
+
+    if (action === 'approve_voice' || action === 'dismiss_voice') {
+      // Built once — reused for the proposal read/clear below and (on dismiss) the cooldown
+      // write, all against the same 'ceo_inbox' namespace.
+      const store = new ConfigStore(ctx.entityMemory, ctx.log);
+      const proposal = await readVoiceProposal(store, ctx.log);
+      if (!proposal || proposal.status !== 'pending') {
+        return { success: false, error: 'No pending voice guide proposal' };
+      }
+
+      if (action === 'approve_voice') {
+        const current = ctx.executiveProfileService.get().writingVoice;
+        await ctx.executiveProfileService.update(
+          { writingVoice: { ...current, guide: proposal.guide } },
+          'tool',
+          'voice guide approved',
+        );
+
+        // Clear the resolved proposal so it doesn't stay "pending" forever — the approved
+        // guide now lives in the versioned profile, which is the real audit trail.
+        //
+        // The primary side effect (the profile write above) already succeeded by this point.
+        // If the clear itself soft-rejects (stored:false — a dedup 'conflict'/'auto_rejected'
+        // outcome, not a throw), we must NOT report success: the proposal item would still be
+        // there next time the digest is listed, contradicting a "resolved: true" response. We
+        // surface that honestly instead. A retry is safe because the mutations here are
+        // idempotent — re-approving writes the identical guide text again, and re-clearing a
+        // proposal that's already gone is a no-op.
+        const cleared = await writeVoiceProposal(store, null);
+        if (!cleared) {
+          return {
+            success: false,
+            error: 'Voice guide applied to the profile, but the pending proposal could not be cleared (transient) and may reappear — retry to clear it.',
+          };
+        }
+        return { success: true, data: { resolved: true, detail: 'Approved voice guide' } };
+      }
+
+      // dismiss: keep the existing DISMISSED_KEY cooldown write. There's only one guide
+      // dimension now (no per-field proposals), so the cooldown entry uses a fixed key.
+      const rawDismissed = await store.get(VOICE_NS, DISMISSED_KEY);
+      let dismissed: Array<{ dimension: string; until: string }> = [];
+      if (rawDismissed) {
+        try {
+          dismissed = JSON.parse(rawDismissed) as Array<{ dimension: string; until: string }>;
+        } catch {
+          dismissed = [];
+        }
+      }
+      const until = new Date(Date.now() + 30 * 86_400_000).toISOString();
+      dismissed = dismissed.filter((d) => d.dimension !== 'guide');
+      dismissed.push({ dimension: 'guide', until });
+      await store.set(VOICE_NS, DISMISSED_KEY, JSON.stringify(dismissed));
+
+      // Clear the resolved proposal — the dismiss cooldown is tracked in config, so the
+      // proposal record itself serves no further purpose. The cooldown write above already
+      // landed, so a soft-reject here only means the proposal item may reappear in the digest.
+      const cleared = await writeVoiceProposal(store, null);
+      if (!cleared) {
+        return {
+          success: false,
+          error: 'Voice guide dismissed (cooldown recorded), but the pending proposal could not be cleared (transient) and may reappear — retry to clear it.',
+        };
+      }
+      return { success: true, data: { resolved: true, detail: 'Dismissed voice guide' } };
+    }
+
+    // completion actions: the item is named by its notification number (preferred), or by task id.
+    const numberProvided = input.number !== undefined && input.number !== null && input.number !== '';
+    const rawTaskId = typeof input.task_id === 'string' ? input.task_id.trim() : '';
+    let itemNumber: number | null = null;
+    if (numberProvided) {
+      itemNumber = parseItemNumber(input.number);
+      if (itemNumber === null) {
+        return { success: false, error: 'number must be a positive whole number (the item number from the notification)' };
+      }
+    } else if (!rawTaskId) {
+      return { success: false, error: 'number (or task_id) is required for completion actions' };
+    }
+
+    const store = new ConfigStore(ctx.entityMemory, ctx.log);
+    // Number before resolving, on the full stored map, so legacy entries without `n` get the same
+    // numbers list-learning-digest showed. The clearing writes below persist this numbering.
+    const { map: digestMap, highWater } = await readNumberedCompletionDigest(store, ctx.log);
+    const resolved =
+      itemNumber !== null
+        ? resolveDigestNumber(digestMap, itemNumber)
+        : resolveDigestTaskId(digestMap, rawTaskId);
+    if (!resolved.ok) {
+      return { success: false, error: resolved.error };
+    }
+    // Use the resolved full key for digest lookup AND taskRepo calls — a short
+    // prefix is not a valid task UUID and must not be passed to getTask/etc.
+    const taskId = resolved.taskId;
+    const item = digestMap[taskId];
+
+    // dismiss_completion only drops a map entry — it does not touch the task — so kind
+    // is irrelevant. Undo items are "leave it done" as well as confirm items (#1936).
+    // The kind guard below is unchanged for undo_completion and confirm_completion,
+    // which mutate a task and must not run against an arbitrary id.
+    if (action === 'dismiss_completion') {
+      if (!item) {
+        return { success: false, error: `No completion-digest item for task ${taskId}` };
+      }
+      const cleared = await clearDigestItem(store, digestMap, highWater, taskId, ctx.log);
+      if (!cleared) {
+        return {
+          success: false,
+          error: `Digest item for task ${taskId} could not be cleared (transient); retry.`,
+        };
+      }
+      // Undo and confirm dismissals are opposite outcomes. The same "Dismissed
+      // completion" string reads as "the task was un-completed" on an undo item.
+      const detail =
+        item.kind === 'undo'
+          ? `Left ${itemName(item)} marked done; dropped the undo prompt`
+          : `Dismissed the confirm prompt for ${itemName(item)}; the task was not completed`;
+      return { success: true, data: { resolved: true, kind: item.kind, detail } };
+    }
+
+    // Require an actionable digest item of the matching kind before mutating a task —
+    // otherwise undo/confirm would reopen/complete ANY task id the caller supplies, and
+    // still report success even when the digest held no such item.
+    const expectedKind = action === 'undo_completion' ? 'undo' : 'confirm';
+    if (!item || item.kind !== expectedKind) {
+      // Name the kind actually stored when one is present, so a kind mismatch is not
+      // reported with the same string as a missing item (#1546 misattributed that).
+      const actual = item ? ` (digest has '${item.kind}')` : '';
+      return {
+        success: false,
+        error: `No actionable ${expectedKind} item for task ${taskId}${actual}`,
+      };
+    }
+
+    if (action === 'undo_completion') {
+      // Idempotency guard (mirrors confirm_completion below): reopenTask THROWS on any status other
+      // than 'done' (src/db/task-repo.ts). On a replay after a soft-rejected clear, run 1 already
+      // reopened the task (done -> open), so calling reopenTask again would throw and wedge the
+      // digest item forever. Branch precisely on the status so we never falsely report "Reopened":
+      //   - 'done'  : reopen it (the normal path), then clear the item.
+      //   - 'open'  : run 1's reopen already landed — converge by clearing the item.
+      //   - other   : the task moved on independently (cancelled / failed / in_progress / ...).
+      //               Reopening doesn't apply and reporting "Reopened" would be a lie, so fail loud
+      //               and KEEP the item (the user can drop it via dismiss_completion).
+      // A missing task also fails loud with the item kept, same as the confirm path.
+      const task = await ctx.taskRepo.getTask(taskId);
+      if (!task) {
+        return { success: false, error: `Task ${taskId} not found; cannot undo completion` };
+      }
+      if (task.status === 'done') {
+        const reopened = await ctx.taskRepo.reopenTask(
+          taskId,
+          'Undo auto-complete from sent mail',
+          ctx.agentId,
+        );
+        // reopenTask returns null when the row vanished / raced to non-done between the read and
+        // the UPDATE — fail loud and DON'T consume the digest item, so the undo affordance survives.
+        if (!reopened) {
+          return { success: false, error: `Task ${taskId} could not be reopened (it may have changed); retry` };
+        }
+      } else if (task.status !== 'open') {
+        // Not 'done' (reopenable) and not 'open' (already reopened by a prior run's undo) — the task
+        // is in some other state we didn't cause. Don't clear the item and don't claim a reopen.
+        return {
+          success: false,
+          error: `Task ${taskId} is '${task.status}', not done; cannot undo completion`,
+        };
+      }
+      // status is 'done' (just reopened) or 'open' (already reopened) — clear the digest item. A
+      // soft-reject on the clear only means the item may reappear; a retry re-checks status and
+      // clears idempotently.
+      const cleared = await clearDigestItem(store, digestMap, highWater, taskId, ctx.log);
+      if (!cleared) {
+        return {
+          success: false,
+          error: `Task ${taskId} was reopened, but the digest item could not be cleared (transient) and may reappear — retry to clear it.`,
+        };
+      }
+      return { success: true, data: { resolved: true, detail: `Reopened ${itemName(item)}` } };
+    }
+
+    if (action === 'confirm_completion') {
+      const task = await ctx.taskRepo.getTask(taskId);
+      // Fail loudly when the task no longer exists — otherwise we'd mark the digest
+      // "confirmed" and report success while completing nothing.
+      if (!task) {
+        return { success: false, error: `Task ${taskId} not found; cannot confirm completion` };
+      }
+      if (task.status !== 'done') {
+        await ctx.taskRepo.completeTask(
+          taskId,
+          'Confirmed complete from sent-mail digest',
+          ctx.agentId,
+        );
+      }
+      // Task completion (if needed) already happened above; a soft-reject on the clear only
+      // means the digest item may reappear — completing an already-done task next retry is a
+      // no-op (the `task.status !== 'done'` guard above skips it).
+      const cleared = await clearDigestItem(store, digestMap, highWater, taskId, ctx.log);
+      if (!cleared) {
+        return {
+          success: false,
+          error: `Task ${taskId} was confirmed complete, but the digest item could not be cleared (transient) and may reappear — retry to clear it.`,
+        };
+      }
+      return { success: true, data: { resolved: true, detail: `Confirmed completion of ${itemName(item)}` } };
+    }
+
+    // Unreachable while every DigestAction returns above. A new action that is
+    // added to ACTIONS without a branch fails here at compile time (`never`).
+    const _exhaustive: never = action;
+    return {
+      success: false,
+      error: `resolve-learning-digest: unhandled action '${String(_exhaustive)}'`,
+    };
+  }
+}

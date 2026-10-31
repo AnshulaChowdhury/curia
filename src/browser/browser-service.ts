@@ -23,7 +23,7 @@
 //    Drop the Xvfb management entirely when using a managed service.
 //
 // For options 2 and 3, only this file needs to change — the handler,
-// session model, and SkillContext interface are unaffected.
+// session model, and ToolContext interface are unaffected.
 
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -31,33 +31,54 @@ import type { ChildProcess } from 'node:child_process';
 import { existsSync, readFileSync, rmSync, lstatSync, readlinkSync } from 'node:fs';
 import { homedir, hostname as osHostname } from 'node:os';
 import { join } from 'node:path';
-import { chromium as stealthChromium } from 'playwright-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+// Patchright is a drop-in Playwright fork that patches the protocol-level leaks the old
+// stealth plugin couldn't reach — most importantly the CDP `Runtime.enable` /
+// console / exec-context leaks detection vendors key on, plus Playwright's own header
+// signatures. We keep the real-Chrome channel + persistent-context model unchanged; only
+// the launcher changes. The rest of the file types against the 'playwright' BrowserContext
+// (structurally identical), hence the existing `as unknown as BrowserContext` casts. (#1053)
+import { chromium } from 'patchright';
 import type { BrowserContext, BrowserContextOptions } from 'playwright';
 import { PlaywrightBlocker } from '@ghostery/adblocker-playwright';
 import type { Logger } from '../logger.js';
 import { BrowserSession } from './browser-session.js';
 import type { SessionId } from './types.js';
+import { parseProxyConfig, type ProxyConfig } from './proxy-config.js';
 
-// Register the stealth plugin once at module load. It patches the residual automation
-// signals (navigator.plugins, window.chrome, WebGL vendor/renderer, permissions.query,
-// and the User-Agent) that --disable-blink-features=AutomationControlled alone leaves
-// exposed. It applies at the browser level, so it covers both the persistent context and
-// any incognito context spun off the same browser.
-stealthChromium.use(StealthPlugin());
+// Xvfb screen and browser window geometry. The window must fit inside the screen: a
+// window bigger than its screen is a fingerprint inconsistency no real device shows.
+// The window is kept short of full-screen so screenshots stay a moderate size. (#2221)
+export const SCREEN_SIZE = { width: 1920, height: 1080 } as const;
+export const WINDOW_SIZE = { width: 1440, height: 900 } as const;
 
 interface BrowserServiceOptions {
   logger: Logger;
-  /** Session idle TTL in ms. Default: 600_000 (10 minutes). */
+  /** Session idle TTL in ms. Default: 1_800_000 (30 minutes) — long enough that a multi-page
+   *  form (e.g. a 60-question survey) doesn't get its session evicted between agent turns,
+   *  which would orphan every element ref the agent still holds. */
   sessionTtlMs?: number;
   /** How often to sweep expired sessions in ms. Default: 120_000 (2 minutes). */
   sweepIntervalMs?: number;
+  /** Absolute-age cap for keep-warm (pinned) sessions in ms. A pinned session is exempt from
+   *  the idle TTL but still evicted once older than this since creation, so a task that never
+   *  releases its session can't leak a browser tab forever. Default: 7_200_000 (2 hours). */
+  keepWarmMaxAgeMs?: number;
   /** Persistent profile directory. Empty/absent → ${HOME}/.curia/browser-profile. */
   profileDir?: string;
   /** Browser channel, e.g. 'chrome' for real Chrome. Absent → bundled Chromium. */
   channel?: string;
+  /**
+   * Optional egress proxy for browser traffic (e.g. a residential home-network exit).
+   * Full URL or bare host:port. Absent/empty → direct egress. See parseProxyConfig.
+   */
+  proxy?: string;
   /** Context locale (BCP 47). Default 'en-US'. */
   locale?: string;
+  /** Ordered navigator.languages / Accept-Language list. `locale` is always first. */
+  languages?: string[];
+  /** Longest the web-browser skill waits for a page to finish redirecting before reading
+   *  it, in ms (#2244). Default 35_000: Air Canada's sign-in chain takes ~28s. */
+  settleCapMs?: number;
   /** IANA timezone for the context, aligned to the principal. */
   timezone?: string;
   /**
@@ -71,10 +92,17 @@ export class BrowserService {
   private logger: Logger;
   private sessionTtlMs: number;
   private sweepIntervalMs: number;
+  private keepWarmMaxAgeMs: number;
   private profileDir: string;
   private channel: string | undefined;
+  // Parsed once in the constructor; spread into every context's options and used to gate
+  // the WebRTC-leak launch flag. Undefined → direct egress.
+  private proxy: ProxyConfig | undefined;
   private locale: string;
+  private languages: string[];
   private timezone: string | undefined;
+  /** See BrowserServiceOptions.settleCapMs. Read by the web-browser skill. */
+  readonly settleCapMs: number;
   private contextFactory: () => Promise<BrowserContext>;
 
   // The persistent context IS the warm browser in this model. Sessions are pages within
@@ -101,17 +129,23 @@ export class BrowserService {
   private sessions: Map<SessionId, BrowserSession> = new Map();
   private sweepTimer: NodeJS.Timeout | null = null;
   private xvfbProcess: ChildProcess | null = null;
+  // Window manager + panel running on our Xvfb display (see startDesktopSession).
+  private desktopProcesses: ChildProcess[] = [];
 
   constructor(options: BrowserServiceOptions) {
     this.logger = options.logger.child({ service: 'BrowserService' });
-    this.sessionTtlMs = options.sessionTtlMs ?? 600_000;
+    this.sessionTtlMs = options.sessionTtlMs ?? 1_800_000;
     this.sweepIntervalMs = options.sweepIntervalMs ?? 120_000;
+    this.keepWarmMaxAgeMs = options.keepWarmMaxAgeMs ?? 7_200_000;
     this.profileDir = options.profileDir && options.profileDir.length > 0
       ? options.profileDir
       : join(homedir(), '.curia', 'browser-profile');
     this.channel = options.channel && options.channel.length > 0 ? options.channel : undefined;
+    this.proxy = parseProxyConfig(options.proxy);
     this.locale = options.locale && options.locale.length > 0 ? options.locale : 'en-US';
+    this.languages = [...new Set([this.locale, ...(options.languages ?? [])])];
     this.timezone = options.timezone;
+    this.settleCapMs = options.settleCapMs ?? 35_000;
     this.contextFactory = options.contextFactory ?? (() => this.launchPersistentContext());
   }
 
@@ -134,8 +168,7 @@ export class BrowserService {
       // must clean up after itself for callers that don't call stop() on failure.
       if (this.xvfbProcess) {
         this.logger.error({ err }, 'Persistent context launch failed — killing the Xvfb display started for it');
-        this.xvfbProcess.kill();
-        this.xvfbProcess = null;
+        this.stopDisplay();
       }
       throw err;
     }
@@ -198,6 +231,12 @@ export class BrowserService {
         this.attachDisconnectedHandler(ctx);
       }).catch(err => {
         this.logger.error({ err }, 'Browser restart failed');
+        // Clear the stale crashed context: a failed relaunch means there is no browser,
+        // and the getter must not hand out a reference to a corpse. Since #1762
+        // checkBrowser round-trips rather than trusting the reference, so it would
+        // report 'fail' here regardless — this is no longer the health check's only
+        // line of defence, but leaving a dead reference reachable would still be wrong.
+        this.context = null;
       });
     });
   }
@@ -236,10 +275,7 @@ export class BrowserService {
       }
     }
 
-    if (this.xvfbProcess) {
-      this.xvfbProcess.kill();
-      this.xvfbProcess = null;
-    }
+    this.stopDisplay();
 
     this.logger.info('BrowserService stopped');
   }
@@ -253,12 +289,16 @@ export class BrowserService {
    *
    * opts.incognito → isolated ephemeral context off the same browser (no persistent
    * profile). opts.blockAds → attach the (lazily-fetched) Ghostery ad blocker to the page.
+   * opts.keepWarm → pin the session (exempt from the idle TTL, subject to the absolute-age
+   * cap) so a parked long-running task can resume the same live page across far-apart wakes.
+   * Passing keepWarm:true when reusing an existing session upgrades it to pinned; it is never
+   * auto-downgraded (release via closeSession). See ADR-030.
    *
    * Returns the session and its (possibly new) sessionId.
    */
   async getOrCreateSession(
     sessionId: SessionId | undefined,
-    opts: { incognito?: boolean; blockAds?: boolean } = {},
+    opts: { incognito?: boolean; blockAds?: boolean; keepWarm?: boolean } = {},
   ): Promise<{ sessionId: SessionId; session: BrowserSession }> {
     const browser = this.context?.browser();
     if (!this.context || !browser || !browser.isConnected()) {
@@ -267,8 +307,10 @@ export class BrowserService {
 
     if (sessionId) {
       const existing = this.sessions.get(sessionId);
-      if (existing && !existing.isExpired(this.sessionTtlMs)) {
+      if (existing && !existing.isExpired(this.sessionTtlMs, this.keepWarmMaxAgeMs)) {
         existing.lastUsedAt = Date.now();
+        // Upgrade to pinned if the caller now wants to keep this session warm across wakes.
+        if (opts.keepWarm) existing.keepWarm = true;
         return { sessionId, session: existing };
       }
       if (existing) {
@@ -315,6 +357,8 @@ export class BrowserService {
 
     const newSessionId = randomUUID();
     const session = new BrowserSession(ownedContext ?? this.context, page, ownedContext);
+    // Pin from creation when the caller asked to keep this session warm across wakes.
+    if (opts.keepWarm) session.keepWarm = true;
 
     // Crash safety: if the page crashes, invalidate the session so the next
     // skill call starts fresh rather than retrying on a broken page.
@@ -324,9 +368,19 @@ export class BrowserService {
       this.sessions.delete(newSessionId);
     });
 
+    // Page errors, kept on the session so a blank or unsettled page can be diagnosed
+    // (#2244). Under Patchright 'console' carries only browser-reported entries (failed
+    // loads, CSP and security errors); see BrowserSession.consoleErrors.
+    page.on('console', (message) => {
+      if (message.type() === 'error') session.recordConsoleError(message.text());
+    });
+    page.on('pageerror', (error) => {
+      session.recordConsoleError(`Uncaught ${error.name}: ${error.message}`);
+    });
+
     this.sessions.set(newSessionId, session);
     this.logger.debug(
-      { sessionId: newSessionId, incognito: opts.incognito === true, blockAds: opts.blockAds === true },
+      { sessionId: newSessionId, incognito: opts.incognito === true, blockAds: opts.blockAds === true, keepWarm: opts.keepWarm === true },
       'New browser session created',
     );
 
@@ -354,7 +408,7 @@ export class BrowserService {
     // from closing the same sessions twice. Delete from the map before awaiting
     // close() so a concurrent getOrCreateSession() can't return a session that's
     // already been closed.
-    const expired = [...this.sessions.entries()].filter(([, s]) => s.isExpired(this.sessionTtlMs));
+    const expired = [...this.sessions.entries()].filter(([, s]) => s.isExpired(this.sessionTtlMs, this.keepWarmMaxAgeMs));
     for (const [sessionId, session] of expired) {
       if (!this.sessions.has(sessionId)) continue; // already closed by a concurrent call
       this.sessions.delete(sessionId);
@@ -380,21 +434,48 @@ export class BrowserService {
     return this.channelFallbackActive;
   }
 
+  /**
+   * Expose the persistent browser context for liveness probes. Null when the service
+   * has not been started or has been stopped.
+   *
+   * The probe (`checkBrowser`) does a bounded `cookies()` round-trip into Chrome. It
+   * deliberately does NOT use `isConnected()`, which this comment previously claimed:
+   * that is synchronous cached transport state, so a wedged-but-connected renderer
+   * still reports true (#1762).
+   */
+  get browserContext(): BrowserContext | null {
+    return this.context;
+  }
+
   // --- Private helpers ---
 
   /**
-   * Fingerprint/context options shared by the persistent context and any incognito
-   * context. We deliberately DO NOT set userAgent — with the real Chrome channel and the
-   * stealth plugin's UA-override evasion the genuine current UA is sent, so it can never
-   * go stale (the old hardcoded Chrome/122 was a bot tell). timezoneId is set only when a
-   * timezone is configured, aligning the context with the principal.
+   * Fingerprint/context options shared by the persistent context and any incognito context.
+   * We deliberately DO NOT set userAgent (or any sec-ch-ua / userAgentData override): with
+   * the real Chrome channel, Chrome natively emits a COMPLETE, mutually-consistent identity
+   * set (UA + client hints + userAgentData) for the true binary version and OS. Overriding
+   * any single surface without perfectly mirroring the others manufactures exactly the
+   * inconsistency detection keys on — and a hardcoded UA goes stale into a bot tell (#987).
+   * timezoneId is set only when a timezone is configured, aligning the context with the
+   * principal. (#1053)
+   *
+   * The proxy (when configured) is spread here so it applies to BOTH the persistent context
+   * (launchPersistentContext) and any incognito context (browser.newContext) — routing all
+   * browser egress through, e.g., a residential home-network exit. (residential-proxy support)
+   *
+   * viewport and locale are deliberately absent too (#2221). A Playwright viewport is CDP
+   * device-metrics emulation, which also forces `screen` to the viewport size, so the window
+   * read bigger than its own screen. With no viewport, the page takes the real window
+   * (WINDOW_SIZE) on the real Xvfb screen (SCREEN_SIZE). Playwright's `locale` collapses
+   * navigator.languages to one entry; the --lang / --accept-lang launch flags set the
+   * full list natively instead, and they also cover incognito contexts.
    */
   private buildContextOptions(): BrowserContextOptions {
     return {
-      viewport: { width: 1280, height: 720 },
-      locale: this.locale,
+      viewport: null,
       colorScheme: 'light',
       ...(this.timezone ? { timezoneId: this.timezone } : {}),
+      ...(this.proxy ? { proxy: this.proxy } : {}),
     };
   }
 
@@ -421,7 +502,7 @@ export class BrowserService {
    * Launch the single persistent browser context (the principal's profile). Tries the
    * configured channel (e.g. real Chrome) first and falls back to bundled Chromium if it
    * isn't installed, so the skill degrades instead of failing to boot. Cast through unknown:
-   * playwright-extra returns a playwright-core BrowserContext, structurally identical to the
+   * patchright returns its own BrowserContext, structurally identical to the
    * 'playwright' BrowserContext we type against.
    */
   private async launchPersistentContext(): Promise<BrowserContext> {
@@ -438,10 +519,28 @@ export class BrowserService {
     const baseOptions = {
       headless: false,
       args: [
-        '--disable-blink-features=AutomationControlled', // removes navigator.webdriver flag
-        '--no-sandbox',                                   // required in container environments
-        '--disable-dev-shm-usage',                        // prevents /dev/shm OOM in Docker
+        // Patchright owns the navigator.webdriver / AutomationControlled surface, so we no
+        // longer pass --disable-blink-features=AutomationControlled (stacking a flag it
+        // manages is a documented anti-pattern). These two are container requirements. (#1053)
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        // When egressing through a proxy, force WebRTC to only use proxied UDP so a STUN
+        // candidate can't leak the real (datacenter) IP behind the residential exit. This is
+        // a browser-process-level flag, so it also covers incognito contexts spun off this
+        // launch. Only added when a proxy is set. (residential-proxy support)
+        ...(this.proxy ? ['--force-webrtc-ip-handling-policy=disable_non_proxied_udp'] : []),
+        // A desktop-sized window that sits inside the larger Xvfb screen, so
+        // screen >= availHeight >= outerHeight > innerHeight holds the way it does on a
+        // real device. (#2221)
+        `--window-size=${WINDOW_SIZE.width},${WINDOW_SIZE.height}`,
+        // Locale natively: --lang sets the UI/Intl locale, --accept-lang sets
+        // navigator.languages and the Accept-Language header to the same ordered list. (#2221)
+        `--lang=${this.locale}`,
+        `--accept-lang=${this.languages.join(',')}`,
       ],
+      // On Linux, Chrome takes its ICU (Intl) locale from LANG, not --lang, so without
+      // this Intl reports en-US beside an en-CA navigator.language. (#2221)
+      env: { ...process.env, LANG: `${this.locale.replace('-', '_')}.UTF-8` },
       ...this.buildContextOptions(),
     };
 
@@ -451,7 +550,7 @@ export class BrowserService {
     this.channelFallbackActive = false;
 
     try {
-      const context = await stealthChromium.launchPersistentContext(
+      const context = await chromium.launchPersistentContext(
         this.profileDir,
         this.channel ? { ...baseOptions, channel: this.channel } : baseOptions,
       ) as unknown as BrowserContext;
@@ -470,7 +569,7 @@ export class BrowserService {
         { err, requestedChannel: this.channel },
         'Browser channel launch failed — DEGRADED to bundled Chromium (weaker fingerprint than configured); is the channel installed in the image?',
       );
-      const context = await stealthChromium.launchPersistentContext(
+      const context = await chromium.launchPersistentContext(
         this.profileDir,
         baseOptions,
       ) as unknown as BrowserContext;
@@ -482,7 +581,12 @@ export class BrowserService {
   /** Log the resolved channel + real browser version for observability (UA traceability). */
   private logChannel(context: BrowserContext, channel: string | undefined): void {
     const version = context.browser()?.version();
-    this.logger.info({ channel: channel ?? 'chromium', version, profileDir: this.profileDir }, 'Persistent browser context launched');
+    // Log the proxy server (never the credentials) so the egress posture is greppable —
+    // a residential exit vs. direct datacenter egress is exactly what we want observable.
+    this.logger.info(
+      { channel: channel ?? 'chromium', version, profileDir: this.profileDir, proxy: this.proxy?.server ?? null },
+      'Persistent browser context launched',
+    );
   }
 
   /**
@@ -506,7 +610,7 @@ export class BrowserService {
     clearStaleX11Lock({ displayNum: 99, logger: this.logger });
 
     this.logger.info('Spawning Xvfb virtual display on :99');
-    this.xvfbProcess = spawn('Xvfb', [':99', '-screen', '0', '1280x720x24'], {
+    this.xvfbProcess = spawn('Xvfb', [':99', '-screen', '0', `${SCREEN_SIZE.width}x${SCREEN_SIZE.height}x24`], {
       stdio: 'ignore',
       detached: false,
     });
@@ -546,6 +650,63 @@ export class BrowserService {
       setTimeout(() => { cleanup(); resolve(); }, 500);
     });
     this.logger.info('Xvfb started on DISPLAY=:99');
+
+    await this.startDesktopSession();
+  }
+
+  /**
+   * Run a window manager and a panel on our Xvfb display (#2221). Bare Xvfb has no work
+   * area, so screen.availHeight equals screen.height — the `noTaskbar` tell CreepJS counts
+   * toward "like headless". openbox publishes _NET_WORKAREA minus the strut tint2's bottom
+   * panel reserves, and Chrome reports that as the available screen.
+   *
+   * Best-effort: without the binaries the browser still works, just with the tell, so a
+   * failure warns instead of failing start().
+   */
+  private async startDesktopSession(): Promise<void> {
+    const programs: Array<[string, string[]]> = [['openbox', ['--sm-disable']], ['tint2', []]];
+    for (const [command, args] of programs) {
+      const proc = await this.spawnDesktopProcess(command, args);
+      // No point starting the panel without a WM: nothing would turn its strut into a work area.
+      if (!proc) return;
+      this.desktopProcesses.push(proc);
+    }
+    this.logger.info('Window manager and panel started on DISPLAY=:99');
+  }
+
+  /** Spawn one desktop program; resolve it if still running after 500ms, else warn and resolve null. */
+  private spawnDesktopProcess(command: string, args: string[]): Promise<ChildProcess | null> {
+    const proc = spawn(command, args, { stdio: 'ignore', detached: false });
+    return new Promise(resolve => {
+      const settle = (result: ChildProcess | null) => {
+        clearTimeout(timer);
+        proc.off('error', onError);
+        proc.off('close', onClose);
+        resolve(result);
+      };
+      const fail = (reason: string) => {
+        this.logger.warn(
+          { command, reason },
+          'Desktop session program failed to start — screen.availHeight will equal screen.height (a headless fingerprint tell); is it installed in the image?',
+        );
+        settle(null);
+      };
+      const onError = (err: Error) => fail(err.message);
+      const onClose = (code: number | null) => fail(`exited during startup (code ${code ?? 'null'})`);
+      proc.once('error', onError);
+      proc.once('close', onClose);
+      const timer = setTimeout(() => settle(proc), 500);
+    });
+  }
+
+  /** Kill the desktop session and the Xvfb display we spawned, if any. */
+  private stopDisplay(): void {
+    for (const proc of this.desktopProcesses) proc.kill();
+    this.desktopProcesses = [];
+    if (this.xvfbProcess) {
+      this.xvfbProcess.kill();
+      this.xvfbProcess = null;
+    }
   }
 }
 

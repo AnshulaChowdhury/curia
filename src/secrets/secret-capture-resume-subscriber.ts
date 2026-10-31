@@ -20,17 +20,87 @@ import type { EventBus } from '../bus/bus.js';
 import type { Logger } from '../logger.js';
 import type { BusEvent, SecretCapturedEvent } from '../bus/events.js';
 import { createAgentTask } from '../bus/events.js';
+import { decodeResumeToken } from '../agents/resume-token.js';
+import type { ContactTier, SystemRole, TaskOriginator } from '../contacts/types.js';
 
 /**
  * Seeds channel routing for the synthetic resume task so the agent's response is delivered back
  * to the originating channel. Without it, the dispatcher's handleAgentResponse finds no routing
  * for the task id and drops the reply (the same path bullpen tasks take). In production this is
  * `Dispatcher.registerExternalTaskRouting`; tests inject a spy.
+ *
+ * `originator` is required (#1733) so Gate C on the relay cannot silently skip.
  */
 export type ResumeRoutingRegistrar = (
   taskEventId: string,
-  routing: { channelId: string; conversationId: string; senderId: string; accountId?: string },
+  routing: {
+    channelId: string;
+    conversationId: string;
+    senderId: string;
+    originator: TaskOriginator;
+    accountId?: string;
+  },
 ) => void;
+
+/**
+ * Narrow the opaque originator bag from secret.captured into a TaskOriginator.
+ * Returns undefined when the bag is missing required fields (pre-#972 tokens).
+ */
+function parseOriginator(raw: Record<string, unknown> | undefined): TaskOriginator | undefined {
+  if (!raw) return undefined;
+  if (typeof raw.contactId !== 'string' || typeof raw.channel !== 'string') return undefined;
+  if (typeof raw.initiatedAt !== 'string') return undefined;
+  const systemRole = raw.systemRole;
+  if (
+    systemRole !== null &&
+    systemRole !== undefined &&
+    systemRole !== 'principal' &&
+    systemRole !== 'system' &&
+    systemRole !== 'agent'
+  ) {
+    return undefined;
+  }
+  const tier = raw.tier;
+  if (
+    tier !== undefined &&
+    tier !== null &&
+    tier !== 'principal' &&
+    tier !== 'trusted' &&
+    tier !== 'known' &&
+    tier !== 'unknown' &&
+    tier !== 'blocked'
+  ) {
+    return undefined;
+  }
+  const result: TaskOriginator = {
+    contactId: raw.contactId,
+    systemRole: (systemRole ?? null) as SystemRole | null,
+    channel: raw.channel,
+    initiatedAt: raw.initiatedAt,
+  };
+  // Preserve absent tier as absent (don't coerce to null) so round-tripped bags
+  // match production stampOriginator shape when tier was present, and fixtures
+  // without tier stay equal to the input bag.
+  if (tier !== undefined) {
+    result.tier = tier as ContactTier | null;
+  }
+  // Same absent-stays-absent rule; present, only an exact true counts (#2312).
+  if (raw.authenticated !== undefined) {
+    result.authenticated = raw.authenticated === true;
+  }
+  return result;
+}
+
+/** Fail-closed originator when the capture token carried none (#1733 / #1059). */
+function unresolvedExternalOriginator(channelId: string): TaskOriginator {
+  return {
+    contactId: 'unresolved',
+    systemRole: null,
+    channel: channelId,
+    initiatedAt: new Date().toISOString(),
+    tier: null,
+  };
+}
 
 /** Cap on the dedup set so a long-running process can't grow it without bound (one entry per
  *  capture otherwise lives for the process lifetime). Generous — duplicates are rare — and FIFO
@@ -47,8 +117,11 @@ const MAX_DISPATCHED_IDS = 10_000;
  * adapter delivers and no user is watching — AND the coordinator's delegate-await that would relay
  * it has already returned. We skip those with a loud log rather than dead-ending silently.
  *
- * Cleanly resuming a delegated specialist is a separate feature: it needs the coordinator to
- * re-delegate via the delegate skill's resume_token, not a direct re-entry. Tracked as follow-up.
+ * A delegated specialist now resumes by minting its capture link with the COORDINATOR's routing
+ * + a resume_token (#995), so by the time the event reaches here channelId is already the
+ * coordinator's deliverable channel and this guard passes. This guard now only catches a
+ * genuinely unroutable mint (an internal-channel link with no delegation context), which should
+ * not occur but must not dead-end loudly into a non-deliverable channel.
  */
 const NON_DELIVERABLE_CHANNELS = new Set(['internal', 'bullpen', 'scheduler']);
 
@@ -84,7 +157,7 @@ export class SecretCaptureResumeSubscriber {
       return;
     }
 
-    const { secretName, label, conversationId, agentId, channelId, taskEventId, resumeIntent, originator } = event.payload;
+    const { secretName, label, conversationId, agentId, channelId, taskEventId, resumeIntent, resumeToken, originator } = event.payload;
 
     // Essential routing must be present to re-enter an agent. A token minted outside an agent
     // context (or before #972's migration) has no origin — there is nothing to resume, so we
@@ -111,24 +184,62 @@ export class SecretCaptureResumeSubscriber {
       return;
     }
 
-    // Mark dispatched BEFORE publishing so a synchronous re-delivery during publish can't slip
-    // through (mirrors the scheduler tracking its pending job before publish()).
-    this.markDispatched(event.id);
-
     const displayName = label ?? secretName;
-    const intentLine = resumeIntent ? ` Original request: ${resumeIntent}.` : '';
-    const content =
-      `The secret '${displayName}' was just captured and saved to the vault.${intentLine} ` +
-      `If you now have everything you need to continue, proceed. Otherwise, tell the user what ` +
-      `is still outstanding (check your conversation history for any other secrets you asked for).`;
+    let content: string;
+    if (resumeToken) {
+      // Delegated-specialist resume (#995): decode the token to recover the specialist name, then
+      // instruct the coordinator to re-delegate with the token (verbatim) and relay the reply.
+      const decoded = decodeResumeToken(resumeToken);
+      if (!decoded) {
+        // A system-minted token should always decode; a malformed one is unrecoverable, so skip
+        // (don't fabricate a re-delegation) and log loudly rather than swallow. Do NOT mark
+        // dispatched here — the skip should remain replayable if the operator corrects the token
+        // (e.g. re-publishes the event after a bug fix). A safe fingerprint (length + prefix) makes
+        // a "why won't this decode" investigation tractable; the token holds no secret value
+        // (names + NL only) so logging a prefix carries no privacy cost.
+        this.logger.warn(
+          { eventId: event.id, secretName, agentId, tokenLength: resumeToken.length, tokenPrefix: resumeToken.slice(0, 8) },
+          'secret.captured carried a resume_token that could not be decoded — skipping specialist re-delegation',
+        );
+        return;
+      }
+      const goalLine = resumeIntent ? ` (Original goal: ${resumeIntent}.)` : '';
+      content =
+        `The secret '${displayName}' that a specialist asked for was just captured and saved to the vault. ` +
+        `The specialist '${decoded.agent}' paused waiting for it. Re-delegate to '${decoded.agent}' to continue, ` +
+        `passing this resume_token EXACTLY as given (do not alter, redact, or shorten it):\n\n${resumeToken}\n\n` +
+        `Then relay its reply to the user.${goalLine} If '${decoded.agent}' reports it is still missing other ` +
+        `secrets it already requested, relay that to the user — do not send new capture links for secrets ` +
+        `whose links are still pending.`;
+    } else {
+      const intentLine = resumeIntent ? ` Original request: ${resumeIntent}.` : '';
+      content =
+        `The secret '${displayName}' was just captured and saved to the vault.${intentLine} ` +
+        `If you now have everything you need to continue, proceed. Otherwise, tell the user what ` +
+        `is still outstanding (check your conversation history for any other secrets you asked for).`;
+    }
 
     // Attribute the resumed turn to whoever started the chain. originator is round-tripped from
     // JSONB (typed Record<string, unknown>), so validate contactId is actually a string before
     // using it as senderId — a malformed persisted value must not produce a non-string senderId.
-    // The originator object is still preserved verbatim on metadata so authorization gates resolve
-    // exactly as they did on the original task.
+    // Normalize once for both task metadata and dispatcher routing so Gate C sees the same
+    // originator on skill invoke and on the relay (#1733). Absent/malformed bags fail closed.
     const contactId = originator?.['contactId'];
     const senderId = typeof contactId === 'string' && contactId.length > 0 ? contactId : 'secret-capture';
+    const parsedOriginator = parseOriginator(originator);
+    const routingOriginator = parsedOriginator ?? unresolvedExternalOriginator(channelId);
+    if (!parsedOriginator) {
+      this.logger.warn(
+        { eventId: event.id, channelId, conversationId, hadOriginatorBag: !!originator },
+        'secret.captured missing or malformed originator — using fail-closed unresolved originator for Gate C (#1733)',
+      );
+    }
+
+    // Mark dispatched BEFORE publishing so a synchronous re-delivery during publish can't slip
+    // through (mirrors the scheduler tracking its pending job before publish()). Placed here —
+    // after all validation — so decode/deliverability failures don't permanently dead-letter
+    // the event id (skipped events remain replayable without a process restart).
+    this.markDispatched(event.id);
 
     // Build the task first so we know its id, then seed dispatcher routing BEFORE publishing —
     // otherwise the agent's response could arrive before routing exists, or find none and be
@@ -139,14 +250,22 @@ export class SecretCaptureResumeSubscriber {
       channelId,
       senderId,
       content,
-      metadata: originator ? { originator } : undefined,
+      // Curia telling itself the secret landed. senderId is the originator, for
+      // routing and Gate C — but this text is not something they said (#1892).
+      syntheticTurn: true,
+      metadata: { originator: routingOriginator },
       // Thread back to the originating agent.task when known so the causal chain is intact;
       // fall back to this event's id otherwise (agent.task requires a parentEventId).
       parentEventId: taskEventId ?? event.id,
     });
 
     try {
-      this.registerRouting?.(task.id, { channelId, conversationId, senderId });
+      this.registerRouting?.(task.id, {
+        channelId,
+        conversationId,
+        senderId,
+        originator: routingOriginator,
+      });
       await this.bus.publish('system', task);
       this.logger.info({ eventId: event.id, agentId, conversationId, secretName }, 'Resumed agent after secret capture');
     } catch (err) {

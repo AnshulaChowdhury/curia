@@ -11,8 +11,10 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { RegistryService } from '../../../registry/registry-service.js';
+import type { McpRegistryService } from '../../../registry/mcp-registry-service.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
 import { CHANNEL_CATALOG } from '../../catalog.js';
+import { isPerAccountEmailGrantKey } from '../../email/email-account-secrets.js';
 
 // Allow-set of valid channel credential vault keys, derived once from the static catalog.
 // A channel credential is stored as `channel.<channel>.<field.key>`; only the exact
@@ -53,10 +55,12 @@ const MAX_SECRET_VALUE_LENGTH = 8192;
 
 export interface VaultRouteOptions {
   secretsService: VaultSecretsPort;
-  /** Used to scope writes to secrets that some skill actually declares it needs. */
-  registryService: RegistryService;
+  /** Optional: when present, declared skill secret keys are added to the write allowlist. */
+  registryService?: RegistryService;
   webAppBootstrapSecret: string;
   sessions: SessionStore;
+  /** Optional: when present, declared MCP secret keys are added to the write allowlist. */
+  mcpRegistryService?: McpRegistryService;
 }
 
 export async function vaultRoutes(
@@ -102,18 +106,20 @@ export async function vaultRoutes(
       return reply.status(400).send({ error: `Secret value exceeds ${MAX_SECRET_VALUE_LENGTH} characters.` });
     }
 
-    // Scope guard: a name may be set only if it is EITHER a secret some skill declares
-    // OR a valid channel credential key from the catalog. This is the line between
-    // "configure a declared secret / known channel credential" and "write any key into
-    // the vault". Arbitrary `channel.*` names that aren't in the catalog are still rejected.
-    const isSkillDeclared = registryService.declaredSecretNames().includes(name);
-    if (!isSkillDeclared && !isChannelCredentialKey(name)) {
-      request.log.info({ name }, 'vault set rejected: name not declared by any skill or channel');
+    // Scope guard: a name may be set only if it is a secret some skill declares, a valid
+    // channel credential key from the catalog, a secret key declared by an installed MCP
+    // server, OR a per-account email grant key (channel.email.<name>.nylas_grant_id, written
+    // by the email-accounts console flow, #1101). This is the line between "configure a
+    // declared secret / known channel credential / per-account grant" and "write any key into
+    // the vault". Arbitrary `channel.*` names outside the catalog or the grant pattern, and
+    // arbitrary MCP keys not declared in config, are still rejected.
+    const isSkillDeclared = registryService?.declaredSecretNames().includes(name) ?? false;
+    const isMcpDeclared = options.mcpRegistryService?.declaredSecretKeys().includes(name) ?? false;
+    if (!isSkillDeclared && !isChannelCredentialKey(name) && !isMcpDeclared && !isPerAccountEmailGrantKey(name)) {
+      request.log.info({ name }, 'vault set rejected: name not declared by any skill, MCP server, or channel');
       return reply.status(400).send({
-        error: `'${name}' is not a required secret declared by any skill, ` +
-          `nor a known channel credential. Only secrets a skill lists in ` +
-          `install.requires_secrets, or channel credentials defined in the channel catalog, ` +
-          `can be set here.`,
+        error: `'${name}' is not a required secret declared by any skill or MCP server, ` +
+          `nor a known channel credential. Only declared secrets can be set here.`,
       });
     }
 

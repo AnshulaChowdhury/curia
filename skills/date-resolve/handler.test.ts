@@ -3,18 +3,18 @@
 // Tests for the date-resolve skill. All tests are pure computation —
 // no mocks, no external services.
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { DateResolveHandler } from './handler.js';
-import type { SkillContext } from '../../src/skills/types.js';
+import type { ToolContext } from '../../src/skills/types.js';
 import { DateTime, Settings } from 'luxon';
 import pino from 'pino';
 
-function makeCtx(input: Record<string, unknown>, timezone = 'America/Toronto'): SkillContext {
+function makeCtx(input: Record<string, unknown>, timezone = 'America/Toronto'): ToolContext {
   return {
     input,
     timezone,
     log: pino({ level: 'silent' }),
-  } as unknown as SkillContext;
+  } as unknown as ToolContext;
 }
 
 const handler = new DateResolveHandler();
@@ -38,6 +38,19 @@ describe('DateResolveHandler', () => {
     const result = await handler.execute(makeCtx({ relative: 'sometime next week maybe' }));
     expect(result.success).toBe(false);
     if (!result.success) expect(result.error).toMatch(/could not resolve/i);
+  });
+
+  // An invalid zone makes luxon return an invalid DateTime rather than throw, so
+  // without a guard it surfaces as a misleading "could not parse date" or worse.
+  // The startup TIMEZONE check normally prevents this; the handler states it plainly.
+  it.each([
+    ['relative "tomorrow"', { relative: 'tomorrow' }],
+    ['relative "next Monday"', { relative: 'next Monday' }],
+    ['ISO date', { date: '2026-05-19' }],
+  ])('returns an invalid-timezone error for %s', async (_label, input) => {
+    const result = await handler.execute(makeCtx(input, 'Not/AZone'));
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(/invalid timezone.*Not\/AZone/i);
   });
 
   it('returns error for invalid expected_day name', async () => {
@@ -227,6 +240,150 @@ describe('DateResolveHandler', () => {
         expect(result.data).toMatchObject({ date: '2026-05-22', day_of_week: 'Friday' });
       }
     });
+
+    // #1986: the most common relative expressions used to fall through to an error,
+    // leaving the model to do the day-of-week arithmetic itself.
+    it('"today" → Thursday May 7', async () => {
+      const result = await handler.execute(makeCtx({ relative: 'today' }));
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toMatchObject({
+          date: '2026-05-07',
+          day_of_week: 'Thursday',
+          formatted: 'Thursday, May 7, 2026',
+        });
+      }
+    });
+
+    it('"tomorrow" → Friday May 8', async () => {
+      const result = await handler.execute(makeCtx({ relative: 'tomorrow' }));
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toMatchObject({ date: '2026-05-08', day_of_week: 'Friday' });
+      }
+    });
+
+    it('"yesterday" → Wednesday May 6', async () => {
+      const result = await handler.execute(makeCtx({ relative: 'yesterday' }));
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toMatchObject({ date: '2026-05-06', day_of_week: 'Wednesday' });
+      }
+    });
+
+    it('matches "tomorrow" case-insensitively and ignores surrounding whitespace', async () => {
+      const result = await handler.execute(makeCtx({ relative: '  ToMoRRoW \n' }));
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toMatchObject({ date: '2026-05-08', day_of_week: 'Friday' });
+      }
+    });
+
+    it('verifies "today" against expected_day', async () => {
+      const result = await handler.execute(makeCtx({ relative: 'today', expected_day: 'Thursday' }));
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toMatchObject({ date: '2026-05-07', correct: true, expected_day: 'Thursday' });
+      }
+    });
+
+    it('verifies "tomorrow" against expected_day (catches a wrong day)', async () => {
+      const result = await handler.execute(makeCtx({ relative: 'tomorrow', expected_day: 'Saturday' }));
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toMatchObject({
+          date: '2026-05-08',
+          day_of_week: 'Friday',
+          correct: false,
+          expected_day: 'Saturday',
+        });
+      }
+    });
+
+    it('verifies "yesterday" against expected_day', async () => {
+      const result = await handler.execute(makeCtx({ relative: 'yesterday', expected_day: 'wednesday' }));
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toMatchObject({ date: '2026-05-06', correct: true, expected_day: 'Wednesday' });
+      }
+    });
+
+    it('does not treat a longer phrase containing "tomorrow" as tomorrow', async () => {
+      // Whole-input match only: "the day after tomorrow" must not resolve to tomorrow.
+      const result = await handler.execute(makeCtx({ relative: 'the day after tomorrow' }));
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a bare weekday and points to "this <day>" / "next <day>"', async () => {
+      // "Friday" alone is ambiguous (this week's, possibly past, or the coming one).
+      // The calendar brief check still requires a resolved date for it, so the error
+      // has to tell the model which explicit forms resolve it.
+      const result = await handler.execute(makeCtx({ relative: ' Friday ' }));
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toMatch(/ambiguous/i);
+        expect(result.error).toContain('"this Friday"');
+        expect(result.error).toContain('"next Friday"');
+      }
+    });
+
+    it('lists today/tomorrow/yesterday in the unsupported-expression error', async () => {
+      const result = await handler.execute(makeCtx({ relative: 'sometime next week maybe' }));
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toContain('"today"');
+        expect(result.error).toContain('"tomorrow"');
+        expect(result.error).toContain('"yesterday"');
+      }
+    });
+  });
+
+  // ── today / tomorrow / yesterday near midnight (#1986) ───────────────────
+  //
+  // The calendar day must come from the configured timezone, not UTC. Each case pins
+  // `now` to an instant whose local date differs from its UTC date.
+
+  describe('today/tomorrow/yesterday near midnight', () => {
+    afterEach(() => {
+      Settings.now = () => Date.now();
+    });
+
+    it('uses the local day when local time is before midnight but UTC is past it (Toronto 23:30)', async () => {
+      // 2026-10-03 23:30 EDT is 2026-10-04 03:30 UTC — still Saturday Oct 3 locally.
+      const fixedMs = DateTime.fromISO('2026-10-03T23:30:00', { zone: 'America/Toronto' }).toMillis();
+      Settings.now = () => fixedMs;
+
+      const today = await handler.execute(makeCtx({ relative: 'today' }));
+      const tomorrow = await handler.execute(makeCtx({ relative: 'tomorrow' }));
+      const yesterday = await handler.execute(makeCtx({ relative: 'yesterday' }));
+
+      expect(today).toMatchObject({ success: true, data: { date: '2026-10-03', day_of_week: 'Saturday' } });
+      expect(tomorrow).toMatchObject({ success: true, data: { date: '2026-10-04', day_of_week: 'Sunday' } });
+      expect(yesterday).toMatchObject({ success: true, data: { date: '2026-10-02', day_of_week: 'Friday' } });
+    });
+
+    it('uses the local day when local time is past midnight but UTC is not (Tokyo 00:30)', async () => {
+      // 2026-10-04 00:30 JST is 2026-10-03 15:30 UTC — already Sunday Oct 4 locally.
+      const fixedMs = DateTime.fromISO('2026-10-04T00:30:00', { zone: 'Asia/Tokyo' }).toMillis();
+      Settings.now = () => fixedMs;
+
+      const today = await handler.execute(makeCtx({ relative: 'today' }, 'Asia/Tokyo'));
+      const tomorrow = await handler.execute(makeCtx({ relative: 'tomorrow' }, 'Asia/Tokyo'));
+      const yesterday = await handler.execute(makeCtx({ relative: 'yesterday' }, 'Asia/Tokyo'));
+
+      expect(today).toMatchObject({ success: true, data: { date: '2026-10-04', day_of_week: 'Sunday' } });
+      expect(tomorrow).toMatchObject({ success: true, data: { date: '2026-10-05', day_of_week: 'Monday' } });
+      expect(yesterday).toMatchObject({ success: true, data: { date: '2026-10-03', day_of_week: 'Saturday' } });
+    });
+
+    it('steps across a DST change by calendar day (Toronto, night before spring-forward)', async () => {
+      // Clocks jump 02:00 → 03:00 on 2026-03-08; "tomorrow" is still Sunday Mar 8.
+      const fixedMs = DateTime.fromISO('2026-03-07T23:30:00', { zone: 'America/Toronto' }).toMillis();
+      Settings.now = () => fixedMs;
+
+      const tomorrow = await handler.execute(makeCtx({ relative: 'tomorrow' }));
+      expect(tomorrow).toMatchObject({ success: true, data: { date: '2026-03-08', day_of_week: 'Sunday' } });
+    });
   });
 
   // ── Edge cases ───────────────────────────────────────────────────────────
@@ -296,6 +453,44 @@ describe('DateResolveHandler', () => {
       expect(typeof data.displayTimezone).toBe('string');
       expect(data.displayTimezone).toMatch(/UTC/);
     }
+  });
+
+  // The label must describe the resolved date, not the moment of the call: a December
+  // date asked about in May is EST, and "tomorrow" on the night before spring-forward
+  // is EDT. Fake the system clock (not just luxon's Settings.now) so a label taken from
+  // the real `Date` can't pass by matching whatever offset applies on the day CI runs.
+  describe('displayTimezone follows the resolved date', () => {
+    function pinClock(isoLocal: string): void {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(DateTime.fromISO(isoLocal, { zone: 'America/Toronto' }).toMillis());
+    }
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('labels a winter date EST when asked in summer', async () => {
+      pinClock('2026-05-07T12:00:00');
+      const result = await handler.execute(makeCtx({ date: '2026-12-15' }));
+      expect(result).toMatchObject({ success: true, data: { displayTimezone: 'EST (UTC-05:00)' } });
+    });
+
+    it('labels a summer date EDT when asked in winter', async () => {
+      pinClock('2026-12-01T12:00:00');
+      const result = await handler.execute(makeCtx({ date: '2027-07-01' }));
+      expect(result).toMatchObject({ success: true, data: { displayTimezone: 'EDT (UTC-04:00)' } });
+    });
+
+    it('labels "tomorrow" EDT on the night before spring-forward', async () => {
+      // 2026-03-07 23:30 is EST. Clocks change at 02:00 on Mar 8, so midnight Mar 8 is
+      // still EST but most of the day is EDT; the label should describe the day.
+      pinClock('2026-03-07T23:30:00');
+      const result = await handler.execute(makeCtx({ relative: 'tomorrow' }));
+      expect(result).toMatchObject({
+        success: true,
+        data: { date: '2026-03-08', displayTimezone: 'EDT (UTC-04:00)' },
+      });
+    });
   });
 
   it('sets displayTimezone to null when timezone is not configured', async () => {

@@ -1,0 +1,500 @@
+// handler.test.ts — delegate skill: forwarding of relay context for specialist resume (#995).
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import pino from 'pino';
+import { DelegateHandler } from './handler.js';
+import type { ToolContext } from '../../src/skills/types.js';
+import type { EventBus } from '../../src/bus/bus.js';
+import type { BusEvent, AgentTaskEvent } from '../../src/bus/events.js';
+import { createAgentResponse } from '../../src/bus/events.js';
+import { encodeResumeToken } from '../../src/agents/resume-token.js';
+import type { VerificationRuntime } from '../../src/verification/index.js';
+import type { Verification } from '../../src/verification/types.js';
+
+/** Fake bus that, when an agent.task is published, immediately delivers a successful
+ *  agent.response parented to it so DelegateHandler's await resolves. */
+function makeBus(responseContent = 'done') {
+  const published: BusEvent[] = [];
+  const responseHandlers: Array<(e: BusEvent) => unknown> = [];
+  const bus = {
+    subscribe(type: string, _layer: string, handler: (e: BusEvent) => unknown) {
+      if (type === 'agent.response') responseHandlers.push(handler);
+    },
+    async publish(_layer: string, event: BusEvent) {
+      published.push(event);
+      if (event.type === 'agent.task') {
+        const task = event as AgentTaskEvent;
+        const resp = createAgentResponse({
+          agentId: task.payload.agentId,
+          conversationId: task.payload.conversationId,
+          content: responseContent,
+          skillsCalled: [],
+          parentEventId: task.id,
+        });
+        for (const h of responseHandlers) await h(resp);
+      }
+    },
+  } as unknown as EventBus;
+  return { bus, published };
+}
+
+const agentRegistryMock: {
+  has: (n: string) => boolean;
+  get: (n: string) => { name: string; role: string };
+  listSpecialists: () => Array<{ name: string }>;
+} = {
+  has: (n: string) => n === 'research-analyst',
+  get: (n: string) => ({ name: n, role: 'specialist' }),
+  listSpecialists: () => [{ name: 'research-analyst' }],
+};
+
+const agentRegistry = agentRegistryMock as unknown as ToolContext['agentRegistry'];
+
+function useCalendarRegistry(): void {
+  agentRegistryMock.has = (n: string) => n === 'calendar';
+  agentRegistryMock.get = (n: string) => ({ name: n, role: 'specialist' });
+  agentRegistryMock.listSpecialists = () => [{ name: 'calendar' }];
+}
+
+function restoreDefaultRegistry(): void {
+  agentRegistryMock.has = (n: string) => n === 'research-analyst';
+  agentRegistryMock.get = (n: string) => ({ name: n, role: 'specialist' });
+  agentRegistryMock.listSpecialists = () => [{ name: 'research-analyst' }];
+}
+
+function makeCtx(bus: EventBus, over: Partial<ToolContext> = {}): ToolContext {
+  return {
+    input: { agent: 'research-analyst', task: 'find the acquisition comps' },
+    log: pino({ level: 'silent' }),
+    bus,
+    agentRegistry,
+    agentId: 'coordinator',
+    conversationId: 'user-conv',
+    channelId: 'email',
+    taskMetadata: { originator: { contactId: 'ceo', systemRole: 'principal', channel: 'email', initiatedAt: 't' } },
+    ...over,
+  } as unknown as ToolContext;
+}
+
+describe('DelegateHandler relay-context forwarding (#995)', () => {
+  it('forwards delegationOrigin (coordinator routing + brief) and originator on the specialist task', async () => {
+    const { bus, published } = makeBus();
+    const result = await new DelegateHandler().execute(makeCtx(bus));
+    expect(result.success).toBe(true);
+
+    const task = published.find(e => e.type === 'agent.task');
+    expect(task).toBeDefined();
+    expect((task as AgentTaskEvent).payload.metadata).toMatchObject({
+      delegationOrigin: {
+        conversationId: 'user-conv',
+        channelId: 'email',
+        agentId: 'coordinator',
+        originalTask: 'find the acquisition comps',
+      },
+      originator: { contactId: 'ceo', systemRole: 'principal', channel: 'email', initiatedAt: 't' },
+    });
+  });
+
+  it('forwards the coordinator task id on delegationOrigin (#1860)', async () => {
+    const { bus, published } = makeBus();
+    const result = await new DelegateHandler().execute(makeCtx(bus, { taskEventId: 'task-coord-1' }));
+    expect(result.success).toBe(true);
+    const task = published.find(e => e.type === 'agent.task');
+    expect((task as AgentTaskEvent).payload.metadata).toMatchObject({
+      delegationOrigin: { taskEventId: 'task-coord-1', conversationId: 'user-conv' },
+    });
+  });
+
+  it('forwards delegationOrigin without originator when no originator is in ctx', async () => {
+    const { bus, published } = makeBus();
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, { taskMetadata: undefined }),
+    );
+    expect(result.success).toBe(true);
+
+    const task = published.find(e => e.type === 'agent.task');
+    expect(task).toBeDefined();
+    expect((task as AgentTaskEvent).payload.metadata).toMatchObject({
+      delegationOrigin: {
+        conversationId: 'user-conv',
+        channelId: 'email',
+        agentId: 'coordinator',
+        originalTask: 'find the acquisition comps',
+      },
+    });
+    expect((task as AgentTaskEvent).payload.metadata).not.toHaveProperty('originator');
+  });
+
+  it('forwards the live-principal-turn signal across a synchronous delegation (#1126)', async () => {
+    // The crux of #1126's delegated-elevated support: a specialist delegated-to inside the CEO's
+    // live turn inherits liveTurn, so it can satisfy the elevated gate (e.g. contact-set-tier).
+    const { bus, published } = makeBus();
+    const result = await new DelegateHandler().execute(makeCtx(bus, { liveTurn: true }));
+    expect(result.success).toBe(true);
+
+    const task = published.find(e => e.type === 'agent.task') as AgentTaskEvent;
+    // liveTurn is a DISTINCT payload field, not a metadata-bag key — so it cannot be persisted.
+    expect(task.payload.liveTurn).toBe(true);
+    expect(task.payload.metadata).not.toHaveProperty('liveTurn');
+  });
+
+  it('does NOT forward a live signal when the delegating turn is not live', async () => {
+    // An autonomous/woken coordinator turn (no liveTurn) delegating to a specialist must not
+    // manufacture live-ness — the sub-task stays non-live and elevated skills stay blocked.
+    const { bus, published } = makeBus();
+    const result = await new DelegateHandler().execute(makeCtx(bus, { liveTurn: undefined }));
+    expect(result.success).toBe(true);
+
+    const task = published.find(e => e.type === 'agent.task') as AgentTaskEvent;
+    expect(task.payload.liveTurn).toBeUndefined();
+  });
+});
+
+describe('DelegateHandler turn deadline (#2371)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('the published agent.task carries turnDeadlineAt = dispatch time + the resolved wait', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-29T12:00:00Z'));
+    const now = Date.now();
+    const { bus, published } = makeBus();
+    const ctx = makeCtx(bus);
+    ctx.input = { agent: 'research-analyst', task: 'find the acquisition comps', timeout_ms: 563_000 };
+    const result = await new DelegateHandler().execute(ctx);
+    expect(result.success).toBe(true);
+
+    const task = published.find(e => e.type === 'agent.task') as AgentTaskEvent;
+    expect(task.payload.turnDeadlineAt).toBe(now + 563_000);
+    // A distinct payload field, never a metadata key.
+    expect(task.payload.metadata).not.toHaveProperty('turnDeadlineAt');
+  });
+});
+
+describe('DelegateHandler date-resolve brief validation (#1612)', () => {
+  afterEach(() => {
+    restoreDefaultRegistry();
+  });
+
+  it('rejects a calendar brief that contradicts date-resolve output from this turn', async () => {
+    const { bus, published } = makeBus();
+    useCalendarRegistry();
+
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, {
+        input: {
+          agent: 'calendar',
+          task: 'Schedule a catch-up on August 1, 2026 at 2pm.',
+        },
+        turnDateResolveResults: [{ isoDate: '2026-07-31', formatted: 'Friday, July 31, 2026' }],
+      }),
+    );
+    if (result.success) throw new Error('expected delegate to reject a contradicting calendar brief');
+    expect(result.error).toMatch(/must include a date date-resolve produced/i);
+    expect(published.find(e => e.type === 'agent.task')).toBeUndefined();
+  });
+
+  it('accepts a calendar brief that matches date-resolve output from this turn', async () => {
+    const { bus, published } = makeBus();
+    useCalendarRegistry();
+
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, {
+        input: {
+          agent: 'calendar',
+          task: 'Schedule a catch-up on Friday, July 31, 2026 at 2pm.',
+        },
+        turnDateResolveResults: [{ isoDate: '2026-07-31', formatted: 'Friday, July 31, 2026' }],
+      }),
+    );
+    expect(result.success).toBe(true);
+    expect(published.find(e => e.type === 'agent.task')).toBeDefined();
+  });
+
+  it('rejects relative calendar asks when date-resolve was not called this turn', async () => {
+    const { bus, published } = makeBus();
+    useCalendarRegistry();
+
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, {
+        input: {
+          agent: 'calendar',
+          task: "What's on my calendar next Tuesday?",
+        },
+      }),
+    );
+    if (result.success) throw new Error('expected delegate to require date-resolve first');
+    expect(result.error).toMatch(/requires date-resolve first/i);
+    expect(published.find(e => e.type === 'agent.task')).toBeUndefined();
+  });
+
+  it('skips date validation when resuming with a resume_token', async () => {
+    const { bus, published } = makeBus();
+    useCalendarRegistry();
+    const resume_token = encodeResumeToken({
+      agent: 'calendar',
+      originalTask: 'Schedule the Friday meeting.',
+      context: 'Waiting on CEO direction for the exact time.',
+    });
+
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, {
+        input: {
+          agent: 'calendar',
+          task: 'Use 2pm.',
+          resume_token,
+        },
+      }),
+    );
+    expect(result.success).toBe(true);
+    expect(published.find(e => e.type === 'agent.task')).toBeDefined();
+  });
+});
+
+describe('DelegateHandler resume_token decode', () => {
+  it('builds a task brief from a valid resume_token (original task + progress + CEO direction)', async () => {
+    const { bus, published } = makeBus();
+    const resume_token = encodeResumeToken({
+      agent: 'research-analyst',
+      originalTask: 'compile the acquisition comps',
+      context: 'gathered 3 of 5 comps; blocked on the private ones',
+    });
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, { input: { agent: 'research-analyst', task: 'use the public filings only', resume_token } }),
+    );
+    expect(result.success).toBe(true);
+    const task = published.find(e => e.type === 'agent.task');
+    expect(task).toBeDefined();
+    expect((task as AgentTaskEvent).payload.content).toContain('compile the acquisition comps'); // original_task
+    expect((task as AgentTaskEvent).payload.content).toContain('gathered 3 of 5 comps');          // progress/context
+    expect((task as AgentTaskEvent).payload.content).toContain('use the public filings only');    // CEO direction (task)
+  });
+
+  it('rejects a malformed resume_token without publishing a task', async () => {
+    const { bus, published } = makeBus();
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, { input: { agent: 'research-analyst', task: 'continue', resume_token: '!!!not base64 json!!!' } }),
+    );
+    if (result.success) throw new Error('expected delegate to reject a malformed resume_token');
+    expect(result.error).toMatch(/could not be decoded|corrupted/i);
+    expect(published.find(e => e.type === 'agent.task')).toBeUndefined();
+  });
+
+  it('rejects a resume_token minted for a different specialist (cross-agent guard)', async () => {
+    const { bus, published } = makeBus();
+    const resume_token = encodeResumeToken({ agent: 'accounts-specialist', originalTask: 'x', context: 'y' });
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, { input: { agent: 'research-analyst', task: 'continue', resume_token } }),
+    );
+    if (result.success) throw new Error('expected delegate to reject a cross-agent resume_token');
+    expect(result.error).toMatch(/accounts-specialist/);
+    expect(published.find(e => e.type === 'agent.task')).toBeUndefined();
+  });
+
+  it('rejects a resume_token with an empty agent field (cross-agent guard bypass via falsy agent)', async () => {
+    const { bus, published } = makeBus();
+    // Encode a token with agent: "" — decodeResumeToken accepts it (validates only typeof),
+    // so the handler's strict-equality guard must reject it rather than letting it through via
+    // the old `payload.agent && payload.agent !== agent` falsy-bypass.
+    const resume_token = Buffer.from(
+      JSON.stringify({ v: 1, agent: '', original_task: 'orig task', context: 'progress' }),
+    ).toString('base64');
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, { input: { agent: 'research-analyst', task: 'continue', resume_token } }),
+    );
+    if (result.success) throw new Error('expected delegate to reject an empty-agent resume_token');
+    expect(result.error).toMatch(/empty agent field|corrupted/i);
+    expect(published.find(e => e.type === 'agent.task')).toBeUndefined();
+  });
+
+  it('rejects a resume_token whose required field is an empty string', async () => {
+    const { bus, published } = makeBus();
+    // Valid base64/JSON with the right keys, but original_task is empty — the shared decode accepts
+    // it (it is a string), so the handler's own empty-field guard must still reject it.
+    const resume_token = encodeResumeToken({ agent: 'research-analyst', originalTask: '', context: 'y' });
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, { input: { agent: 'research-analyst', task: 'continue', resume_token } }),
+    );
+    if (result.success) throw new Error('expected delegate to reject an empty-field resume_token');
+    expect(result.error).toMatch(/missing required fields/i);
+    expect(published.find(e => e.type === 'agent.task')).toBeUndefined();
+  });
+
+  it('warns but proceeds when the resume_token version does not match', async () => {
+    const { bus, published } = makeBus();
+    const logger = pino({ level: 'silent' });
+    const warnSpy = vi.spyOn(logger, 'warn');
+    // Hand-craft a token with a future version (encodeResumeToken always stamps the current one).
+    const resume_token = Buffer.from(
+      JSON.stringify({ v: 99, agent: 'research-analyst', original_task: 'orig task', context: 'progress' }),
+    ).toString('base64');
+    const result = await new DelegateHandler().execute(
+      makeCtx(bus, { log: logger, input: { agent: 'research-analyst', task: 'continue', resume_token } }),
+    );
+    expect(result.success).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ tokenVersion: 99, expectedVersion: 1 }),
+      expect.stringMatching(/version mismatch/i),
+    );
+    // Despite the mismatch it still proceeds and builds the brief.
+    const task = published.find(e => e.type === 'agent.task');
+    expect(task).toBeDefined();
+    expect((task as AgentTaskEvent).payload.content).toContain('orig task');
+  });
+});
+
+describe('DelegateHandler resolved entities (#1818)', () => {
+  it('returns contact IDs parsed from the specialist <resolved_entities> block', async () => {
+    const id = '11111111-1111-4111-8111-111111111111';
+    const { bus } = makeBus(
+      `Xiaopu Fung is on file.\n<resolved_entities><contact name="Xiaopu Fung" id="${id}" role="Spouse"/></resolved_entities>`,
+    );
+    const result = await new DelegateHandler().execute(makeCtx(bus));
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data).toMatchObject({
+      agent: 'research-analyst',
+      resolvedContactIds: [id],
+    });
+  });
+});
+
+describe('DelegateHandler sign-in code tracking from ceo-inbox (#2017)', () => {
+  afterEach(() => {
+    restoreDefaultRegistry();
+  });
+
+  function useInboxRegistry(): void {
+    agentRegistryMock.has = (n: string) => n === 'ceo-inbox' || n === 'research-analyst';
+    agentRegistryMock.get = (n: string) => ({ name: n, role: 'specialist' });
+    agentRegistryMock.listSpecialists = () => [{ name: 'ceo-inbox' }, { name: 'research-analyst' }];
+  }
+
+  function makeVerification(over: Partial<Verification> = {}): Verification {
+    return {
+      id: 'ver-1',
+      purpose: 'sign_in',
+      kind: 'code',
+      delivery: 'email',
+      site: 'aircanada.com',
+      pageDomain: 'aircanada.com',
+      browserSessionId: 'sess-1',
+      taskId: null,
+      conversationId: null,
+      status: 'pending',
+      requestedAt: new Date(),
+      expiresAt: new Date(Date.now() + 600_000),
+      resolvedAt: null,
+      metadata: {},
+      ...over,
+    };
+  }
+
+  function makeRuntime(rows: Verification[] | Error) {
+    const register = vi.fn();
+    const closed = vi.fn();
+    const listActive = vi.fn(async () => {
+      if (rows instanceof Error) throw rows;
+      return rows;
+    });
+    const runtime = { listActive, tracker: { register, closed } } as unknown as VerificationRuntime;
+    return { runtime, register, closed, listActive };
+  }
+
+  const inboxInput = { agent: 'ceo-inbox', task: 'find the Air Canada code in the inbox' };
+
+  it('registers a 6-8 character code from a ceo-inbox result for the pending email verification', async () => {
+    useInboxRegistry();
+    const { bus } = makeBus('Your Air Canada code is 739204');
+    const { runtime, register } = makeRuntime([makeVerification()]);
+    const result = await new DelegateHandler().execute(makeCtx(bus, { input: inboxInput, verification: runtime }));
+    expect(result.success).toBe(true);
+    expect(register).toHaveBeenCalledWith('ver-1', 'aircanada.com', '739204', 'sess-1');
+    // The result returned to the coordinator is unchanged.
+    if (!result.success) return;
+    expect(JSON.stringify(result.data)).toContain('739204');
+  });
+
+  it('registers against every pending-or-recent email verification, never a satisfied one, and ignores other deliveries', async () => {
+    useInboxRegistry();
+    const { bus } = makeBus('Code: 739204');
+    const { runtime, register, closed } = makeRuntime([
+      makeVerification({ id: 'ver-1' }),
+      makeVerification({ id: 'ver-2', pageDomain: 'idp.example.com' }),
+      makeVerification({ id: 'ver-sms', delivery: 'sms' }),
+      makeVerification({ id: 'ver-late', status: 'expired' }),
+      makeVerification({ id: 'ver-done', status: 'satisfied' }),
+    ]);
+    await new DelegateHandler().execute(makeCtx(bus, { input: inboxInput, verification: runtime }));
+    expect(register.mock.calls.map(c => c[0]).sort()).toEqual(['ver-1', 'ver-2', 'ver-late']);
+    // Only the already-closed row starts its TTL clock; pending rows stay open.
+    expect(closed.mock.calls.map(c => c[0])).toEqual(['ver-late']);
+  });
+
+  it.each(['expired', 'abandoned'] as const)(
+    'still registers for a recently %s email verification and starts its TTL clock',
+    async (status) => {
+      useInboxRegistry();
+      const { bus } = makeBus('Your Air Canada code is 739204');
+      const { runtime, register, closed } = makeRuntime([makeVerification({ id: 'ver-r', status })]);
+      await new DelegateHandler().execute(makeCtx(bus, { input: inboxInput, verification: runtime }));
+      expect(register).toHaveBeenCalledWith('ver-r', 'aircanada.com', '739204', 'sess-1');
+      expect(closed).toHaveBeenCalledWith('ver-r');
+    },
+  );
+
+  it('does not start the TTL clock for a pending verification', async () => {
+    useInboxRegistry();
+    const { bus } = makeBus('Your Air Canada code is 739204');
+    const { runtime, closed } = makeRuntime([makeVerification()]);
+    await new DelegateHandler().execute(makeCtx(bus, { input: inboxInput, verification: runtime }));
+    expect(closed).not.toHaveBeenCalled();
+  });
+
+  it('does not register a 4-digit code from a ceo-inbox result', async () => {
+    useInboxRegistry();
+    const { bus } = makeBus('Your Air Canada code is 4821');
+    const { runtime, register } = makeRuntime([makeVerification()]);
+    const result = await new DelegateHandler().execute(makeCtx(bus, { input: inboxInput, verification: runtime }));
+    expect(result.success).toBe(true);
+    expect(register).not.toHaveBeenCalled();
+  });
+
+  it('registers nothing when delegating to another agent', async () => {
+    useInboxRegistry();
+    const { bus } = makeBus('Your Air Canada code is 739204');
+    const { runtime, register, listActive } = makeRuntime([makeVerification()]);
+    const result = await new DelegateHandler().execute(makeCtx(bus, { verification: runtime }));
+    expect(result.success).toBe(true);
+    expect(register).not.toHaveBeenCalled();
+    expect(listActive).not.toHaveBeenCalled();
+  });
+
+  it('registers nothing when no email verification is pending or recent', async () => {
+    useInboxRegistry();
+    const { bus } = makeBus('Your Air Canada code is 739204');
+    const { runtime, register } = makeRuntime([makeVerification({ delivery: 'sms' })]);
+    await new DelegateHandler().execute(makeCtx(bus, { input: inboxInput, verification: runtime }));
+    expect(register).not.toHaveBeenCalled();
+  });
+
+  it('still delegates normally when no verification runtime is wired', async () => {
+    useInboxRegistry();
+    const { bus } = makeBus('Your Air Canada code is 739204');
+    const result = await new DelegateHandler().execute(makeCtx(bus, { input: inboxInput }));
+    expect(result.success).toBe(true);
+  });
+
+  it('does not fail the delegation when listing verifications throws, and logs no content', async () => {
+    useInboxRegistry();
+    const { bus } = makeBus('Your Air Canada code is 739204');
+    const { runtime, register } = makeRuntime(new Error('db down'));
+    const log = pino({ level: 'silent' });
+    const warnSpy = vi.spyOn(log, 'warn');
+    const result = await new DelegateHandler().execute(makeCtx(bus, { input: inboxInput, verification: runtime, log }));
+    expect(result.success).toBe(true);
+    expect(register).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalled();
+    expect(JSON.stringify(warnSpy.mock.calls)).not.toContain('739204');
+  });
+});

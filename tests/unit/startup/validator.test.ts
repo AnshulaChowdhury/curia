@@ -140,6 +140,14 @@ describe('startup validator — default config', () => {
       runWith({ config: path.join(F, 'config/unknown-key') }),
     ).rejects.toThrow(/trust-policy/);
   });
+
+  // #2159 retired autonomy_scoring.weakExpiredWeight. A config that still sets it must
+  // keep booting: the key is accepted and ignored, never a reason to refuse startup.
+  it('passes for a config that still sets the retired weakExpiredWeight', async () => {
+    await expect(
+      runWith({ config: path.join(F, 'config/retired-weak-expired-weight') }),
+    ).resolves.toBeUndefined();
+  });
 });
 
 // ── skills.yaml (MCP server config) validation ──────────────────────────────
@@ -177,7 +185,7 @@ describe('startup validator — skills.yaml', () => {
 
 // ── Real project files ───────────────────────────────────────────────────────
 //
-// Validates the actual config/default.yaml, agents/*.yaml, and skills/*/skill.json
+// Validates the actual config/default.yaml, agents/*.yaml, and skills/*/tool.json
 // against the schemas. This catches schema/config drift before it reaches prod —
 // the incident that prompted this test: dispatch.rate_limit was added to default.yaml
 // but not to the schema, causing every deploy to fail on startup validation.
@@ -210,7 +218,7 @@ describe('startup validator — real project files', () => {
     ).resolves.toBeUndefined();
   });
 
-  it('all skills/*/skill.json pass schema validation', async () => {
+  it('all flat and nested skills/**/tool.json pass schema validation', async () => {
     await expect(
       runStartupValidation({
         skillsDir: path.join(ROOT, 'skills'),

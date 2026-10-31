@@ -38,6 +38,8 @@ pgdata/
 # Smoke test outputs (timestamped, not committed)
 tests/smoke/results/*.json
 tests/smoke/reports/*.html
+tests/scenarios/results/
+tests/setup-wizard/results/
 
 # Claude Code local skills (managed by trimkit, not committed)
 .claude/skills/
@@ -51,3 +53,4 @@ tests/redteam/results/
 # Superpowers subagent-driven-development scratch (task briefs, reports, review
 # diffs) — local workflow artifacts, never committed
 .superpowers/
+scripts/spikes/voice-brain-parity/results*.json

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { ceoPrimaryEmailIsPlaceholder, loadConfig } from '../../src/config.js';
+import { loadConfig } from '../../src/config.js';
 
 describe('loadConfig', () => {
   const originalEnv = process.env;
@@ -30,6 +30,15 @@ describe('loadConfig', () => {
     expect(config.anthropicApiKey).toBeUndefined();
   });
 
+  it('reads EMBEDDING_BASE_URL and EMBEDDING_MODEL from environment', () => {
+    process.env.DATABASE_URL = 'postgres://test:test@localhost:5432/test';
+    process.env.EMBEDDING_BASE_URL = 'http://embed.local/v1';
+    process.env.EMBEDDING_MODEL = 'Qwen3-Embedding-4B';
+    const config = loadConfig();
+    expect(config.embeddingBaseUrl).toBe('http://embed.local/v1');
+    expect(config.embeddingModel).toBe('Qwen3-Embedding-4B');
+  });
+
   it('defaults LOG_LEVEL to info', () => {
     process.env.DATABASE_URL = 'postgres://test:test@localhost:5432/test';
     // Explicitly remove LOG_LEVEL to test the default — CI sets LOG_LEVEL=error
@@ -37,44 +46,53 @@ describe('loadConfig', () => {
     const config = loadConfig();
     expect(config.logLevel).toBe('info');
   });
-
-  describe('CEO_PRIMARY_EMAIL placeholder handling', () => {
+  describe('AWS Bedrock settings', () => {
     beforeEach(() => {
       process.env.DATABASE_URL = 'postgres://test:test@localhost:5432/test';
+      delete process.env.AWS_REGION;
+      delete process.env.AWS_BEDROCK_TIMEOUT;
     });
 
-    it('normalizes a real email to lowercase trimmed value', () => {
-      process.env.CEO_PRIMARY_EMAIL = '  Joe@Example.COM  ';
-      expect(loadConfig().ceoPrimaryEmail).toBe('joe@example.com');
+    it('defaults the timeout to 120 seconds, expressed in milliseconds, with no region', () => {
+      const config = loadConfig();
+      expect(config.awsBedrockTimeoutMs).toBe(120_000);
+      expect(config.awsRegion).toBeUndefined();
     });
 
-    it('treats the literal .env.example placeholder as unset', () => {
-      process.env.CEO_PRIMARY_EMAIL = 'you@yourdomain.com';
-      expect(loadConfig().ceoPrimaryEmail).toBeUndefined();
+    it('reads AWS_BEDROCK_TIMEOUT as seconds and trims AWS_REGION', () => {
+      process.env.AWS_BEDROCK_TIMEOUT = '45';
+      process.env.AWS_REGION = '  ca-central-1 ';
+      const config = loadConfig();
+      expect(config.awsBedrockTimeoutMs).toBe(45_000);
+      expect(config.awsRegion).toBe('ca-central-1');
     });
 
-    it('treats a case-and-whitespace variant of the placeholder as unset', () => {
-      process.env.CEO_PRIMARY_EMAIL = '  YOU@YourDomain.com  ';
-      expect(loadConfig().ceoPrimaryEmail).toBeUndefined();
+    it('treats a blank AWS_REGION as unset', () => {
+      process.env.AWS_REGION = '   ';
+      expect(loadConfig().awsRegion).toBeUndefined();
     });
 
-    it('treats an empty string env var as unset', () => {
-      process.env.CEO_PRIMARY_EMAIL = '';
-      expect(loadConfig().ceoPrimaryEmail).toBeUndefined();
+    it.each(['0', '-5', 'abc', ''])('rejects AWS_BEDROCK_TIMEOUT=%j', (value) => {
+      process.env.AWS_BEDROCK_TIMEOUT = value;
+      expect(() => loadConfig()).toThrow(/AWS_BEDROCK_TIMEOUT must be a positive number of seconds/);
     });
 
-    it('ceoPrimaryEmailIsPlaceholder() returns true only for the literal placeholder', () => {
-      process.env.CEO_PRIMARY_EMAIL = 'you@yourdomain.com';
-      expect(ceoPrimaryEmailIsPlaceholder()).toBe(true);
+    it('accepts the largest timeout that fits a Node timer', () => {
+      process.env.AWS_BEDROCK_TIMEOUT = String(Math.floor(2_147_483_647 / 1000));
+      expect(loadConfig().awsBedrockTimeoutMs).toBe(2_147_483_000);
+    });
 
-      process.env.CEO_PRIMARY_EMAIL = '  YOU@YourDomain.com  ';
-      expect(ceoPrimaryEmailIsPlaceholder()).toBe(true);
+    it('rejects a timeout past the Node timer limit, which would make every call abort at once', () => {
+      process.env.AWS_BEDROCK_TIMEOUT = String(Math.floor(2_147_483_647 / 1000) + 1);
+      expect(() => loadConfig()).toThrow(/AWS_BEDROCK_TIMEOUT exceeds the Node.js timer limit \(2147483 seconds\)/);
+    });
 
-      process.env.CEO_PRIMARY_EMAIL = 'joe@example.com';
-      expect(ceoPrimaryEmailIsPlaceholder()).toBe(false);
-
-      delete process.env.CEO_PRIMARY_EMAIL;
-      expect(ceoPrimaryEmailIsPlaceholder()).toBe(false);
+    it('does not read AWS credentials from the environment (vault-only)', () => {
+      process.env.AWS_ACCESS_KEY_ID = 'AKIA-env';
+      process.env.AWS_SECRET_ACCESS_KEY = 'secret-env';
+      const config = loadConfig();
+      expect(config.awsAccessKeyId).toBeUndefined();
+      expect(config.awsSecretAccessKey).toBeUndefined();
     });
   });
 });

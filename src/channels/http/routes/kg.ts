@@ -1,16 +1,28 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+// kg.ts — knowledge-graph primitives and console session login.
+//
+// Graph node/edge routes stay under /api/kg/*. Task, contact, and chat CRUD
+// moved to their own route files under /api/* (#872).
+//
+// Auth for /api/kg/*: session cookie or x-web-bootstrap-secret via assertSecret.
+// POST /auth mints the curia_session cookie used by all console routes.
+
+import { randomBytes } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
-import type { EventBus } from '../../../bus/bus.js';
-import { createInboundMessage } from '../../../bus/events.js';
 import type { Logger } from '../../../logger.js';
 import type { ContactService } from '../../../contacts/contact-service.js';
-import { ContactValidationError } from '../../../contacts/contact-service.js';
-import type { ChannelIdentity, Contact, ContactCanonicalFields, ContactKind, ContactTier } from '../../../contacts/types.js';
-import type { EventRouter } from '../event-router.js';
-import { assertSecret, compareSecrets, hashToken, type SessionStore } from '../session-auth.js';
-import { markdownToHtml } from '../../../utils/markdown-to-html.js';
-import { stripOutboundContextPreamble } from '../../../dispatch/outbound-context.js';
+import { assertSecret, compareSecrets, CONSOLE_RATE, hashToken, type SessionStore } from '../session-auth.js';
+import { resolveConsoleOriginator } from '../console-originator.js';
+import { isUuid } from '../../../util/uuid.js';
+import type { NodeMergeApi } from '../../../kg-merge/service.js';
+import { DEFAULT_CANDIDATES, MAX_CANDIDATES } from '../../../kg-merge/service.js';
+import { parseResolutions } from '../../../kg-merge/resolve.js';
+import {
+  InvalidResolutionError,
+  MergeBlockedError,
+  NodeNotFoundError,
+  StalePreviewError,
+} from '../../../kg-merge/errors.js';
 
 export interface KnowledgeGraphRouteOptions {
   pool: Pool;
@@ -19,26 +31,15 @@ export interface KnowledgeGraphRouteOptions {
   // True when APP_ORIGIN is https:// — causes Set-Cookie to include the Secure flag.
   // False in local dev so cookies work on http://localhost without browser rejection.
   secureCookies: boolean;
-  // Bus + EventRouter are required for the chat endpoints (POST /api/kg/chat/messages
-  // and GET /api/kg/chat/stream). The chat routes dispatch inbound messages through the
-  // bus and stream outbound responses back via SSE, mirroring the pattern used by the
-  // existing /api/messages endpoints.
-  bus: EventBus;
-  eventRouter: EventRouter;
   contactService: ContactService;
-  // Shared session store — created in HttpAdapter, passed to both KG and identity routes
-  // so both can accept the curia_session cookie for authentication.
+  // Shared session store — created in HttpAdapter, passed to KG and other console routes
+  // so all can accept the curia_session cookie for authentication.
   sessions: SessionStore;
+  // Node merge (#2233): POST /api/kg/nodes/merge and GET /api/kg/nodes/:id/merge-candidates.
+  // Optional so callers that never mount the merge (tests) need not build one; when absent
+  // those two routes answer 503.
+  nodeMergeService?: NodeMergeApi;
 }
-
-// Channel identifier used when the KG web app dispatches messages to the agent layer.
-// The 'web' channel is special-cased in contact-resolver.ts to auto-resolve to the CEO —
-// the bootstrap secret is CEO-only, so any authenticated web request is implicitly the CEO.
-// See config/channel-trust.yaml for the channel policy.
-const WEB_CHANNEL_ID = 'web';
-// Sentinel sender ID for the web channel. The value is cosmetic — contact-resolver.ts
-// short-circuits to the CEO contact for this channel regardless of the sender string.
-const WEB_SENDER_ID = 'ceo-web-user';
 
 interface KgNodeRow {
   id: string;
@@ -51,6 +52,28 @@ interface KgNodeRow {
   created_at: string;
   last_confirmed_at: string;
   sensitivity: string;
+}
+
+/** GET /api/kg/nodes also returns the alias list, identity tier and archived flag (#2233). */
+interface KgNodeListRow extends KgNodeRow {
+  aliases: string[] | null;
+  identity_source: string;
+  archived_at: string | null;
+}
+
+/** GET /api/kg/graph nodes carry the alias list and whether the node is archived (#2233). */
+interface KgGraphNodeRow extends KgNodeRow {
+  aliases: string[] | null;
+  archived_at: string | null;
+}
+
+/**
+ * SQL predicate: the row aliased `n` is NOT a merge tombstone — an archived node whose
+ * properties name the survivor it was merged into (#2233). Decayed archived nodes (no
+ * merged_into) still pass.
+ */
+function notMergeTombstone(alias: string): string {
+  return `NOT (${alias}.archived_at IS NOT NULL AND ${alias}.properties->>'merged_into' IS NOT NULL)`;
 }
 
 interface KgEdgeRow {
@@ -76,7 +99,7 @@ export async function knowledgeGraphRoutes(
   app: FastifyInstance,
   options: KnowledgeGraphRouteOptions,
 ): Promise<void> {
-  const { pool, logger, webAppBootstrapSecret, secureCookies, bus, eventRouter, contactService, sessions } = options;
+  const { pool, logger, webAppBootstrapSecret, secureCookies, contactService, sessions, nodeMergeService } = options;
   // sessions is managed by HttpAdapter — no local Map creation needed here.
 
   // POST /auth — exchanges the bootstrap secret for an HttpOnly session cookie.
@@ -129,9 +152,8 @@ export async function knowledgeGraphRoutes(
     return reply.status(200).send({ ok: true });
   });
 
-  // Rate limit for KG API endpoints: 60/min per IP allows interactive browsing
-  // while blocking DoS-level query floods against the database.
-  const KG_RATE = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
+  // Rate limit for KG API endpoints: shared console 60/min per IP.
+  const KG_RATE = CONSOLE_RATE;
 
   app.get('/api/kg/nodes', KG_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
@@ -140,24 +162,35 @@ export async function knowledgeGraphRoutes(
       query?: string;
       type?: string;
       limit?: string;
+      exclude_facts?: string;
     };
 
     const limit = normalizeLimit(query.limit, 50, 250);
     const searchQuery = query.query?.trim();
     const typeFilter = query.type?.trim();
+    // exclude_facts=true drops fact nodes — the merge picker searches entities only (#2233).
+    const excludeFacts = query.exclude_facts === 'true' || query.exclude_facts === '1';
 
-    const result = await pool.query<KgNodeRow>(
-      `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity
+    // Merge tombstones are excluded (#2233), the same rule /api/kg/graph applies: a
+    // merged-away node lives on only as a redirect to its survivor. Decayed archived nodes
+    // are still listed, flagged `archived`, so the list and the graph agree. The text
+    // search also matches aliases, so a node is found by a name it was merged from.
+    const result = await pool.query<KgNodeListRow>(
+      `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity,
+              aliases, identity_source, archived_at
        FROM kg_nodes
-       WHERE ($1::text IS NULL OR type = $1)
+       WHERE ${notMergeTombstone('kg_nodes')}
+         AND ($1::text IS NULL OR type = $1)
+         AND (NOT $4::boolean OR type <> 'fact')
          AND (
            $2::text IS NULL
            OR label ILIKE '%' || $2 || '%'
            OR properties::text ILIKE '%' || $2 || '%'
+           OR EXISTS (SELECT 1 FROM unnest(aliases) AS a(alias) WHERE a.alias ILIKE '%' || $2 || '%')
          )
        ORDER BY last_confirmed_at DESC
        LIMIT $3`,
-      [typeFilter || null, searchQuery || null, limit],
+      [typeFilter || null, searchQuery || null, limit, excludeFacts],
     );
 
     return reply.send({
@@ -172,6 +205,9 @@ export async function knowledgeGraphRoutes(
         createdAt: row.created_at,
         lastConfirmedAt: row.last_confirmed_at,
         sensitivity: row.sensitivity,
+        aliases: row.aliases ?? [],
+        identitySource: row.identity_source === 'contact' ? 'contact' : 'label',
+        archived: row.archived_at !== null && row.archived_at !== undefined,
       })),
     });
   });
@@ -191,12 +227,14 @@ export async function knowledgeGraphRoutes(
 
     // Reject malformed UUIDs before they reach SQL — Postgres would throw a cast error
     // and surface as a 500 rather than a useful 400 for the caller.
-    if (nodeId && !UUID_RE.test(nodeId)) {
+    if (nodeId && !isUuid(nodeId)) {
       return reply.status(400).send({ error: 'Invalid node_id: must be a valid UUID.' });
     }
 
+    // Merge tombstones (#2233) are never drawn or traversed through; only the focal node
+    // itself (the CTE anchor) may be one, so the 404 node_merged below can name the survivor.
     const nodeResult = nodeId
-      ? await pool.query<KgNodeRow>(
+      ? await pool.query<KgGraphNodeRow>(
           // visited tracks the set of node IDs already expanded, preventing the same
           // node from being re-expanded when reached at a different depth (which UNION
           // alone can't prevent because depth is part of each row's identity).
@@ -206,31 +244,61 @@ export async function knowledgeGraphRoutes(
              WHERE id = $1::uuid
              UNION ALL
              SELECT
-               CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END AS id,
+               o.id,
                t.depth + 1,
-               t.visited || CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END
+               t.visited || o.id
              FROM traversal t
              JOIN kg_edges e ON e.source_node_id = t.id OR e.target_node_id = t.id
+             JOIN kg_nodes o ON o.id = CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END
              WHERE t.depth < $2
-               AND NOT (CASE WHEN e.source_node_id = t.id THEN e.target_node_id ELSE e.source_node_id END = ANY(t.visited))
+               AND NOT (o.id = ANY(t.visited))
+               AND ${notMergeTombstone('o')}
            )
-           SELECT DISTINCT n.id, n.type, n.label, n.properties, n.confidence, n.decay_class, n.source, n.created_at, n.last_confirmed_at, n.sensitivity
+           SELECT DISTINCT n.id, n.type, n.label, n.properties, n.confidence, n.decay_class, n.source, n.created_at, n.last_confirmed_at, n.sensitivity,
+                  n.aliases, n.archived_at
            FROM traversal t
            JOIN kg_nodes n ON n.id = t.id
            ORDER BY n.last_confirmed_at DESC
            LIMIT $3`,
           [nodeId, depth, limit],
         )
-      : await pool.query<KgNodeRow>(
-          `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity
-           FROM kg_nodes
+      : await pool.query<KgGraphNodeRow>(
+          `SELECT id, type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, sensitivity,
+                  aliases, archived_at
+           FROM kg_nodes n
+           WHERE ${notMergeTombstone('n')}
            ORDER BY last_confirmed_at DESC
            LIMIT $1`,
           [limit],
         );
 
     if (nodeResult.rows.length === 0) {
+      // With a focal node_id the CTE anchor is that node itself: zero rows means no
+      // kg_nodes row (including archived — the anchor is never filtered). An
+      // isolated node still yields exactly one row (itself) and an empty edge list
+      // below — keep that as 200 so callers can tell the two apart (#1881).
+      if (nodeId) {
+        logger.debug({ nodeId }, 'kg: graph node not found');
+        return reply.status(404).send({ error: `Node not found: ${nodeId}` });
+      }
       return reply.send({ nodes: [], edges: [] });
+    }
+
+    // A deep link to a node that was merged away (#2233): send the console to the
+    // survivor instead of drawing the tombstone. An archived node without merged_into
+    // (decayed) keeps the behaviour above — it is still drawn.
+    if (nodeId) {
+      const focal = nodeResult.rows.find((row) => row.id === nodeId);
+      const mergedInto = focal?.properties?.merged_into;
+      if (focal?.archived_at && typeof mergedInto === 'string' && mergedInto.length > 0) {
+        logger.debug({ nodeId, mergedInto }, 'kg: graph node was merged away');
+        return reply.status(404).send({
+          error: `Node ${nodeId} was merged into ${mergedInto}.`,
+          code: 'node_merged',
+          mergedInto,
+          label: focal.label,
+        });
+      }
     }
 
     const nodeIds = nodeResult.rows.map((row) => row.id);
@@ -258,6 +326,8 @@ export async function knowledgeGraphRoutes(
         createdAt: row.created_at,
         lastConfirmedAt: row.last_confirmed_at,
         sensitivity: row.sensitivity,
+        aliases: row.aliases ?? [],
+        archived: row.archived_at !== null && row.archived_at !== undefined,
       })),
       edges: edgeResult.rows.map((row) => ({
         id: row.id,
@@ -273,1095 +343,97 @@ export async function knowledgeGraphRoutes(
     });
   });
 
-  // tier/kind selectable via the API — 'principal' and kind∈{principal,agent} are structural-only.
-  const validContactTiers: ContactTier[] = ['blocked', 'unknown', 'known', 'trusted'];
-  const validContactKinds: ContactKind[] = ['person', 'organization', 'automated'];
-  const validTaskStatuses = [
-    // Legacy values used by the scheduler before task skills shipped
-    'active', 'pending', 'paused', 'completed', 'failed',
-    // Task-lifecycle values introduced by migration 049
-    'open', 'in_progress', 'blocked', 'waiting', 'done', 'cancelled',
-  ];
-  // Reused across contacts endpoints — Postgres UUID columns throw cast errors on bad input
-  // so we reject at the API boundary with a 400 instead.
-  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  // ── Node merge (#2233, docs/wip/2026-10-21-kg-node-merge-design.md §8) ──────────
 
-  // Full DB row shape for the tasks table (all columns post-migration-049).
-  // The enriched variant (used for GET list) includes joined fields from
-  // contacts and a correlated subquery for the next scheduled wake-up time.
-  type DbTaskRow = {
-    id: string;
-    agent_id: string;
-    title: string;
-    intent_anchor: string;
-    description: string | null;
-    status: string;
-    owner: string;
-    priority: number;
-    due_at: string | null;
-    source: string;
-    source_agent_id: string | null;
-    tags: string[];
-    waiting_on_contact_id: string | null;
-    waiting_on_text: string | null;
-    parent_task_id: string | null;
-    blocked_by_task_id: string | null;
-    progress: Record<string, unknown> | null;
-    error_budget: Record<string, unknown> | null;
-    conversation_id: string | null;
-    created_at: string;
-    updated_at: string;
-    // Enriched fields — null on rows returned by the bare UPDATE RETURNING path.
-    waiting_on_contact_name: string | null;
-    next_wake_at: string | null;
-  };
-
-  // Columns used for bare SELECT / UPDATE RETURNING (no JOIN needed).
-  const TASK_SELECT = `
-    id, agent_id, title, intent_anchor, description, status, owner, priority,
-    due_at, source, source_agent_id, tags, waiting_on_contact_id, waiting_on_text,
-    parent_task_id, blocked_by_task_id, progress, error_budget, conversation_id,
-    created_at, updated_at`;
-
-  // Full enriched query for the GET list: joins contacts for display name and
-  // uses a correlated subquery to surface the next pending scheduled wake-up.
-  const TASK_ENRICHED_QUERY = `
-    SELECT
-      t.id, t.agent_id, t.title, t.intent_anchor, t.description, t.status,
-      t.owner, t.priority, t.due_at, t.source, t.source_agent_id, t.tags,
-      t.waiting_on_contact_id, t.waiting_on_text, t.parent_task_id,
-      t.blocked_by_task_id, t.progress, t.error_budget, t.conversation_id,
-      t.created_at, t.updated_at,
-      c.display_name AS waiting_on_contact_name,
-      (SELECT sj.next_run_at FROM scheduled_jobs sj
-       WHERE sj.task_id = t.id AND sj.status = 'pending'
-       ORDER BY sj.next_run_at ASC LIMIT 1) AS next_wake_at
-    FROM tasks t
-    LEFT JOIN contacts c ON c.id = t.waiting_on_contact_id
-    ORDER BY t.updated_at DESC
-    LIMIT 500`;
-
-  function serializeTask(row: DbTaskRow) {
-    return {
-      id: row.id,
-      agentId: row.agent_id,
-      title: row.title,
-      intentAnchor: row.intent_anchor,
-      description: row.description,
-      status: row.status,
-      owner: row.owner,
-      priority: row.priority,
-      dueAt: row.due_at,
-      source: row.source,
-      sourceAgentId: row.source_agent_id,
-      tags: row.tags ?? [],
-      waitingOnContactId: row.waiting_on_contact_id,
-      waitingOnContactName: row.waiting_on_contact_name ?? null,
-      waitingOnText: row.waiting_on_text,
-      parentTaskId: row.parent_task_id,
-      blockedByTaskId: row.blocked_by_task_id,
-      nextWakeAt: row.next_wake_at ?? null,
-      progress: row.progress ?? {},
-      errorBudget: row.error_budget ?? {},
-      conversationId: row.conversation_id,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
+  /** Map a merge failure to its HTTP response; null when it is not a merge error. */
+  function mergeErrorResponse(err: unknown): { status: number; body: Record<string, unknown> } | null {
+    if (err instanceof InvalidResolutionError) return { status: 400, body: { error: err.message, code: err.code } };
+    if (err instanceof NodeNotFoundError) return { status: 404, body: { error: err.message, code: err.code } };
+    if (err instanceof StalePreviewError) return { status: 409, body: { error: err.message, code: err.code } };
+    if (err instanceof MergeBlockedError) {
+      return { status: 422, body: { error: err.message, code: err.code, blockers: err.blockers } };
+    }
+    return null;
   }
 
-  const validOwners = ['curia', 'ceo', 'external'];
-  const validSources = ['ceo', 'agent', 'scheduler', 'coordinator'];
-
-  app.get('/api/kg/tasks', KG_RATE, async (request, reply) => {
+  // POST /api/kg/nodes/merge — preview (dryRun, the default) or apply a node merge.
+  app.post('/api/kg/nodes/merge', KG_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+    if (!nodeMergeService) {
+      return reply.status(503).send({ error: 'Node merge is not available.', code: 'unavailable' });
+    }
+
+    const body = (request.body ?? {}) as {
+      survivorId?: unknown;
+      absorbedId?: unknown;
+      dryRun?: unknown;
+      planToken?: unknown;
+      resolutions?: unknown;
+    };
+    const invalid = (error: string) => reply.status(400).send({ error, code: 'invalid_request' });
+    const survivorId = typeof body.survivorId === 'string' ? body.survivorId.trim() : '';
+    const absorbedId = typeof body.absorbedId === 'string' ? body.absorbedId.trim() : '';
+    if (!isUuid(survivorId) || !isUuid(absorbedId)) {
+      return invalid('survivorId and absorbedId must be valid UUIDs.');
+    }
+    if (survivorId.toLowerCase() === absorbedId.toLowerCase()) {
+      return invalid('survivorId and absorbedId must differ.');
+    }
+    if (body.dryRun !== undefined && typeof body.dryRun !== 'boolean') {
+      return invalid('dryRun must be a boolean.');
+    }
+    const dryRun = body.dryRun !== false;
+
     try {
-      const result = await pool.query(TASK_ENRICHED_QUERY);
-      return reply.send({
-        tasks: result.rows.map((row) => serializeTask(row as DbTaskRow)),
+      if (dryRun) {
+        // JSON body (Fastify serializes the object as application/json), not HTML;
+        // resp.render() does not apply. Same send path as the other KG JSON routes.
+        // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write
+        return reply.send(await nodeMergeService.preview(survivorId, absorbedId));
+      }
+      if (typeof body.planToken !== 'string' || body.planToken.trim().length === 0) {
+        return invalid('planToken is required when dryRun is false. Preview the merge first.');
+      }
+      const resolutions = parseResolutions(body.resolutions);
+      const actor = await resolveConsoleOriginator(contactService, logger);
+      const result = await nodeMergeService.apply({
+        survivorId,
+        absorbedId,
+        planToken: body.planToken.trim(),
+        resolutions,
+        actor,
       });
+      // JSON body (Fastify serializes the object as application/json), not HTML;
+      // resp.render() does not apply. Same send path as the other KG JSON routes.
+      // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write
+      return reply.send(result);
     } catch (err) {
-      logger.error({ err }, 'kg: GET /api/kg/tasks failed');
-      return reply.status(500).send({ error: 'Failed to load tasks.' });
+      const mapped = mergeErrorResponse(err);
+      if (mapped) return reply.status(mapped.status).send(mapped.body);
+      logger.error({ err, survivorId, absorbedId, dryRun }, 'POST /api/kg/nodes/merge failed');
+      return reply.status(500).send({ error: dryRun ? 'Failed to preview node merge.' : 'Failed to merge nodes.' });
     }
   });
 
-  app.post('/api/kg/tasks', KG_RATE, async (request, reply) => {
+  // GET /api/kg/nodes/:id/merge-candidates?limit=8 — likely duplicates of any type.
+  app.get('/api/kg/nodes/:id/merge-candidates', KG_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-    const body = request.body as {
-      agentId?: unknown;
-      title?: unknown;
-      intentAnchor?: unknown;
-      description?: unknown;
-      status?: unknown;
-      owner?: unknown;
-      priority?: unknown;
-      dueAt?: unknown;
-      source?: unknown;
-      sourceAgentId?: unknown;
-      tags?: unknown;
-      waitingOnText?: unknown;
-      progress?: unknown;
-      errorBudget?: unknown;
-      conversationId?: unknown;
-    };
-    if (typeof body.agentId !== 'string' || body.agentId.trim().length === 0) {
-      return reply.status(400).send({ error: 'agentId is required.' });
+    if (!nodeMergeService) {
+      return reply.status(503).send({ error: 'Node merge is not available.', code: 'unavailable' });
     }
-    if (typeof body.intentAnchor !== 'string' || body.intentAnchor.trim().length === 0) {
-      return reply.status(400).send({ error: 'intentAnchor is required.' });
-    }
-    const status = typeof body.status === 'string' ? body.status : 'open';
-    if (!validTaskStatuses.includes(status)) {
-      return reply.status(400).send({ error: 'Invalid status.' });
-    }
-    // Resolve with defaults first, then validate — avoids dual-layer guard maintenance trap.
-    const owner = typeof body.owner === 'string' ? body.owner : 'curia';
-    const source = typeof body.source === 'string' ? body.source : 'agent';
-    if (!validOwners.includes(owner)) {
-      return reply.status(400).send({ error: 'Invalid owner. Must be curia, ceo, or external.' });
-    }
-    if (!validSources.includes(source)) {
-      return reply.status(400).send({ error: 'Invalid source. Must be ceo, agent, scheduler, or coordinator.' });
-    }
-    if (body.priority !== undefined && (typeof body.priority !== 'number' || !Number.isInteger(body.priority) || body.priority < 0 || body.priority > 100)) {
-      return reply.status(400).send({ error: 'priority must be an integer 0–100.' });
-    }
-    if (body.tags !== undefined && (!Array.isArray(body.tags) || (body.tags as unknown[]).some(t => typeof t !== 'string'))) {
-      return reply.status(400).send({ error: 'tags must be an array of strings.' });
-    }
-    if (body.errorBudget !== undefined && (typeof body.errorBudget !== 'object' || body.errorBudget === null || Array.isArray(body.errorBudget))) {
-      return reply.status(400).send({ error: 'errorBudget must be a JSON object.' });
-    }
-    if (body.progress !== undefined && (typeof body.progress !== 'object' || body.progress === null || Array.isArray(body.progress))) {
-      return reply.status(400).send({ error: 'progress must be a JSON object.' });
-    }
-
-    const conversationId =
-      typeof body.conversationId === 'string' && body.conversationId.trim().length > 0
-        ? body.conversationId.trim()
-        : null;
-    if (conversationId && !UUID_RE.test(conversationId)) {
-      return reply.status(400).send({ error: 'Invalid conversationId: must be a valid UUID.' });
-    }
-
-    const intentAnchor = body.intentAnchor.trim();
-    const title = typeof body.title === 'string' && body.title.trim() ? body.title.trim() : intentAnchor;
-    const description = typeof body.description === 'string' ? body.description.trim() || null : null;
-    const priority = typeof body.priority === 'number' ? body.priority : 50;
-    const dueAt = typeof body.dueAt === 'string' && body.dueAt.trim() ? body.dueAt.trim() : null;
-    if (dueAt !== null && isNaN(new Date(dueAt).getTime())) {
-      return reply.status(400).send({ error: 'Invalid dueAt: must be a valid ISO 8601 date string.' });
-    }
-    const tags = Array.isArray(body.tags) ? (body.tags as string[]) : [];
-    const sourceAgentId = typeof body.sourceAgentId === 'string' && body.sourceAgentId.trim()
-      ? body.sourceAgentId.trim()
-      : null;
-    if (sourceAgentId && !UUID_RE.test(sourceAgentId)) {
-      return reply.status(400).send({ error: 'Invalid sourceAgentId: must be a valid UUID.' });
-    }
-    const waitingOnText = typeof body.waitingOnText === 'string' && body.waitingOnText.trim()
-      ? body.waitingOnText.trim()
-      : null;
-
-    try {
-      const inserted = await pool.query(
-        `INSERT INTO tasks (
-           agent_id, title, intent_anchor, description, status, owner, priority,
-           due_at, source, source_agent_id, tags, waiting_on_text,
-           progress, error_budget, conversation_id, updated_at
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, now())
-         RETURNING ${TASK_SELECT}`,
-        [
-          body.agentId.trim(),
-          title,
-          intentAnchor,
-          description,
-          status,
-          owner,
-          priority,
-          dueAt,
-          source,
-          sourceAgentId,
-          tags,
-          waitingOnText,
-          JSON.stringify((body.progress as Record<string, unknown> | undefined) ?? {}),
-          JSON.stringify((body.errorBudget as Record<string, unknown> | undefined) ?? {}),
-          conversationId,
-        ],
-      );
-      if (!inserted.rowCount) {
-        logger.error('kg: INSERT tasks returned no rows');
-        return reply.status(500).send({ error: 'Failed to create task.' });
-      }
-      return reply.status(201).send({
-        task: serializeTask(inserted.rows[0]! as DbTaskRow),
-      });
-    } catch (err) {
-      logger.error({ err }, 'kg: POST /api/kg/tasks failed');
-      return reply.status(500).send({ error: 'Failed to create task.' });
-    }
-  });
-
-  app.patch('/api/kg/tasks/:id', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     const { id } = request.params as { id: string };
-    if (!UUID_RE.test(id)) {
-      return reply.status(400).send({ error: 'Invalid task id.' });
+    if (!isUuid(id)) {
+      return reply.status(400).send({ error: 'Invalid node id: must be a valid UUID.', code: 'invalid_request' });
     }
-    const body = request.body as {
-      agentId?: unknown;
-      title?: unknown;
-      intentAnchor?: unknown;
-      description?: unknown;
-      status?: unknown;
-      owner?: unknown;
-      priority?: unknown;
-      dueAt?: unknown;
-      source?: unknown;
-      tags?: unknown;
-      waitingOnText?: unknown;
-      progress?: unknown;
-      errorBudget?: unknown;
-      conversationId?: unknown;
-    };
-
-    // Wrap the entire DB interaction in one try-catch so pool errors on the
-    // existence check are handled the same way as errors from the UPDATE.
-    let row: DbTaskRow;
+    const limit = normalizeLimit((request.query as { limit?: string }).limit, DEFAULT_CANDIDATES, MAX_CANDIDATES);
     try {
-      const existing = await pool.query(
-        `SELECT ${TASK_SELECT} FROM tasks WHERE id = $1`,
-        [id],
-      );
-      if (existing.rowCount === 0) {
-        return reply.status(404).send({ error: 'Task not found.' });
-      }
-      row = existing.rows[0]! as DbTaskRow;
+      const candidates = await nodeMergeService.candidates(id, limit);
+      return reply.send({ candidates });
     } catch (err) {
-      logger.error({ err, taskId: id }, 'kg: PATCH /api/kg/tasks/:id existence check failed');
-      return reply.status(500).send({ error: 'Failed to load task.' });
-    }
-
-    // Validate status value before checking transition rules so callers get
-    // "Invalid status" rather than "terminal state" for nonsense status strings.
-    if (typeof body.status === 'string' && !validTaskStatuses.includes(body.status)) {
-      return reply.status(400).send({ error: 'Invalid status.' });
-    }
-
-    // Mirror the TaskRepo terminal-state guard: once a task is done or cancelled,
-    // status cannot be changed via the console API either.
-    const TERMINAL_STATUSES_KG = ['done', 'cancelled'];
-    if (
-      TERMINAL_STATUSES_KG.includes(row.status) &&
-      typeof body.status === 'string' &&
-      body.status !== row.status
-    ) {
-      return reply.status(400).send({
-        error: `Cannot transition task from '${row.status}' — it is a terminal state.`,
-      });
-    }
-
-    const agentId = typeof body.agentId === 'string' ? body.agentId.trim() : row.agent_id;
-    const title = typeof body.title === 'string' ? body.title.trim() : row.title;
-    const intentAnchor = typeof body.intentAnchor === 'string' ? body.intentAnchor.trim() : row.intent_anchor;
-    const description = body.description === undefined ? row.description
-      : body.description === null || body.description === '' ? null
-      : typeof body.description === 'string' ? body.description.trim()
-      : row.description;
-    const status = typeof body.status === 'string' ? body.status : row.status;
-    const owner = typeof body.owner === 'string' ? body.owner : row.owner;
-    const priority = typeof body.priority === 'number' ? body.priority : row.priority;
-    const dueAt = body.dueAt === undefined ? row.due_at
-      : body.dueAt === null || body.dueAt === '' ? null
-      : typeof body.dueAt === 'string' ? body.dueAt.trim() || null
-      : row.due_at;
-    const source = typeof body.source === 'string' ? body.source : row.source;
-    const tags = Array.isArray(body.tags) ? (body.tags as string[]) : row.tags;
-    const waitingOnText = body.waitingOnText === undefined ? row.waiting_on_text
-      : body.waitingOnText === null || body.waitingOnText === '' ? null
-      : typeof body.waitingOnText === 'string' ? body.waitingOnText
-      : row.waiting_on_text;
-
-    if (!agentId) return reply.status(400).send({ error: 'agentId is required.' });
-    if (!intentAnchor) return reply.status(400).send({ error: 'intentAnchor is required.' });
-    if (!validTaskStatuses.includes(status)) return reply.status(400).send({ error: 'Invalid status.' });
-    if (!validOwners.includes(owner)) return reply.status(400).send({ error: 'Invalid owner. Must be curia, ceo, or external.' });
-    if (!validSources.includes(source)) return reply.status(400).send({ error: 'Invalid source. Must be ceo, agent, scheduler, or coordinator.' });
-    if (!Number.isInteger(priority) || priority < 0 || priority > 100) return reply.status(400).send({ error: 'priority must be an integer 0–100.' });
-    if (dueAt !== null && isNaN(new Date(dueAt).getTime())) {
-      return reply.status(400).send({ error: 'Invalid dueAt: must be a valid ISO 8601 date string.' });
-    }
-    if (body.tags !== undefined && (!Array.isArray(body.tags) || (body.tags as unknown[]).some(t => typeof t !== 'string'))) {
-      return reply.status(400).send({ error: 'tags must be an array of strings.' });
-    }
-    if (body.errorBudget !== undefined && (typeof body.errorBudget !== 'object' || body.errorBudget === null || Array.isArray(body.errorBudget))) {
-      return reply.status(400).send({ error: 'errorBudget must be a JSON object.' });
-    }
-    if (body.progress !== undefined && (typeof body.progress !== 'object' || body.progress === null || Array.isArray(body.progress))) {
-      return reply.status(400).send({ error: 'progress must be a JSON object.' });
-    }
-
-    const conversationId =
-      typeof body.conversationId === 'string'
-        ? body.conversationId.trim() || null
-        : body.conversationId === null
-        ? null
-        : row.conversation_id;
-    if (conversationId && !UUID_RE.test(conversationId)) {
-      return reply.status(400).send({ error: 'Invalid conversationId: must be a valid UUID.' });
-    }
-
-    try {
-      const updated = await pool.query(
-        `UPDATE tasks
-         SET agent_id        = $2,
-             title           = $3,
-             intent_anchor   = $4,
-             description     = $5,
-             status          = $6,
-             owner           = $7,
-             priority        = $8,
-             due_at          = $9,
-             source          = $10,
-             tags            = $11,
-             waiting_on_text = $12,
-             progress        = $13::jsonb,
-             error_budget    = $14::jsonb,
-             conversation_id = $15,
-             updated_at      = now()
-         WHERE id = $1
-           AND ($6 = status OR status NOT IN ('done', 'cancelled'))
-         RETURNING ${TASK_SELECT}`,
-        [
-          id,
-          agentId,
-          title,
-          intentAnchor,
-          description,
-          status,
-          owner,
-          priority,
-          dueAt,
-          source,
-          tags,
-          waitingOnText,
-          JSON.stringify((body.progress as Record<string, unknown> | undefined) ?? row.progress ?? {}),
-          JSON.stringify((body.errorBudget as Record<string, unknown> | undefined) ?? row.error_budget ?? {}),
-          conversationId,
-        ],
-      );
-      // Zero rows updated: either a concurrent delete or a concurrent terminal transition
-      // slipped in after our pre-check. Re-read to distinguish the two cases.
-      if (!updated.rowCount) {
-        const current = await pool.query<{ status: string }>(
-          `SELECT status FROM tasks WHERE id = $1`,
-          [id],
-        );
-        if (!current.rowCount) {
-          logger.warn({ taskId: id }, 'kg: PATCH tasks matched 0 rows — likely concurrent delete');
-          return reply.status(404).send({ error: 'Task not found.' });
-        }
-        const currentStatus = current.rows[0]!.status;
-        if (['done', 'cancelled'].includes(currentStatus) && typeof body.status === 'string' && body.status !== currentStatus) {
-          return reply.status(400).send({
-            error: `Cannot transition task from '${currentStatus}' — it is a terminal state.`,
-          });
-        }
-        // Neither delete nor terminal: unexpected. Surface a 500 rather than silently dropping.
-        logger.error({ taskId: id, currentStatus }, 'kg: PATCH UPDATE matched 0 rows for non-terminal task');
-        return reply.status(500).send({ error: 'Update failed unexpectedly.' });
-      }
-      // Re-fetch with enriched JOIN so the response includes contact name and
-      // next wake-up time, keeping parity with the GET list response shape.
-      const enriched = await pool.query(
-        `SELECT
-          t.id, t.agent_id, t.title, t.intent_anchor, t.description, t.status,
-          t.owner, t.priority, t.due_at, t.source, t.source_agent_id, t.tags,
-          t.waiting_on_contact_id, t.waiting_on_text, t.parent_task_id,
-          t.blocked_by_task_id, t.progress, t.error_budget, t.conversation_id,
-          t.created_at, t.updated_at,
-          c.display_name AS waiting_on_contact_name,
-          (SELECT sj.next_run_at FROM scheduled_jobs sj
-           WHERE sj.task_id = t.id AND sj.status = 'pending'
-           ORDER BY sj.next_run_at ASC LIMIT 1) AS next_wake_at
-         FROM tasks t
-         LEFT JOIN contacts c ON c.id = t.waiting_on_contact_id
-         WHERE t.id = $1`,
-        [id],
-      );
-      // Guard against concurrent deletes between the UPDATE and the re-fetch.
-      if (!enriched.rowCount) {
-        logger.warn({ taskId: id }, 'kg: PATCH enriched re-fetch matched 0 rows — concurrent delete');
-        return reply.status(404).send({ error: 'Task not found.' });
-      }
-      return reply.send({
-        task: serializeTask(enriched.rows[0]! as DbTaskRow),
-      });
-    } catch (err) {
-      logger.error({ err, taskId: id }, 'kg: PATCH /api/kg/tasks/:id failed');
-      return reply.status(500).send({ error: 'Failed to update task.' });
-    }
-  });
-
-  app.delete('/api/kg/tasks/:id', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-    const { id } = request.params as { id: string };
-    if (!UUID_RE.test(id)) {
-      return reply.status(400).send({ error: 'Invalid task id.' });
-    }
-    try {
-      const deleted = await pool.query('DELETE FROM tasks WHERE id = $1', [id]);
-      if (deleted.rowCount === 0) {
-        return reply.status(404).send({ error: 'Task not found.' });
-      }
-      return reply.status(204).send();
-    } catch (err) {
-      logger.error({ err, taskId: id }, 'kg: DELETE /api/kg/tasks/:id failed');
-      return reply.status(500).send({ error: 'Failed to delete task.' });
-    }
-  });
-
-  // Serialize a Contact object to the HTTP response shape.
-  // Returns all canonical fields so the Console UI can display them
-  // without a separate detail fetch.
-  function serializeContact(c: Contact) {
-    return {
-      id: c.id,
-      kgNodeId: c.kgNodeId,
-      displayName: c.displayName,
-      role: c.role,
-      // Capability axis (issue #945) — the legacy status/trust_level fields were removed in #955.
-      tier: c.tier,
-      kind: c.kind,
-      systemRole: c.systemRole,
-      notes: c.notes,
-      createdAt: c.createdAt.toISOString(),
-      updatedAt: c.updatedAt.toISOString(),
-      // Canonical fields (migration 048)
-      preferredName: c.preferredName,
-      title: c.title,
-      organization: c.organization,
-      primaryEmail: c.primaryEmail,
-      primaryPhone: c.primaryPhone,
-      timezone: c.timezone,
-      locale: c.locale,
-      location: c.location,
-      pronouns: c.pronouns,
-      linkedinUrl: c.linkedinUrl,
-      bio: c.bio,
-      birthday: c.birthday,
-    };
-  }
-
-  // Serialize a channel identity for the API: Date fields → ISO strings, so the
-  // contacts View drawer (#1069) can render them. Mirrors serializeContact above.
-  function serializeIdentity(i: ChannelIdentity) {
-    return {
-      id: i.id,
-      contactId: i.contactId,
-      channel: i.channel,
-      channelIdentifier: i.channelIdentifier,
-      label: i.label,
-      verified: i.verified,
-      verifiedAt: i.verifiedAt ? i.verifiedAt.toISOString() : null,
-      status: i.status,
-      source: i.source,
-      createdAt: i.createdAt.toISOString(),
-      updatedAt: i.updatedAt.toISOString(),
-    };
-  }
-
-  // Validate canonical fields from a POST/PATCH body.
-  // Returns an error string if invalid, or null if all checks pass.
-  // `fields` entries are trimmed and empty-string-coerced to null.
-  function extractAndValidateCanonicalFields(body: Record<string, unknown>): {
-    error: string | null;
-    fields: ContactCanonicalFields;
-  } {
-    const str = (v: unknown): string | null =>
-      typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
-
-    const fields: ContactCanonicalFields = {};
-
-    // Reject non-string, non-nullish values — the str() helper would silently coerce
-    // them to null, which would erase existing data on PATCH.
-    const CANONICAL_STRING_KEYS = [
-      'preferredName', 'title', 'organization', 'primaryPhone', 'timezone', 'locale',
-      'location', 'pronouns', 'birthday', 'linkedinUrl', 'bio', 'primaryEmail',
-    ] as const;
-    const badKey = CANONICAL_STRING_KEYS.find(
-      k => k in body && body[k] !== null && body[k] !== undefined && typeof body[k] !== 'string',
-    );
-    if (badKey) {
-      return { error: `${badKey} must be a string or null.`, fields };
-    }
-
-    if ('preferredName' in body) fields.preferredName = str(body.preferredName);
-    if ('title' in body) fields.title = str(body.title);
-    if ('organization' in body) fields.organization = str(body.organization);
-    if ('primaryPhone' in body) fields.primaryPhone = str(body.primaryPhone);
-    if ('timezone' in body) fields.timezone = str(body.timezone);
-    if ('locale' in body) fields.locale = str(body.locale);
-    if ('location' in body) fields.location = str(body.location);
-    if ('pronouns' in body) fields.pronouns = str(body.pronouns);
-    if ('birthday' in body) fields.birthday = str(body.birthday);
-    if ('linkedinUrl' in body) fields.linkedinUrl = str(body.linkedinUrl);
-    if ('bio' in body) fields.bio = str(body.bio);
-    if ('primaryEmail' in body) fields.primaryEmail = str(body.primaryEmail);
-
-    // Format validation
-    // Domain labels exclude '.' so the repeated atom and the literal '.' don't
-    // overlap — this keeps matching linear and avoids the polynomial-time
-    // backtracking (ReDoS) the previous `[^@\s]+\.[^@\s]+` form allowed on
-    // attacker-controlled input. See CodeQL alert js/polynomial-redos (#96).
-    if (fields.primaryEmail != null && !/^[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+$/.test(fields.primaryEmail)) {
-      return { error: 'Invalid primaryEmail format.', fields };
-    }
-    if (fields.linkedinUrl != null && !/^https?:\/\/(www\.)?linkedin\.com\//.test(fields.linkedinUrl)) {
-      return { error: 'linkedinUrl must be a linkedin.com URL (e.g. https://linkedin.com/in/…).', fields };
-    }
-    if (fields.primaryPhone != null && !/^\+[1-9]\d{6,14}$/.test(fields.primaryPhone)) {
-      return { error: 'primaryPhone must be in E.164 format (e.g. +15551234567).', fields };
-    }
-    if (fields.locale != null && !/^[a-z]{2,3}(-[A-Z]{2,4})?$/.test(fields.locale)) {
-      return { error: 'locale must be a BCP 47 code (e.g. en-US, fr, zh-Hans).', fields };
-    }
-    if (fields.bio != null && fields.bio.length > 500) {
-      return { error: 'bio must be 500 characters or fewer.', fields };
-    }
-    if (fields.birthday != null &&
-        !/^\d{4}-\d{2}-\d{2}$/.test(fields.birthday) &&
-        !/^--\d{2}-\d{2}$/.test(fields.birthday)) {
-      return { error: 'birthday must be YYYY-MM-DD or --MM-DD.', fields };
-    }
-
-    return { error: null, fields };
-  }
-
-  app.get('/api/kg/contacts', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-    try {
-      const contacts = await contactService.listContacts();
-      return reply.send({
-        contacts: contacts.map(serializeContact),
-      });
-    } catch (err) {
-      logger.error({ err }, 'GET /api/kg/contacts failed');
-      return reply.status(500).send({ error: 'Failed to load contacts' });
-    }
-  });
-
-  app.post('/api/kg/contacts', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-    const body = request.body as {
-      displayName?: unknown;
-      role?: unknown;
-      tier?: unknown;
-      kind?: unknown;
-      notes?: unknown;
-      kgNodeId?: unknown;
-    };
-
-    if (typeof body.displayName !== 'string' || body.displayName.trim().length === 0) {
-      return reply.status(400).send({ error: 'displayName is required.' });
-    }
-    if (body.tier !== undefined &&
-        (typeof body.tier !== 'string' || !validContactTiers.includes(body.tier as ContactTier))) {
-      return reply.status(400).send({ error: `Invalid tier. Must be one of: ${validContactTiers.join(', ')}.` });
-    }
-    if (body.kind !== undefined &&
-        (typeof body.kind !== 'string' || !validContactKinds.includes(body.kind as ContactKind))) {
-      return reply.status(400).send({ error: `Invalid kind. Must be one of: ${validContactKinds.join(', ')}.` });
-    }
-
-    const kgNodeId =
-      typeof body.kgNodeId === 'string' && body.kgNodeId.trim().length > 0
-        ? body.kgNodeId.trim()
-        : undefined;
-    if (kgNodeId && !UUID_RE.test(kgNodeId)) {
-      return reply.status(400).send({ error: 'Invalid kgNodeId: must be a valid UUID.' });
-    }
-
-    const { error: canonicalError, fields: canonicalFields } = extractAndValidateCanonicalFields(body as Record<string, unknown>);
-    if (canonicalError) {
-      return reply.status(400).send({ error: canonicalError });
-    }
-
-    const created = await contactService.createContact({
-      displayName: body.displayName,
-      role: typeof body.role === 'string' && body.role.trim().length > 0 ? body.role : undefined,
-      notes: typeof body.notes === 'string' && body.notes.trim().length > 0 ? body.notes : undefined,
-      kgNodeId,
-      source: 'kg_web_ui',
-      ...canonicalFields,
-    });
-
-    // Read back so tier/kind overrides below start from the current contact state.
-    let freshCreated = await contactService.getContact(created.id);
-    if (!freshCreated) {
-      // Should never happen — contact was just created — but guard rather than return stale data.
-      logger.error({ contactId: created.id }, 'POST /api/kg/contacts: contact not found after creation');
-      return reply.status(500).send({ error: 'Contact created but could not be retrieved.' });
-    }
-
-    // Apply tier/kind overrides atomically — one write prevents partial state if either fails.
-    if (typeof body.tier === 'string' || typeof body.kind === 'string') {
-      let enriched: Contact = { ...freshCreated, updatedAt: new Date() };
-      if (typeof body.tier === 'string') enriched = { ...enriched, tier: body.tier as ContactTier };
-      if (typeof body.kind === 'string') enriched = { ...enriched, kind: body.kind as ContactKind };
-      freshCreated = await contactService.saveContact(enriched);
-    }
-
-    return reply.status(201).send({
-      contact: serializeContact(freshCreated),
-    });
-  });
-
-  app.patch('/api/kg/contacts/:id', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-    const { id } = request.params as { id: string };
-    const body = request.body as {
-      displayName?: unknown;
-      role?: unknown;
-      tier?: unknown;
-      kind?: unknown;
-      notes?: unknown;
-      kgNodeId?: unknown;
-    };
-    const contact = await contactService.getContact(id);
-    if (!contact) {
-      return reply.status(404).send({ error: 'Contact not found.' });
-    }
-
-    // Validate all inputs before any mutations to avoid partial writes on bad input.
-    // Validate tier — rejects 'principal' (structural, derived from system_role).
-    if ('tier' in body) {
-      if (typeof body.tier !== 'string' || !validContactTiers.includes(body.tier as ContactTier)) {
-        return reply.status(400).send({ error: `Invalid tier. Must be one of: ${validContactTiers.join(', ')}.` });
-      }
-      // Principal contacts cannot be demoted or re-typed via the API.
-      if (contact.systemRole === 'principal') {
-        return reply.status(400).send({ error: 'The principal contact\'s tier cannot be changed via the API.' });
-      }
-    }
-    // Validate kind — rejects 'principal' and 'agent' (structural).
-    if ('kind' in body) {
-      if (typeof body.kind !== 'string' || !validContactKinds.includes(body.kind as ContactKind)) {
-        return reply.status(400).send({ error: `Invalid kind. Must be one of: ${validContactKinds.join(', ')}.` });
-      }
-      if (contact.systemRole === 'principal' || contact.systemRole === 'agent') {
-        return reply.status(400).send({ error: 'The kind of a system contact (principal or agent) cannot be changed via the API.' });
-      }
-    }
-    // Trim once; collapse whitespace-only strings to null so they don't reach the DB as invalid UUIDs.
-    const normalizedKgNodeId: string | null | undefined =
-      typeof body.kgNodeId === 'string'
-        ? (body.kgNodeId.trim() || null)
-        : body.kgNodeId === null
-        ? null
-        : undefined;
-    if (typeof normalizedKgNodeId === 'string' && !UUID_RE.test(normalizedKgNodeId)) {
-      return reply.status(400).send({ error: 'Invalid kgNodeId: must be a valid UUID.' });
-    }
-
-    const { error: canonicalError, fields: canonicalFields } = extractAndValidateCanonicalFields(body as Record<string, unknown>);
-    if (canonicalError) {
-      return reply.status(400).send({ error: canonicalError });
-    }
-
-    // Validate primaryEmail against CCI before any mutations so a bad value can never
-    // produce partial writes (other fields committed, response still 400).
-    if (canonicalFields.primaryEmail != null) {
-      try {
-        await contactService.validatePrimaryEmail(id, canonicalFields.primaryEmail);
-      } catch (err) {
-        if (err instanceof ContactValidationError) {
-          return reply.status(400).send({ error: err.message });
-        }
-        throw err;
-      }
-    }
-
-    // Build the complete updated contact in memory. All field changes are merged
-    // here so the transaction only needs one write — avoids non-transactional stale
-    // reads that occur when individual per-field setters each load the contact.
-    // `changed` tracks whether any recognized mutable field was actually supplied: a
-    // PATCH carrying only ignored/legacy fields (e.g. `status`) or nothing recognized
-    // must NOT bump `updatedAt` or perform a write, which would emit a false
-    // "contact updated" and burn a needless transaction.
-    let pending: Contact = { ...contact };
-    let changed = false;
-
-    if (typeof body.displayName === 'string' && body.displayName.trim().length > 0) {
-      pending = { ...pending, displayName: body.displayName.trim() };
-      changed = true;
-    }
-    if (typeof body.role === 'string') {
-      pending = { ...pending, role: body.role };
-      changed = true;
-    } else if (body.role === null) {
-      pending = { ...pending, role: null };
-      changed = true;
-    }
-    if (typeof body.tier === 'string') {
-      pending = { ...pending, tier: body.tier as ContactTier };
-      changed = true;
-    }
-    if (typeof body.kind === 'string') {
-      pending = { ...pending, kind: body.kind as ContactKind };
-      changed = true;
-    }
-    if (body.notes !== undefined) {
-      pending = { ...pending, notes: typeof body.notes === 'string' ? body.notes : null };
-      changed = true;
-    }
-    if (normalizedKgNodeId !== undefined) {
-      pending = { ...pending, kgNodeId: normalizedKgNodeId };
-      changed = true;
-    }
-    const CANONICAL_KEYS: Array<keyof typeof canonicalFields> = [
-      'preferredName', 'title', 'organization', 'primaryEmail', 'primaryPhone',
-      'timezone', 'locale', 'location', 'pronouns', 'linkedinUrl', 'bio', 'birthday',
-    ];
-    const hasCanonicalFields = CANONICAL_KEYS.some(k => k in (body as Record<string, unknown>));
-    if (hasCanonicalFields) {
-      const definedFields = Object.fromEntries(
-        Object.entries(canonicalFields).filter(([, value]) => value !== undefined),
-      ) as ContactCanonicalFields;
-      if (Object.keys(definedFields).length > 0) {
-        if (definedFields.primaryEmail != null) {
-          definedFields.primaryEmail = definedFields.primaryEmail.toLowerCase();
-        }
-        pending = { ...pending, ...definedFields };
-        changed = true;
-      }
-    }
-
-    // No recognized mutable field changed — return the current contact without a
-    // spurious write or `updatedAt` bump (true no-op PATCH).
-    if (!changed) {
-      return reply.send({ contact: serializeContact(contact) });
-    }
-    pending = { ...pending, updatedAt: new Date() };
-
-    // All remaining mutations are wrapped in a single DB transaction for atomicity.
-    // saveContact applies display-name sanitization and writes all fields in one UPDATE.
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      await contactService.saveContact(pending, client);
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      if (err instanceof ContactValidationError) {
-        return reply.status(400).send({ error: err.message });
-      }
-      request.log.error({ err }, 'contacts: PATCH mutation failed');
-      return reply.status(500).send({ error: 'An error occurred while updating the contact.' });
-    } finally {
-      client.release();
-    }
-
-    const updated = await contactService.getContact(id);
-    if (!updated) {
-      return reply.status(404).send({ error: 'Contact not found after update.' });
-    }
-    return reply.send({
-      contact: serializeContact(updated),
-    });
-  });
-
-  app.delete('/api/kg/contacts/:id', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-    const { id } = request.params as { id: string };
-    const contact = await contactService.getContact(id);
-    if (!contact) {
-      return reply.status(404).send({ error: 'Contact not found.' });
-    }
-    await pool.query('DELETE FROM contacts WHERE id = $1', [id]);
-    return reply.status(204).send();
-  });
-
-  // GET /api/kg/contacts/:id/overrides — list active auth overrides for a contact.
-  app.get('/api/kg/contacts/:id/overrides', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-    const { id } = request.params as { id: string };
-    if (!UUID_RE.test(id)) return reply.status(400).send({ error: 'Invalid contact ID.' });
-
-    try {
-      const contact = await contactService.getContact(id);
-      if (!contact) return reply.status(404).send({ error: 'Contact not found.' });
-      const overrides = await contactService.getAuthOverrides(id);
-      return reply.send({ overrides });
-    } catch (err) {
-      logger.error({ err, contactId: id }, 'GET /api/kg/contacts/:id/overrides failed');
-      return reply.status(500).send({ error: 'Failed to load auth overrides.' });
-    }
-  });
-
-  // GET /api/kg/contacts/:id/identities — list a contact's linked channel identities.
-  // Read-only display surface for the contacts View drawer (#1069): the drawer shows
-  // the actual channel identities (email/phone/Signal/…) Curia has on file, not just
-  // the denormalized primaryEmail/primaryPhone columns.
-  app.get('/api/kg/contacts/:id/identities', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-    const { id } = request.params as { id: string };
-    if (!UUID_RE.test(id)) return reply.status(400).send({ error: 'Invalid contact ID.' });
-
-    try {
-      const contact = await contactService.getContact(id);
-      if (!contact) return reply.status(404).send({ error: 'Contact not found.' });
-      const identities = await contactService.getIdentitiesForContact(id);
-      return reply.send({ identities: identities.map(serializeIdentity) });
-    } catch (err) {
-      logger.error({ err, contactId: id }, 'GET /api/kg/contacts/:id/identities failed');
-      return reply.status(500).send({ error: 'Failed to load identities.' });
-    }
-  });
-
-  // DELETE /api/kg/contacts/:id/overrides/:permission — revoke a specific override.
-  app.delete('/api/kg/contacts/:id/overrides/:permission', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-    const { id, permission } = request.params as { id: string; permission: string };
-    if (!UUID_RE.test(id)) return reply.status(400).send({ error: 'Invalid contact ID.' });
-    if (!/^[a-z][a-z0-9_]*$/.test(permission)) {
-      return reply.status(400).send({ error: 'Invalid permission name.' });
-    }
-
-    try {
-      const contact = await contactService.getContact(id);
-      if (!contact) return reply.status(404).send({ error: 'Contact not found.' });
-      const revoked = await contactService.revokePermission(id, permission);
-      if (!revoked) return reply.status(404).send({ error: 'No active override found for this permission.' });
-      return reply.status(204).send();
-    } catch (err) {
-      logger.error({ err, contactId: id, permission }, 'DELETE /api/kg/contacts/:id/overrides/:permission failed');
-      return reply.status(500).send({ error: 'Failed to revoke override.' });
-    }
-  });
-
-  // GET /api/kg/grant-recommendations — list pending (or all) grant recommendations.
-  app.get('/api/kg/grant-recommendations', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-    const query = request.query as { status?: string; limit?: string };
-    const statusFilter = query.status === 'pending' || query.status === 'approved' || query.status === 'declined'
-      ? query.status
-      : 'pending';
-    const limit = Math.max(1, Math.min(Number.parseInt(query.limit ?? '50', 10) || 50, 200));
-
-    try {
-      const recommendations = await contactService.listGrantRecommendations({ status: statusFilter, limit });
-      return reply.send({ recommendations });
-    } catch (err) {
-      logger.error({ err }, 'GET /api/kg/grant-recommendations failed');
-      return reply.status(500).send({ error: 'Failed to load grant recommendations.' });
-    }
-  });
-
-  // ── Chat endpoints ──────────────────────────────────────────────────────
-  //
-  // The chat endpoints let the KG web app send messages to the agent layer
-  // and stream responses back. They mirror the pattern of src/channels/http/routes/messages.ts
-  // (POST /api/messages + GET /api/messages/stream) but use the 'web' channel so
-  // contact-resolver auto-attributes the sender to the CEO (the bootstrap secret is CEO-only).
-  //
-  // Auth: both routes enforce the same assertSecret guard as the KG read APIs — they accept
-  // either a valid curia_session cookie (browser flow) or x-web-bootstrap-secret header
-  // (programmatic flow, e.g. tests and scripts).
-
-  /**
-   * POST /api/kg/chat/messages — publish a chat message and ack immediately.
-   *
-   * Body: { message: string, conversationId?: string }
-   * Response: 202 { conversationId }
-   *
-   * Ack-and-stream (#985): the handler publishes the inbound message and returns
-   * 202 without waiting for the agent's reply. The final reply and intermediate
-   * progress (skill.invoke / skill.result) arrive over GET /api/kg/chat/stream,
-   * which is the source of truth for the assistant turn. This removes the former
-   * synchronous 120s wait that 504'd on long tasks (browser automation, delegation
-   * chains, research).
-   */
-  app.post('/api/kg/chat/messages', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-
-    const body = request.body as { message?: unknown; conversationId?: unknown };
-    if (typeof body?.message !== 'string' || body.message.trim().length === 0) {
-      return reply.status(400).send({ error: 'Missing required field: message (non-empty string)' });
-    }
-
-    const conversationId =
-      typeof body.conversationId === 'string' && body.conversationId.length > 0
-        ? body.conversationId
-        : `kg-web-${randomUUID()}`;
-
-    try {
-      await bus.publish('channel', createInboundMessage({
-        conversationId,
-        channelId: WEB_CHANNEL_ID,
-        senderId: WEB_SENDER_ID,
-        content: body.message,
-        // Tag with structural channel trust level — session-cookie auth earns medium trust,
-        // same as bearer token auth on the API channel. Required for messageTrustScore computation.
-        metadata: { trustLevel: 'medium' },
-      }));
-    } catch (publishErr) {
-      // Log the real error server-side (full context) but return a fixed,
-      // client-safe message — don't echo internal bus/implementation detail back.
-      logger.error({ err: publishErr, conversationId }, 'KG chat message publish failed');
-      return reply.status(500).send({ error: 'Failed to publish chat message.' });
-    }
-
-    // Ack: the reply is delivered over the SSE stream, not this response.
-    return reply.status(202).send({ conversationId });
-  });
-
-  /**
-   * GET /api/kg/chat/stream — SSE stream of agent events for the KG web app.
-   *
-   * Streams outbound.message, skill.invoke, and skill.result events from the EventRouter,
-   * optionally filtered by ?conversationId=xxx. Mirrors GET /api/messages/stream.
-   */
-  app.get('/api/kg/chat/stream', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-
-    const query = request.query as { conversationId?: string };
-
-    // Hand the raw socket over to us — Fastify won't send a default response after the
-    // handler returns, which is what we want for a long-lived SSE stream.
-    reply.hijack();
-    reply.raw.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      // Nginx/ALB/Cloudflare buffer SSE by default — this header disables that.
-      'X-Accel-Buffering': 'no',
-    });
-    reply.raw.write(':connected\n\n');
-
-    const cleanup = eventRouter.addSseClient({
-      res: reply.raw,
-      conversationId: query.conversationId,
-    });
-
-    // 30s heartbeat keeps intermediary proxies from closing the connection on idle.
-    const heartbeat = setInterval(() => {
-      try {
-        reply.raw.write(':ping\n\n');
-      } catch (err) {
-        // Write failed — client likely disconnected without a clean TCP close.
-        // Clear the interval and explicitly remove the SSE client to prevent a leak
-        // in the case where the 'close' event on request.raw doesn't fire.
-        logger.debug({ err, conversationId: query.conversationId }, 'KG chat SSE heartbeat write failed — removing client');
-        clearInterval(heartbeat);
-        cleanup();
-      }
-    }, 30_000);
-
-    request.raw.on('close', () => {
-      clearInterval(heartbeat);
-      cleanup();
-    });
-  });
-
-  /**
-   * GET /api/kg/chat/history — fetch paginated chat history from working_memory.
-   *
-   * Query params:
-   *   - conversationId: string (required)
-   *   - before: string (optional ISO timestamp — returns messages older than this cursor)
-   *   - limit: number (optional, default 25, max 50)
-   *
-   * Returns messages in chronological order (oldest first) so the client can
-   * prepend them to the thread. Fetches one extra row to determine hasMore.
-   *
-   * Only user/assistant turns are returned — system turns (synthetic summaries
-   * inserted by the summarisation pass) are excluded since they are internal
-   * artifacts not intended for display.
-   */
-  app.get('/api/kg/chat/history', KG_RATE, async (request, reply) => {
-    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
-
-    const query = request.query as {
-      conversationId?: string;
-      before?: string;
-      limit?: string;
-    };
-
-    if (typeof query.conversationId !== 'string' || query.conversationId.trim().length === 0) {
-      return reply.status(400).send({ error: 'Missing required query param: conversationId' });
-    }
-    const conversationId = query.conversationId.trim();
-
-    const rawLimit = parseInt(query.limit ?? '25', 10);
-    const limit = isNaN(rawLimit) || rawLimit < 1 ? 25 : Math.min(rawLimit, 50);
-
-    // Validate the before cursor: must be a parseable ISO date if provided.
-    let beforeDate: Date | undefined;
-    if (query.before !== undefined && query.before.trim().length > 0) {
-      beforeDate = new Date(query.before);
-      if (isNaN(beforeDate.getTime())) {
-        return reply.status(400).send({ error: 'Invalid before param: must be an ISO timestamp' });
-      }
-    }
-
-    interface HistoryRow {
-      id: string;
-      role: string;
-      content: string;
-      created_at: Date;
-    }
-
-    try {
-      // Fetch limit+1 rows so we can tell if there are more pages without a COUNT query.
-      // Rows arrive newest-first; we reverse after slicing to serve them chronologically.
-      // The $2::timestamptz IS NULL check makes the before-cursor optional in a single query.
-      const result = await pool.query<HistoryRow>(
-        `SELECT id, role, content, created_at
-         FROM working_memory
-         WHERE conversation_id = $1
-           AND archived = false
-           AND role IN ('user', 'assistant')
-           AND ($2::timestamptz IS NULL OR created_at < $2)
-         ORDER BY created_at DESC
-         LIMIT $3`,
-        [conversationId, beforeDate?.toISOString() ?? null, limit + 1],
-      );
-
-      const hasMore = result.rows.length > limit;
-      // Take at most `limit` rows, then restore chronological order.
-      const rows = result.rows.slice(0, limit).reverse();
-
-      const messages = rows.map((row) => {
-        // Per-row try/catch so one bad message doesn't fail the whole page.
-        let html: string | null = null;
-        // Strip dispatcher-injected outbound context preambles from user messages
-        // before serving them — the preamble is coordinator-internal and looks
-        // confusing inside the user's chat bubble.
-        const content = row.role === 'user'
-          ? stripOutboundContextPreamble(row.content)
-          : row.content;
-        if (row.role === 'assistant') {
-          try {
-            html = markdownToHtml(content);
-          } catch (convErr) {
-            logger.warn({ err: convErr, messageId: row.id }, 'markdownToHtml failed for history row; falling back to plain text');
-          }
-        }
-        return {
-          id: row.id,
-          role: row.role as 'user' | 'assistant',
-          content,
-          html,
-          timestamp: row.created_at.toISOString(),
-        };
-      });
-
-      return reply.send({ messages, hasMore });
-    } catch (err) {
-      logger.error({ err, conversationId }, 'KG chat history fetch failed');
-      return reply.status(500).send({ error: 'Failed to fetch chat history' });
+      const mapped = mergeErrorResponse(err);
+      if (mapped) return reply.status(mapped.status).send(mapped.body);
+      logger.error({ err, nodeId: id }, 'GET /api/kg/nodes/:id/merge-candidates failed');
+      return reply.status(500).send({ error: 'Failed to load merge candidates.' });
     }
   });
 }

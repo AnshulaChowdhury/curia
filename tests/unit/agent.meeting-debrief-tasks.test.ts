@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 
 let parsed: Record<string, unknown>;
 let prompt: string;
@@ -52,9 +52,10 @@ describe('meeting-debrief tasks migration (#839)', () => {
     }
   });
 
-  it('no longer pins scheduler-report or scheduler-list', () => {
-    expect(pinnedSkills).not.toContain('scheduler-report');
+  it('pins scheduler-report alone for scheduled detection reporting (#1831); not scheduler-list', () => {
+    expect(pinnedSkills).toContain('scheduler-report');
     expect(pinnedSkills).not.toContain('scheduler-list');
+    expect(pinnedSkills).not.toContain('scheduler');
   });
 
   it('removes all bespoke state-map references from the prompt', () => {
