@@ -18,6 +18,20 @@ const BYDAY_CODES: Record<string, string> = {
 };
 
 /**
+ * True when `until` is an RFC 5545 DATE (YYYYMMDD) or DATE-TIME (YYYYMMDDTHHMMSS[Z])
+ * that names a real moment: the date round-trips through the calendar (no Feb 30)
+ * and the clock is in range. Second 60 is allowed because RFC 5545 permits leap seconds.
+ */
+function isValidUntil(until: string): boolean {
+  const m = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})Z?)?$/.exec(until);
+  if (!m) return false;
+  const [y, mo, d, h, mi, sec] = m.slice(1).map((v) => Number(v ?? 0)) as [number, number, number, number, number, number];
+  const date = new Date(Date.UTC(y, mo - 1, d));
+  const realDate = date.getUTCFullYear() === y && date.getUTCMonth() === mo - 1 && date.getUTCDate() === d;
+  return realDate && h <= 23 && mi <= 59 && sec <= 60;
+}
+
+/**
  * Validate a model-supplied `recurrence` value.
  *
  * When `start` is given and the rule is a plain weekly BYDAY rule, also check
@@ -73,8 +87,8 @@ export function parseRecurrence(
     }
   }
   const until = parts.get('UNTIL');
-  if (until !== undefined && !/^\d{8}(T\d{6}Z?)?$/.test(until)) {
-    return { ok: false, error: `Invalid input: RRULE UNTIL must be a date (YYYYMMDD) or UTC date-time (YYYYMMDDTHHMMSSZ), got "${until}"` };
+  if (until !== undefined && !isValidUntil(until)) {
+    return { ok: false, error: `Invalid input: RRULE UNTIL must be a real date (YYYYMMDD) or UTC date-time (YYYYMMDDTHHMMSSZ), got "${until}"` };
   }
   if (until !== undefined && parts.has('COUNT')) {
     return { ok: false, error: 'Invalid input: an RRULE may set COUNT or UNTIL, not both' };

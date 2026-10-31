@@ -94,6 +94,17 @@ describe('parseRecurrence', () => {
     expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=next-year'], { timezone: TZ }).ok).toBe(false);
   });
 
+  it('rejects an UNTIL that is the right shape but an impossible date or time', () => {
+    for (const until of ['20261399', '20260230', '20261231T256199Z', '20261231T236000Z', '20261231T235961Z']) {
+      expect(parseRecurrence([`RRULE:FREQ=WEEKLY;UNTIL=${until}`], { timezone: TZ }).ok, until).toBe(false);
+    }
+  });
+
+  it('accepts a leap day, and second 60 for a leap second', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20280229'], { timezone: TZ }).ok).toBe(true);
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20261231T235960Z'], { timezone: TZ }).ok).toBe(true);
+  });
+
   it('rejects COUNT and UNTIL together', () => {
     expect(parseRecurrence(['RRULE:FREQ=WEEKLY;COUNT=5;UNTIL=20261231T235959Z'], { timezone: TZ }).ok).toBe(false);
   });
