@@ -16,6 +16,14 @@ import {
   guestListMismatchWarnings,
 } from '../../../../src/channels/calendar/attendee-input.js';
 import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import { parseRecurrence } from '../../../../src/channels/calendar/recurrence-input.js';
+import { undeclaredInputError } from '../../../../src/skills/_shared/undeclared-input-guard.js';
+
+// Mirrors tool.json `inputs`. Anything else is refused rather than silently dropped (#2385).
+const DECLARED_INPUTS = [
+  'calendarId', 'eventId', 'title', 'start', 'end', 'description', 'location', 'attendees',
+  'conferencing', 'recurrence', 'notifyAttendees',
+] as const;
 
 export class CalendarUpdateEventHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -23,7 +31,10 @@ export class CalendarUpdateEventHandler implements ToolHandler {
       return { success: false, error: 'Calendar not configured — Nylas credentials missing' };
     }
 
-    const { calendarId, eventId, title, start, end, description, location, attendees, conferencing, notifyAttendees } = ctx.input as {
+    const undeclared = undeclaredInputError(ctx.input, DECLARED_INPUTS);
+    if (undeclared) return { success: false, error: undeclared };
+
+    const { calendarId, eventId, title, start, end, description, location, attendees, conferencing, recurrence, notifyAttendees } = ctx.input as {
       calendarId?: string;
       eventId?: string;
       title?: string;
@@ -33,6 +44,7 @@ export class CalendarUpdateEventHandler implements ToolHandler {
       location?: string;
       attendees?: unknown;
       conferencing?: Record<string, unknown>;
+      recurrence?: unknown;
       notifyAttendees?: unknown;
     };
 
@@ -73,10 +85,34 @@ export class CalendarUpdateEventHandler implements ToolHandler {
         changes.attendees = parsed.attendees;
       }
       if (conferencing !== undefined) changes.conferencing = conferencing;
+      if (recurrence !== undefined) {
+        if (!ctx.timezone) {
+          return { success: false, error: 'Cannot change a recurrence rule: no timezone is configured for Curia' };
+        }
+        // Validate shape first so a malformed rule costs no Nylas call.
+        const shape = parseRecurrence(recurrence, { timezone: ctx.timezone });
+        if (!shape.ok) return { success: false, error: shape.error };
+        // The rule lives on the series master. An instance id here would at best
+        // detach that one occurrence, so refuse and name the master instead.
+        const target = await ctx.nylasCalendarClient.getEvent(calendarId, eventId);
+        if (target.masterEventId) {
+          return {
+            success: false,
+            error: `Event '${eventId}' is one occurrence of a recurring series. Change the rule on the series by passing its master event id '${target.masterEventId}' as eventId. Nothing was changed.`,
+          };
+        }
+        // Check the rule against the start the series will have after this write.
+        const seriesStart = changes.start
+          ?? (target.startTime !== null ? new Date(target.startTime * 1000).toISOString() : undefined);
+        const parsed = parseRecurrence(recurrence, { start: seriesStart, timezone: ctx.timezone });
+        if (!parsed.ok) return { success: false, error: parsed.error };
+        changes.recurrence = parsed.recurrence;
+        changes.timezone = ctx.timezone;
+      }
 
       // Guard against silent no-ops — require at least one field to update.
       if (Object.keys(changes).length === 0) {
-        return { success: false, error: 'No fields provided to update — at least one of title, start, end, description, location, attendees, or conferencing is required' };
+        return { success: false, error: 'No fields provided to update — at least one of title, start, end, description, location, attendees, conferencing, or recurrence is required' };
       }
 
       const event = await ctx.nylasCalendarClient.updateEvent(

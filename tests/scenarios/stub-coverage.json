@@ -103,6 +103,10 @@
       "model": "deepseek/deepseek-v4.1-flash",
       "recordedAt": "2026-10-30T02:29:54.689Z"
     },
+    "calendar weekly meeting is one recurring event": {
+      "unstubbed": null,
+      "reason": "New in #2385; not yet run (paid suite). The first run records coverage."
+    },
     "cc coffee follows standing rule (both)": {
       "unstubbed": 0,
       "runs": 5,

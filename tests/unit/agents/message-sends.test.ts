@@ -30,6 +30,7 @@ describe('isMessageSend (#2055)', () => {
     expect(isMessageSend('calendar-update-event', { start: '2026-10-12T10:00:00-04:00' })).toBe(true);
     expect(isMessageSend('calendar-update-event', { start: '2026-10-12T10:00:00-04:00', notifyAttendees: false })).toBe(false);
     expect(isMessageSend('calendar-update-event', { title: 'Renamed' })).toBe(false);
+    expect(isMessageSend('calendar-update-event', { recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261231T235959Z'] })).toBe(true);
   });
 
   it('counts a delete unless notifications are off', () => {

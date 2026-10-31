@@ -33,7 +33,10 @@ export function isMessageSend(toolName: string, input: unknown): boolean {
     case 'calendar-create-event':
       return hasGuests(record);
     case 'calendar-update-event':
-      return notifies && (hasGuests(record) || record['start'] !== undefined || record['end'] !== undefined);
+      // A recurrence change moves every occurrence, so guests get an update like a time change.
+      return notifies && (
+        hasGuests(record) || record['start'] !== undefined || record['end'] !== undefined || record['recurrence'] !== undefined
+      );
     case 'calendar-delete-event':
       return notifies;
     case 'calendar-respond-to-invite':

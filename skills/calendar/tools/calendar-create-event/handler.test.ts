@@ -296,3 +296,76 @@ describe('CalendarCreateEventHandler -- happy path', () => {
     expect(result.success).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Recurring events (#2385)
+// ---------------------------------------------------------------------------
+
+describe('CalendarCreateEventHandler -- recurrence', () => {
+  let handler: CalendarCreateEventHandler;
+  beforeEach(() => { handler = new CalendarCreateEventHandler(); });
+
+  // 2026-11-02 is a Monday; 14:00Z is 9:00 AM in Toronto.
+  const MONDAY = { calendarId: 'cal-work', title: 'Weekly sync', start: '2026-11-02T14:00:00Z', end: '2026-11-02T14:15:00Z' };
+
+  it('passes recurrence and the configured timezone to createEvent', async () => {
+    const createEvent = vi.fn().mockResolvedValue(makeEvent({ id: 'master', recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'] }));
+    const ctx = makeCtx({ createEvent });
+    ctx.input = { ...MONDAY, recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'] };
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    const sent = createEvent.mock.calls[0]![1];
+    expect(sent.recurrence).toEqual(['RRULE:FREQ=WEEKLY;BYDAY=MO']);
+    expect(sent.timezone).toBe('America/Toronto');
+  });
+
+  it('rejects malformed recurrence without calling Nylas', async () => {
+    const createEvent = vi.fn();
+    const ctx = makeCtx({ createEvent });
+    ctx.input = { ...MONDAY, recurrence: ['FREQ=WEEKLY;BYDAY=MO'] };
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(false);
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+
+  it('rejects a start that is off the weekly pattern', async () => {
+    const createEvent = vi.fn();
+    const ctx = makeCtx({ createEvent });
+    ctx.input = { ...MONDAY, recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=TU'] };
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(false);
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+
+  it('refuses a recurring event when no timezone is configured', async () => {
+    const createEvent = vi.fn();
+    const ctx = makeCtx({ createEvent });
+    ctx.input = { ...MONDAY, recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'] };
+    (ctx as { timezone?: string }).timezone = undefined;
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(false);
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe('CalendarCreateEventHandler -- undeclared inputs', () => {
+  it('rejects an input the manifest does not declare, naming it, without creating anything', async () => {
+    const createEvent = vi.fn();
+    const ctx = makeCtx({ createEvent });
+    ctx.input = { calendarId: 'cal-work', title: 'Sync', start: START_ISO, end: END_ISO, repeat: 'weekly' };
+
+    const result = await new CalendarCreateEventHandler().execute(ctx);
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("'repeat'");
+    expect(createEvent).not.toHaveBeenCalled();
+  });
+});
