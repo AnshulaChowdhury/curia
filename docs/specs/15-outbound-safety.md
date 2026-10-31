@@ -4,10 +4,6 @@
 
 > **TODO:** Keep this spec aligned with production behaviour as Stage 2 evolves
 > (tone/persona guardrails, operator override guidance, and caller-verification notes).
-> Detailed implementation notes are in `docs/wip/`:
-> - `docs/wip/2026-03-27-outbound-gateway-design.md`
-> - `docs/wip/2026-03-27-outbound-content-filter-design.md`
-> - `docs/wip/2026-03-28-caller-verification-design.md`
 
 ---
 
@@ -33,8 +29,10 @@ the CEO, or exfiltrate internal data to an external party.
 | Threat | Example | Defence |
 |---|---|---|
 | **Prompt injection via inbound email** | Attacker email instructs LLM to dump system prompt in reply | Content filter — Stage 1 (deterministic) + Stage 2 (LLM-as-judge) |
-| **Accidental context leakage** | LLM naturally includes a third party's email address in a reply | Content filter — contact data leakage rule |
-| **Over-disclosure to an untrusted recipient** | Reply shares the CEO's availability or another contact's details with an unknown-tier recipient | Content filter — Stage 2.5 tier-keyed disclosure gate (escalation judge) |
+| **Accidental context leakage** | LLM naturally includes a third party's email address in a reply | Content filter — contact data leakage rule (`autonomy.gating: tier`); band send review's *necessity* question (`band`) |
+| **Over-disclosure to an untrusted recipient** | Reply shares the CEO's availability or another contact's details with an unknown-tier recipient | Content filter — Stage 2.5 tier-keyed disclosure gate (`tier`); band send review (`band`, [spec 14](14-autonomy-engine.md#band-gating-2159)) |
+| **A false claim in the principal's voice** | Reply tells a counterparty the principal is away when they are not | Band send review's *grounding* question (`band` only) |
+| **A sign-in code written down or sent on** | A one-time code the principal relays lands in a task note, a report, memory, a document or a message | Sign-in code scrub — tracked values replaced by `[sign-in code]` in every tool input and every reply (below) |
 | **Skill-layer bypass** | Prompt injection tricks LLM into calling `email-send` directly, circumventing the dispatcher filter | Outbound gateway — all `nylasClient.sendMessage()` calls go through it |
 | **Impersonation of CEO** | Attacker sends email claiming to be the CEO, triggers a high-sensitivity action | Caller verification — cross-channel challenge/response for elevated skills |
 | **Display name spoofing** | Reply-To header set to `Jane Doe <attacker@evil.com>` | Display name sanitization — strip or flag mismatched display names |
@@ -53,12 +51,33 @@ message must pass through it regardless of origin.
 
 **Pipeline (in order):**
 1. **Blocked contact check** — reject immediately if the recipient is blocked
-2. **Content filter** — run the two-stage filter pipeline (see below)
-3. **Channel dispatch** — route to the appropriate channel client (`email` → Nylas, etc.)
-4. **Audit emission** — on successful wire-level delivery, emit `outbound.delivered`
+2. **PII step** — tier gating redacts detected personal details to `[REDACTED: …]` tokens and reports the labels in the send result (`redactions`, labels only). Band gating only *detects* here and builds a redacted copy for the steps below; the band review (step 5) rules on each item
+3. **Content filter** — run the two-stage filter pipeline (see below) on the redacted copy. It runs before the band review, so a Stage 2 block wins over any disclosure ruling: the review never sees that send
+4. **Relay budget** — a send to the principal alone that an outside contact caused counts against that contact's hourly budget; over it, the message goes to the principal's digest instead (#1320, spec 14)
+5. **Band review** (band gating only) — rules on each detected item and the other band questions, then sends, bounces, holds or blocks (see [Personal details](#personal-details-outreach-links-and-asks))
+6. **Channel dispatch** — route to the appropriate channel client (`email` → Nylas, etc.)
+7. **Audit emission** — on successful wire-level delivery, emit `outbound.delivered`
 
 The gateway fails closed: if the content filter crashes, the message is blocked. A channel
 client failure returns a structured error; it does not silently drop the message.
+
+### Personal details, outreach links and asks
+
+Authority-aware PII disclosure, [ADR-054](../adr/054-authority-aware-pii-disclosure.md) (#2312). The full policy table and judge contract are in [spec 14](14-autonomy-engine.md#personal-details-under-band-gating-2312); this is the gateway's side.
+
+**Band flow: detect → judge per item → policy table → act.** `PiiRedactor.detect(content, channel, ctx)` returns the items that would have been redacted (`id`, `label`, span, matched text) from the subject, the body and, for email replies, the quoted thread. `apply` is the old redaction, kept for tier gating and fallbacks. The recipient set for the principal-only bypass is the filter's own, with Curia's mailboxes excluded, so "To: principal, cc: third party" is no longer exempt (both modes). Under band, nothing is cut, no token is delivered, and a stray `[REDACTED: …]` in a body or subject is itself a defect (bounce, then block). The agent's error or success note names the labels, never the values; `outbound_context.content_preview` stores what was delivered; `outbound.delivered` stores the redacted copy, and in `disclosed` the labels (and fields, quote included) of details that went out as written. If the judge fails, an item in the message's own text is treated as unsupported (fail closed): at 80+ the draft bounces, below 80 it holds, and a recheck holds. A send whose only items are in the quoted thread fails as any send does without its judge: at 80+ it goes out without the quote, as a capped `sent_without_review` send; below 80 it holds.
+
+**Authority.** The judge's `directed`/`inferred` rulings count only for an authority code confirms from the stamped originator (tier, system role, channel, `authenticated`), the live turn, the task and root task, and the reply link. Authenticated means Signal, Slack, or email with `senderVerified`; SMS and voice never count. A trusted contact's explicit directive is held for the principal at any score: the trusted tier grants no `send_on_behalf`.
+
+**Outreach links.** `task_outreach` rows (migration 107) record whom Curia contacted for a task: domains, addresses, contact ids, the contact given on a form, a one-line summary, `confirmed`, a 30-day expiry, closed with the task. Writers are task-bound email/other sends, the coordinator-only `record-outreach` tool (forms, calls), and a `web-browser` backstop that records an unconfirmed skeleton row when a task-bound turn types the principal's or Curia's address or number into a page. Only explicit acts on principal-originated turns set `confirmed`. For a non-principal email the dispatcher matches, in order, address, known contact, and the organization domain (a deny list of freemail, shared-tenant and private-suffix hosts excluded on both sides), preferring the newest confirmed row; a fast-tier model check over up to ten open rows is the weak fallback. Auto-generated mail is skipped, and channel-supplied `linkedTask`/`boundTask` are stripped. The link is **strong** only for a direct match, an authenticated sender and a confirmed row; everything else is **weak**. The reply turn answers and the task is not woken; only a strong link also adds a progress note to the task (a weak link stamps the turn's metadata and the coordinator's block only). The link carries the task as context and judge evidence, never a tier change, and the sender's address is learned onto the row only after a strong link or the principal's yes. Link authority applies only when every non-principal recipient is a linked counterparty.
+
+**Asks and decisions.** A requested, askable `unsupported` item (or an `inferred` one below 80 with no strong link) holds the original send as an approval whose display opens with "<requester> wants your <label> to <summary>. Share it?" and lists every personal detail with its value. The ask rides on the action row (`disclosure_ask`), never in the replayed payload; the agent is told to deliver the approval and send a holding reply without the data. `approve-action` refuses an approval carrying personal details that was never delivered. A yes or no is stored in `disclosure_decisions` (migration 108: conversation, counterparty, label, decision, `decided_by`); a yes authorizes that label to that counterparty on that thread only, a no stops asks there, and the principal's newest live word wins. Relayed replies hold rather than block.
+
+**Quoted thread.** Details only in quoted text are exempt when every non-principal recipient was on the quoted message; otherwise the quote is dropped.
+
+**Saved drafts.** `send-draft` detects and reviews like a send. A draft cannot bounce, so any outcome but "send" holds. Under tier gating, a draft with detected details is refused unless principal-directed. The draft passes as approved only if it still matches the approved subject and body.
+
+**Under `gating: tier`** only the reporting applies (the redacted labels in send results). The quoted thread is not scanned.
 
 ### `outbound.delivered` — the canonical wire-level audit event
 
@@ -69,20 +88,111 @@ The gateway emits an `outbound.delivered` event after every successful send. Thi
 - Distinct from `outbound.message` (emitted by `dispatch` when translating `agent.response` → send request), which represents *intent* to send and is only emitted for response-path sends. Skill-invoked sends (`signal-send`, `email-send`, `email-reply`, etc.) bypass `dispatch` entirely; without `outbound.delivered`, those sends would be invisible to a security review counting outbound traffic. See [spec 10](10-audit-log-hardening.md) for the full extraction-row contract.
 - HTTP/web responses are captured by `agent.response` and are out of scope for `outbound.delivered`. CLI is dev-only and excluded by design.
 
+### Dispatcher relay can send nothing (#1732, #1733)
+
+The dispatcher translates every `agent.response` with a routing entry into `outbound.message`,
+**except**:
+
+1. **Reply-lock** (`outbound.suppressed_duplicate`) — a human-facing reply skill
+   (`email-reply`, `email-send`, `signal-send`, `sms-send`, `slack-send`) already
+   reached this person on this task. `routingTaskId` selects that task: the
+   coordinator task for a specialist, the task's own id for a direct send.
+   A channel-supplied `delegationOrigin` is stripped, so it cannot select a
+   different id. `originConversationId` ties a specialist send to the principal conversation.
+   The recipient may be the inbound sender or another verified identity of that
+   contact. The withheld narration is filed on a closed bullpen thread (#847, #1860).
+2. **Explicit no-reply** (`outbound.no_reply`) — the agent's entire response is the sentinel
+   `NO_REPLY`, or inbound email was classified as auto-generated (#1734). Nothing is
+   published to the channel. Reasons: `'agent_declined'` on a normal turn,
+   `'content_block_abandoned'` when the agent returns the sentinel on a content-filter
+   rewrite task, `'auto_generated'` when dispatch suppresses machine mail (message-derived;
+   independent of contact `kind`). Auto-generated turns also stamp
+   `autoGeneratedSuppress` / `autoGeneratedSenderId` on task metadata so
+   `email-reply` / `email-send` cannot mail the machine sender (principal
+   escalation to a different recipient stays open).
+3. **Gate C on the relay** (#1733) — the relay is subject to the same contact-tier action
+   gate as an equivalent medium-risk reply skill. A known-tier ambiguous cell consults the
+   EscalationJudge (email may reply-all). Escalate withholds the real `outbound.message`,
+   emits `authorization.decision` with `action: 'dispatcher-relay'` / `sourceLayer: 'dispatch'`,
+   and creates a pending approval whose approve path re-invokes the `dispatcher-relay` skill.
+   If a reply skill on the same turn already Gate C–escalated, the relay is suppressed without
+   a second approval (matched via `authorization.decision` `taskEventId` or `conversationId`).
+   Channel `http` still receives a terminal pending-approval status outbound so a
+   waiter cannot hang. No route registers that waiter after `POST /api/messages`
+   was removed (ADR-057).
+
+**A note for the principal** (prompt trim PR 5). On a turn answering someone other than the
+principal, the coordinator puts what the principal needs to hear in a
+`<note_for_principal></note_for_principal>` block. The runtime cuts it out of the final
+response before the `NO_REPLY` lift and carries it on `agent.response` as `principalNote`
+(`src/agents/principal-note.ts`). Which turns: any turn given the `non-principal-reply-shaped`
+guidance, which asks for the tag, and any other the delegation-failure reply's audience rule
+(#1978) reads as an outside sender's. Untagged output is the whole reply, unchanged. A note never closed takes the rest of the response with it,
+and a closing tag with no note is removed, so markup never reaches the sender. The
+dispatcher emails the note to the principal as a `principal_note` `outbound.notification`
+before any exception above applies: a declined, suppressed or held reply still delivers it.
+It is not emailed when a send already reached one of the principal's verified identities on
+that turn. The delegation-failure reply's note (#1990) takes the same path. Only the final
+response is cut, so a note written into a send skill's body (an `email-reply` on a CC'd
+thread) would go to its recipients: the Stage 1 `principal-note-markup` rule blocks any send
+to someone other than the principal that carries a note tag, and tells the agent the note
+belongs in its final response. Stage 2 is the
+backstop for a note written without the tag: probed directly on the production judge
+(`google/gemini-3.1-flash-lite`, temperature 0, 13 trials per draft, #1954 PR 5), it blocked
+a postscript or a labelled note to the principal 13 of 13 times and an aside woven into the
+body 0 of 13, while clean replies passed 13 of 13. The tag remains the real guard.
+
+The content-filter rewrite prompt (#1355) offers `NO_REPLY` alongside rewrite. Returning it
+abandons delivery: no send, no salvage draft, no further retry. An `llm-judge-audience-leak`
+block that the agent abandons therefore cannot be polished into a recipient-appropriate
+acknowledgement and delivered — the failure mode of the 2026-09-04 reply storm.
+
+Skipping salvage on an exact rewrite abandon is deliberate, not an accident of the early
+return. A draft is a standing invitation to send the blocked text; the point of abandon is
+that the message should not exist. The three events that fire around a block do not all
+carry the body:
+
+- `outbound.blocked.content` stores the PII-redacted body (`redactedBody`).
+- `outbound.notification` omits the body (recipient, timestamp, block ID, audit event ID,
+  and a principal-safe reason summary only).
+- Exact rewrite abandon stores the blocked body on `outbound.no_reply.abandonedContent`
+  so it is recoverable from the audit row without a log dig.
+
+The `outbound.blocked` CEO notification at block time remains the human-visible signal —
+it is considered sufficient closure for the abandoned case.
+
+A near-miss sentinel (fenced token plus prose, or the token as a standalone word in a longer
+body) is the opposite trade: suppress the send and salvage an email draft, never deliver the
+control token to an external inbox.
+
+A live principal turn that returns `NO_REPLY` is honoured on the original channel.
+Silence is reconstructible from `outbound.no_reply` and the dispatcher log line —
+there is no inbox interrupt for a deliberate decline (#1908).
+
+Agents document the sentinel in the coordinator prompt (external-audience and Sending and
+replying sections). Narration such as "I'll just archive it" that does **not** start with
+the token is still payload and will be sent. `InboundScanner` scores inbound occurrences of
+the token for visibility; it does not block.
+
 ---
 
 ## Content Filter
 
 A multi-stage pipeline that runs on every outbound message to an external recipient: Stage 1 (deterministic rules), Stage 2 (LLM audience-leak judge), and Stage 2.5 (tier-keyed disclosure gate). Each stage can block; later stages run only if earlier ones pass.
 
+Under `autonomy.gating: band` (#2159, [ADR-049](../adr/049-band-driven-autonomy.md)) the `contact-data-leak` rule and Stage 2.5 are off, and the gateway's band send review runs after Stage 2 instead; see [spec 14 → Band gating](14-autonomy-engine.md#band-gating-2159). Everything below about those two applies under `tier`, the default.
+
 ### Stage 1: Deterministic Rules (implemented)
 
 Fast, zero-cost pattern matching. Any finding from Stage 1 blocks immediately — Stage 2 is skipped.
 
-- **System prompt fragments** — marker phrases extracted from loaded agent config checked for verbatim or near-verbatim matches in the outbound body
+- **System prompt fragments** — prompt-exfiltration markers are *derived at runtime from the live coordinator prompt* (not a hardcoded phrase list), and matching is whitespace- and markdown-robust so trivial reformatting cannot bypass them. Checked for verbatim or near-verbatim matches in the outbound body. (#1334)
 - **Internal structure leakage** — bus event type names, YAML/JSON config patterns, internal field names (`conversationId`, `taskId`, `agentId`, etc.)
 - **Secret patterns** — reuses existing patterns from `sanitizeOutput()`: API keys, bearer tokens, hex tokens ≥ 32 chars
-- **Contact data leakage** — email addresses in the body that are not the intended recipient or the CEO
+- **Contact data leakage** — email addresses in the body that are not the intended recipient, the CEO or one of the assistant's own mailboxes (which the email signature may carry; prompt trim PR 6)
+- **Principal note markup** — a `<note_for_principal>` tag (any spelling) in the body. Notes are cut only out of the coordinator's final response, so one in a send skill's body would reach its recipients (prompt trim PR 5)
+
+The identity- and structure-leakage rules, and the principal-note rule, carry a **principal-recipient bypass**: when the outbound message's recipient set is exclusively the structurally-verified principal, these rules do not fire (the principal is entitled to see internal structure). Secret-pattern and contact-leakage rules still apply. (#1334)
 
 ### Stage 2: LLM-as-Judge — audience-leak & sensitive-data detection (implemented)
 
@@ -108,13 +218,23 @@ value — so the secret does not re-leak into the `outbound.blocked` audit event
   the SOLE recipient (a private channel). The judge model therefore only ever sees messages
   with at least one non-principal recipient, and the prompt does not reason about the
   principal-sole case. Principal + third parties → judge runs.
-- **Model.** Configurable via `filter.llmJudge.model` (default `claude-haiku-4-5`).
+- **Model.** Configurable via `filter.llmJudge.model` (default `claude-haiku-5-5`).
   Operators are strongly encouraged to use a different vendor/family than the agent tiers
   so an attack crafted for the coordinator cannot also fool the reviewer.
 - **Failure handling** (`filter.llmJudge.failMode`, default `split`): a judge that is
   unreachable (timeout / API error) fails open (message delivered, Stage-1-only); a live
   model that returns an unparseable verdict fails closed (blocked). `open`/`closed` force
-  uniform behavior.
+  uniform behavior. Every Stage-2 decision publishes an `outbound.judge` audit event with
+  outcome `judged_pass` | `judged_block` | `skipped_principal_sole` | `failed_open` |
+  `failed_closed`, plus a `reasonCode` (`audience_leak` | `unreachable` | `unparseable`)
+  so a fail-open/closed outage is distinguishable from a real leak verdict without
+  correlating `llm.call` rows (#1911). Alarm surface is the audit row + existing
+  `logger.warn` — not HealthService tier heartbeats (the judge model is usually not a tier).
+- **Disabled / not wired.** When `filter.llmJudge.enabled: false` (or the judge is left
+  undefined at bootstrap), Stage 2 emits no `outbound.judge` rows. Detect that gap with
+  `count(outbound.message)` vs `count(outbound.judge)` over the same window — a sustained
+  imbalance with mixed-audience traffic means Stage 2 is off, not that every send was
+  principal-sole.
 
 Tone alignment and persona consistency are deferred to a follow-up; the judge prompt can be
 extended to cover them without further plumbing changes.
@@ -128,13 +248,16 @@ principal-safe **reason summary**:
   construction (names the category, never quotes the value), so it is safe to show and gives
   the CEO something actionable.
 - For a Stage 1 deterministic block, only the rule *name* is shown (e.g. `secret-pattern`); the
-  rule detail can embed the matched fragment, so it is withheld.
+  rule detail can embed the matched fragment, so it is withheld. `principal-note-markup` is
+  the exception: its detail is fixed text saying where the note goes, so it is shown.
 
-The blocked content itself is never included, on either path. There is no review-and-approve /
+`outbound.blocked.content` stores the PII-redacted body. The CEO notification omits the
+blocked body on both Stage 1 and Stage 2 paths. Exact rewrite abandon additionally copies
+the blocked body onto `outbound.no_reply.abandonedContent`. There is no review-and-approve /
 resend flow yet (see *What's Not Here Yet*), so a false positive currently means the agent's send
 is dropped and must be re-requested.
 
-### Stage 2.5: Escalation Judge — tier-keyed disclosure gate (implemented)
+### Stage 2.5: Escalation Judge — tier-keyed disclosure gate (implemented; `autonomy.gating: tier` only)
 
 Stages 1 and 2 catch *leaked internal content*. Stage 2.5 catches *over-disclosure to a recipient who isn't trusted enough to receive it* — sharing the principal's availability with an unknown sender, or another contact's details with someone who has no business seeing them. It runs only if Stages 1 and 2 both pass (#948, #949).
 
@@ -151,6 +274,10 @@ The policy is **deterministic code**; the LLM does only the natural-language cla
 
 - **Recipient tier** is the contact's `tier` (`contact.tier`), not the legacy `trust_level` column — that column was retired in the contacts redesign. The principal-bypass that the old `trust_override` redactor config provided is now structural (the immutable CEO contact UUID), and `trust_override` was removed (#949).
 - **Fail-closed.** Any LLM failure (timeout, malformed verdict, provider error) resolves to `decision='escalate'`. A configured-but-throwing judge yields a `disclosure-gate-error` finding and blocks. When **no** escalation judge is configured, Stage 2.5 is a no-op pass.
+- **Wiring (#1870).** Bootstrap builds the `EscalationJudge` before the filter and passes it in (`src/dispatch/outbound-filter-wiring.ts`). Before #1870 the filter was built without it, so Stage 2.5 never ran in production. Startup logs whether the gate is `active` (info) or inactive (warn: `no-judge` / `judge-disabled`). `escalation.judge.enabled: false` turns off both Gate C's classifier and Stage 2.5.
+- **Unrestricted-tier bypass (#1225, #1870).** Stage 2.5 returns no findings, *before* any classification call, for any tier whose policy entry allows every disclosure class. Today those tiers are `principal` and `trusted`. The rule is derived from the table, not a tier list, so a future tier gets the bypass exactly when its entry is unrestricted. Running the judge there could only add a fail-closed false block, for example on a transient judge failure for principal-bound mail such as the daily recap. A structurally verified sole-principal recipient is skipped the same way, mirroring Stage 2.
+- **Principal-directed bypass (#1870).** Stage 2.5 does not block a send the principal directed. Send skills set `principalDirected` with `isPrincipalDirectedSend()`: true for a **live principal turn** (`isLivePrincipalTurn`, the same notion as the `elevated` gate), or when the principal approved the exact action (`humanApproved`). Principal *lineage* is deliberately not enough. A heartbeat-woken or scheduled principal-lineage task can keep principal standing through the bypass ladder, but it composes its content autonomously, so it gets the gate. A scheduled send the principal set up earlier is therefore still gated; if it blocks, the principal is notified. Otherwise the gate would block the principal telling a `known` contact a third party's surname (the 2026-09-17 case in #1815). The bypass applies to Stage 2.5 only; Stages 1 and 2 still run. A sender that omits the flag gets the gate. Dispatcher-routed replies never set it: they answer the inbound sender, so that sender's tier governs.
+- **Failed tier lookup stays fail-closed (#1870).** The gateway fails *open* when the recipient's contact lookup throws: the send proceeds with `recipientTier='unknown'`. Stage 2.5 deliberately does **not** follow suit. It evaluates at `unknown`, so anything beyond `public` blocks. The gate is an allow-list keyed on tier, and skipping it on a lookup failure would grant an unresolved recipient the most permissive outcome. A deny-list check (the gateway's blocked-contact check) can fail open safely; an allow-list cannot. The cost is bounded. Principal-directed sends and sole-principal recipients still pass, and the block is not silent: it publishes `outbound.blocked` and notifies the principal. The finding detail carries `(recipient tier unresolved: contact lookup failed)`, so an outage-caused block can be told apart from one on the merits.
 - **Shared policy module.** Both this disclosure gate and the [Gate C action gate](09-contacts-and-identity.md#layer-4-tier-based-action-gate-gate-c) import the same `src/autonomy/escalation-policy.ts` tables (`DisclosureClass`, `ActionConsequenceClass`). The action gate adds a reversibility axis (`none` → `reversible-internal` → `reversible-external` → `irreversible`) and a `isThirdPartyFacing` runtime flag the judge resolves per-invocation.
 
 A Stage 2.5 escalation surfaces to the CEO the same way as a block: the finding names the disclosure class and recipient tier (never the offending value), so the audit event and CEO notification stay principal-safe.
@@ -163,7 +290,36 @@ never returned to the LLM in the first place: it is tracked per browser session 
 raw plus its URL- and HTML-encoded variants — from the returned page content, the page URL,
 and any error messages, so a hostile page cannot reflect the injected credential back into the
 model's context. Screenshots are suppressed on any action that fills a secret, since an image
-cannot be value-redacted. See [spec 03 — Output Sanitization](03-skills-and-execution.md#output-sanitization).
+cannot be value-redacted. See [spec 03 — Output Sanitization](03-tools-and-execution.md#output-sanitization).
+
+### Sign-in code scrub (#2017)
+
+A one-time sign-in code is not something the content filter can catch. Stage 1 `SECRET_PATTERNS` do not match a six-digit code, and the Stage 2 judge is skipped when the principal is the sole recipient and fails open when unreachable. So the judge is no longer the only line for these codes, and the scrub below does not depend on it. It exists because a delegated sign-in ([ADR-050](../adr/050-external-verifications-as-first-class-state.md)) legitimately moves a code through the coordinator, and the code must go only into the challenge that asked for it.
+
+An in-memory tracker holds the code values of live sign-in verifications (registered when `web-browser` types one, when the principal relays one on an inbound while an `sms` or `app` verification is open, and when ceo-inbox returns one for an `email` verification). Every tracked value is then **replaced with `[sign-in code]`, not blocked**, on three paths:
+
+- **Tool inputs.** The execution layer scrubs every string of every tool's input, default-deny, except `web-browser` ([spec 03](03-tools-and-execution.md#sign-in-code-scrub-2017)). That covers progress notes, scheduled-job payloads, documents, reports to the principal, memory writes and every send skill. A send containing a code goes out with `[sign-in code]` in its place; the turn does not fail.
+- **Replies.** The dispatcher scrubs the coordinator's reply and its note for the principal once, at the top of `handleAgentResponse`, so every relay path built from them (rewrites, approvals, bullpen filing, no-reply audit records) carries the scrubbed text. **This is a deliberate deviation from the design's "outbound filter Stage 1" placement.** Stage 1 only blocks, and the principal chose replace-not-block, so the rule lives where the reply is still editable. Stage 1 is unchanged.
+- **Extraction.** The checkpoint transcript is scrubbed before fact and relationship extraction, so a code never becomes a knowledge-graph fact.
+
+The raw stored message record (working memory, `audit_log`, `llm_call_archive`) is not scrubbed: the principal accepts single-use codes there. Over-capture within the narrow window of an open verification is accepted (a stray 6–8 character number in the code reply is masked); under-capture is the failure to avoid. The tracker is in memory, so a restart drops tracked values.
+
+### Bulk Export Gates (#201)
+
+Where the content filter guards *message bodies*, a separate set of gates guards *bulk data
+leaving the building* — email attachments through the `OutboundGateway` and Google Workspace MCP
+exports (`create_drive_file`, `create_sheet`, `append_table_rows`). Three deterministic gates apply:
+
+1. **Item-count threshold** — an export exceeding the configured item count escalates for CEO approval.
+2. **Non-contact destination allowlist** — exports to destinations that are not a known contact are
+   permitted only for `confidential`+ data (unknown destinations otherwise escalate).
+3. **Sensitivity ceiling** — `restricted`-tier data is never bulk-exported.
+
+Skills tag exported data for sensitivity resolution via an `export_items` input (with a per-attachment
+`node_id` resolved against `kg_nodes`); an agent-supplied `sensitivity` can only ratchet *up*, never
+downgrade the resolved value. CEO approval notifications for a gated export include the export item
+list. The authoritative gate definitions and sensitivity-resolution rules live in
+[spec 06 — Audit & Security](06-audit-and-security.md#sensitivity-resolution).
 
 ---
 
@@ -217,40 +373,12 @@ without cross-channel confirmation.
 
 ---
 
-## Implementation Status
+## Known Deficiencies
 
-| Item | Status |
-|---|---|
-| `OutboundGateway` class — single chokepoint for all external messages | Done |
-| Blocked contact check in gateway pipeline | Done |
-| Content filter Stage 1 — deterministic rules (system prompt fragments, internal field names, secret patterns, contact data leakage) | Done |
-| Content filter Stage 2 — LLM-as-judge (audience-leak & hyper-sensitive financial/credential detection) | Done |
-| Content filter Stage 2.5 — tier-keyed disclosure gate (escalation judge classifies `DisclosureClass`; `applyDisclosurePolicy` gates on recipient `tier`; fail-closed) (#948, #949) | Done |
-| Disclosure gate + PII redactor key on `contact.tier`; legacy `trust_override` redactor config removed (principal bypass now structural) (#949) | Done |
-| Audience partitioning — coordinator prompt guidance to send external reply and principal status update as **separate** outbound messages (no shared body) | Done |
-| `outbound.blocked` audit event published on filter block | Done |
-| Caller verification gate — elevated-skill check in execution layer | Partial — role-based gate exists; cross-channel challenge/response flow not built |
-| Display name sanitization — storage-time sanitization of inbound display names | Done |
-| Display name mismatch check — flag when display name matches known contact but address does not | Not Done |
-| CEO review-and-approve / edit / discard flow for blocked messages | Not Done |
-| Web UI for reviewing `outbound.blocked` events | Not Done |
-| Outbound rate limiting per recipient | Not Done |
-| Blocklist management skills (`outbound-block` / `outbound-unblock`) | Not Done |
-| `outbound.notification` event type (CEO notifications route through the filter pipeline) | Done |
-| Email reply quoting — `email-reply` includes the quoted original message body in drafts and sends; the filter pipeline runs over the full quoted reply | Done |
-| ceo-inbox URGENT alerts route through coordinator via Bullpen — specialist agents no longer call `signal-send` directly; alerts are requested as Bullpen threads mentioning the coordinator (see [spec 17 §4](17-meeting-debrief.md)) | Done |
-| `ceo-inbox-update-folders` empty-folders guard — refuses to PUT an empty folder set to Nylas, preventing accidental folder wipes | Done |
-| `ceo-inbox-draft-reply` — fails on missing sender rather than substituting an `"unknown"` placeholder in the draft | Done |
-
----
-
-## What's Not Here Yet
-
-- Stage 2 follow-up: tone alignment and persona consistency checks (the judge prompt can be extended without further plumbing changes)
-- CEO review-and-approve / edit / discard flow for blocked messages
-- Web UI for reviewing `outbound.blocked` events
-- Outbound rate limiting per recipient
-- Blocklist management skills (`outbound-block` / `outbound-unblock`)
-
-> **TODO:** Replace this section with a proper "What's Implemented / What's Planned" table
-> once the feature is complete. The outstanding items above are the main gaps.
+- **Cross-channel caller challenge** — role-based caller verification gate exists, but the cross-channel challenge/response flow is not built.
+- **Display-name mismatch check** — no flag when a display name matches a known contact but the address does not.
+- **CEO review/approve/edit/discard flow** — no review-and-approve / edit / discard flow for blocked messages.
+- **Web UI for `outbound.blocked`** — no web UI for reviewing `outbound.blocked` events.
+- **Per-recipient outbound rate limiting** — not implemented.
+- **Blocklist skills** — no `outbound-block` / `outbound-unblock` management skills.
+- **Stage 2 follow-up: tone/persona checks** — tone alignment and persona consistency checks; the judge prompt can be extended without further plumbing changes.

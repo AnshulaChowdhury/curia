@@ -1,105 +1,77 @@
 import { describe, it, expect } from 'vitest';
+// The seed a fresh install loads, imported so the warm template cannot drift from it.
+import { DEFAULT_OFFICE_IDENTITY } from '../../../../src/identity/defaults.js';
+import { TONE_STYLE_MAX_LENGTH as SERVER_TONE_STYLE_MAX_LENGTH } from '../../../../src/identity/types.js';
+import { DETAIL_BANDS, LENGTH_ROWS, LENGTH_ROW_LABELS, detailBand } from '../../../../src/identity/length.js';
 import {
-  toggleToneSelection,
-  verbosityBand,
-  directnessBand,
-  tonePreviewText,
+  lengthPreview,
   verbosityReviewDesc,
-  directnessReviewDesc,
-  postureReviewDesc,
+  formalityBand,
+  STYLE_TEMPLATES,
+  TONE_STYLE_MAX_LENGTH,
+  validateToneStyle,
+  styleReviewDesc,
+  autonomyChange,
   validateNonEmptyName,
   validatePrincipalName,
   PRINCIPAL_NAME_MAX_LENGTH,
   buildIdentityPayload,
+  assistantFullName,
+  defaultSignature,
+  DEFAULT_WIZARD_STATE,
+  detectBrowserTimezone,
+  validateProfileEmail,
+  buildProfilePayload,
+  WIZARD_TOTAL_STEPS,
+  clampWizardStep,
   type WizardState,
   type LocalIdentity,
 } from './wizard-utils.js';
 
+// ── assistantFullName / defaultSignature ──────────────────────────────────────
+
+describe('assistantFullName', () => {
+  it('pairs a first name with the Curia surname', () => {
+    expect(assistantFullName('Sam')).toBe('Sam Curia');
+  });
+});
+
+describe('defaultSignature', () => {
+  it('builds the full default signature block', () => {
+    expect(defaultSignature('Sam')).toBe('--\nSam Curia\nDigital EA');
+  });
+
+  it('backs the populated DEFAULT_WIZARD_STATE signature (not blank)', () => {
+    expect(DEFAULT_WIZARD_STATE.signature).toBe('--\nAlex Curia\nDigital EA');
+  });
+
+  it('backs the DEFAULT_WIZARD_STATE name', () => {
+    expect(DEFAULT_WIZARD_STATE.name).toBe('Alex Curia');
+  });
+});
+
 // ── toggleToneSelection ───────────────────────────────────────────────────────
 
-describe('toggleToneSelection', () => {
-  it('adds a word when under the max', () => {
-    expect(toggleToneSelection(['warm'], 'direct')).toEqual(['warm', 'direct']);
+describe('lengthPreview (#2143)', () => {
+  // The server's own table, shaped as GET /api/identity returns it.
+  const table = {
+    rows: LENGTH_ROWS.map(id => ({ id, label: LENGTH_ROW_LABELS[id] })),
+    bands: DETAIL_BANDS,
+  };
+
+  it('shows the band and each channel limit the identity block gives at that setting', () => {
+    for (const verbosity of [0, 25, 26, 50, 51, 75, 76, 100]) {
+      const preview = lengthPreview(table, verbosity)!;
+      const band = detailBand(verbosity);
+      expect(preview.band).toBe(band.label);
+      expect(preview.lines).toEqual(LENGTH_ROWS.map(row => ({ label: LENGTH_ROW_LABELS[row], limit: band.limits[row] })));
+    }
   });
 
-  it('removes a word when it is already selected', () => {
-    expect(toggleToneSelection(['warm', 'direct'], 'warm')).toEqual(['direct']);
-  });
-
-  it('prevents removing the last word (min 1)', () => {
-    expect(toggleToneSelection(['warm'], 'warm')).toEqual(['warm']);
-  });
-
-  it('prevents adding a 4th word (max 3)', () => {
-    const current = ['warm', 'direct', 'calm'];
-    expect(toggleToneSelection(current, 'witty')).toEqual(current);
-  });
-
-  it('allows toggling when exactly 3 are selected — remove one', () => {
-    expect(toggleToneSelection(['warm', 'direct', 'calm'], 'calm'))
-      .toEqual(['warm', 'direct']);
+  it('has nothing to show for an empty table', () => {
+    expect(lengthPreview({ rows: [], bands: [] }, 50)).toBeNull();
   });
 });
-
-// ── verbosityBand ─────────────────────────────────────────────────────────────
-
-describe('verbosityBand', () => {
-  it('returns brief copy at 0', () => {
-    expect(verbosityBand(0)).toBe('"Here\'s the short answer."');
-  });
-
-  it('returns brief copy at 25', () => {
-    expect(verbosityBand(25)).toBe('"Here\'s the short answer."');
-  });
-
-  it('returns concise copy at 26', () => {
-    expect(verbosityBand(26)).toBe(
-      '"Happy to help — let me know if you\'d like more detail."',
-    );
-  });
-
-  it('returns thorough copy at 100', () => {
-    expect(verbosityBand(100)).toBe('"Let me walk you through this thoroughly."');
-  });
-});
-
-// ── directnessBand ────────────────────────────────────────────────────────────
-
-describe('directnessBand', () => {
-  it('returns hedged copy at 0', () => {
-    expect(directnessBand(0)).toBe(
-      '"There are a few things worth considering here — it\'s hard to say definitively."',
-    );
-  });
-
-  it('returns direct copy at 100', () => {
-    expect(directnessBand(100)).toBe('"Do it. The risk is low and the upside is clear."');
-  });
-});
-
-// ── tonePreviewText ───────────────────────────────────────────────────────────
-
-describe('tonePreviewText', () => {
-  it('formats single word', () => {
-    expect(tonePreviewText(['warm'])).toBe('Your tone is warm.');
-  });
-
-  it('formats two words with "and"', () => {
-    expect(tonePreviewText(['warm', 'direct'])).toBe('Your tone is warm and direct.');
-  });
-
-  it('formats three words with Oxford comma + note', () => {
-    expect(tonePreviewText(['warm', 'direct', 'calm'])).toBe(
-      'Your tone is warm, direct and calm. (Pick up to 3)',
-    );
-  });
-
-  it('returns empty string for empty array', () => {
-    expect(tonePreviewText([])).toBe('');
-  });
-});
-
-// ── verbosityReviewDesc / directnessReviewDesc / postureReviewDesc ────────────
 
 describe('verbosityReviewDesc', () => {
   it('returns concise description at 50', () => {
@@ -107,27 +79,14 @@ describe('verbosityReviewDesc', () => {
   });
 });
 
-describe('directnessReviewDesc', () => {
-  it('returns direct description at 75', () => {
-    expect(directnessReviewDesc(75)).toBe('Direct — minimal unnecessary hedging.');
+describe('formalityBand', () => {
+  it('returns a casual sample at low formality', () => {
+    expect(formalityBand(10)).toContain('Hey');
+  });
+  it('returns a formal sample at high formality', () => {
+    expect(formalityBand(90)).toContain('formally');
   });
 });
-
-describe('postureReviewDesc', () => {
-  it('maps conservative', () => {
-    expect(postureReviewDesc('conservative')).toBe(
-      'Verifies before acting on external requests.',
-    );
-  });
-  it('maps balanced', () => {
-    expect(postureReviewDesc('balanced')).toBe('Acts when confident; flags when uncertain.');
-  });
-  it('maps proactive', () => {
-    expect(postureReviewDesc('proactive')).toBe('Biases toward action with less checking in.');
-  });
-});
-
-// ── validateNonEmptyName ──────────────────────────────────────────────────────
 
 describe('validateNonEmptyName', () => {
   it('returns true for a non-empty name', () => {
@@ -176,9 +135,8 @@ describe('validatePrincipalName', () => {
 describe('buildIdentityPayload', () => {
   const existingIdentity: LocalIdentity = {
     assistant: { name: 'Old', title: 'Old Title', emailSignature: '' },
-    tone: { baseline: ['warm'], verbosity: 50, directness: 75 },
+    tone: { style: 'Warm.', verbosity: 50 },
     behavioralPreferences: ['existing pref'],
-    decisionStyle: { externalActions: 'balanced', internalAnalysis: 'proactive' },
     constraints: ['no spam'],
   };
 
@@ -187,11 +145,15 @@ describe('buildIdentityPayload', () => {
     name: 'Alex Curia',
     title: 'Executive Assistant to the CEO',
     signature: 'Best, Alex',
-    toneBaseline: ['warm', 'direct'],
+    toneStyle: '  Dry and brief.\nSounds like: "Done."  ',
     verbosity: 60,
-    directness: 80,
-    posture: 'conservative',
+    autonomyBand: 'spot-check',
     preferences: 'Flag investor emails',
+    timezone: 'America/Toronto',
+    email: '',
+    preferredName: '',
+    principalTitle: '',
+    workingHours: null,
   };
 
   it('maps WizardState onto identity correctly', () => {
@@ -199,10 +161,9 @@ describe('buildIdentityPayload', () => {
     expect(identity.assistant.name).toBe('Alex Curia');
     expect(identity.assistant.title).toBe('Executive Assistant to the CEO');
     expect(identity.assistant.emailSignature).toBe('Best, Alex');
-    expect(identity.tone.baseline).toEqual(['warm', 'direct']);
-    expect(identity.tone.verbosity).toBe(60);
-    expect(identity.tone.directness).toBe(80);
-    expect(identity.decisionStyle.externalActions).toBe('conservative');
+    expect(identity.tone).toEqual({ style: 'Dry and brief.\nSounds like: "Done."', verbosity: 60 });
+    // The identity no longer carries a decision style; autonomy is saved separately.
+    expect(identity).not.toHaveProperty('decisionStyle');
   });
 
   it('appends preferences to existing behavioralPreferences', () => {
@@ -221,11 +182,6 @@ describe('buildIdentityPayload', () => {
     expect(identity.behavioralPreferences).toEqual(['existing pref']);
   });
 
-  it('preserves internalAnalysis from existing identity', () => {
-    const { identity } = buildIdentityPayload(state, existingIdentity);
-    expect(identity.decisionStyle.internalAnalysis).toBe('proactive');
-  });
-
   it('preserves constraints from existing identity', () => {
     const { identity } = buildIdentityPayload(state, existingIdentity);
     expect(identity.constraints).toEqual(['no spam']);
@@ -234,5 +190,134 @@ describe('buildIdentityPayload', () => {
   it('sets note to "Saved via onboarding wizard"', () => {
     const { note } = buildIdentityPayload(state, existingIdentity);
     expect(note).toBe('Saved via onboarding wizard');
+  });
+});
+
+// ── validateProfileEmail ──────────────────────────────────────────────────────
+
+describe('validateProfileEmail', () => {
+  it('returns null for empty (optional field)', () => {
+    expect(validateProfileEmail('')).toBeNull();
+    expect(validateProfileEmail('   ')).toBeNull();
+  });
+  it('returns null for a valid address', () => {
+    expect(validateProfileEmail('a@b.com')).toBeNull();
+  });
+  it('returns an error for a malformed address', () => {
+    expect(validateProfileEmail('not-an-email')).toMatch(/valid/i);
+  });
+});
+
+// ── buildProfilePayload ───────────────────────────────────────────────────────
+
+describe('buildProfilePayload', () => {
+  it('includes timezone and omits empty optionals', () => {
+    const state = { ...DEFAULT_WIZARD_STATE, timezone: 'America/Vancouver' };
+    expect(buildProfilePayload(state)).toEqual({ timezone: 'America/Vancouver' });
+  });
+  it('includes provided optionals and trims them', () => {
+    const state = {
+      ...DEFAULT_WIZARD_STATE, timezone: 'America/Toronto',
+      email: '  Me@Example.com ', preferredName: ' Jo ', principalTitle: ' CEO ',
+      workingHours: { start: '09:00', end: '17:00', days: [1, 2, 3, 4, 5] },
+    };
+    expect(buildProfilePayload(state)).toEqual({
+      timezone: 'America/Toronto', email: 'Me@Example.com', preferredName: 'Jo',
+      title: 'CEO', workingHours: { start: '09:00', end: '17:00', days: [1, 2, 3, 4, 5] },
+    });
+  });
+});
+
+// ── detectBrowserTimezone ─────────────────────────────────────────────────────
+
+describe('detectBrowserTimezone', () => {
+  it('returns a non-empty IANA-looking string', () => {
+    // CI environments often report 'UTC' — a valid IANA zone without a slash.
+    // Accept any non-empty string that Intl recognises as a real zone.
+    const tz = detectBrowserTimezone();
+    expect(tz.length).toBeGreaterThan(0);
+    expect(() => Intl.DateTimeFormat(undefined, { timeZone: tz })).not.toThrow();
+  });
+});
+
+// ── clampWizardStep ───────────────────────────────────────────────────────────
+
+describe('clampWizardStep', () => {
+  it('accepts every real step, including the final review step (#2146)', () => {
+    for (let step = 1; step <= WIZARD_TOTAL_STEPS; step++) {
+      expect(clampWizardStep(step)).toBe(step);
+    }
+    expect(clampWizardStep(6)).toBe(6);
+  });
+
+  it('clamps out-of-range steps to the nearest real step', () => {
+    expect(clampWizardStep(0)).toBe(1);
+    expect(clampWizardStep(-3)).toBe(1);
+    expect(clampWizardStep(WIZARD_TOTAL_STEPS + 1)).toBe(WIZARD_TOTAL_STEPS);
+  });
+
+  it('rounds fractional steps', () => {
+    expect(clampWizardStep(2.6)).toBe(3);
+  });
+
+  it('falls back to step 1 for non-numeric values', () => {
+    expect(clampWizardStep(undefined)).toBe(1);
+    expect(clampWizardStep('3')).toBe(1);
+    expect(clampWizardStep(Number.NaN)).toBe(1);
+    expect(clampWizardStep(Number.POSITIVE_INFINITY)).toBe(1);
+  });
+});
+
+// ── Tone & style (#2143) ──────────────────────────────────────────────────────
+
+describe('STYLE_TEMPLATES', () => {
+  it('offers the four starters, each ending in one example line', () => {
+    expect(STYLE_TEMPLATES.map(t => t.label)).toEqual(['Dry & understated', 'Warm & personable', 'Crisp & direct', 'Formal']);
+    for (const t of STYLE_TEMPLATES) {
+      expect(t.text.split('\n').at(-1)).toMatch(/^Sounds like: ".+"$/);
+      expect(validateToneStyle(t.text)).toBeNull();
+    }
+  });
+
+  it('keeps the warm template identical to the seeded default style', () => {
+    // A fresh install's wizard loads the seed: it must read as an untouched template.
+    expect(STYLE_TEMPLATES.find(t => t.id === 'warm')!.text).toBe(DEFAULT_OFFICE_IDENTITY.tone.style);
+  });
+});
+
+describe('validateToneStyle', () => {
+  it('requires some text', () => {
+    expect(validateToneStyle('')).toMatch(/Describe how/);
+    expect(validateToneStyle('   ')).toMatch(/Describe how/);
+  });
+  it('caps the length at the identity limit', () => {
+    expect(TONE_STYLE_MAX_LENGTH).toBe(SERVER_TONE_STYLE_MAX_LENGTH);
+    expect(validateToneStyle('x'.repeat(TONE_STYLE_MAX_LENGTH))).toBeNull();
+    expect(validateToneStyle('x'.repeat(TONE_STYLE_MAX_LENGTH + 1))).toMatch(/801/);
+  });
+});
+
+describe('styleReviewDesc', () => {
+  it('shows the first line', () => {
+    expect(styleReviewDesc('Dry and brief.\nSounds like: "Done."')).toBe('Dry and brief.');
+  });
+  it('cuts a long first line short', () => {
+    const out = styleReviewDesc('word '.repeat(60));
+    expect(out.length).toBeLessThanOrEqual(118);
+    expect(out.endsWith('…')).toBe(true);
+  });
+});
+
+// ── Autonomy band (#2143) ─────────────────────────────────────────────────────
+
+describe('autonomyChange', () => {
+  it('skips the save when the picked band is the current one', () => {
+    expect(autonomyChange(84, 'spot-check')).toBeNull();
+    expect(autonomyChange(60, 'draft-only')).toBeNull();
+  });
+  it('saves a changed band at its lower bound, with the wizard reason', () => {
+    expect(autonomyChange(84, 'full')).toEqual({ score: 90, reason: 'Set via onboarding wizard' });
+    expect(autonomyChange(84, 'approval-required')).toEqual({ score: 70, reason: 'Set via onboarding wizard' });
+    expect(autonomyChange(75, 'restricted')).toEqual({ score: 0, reason: 'Set via onboarding wizard' });
   });
 });

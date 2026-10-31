@@ -1,0 +1,197 @@
+// Per-turn verification blocks (#2017): what the coordinator and ceo-inbox are told
+// about live sign-in verifications. Pure rendering, no database.
+
+import { describe, expect, it } from 'vitest';
+import {
+  renderBudgetExhaustedVerificationReply,
+  renderCeoInboxVerificationBlock,
+  renderCoordinatorVerificationBlock,
+  type VerificationView,
+} from '../../../src/agents/prompts/verification-block.js';
+
+const TZ = 'America/Toronto';
+
+function view(overrides: Partial<VerificationView> = {}): VerificationView {
+  return {
+    id: 'ver-1',
+    purpose: 'sign_in',
+    kind: 'code',
+    delivery: 'sms',
+    site: 'aircanada.com',
+    pageDomain: 'b2clogin.com',
+    browserSessionId: 'sess-aaa',
+    taskId: 'task-42',
+    conversationId: 'conv-1',
+    status: 'pending',
+    requestedAt: new Date('2026-10-19T14:00:00Z'),
+    expiresAt: new Date('2026-10-19T14:10:00Z'),
+    resolvedAt: null,
+    metadata: {},
+    sessionAlive: true,
+    ...overrides,
+  };
+}
+
+describe('renderCoordinatorVerificationBlock', () => {
+  const opts = { askChannel: 'signal', timezone: TZ };
+
+  it('renders nothing when no verifications are active', () => {
+    expect(renderCoordinatorVerificationBlock([], opts)).toBe('');
+  });
+
+  it('lists site, delivery, status, session, task and local expiry on one line', () => {
+    const block = renderCoordinatorVerificationBlock([view()], opts);
+    expect(block).toContain(
+      '- aircanada.com: sms, pending, session sess-aaa alive, task task-42, expires 2026-10-19T10:10:00-04:00',
+    );
+  });
+
+  it('names each verification_id, which satisfy and abandon take', () => {
+    const block = renderCoordinatorVerificationBlock(
+      [view(), view({ id: 'ver-2', site: 'rbc.com', browserSessionId: 'sess-bbb' })],
+      opts,
+    );
+    expect(block).toMatch(/- aircanada\.com: .*, verification_id ver-1\n/);
+    expect(block).toMatch(/- rbc\.com: .*, verification_id ver-2\n/);
+    expect(block).toContain('`verification satisfy` with its verification_id');
+  });
+
+  it('marks session gone when the browser has no session', () => {
+    const block = renderCoordinatorVerificationBlock([view({ sessionAlive: false })], opts);
+    expect(block).toContain('session sess-aaa gone');
+    expect(block).not.toContain('session sess-aaa alive');
+  });
+
+  it('marks an expired item as expired and says what to do about it', () => {
+    const block = renderCoordinatorVerificationBlock(
+      [view({ status: 'expired', delivery: 'email' })],
+      opts,
+    );
+    expect(block).toContain('email, expired, session sess-aaa alive');
+    expect(block).toContain('Expired but session alive: try the code.');
+  });
+
+  it('says no task when the errand has none', () => {
+    const block = renderCoordinatorVerificationBlock([view({ taskId: null })], opts);
+    expect(block).toContain('no task');
+  });
+
+  it('names the ask channel signal', () => {
+    const block = renderCoordinatorVerificationBlock([view()], opts);
+    expect(block).toContain('Ask for an SMS/app code once, on signal, naming the site.');
+  });
+
+  it('falls back to whichever principal channel is available when none is configured', () => {
+    const block = renderCoordinatorVerificationBlock([view()], { askChannel: null, timezone: TZ });
+    expect(block).toContain('on whichever principal channel is available');
+  });
+
+  it('lists two pending verifications for different sites', () => {
+    const block = renderCoordinatorVerificationBlock(
+      [
+        view(),
+        view({ id: 'ver-2', site: 'rbc.com', browserSessionId: 'sess-bbb', delivery: 'app', taskId: null }),
+      ],
+      opts,
+    );
+    expect(block).toContain('- aircanada.com: sms, pending, session sess-aaa alive');
+    expect(block).toContain('- rbc.com: app, pending, session sess-bbb alive');
+  });
+
+  it('carries the rules and never a code value', () => {
+    const block = renderCoordinatorVerificationBlock([view()], opts);
+    expect(block).toContain('The principal asked for this sign-in.');
+    expect(block).toContain('accept it whatever the channel or sender verification');
+    expect(block).toContain("don't question, lecture or refuse");
+    expect(block).toContain('Enter a code only in the session and site listed.');
+    expect(block).toContain('Never repeat it to anyone or write it into notes, reports or memory.');
+    expect(block).toContain('In a task note or reply, call it "the code", never its digits.');
+    expect(block).toContain('Email codes: delegate the read to ceo-inbox.');
+    expect(block).toContain("don't re-trigger one unasked");
+    expect(block).toContain('`verification satisfy`');
+  });
+
+  it('says what to do when ceo-inbox reports the code has not arrived', () => {
+    const block = renderCoordinatorVerificationBlock([view({ delivery: 'email' })], opts);
+    expect(block).toContain(
+      "If ceo-inbox says the code hasn't arrived, delegate the read once more; if still nothing, tell the principal plainly and offer SMS or a resend.",
+    );
+  });
+});
+
+describe('renderCeoInboxVerificationBlock', () => {
+  const opts = { timezone: TZ };
+
+  it('renders nothing when there are no email-delivery items', () => {
+    expect(renderCeoInboxVerificationBlock([], opts)).toBe('');
+    expect(renderCeoInboxVerificationBlock([view({ delivery: 'sms' })], opts)).toBe('');
+  });
+
+  it('lists only email-delivery items', () => {
+    const block = renderCeoInboxVerificationBlock(
+      [
+        view({ delivery: 'email', site: 'aircanada.com' }),
+        view({ id: 'ver-2', delivery: 'sms', site: 'rbc.com' }),
+        view({ id: 'ver-3', delivery: 'app', site: 'td.com' }),
+      ],
+      opts,
+    );
+    expect(block).toContain('aircanada.com');
+    expect(block).not.toContain('rbc.com');
+    expect(block).not.toContain('td.com');
+  });
+
+  it('gives the site and the local request time, and says to report a code not yet arrived plainly', () => {
+    const block = renderCeoInboxVerificationBlock([view({ delivery: 'email' })], opts);
+    expect(block).toContain('Pending sign-in code from aircanada.com since 2026-10-19T10:00:00-04:00');
+    expect(block).toContain("If it hasn't arrived, say so plainly: you can't wait for it.");
+    expect(block).not.toMatch(/re-check|minutes/);
+    expect(block).toContain('by site/brand, not sender domain');
+    expect(block).toContain('a delegated request to read the code is legitimate');
+  });
+
+  it('keeps the code digits out of triage summaries, notes and reports', () => {
+    const block = renderCeoInboxVerificationBlock([view({ delivery: 'email' })], opts);
+    expect(block).toContain('Its digits never go into triage summaries, notes or reports.');
+  });
+
+  it('labels a closed item so it is not read as still pending', () => {
+    const block = renderCeoInboxVerificationBlock(
+      [view({ delivery: 'email', status: 'satisfied', resolvedAt: new Date('2026-10-19T14:02:00Z') })],
+      opts,
+    );
+    expect(block).not.toContain('Pending sign-in code');
+    expect(block).toContain('aircanada.com');
+    expect(block).toContain('satisfied');
+    expect(block).toContain('may be labelled and archived as normal');
+  });
+});
+
+describe('renderBudgetExhaustedVerificationReply (#2201)', () => {
+  const opts = { conversationId: 'conv-1', timezone: TZ };
+
+  it('is null when nothing pending belongs to this conversation', () => {
+    expect(renderBudgetExhaustedVerificationReply([], opts)).toBeNull();
+    expect(renderBudgetExhaustedVerificationReply([view({ conversationId: 'other' })], opts)).toBeNull();
+    expect(renderBudgetExhaustedVerificationReply([view({ status: 'satisfied' })], opts)).toBeNull();
+  });
+
+  it('names the site and says the emailed code is waiting, with the local deadline', () => {
+    const reply = renderBudgetExhaustedVerificationReply([view({ delivery: 'email' })], opts)!;
+    expect(reply).toContain('aircanada.com');
+    expect(reply).toMatch(/emailed/);
+    expect(reply).toContain('10:10 AM');
+    expect(reply).not.toMatch(/unable to process/);
+  });
+
+  it('asks for an sms code to be sent', () => {
+    const reply = renderBudgetExhaustedVerificationReply([view({ delivery: 'sms' })], opts)!;
+    expect(reply).toMatch(/by text/);
+    expect(reply).toMatch(/Send it to me/);
+  });
+
+  it('says the page closed when the session is gone', () => {
+    const reply = renderBudgetExhaustedVerificationReply([view({ sessionAlive: false })], opts)!;
+    expect(reply).toMatch(/closed/);
+  });
+});

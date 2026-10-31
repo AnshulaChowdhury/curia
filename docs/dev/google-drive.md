@@ -10,11 +10,23 @@ official hosted Workspace MCP server.
 
 Google's hosted Workspace MCP server is not yet available. In the meantime, Curia
 uses [`taylorwilsdon/google_workspace_mcp`](https://github.com/taylorwilsdon/google_workspace_mcp)
-as a local stdio subprocess — the MCP loader spawns it via `uvx workspace-mcp` and
-communicates over stdin/stdout.
+as a local stdio subprocess — the MCP loader spawns it via `scripts/workspace-mcp.sh`
+and communicates over stdin/stdout. That launcher runs the version pinned in
+`scripts/workspace-mcp.pin` (#2010): the Docker image installs it at build time, so
+the container never fetches it from PyPI, and anywhere else (`pnpm dev`,
+`scripts/gdrive-auth.py`) it runs through `uvx` at the same pin. See
+[Bumping workspace-mcp](#bumping-workspace-mcp).
 
-This gives Curia full access to Drive, Sheets, Docs, Gmail, Calendar, and more using
-OAuth 2.0 as Curia's own Gmail user.
+This gives Curia access to Drive, Sheets and Docs using OAuth 2.0 as Curia's own
+Gmail user. `config/skills.yaml` passes `--tools drive docs sheets`, and that
+allowlist is the only thing deciding which services load (#1957), so keep it
+exact: `tests/unit/config.google-workspace-allowlist.test.ts` fails on any change.
+
+- **Calendar is never on it.** Principal calendar access goes through the
+  Nylas-backed `calendar` skill; Workspace Calendar tools would authenticate as
+  Curia's own identity and read an empty calendar (#1853).
+- **Gmail is not on it.** Curia's email tools (the `email` bundle) cover the same
+  mailbox, including whole-thread reads (`email-get-thread`).
 
 ### One-time setup
 
@@ -26,16 +38,28 @@ OAuth 2.0 as Curia's own Gmail user.
    - Google Drive API
    - Google Sheets API
    - Google Docs API
-   - Gmail API
-   - Google Calendar API
+
+   Do **not** enable Google Calendar API for Curia's Workspace OAuth client.
+   Principal calendar traffic uses Nylas, and Calendar is not in `--tools`
+   (#1853). Enabling it here only widens Curia's grant without a caller. The
+   same goes for the Gmail API: Curia's email runs through Nylas.
 
 #### Step 2 — OAuth consent screen
 
 1. Go to APIs & Services → OAuth consent screen.
 2. Choose **External** (works with any Gmail account, including Curia's).
 3. Fill in the app name and contact email.
-4. Add scopes: Drive, Sheets, Docs, Gmail, Calendar.
+4. Add scopes: Drive, Sheets, Docs.
+   Omit Calendar and Gmail — see Step 1.
 5. Under **Test users**, add Curia's Gmail address.
+
+> **Existing deployments:** narrowing `--tools` does not revoke anything already
+> granted. Existing tokens keep working (upstream scope checks are
+> superset-based), but scopes for services no longer loaded (Calendar, Gmail,
+> and anything else an older allowlist had) stay live until you revoke the grant
+> at [myaccount.google.com](https://myaccount.google.com/permissions) and re-run
+> Step 5. Do this at the next convenient window; nothing breaks if you don't —
+> there is simply no caller for those scopes (#1853, #1957).
 
 > The app can stay in "Testing" mode. If you want non-expiring tokens without having
 > to re-add test users, publish the app (Publish App button). Publishing does not make
@@ -48,14 +72,27 @@ OAuth 2.0 as Curia's own Gmail user.
 3. Name it (e.g. `curia-mcp-client`).
 4. Note the **Client ID** and **Client Secret** — you will need these in the next step.
 
-#### Step 4 — Set env vars
+#### Step 4 — Seed the OAuth secrets into the vault
 
-Add to `.env` (VPS and local):
+As of #913 the Google Workspace OAuth secrets live in the **encrypted vault**, not
+in `.env`. Both consumers read them from the vault at runtime: the
+`drive-download-file` skill (via `ctx.secret()`, audited) and the `google-workspace`
+MCP subprocess (resolved at spawn time by the MCP loader, vault-only).
 
-```env
-GOOGLE_OAUTH_CLIENT_ID=<your-client-id>.apps.googleusercontent.com
-GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-...
+Seed all three on each environment (VPS and local) by setting them transiently and
+running the seeder — the vault upsert is idempotent, so re-running is safe:
+
+```bash
+GOOGLE_OAUTH_CLIENT_ID=<your-client-id>.apps.googleusercontent.com \
+GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-... \
+CURIA_GOOGLE_EMAIL=<curia-gmail> \
+  pnpm run seed-vault
 ```
+
+This writes the vault keys `google_oauth_client_id`, `google_oauth_client_secret`,
+and `curia_google_email`. Do **not** add these to `.env` — if the vault has no row
+for them, the `google-workspace` MCP server is skipped at startup and Drive download
+fails with a clear "not set in the vault" error.
 
 #### Step 5 — Run the first OAuth flow
 
@@ -77,11 +114,15 @@ GOOGLE_OAUTH_CLIENT_ID=<...> GOOGLE_OAUTH_CLIENT_SECRET=<...> CURIA_GOOGLE_EMAIL
 
 The script connects to a single persistent `workspace-mcp` process (important — each
 service auth call must happen in the same process so the OAuth state survives the
-callback), opens your browser once per service, and waits for you to complete the login.
+callback) with the same `--tools drive docs sheets` allowlist as runtime, opens your
+browser once, and waits for you to complete the login. The allowlist is what keeps
+Calendar and Gmail scopes out of the consent: workspace-mcp requests the scopes of
+every service it has enabled.
 
-Log in as **Curia's Gmail account** each time.
+Log in as **Curia's Gmail account**.
 
-After all five services are authenticated, tokens are saved to:
+After all services in the auth script are authenticated (Drive, Sheets and Docs;
+#1957), tokens are saved to:
 ```text
 ~/.google_workspace_mcp/credentials/<curia-gmail>.json
 ```
@@ -130,7 +171,9 @@ repeat Step 5 to re-authenticate and copy fresh tokens to the VPS.
    A non-zero `registered` count means the server connected and tools are available.
 
 2. **Tool discovery**: ask Curia: *"What Google Workspace tools do you have available?"*
-   It should list Drive, Sheets, Docs, Gmail, and Calendar tools.
+   It should list Drive, Sheets and Docs tools only — no Gmail or Calendar
+   tools (#1957, #1853). The startup log line `Tool tier 'complete' loaded: N
+   tools across 3 services [['docs', 'drive', 'sheets']]` confirms the same.
 
 3. **End-to-end read**: share a test Google Sheet with Curia's Gmail, then ask:
    *"Read the test sheet and summarize what's in it."*
@@ -143,10 +186,14 @@ repeat Step 5 to re-authenticate and copy fresh tokens to the VPS.
 
 **`ERROR Failed to connect to MCP server`**
 
-`uvx` is not on the PATH inside the container. The Dockerfile installs `uv`/`uvx` into
-`/usr/local/bin/` via `COPY --from=ghcr.io/astral-sh/uv`. Verify with
-`docker compose exec curia which uvx` — if missing, rebuild the image.
+In the container, the server runs from its build-time install at
+`/opt/uv/bin/workspace-mcp`, so no network is involved. Check it is there with
+`docker compose exec curia test -x /opt/uv/bin/workspace-mcp && echo ok`. If it is
+missing, the image predates #2010 or was built from a different Dockerfile; rebuild it.
 (The compose-service form resolves the container regardless of project name.)
+
+Under `pnpm dev`, the launcher needs `uvx` on the PATH (install `uv`, see Step 5),
+and the first start downloads the pinned version.
 
 **`INFO MCP server tools registered {"registered":0}`**
 
@@ -173,15 +220,40 @@ security settings, then repeat Step 5.
 
 ---
 
+## Bumping workspace-mcp
+
+The version and the dependency cutoff live in `scripts/workspace-mcp.pin`, and
+nowhere else. Bump them together, in the same edit:
+
+- `WORKSPACE_MCP_VERSION` is the exact release. It pins one package only.
+- `WORKSPACE_MCP_EXCLUDE_NEWER` is passed to uv as `--exclude-newer`. uv ignores
+  every distribution uploaded after it, so fastmcp, mcp and the Google client
+  libraries resolve the same way on every rebuild. The image's uv supports only
+  this single global cutoff, which applies to workspace-mcp too, so it must fall
+  **after** the new release's upload time. Otherwise the pin cannot resolve and
+  the image build fails.
+
+To bump:
+
+1. Find the release's upload time on PyPI
+   (`curl -s https://pypi.org/pypi/workspace-mcp/<version>/json | jq '.urls[].upload_time_iso_8601'`)
+   and set the cutoff a little after it (e.g. the next midnight UTC).
+2. Update both lines in `scripts/workspace-mcp.pin`.
+3. Build the image (`docker build .`). The build imports `main` and the module of
+   each `--tools` service, so a broken dependency or a service that no longer
+   loads fails here, not at boot. If the allowlist changes, update the import
+   list in the `Dockerfile` and `SERVICE_MODULES` in
+   `tests/unit/config.workspace-mcp-pin.test.ts`.
+4. Start the server and compare its `tools/list` with the previous version's.
+   Upstream renames and drops tools between releases, majors in particular.
+
+---
+
 ## Production Dockerfile (`curia-deploy`)
 
 The production image uses `curia-deploy/deploy/compose/Dockerfile.curia` (not the
-`curia/Dockerfile`). That file also needs `uv`/`uvx`. Use the same signed,
-version-pinned copy pattern as `curia/Dockerfile`:
-
-```dockerfile
-COPY --from=ghcr.io/astral-sh/uv:0.6.3 /uv /uvx /usr/local/bin/
-```
+`curia/Dockerfile`). It builds `FROM` the core image, so it inherits the
+build-time `workspace-mcp` install at `/opt/uv/bin/workspace-mcp`.
 
 Also add the token volume to `compose.production.yaml` under the `curia` service:
 
@@ -201,7 +273,8 @@ volumes:
 
 ## Future: Google-hosted Workspace MCP server
 
-Google announced a hosted Workspace MCP server (Drive, Docs, Sheets, Calendar, Gmail)
+Google announced a hosted Workspace MCP server (Drive, Docs, Sheets, Gmail;
+Calendar historically included upstream but Curia omits it — #1853)
 in late 2025. Track availability at:
 
 > https://docs.cloud.google.com/mcp/supported-products

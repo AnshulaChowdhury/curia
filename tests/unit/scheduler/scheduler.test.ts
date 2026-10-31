@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Scheduler, POLL_INTERVAL_MS, WATCHDOG_INTERVAL_MS, computeRecoveryTimeout } from '../../../src/scheduler/scheduler.js';
+import {
+  DAILY_DEBRIEF_RECAP_INSTRUCTION,
+  WEEKLY_DEBRIEF_RECAP_INSTRUCTION,
+} from '../../../src/agents/prompts/debrief-recap-instruction.js';
+import { WAKE_DISPOSITION_INSTRUCTION } from '../../../src/scheduler/wake-disposition.js';
+import { Scheduler, POLL_INTERVAL_MS, WATCHDOG_INTERVAL_MS, computeRecoveryTimeout, MAX_PRIOR_SUMMARY_CHARS, MAX_PRIOR_CONTEXT_CHARS, TRUNCATED_MARKER, DEFAULT_MAX_IN_FLIGHT } from '../../../src/scheduler/scheduler.js';
 import type { AgentYamlConfig } from '../../../src/agents/loader.js';
+import { CodeTracker } from '../../../src/verification/code-tracker.js';
+import type { VerificationRuntime } from '../../../src/verification/index.js';
 
 // -- Mock helpers --
 
@@ -64,6 +71,8 @@ function fakeDbRow(overrides: Record<string, unknown> = {}) {
     agent_task_id: null,
     intent_anchor: null,
     progress: null,
+    task_error_budget: null,
+    task_tags: null,
     task_title: null,
     run_started_at: null,
     expected_duration_seconds: null,
@@ -72,6 +81,32 @@ function fakeDbRow(overrides: Record<string, unknown> = {}) {
     last_run_context: null,
     ...overrides,
   };
+}
+
+/** Read the Scheduler's private burst-counter Map to assert eviction (#1664).
+ *  TypeScript `private` is not enforced at runtime, so a cast is the standard way
+ *  to inspect internal bookkeeping from a unit test. */
+function burstCounts(s: Scheduler): Map<string, number> {
+  return (s as unknown as { burstCounts: Map<string, number> }).burstCounts;
+}
+
+function pendingJobs(s: Scheduler): Map<string, string> {
+  return (s as unknown as { pendingJobs: Map<string, string> }).pendingJobs;
+}
+
+function inFlightOf(s: Scheduler): number {
+  return (s as unknown as { inFlight: number }).inFlight;
+}
+
+function drainInFlight(s: Scheduler): Promise<void> {
+  return s.drainInFlight();
+}
+
+/** Text form of timestamptz, including microseconds, as `run_started_at::text` returns it. */
+const CLAIMED_AT = '2026-09-24 12:00:00.123456+00';
+
+function claimed(runStartedAt: string = CLAIMED_AT) {
+  return { rowCount: 1, rows: [{ run_started_at: runStartedAt }] };
 }
 
 describe('Scheduler', () => {
@@ -96,6 +131,7 @@ describe('Scheduler', () => {
       logger: logger as any,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       schedulerService: schedulerService as any,
+      ownsAgent: () => true,
     });
   });
 
@@ -163,6 +199,19 @@ describe('Scheduler', () => {
       expect(recoverSpy).toHaveBeenCalled();
     });
 
+    it('watchdog tick alone does not stamp lastTickAt — only pollDueJobs does (#1359)', async () => {
+      pool.query.mockResolvedValue({ rows: [] });
+      vi.spyOn(scheduler, 'recoverStuckJobs').mockResolvedValue();
+      // Prevent the 30s poll interval from firing so only the watchdog runs.
+      vi.spyOn(scheduler, 'pollDueJobs').mockResolvedValue();
+
+      scheduler.start();
+
+      await vi.advanceTimersByTimeAsync(WATCHDOG_INTERVAL_MS);
+
+      expect(scheduler.lastTickAt).toBeNull();
+    });
+
     it('stop clears the watchdog interval', async () => {
       pool.query.mockResolvedValue({ rows: [] });
 
@@ -192,12 +241,29 @@ describe('Scheduler', () => {
       expect(bus.publish).not.toHaveBeenCalled();
     });
 
+    it('stamps lastTickAt on every call — this is the liveness signal checkScheduler reads (#1359)', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [] });
+      expect(scheduler.lastTickAt).toBeNull();
+
+      await scheduler.pollDueJobs();
+
+      expect(scheduler.lastTickAt).toBeInstanceOf(Date);
+    });
+
+    it('stamps lastTickAt even when the due-jobs query throws', async () => {
+      pool.query.mockRejectedValueOnce(new Error('connection refused'));
+
+      await scheduler.pollDueJobs();
+
+      expect(scheduler.lastTickAt).toBeInstanceOf(Date);
+    });
+
     it('claims due jobs and fires them (publishes schedule.fired + agent.task)', async () => {
       const row = fakeDbRow();
       // First call: SELECT due jobs
       pool.query.mockResolvedValueOnce({ rows: [row] });
       // Second call: UPDATE status to running
-      pool.query.mockResolvedValueOnce({ rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -223,6 +289,100 @@ describe('Scheduler', () => {
       expect(event2.payload.conversationId).toMatch(/^scheduler:job-1:[0-9a-f-]{36}$/);
     });
 
+    it('wakes a deferred delegation in the originating conversation (#1893)', async () => {
+      const register = vi.fn();
+      scheduler.setExternalRoutingRegistrar(register);
+      const row = fakeDbRow({
+        cron_expr: null,
+        run_at: new Date().toISOString(),
+        task_payload: {
+          type: 'task-wake',
+          delegationRetry: {
+            conversationId: 'signal:+15551212',
+            channelId: 'signal',
+            senderId: '+15551212',
+            targetAgent: 'calendar',
+            brief: 'Book Tuesday at 10',
+            attempt: 1,
+          },
+        },
+        agent_task_id: 'task-retry-1',
+        task_tags: ['delegation-retry', 'calendar'],
+        originator: {
+          contactId: 'contact-1',
+          systemRole: 'principal',
+          channel: 'signal',
+          initiatedAt: '2026-09-24T00:00:00.000Z',
+        },
+      });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+      await scheduler.pollDueJobs();
+      await scheduler.drainInFlight();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, {
+        id: string;
+        payload: {
+          conversationId: string;
+          channelId: string;
+          senderId: string;
+          content: string;
+          syntheticTurn?: boolean;
+        };
+      }];
+      expect(taskEvent.payload.conversationId).toBe('signal:+15551212');
+      expect(taskEvent.payload.channelId).toBe('signal');
+      expect(taskEvent.payload.senderId).toBe('+15551212');
+      expect(taskEvent.payload.syntheticTurn).toBe(true);
+      expect(taskEvent.payload.content).toContain('Book Tuesday at 10');
+      expect(taskEvent.payload.content).not.toContain('scheduler:');
+      expect(register).toHaveBeenCalledWith(taskEvent.id, expect.objectContaining({
+        conversationId: 'signal:+15551212',
+        channelId: 'signal',
+        senderId: '+15551212',
+      }));
+      const closeCall = pool.query.mock.calls.find((call) => String(call[0]).includes("'delegation-retry'"));
+      expect(String(closeCall?.[0])).toContain("status = 'done'");
+      expect(closeCall?.[1]).toEqual(['task-retry-1']);
+      expect(logger.warn.mock.calls.map((call) => call[1])).not.toContain(
+        'Delegation retry wake fired but no open delegation-retry task matched — BacklogHeartbeat may re-run the brief',
+      );
+    });
+
+    it('warns when the delegation-retry task is no longer open (#1893)', async () => {
+      scheduler.setExternalRoutingRegistrar(vi.fn());
+      const row = fakeDbRow({
+        cron_expr: null,
+        run_at: new Date().toISOString(),
+        task_payload: {
+          type: 'task-wake',
+          delegationRetry: {
+            conversationId: 'signal:+15551212',
+            channelId: 'signal',
+            senderId: '+15551212',
+            targetAgent: 'calendar',
+            brief: 'Book Tuesday at 10',
+            attempt: 1,
+          },
+        },
+        agent_task_id: 'task-retry-1',
+        task_tags: ['delegation-retry', 'calendar'],
+      });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+      pool.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+
+      await scheduler.pollDueJobs();
+      await scheduler.drainInFlight();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        { jobId: 'job-1', taskId: 'task-retry-1' },
+        'Delegation retry wake fired but no open delegation-retry task matched — BacklogHeartbeat may re-run the brief',
+      );
+    });
+
     it('passes intentAnchor in event payload for persistent tasks', async () => {
       const row = fakeDbRow({
         agent_task_id: 'task-aaa',
@@ -230,7 +390,7 @@ describe('Scheduler', () => {
         progress: { step: 3 },
       });
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] }); // claim
+      pool.query.mockResolvedValueOnce(claimed()); // claim
 
       await scheduler.pollDueJobs();
 
@@ -245,7 +405,7 @@ describe('Scheduler', () => {
         progress: { step: 3 },
       });
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -256,10 +416,68 @@ describe('Scheduler', () => {
       expect(content.task_payload).toEqual({ skill: 'morning-brief' });
     });
 
+    // #1959: the recap steps travel with the debrief job instead of the always-on prompt.
+    it.each([
+      ['daily_debrief', DAILY_DEBRIEF_RECAP_INSTRUCTION],
+      ['weekly_debrief', WEEKLY_DEBRIEF_RECAP_INSTRUCTION],
+    ])('adds the recap steps to a coordinator %s job', async (anchor, instruction) => {
+      const row = fakeDbRow({
+        agent_id: 'coordinator',
+        agent_task_id: 'task-debrief',
+        intent_anchor: anchor,
+        task_payload: { task: 'Generate end-of-day summary' },
+      });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { content: string } }];
+      expect(JSON.parse(taskEvent.payload.content).instruction).toBe(instruction);
+    });
+
+    it.each([
+      ['another coordinator job', { agent_id: 'coordinator', agent_task_id: 'task-aaa', intent_anchor: 'weekly-report' }],
+      // Coordinator anchors are free text; only the wizard's exact anchors are debrief jobs.
+      ['a coordinator anchor that only mentions a debrief', { agent_id: 'coordinator', agent_task_id: 'task-aaa', intent_anchor: 'Follow up on the weekly board meeting debrief' }],
+      ['a debrief anchor on another agent', { agent_id: 'meeting-debrief', agent_task_id: 'task-aaa', intent_anchor: 'daily_debrief' }],
+      ['a job with no anchor', { agent_id: 'coordinator' }],
+    ])('adds no recap steps to %s', async (_label, overrides) => {
+      const row = fakeDbRow(overrides);
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { type: string; payload: { content: string } }];
+      expect(taskEvent.type).toBe('agent.task');
+      expect(taskEvent.payload.content).not.toContain('end-of-day debrief');
+    });
+
+    // A debrief run that parks its task with wake_at gets a task-wake job on the same task,
+    // so it carries the debrief anchor. The wake advances the parked task: it keeps the wake
+    // disposition and must not be told to redo the whole recap.
+    it('keeps the wake disposition and adds no recap steps to a task wake on a debrief task', async () => {
+      const row = fakeDbRow({
+        agent_id: 'coordinator',
+        agent_task_id: 'task-debrief',
+        intent_anchor: 'daily_debrief',
+        task_payload: { type: 'task-wake' },
+      });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { content: string } }];
+      expect(JSON.parse(taskEvent.payload.content).instruction).toBe(WAKE_DISPOSITION_INSTRUCTION);
+      expect(taskEvent.payload.content).not.toContain('end-of-day debrief');
+    });
+
     it('does not pass intentAnchor for jobs without a linked agent_task', async () => {
       const row = fakeDbRow(); // no agent_task_id
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -270,7 +488,7 @@ describe('Scheduler', () => {
     it('forwards expectedDurationSeconds in agent.task payload when set on the job', async () => {
       const row = fakeDbRow({ expected_duration_seconds: 300 });
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -281,12 +499,37 @@ describe('Scheduler', () => {
     it('omits expectedDurationSeconds from agent.task payload when null on the job', async () => {
       const row = fakeDbRow({ expected_duration_seconds: null });
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
       const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { expectedDurationSeconds?: number } }];
       expect(taskEvent.payload.expectedDurationSeconds).toBeUndefined();
+    });
+
+    it('a fired agent.task carries turnDeadlineAt = fire time + the slot timeout, with a duration hint (#2371)', async () => {
+      vi.setSystemTime(new Date('2026-10-29T12:00:00Z'));
+      const row = fakeDbRow({ expected_duration_seconds: 300 });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { turnDeadlineAt?: number } }];
+      expect(taskEvent.payload.turnDeadlineAt).toBe(Date.now() + computeRecoveryTimeout(300) * 1000);
+    });
+
+    it('a fired agent.task carries turnDeadlineAt from the default duration when the job has no hint (#2371)', async () => {
+      vi.setSystemTime(new Date('2026-10-29T12:00:00Z'));
+      const row = fakeDbRow({ expected_duration_seconds: null });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { turnDeadlineAt?: number } }];
+      // The scheduler's default assumed duration is 600 s.
+      expect(taskEvent.payload.turnDeadlineAt).toBe(Date.now() + computeRecoveryTimeout(600) * 1000);
     });
 
     it('logs and swallows errors during polling', async () => {
@@ -301,14 +544,246 @@ describe('Scheduler', () => {
     it('sets run_started_at when claiming a job', async () => {
       const row = fakeDbRow();
       pool.query.mockResolvedValueOnce({ rows: [row] });       // SELECT due jobs
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] }); // UPDATE claim
+      pool.query.mockResolvedValueOnce(claimed()); // UPDATE claim
 
       await scheduler.pollDueJobs();
 
       const [claimSql, claimParams] = pool.query.mock.calls[1] as [string, unknown[]];
       expect(claimSql).toContain('run_started_at');
+      expect(claimSql).toContain('RETURNING run_started_at::text');
       expect(claimSql).toContain('now()');
       expect(claimParams).toContain('job-1');
+    });
+
+    // Regression: scheduler fired same cron job 3x in 80s (#1124). The atomic claim UPDATE
+    // uses rowCount to detect concurrent claims — rowCount=0 means another poller claimed
+    // first, so this poller must skip. pg types rowCount as number|null; both 0 and null
+    // must abort, otherwise a null rowCount bypasses the guard and fires a duplicate.
+    it('skips firing when claim UPDATE returns rowCount=0 (concurrent claim)', async () => {
+      const row = fakeDbRow();
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce({ rowCount: 0, rows: [] }); // already claimed
+
+      await scheduler.pollDueJobs();
+
+      expect(bus.publish).not.toHaveBeenCalled();
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job-1' }),
+        expect.stringContaining('skipping fire'),
+      );
+    });
+
+    it('skips firing when claim UPDATE returns rowCount=null (pg null-safety)', async () => {
+      const row = fakeDbRow();
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce({ rowCount: null, rows: [] });
+
+      await scheduler.pollDueJobs();
+
+      expect(bus.publish).not.toHaveBeenCalled();
+      // null rowCount is anomalous — should be visible in prod logs, not silently swallowed at debug
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job-1' }),
+        expect.stringContaining('null rowCount'),
+      );
+    });
+
+    it('skips firing when cron expression changed between poll and claim (optimistic-concurrency guard)', async () => {
+      // Scenario: updateJob() changes cron_expr after the poll SELECT but before the
+      // claim UPDATE. The WHERE includes cron_expr/timezone so the UPDATE matches 0 rows,
+      // and the job is skipped. The next poll fires it with the corrected expression.
+      const row = fakeDbRow(); // cron_expr: '0 9 * * *', timezone: 'UTC'
+      const nextRun = new Date('2026-06-24T09:00:00.000Z');
+      schedulerService.nextRunFromCron.mockReturnValueOnce(nextRun);
+
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce({ rowCount: 0, rows: [] }); // cron changed, WHERE didn't match
+
+      await scheduler.pollDueJobs();
+
+      expect(bus.publish).not.toHaveBeenCalled();
+      const [claimSql, claimParams] = pool.query.mock.calls[1] as [string, unknown[]];
+      expect(claimSql).toContain('cron_expr = $4');
+      expect(claimSql).toContain('timezone = $5');
+      expect(claimParams[3]).toBe('0 9 * * *');
+      expect(claimParams[4]).toBe('UTC');
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job-1' }),
+        expect.stringContaining('skipping fire'),
+      );
+    });
+
+    it('marks cron job failed (not pending) when nextRunFromCron throws, preventing retry storm', async () => {
+      // If nextRunFromCron throws (e.g. corrupt cron_expr inserted directly into DB),
+      // the outer pollDueJobs error handler would try to revert status='running' — but
+      // the job was never claimed, so the revert is a silent no-op. The job stays 'pending'
+      // with next_run_at in the past and the scheduler loops forever. Guard: mark failed.
+      const row = fakeDbRow({ cron_expr: 'bad-expr' });
+      const badExprError = new Error('Invalid cron expression');
+      schedulerService.nextRunFromCron.mockImplementationOnce(() => { throw badExprError; });
+
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce({ rows: [] }); // mark-failed UPDATE
+
+      await scheduler.pollDueJobs();
+
+      expect(bus.publish).not.toHaveBeenCalled();
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job-1', cronExpr: 'bad-expr' }),
+        'Invalid cron expression — marking job failed to prevent retry storm',
+      );
+      // Confirm the mark-failed UPDATE was issued (not the standard claim UPDATE)
+      const [failSql, failParams] = pool.query.mock.calls[1] as [string, unknown[]];
+      expect(failSql).toContain("status = 'failed'");
+      expect(failSql).toContain('last_error');
+      // next_run_at = NULL prevents the poll SELECT from re-selecting this job on every tick
+      expect(failSql).toContain('next_run_at = NULL');
+      // Status guard prevents clobbering a concurrent cancellation
+      expect(failSql).toContain("status IN ('pending', 'failed')");
+      // Optimistic-concurrency guard: if updateJob() fixed the cron between poll and here,
+      // this WHERE won't match and the job stays 'pending' with the corrected expression
+      expect(failSql).toContain('cron_expr = $3');
+      expect(failSql).toContain('timezone = $4');
+      expect(failParams[0]).toBe('job-1');
+      expect(failParams[2]).toBe('bad-expr');
+      expect(failParams[3]).toBe('UTC');
+    });
+
+    it('fails a due job whose agent is not loaded instead of logging Job fired (#1898)', async () => {
+      const row = fakeDbRow({
+        agent_id: 'ghost-agent',
+        cron_expr: null,
+        run_at: new Date('2026-06-24T09:00:00.000Z').toISOString(),
+      });
+      const local = new Scheduler({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        pool: pool as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        bus: bus as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        logger: logger as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        schedulerService: schedulerService as any,
+        ownsAgent: (id) => id === 'coordinator',
+      });
+
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+      await local.pollDueJobs();
+
+      expect(bus.publish).not.toHaveBeenCalled();
+      expect(logger.info).not.toHaveBeenCalledWith(expect.anything(), 'Job fired');
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job-1', agentId: 'ghost-agent' }),
+        'Job not fired — no registered agent owns this id',
+      );
+      const [sql, params] = pool.query.mock.calls[1] as [string, unknown[]];
+      expect(sql).toContain("status = 'failed'");
+      expect(sql).toContain('next_run_at = NULL');
+      expect(sql).toContain("status IN ('pending', 'failed')");
+      expect(sql).not.toContain('run_started_at = now()');
+      expect(params[0]).toBe('job-1');
+      expect(params[1]).toContain('ghost-agent');
+      local.stop();
+    });
+
+    it('advances next_run_at in claim UPDATE for cron jobs', async () => {
+      const row = fakeDbRow(); // cron_expr: '0 9 * * *', timezone: 'UTC'
+      const nextRun = new Date('2026-06-24T09:00:00.000Z');
+      schedulerService.nextRunFromCron.mockReturnValueOnce(nextRun);
+
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      const [claimSql, claimParams] = pool.query.mock.calls[1] as [string, unknown[]];
+      expect(claimSql).toContain('next_run_at');
+      expect(claimParams).toContain(nextRun);
+      expect(schedulerService.nextRunFromCron).toHaveBeenCalledWith('0 9 * * *', 'UTC');
+      // Optimistic-concurrency guard: cron_expr/timezone in WHERE prevents overwriting a
+      // next_run_at that updateJob() just set with a concurrent cron-expression change
+      expect(claimSql).toContain('cron_expr = $4');
+      expect(claimSql).toContain('timezone = $5');
+      expect(claimParams[3]).toBe('0 9 * * *');
+      expect(claimParams[4]).toBe('UTC');
+    });
+
+    // Regression (duplicate daily digest, 2026-06-24): two overlapping pollDueJobs cycles
+    // each captured the same still-pending cron job in their in-memory list. Poll A claimed
+    // and fired it; completeJobRun reset the recurring job to status='pending'; Poll B then
+    // re-claimed it because the claim UPDATE gated only on status — NOT on next_run_at. The
+    // claim must re-check next_run_at <= now() (the same predicate the SELECT used) so that a
+    // stale concurrent claim, whose row's next_run_at was already advanced to the future by
+    // the first claim, matches 0 rows and skips. (#1124 advanced next_run_at but only protected
+    // the NEXT poll's SELECT, not a concurrent poll already holding the row.)
+    it('gates the cron claim UPDATE on next_run_at <= now() to block stale concurrent re-claims', async () => {
+      const row = fakeDbRow();
+      schedulerService.nextRunFromCron.mockReturnValueOnce(new Date('2026-06-25T09:00:00.000Z'));
+
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      const [claimSql] = pool.query.mock.calls[1] as [string, unknown[]];
+      expect(claimSql).toContain('next_run_at <= now()');
+    });
+
+    // #1829: last_run_summary was write-once because completeJobRun used
+    // COALESCE(last_run_summary, autoSummary) against whatever the *previous* run left.
+    // Clearing the summary at claim makes COALESCE mean "this run's
+    // scheduler-report beats the auto-summary" — the intent of the original guard.
+    // last_run_context is NOT cleared — it carries continuity cursors across failed runs.
+    it('clears last_run_summary (but not last_run_context) in the cron claim UPDATE (#1829)', async () => {
+      const row = fakeDbRow({
+        last_run_summary: 'stale prior summary',
+        last_run_context: { scanned: 3 },
+      });
+      schedulerService.nextRunFromCron.mockReturnValueOnce(new Date('2026-06-25T09:00:00.000Z'));
+
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      const [claimSql] = pool.query.mock.calls[1] as [string, unknown[]];
+      expect(claimSql).toContain('last_run_summary = NULL');
+      expect(claimSql).not.toContain('last_run_context');
+    });
+
+    it('clears last_run_summary (but not last_run_context) in the one-shot claim UPDATE (#1829)', async () => {
+      const row = fakeDbRow({
+        cron_expr: null,
+        run_at: new Date('2026-06-24T09:00:00.000Z').toISOString(),
+        last_run_summary: 'stale prior summary',
+        last_run_context: { scanned: 3 },
+      });
+
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      const [claimSql] = pool.query.mock.calls[1] as [string, unknown[]];
+      expect(claimSql).toContain('last_run_summary = NULL');
+      expect(claimSql).not.toContain('last_run_context');
+      expect(claimSql).not.toContain('next_run_at');
+      expect(claimSql).toContain('RETURNING run_started_at::text');
+    });
+
+    it('does not include next_run_at in claim UPDATE for one-shot jobs', async () => {
+      const row = fakeDbRow({ cron_expr: null, run_at: new Date('2026-06-24T09:00:00.000Z').toISOString() });
+
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      expect(schedulerService.nextRunFromCron).not.toHaveBeenCalled();
+      const [claimSql] = pool.query.mock.calls[1] as [string, unknown[]];
+      expect(claimSql).not.toContain('next_run_at');
     });
 
     it('uses a unique conversationId per run (not job ID)', async () => {
@@ -328,7 +803,7 @@ describe('Scheduler', () => {
             last_run_outcome: null, last_run_summary: null, last_run_context: null,
           }],
         })
-        .mockResolvedValueOnce({ rowCount: 1 }); // claim update
+        .mockResolvedValueOnce(claimed()); // claim update
 
       bus.publish.mockResolvedValue(undefined);
       bus.publish.mockImplementation((_layer: unknown, event: { id: string; type: string }) => {
@@ -364,7 +839,7 @@ describe('Scheduler', () => {
             last_run_context: { events_sent: 6 },
           }],
         })
-        .mockResolvedValueOnce({ rowCount: 1 });
+        .mockResolvedValueOnce(claimed());
 
       bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
         if (event.type === 'agent.task') Object.assign(taskEvent, event);
@@ -379,6 +854,420 @@ describe('Scheduler', () => {
       expect(content).toContain('Summary: Sent schedule');
       expect(content).toContain('Agent context:');
       expect(content).toContain('"events_sent": 6');
+    });
+
+    it('strips failedSkills from prior-run prompt injection (#1830)', async () => {
+      const jobId = 'job-strip-failed-skills';
+      const taskEvent = { payload: { content: '' } };
+
+      pool.query
+        .mockResolvedValueOnce({
+          rows: [{
+            id: jobId, agent_id: 'calendar', cron_expr: '0 6 * * *',
+            run_at: null, task_payload: { task: 'holds sweep' }, status: 'pending',
+            last_run_at: new Date('2026-09-19T06:00:00Z'), next_run_at: new Date(),
+            last_error: null, consecutive_failures: 0, created_by: 'system',
+            created_at: new Date(), timezone: 'UTC',
+            agent_task_id: null, intent_anchor: null, progress: null,
+            run_started_at: null, expected_duration_seconds: null,
+            last_run_outcome: 'completed',
+            last_run_summary: 'sweep ok',
+            last_run_context: {
+              cursor: '2026-09-19',
+              failedSkills: [{ name: 'bullpen-post', error: 'Thread not found' }],
+              failedSkillsOmitted: 2,
+            },
+          }],
+        })
+        .mockResolvedValueOnce(claimed());
+
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
+        if (event.type === 'agent.task') Object.assign(taskEvent, event);
+        return Promise.resolve();
+      });
+
+      await scheduler.pollDueJobs();
+
+      const content: string = (taskEvent as { payload: { content: string } }).payload.content;
+      expect(content).toContain('"cursor": "2026-09-19"');
+      expect(content).not.toContain('failedSkills');
+      expect(content).not.toContain('bullpen-post');
+      expect(content).not.toContain('Thread not found');
+    });
+
+    it('truncates an oversized prior-run summary and context (#243)', async () => {
+      const jobId = 'job-oversized-prior-run';
+      const taskEvent = { payload: { content: '' } };
+
+      // scheduler-report is the intended write-time boundary, but blobs written by an
+      // older agent version (or a future handler missing the check) can still be read
+      // back oversized — the read path must bound them too.
+      const hugeSummary = 'S'.repeat(5_000);
+      // The verbose key is ordered FIRST and the cursor LAST. JSON.stringify emits keys in
+      // insertion order, so cutting the serialised string would drop the cursor — spec 05
+      // persists the promotion sweep's offset there, and no skill reads that column back,
+      // so the sweep would silently restart at offset 0 every run.
+      const hugeContext = { notes: 'C'.repeat(10_000), offset: 40, batch_size: 10 };
+
+      pool.query
+        .mockResolvedValueOnce({
+          rows: [{
+            id: jobId, agent_id: 'coordinator', cron_expr: '0 9 * * *',
+            run_at: null, task_payload: { task: 'do work' }, status: 'pending',
+            last_run_at: new Date('2026-04-08T11:30:00Z'), next_run_at: new Date(),
+            last_error: null, consecutive_failures: 0, created_by: 'system',
+            created_at: new Date(), timezone: 'America/Toronto',
+            agent_task_id: null, intent_anchor: null, progress: null,
+            run_started_at: null, expected_duration_seconds: null,
+            last_run_outcome: 'completed',
+            last_run_summary: hugeSummary,
+            last_run_context: hugeContext,
+          }],
+        })
+        .mockResolvedValueOnce(claimed());
+
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
+        if (event.type === 'agent.task') Object.assign(taskEvent, event);
+        return Promise.resolve();
+      });
+
+      await scheduler.pollDueJobs();
+
+      const content: string = (taskEvent as { payload: { content: string } }).payload.content;
+
+      // Both fields are cut to their cap and marked, so a reader can tell the block
+      // is incomplete rather than silently receiving a partial summary.
+      const summaryLine = content.split('\n').find(l => l.startsWith('Summary: '))!;
+      const summaryValue = summaryLine.slice('Summary: '.length);
+      // The marker is counted against the cap, not added on top of it — a cap the output
+      // can exceed is not a cap.
+      expect(summaryValue).toBe('S'.repeat(MAX_PRIOR_SUMMARY_CHARS - TRUNCATED_MARKER.length) + TRUNCATED_MARKER);
+      expect(summaryValue).toHaveLength(MAX_PRIOR_SUMMARY_CHARS);
+
+      // Pin the context cap directly. Asserting only that *some* '…[truncated]' appears
+      // would pass on the summary line above and prove nothing about the context.
+      const contextStart = content.indexOf('Agent context: ');
+      expect(contextStart).toBeGreaterThanOrEqual(0);
+      // The block is prepended to the task payload with a blank-line separator, and
+      // pretty-printed JSON never contains one — so this isolates the context value.
+      const contextValue = content
+        .slice(contextStart + 'Agent context: '.length)
+        .split('\n\n')[0]!;
+      expect(contextValue.length).toBeLessThanOrEqual(MAX_PRIOR_CONTEXT_CHARS);
+
+      // The context is truncated per-value, not as a string, so it stays parseable and —
+      // the point of the exercise — every top-level key survives with its cursor intact.
+      const parsed = JSON.parse(contextValue);
+      expect(Object.keys(parsed)).toEqual(['notes', 'offset', 'batch_size']);
+      expect(parsed.offset).toBe(40);
+      expect(parsed.batch_size).toBe(10);
+      expect(String(parsed.notes)).toMatch(/^…\[elided 10\d{3} chars\]$/);
+
+      // Truncation must not be silent — an unrecoverable cut to lastRunContext (it can
+      // carry a pagination cursor, and no skill reads that column back) would otherwise
+      // surface only as a sweep that re-scans the same batch forever.
+      const truncationWarnings = logger.warn.mock.calls.filter(
+        c => typeof c[1] === 'string' && /prior-run field truncated/.test(c[1] as string),
+      );
+      expect(truncationWarnings.map(c => (c[0] as { field: string }).field).sort())
+        .toEqual(['lastRunContext', 'lastRunSummary']);
+      expect(truncationWarnings[0]![0]).toHaveProperty('jobId', jobId);
+    });
+
+    it('drops trailing context keys only when eliding every value is still not enough (#243)', async () => {
+      const jobId = 'job-many-key-context';
+      const taskEvent = { payload: { content: '' } };
+
+      // 800 keys: even reduced to elision markers the object cannot fit the cap, so keys
+      // must be dropped. That is unrecoverable, hence the explicit marker and the warn log.
+      const manyKeys: Record<string, number> = {};
+      for (let i = 0; i < 800; i++) manyKeys[`key_${i}`] = i;
+
+      pool.query
+        .mockResolvedValueOnce({
+          rows: [{
+            id: jobId, agent_id: 'coordinator', cron_expr: '0 9 * * *',
+            run_at: null, task_payload: { task: 'do work' }, status: 'pending',
+            last_run_at: new Date('2026-04-08T11:30:00Z'), next_run_at: new Date(),
+            last_error: null, consecutive_failures: 0, created_by: 'system',
+            created_at: new Date(), timezone: 'America/Toronto',
+            agent_task_id: null, intent_anchor: null, progress: null,
+            run_started_at: null, expected_duration_seconds: null,
+            last_run_outcome: 'completed', last_run_summary: null, last_run_context: manyKeys,
+          }],
+        })
+        .mockResolvedValueOnce(claimed());
+
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
+        if (event.type === 'agent.task') Object.assign(taskEvent, event);
+        return Promise.resolve();
+      });
+
+      await scheduler.pollDueJobs();
+
+      const content: string = (taskEvent as { payload: { content: string } }).payload.content;
+      const contextValue = content
+        .slice(content.indexOf('Agent context: ') + 'Agent context: '.length)
+        .split('\n\n')[0]!;
+
+      expect(contextValue.length).toBeLessThanOrEqual(MAX_PRIOR_CONTEXT_CHARS);
+      const parsed = JSON.parse(contextValue);
+      // Earliest keys are kept; the tail is dropped and counted.
+      expect(parsed.key_0).toBe(0);
+      expect(parsed.key_799).toBeUndefined();
+      expect(String(parsed.__truncated__)).toMatch(/^\d+ keys omitted$/);
+
+      const warn = logger.warn.mock.calls.find(
+        c => typeof c[1] === 'string' && /prior-run field truncated/.test(c[1] as string),
+      );
+      expect((warn![0] as { omittedKeys: number }).omittedKeys).toBeGreaterThan(0);
+    });
+
+    it.each([
+      ['array', Array.from({ length: 300 }, (_, i) => ({ id: i, blob: 'B'.repeat(100) }))],
+      ['scalar string', 'X'.repeat(10_000)],
+    ])('keeps an oversized %s context valid JSON (#243)', async (shape, oversized) => {
+      const jobId = `job-nonobject-${String(shape).replace(' ', '-')}`;
+      const taskEvent = { payload: { content: '' } };
+
+      // The column is JSONB, so despite the Record<string, unknown> type it can hold an
+      // array or a scalar. Slicing their serialised text would cut mid-structure and
+      // leave the Agent context block unparseable.
+      pool.query
+        .mockResolvedValueOnce({
+          rows: [{
+            id: jobId, agent_id: 'coordinator', cron_expr: '0 9 * * *',
+            run_at: null, task_payload: { task: 'do work' }, status: 'pending',
+            last_run_at: new Date('2026-04-08T11:30:00Z'), next_run_at: new Date(),
+            last_error: null, consecutive_failures: 0, created_by: 'system',
+            created_at: new Date(), timezone: 'America/Toronto',
+            agent_task_id: null, intent_anchor: null, progress: null,
+            run_started_at: null, expected_duration_seconds: null,
+            last_run_outcome: 'completed', last_run_summary: null,
+            last_run_context: oversized as unknown as Record<string, unknown>,
+          }],
+        })
+        .mockResolvedValueOnce(claimed());
+
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
+        if (event.type === 'agent.task') Object.assign(taskEvent, event);
+        return Promise.resolve();
+      });
+
+      await scheduler.pollDueJobs();
+
+      const content: string = (taskEvent as { payload: { content: string } }).payload.content;
+      const contextValue = content
+        .slice(content.indexOf('Agent context: ') + 'Agent context: '.length)
+        .split('\n\n')[0]!;
+
+      expect(contextValue.length).toBeLessThanOrEqual(MAX_PRIOR_CONTEXT_CHARS);
+      expect(() => JSON.parse(contextValue)).not.toThrow();
+
+      // And the cut is still reported, same as the object path.
+      const warn = logger.warn.mock.calls.find(
+        c => typeof c[1] === 'string' && /prior-run field truncated/.test(c[1] as string),
+      );
+      expect((warn![0] as { field: string }).field).toBe('lastRunContext');
+    });
+
+    it.each([
+      ['zero', 0, '0'],
+      ['false', false, 'false'],
+      ['empty string', '', '""'],
+    ])('injects a falsy %s context rather than dropping it (#243)', async (_label, stored, expected) => {
+      const jobId = `job-falsy-context-${String(_label).replace(' ', '-')}`;
+      const taskEvent = { payload: { content: '' } };
+
+      // last_run_context is JSONB, which accepts 0, false and "". The row loader preserves
+      // them (`?? null` only collapses null/undefined), so a truthiness guard here would
+      // silently drop continuity state the agent was told had been written.
+      pool.query
+        .mockResolvedValueOnce({
+          rows: [{
+            id: jobId, agent_id: 'coordinator', cron_expr: '0 9 * * *',
+            run_at: null, task_payload: { task: 'do work' }, status: 'pending',
+            last_run_at: new Date('2026-04-08T11:30:00Z'), next_run_at: new Date(),
+            last_error: null, consecutive_failures: 0, created_by: 'system',
+            created_at: new Date(), timezone: 'America/Toronto',
+            agent_task_id: null, intent_anchor: null, progress: null,
+            run_started_at: null, expected_duration_seconds: null,
+            last_run_outcome: 'completed', last_run_summary: null,
+            last_run_context: stored as unknown as Record<string, unknown>,
+          }],
+        })
+        .mockResolvedValueOnce(claimed());
+
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
+        if (event.type === 'agent.task') Object.assign(taskEvent, event);
+        return Promise.resolve();
+      });
+
+      await scheduler.pollDueJobs();
+
+      const content: string = (taskEvent as { payload: { content: string } }).payload.content;
+      expect(content).toContain(`Agent context: ${expected}`);
+    });
+
+    it('omits the context line entirely when last_run_context is null (#243)', async () => {
+      const jobId = 'job-null-context';
+      const taskEvent = { payload: { content: '' } };
+
+      pool.query
+        .mockResolvedValueOnce({
+          rows: [{
+            id: jobId, agent_id: 'coordinator', cron_expr: '0 9 * * *',
+            run_at: null, task_payload: { task: 'do work' }, status: 'pending',
+            last_run_at: new Date('2026-04-08T11:30:00Z'), next_run_at: new Date(),
+            last_error: null, consecutive_failures: 0, created_by: 'system',
+            created_at: new Date(), timezone: 'America/Toronto',
+            agent_task_id: null, intent_anchor: null, progress: null,
+            run_started_at: null, expected_duration_seconds: null,
+            last_run_outcome: 'completed', last_run_summary: 'done', last_run_context: null,
+          }],
+        })
+        .mockResolvedValueOnce(claimed());
+
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
+        if (event.type === 'agent.task') Object.assign(taskEvent, event);
+        return Promise.resolve();
+      });
+
+      await scheduler.pollDueJobs();
+
+      const content: string = (taskEvent as { payload: { content: string } }).payload.content;
+      expect(content).toContain('Summary: done');
+      expect(content).not.toContain('Agent context:');
+    });
+
+    it('does not overwrite a caller key that collides with the omission marker (#243)', async () => {
+      const jobId = 'job-colliding-omission-key';
+      const taskEvent = { payload: { content: '' } };
+
+      // last_run_context is opaque JSONB written from caller-supplied context, so the
+      // metadata key name is not reserved — a caller can legitimately hold '__truncated__'.
+      // Overwriting it would destroy exactly the continuity state this reduction exists
+      // to preserve. Ordered first so tail-shedding cannot account for its survival.
+      const colliding: Record<string, unknown> = { __truncated__: 'cursor-abc123' };
+      for (let i = 0; i < 800; i++) colliding[`key_${i}`] = i;
+
+      pool.query
+        .mockResolvedValueOnce({
+          rows: [{
+            id: jobId, agent_id: 'coordinator', cron_expr: '0 9 * * *',
+            run_at: null, task_payload: { task: 'do work' }, status: 'pending',
+            last_run_at: new Date('2026-04-08T11:30:00Z'), next_run_at: new Date(),
+            last_error: null, consecutive_failures: 0, created_by: 'system',
+            created_at: new Date(), timezone: 'America/Toronto',
+            agent_task_id: null, intent_anchor: null, progress: null,
+            run_started_at: null, expected_duration_seconds: null,
+            last_run_outcome: 'completed', last_run_summary: null, last_run_context: colliding,
+          }],
+        })
+        .mockResolvedValueOnce(claimed());
+
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
+        if (event.type === 'agent.task') Object.assign(taskEvent, event);
+        return Promise.resolve();
+      });
+
+      await scheduler.pollDueJobs();
+
+      const content: string = (taskEvent as { payload: { content: string } }).payload.content;
+      const contextValue = content
+        .slice(content.indexOf('Agent context: ') + 'Agent context: '.length)
+        .split('\n\n')[0]!;
+
+      const parsed = JSON.parse(contextValue);
+      // The caller's value survives untouched...
+      expect(parsed.__truncated__).toBe('cursor-abc123');
+      // ...and the omission count lands on a distinct, non-colliding key.
+      const omissionEntry = Object.entries(parsed).find(
+        ([key, value]) => key !== '__truncated__' && /^\d+ keys omitted$/.test(String(value)),
+      );
+      expect(omissionEntry).toBeDefined();
+    });
+
+    it('preserves an own __proto__ key while reducing an oversized context (#243)', async () => {
+      const jobId = 'job-proto-key-context';
+      const taskEvent = { payload: { content: '' } };
+
+      // pg parses JSONB with JSON.parse, which creates `__proto__` as an *own* data
+      // property rather than invoking the legacy prototype setter. Copying that onto a
+      // plain `{}` does invoke the setter, so the key vanishes from the output — meaning a
+      // context under the cap would keep it and one over the cap would silently drop it.
+      const withOwnProto = JSON.parse(
+        `{"__proto__":"cursor-xyz","notes":${JSON.stringify('N'.repeat(10_000))},"offset":7}`,
+      ) as Record<string, unknown>;
+
+      pool.query
+        .mockResolvedValueOnce({
+          rows: [{
+            id: jobId, agent_id: 'coordinator', cron_expr: '0 9 * * *',
+            run_at: null, task_payload: { task: 'do work' }, status: 'pending',
+            last_run_at: new Date('2026-04-08T11:30:00Z'), next_run_at: new Date(),
+            last_error: null, consecutive_failures: 0, created_by: 'system',
+            created_at: new Date(), timezone: 'America/Toronto',
+            agent_task_id: null, intent_anchor: null, progress: null,
+            run_started_at: null, expected_duration_seconds: null,
+            last_run_outcome: 'completed', last_run_summary: null, last_run_context: withOwnProto,
+          }],
+        })
+        .mockResolvedValueOnce(claimed());
+
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
+        if (event.type === 'agent.task') Object.assign(taskEvent, event);
+        return Promise.resolve();
+      });
+
+      await scheduler.pollDueJobs();
+
+      const content: string = (taskEvent as { payload: { content: string } }).payload.content;
+      const contextValue = content
+        .slice(content.indexOf('Agent context: ') + 'Agent context: '.length)
+        .split('\n\n')[0]!;
+
+      const parsed = JSON.parse(contextValue) as Record<string, unknown>;
+      // Read via the descriptor — `parsed.__proto__` would be ambiguous with the accessor.
+      expect(Object.getOwnPropertyDescriptor(parsed, '__proto__')?.value).toBe('cursor-xyz');
+      expect(parsed.offset).toBe(7);
+    });
+
+    it('leaves prior-run summary and context intact when within limits (#243)', async () => {
+      const jobId = 'job-small-prior-run';
+      const taskEvent = { payload: { content: '' } };
+
+      pool.query
+        .mockResolvedValueOnce({
+          rows: [{
+            id: jobId, agent_id: 'coordinator', cron_expr: '0 9 * * *',
+            run_at: null, task_payload: { task: 'do work' }, status: 'pending',
+            last_run_at: new Date('2026-04-08T11:30:00Z'), next_run_at: new Date(),
+            last_error: null, consecutive_failures: 0, created_by: 'system',
+            created_at: new Date(), timezone: 'America/Toronto',
+            agent_task_id: null, intent_anchor: null, progress: null,
+            run_started_at: null, expected_duration_seconds: null,
+            last_run_outcome: 'completed',
+            last_run_summary: 'Sent schedule',
+            last_run_context: { events_sent: 6 },
+          }],
+        })
+        .mockResolvedValueOnce(claimed());
+
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
+        if (event.type === 'agent.task') Object.assign(taskEvent, event);
+        return Promise.resolve();
+      });
+
+      await scheduler.pollDueJobs();
+
+      const content: string = (taskEvent as { payload: { content: string } }).payload.content;
+      expect(content).toContain('Summary: Sent schedule');
+      expect(content).toContain('"events_sent": 6');
+      expect(content).not.toContain('[truncated]');
+      expect(logger.warn.mock.calls.filter(
+        c => typeof c[1] === 'string' && /prior-run field truncated/.test(c[1] as string),
+      )).toHaveLength(0);
     });
 
     it('does not inject prior-run block when last_run_outcome is null (first run)', async () => {
@@ -397,7 +1286,7 @@ describe('Scheduler', () => {
             last_run_outcome: null, last_run_summary: null, last_run_context: null,
           }],
         })
-        .mockResolvedValueOnce({ rowCount: 1 });
+        .mockResolvedValueOnce(claimed());
 
       bus.publish.mockImplementation((_layer: unknown, event: { type: string; payload?: unknown }) => {
         if (event.type === 'agent.task') Object.assign(taskEvent, event);
@@ -424,7 +1313,7 @@ describe('Scheduler', () => {
         progress: { notes: [] },
       });
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -441,7 +1330,7 @@ describe('Scheduler', () => {
         task_payload: { type: 'task-wake' },
       });
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -453,6 +1342,8 @@ describe('Scheduler', () => {
       expect(content.task_payload).toEqual({ type: 'task-wake' });
       // intent_anchor stays in the event payload, not content
       expect(content.intent_anchor).toBeUndefined();
+      // Bare job UUID must not appear in model-visible task content (#1828)
+      expect(content.scheduler_job_id).toBeUndefined();
     });
 
     it('omits title from content bundle when task_title is null', async () => {
@@ -462,7 +1353,7 @@ describe('Scheduler', () => {
         progress: { notes: [] },
       });
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -480,7 +1371,7 @@ describe('Scheduler', () => {
         task_payload: { skill: 'morning-brief' },
       });
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -490,6 +1381,7 @@ describe('Scheduler', () => {
       // Non-task-bound: raw payload, no task_id
       expect(content.task_id).toBeUndefined();
       expect(content.skill).toBe('morning-brief');
+      expect(content.scheduler_job_id).toBeUndefined();
     });
   });
 
@@ -505,7 +1397,7 @@ describe('Scheduler', () => {
       };
       const row = fakeDbRow({ originator });
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] }); // claim
+      pool.query.mockResolvedValueOnce(claimed()); // claim
 
       await scheduler.pollDueJobs();
 
@@ -516,12 +1408,96 @@ describe('Scheduler', () => {
     it('omits metadata from fired agent.task when job has no originator', async () => {
       const row = fakeDbRow({ originator: null });
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] }); // claim
+      pool.query.mockResolvedValueOnce(claimed()); // claim
 
       await scheduler.pollDueJobs();
 
       const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { metadata?: Record<string, unknown> } }];
       expect(taskEvent.payload.metadata).toBeUndefined();
+    });
+
+    it('threads boundTask metadata for task-bound fires (#1173)', async () => {
+      const row = fakeDbRow({
+        agent_task_id: 'task-resumable-1',
+        task_error_budget: { resumable: true },
+        task_tags: ['audit'],
+        progress: { resumable: { cursor: null, done: 5, total: 100, accumulator: [], lastSliceUnits: 5, next: 'Continue' } },
+      });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed()); // claim
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { metadata?: Record<string, unknown> } }];
+      expect(taskEvent.payload.metadata?.boundTask).toEqual({
+        taskId: 'task-resumable-1',
+        errorBudget: { resumable: true },
+        tags: ['audit'],
+        progress: {
+          resumable: {
+            cursor: null,
+            done: 5,
+            total: 100,
+            accumulator: [],
+            lastSliceUnits: 5,
+            next: 'Continue',
+          },
+        },
+      });
+    });
+
+    it('stamps a wakeContext for a heartbeat wake (task-wake payload) so the ladder applies (#1125)', async () => {
+      const originator = { contactId: 'system', systemRole: 'system', channel: 'declarative', initiatedAt: '2026-06-23T00:00:00.000Z' };
+      const row = fakeDbRow({ originator, task_payload: { type: 'task-wake', task_id: 't9', standing: { derived: true } } });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed()); // claim
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { metadata?: Record<string, unknown> } }];
+      expect(taskEvent.payload.metadata?.originator).toEqual(originator);
+      expect(taskEvent.payload.metadata?.wakeContext).toEqual({ derived: true });
+    });
+
+    it('stamps a wakeContext for a heartbeat wake even when the originator is null (pre-065 task)', async () => {
+      // A heartbeat wake of an unstamped task carries a `standing` envelope but no originator —
+      // it must still be marked woken so the execution layer applies the ladder / fail-closed path.
+      const row = fakeDbRow({ originator: null, task_payload: { type: 'task-wake', task_id: 't0', standing: { derived: false } } });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed()); // claim
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { metadata?: Record<string, unknown> } }];
+      expect(taskEvent.payload.metadata?.wakeContext).toEqual({ derived: false });
+      expect(taskEvent.payload.metadata?.originator).toBeUndefined();
+    });
+
+    it('does NOT stamp a wakeContext for a wake_at job (task-wake payload but no standing envelope)', async () => {
+      // The CTE-created wake_at path writes { type: 'task-wake' } with no standing and no originator
+      // — intentionally out of scope for the ladder, so it must NOT be marked woken.
+      const row = fakeDbRow({ originator: null, task_payload: { type: 'task-wake', task_id: 't1' } });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed()); // claim
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { metadata?: Record<string, unknown> } }];
+      expect(taskEvent.payload.metadata).toBeUndefined();
+    });
+
+    it('does NOT stamp a wakeContext for a non-wake (scheduler-create) job — it keeps originator at fire time', async () => {
+      const originator = { contactId: 'ceo', systemRole: 'principal', channel: 'email', initiatedAt: '2026-06-23T00:00:00.000Z' };
+      // Default fakeDbRow task_payload is { skill: 'morning-brief' } — a specific scheduled action, not a heartbeat wake.
+      const row = fakeDbRow({ originator });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed()); // claim
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { payload: { metadata?: Record<string, unknown> } }];
+      expect(taskEvent.payload.metadata?.originator).toEqual(originator);
+      expect(taskEvent.payload.metadata?.wakeContext).toBeUndefined();
     });
   });
 
@@ -532,7 +1508,7 @@ describe('Scheduler', () => {
       // Set up: fire a job first so the pendingJobs map has an entry
       const row = fakeDbRow();
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -558,13 +1534,92 @@ describe('Scheduler', () => {
         payload: { agentId: 'agent-1', conversationId: 'c1', content: 'done' },
       });
 
-      expect(schedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done');
+      expect(schedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done', undefined, undefined);
+    });
+
+    it('marks the suspension notice as a synthetic turn (#2018)', async () => {
+      const row = fakeDbRow();
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { id: string }];
+      schedulerService.completeJobRun.mockResolvedValueOnce({ suspended: true });
+      schedulerService.getJob.mockResolvedValueOnce({
+        id: 'job-1',
+        agentId: 'agent-1',
+        consecutiveFailures: 3,
+      });
+      scheduler.start();
+
+      const responseHandler = bus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>;
+      await responseHandler({
+        id: 'resp-suspended',
+        type: 'agent.response',
+        sourceLayer: 'agent',
+        parentEventId: taskEvent.id,
+        timestamp: new Date(),
+        payload: { agentId: 'agent-1', conversationId: 'c1', content: 'done' },
+      });
+      // handleCompletion is not awaited by the subscriber. The notice is published
+      // after completeJobRun and getJob resolve. Wait on that publish rather than
+      // a fixed number of microtasks.
+      type Published = [string, { type: string; payload: { conversationId?: string; syntheticTurn?: boolean; content?: string } }];
+      const findNotify = (): Published | undefined => (bus.publish.mock.calls as Published[])
+        .find(([, event]) => event.type === 'agent.task' && event.payload.content?.includes('schedule_suspended'));
+      await vi.waitFor(() => {
+        expect(findNotify()).toBeDefined();
+      });
+      const notify = findNotify();
+      expect(notify?.[1].payload.syntheticTurn).toBe(true);
+      expect(notify?.[1].payload.conversationId).toBe('scheduler:job-1');
+    });
+
+    it('threads failedSkills from agent.response into completeJobRun (#1830)', async () => {
+      const row = fakeDbRow();
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { id: string }];
+      const taskEventId = taskEvent.id;
+
+      schedulerService.completeJobRun.mockResolvedValueOnce({ suspended: false });
+      scheduler.start();
+
+      const failedSkills = [
+        { name: 'bullpen-post', error: 'Thread not found' },
+      ];
+      const responseHandler = bus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>;
+      await responseHandler({
+        id: 'resp-failed-skills',
+        type: 'agent.response',
+        sourceLayer: 'agent',
+        parentEventId: taskEventId,
+        timestamp: new Date(),
+        payload: {
+          agentId: 'agent-1',
+          conversationId: 'c1',
+          content: 'Sweep finished; one report call failed.',
+          failedSkills,
+        },
+      });
+
+      expect(schedulerService.completeJobRun).toHaveBeenCalledWith(
+        'job-1',
+        true,
+        undefined,
+        'Sweep finished; one report call failed.',
+        failedSkills,
+        undefined,
+      );
     });
 
     it('passes auto-summary truncated to 500 chars on agent.response', async () => {
       const row = fakeDbRow();
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -590,11 +1645,11 @@ describe('Scheduler', () => {
       expect(autoSummary).toBe('x'.repeat(500));
     });
 
-    it('completes a job run on agent.error', async () => {
+    it('completes a failed run from agent.response(isError), using the stashed agent.error message', async () => {
       // Set up: fire a job
       const row = fakeDbRow();
       pool.query.mockResolvedValueOnce({ rows: [row] });
-      pool.query.mockResolvedValueOnce({ rows: [] });
+      pool.query.mockResolvedValueOnce(claimed());
 
       await scheduler.pollDueJobs();
 
@@ -605,8 +1660,10 @@ describe('Scheduler', () => {
 
       scheduler.start();
 
-      // The error handler is the second subscriber
+      const responseHandler = bus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>;
       const errorHandler = bus.subscribe.mock.calls[1]?.[2] as (event: unknown) => Promise<void>;
+
+      // Production order: agent.error first (stash), then agent.response(isError) completes.
       await errorHandler({
         id: 'err-1',
         type: 'agent.error',
@@ -623,8 +1680,265 @@ describe('Scheduler', () => {
           context: {},
         },
       });
+      expect(schedulerService.completeJobRun).not.toHaveBeenCalled();
 
-      expect(schedulerService.completeJobRun).toHaveBeenCalledWith('job-1', false, 'budget blown', undefined);
+      await responseHandler({
+        id: 'resp-err-1',
+        type: 'agent.response',
+        sourceLayer: 'agent',
+        parentEventId: taskEventId,
+        timestamp: new Date(),
+        payload: {
+          agentId: 'agent-1',
+          conversationId: 'c1',
+          content: 'fallback',
+          isError: true,
+        },
+      });
+
+      expect(schedulerService.completeJobRun).toHaveBeenCalledWith(
+        'job-1', false, 'budget blown', undefined, undefined, undefined,
+      );
+    });
+
+    describe('sign-in codes stay out of the stored run record (#2017)', () => {
+      function scrubbingScheduler() {
+        const tracker = new CodeTracker({ ttlMinutesAfterClose: 120 });
+        tracker.register('v-1', 'aircanada.com', '482913', 's1');
+        return new Scheduler({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          pool: pool as any,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          bus: bus as any,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          logger: logger as any,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          schedulerService: schedulerService as any,
+          ownsAgent: () => true,
+          verification: { tracker } as unknown as VerificationRuntime,
+        });
+      }
+
+      async function fireAndGetHandlers(s: Scheduler) {
+        pool.query.mockResolvedValueOnce({ rows: [fakeDbRow()] });
+        pool.query.mockResolvedValueOnce(claimed());
+        await s.pollDueJobs();
+        const [, taskEvent] = bus.publish.mock.calls[1] as [string, { id: string }];
+        schedulerService.completeJobRun.mockResolvedValueOnce({ suspended: false });
+        s.start();
+        return {
+          taskEventId: taskEvent.id,
+          responseHandler: bus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>,
+          errorHandler: bus.subscribe.mock.calls[1]?.[2] as (event: unknown) => Promise<void>,
+        };
+      }
+
+      it('scrubs a tracked code from the auto-summary and failed-skill errors', async () => {
+        const s = scrubbingScheduler();
+        const { taskEventId, responseHandler } = await fireAndGetHandlers(s);
+        await responseHandler({
+          id: 'resp-code', type: 'agent.response', sourceLayer: 'agent', parentEventId: taskEventId,
+          timestamp: new Date(),
+          payload: {
+            agentId: 'coordinator', conversationId: 'c1', content: 'Signed in to Air Canada with 482 913.',
+            failedSkills: [{ name: 'task-update', error: 'note "code 482913" rejected' }],
+          },
+        });
+        s.stop();
+        expect(schedulerService.completeJobRun).toHaveBeenCalledWith(
+          'job-1', true, undefined, 'Signed in to Air Canada with [sign-in code].',
+          [{ name: 'task-update', error: 'note "code [sign-in code]" rejected' }], undefined,
+        );
+      });
+
+      it('scrubs a tracked code from last_error, stashed or taken from the response', async () => {
+        const s = scrubbingScheduler();
+        const { taskEventId, responseHandler, errorHandler } = await fireAndGetHandlers(s);
+        await errorHandler({
+          id: 'err-code', type: 'agent.error', sourceLayer: 'agent', parentEventId: taskEventId,
+          timestamp: new Date(),
+          payload: {
+            agentId: 'coordinator', conversationId: 'c1', errorType: 'tool_error', source: 'runtime',
+            message: 'typing 482913 failed', retryable: false, context: {},
+          },
+        });
+        await responseHandler({
+          id: 'resp-err-code', type: 'agent.response', sourceLayer: 'agent', parentEventId: taskEventId,
+          timestamp: new Date(),
+          payload: { agentId: 'coordinator', conversationId: 'c1', content: 'fallback 482913', isError: true },
+        });
+        s.stop();
+        expect(schedulerService.completeJobRun).toHaveBeenCalledWith(
+          'job-1', false, 'typing [sign-in code] failed', undefined, undefined, undefined,
+        );
+      });
+
+      it('scrubs the response-content fallback for last_error when no agent.error was stashed', async () => {
+        const s = scrubbingScheduler();
+        const { taskEventId, responseHandler } = await fireAndGetHandlers(s);
+        await responseHandler({
+          id: 'resp-err-fallback', type: 'agent.response', sourceLayer: 'agent', parentEventId: taskEventId,
+          timestamp: new Date(),
+          payload: { agentId: 'coordinator', conversationId: 'c1', content: 'gave up after 482-913', isError: true },
+        });
+        s.stop();
+        expect(schedulerService.completeJobRun).toHaveBeenCalledWith(
+          'job-1', false, 'gave up after [sign-in code]', undefined, undefined, undefined,
+        );
+      });
+    });
+
+    it('persists failedSkills on a failed run from agent.response(isError) (#1830)', async () => {
+      const row = fakeDbRow();
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { id: string }];
+      const taskEventId = taskEvent.id;
+
+      schedulerService.completeJobRun.mockResolvedValueOnce({ suspended: false });
+      scheduler.start();
+
+      const responseHandler = bus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>;
+      const errorHandler = bus.subscribe.mock.calls[1]?.[2] as (event: unknown) => Promise<void>;
+
+      const failedSkills = [{ name: 'bullpen-post', error: 'Thread not found' }];
+      await errorHandler({
+        id: 'err-fs',
+        type: 'agent.error',
+        sourceLayer: 'agent',
+        parentEventId: taskEventId,
+        timestamp: new Date(),
+        payload: {
+          agentId: 'agent-1',
+          conversationId: 'c1',
+          errorType: 'BUDGET_EXCEEDED',
+          source: 'runtime',
+          message: 'Task exceeded consecutive error budget',
+          retryable: false,
+          context: {},
+        },
+      });
+      await responseHandler({
+        id: 'resp-fs',
+        type: 'agent.response',
+        sourceLayer: 'agent',
+        parentEventId: taskEventId,
+        timestamp: new Date(),
+        payload: {
+          agentId: 'agent-1',
+          conversationId: 'c1',
+          content: 'fallback',
+          isError: true,
+          failedSkills,
+        },
+      });
+
+      expect(schedulerService.completeJobRun).toHaveBeenCalledWith(
+        'job-1',
+        false,
+        'Task exceeded consecutive error budget',
+        undefined,
+        failedSkills,
+        undefined,
+      );
+    });
+
+    it('does not double-complete when both agent.error and agent.response(isError) are published', async () => {
+      const row = fakeDbRow();
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { id: string }];
+      const taskEventId = taskEvent.id;
+
+      schedulerService.completeJobRun.mockResolvedValueOnce({ suspended: false });
+      scheduler.start();
+
+      const responseHandler = bus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>;
+      const errorHandler = bus.subscribe.mock.calls[1]?.[2] as (event: unknown) => Promise<void>;
+
+      // Production order: error then response. Completes once on the response.
+      await errorHandler({
+        id: 'err-2',
+        type: 'agent.error',
+        sourceLayer: 'agent',
+        parentEventId: taskEventId,
+        timestamp: new Date(),
+        payload: {
+          agentId: 'agent-1',
+          conversationId: 'c1',
+          errorType: 'UNKNOWN',
+          source: 'runtime',
+          message: 'Tool loop exhausted without a text response',
+          retryable: false,
+          context: {},
+        },
+      });
+      await responseHandler({
+        id: 'resp-err-1',
+        type: 'agent.response',
+        sourceLayer: 'agent',
+        parentEventId: taskEventId,
+        timestamp: new Date(),
+        payload: { agentId: 'agent-1', conversationId: 'c1', content: 'fallback', isError: true },
+      });
+
+      expect(schedulerService.completeJobRun).toHaveBeenCalledTimes(1);
+      expect(schedulerService.completeJobRun).toHaveBeenCalledWith(
+        'job-1',
+        false,
+        'Tool loop exhausted without a text response',
+        undefined,
+        undefined,
+        undefined,
+      );
+      expect(pendingJobs(scheduler).size).toBe(0);
+      expect(burstCounts(scheduler).has('job-1')).toBe(false);
+    });
+
+    it('completes on unpaired agent.response(isError) using content, and warns (#1830)', async () => {
+      const row = fakeDbRow();
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+      await scheduler.pollDueJobs();
+
+      const [, taskEvent] = bus.publish.mock.calls[1] as [string, { id: string }];
+      const taskEventId = taskEvent.id;
+
+      schedulerService.completeJobRun.mockResolvedValueOnce({ suspended: false });
+      scheduler.start();
+
+      const responseHandler = bus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>;
+      // No preceding agent.error — stash miss path.
+      await responseHandler({
+        id: 'resp-unpaired',
+        type: 'agent.response',
+        sourceLayer: 'agent',
+        parentEventId: taskEventId,
+        timestamp: new Date(),
+        payload: {
+          agentId: 'agent-1',
+          conversationId: 'c1',
+          content: 'Generic failure fallback message',
+          isError: true,
+        },
+      });
+
+      expect(schedulerService.completeJobRun).toHaveBeenCalledWith(
+        'job-1',
+        false,
+        'Generic failure fallback message',
+        undefined,
+        undefined,
+        undefined,
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        { parentEventId: taskEventId },
+        expect.stringContaining('no preceding agent.error'),
+      );
     });
 
     it('ignores events not originating from the scheduler', async () => {
@@ -681,6 +1995,7 @@ describe('Scheduler', () => {
         schedulerService: driftSchedulerService as any,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         driftDetector: driftDetector as any,
+        ownsAgent: () => true,
       });
     });
 
@@ -691,7 +2006,7 @@ describe('Scheduler', () => {
     it('runs drift check and calls completeJobRun when no drift detected', async () => {
       // Fire the job to populate pendingJobs
       driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
-      driftPool.query.mockResolvedValueOnce({ rows: [] });
+      driftPool.query.mockResolvedValueOnce(claimed());
       await driftScheduler.pollDueJobs();
       const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
 
@@ -728,13 +2043,13 @@ describe('Scheduler', () => {
           lastRunSummary: 'Found 5 articles on AI safety.',
         });
         expect(driftSchedulerService.pauseJobForDrift).not.toHaveBeenCalled();
-        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'Here are the articles.');
+        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'Here are the articles.', undefined, undefined);
       });
     });
 
     it('pauses job, publishes drift event, notifies coordinator, and skips completeJobRun when drift detected', async () => {
       driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
-      driftPool.query.mockResolvedValueOnce({ rows: [] });
+      driftPool.query.mockResolvedValueOnce(claimed());
       await driftScheduler.pollDueJobs();
       const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
 
@@ -785,7 +2100,7 @@ describe('Scheduler', () => {
 
     it('calls completeJobRun when drift detected but below confidence threshold', async () => {
       driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
-      driftPool.query.mockResolvedValueOnce({ rows: [] });
+      driftPool.query.mockResolvedValueOnce(claimed());
       await driftScheduler.pollDueJobs();
       const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
 
@@ -816,13 +2131,94 @@ describe('Scheduler', () => {
       // the response handler doesn't return a promise so we must wait for microtasks.
       await vi.waitFor(() => {
         expect(driftSchedulerService.pauseJobForDrift).not.toHaveBeenCalled();
-        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done');
+        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done', undefined, undefined);
+      });
+    });
+
+    // #1829: claim clears last_run_summary, so auto-summary-only agents would otherwise
+    // feed the drift detector a null "last run" section. Fall back to this run's autoSummary.
+    it('passes in-flight autoSummary to drift check when last_run_summary is null (#1829)', async () => {
+      driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
+      driftPool.query.mockResolvedValueOnce(claimed());
+      await driftScheduler.pollDueJobs();
+      const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
+
+      driftSchedulerService.getJob.mockResolvedValueOnce({
+        id: 'job-1',
+        agentId: 'agent-1',
+        agentTaskId: 'task-99',
+        intentAnchor: 'Research AI safety articles weekly.',
+        taskPayload: { skill: 'web-search', query: 'AI safety' },
+        lastRunSummary: null, // cleared at claim; no scheduler-report this run
+      });
+      driftDetector.check.mockResolvedValueOnce({ drifted: false, reason: 'Aligned.', confidence: 'high' });
+      driftDetector.shouldPause.mockReturnValueOnce(false);
+      driftSchedulerService.completeJobRun.mockResolvedValueOnce({ suspended: false });
+
+      driftScheduler.start();
+      const responseHandler = driftBus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>;
+      await responseHandler({
+        id: 'resp-drift-auto-summary',
+        type: 'agent.response',
+        sourceLayer: 'agent',
+        parentEventId: taskEvent.id,
+        timestamp: new Date(),
+        payload: { agentId: 'agent-1', conversationId: 'c1', content: 'Found 3 new articles this week.' },
+      });
+
+      await vi.waitFor(() => {
+        expect(driftDetector.check).toHaveBeenCalledWith({
+          intentAnchor: 'Research AI safety articles weekly.',
+          taskPayload: { skill: 'web-search', query: 'AI safety' },
+          lastRunSummary: 'Found 3 new articles this week.',
+        });
+        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith(
+          'job-1', true, undefined, 'Found 3 new articles this week.', undefined, undefined,
+        );
+      });
+    });
+
+    it('prefers an explicit scheduler-report over autoSummary for the drift check (#1829)', async () => {
+      driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
+      driftPool.query.mockResolvedValueOnce(claimed());
+      await driftScheduler.pollDueJobs();
+      const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
+
+      driftSchedulerService.getJob.mockResolvedValueOnce({
+        id: 'job-1',
+        agentId: 'agent-1',
+        agentTaskId: 'task-99',
+        intentAnchor: 'Research AI safety articles weekly.',
+        taskPayload: { skill: 'web-search', query: 'AI safety' },
+        lastRunSummary: 'agent report: scanned 5', // written mid-run by scheduler-report
+      });
+      driftDetector.check.mockResolvedValueOnce({ drifted: false, reason: 'Aligned.', confidence: 'high' });
+      driftDetector.shouldPause.mockReturnValueOnce(false);
+      driftSchedulerService.completeJobRun.mockResolvedValueOnce({ suspended: false });
+
+      driftScheduler.start();
+      const responseHandler = driftBus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>;
+      await responseHandler({
+        id: 'resp-drift-report-wins',
+        type: 'agent.response',
+        sourceLayer: 'agent',
+        parentEventId: taskEvent.id,
+        timestamp: new Date(),
+        payload: { agentId: 'agent-1', conversationId: 'c1', content: 'auto summary should lose' },
+      });
+
+      await vi.waitFor(() => {
+        expect(driftDetector.check).toHaveBeenCalledWith({
+          intentAnchor: 'Research AI safety articles weekly.',
+          taskPayload: { skill: 'web-search', query: 'AI safety' },
+          lastRunSummary: 'agent report: scanned 5',
+        });
       });
     });
 
     it('calls completeJobRun normally when drift check returns null (skipped)', async () => {
       driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
-      driftPool.query.mockResolvedValueOnce({ rows: [] });
+      driftPool.query.mockResolvedValueOnce(claimed());
       await driftScheduler.pollDueJobs();
       const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
 
@@ -852,7 +2248,7 @@ describe('Scheduler', () => {
       // the response handler doesn't return a promise so we must wait for microtasks.
       await vi.waitFor(() => {
         expect(driftSchedulerService.pauseJobForDrift).not.toHaveBeenCalled();
-        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done');
+        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done', undefined, undefined);
       });
     });
 
@@ -860,7 +2256,7 @@ describe('Scheduler', () => {
       // Non-persistent job (no agent_task_id)
       const simpleRow = fakeDbRow({ agent_task_id: null, intent_anchor: null });
       driftPool.query.mockResolvedValueOnce({ rows: [simpleRow] });
-      driftPool.query.mockResolvedValueOnce({ rows: [] });
+      driftPool.query.mockResolvedValueOnce(claimed());
       await driftScheduler.pollDueJobs();
       const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
 
@@ -889,7 +2285,7 @@ describe('Scheduler', () => {
       // the response handler doesn't return a promise so we must wait for microtasks.
       await vi.waitFor(() => {
         expect(driftDetector.check).not.toHaveBeenCalled();
-        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done');
+        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done', undefined, undefined);
       });
     });
 
@@ -900,7 +2296,7 @@ describe('Scheduler', () => {
     // The drift check must be skipped entirely for these jobs, and the job completed normally.
     it('skips drift check for task-wake envelope payloads and completes normally', async () => {
       driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
-      driftPool.query.mockResolvedValueOnce({ rows: [] });
+      driftPool.query.mockResolvedValueOnce(claimed());
       await driftScheduler.pollDueJobs();
       const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
 
@@ -936,6 +2332,8 @@ describe('Scheduler', () => {
           true,
           undefined,
           'Debrief prompt sent.',
+          undefined,
+          undefined,
         );
       });
     });
@@ -947,7 +2345,7 @@ describe('Scheduler', () => {
     // stranding the run in 'running' until watchdog recovery (#1086 review).
     it('does not throw when taskPayload is null; job still completes', async () => {
       driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
-      driftPool.query.mockResolvedValueOnce({ rows: [] });
+      driftPool.query.mockResolvedValueOnce(claimed());
       await driftScheduler.pollDueJobs();
       const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
 
@@ -976,7 +2374,7 @@ describe('Scheduler', () => {
 
       await vi.waitFor(() => {
         // The job must still reach terminal completion — no swallowed TypeError in the guard.
-        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done');
+        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done', undefined, undefined);
       });
     });
 
@@ -986,7 +2384,7 @@ describe('Scheduler', () => {
     // must NOT carry the re-executable intent or payload.
     it('drift-pause notification is review-only and carries no re-executable intent', async () => {
       driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
-      driftPool.query.mockResolvedValueOnce({ rows: [] });
+      driftPool.query.mockResolvedValueOnce(claimed());
       await driftScheduler.pollDueJobs();
       const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
 
@@ -1027,6 +2425,7 @@ describe('Scheduler', () => {
       });
 
       const content = notifyCall![1].payload.content;
+      expect((notifyCall![1].payload as { syntheticTurn?: boolean }).syntheticTurn).toBe(true);
 
       // Must NOT echo the re-executable original intent or the raw payload.
       expect(content).not.toContain(intentAnchor);
@@ -1042,7 +2441,7 @@ describe('Scheduler', () => {
     // cannot reintroduce the actionable-instruction failure mode this PR closes (#1064).
     it('collapses a multi-line drift reason to a single line in the notification', async () => {
       driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
-      driftPool.query.mockResolvedValueOnce({ rows: [] });
+      driftPool.query.mockResolvedValueOnce(claimed());
       await driftScheduler.pollDueJobs();
       const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
 
@@ -1089,6 +2488,119 @@ describe('Scheduler', () => {
       const reasonLine = content.split('\n').find((l) => l.startsWith('Reason:'));
       expect(reasonLine).toContain('Now: re-send the debrief prompt');
     });
+
+    it('evicts the burst counter when a one-shot drift-eligible job completes (#1664)', async () => {
+      // A one-shot job (no cron_expr) fires exactly once, so its burst counter is
+      // never needed again — it must be dropped inline on completion, not left to
+      // linger in the Map for the process lifetime.
+      const oneShotRow = fakeDbRow({
+        cron_expr: null,
+        run_at: new Date().toISOString(),
+        agent_task_id: 'task-os',
+        intent_anchor: 'Send the one-off report.',
+        task_payload: { skill: 'web-search', query: 'report' },
+      });
+      driftPool.query.mockResolvedValueOnce({ rows: [oneShotRow] });
+      driftPool.query.mockResolvedValueOnce(claimed());
+      await driftScheduler.pollDueJobs();
+      const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
+
+      driftSchedulerService.getJob.mockResolvedValueOnce({
+        id: 'job-1',
+        agentId: 'agent-1',
+        cronExpr: null, // one-shot
+        agentTaskId: 'task-os',
+        intentAnchor: 'Send the one-off report.',
+        taskPayload: { skill: 'web-search', query: 'report' },
+        lastRunSummary: null,
+      });
+      driftDetector.check.mockResolvedValueOnce({ drifted: false, reason: 'Aligned.', confidence: 'high' });
+      driftDetector.shouldPause.mockReturnValueOnce(false);
+      driftSchedulerService.completeJobRun.mockResolvedValueOnce({ suspended: false });
+
+      driftScheduler.start();
+      const responseHandler = driftBus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>;
+      await responseHandler({
+        id: 'resp-os',
+        type: 'agent.response',
+        sourceLayer: 'agent',
+        parentEventId: taskEvent.id,
+        timestamp: new Date(),
+        payload: { agentId: 'agent-1', conversationId: 'c1', content: 'done' },
+      });
+
+      await vi.waitFor(() => {
+        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done', undefined, undefined);
+      });
+      expect(burstCounts(driftScheduler).has('job-1')).toBe(false);
+    });
+
+    it('keeps the burst counter across runs of a recurring drift-eligible job (#1664)', async () => {
+      // A recurring job's counter drives checkEveryNBursts and MUST persist between
+      // runs — the one-shot eviction must not touch it.
+      driftPool.query.mockResolvedValueOnce({ rows: [persistentRow] });
+      driftPool.query.mockResolvedValueOnce(claimed());
+      await driftScheduler.pollDueJobs();
+      const [, taskEvent] = driftBus.publish.mock.calls[1] as [string, { id: string }];
+
+      driftSchedulerService.getJob.mockResolvedValueOnce({
+        id: 'job-1',
+        agentId: 'agent-1',
+        cronExpr: '0 9 * * *', // recurring
+        agentTaskId: 'task-99',
+        intentAnchor: 'Research AI safety articles weekly.',
+        taskPayload: { skill: 'web-search', query: 'AI safety' },
+        lastRunSummary: null,
+      });
+      driftDetector.check.mockResolvedValueOnce({ drifted: false, reason: 'Aligned.', confidence: 'high' });
+      driftDetector.shouldPause.mockReturnValueOnce(false);
+      driftSchedulerService.completeJobRun.mockResolvedValueOnce({ suspended: false });
+
+      driftScheduler.start();
+      const responseHandler = driftBus.subscribe.mock.calls[0]?.[2] as (event: unknown) => Promise<void>;
+      await responseHandler({
+        id: 'resp-rec',
+        type: 'agent.response',
+        sourceLayer: 'agent',
+        parentEventId: taskEvent.id,
+        timestamp: new Date(),
+        payload: { agentId: 'agent-1', conversationId: 'c1', content: 'done' },
+      });
+
+      await vi.waitFor(() => {
+        expect(driftSchedulerService.completeJobRun).toHaveBeenCalledWith('job-1', true, undefined, 'done', undefined, undefined);
+      });
+      expect(burstCounts(driftScheduler).get('job-1')).toBe(1);
+    });
+  });
+
+  // -- burst-counter sweep (#1664) --
+
+  describe('pruneStaleBurstCounts', () => {
+    it('evicts burst counters for jobs that are no longer active recurring jobs', async () => {
+      // The poller never observes a cancel/delete/suspend (they mutate the DB via
+      // SchedulerService), so the watchdog sweep reconciles burstCounts against the
+      // set of jobs that are still pending/running recurring jobs.
+      const burst = burstCounts(scheduler);
+      burst.set('job-live', 3);
+      burst.set('job-gone', 1);
+
+      pool.query.mockResolvedValueOnce({ rows: [{ id: 'job-live' }] });
+
+      await scheduler.pruneStaleBurstCounts();
+
+      expect(burst.has('job-live')).toBe(true);
+      expect(burst.has('job-gone')).toBe(false);
+
+      // Parameterized query — the tracked ids are bound, never interpolated.
+      const [, params] = pool.query.mock.calls[0]! as [string, unknown[]];
+      expect(params[0]!).toEqual(['job-live', 'job-gone']);
+    });
+
+    it('does not query the DB when no burst counters are tracked', async () => {
+      await scheduler.pruneStaleBurstCounts();
+      expect(pool.query).not.toHaveBeenCalled();
+    });
   });
 
   // -- loadDeclarativeJobs --
@@ -1100,7 +2612,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'coordinator',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'You are the coordinator.',
           schedule: [
             { cron: '0 9 * * 1', task: 'weekly-standup' },
@@ -1109,7 +2621,7 @@ describe('Scheduler', () => {
         },
         {
           name: 'researcher',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'You research things.',
           // No schedule block — should be skipped.
         },
@@ -1135,7 +2647,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'no-schedule',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'No schedule.',
         },
       ];
@@ -1149,7 +2661,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'empty-sched',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Empty schedule.',
           schedule: [],
         },
@@ -1166,7 +2678,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'writing-scout',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Scout.',
           schedule: [
             { cron: '30 8 * * 2', task: 'Run the writing scout', agent_id: 'coordinator' },
@@ -1175,7 +2687,7 @@ describe('Scheduler', () => {
         // coordinator must be in the config list so the unknown-agent guard allows the target
         {
           name: 'coordinator',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Coord.',
         },
       ];
@@ -1196,7 +2708,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'writing-scout',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Scout.',
           schedule: [
             { cron: '30 8 * * 2', task: 'Check the shared inbox', agent_id: 'coordinator' },
@@ -1204,7 +2716,7 @@ describe('Scheduler', () => {
         },
         {
           name: 'researcher',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Research.',
           schedule: [
             { cron: '30 8 * * 2', task: 'Check the shared inbox', agent_id: 'coordinator' },
@@ -1212,7 +2724,7 @@ describe('Scheduler', () => {
         },
         {
           name: 'coordinator',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Coord.',
         },
       ];
@@ -1237,7 +2749,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'my-agent',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Agent.',
           schedule: [
             { cron: '0 9 * * 1', task: 'weekly task' },
@@ -1260,13 +2772,13 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'agent-a',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'A.',
           schedule: [{ cron: '0 9 * * 1', task: 'task', agent_id: 'agent-b' }],
         },
         {
           name: 'agent-b',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'B.',
           schedule: [{ cron: '0 9 * * 1', task: 'task', agent_id: 'agent-a' }],
         },
@@ -1288,7 +2800,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'coordinator',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Coord.',
           schedule: [{ cron: '0 9 * * 1', task: 'task', agent_id: 'coordinator' }],
         },
@@ -1303,7 +2815,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'my-agent',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Agent.',
           schedule: [
             { cron: '0 9 * * 1', task: 'weekly task', agent_id: 'nonexistent-agent' },
@@ -1329,7 +2841,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'agent-x',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'test',
           schedule: [
             { cron: '0 1 * * *', task: 'fail-task' },
@@ -1354,7 +2866,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'coordinator',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Coord.',
           schedule: [
             {
@@ -1386,7 +2898,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'coordinator',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Coord.',
           schedule: [
             { cron: '0 9 * * 1', task: 'weekly-standup' },
@@ -1428,7 +2940,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'agent-x',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'test',
           schedule: [
             { cron: '0 1 * * *', task: 'fail-task' },
@@ -1465,7 +2977,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'writing-scout',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Scout.',
           schedule: [
             { cron: '30 8 * * 2', task: 'Run the writing scout', agent_id: 'coordinator' },
@@ -1473,7 +2985,7 @@ describe('Scheduler', () => {
         },
         {
           name: 'coordinator',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Coord.',
         },
       ];
@@ -1499,7 +3011,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'no-schedule',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'No schedule.',
         },
       ];
@@ -1516,7 +3028,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'coordinator',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Coord.',
           schedule: [{ cron: '0 9 * * *', task: 'brief' }],
         },
@@ -1537,7 +3049,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'coordinator',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Coord.',
           schedule: [{ cron: '0 9 * * *', task: 'brief' }],
         },
@@ -1560,7 +3072,7 @@ describe('Scheduler', () => {
       const configs: AgentYamlConfig[] = [
         {
           name: 'coordinator',
-          model: { provider: 'anthropic', model: 'claude-3' },
+          model: { tier: 'standard' },
           system_prompt: 'Coord.',
           schedule: [{ cron: '0 9 * * *', task: 'brief' }],
         },
@@ -1682,6 +3194,302 @@ describe('Scheduler', () => {
       expect(schedulerService.recoverStuckJob).toHaveBeenCalledTimes(2);
       expect(logger.error).toHaveBeenCalled();
       expect(bus.publish).toHaveBeenCalledOnce();
+    });
+  });
+
+  // -- bounded concurrency (#1160) --
+
+  describe('bounded concurrency (#1160)', () => {
+    function agentTaskPublishes(): number {
+      return bus.publish.mock.calls.filter((call) => {
+        const event = call[1] as { type?: string } | undefined;
+        return event?.type === 'agent.task';
+      }).length;
+    }
+
+    it('selects due jobs with LIMIT and without a row lock', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [] });
+
+      await scheduler.pollDueJobs();
+
+      const [sql, params] = pool.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).not.toContain('FOR UPDATE');
+      expect(sql).not.toContain('SKIP LOCKED');
+      expect(sql).toContain('LIMIT $1');
+      expect(params).toEqual([DEFAULT_MAX_IN_FLIGHT]);
+    });
+
+    it('returns while an agent run is still in flight', async () => {
+      const row = fakeDbRow();
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string }) => {
+        if (event.type === 'agent.task') return gate;
+        return Promise.resolve();
+      });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      expect(agentTaskPublishes()).toBe(1);
+      expect(inFlightOf(scheduler)).toBe(1);
+      expect(pendingJobs(scheduler).size).toBe(1);
+
+      release();
+      await drainInFlight(scheduler);
+      expect(inFlightOf(scheduler)).toBe(0);
+    });
+
+    it('caps in-flight runs and leaves the overflow unclaimed', async () => {
+      scheduler = new Scheduler({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        pool: pool as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        bus: bus as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        logger: logger as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        schedulerService: schedulerService as any,
+        maxInFlight: 2,
+        ownsAgent: () => true,
+      });
+      const rows = [1, 2, 3, 4].map((n) => fakeDbRow({ id: `job-${n}` }));
+      const releases: Array<() => void> = [];
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string }) => {
+        if (event.type !== 'agent.task') return Promise.resolve();
+        return new Promise<void>((resolve) => { releases.push(resolve); });
+      });
+      pool.query.mockImplementation((sql: string) => {
+        if (sql.includes('count(*)')) {
+          return Promise.resolve({ rows: [{ due: 4 }], rowCount: 1 });
+        }
+        if (sql.includes('LIMIT')) {
+          return Promise.resolve({ rows, rowCount: 1 });
+        }
+        return Promise.resolve(claimed());
+      });
+
+      await scheduler.pollDueJobs();
+
+      expect(releases).toHaveLength(2);
+      expect(inFlightOf(scheduler)).toBe(2);
+      const claimCalls = pool.query.mock.calls.filter((call) => String(call[0]).includes('run_started_at'));
+      expect(claimCalls).toHaveLength(2);
+
+      const callsAtCap = pool.query.mock.calls.length;
+      await scheduler.pollDueJobs();
+      // Saturated: a count of still-due rows, no further claims, no further publishes.
+      const whileCapped = pool.query.mock.calls.slice(callsAtCap);
+      expect(whileCapped).toHaveLength(1);
+      expect(String(whileCapped[0]![0])).toContain('count(*)');
+      expect(releases).toHaveLength(2);
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({ inFlight: 2, maxInFlight: 2, deferred: 4 }),
+        expect.stringContaining('in-flight cap reached'),
+      );
+
+      releases[0]!();
+      for (let i = 0; i < 10 && inFlightOf(scheduler) !== 1; i++) await Promise.resolve();
+      expect(inFlightOf(scheduler)).toBe(1);
+
+      pool.query.mockClear();
+      await scheduler.pollDueJobs();
+      const [sql, params] = pool.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain('LIMIT $1');
+      expect(params).toEqual([1]);
+      expect(releases).toHaveLength(3);
+      expect(inFlightOf(scheduler)).toBe(2);
+
+      for (const release of releases) release();
+      await drainInFlight(scheduler);
+      expect(inFlightOf(scheduler)).toBe(0);
+    });
+
+    it('does not re-fire a job whose agent run outlives a later poll (#1159)', async () => {
+      const row = fakeDbRow();
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string }) => {
+        if (event.type === 'agent.task') return gate;
+        return Promise.resolve();
+      });
+
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+      await scheduler.pollDueJobs();
+      expect(agentTaskPublishes()).toBe(1);
+
+      // Stale overlapping SELECT still returns the row. The claim matches 0
+      // because the first claim advanced next_run_at (or the row is running).
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+      await scheduler.pollDueJobs();
+
+      expect(agentTaskPublishes()).toBe(1);
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job-1' }),
+        expect.stringContaining('skipping fire'),
+      );
+
+      release();
+      await drainInFlight(scheduler);
+    });
+
+    it('reverts to pending and clears pendingJobs when the detached publish rejects', async () => {
+      const row = fakeDbRow();
+      pool.query
+        .mockResolvedValueOnce({ rows: [row] })
+        .mockResolvedValueOnce(claimed())
+        .mockResolvedValue(claimed());
+      bus.publish.mockRejectedValueOnce(new Error('audit hook failed'));
+
+      await scheduler.pollDueJobs();
+      await drainInFlight(scheduler);
+
+      expect(pendingJobs(scheduler).size).toBe(0);
+      expect(inFlightOf(scheduler)).toBe(0);
+      const revert = pool.query.mock.calls.find((call) => String(call[0]).includes("status = 'pending'"));
+      expect(String(revert?.[0])).toContain('run_started_at = $2::timestamptz');
+      expect(revert?.[1]).toEqual(['job-1', CLAIMED_AT]);
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job-1', err: expect.any(Error) }),
+        'Failed to fire job — reverting to pending for retry',
+      );
+    });
+
+    it('reverts a claim that throws before publish, on the poll itself', async () => {
+      const row = fakeDbRow();
+      pool.query
+        .mockResolvedValueOnce({ rows: [row] })
+        .mockRejectedValueOnce(new Error('claim failed'))
+        .mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+
+      expect(bus.publish).not.toHaveBeenCalled();
+      expect(pendingJobs(scheduler).size).toBe(0);
+      expect(inFlightOf(scheduler)).toBe(0);
+      const revert = pool.query.mock.calls.find((call) => String(call[0]).includes("status = 'pending'"));
+      expect(String(revert?.[0])).not.toContain('run_started_at');
+      expect(revert?.[1]).toEqual(['job-1']);
+    });
+
+    it('releases the in-flight slot when a hung run outlives the recovery timeout', async () => {
+      const row = fakeDbRow({ expected_duration_seconds: 60 });
+      const gate = new Promise<void>(() => {});
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string }) => {
+        if (event.type === 'agent.task') return gate;
+        return Promise.resolve();
+      });
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed());
+
+      await scheduler.pollDueJobs();
+      expect(inFlightOf(scheduler)).toBe(1);
+
+      const timeoutMs = computeRecoveryTimeout(60) * 1000;
+      await vi.advanceTimersByTimeAsync(timeoutMs);
+
+      expect(inFlightOf(scheduler)).toBe(0);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job-1', timeoutMs }),
+        expect.stringContaining('released in-flight slot after recovery timeout'),
+      );
+
+      // The slot is free, so a later poll can claim another job while the first
+      // publish is still pending.
+      pool.query.mockResolvedValueOnce({ rows: [fakeDbRow({ id: 'job-2' })] });
+      pool.query.mockResolvedValueOnce(claimed());
+      await scheduler.pollDueJobs();
+      expect(inFlightOf(scheduler)).toBe(1);
+      expect(agentTaskPublishes()).toBe(2);
+    });
+
+    it('does not revert a newer claim when an older publish rejects', async () => {
+      const firstStarted = '2026-09-24 12:00:00.123456+00';
+      const secondStarted = '2026-09-24 12:30:00.654321+00';
+      const row = fakeDbRow({ expected_duration_seconds: 60 });
+      let rejectFirst: (err: Error) => void = () => {};
+      const firstPublish = new Promise<void>((_resolve, reject) => {
+        rejectFirst = reject;
+      });
+      let agentTasks = 0;
+      bus.publish.mockImplementation((_layer: unknown, event: { type: string }) => {
+        if (event.type !== 'agent.task') return Promise.resolve();
+        agentTasks += 1;
+        if (agentTasks === 1) return firstPublish;
+        return Promise.resolve();
+      });
+
+      pool.query.mockResolvedValueOnce({ rows: [row] });
+      pool.query.mockResolvedValueOnce(claimed(firstStarted));
+      pool.query.mockResolvedValueOnce({ rows: [fakeDbRow({ id: 'job-1', expected_duration_seconds: 60 })] });
+      pool.query.mockResolvedValueOnce(claimed(secondStarted));
+      pool.query.mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      await scheduler.pollDueJobs();
+      const firstEventId = [...pendingJobs(scheduler).keys()][0]!;
+      expect(pendingJobs(scheduler).get(firstEventId)).toBe('job-1');
+
+      // Slot timeout frees the slot while the original publish is still pending.
+      // The original map entry is already gone — completion or another cleanup
+      // dropped it — so a revert that scans by job id would hit the newer run.
+      await vi.advanceTimersByTimeAsync(computeRecoveryTimeout(60) * 1000);
+      expect(inFlightOf(scheduler)).toBe(0);
+      pendingJobs(scheduler).delete(firstEventId);
+
+      await scheduler.pollDueJobs();
+      const newer = [...pendingJobs(scheduler).entries()];
+      expect(newer).toHaveLength(1);
+      const [newerEventId] = newer[0]!;
+      expect(newerEventId).not.toBe(firstEventId);
+
+      const callsBeforeReject = pool.query.mock.calls.length;
+      rejectFirst(new Error('audit hook failed'));
+      await drainInFlight(scheduler);
+
+      expect(pendingJobs(scheduler).get(newerEventId)).toBe('job-1');
+      const revert = pool.query.mock.calls.slice(callsBeforeReject).find((call) =>
+        String(call[0]).includes("status = 'pending'"),
+      );
+      expect(String(revert?.[0])).toContain('run_started_at = $2::timestamptz');
+      expect(revert?.[1]).toEqual(['job-1', firstStarted]);
+    });
+
+    it('logs and still releases the slot when reverting a failed fire throws', async () => {
+      const row = fakeDbRow();
+      pool.query
+        .mockResolvedValueOnce({ rows: [row] })
+        .mockResolvedValueOnce(claimed())
+        .mockImplementationOnce(() => {
+          throw new Error('pool closed');
+        });
+      bus.publish.mockRejectedValueOnce(new Error('audit hook failed'));
+
+      await scheduler.pollDueJobs();
+      await drainInFlight(scheduler);
+
+      expect(inFlightOf(scheduler)).toBe(0);
+      expect(pendingJobs(scheduler).size).toBe(0);
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: 'job-1', err: expect.any(Error) }),
+        'Revert after failed fire threw',
+      );
+    });
+
+    it('rejects a non-positive maxInFlight at construction', () => {
+      expect(() => new Scheduler({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        pool: pool as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        bus: bus as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        logger: logger as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        schedulerService: schedulerService as any,
+        maxInFlight: 0,
+        ownsAgent: () => true,
+      })).toThrow(/maxInFlight must be a positive integer/);
     });
   });
 });

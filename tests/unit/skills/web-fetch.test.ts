@@ -1,12 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
-import { WebFetchHandler } from '../../../skills/web-fetch/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { WebFetchHandler } from '../../../skills/web/tools/web-fetch/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
 
-function makeCtx(input: Record<string, unknown>): SkillContext {
+function makeCtx(input: Record<string, unknown>): ToolContext {
   return {
+    toolName: 'web-fetch',
+    toolVersion: '1.0.0',
     input,
     secret: () => { throw new Error('no secrets needed'); },
     log: logger,

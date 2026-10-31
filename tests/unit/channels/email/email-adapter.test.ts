@@ -41,14 +41,21 @@ function makeMockMessage(overrides: Partial<NylasMessage> = {}): NylasMessage {
 function createMocks() {
   const logger = createLogger('error');
 
+  const publish = vi.fn().mockResolvedValue(undefined);
   const bus = {
     subscribe: vi.fn(),
-    publish: vi.fn().mockResolvedValue(undefined),
+    publish,
+    // Write-ahead resolves immediately. Delivery records the event on publish
+    // when the runner starts the turn, which is what these tests assert.
+    stagePublish: vi.fn(async (layer: string, event: BusEvent) => ({
+      deliver: () => publish(layer, event),
+    })),
   } as unknown as EventBus;
 
   const contactService = {
     resolveByChannelIdentity: vi.fn().mockResolvedValue(null),
     createContact: vi.fn(),
+    createContactWithKgOutcome: vi.fn(),
     linkIdentity: vi.fn(),
   } as unknown as ContactService;
 
@@ -68,6 +75,7 @@ function makeAdapter(mocks: ReturnType<typeof createMocks>, overrides: Partial<{
   contactCreationMaxPerHour: number;
   ceoEmail: string;
   timezone: string;
+  suppressedSenderEmails: string[];
 }> = {}) {
   return new EmailAdapter({
     accountId: 'curia',
@@ -77,9 +85,10 @@ function makeAdapter(mocks: ReturnType<typeof createMocks>, overrides: Partial<{
     contactService: mocks.contactService,
     pollingIntervalMs: 7_200_000, // 2 hours — never fires in tests, even under vi.advanceTimersByTime(3_600_001)
     selfEmail: SELF_EMAIL,
-    excludedSenderEmails: [],
+    suppressedSenderEmails: overrides.suppressedSenderEmails ?? [],
     contactCreationMaxPerMessage: overrides.contactCreationMaxPerMessage ?? 10,
     contactCreationMaxPerHour: overrides.contactCreationMaxPerHour ?? 100,
+    maxConcurrentTurns: 4,
     ceoEmail: overrides.ceoEmail ?? CEO_EMAIL,
     timezone: overrides.timezone ?? 'America/Toronto',
   });
@@ -95,7 +104,7 @@ function captureHandler(
   eventType: string,
   mocks: ReturnType<typeof createMocks>,
 ): (event: BusEvent) => Promise<void> {
-  const handlers = ((mocks.bus.subscribe as ReturnType<typeof vi.fn>).__handlerMap ??= {}) as
+  const handlers = ((mocks.bus.subscribe as unknown as { __handlerMap?: Record<string, (event: BusEvent) => Promise<void>> }).__handlerMap ??= {}) as
     Record<string, (event: BusEvent) => Promise<void>>;
   (mocks.bus.subscribe as ReturnType<typeof vi.fn>).mockImplementation(
     (et: string, _layer: string, cb: (event: BusEvent) => Promise<void>) => {
@@ -132,6 +141,20 @@ describe('EmailAdapter — sendOutboundReply', () => {
     void adapter.start();
   });
 
+  it('sends an approved relay as humanApproved, so it is not reviewed again (#2159)', async () => {
+    const humanMessage = makeMockMessage({ from: [{ email: CEO_EMAIL }], to: [{ email: SELF_EMAIL }] });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([humanMessage]);
+
+    await triggerOutbound(createOutboundMessage({
+      conversationId: 'email:thread-abc', channelId: 'email', content: 'Approved reply.', parentEventId: 'task-1', principalApproved: true,
+    }));
+
+    expect(mocks.outboundGateway.send).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ humanApproved: true }),
+    );
+  });
+
   it('sends reply to from address when the latest thread message is from the human', async () => {
     // Latest message is from the human — normal first-reply scenario
     const humanMessage = makeMockMessage({
@@ -146,6 +169,58 @@ describe('EmailAdapter — sendOutboundReply', () => {
       expect.objectContaining({ to: CEO_EMAIL }),
       expect.any(Object),
     );
+  });
+
+  it('passes email_participant when the latest From authenticated and is not Curia (#2071)', async () => {
+    const humanMessage = makeMockMessage({
+      from: [{ email: CEO_EMAIL, name: 'Pat CEO' }],
+      headers: [{ name: 'Authentication-Results', value: 'mx.google.com; spf=pass dkim=pass dmarc=pass' }],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([humanMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    expect(mocks.outboundGateway.listEmailMessages).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: 'thread-abc', fields: 'include_headers' }),
+      'curia',
+    );
+    expect(mocks.outboundGateway.send).toHaveBeenCalledWith(
+      expect.not.objectContaining({ recipientSource: 'email_participant' }),
+      expect.objectContaining({
+        recipientSource: 'email_participant',
+        recipientDisplayName: 'Pat CEO',
+      }),
+    );
+  });
+
+  it('does not pass email_participant when the latest message is ours (#2071)', async () => {
+    const curiaMessage = makeMockMessage({
+      from: [{ email: SELF_EMAIL, name: 'Curia' }],
+      to: [{ email: CEO_EMAIL, name: 'Pat CEO' }],
+      headers: [{ name: 'Authentication-Results', value: 'mx.google.com; spf=pass dkim=pass dmarc=pass' }],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([curiaMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    expect(mocks.outboundGateway.send).toHaveBeenCalledWith(
+      expect.objectContaining({ to: CEO_EMAIL }),
+      expect.any(Object),
+    );
+    const options = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0]![1] as Record<string, unknown>;
+    expect(options).not.toHaveProperty('recipientSource');
+  });
+
+  it('does not pass email_participant when the sender is not authenticated (#2071)', async () => {
+    const humanMessage = makeMockMessage({
+      from: [{ email: CEO_EMAIL, name: 'Pat CEO' }],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([humanMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    const options = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0]![1] as Record<string, unknown>;
+    expect(options).not.toHaveProperty('recipientSource');
   });
 
   it('sends reply to the to address when the latest thread message is from Curia (self)', async () => {
@@ -276,6 +351,8 @@ describe('EmailAdapter — sendOutboundReply', () => {
     // Original HTML body is preserved inside the blockquote (not stripped to plain text)
     expect(callArg.htmlQuote).toContain('<blockquote');
     expect(callArg.htmlQuote).toContain('Hi Curia, can we sync on Q2?');
+    // Who was on the quoted message, lowercased, for the send review (#2312).
+    expect(callArg.quoteParticipants).toEqual([CEO_EMAIL.toLowerCase(), SELF_EMAIL.toLowerCase()]);
   });
 
   it('uses the configured timezone when rendering the quoted Date line', async () => {
@@ -370,10 +447,10 @@ describe('EmailAdapter — sendOutboundReply', () => {
   });
 });
 
-// ── Inbound poll — excludedSenderEmails ──────────────────
+// ── Inbound poll — suppressedSenderEmails ──────────────────
 
-describe('EmailAdapter — inbound poll: excludedSenderEmails', () => {
-  it('suppresses emails from an excluded sender address', async () => {
+describe('EmailAdapter — inbound poll: suppressedSenderEmails', () => {
+  it('suppresses emails from an address in suppressedSenderEmails', async () => {
     const mocks = createMocks();
     const adapter = new EmailAdapter({
       accountId: 'joseph',
@@ -383,9 +460,10 @@ describe('EmailAdapter — inbound poll: excludedSenderEmails', () => {
       contactService: mocks.contactService,
       pollingIntervalMs: 999999,
       selfEmail: 'joseph@example.com',
-      excludedSenderEmails: ['curia@example.com'],
+      suppressedSenderEmails: ['curia@example.com'],
       contactCreationMaxPerMessage: 10,
       contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 4,
       ceoEmail: CEO_EMAIL,
       timezone: 'America/Toronto',
     });
@@ -404,7 +482,7 @@ describe('EmailAdapter — inbound poll: excludedSenderEmails', () => {
     await adapter.stop();
   });
 
-  it('excluded sender check is case-insensitive', async () => {
+  it('suppressed sender check is case-insensitive', async () => {
     const mocks = createMocks();
     const adapter = new EmailAdapter({
       accountId: 'joseph',
@@ -414,14 +492,15 @@ describe('EmailAdapter — inbound poll: excludedSenderEmails', () => {
       contactService: mocks.contactService,
       pollingIntervalMs: 999999,
       selfEmail: 'joseph@example.com',
-      excludedSenderEmails: ['CURIA@EXAMPLE.COM'],
+      suppressedSenderEmails: ['CURIA@EXAMPLE.COM'],
       contactCreationMaxPerMessage: 10,
       contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 4,
       ceoEmail: CEO_EMAIL,
       timezone: 'America/Toronto',
     });
 
-    // Sender address uses different casing than the exclusion list entry
+    // Sender address uses different casing than the suppressedSenderEmails entry
     const msg = makeMockMessage({ from: [{ email: 'curia@example.com' }] });
     (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([msg]);
 
@@ -435,7 +514,7 @@ describe('EmailAdapter — inbound poll: excludedSenderEmails', () => {
     await adapter.stop();
   });
 
-  it('does not suppress emails from non-excluded senders', async () => {
+  it('does not suppress emails from non-suppressed senders', async () => {
     const mocks = createMocks();
     const adapter = new EmailAdapter({
       accountId: 'joseph',
@@ -445,9 +524,10 @@ describe('EmailAdapter — inbound poll: excludedSenderEmails', () => {
       contactService: mocks.contactService,
       pollingIntervalMs: 999999,
       selfEmail: 'joseph@example.com',
-      excludedSenderEmails: ['curia@example.com'],
+      suppressedSenderEmails: ['curia@example.com'],
       contactCreationMaxPerMessage: 10,
       contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 4,
       ceoEmail: CEO_EMAIL,
       timezone: 'America/Toronto',
     });
@@ -519,9 +599,10 @@ describe('EmailAdapter — outbound.notification subscriber', () => {
       contactService: mocks.contactService,
       pollingIntervalMs: 999999,
       selfEmail: 'joseph@example.com',
-      excludedSenderEmails: [],
+      suppressedSenderEmails: [],
       contactCreationMaxPerMessage: 10,
       contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 4,
       ceoEmail: CEO_EMAIL,
       timezone: 'America/Toronto',
     });
@@ -608,7 +689,8 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
     const adapter = makeAdapter(mocks, { contactCreationMaxPerMessage: 3 });
 
     (mocks.contactService.resolveByChannelIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-    (mocks.contactService.createContact as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'c1' });
+    (mocks.contactService.createContactWithKgOutcome as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ contact: { id: 'c1' }, kgNodeCreated: true });
     (mocks.contactService.linkIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 
     // 6 non-self participants (1 from + 5 CC)
@@ -619,7 +701,7 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
     await flushPoll();
 
     // Only 3 contacts should be created (per-message cap of 3)
-    expect(mocks.contactService.createContact).toHaveBeenCalledTimes(3);
+    expect(mocks.contactService.createContactWithKgOutcome).toHaveBeenCalledTimes(3);
 
     await adapter.stop();
   });
@@ -629,7 +711,8 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
     const adapter = makeAdapter(mocks, { contactCreationMaxPerHour: 2, contactCreationMaxPerMessage: 100 });
 
     (mocks.contactService.resolveByChannelIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-    (mocks.contactService.createContact as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'c1' });
+    (mocks.contactService.createContactWithKgOutcome as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ contact: { id: 'c1' }, kgNodeCreated: true });
     (mocks.contactService.linkIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 
     // First email: 2 new participants (from + 1 CC) — creates 2, hits hourly cap
@@ -652,7 +735,7 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
     await flushPoll();
 
     // Only 2 contacts created total (hourly cap of 2), not 3
-    expect(mocks.contactService.createContact).toHaveBeenCalledTimes(2);
+    expect(mocks.contactService.createContactWithKgOutcome).toHaveBeenCalledTimes(2);
 
     await adapter.stop();
   });
@@ -664,7 +747,8 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
       const adapter = makeAdapter(mocks, { contactCreationMaxPerHour: 1, contactCreationMaxPerMessage: 100 });
 
       (mocks.contactService.resolveByChannelIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (mocks.contactService.createContact as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'c1' });
+      (mocks.contactService.createContactWithKgOutcome as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ contact: { id: 'c1' }, kgNodeCreated: true });
       (mocks.contactService.linkIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 
       // First poll: 1 new participant — hits hourly cap of 1
@@ -680,7 +764,7 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
       // setTimeout is fake — skip it and assert directly.
       await adapter.start();
 
-      expect(mocks.contactService.createContact).toHaveBeenCalledTimes(1);
+      expect(mocks.contactService.createContactWithKgOutcome).toHaveBeenCalledTimes(1);
 
       // Advance time by 1 hour + 1ms so the window resets
       vi.advanceTimersByTime(3_600_001);
@@ -695,7 +779,7 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
 
       await (adapter as unknown as { poll(): Promise<void> }).poll();
 
-      expect(mocks.contactService.createContact).toHaveBeenCalledTimes(2);
+      expect(mocks.contactService.createContactWithKgOutcome).toHaveBeenCalledTimes(2);
 
       await adapter.stop();
     } finally {
@@ -713,7 +797,8 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
       resolveCallCount++;
       return Promise.resolve(resolveCallCount <= 3 ? { id: 'existing' } : null);
     });
-    (mocks.contactService.createContact as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'c1' });
+    (mocks.contactService.createContactWithKgOutcome as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ contact: { id: 'c1' }, kgNodeCreated: true });
     (mocks.contactService.linkIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 
     // 5 non-self participants (1 from + 4 CC)
@@ -724,7 +809,7 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
     await flushPoll();
 
     // 3 existed, 2 are new — both new ones created (under the cap of 2)
-    expect(mocks.contactService.createContact).toHaveBeenCalledTimes(2);
+    expect(mocks.contactService.createContactWithKgOutcome).toHaveBeenCalledTimes(2);
 
     await adapter.stop();
   });
@@ -734,7 +819,8 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
     const adapter = makeAdapter(mocks, { contactCreationMaxPerMessage: 1 });
 
     (mocks.contactService.resolveByChannelIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-    (mocks.contactService.createContact as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'c1' });
+    (mocks.contactService.createContactWithKgOutcome as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ contact: { id: 'c1' }, kgNodeCreated: true });
     (mocks.contactService.linkIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 
     // 3 non-self participants (from + 2 CC), cap is 1 — 2 will be skipped
@@ -763,7 +849,8 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
     const adapter = makeAdapter(mocks, { contactCreationMaxPerMessage: 1 });
 
     (mocks.contactService.resolveByChannelIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-    (mocks.contactService.createContact as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'c1' });
+    (mocks.contactService.createContactWithKgOutcome as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ contact: { id: 'c1' }, kgNodeCreated: true });
     (mocks.contactService.linkIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 
     // Two emails that both trigger the per-message limit
@@ -795,7 +882,8 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
     const adapter = makeAdapter(mocks, { contactCreationMaxPerMessage: 2, contactCreationMaxPerHour: 5 });
 
     (mocks.contactService.resolveByChannelIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-    (mocks.contactService.createContact as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'c1' });
+    (mocks.contactService.createContactWithKgOutcome as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ contact: { id: 'c1' }, kgNodeCreated: true });
     (mocks.contactService.linkIdentity as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
 
     // 4 non-self participants (1 from + 3 CC) — per-message cap of 2 should apply
@@ -805,7 +893,7 @@ describe('EmailAdapter — contact auto-creation rate limiting', () => {
     await adapter.start();
     await flushPoll();
 
-    expect(mocks.contactService.createContact).toHaveBeenCalledTimes(2);
+    expect(mocks.contactService.createContactWithKgOutcome).toHaveBeenCalledTimes(2);
 
     await adapter.stop();
   });
@@ -848,8 +936,41 @@ describe('EmailAdapter — sendWithGatedDraftFallback gated-fallback', () => {
 
     expect(mocks.outboundGateway.send).toHaveBeenCalledWith(
       expect.objectContaining({ to: CEO_EMAIL }),
-      expect.objectContaining({ taskEventId: 'task-evt-1', conversationId: 'email:thread-abc' }),
+      // postTurn: a relayed reply is sent after the agent's turn ended, so a held approval
+      // needs the coordinator woken to deliver it (#2159).
+      expect.objectContaining({ taskEventId: 'task-evt-1', conversationId: 'email:thread-abc', postTurn: true }),
     );
+
+    await adapter.stop();
+  });
+
+  it('forwards the note reported to the principal into the gateway send options (#2312)', async () => {
+    const adapter = makeAdapter(mocks);
+    await adapter.start();
+
+    const humanMessage = makeMockMessage({
+      from: [{ email: CEO_EMAIL }],
+      to: [{ email: SELF_EMAIL }],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([humanMessage]);
+
+    await triggerOutbound(createOutboundMessage({
+      conversationId: 'email:thread-abc',
+      channelId: 'email',
+      content: 'Here is my reply.',
+      parentEventId: 'response-1',
+      taskEventId: 'task-evt-1',
+      reportedToPrincipal: 'Provider asked for your number.',
+    }));
+    expect(mocks.outboundGateway.send).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ reportedToPrincipal: 'Provider asked for your number.' }),
+    );
+
+    // Absent on the event, absent in the options.
+    await triggerOutbound(makeOutboundEventWithTask('email:thread-abc', 'task-evt-2'));
+    const options = vi.mocked(mocks.outboundGateway.send).mock.calls.at(-1)![1] as Record<string, unknown>;
+    expect(options).not.toHaveProperty('reportedToPrincipal');
 
     await adapter.stop();
   });
@@ -864,6 +985,7 @@ describe('EmailAdapter — sendWithGatedDraftFallback gated-fallback', () => {
     (mocks.outboundGateway.createEmailDraft as ReturnType<typeof vi.fn>).mockResolvedValue({
       success: true,
       draftId: 'draft-abc',
+      draft: { subject: 'Re: Hello', body: '<p>Call me at the office</p>' },
     });
 
     const adapter = makeAdapter(mocks);
@@ -882,12 +1004,12 @@ describe('EmailAdapter — sendWithGatedDraftFallback gated-fallback', () => {
       expect.objectContaining({ to: CEO_EMAIL, channel: 'email' }),
     );
 
-    // linkGatedAction should be called with the actionRef, taskEventId, and just the draft_id.
-    // account is already in the partialPayload stored at gate time — no need to repeat it here.
+    // linkGatedAction links the draft_id and the draft's subject and body as created (#2312),
+    // so an approval replay matches what was shown. account is already in the partialPayload.
     expect(mocks.outboundGateway.linkGatedAction).toHaveBeenCalledWith(
       'email-42',
       'task-evt-2',
-      { draft_id: 'draft-abc' },
+      { draft_id: 'draft-abc', subject: 'Re: Hello', body: '<p>Call me at the office</p>' },
     );
 
     await adapter.stop();
@@ -1123,9 +1245,10 @@ describe('EmailAdapter — inbound poll: self-loop hardening', () => {
       contactService: mocks.contactService,
       pollingIntervalMs: 999999,
       selfEmail: 'nathancuria1@gmail.com',
-      excludedSenderEmails: [],
+      suppressedSenderEmails: [],
       contactCreationMaxPerMessage: 10,
       contactCreationMaxPerHour: 100,
+      maxConcurrentTurns: 4,
       ceoEmail: CEO_EMAIL,
       timezone: 'America/Toronto',
     });
@@ -1228,9 +1351,9 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
     expect(sendArg.cc).toBeUndefined();
   });
 
-  it('includes To recipients in reply-all CC', async () => {
-    // Thread message has an extra address in to[] that is neither the primary recipient
-    // nor selfEmail — it should appear in the outbound CC (reply-all behaviour).
+  it('keeps the other To recipients on To in reply-all (#2273)', async () => {
+    // Thread message has an extra address in to[] that is neither the sender nor
+    // selfEmail — reply-all keeps it on To, as a mail client would.
     const threadMessage = makeMockMessage({
       from: [{ email: CEO_EMAIL }],
       to: [{ email: 'extra@example.com' }],
@@ -1240,9 +1363,88 @@ describe('EmailAdapter — sendOutboundReply CC', () => {
 
     await triggerOutbound(makeOutboundEvent('email:thread-abc'));
 
-    expect(mocks.outboundGateway.send).toHaveBeenCalledWith(
-      expect.objectContaining({ cc: ['extra@example.com'] }),
-      expect.any(Object),
-    );
+    const sendArg = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(sendArg).toMatchObject({ to: CEO_EMAIL, additionalTo: ['extra@example.com'] });
+    expect(sendArg.cc).toBeUndefined();
+  });
+
+  it('when the latest message is ours, keeps every person it was addressed to on To (#2273)', async () => {
+    const threadMessage = makeMockMessage({
+      from: [{ email: SELF_EMAIL }],
+      to: [{ email: CEO_EMAIL }, { email: 'second@example.com' }],
+      cc: [{ email: 'cc@example.com' }, { email: SELF_EMAIL }],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([threadMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    const [sendArg, options] = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(sendArg).toMatchObject({
+      to: CEO_EMAIL,
+      additionalTo: ['second@example.com'],
+      cc: ['cc@example.com'],
+    });
+    // Taken from our own message's To, not a verified sender header (#2071).
+    expect(options).not.toHaveProperty('recipientSource');
+    // Those people never wrote to us: no known-tier contact for them.
+    expect(sendArg.toFromOwnMessage).toBe(true);
+  });
+
+  it('does not mark a reply to someone who wrote to us', async () => {
+    const threadMessage = makeMockMessage({ from: [{ email: CEO_EMAIL }], to: [{ email: SELF_EMAIL }], cc: [] });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([threadMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    const sendArg = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(sendArg).not.toHaveProperty('toFromOwnMessage');
+  });
+
+  it('treats a latest message from another owned account as ours', async () => {
+    const otherAccount = 'joseph-assistant@example.com';
+    const multiAccount = makeAdapter(mocks, { suppressedSenderEmails: [SELF_EMAIL, otherAccount] });
+    void multiAccount.start();
+    const threadMessage = makeMockMessage({
+      from: [{ email: otherAccount }],
+      to: [{ email: CEO_EMAIL }],
+      cc: [{ email: otherAccount }],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([threadMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    const [sendArg, options] = (mocks.outboundGateway.send as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(sendArg).toMatchObject({ to: CEO_EMAIL, toFromOwnMessage: true });
+    expect(sendArg.cc).toBeUndefined();
+    expect(options).not.toHaveProperty('recipientSource');
+    await multiAccount.stop();
+  });
+
+  it('sends nothing when the latest message is ours and addressed only to us', async () => {
+    const threadMessage = makeMockMessage({
+      from: [{ email: SELF_EMAIL }],
+      to: [{ email: SELF_EMAIL }],
+      cc: [],
+    });
+    (mocks.outboundGateway.listEmailMessages as ReturnType<typeof vi.fn>).mockResolvedValue([threadMessage]);
+
+    await triggerOutbound(makeOutboundEvent('email:thread-abc'));
+
+    expect(mocks.outboundGateway.send).not.toHaveBeenCalled();
+  });
+});
+
+describe('EmailAdapter — subscribeOutbound once-guard (#2312)', () => {
+  it('a second subscribeOutbound() subscribes nothing more, and start() after it adds none', () => {
+    const mocks = createMocks();
+    const adapter = makeAdapter(mocks);
+    adapter.subscribeOutbound();
+    const subscribed = (mocks.bus.subscribe as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(subscribed).toBeGreaterThan(0);
+    adapter.subscribeOutbound();
+    expect((mocks.bus.subscribe as ReturnType<typeof vi.fn>).mock.calls.length).toBe(subscribed);
+    // start() calls subscribeOutbound() itself; as in the suite above, the poll is not awaited.
+    void adapter.start();
+    expect((mocks.bus.subscribe as ReturnType<typeof vi.fn>).mock.calls.length).toBe(subscribed);
   });
 });

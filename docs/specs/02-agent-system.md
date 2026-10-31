@@ -14,23 +14,154 @@ All external communication flows through a single **Coordinator agent** — the 
 
 As of v0.35.0 the Coordinator prompt was re-derived around an explicit three-way routing decision — handle directly, borrow-then-answer (pull work from a specialist, then reply in its own voice), or transfer-ownership (hand the whole interaction to a specialist that owns its lifecycle). The keystone rule: a reply to anything the Coordinator sent on a specialist's behalf (a delegation-hinted outbound) is always transfer-ownership and is routed back to that specialist, never answered directly. Tool-specific mechanics were relocated out of the prompt into the relevant skill manifests (`config-store`, `email-send`/`email-reply`, `signal-send`, `decay-warnings-list`), and the vestigial executive-voice block was removed — CEO-voice drafting lives in the ceo-inbox specialist.
 
+### Delegated specialist context (#1871)
+
+The trust decision — who may authorize a relay, what a specialist author may
+assume, and why the specialist does not re-adjudicate requester identity — is
+[ADR-045](../adr/045-delegated-specialist-trust.md). This section is the
+behaviour that follows from it.
+
+`delegate` publishes the specialist task with `metadata.delegationOrigin`, the
+validated `metadata.originator`, and no `senderContext`. The runtime renders
+two blocks. Requester identity (contact id, channel, system role, tier) goes on
+any internal-channel task that carries a validated originator, including a
+coordinator task such as the voice off-ramp. The delegated-specialist addendum,
+including the `<specialist_decline>` instructions, is rendered only when
+`delegationOrigin` is set. The coordinator does not receive that addendum.
+
+Detection keys off `delegationOrigin`, not `channelId`. A new internal-channel
+caller does not inherit specialist framing. Channel `internal` with neither a
+validated originator nor `delegationOrigin` still receives the unresolved-sender
+low-trust block. Inbound channel metadata cannot supply `delegationOrigin`; the
+dispatcher strips it, the same way it strips a channel-supplied `originator`.
+Only `delegate` stamps the marker, on the specialist task.
+
+Each delegated specialist task emits `delegation.requester_context` with the
+identity evidence placed in the prompt: `contactId`, `channel`, `systemRole`,
+`tier`, and whether the addendum was applied. The specialist `agent.task` id
+is the correlation key. `AuditLogRepo.findDelegationRequesterContext` returns
+the rows for that one delegation.
+
+Calendar RSVP policy stays scoped to a formal-invite consult. A day brief has
+no invite sender. The reason that judgment is task-scoped is ADR-045.
+
+A specialist that cannot do the task ends its reply with
+`<specialist_decline>`. A marker quoted earlier in the answer is not a refusal.
+`delegate` returns `declined: true` rather than prose,
+and `DelegationGuard` blocks further attempts to that specialist for the turn
+even when the coordinator rewords the brief.
+
+### Late delegation delivery (#1799)
+
+A `delegate` wait that times out does not stop the specialist — by design (#1288): cancelling an
+in-flight run risks a half-completed side effect, so the run is left alone and the coordinator's
+turn ends. A queued same-contact follow-up ends that wait the same way (#2018): the specialist
+keeps running, and the handle's `cause` is `interrupted` rather than a timeout. The specialist
+then finishes minutes later and publishes an `agent.response` whose originating turn no longer
+exists. Before v0.44 nothing consumed it, and the work was silently lost: the weekly travel sweep
+timed out four weeks running while the calendar agent delivered a full result each time, and no
+trip task was created for a month.
+
+The lifecycle now:
+
+1. When the wait ends, the runtime publishes `delegation.timed_out` carrying the delegate
+   `agent.task` event id — the value the specialist stamps as `parentEventId` on its eventual
+   response — plus the originating routing. `cause` is `wait_timeout` when the delegate timer
+   fired, and that payload also carries the id of the CEO review task the escalation created.
+   `cause` is `interrupted` when a same-contact follow-up was queued: no review task is opened
+   and nothing is escalated. Either way the late result still wakes the originating turn.
+2. `LateDelegationSubscriber` (system layer) persists that as a row in `pending_delegations`,
+   or promotes the dispatch-time `running` claim for the same `delegate_event_id` in place.
+   `UNIQUE (delegate_event_id)` makes the handle idempotent, and `status` is a lease
+   (`running` → `pending` → `claimed` + `claim_token` → `resolved`) so an actor that crashes
+   mid-delivery leaves recoverable work rather than a row claiming work that never happened.
+3. When the late response arrives, it is classified. A usable result re-enters the **originating
+   agent in its original conversation** with a brief carrying the specialist's output, and the
+   review task is closed. Every other outcome — the specialist ultimately failed, came back with a
+   question, paused, has no routable origin, or a human already closed the review — is recorded on
+   that review task and left open for the principal.
+4. `LateDelegationSweep` (default every 5 min) covers what an in-process subscriber cannot: a
+   response that landed while the process was down or before the handle was written (recovered from
+   `audit_log.parent_event_id`), an abandoned lease, and a handle whose specialist never delivered
+   (abandoned after `delegate.lateDelivery.ttlMinutes`).
+
+Waking is idempotent by construction, not by lock. `EventBus.publish()` awaits its subscribers, and
+one of those is the woken agent's entire turn — minutes of LLM rounds, easily longer than the 120s
+claim lease. While that turn is in flight the holder refreshes `claimed_at` for up to 30
+minutes, so a sweep does not re-claim a resolution that is still running (#1861). Past that
+budget the refresh stops and the lease lapses, so a turn that never settles is recoverable
+again. The wake's event id is *derived* from the delegate event id, so a retry after the holder
+crashed — or a sweep that claims once the budget has lapsed — carries the same id and the audit
+logger's write-ahead insert rejects it on `audit_log`'s primary key before a single subscriber
+sees it. After
+the wake returns, only the actor that still holds the lease annotates the review task and publishes
+`delegation.late_resolved`. A re-claim that finds that event already in `audit_log` finalizes the
+row and does not emit a second one. A wake that failed to publish still releases the lease, so a
+retry can deliver it. The stored `wake_task_event_id` is a record of what happened; the derived id
+is the guarantee.
+
+Two further invariants govern the wake:
+
+- **Re-delegation is blocked structurally.** The wake carries `metadata.lateDelegation`, and the
+  runtime seeds `DelegationGuard` from it, so a model that tries to re-fetch a result it was just
+  handed is short-circuited rather than talked out of it (#1310's guard behaviour is preserved).
+- **The brief never restates the original delegated instruction.** #1064 is the precedent: a notify
+  `agent.task` that echoed the original intent made the coordinator re-execute it and send a
+  duplicate. The original brief is already in the conversation the wake re-enters.
+- **A specialist is claimed when the run is published, not only after the wait expires
+  (#1893, #1858).** Before publishing, and only after a `resume_token` has been validated,
+  `delegate` inserts a `pending_delegations` row with `status = 'running'` for that target
+  agent and originating conversation. A partial unique index makes the insert the claim: a
+  second call, whatever its brief says, returns `already_in_flight` with the existing
+  `delegate_event_id` and `open_handle_age_ms` and does not dispatch. A call with no
+  origin to store — the turn never supplied a sender — logs the gap and publishes
+  without a claim, so voice and an approval re-invoke still start the specialist.
+  An insert that throws still does not dispatch. Age on a running row
+  is time since dispatch; age on a pending row starts when the wait expires (or when that
+  claim is promoted). Every return except the wait-timer timeout deletes the running row.
+  A specialist that reports `reason: 'timeout'` has already finished, so that row is
+  released too. If the delete throws, the row is marked resolved as `delivered` so the
+  sweep does not send the same result again. The running row stores the validated
+  originator, so a claim recovered after a crash wakes with its lineage. A wait-timer
+  timeout does not delete the row: the same row becomes the `pending` handle, and the
+  lookup matches both statuses. The running row's `expires_at` is the wait plus a short
+  grace, so the sweep abandons a claim orphaned by a crash in about the wait, not the
+  late-delivery hour. A pending row still blocks until the sweep abandons it
+  (`delegate.lateDelivery.ttlMinutes`, default 60). A claimed or resolved handle does not
+  block the next delegation. A brief that never dispatched — claim conflict,
+  `already_in_flight`, or a later call skipped after escalation — is stored as a backlog
+  task that wakes the originating agent in the originating conversation. A brief
+  blocked by a `running` claim waits out that claim's delegate wait. A brief
+  blocked by a `pending` handle waits until that row's `expires_at` plus one sweep
+  interval — the wait is far shorter than the late-delivery TTL, and waking on it
+  burns the retry cap while the handle is still open. A later call skipped after
+  the wait-timer timeout of the same specialist uses the expiry the timeout
+  subscriber will write. A specialist that reports `timeout` has already finished
+  and released its claim, so that skip uses the delegate wait. The task is closed
+  when that wake is dispatched, so the
+  heartbeat does not re-run the brief. A timeout is not queued again. Retries of one
+  busy specialist are capped. A wake missing its channel or sender is not written.
+  The result is not a failure, so a coordinator that ignores the prompt can call `delegate`
+  again in the same turn; the prompt is what stops that loop.
+
+The wake restores the stored `originator` (so the follow-up steps still clear the autonomy gate),
+marks itself `derived` via `wakeContext` (so the standing ladder can only downgrade authority), and
+deliberately does not carry `liveTurn` — it crosses an async boundary (#1126).
+
+`delegate.lateDelivery.enabled: false` disables the whole mechanism, including the in-flight
+lookup. Open handles are then neither resolved nor consulted, so turning the knob off does not
+leave a permanent block behind.
+
 ### Coordinator Config
 
 ```yaml
 # agents/coordinator.yaml
 name: coordinator
 role: coordinator                # special role — dispatch always routes here
-persona:
-  display_name: Alex             # what end-users see in emails, messages
-  tone: professional but warm
-  email_signature: |
-    Alex
-    Office of the CEO
 model:
   tier: standard
 system_prompt: |
-  You are ${persona.display_name}, executive assistant to the CEO.
-  You are the single point of contact for all communications.
+  You are a chief of staff, the single point of contact for all communications.
   You have a team of specialists you can delegate to, but you always
   respond in your own voice. The sender should never know multiple
   agents were involved.
@@ -39,13 +170,17 @@ system_prompt: |
   For tasks, delegate to the appropriate specialist and synthesize
   their work into your response.
 pinned_skills:
-  - skill-registry
+  - tool-registry
   - scheduler
   - memory-query
 allow_discovery: true
 ```
 
-The `role: coordinator` field tells the dispatch layer to route all inbound messages here. There is exactly one coordinator per deployment.
+The `role: coordinator` field tells the dispatch layer to route all inbound messages here. There is exactly one coordinator per deployment. The YAML carries no `persona:` block: the assistant's name, title and email signature are office identity config, injected by the runtime and appended by the outbound gateway — see [spec 13](13-office-identity.md).
+
+### Prompt assembly
+
+Behavior rules go on the highest rung that works ([ADR-046](../adr/046-agent-behavior-fix-placement.md)): code enforcement, then injection with its trigger, then the tool description, then a lazily loaded playbook, and only last the always-on `system_prompt`. Guidance that applies only on some turns rides `agent.task.turnGuidance` and is rendered at the head of that turn's user message, not the system prompt (#1959). The coordinator's `## Available Specialists` roster uses each agent's `delegate_when`, falling back to its `description`. `tests/unit/agents/prompt-budget.test.ts` budgets the always-on prompt and local tool-definition bytes of the coordinator (plus its roster) and of `calendar`, `ceo-inbox`, `contacts` and `meeting-debrief`; a deployment holds its own agents to budgets with the same `measureAgentContext()` (`src/agents/prompt-budget.ts`).
 
 ### Model Routing
 
@@ -57,13 +192,26 @@ Agents declare a capability tier rather than a specific model (see [ADR-014](../
 | `standard` | General-purpose task execution |
 | `powerful` | Complex multi-step reasoning, synthesis |
 
-The operator maps tiers to models in `config/default.yaml` → `model_routing`. The `ModelRouter` service resolves each agent's tier to a concrete model at startup; the provider is inferred automatically from the `ModelRegistry` based on the model name prefix (e.g., `claude-*` → Anthropic, `google/gemini-*` or `openai/gpt-*` → OpenRouter).
+The operator maps tiers to models in `config/default.yaml` → `model_routing`. The `ModelRouter` service resolves each agent's tier to a concrete model at startup; the provider is inferred automatically from the `ModelRegistry` based on the model name prefix (e.g., `claude-*` → Anthropic, `google/gemini-*` or `openai/gpt-*` → OpenRouter, `global.anthropic.*` / `us.anthropic.*` / `eu.anthropic.*` → AWS Bedrock).
 
 Optional `needs` flags (`vision`, `large_context`, `reasoning`, `coding`, `audio`, `image_generation`) are documentary — they inform future routing decisions but are not validated in this version.
 
 ### Internal Agent Handles
 
 Specialist agents have internal handles (e.g., `@expense-tracker`, `@research-analyst`) used in the Bullpen and audit log. These are never exposed to external users — they're internal identifiers for the Coordinator and other agents to reference.
+
+Optional `display_name` on the agent YAML is the phrase a principal-facing message may use. When it is absent, the runtime derives one (`social-media` → `social media specialist`). A delegation-failure reply is written by the model with the failed request in context. If that call is unavailable, empty, or still contains the registry id, the fallback uses the display name and quotes the request. Two different asks therefore do not produce the same sentence. (#1860)
+
+### Channel ownership for delegated work
+
+One delegated item produces one message to the principal.
+
+- **Borrow-then-answer** — the coordinator owns the channel. The specialist returns work internally. The coordinator composes the one reply.
+- **Transfer-ownership** — the specialist owns the channel and sends the result (Signal, SMS, Slack, or email). The coordinator does not narrate that send back on the same channel.
+
+A bullpen post from a specialist whose delegation is still `running` wakes the delegator with `originTurnOwnsReply` on that task. The wake may still reply on the thread, and a wake with no open delegation may still message the principal. It may not call `email-reply`, `email-send`, `send-draft`, `signal-send`, `sms-send`, or `slack-send`: the originating conversation sends the one reply, so the context bridge stays there. `originator` is still propagated and `liveTurn` is still omitted (#1126). The lookup reads the same running claim as in-flight delegation protection, and it is unwired when late delivery is off. A lookup error still dispatches the wake. (#1917)
+
+Enforcement is not prompt-only. A successful human-facing send (`email-reply`, `email-send`, `signal-send`, `sms-send`, `slack-send`) sets the dispatcher reply-lock on the task in `tool.result.routingTaskId` only. The recipient matches the inbound sender, or another verified active identity of that contact, so a Signal send can lock an email task for the same person. A delegated specialist runs in a `delegate-…` conversation; `originConversationId` is the principal conversation and `routingTaskId` is the coordinator task that delegated. A direct task's `routingTaskId` is its own id. A channel-supplied `delegationOrigin` is stripped before routing, so it cannot point the lock elsewhere. Another pending task in that conversation still relays. The locked task's later `agent.response` is not delivered. Its text is filed on a closed bullpen thread (no mentions, so nobody is woken). A send to someone else does not lock. (#847, #1860)
 
 ---
 
@@ -78,14 +226,12 @@ description: Tracks and categorizes expenses from receipts and emails
 model:
   tier: standard
 system_prompt: |
-  You are an expense tracking assistant for a CEO.
+  You are an expense tracking assistant for the principal.
   Extract amounts, vendors, categories, and dates from receipts.
 pinned_skills:
   - email-parser
   - spreadsheet-writer
 allow_discovery: true    # can discover and use non-pinned skills
-memory:
-  scopes: [expenses, vendors, budgets]
 schedule:
   - cron: "0 9 * * 1"
     task: "Generate weekly expense summary"
@@ -102,7 +248,7 @@ handler: ./research-analyst.handler.ts
 # ... same config fields plus custom logic
 ```
 
-Handler exports hooks: `onTask`, `onSkillResult`, `beforeRespond`.
+Handler exports hooks: `onTask`, `onToolResult`, `beforeRespond`.
 
 ### Config Validation
 
@@ -126,8 +272,8 @@ Both `${agent_contact_id}` and `${principal_contact_id}` are guarded by a UUID-f
 
 1. Dispatch layer receives `inbound.message`, routes to agent
 2. Agent loads system prompt + relevant memory (entity facts, knowledge graph context, Bullpen status)
-3. Agent calls LLM, which may request skill invocations → publishes `skill.invoke`
-4. Skill results return via `skill.result`
+3. Agent calls LLM, which may request skill invocations → publishes `tool.invoke`
+4. Skill results return via `tool.result`
 5. Agent formulates response → publishes `agent.response`
 6. Dispatch routes response to originating channel
 
@@ -140,7 +286,7 @@ The agent runtime exposes hooks at key lifecycle points. Hooks are used by the f
 - `beforeLLMCall(context)` — modify context before sending to LLM (memory injection, context pruning)
 - `afterLLMCall(response)` — inspect/modify LLM response before acting on it
 - `beforeSkillInvoke(skill, args)` — validate/modify skill invocation
-- `afterSkillResult(skill, result)` — process skill results before feeding back to LLM
+- `afterToolResult(skill, result)` — process skill results before feeding back to LLM
 - `onTaskComplete(task, result)` — cleanup, memory persistence, metric emission
 - `onTaskError(task, error)` — error recovery logic (see [05-error-recovery.md](05-error-recovery.md))
 
@@ -148,7 +294,7 @@ The agent runtime exposes hooks at key lifecycle points. Hooks are used by the f
 
 ## Agent State Model
 
-**Stateful per-conversation, restart-safe.** Each inbound message carries a `conversation_id` — a deterministic UUID v5 generated from `channel:user_id:thread_id` (e.g., `signal:+15550001111:thread-789` → UUID). The agent loads conversation history from working memory (Postgres) on each invocation. No in-process state — restarts lose nothing.
+**Stateful per-conversation, restart-safe.** Each inbound message carries a `conversation_id` — a deterministic, human-readable key derived from the channel and its native thread/sender identity (e.g., `signal:+15550001111`, `email:<threadId>`, `cli:local:default`). It is deliberately *reversible*: outbound adapters parse it back to recover the reply target (thread id, phone number, group id). Stored as TEXT, not a UUID. See ADR-025. The agent loads conversation history from working memory (Postgres) on each invocation. The turn lane is the in-process exception ([ADR-053](../adr/053-turn-lanes-and-mid-turn-injection.md)): one coordinator turn holds a human conversation until it releases. A follow-up that was queued and not drained when the process stops stays unacknowledged, so inbound replay delivers it as its own turn. Conversation history itself stays in Postgres.
 
 ---
 
@@ -198,7 +344,7 @@ This is everything needed to render agents as characters in a visual office: who
 Agent receives message, responds, done. Working memory for the conversation is kept for a configurable TTL (default: 1 hour of inactivity).
 
 ### Persistent Tasks
-Long-running work creates a **task record** in Postgres (the `tasks` table; renamed from `agent_tasks` in v0.33 — see [spec 19 — Tasks & Backlog](19-tasks-and-backlog.md)). The scheduler wakes the agent in bursts — it loads progress from working memory, does a chunk of work, saves progress, sets `next_run`. Like a cron job with state. Task management is also exposed to agents declaratively via the `enable_task_management` capability (spec 19 §4).
+Long-running work creates a **task record** in Postgres (the `tasks` table; renamed from `agent_tasks` in v0.33 — see [spec 19 — Tasks & Backlog](19-tasks-and-backlog.md)). The scheduler wakes the agent in bursts — it loads progress from working memory, does a chunk of work, saves progress, sets `next_run`. Like a cron job with state. Task management is also exposed to agents by pinning the `tasks` skill (spec 19 §4); document workspace is the separate `documents` skill.
 
 Each persistent task carries:
 - `intent_anchor` — the original task description, included in every burst's system prompt to prevent drift
@@ -209,14 +355,15 @@ Each persistent task carries:
 
 ## LLM Provider Abstraction
 
-Multi-provider from day one:
+Multi-provider from day one. There are three chat providers: Anthropic (Claude API), OpenRouter (the route to OpenAI, Google and DeepSeek models) and AWS Bedrock. To add one, follow [Adding an LLM Provider](../dev/adding-an-llm-provider.md).
 
 ```
 src/agents/llm/
   provider.ts      # common interface
   anthropic.ts     # Claude API (Anthropic)
-  openrouter.ts    # OpenRouter API (Gemini Flash, DeepSeek V3, GPT-4o, etc.)
-  ollama.ts        # local models
+  openrouter.ts    # OpenRouter API (Gemini Flash, DeepSeek, GPT-4o, etc.)
+  bedrock.ts       # AWS Bedrock Converse API (Claude via inference profiles; chat only, no stream())
+  reasoning-watchdog-provider.ts # wrapper that bounds runaway reasoning (ADR-048 amendment, #2371)
   model-registry.ts # ModelRegistry — centralized model metadata
 ```
 
@@ -228,10 +375,19 @@ interface LLMProvider {
   chat(params: {
     messages: Message[];
     tools?: ToolDefinition[];
-    options?: LLMOptions;
-  }): Promise<LLMResponse>;
+    toolResults?: ToolResult[];
+    model?: string;
+    options?: Record<string, unknown>;   // max_tokens, temperature, reasoning, signal, ...
+  }): Promise<LLMResponse>;              // text | tool_use | error — API failures are returned, not thrown
+
+  // Optional. Voice and the reasoning watchdog need it; Bedrock has none.
+  stream?(params: { /* same as chat() */ }): AsyncIterable<LLMStreamEvent>;
 }
 ```
+
+`LLMStreamEvent` is `request_started`, `output_started`, `text_delta`, `reasoning_delta`, `tool_use`, `message_end` or `error`. `request_started { maxTokens }` comes first, once, and carries the `max_tokens` the request actually sent. `reasoning_delta { text }` comes once per readable reasoning delta, never for encrypted thinking. `output_started` comes at most once, on the first tool-call chunk, because tool-call arguments produce no other event. Every successful response carries `LLMCallProvenance`, which `llm.call` publishes.
+
+**Reasoning watchdog (#2371).** Each concrete provider is wrapped in `ReasoningWatchdogProvider`, which implements the same interface. It runs a `chat()` through the inner provider's `stream()` and stops the call when reasoning reaches half of the request's `max_tokens`, or half of the usable time window passes, before any output starts (`text_delta`, `output_started` or a terminal event). It then makes one forced attempt through `inner.chat()`, with the tail of the reasoning appended as a runtime note (omitted for a provider that sets `acceptsReasoningInForcedAttempt = false`, as Anthropic does). The window ends at the turn's deadline when the `agent.task` payload carries `turnDeadlineAt` (set by delegation and the scheduler), or at the 10-minute request timeout otherwise, less 60s reserved for the forced attempt. A provider without `stream()` is passed through unwatched. `llm.call` records a stop as `reasoningWatchdog`, and it is `null` when the watchdog did not fire. Turns stay non-cancellable: the deadline positions the watchdog and never aborts a turn. See ADR-048's 2026-10-29 amendment.
 
 ### Provider Configuration
 
@@ -241,7 +397,7 @@ Agents declare a capability tier, and the system resolves it to a concrete model
 model_routing:
   tiers:
     fast:
-      model: claude-haiku-4-5
+      model: claude-haiku-5-5
     standard:
       model: claude-sonnet-4-6
     powerful:
@@ -256,7 +412,21 @@ model:
   needs: [vision, large_context]  # optional hints for routing decisions
 ```
 
-The `ModelRegistry` holds static metadata (pricing, context window, provider prefix) for all supported models. `ModelRouter` validates that each tier's configured model exists in the registry at startup. Cost estimation and token tracking delegate to registry data rather than hardcoded values.
+The `ModelRegistry` holds static metadata (pricing, context window, provider prefix, and declared capabilities) for all supported models. `ModelRouter` validates that each tier's configured model exists in the registry at startup. Cost estimation and token tracking delegate to registry data rather than hardcoded values.
+
+**Lookup is exact-first, then prefix (#1804).** A model id that is a registry key resolves to its own entry. Otherwise the longest registered prefix matches — `claude-haiku-4-5-20251001` → `claude-haiku-4-5` — and the hit is logged at `warn`, naming both ids, once per distinct model id. A prefix hit means the model is being priced and sized as a *different* model, which is only a guess: `deepseek/deepseek-v4-pro-0813` prefix-matched `deepseek/deepseek-v4-pro` and inherited its rates, booting cleanly while reporting costs that were wrong by roughly 3x. Register a dated snapshot in its own right whenever its metadata differs from the base model's.
+
+**Capabilities are the gate for capability-dependent subsystems (#1553).** A model declares what it can do (e.g. `streaming`, `tools`) and callers preflight against that, not against the provider interface. Voice is the first consumer: a spoken turn needs true streaming (ADR-037) and tool calls, and a provider merely *exposing* `stream()` does not prove either — OpenRouter implements `stream()` for every routed model, including ones that neither stream nor tool-call. Voice boot therefore resolves its model and refuses to start when the registry entry is missing `streaming` or `tools` (or when the model is unknown to the registry at all).
+
+**Request-shape flags (#2077).** Two registry flags change what `AnthropicProvider` sends, so the rule lives in one place rather than at each call site. `rejectsSamplingParams` marks a model that returns a 400 for any non-default `temperature`, `top_p` or `top_k`: the provider omits the temperature a caller passes, and every `llm.call` publisher records `temperature: null` through `sentTemperature()` so the audit row matches the request. `thinksByDefault` marks a model that runs adaptive thinking when the request leaves `thinking` unset. Since ADR-048 it is a fact, not a request rule: an unset request gets the model's default, and the provider reads the flag only to give a request that will think a 16,384-token output cap. `claude-haiku-5-5`, `claude-sonnet-5-5` and `claude-opus-5-5` carry both. `deepseek/deepseek-v4.1-flash` carries `thinksByDefault` only, from a measurement at the small-cap call sites (#2224).
+
+**Reasoning effort (ADR-048 §2–3).** `model_routing.tiers.<tier>.reasoning.effort` (`none | low | medium | high | max`) applies to agent turns; the fallback tier's own setting applies when it serves a turn. `ModelRouter` rejects at boot an effort the model's registry `reasoning` entry does not list. Unset sends nothing, so each model keeps its own default. OpenRouter sends `reasoning: { effort }`. `AnthropicProvider` sends adaptive thinking with summarized display plus `output_config.effort`, `none` as `thinking: disabled`, and omits thinking when the call sets a temperature the model accepts or a `max_tokens` below 1,024. Every non-agent call site (judges, `infra-llm`, scoring, drift detection, summarization, voice) sends `NO_REASONING`, which a provider forwards only to models that list `none`. `llm.call.reasoningEffort` records what the provider reports it sent.
+
+A registry entry can name a different value for `none` in `thinkingOffType`. `claude-sonnet-5-5` names `between_tools`, because it rejects `disabled`. `between_tools` turns off thinking before the first response only. Anthropic documents short thinking between tool calls, though none appeared in 16 live requests on 2026-10-21. A call with tools at `none` gets the 16,384-token output cap as a precaution. `claude-opus-5-5` cannot turn thinking off at any effort, so its registry entry does not list `none`. A call site that sends `NO_REASONING` to Opus 5.5 gets the model's default thinking.
+
+**Small-cap call sites (#2224).** Boot refuses a model that fails `ModelRegistry.canTurnThinkingOff` as the fast-tier model, either judge's model or, when the voice channel starts, `channels.voice.model` (`src/agents/llm/small-cap-models.ts`). The error names the config key. The small-cap call sites run on those models: the drift detector, setup's name suggestion, extract-facts, extract-relationships, voice-learn, scan-grant-recommendations and file-parse run on the fast tier for that reason, and a unit test fails if any `infraLlm.extract` is left on standard. A model passes if its entry lists `none` or records `thinksByDefault: false`; with the flag unset, only a model with no `reasoning` entry and no `reasoning` capability passes.
+
+**Reasoning pass-back (ADR-048 §1).** Within one task's tool loop, each assistant `tool_use` turn carries the reasoning that produced it into the next request, as `ReasoningContent` blocks placed first in the turn. OpenRouter sends back `reasoning_details` unmodified (rebuilt from stream fragments when streaming); Anthropic sends back `thinking` and `redacted_thinking` blocks with their signatures. A provider drops blocks another model or provider wrote (tier fallback). For models flagged `thinkingBoundToPrefix` (`claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`), `AnthropicProvider` also checks each turn's thinking against the request prefix (system, tools, earlier messages) as it will be sent, with earlier drops applied, and drops blocks written for a different prefix, because the API rejects stale blocks and the loop does change the prefix (the Bullpen refresh, tool discovery). Blocks written after a change match the reduced prefix and go back on later rounds. Reasoning never enters conversation history, and `llm_call_archive` stores a marker in place of each block.
 
 ### Response Normalization
 
@@ -280,41 +450,25 @@ All agents receive a `## Current Date & Time` block in their system prompt on ev
 **All inbound messages route to the Coordinator.** The dispatch layer does not classify or route messages to specialist agents — that's the Coordinator's job. The dispatcher's responsibilities are:
 
 - Route every `inbound.message` to the Coordinator agent
+- Hold one coordinator turn at a time on a human-channel conversation (`dispatch.turnInjection`, [ADR-053](../adr/053-turn-lanes-and-mid-turn-injection.md)). On in the shipped config; `enabled: false` or omitting the key leaves it off. With the flag on, a live follow-up from the same resolved contact is drained into the turn still running, and the drain is audited as `agent.task.input_injected`. Any other arrival — a different sender, an unresolved sender, auto-generated mail, a message with scanner findings, or a synthetic wake — waits, then runs as its own turn. Scheduler, internal, bullpen, and voice turns are not laned. A waiter that has waited `laneWaitTimeoutMs` (20 minutes) logs an error and runs anyway, without taking the lane.
 - Enforce policy: rate limits, blocked senders, required approvals
-- Translate `agent.response` → `outbound.message` (completing the response loop)
-- Inject `persona.display_name` and `persona.email_signature` into outbound messages
+- Translate `agent.response` → `outbound.message` (completing the response loop), unless the agent returns the `NO_REPLY` sentinel (or `suppressDelivery`) — then publish `outbound.no_reply` and send nothing (#1732). The sentinel is interpreted only by the agent runtime (which blanks `content` and sets `suppressDelivery`) and by dispatch. Other `agent.response` subscribers (scheduler job summary, resumable-continuation) must not parse `content` as a control token.
+- Email the principal a note the coordinator left for them in a reply to someone else (`principalNote`, cut out of `content` by the runtime), whatever happens to the relay ([spec 15](15-outbound-safety.md), prompt trim PR 5)
+- On a principal turn, count what is waiting on the principal (decay warnings, pending approvals, open tasks they own) and, when anything is, set `principalBacklog` on the `agent.task`. The runtime renders it as one line at the end of the turn guidance, telling the coordinator to raise the oldest at a natural pause (`src/agents/prompts/backlog-line.ts`, prompt trim PR 7). A failed count means no line
+- Name the trigger guidance a turn needs (`turnGuidance` on the `agent.task`, `src/dispatch/turn-guidance-triggers.ts`). Two cover scheduling the principal starts (#2227):
+  - `principal-forward`: the principal emails Curia a forward (a `Fwd:`/`FW:` subject, or a Gmail or Apple Mail forward marker). Unless the note says otherwise, the forward is a request to handle what it asks, and Curia tells the principal what it did rather than asking. It replaces the reply-shaped note.
+  - `booking-link`: the message holds a booking-page link (Calendly, Google booking pages, cal.com, Microsoft Bookings and others). When Curia is setting up a meeting with the page's owner, it books through the page with `web-browser`, creates no event or hold of its own (the page sends the invite), and offers times by email only if the page fails.
+  - `make-room`: the principal's own words (above any quote, and not a line quoted with `>`) ask to make room ("let me move a few things around", "free up time", "move my focus block"). A refusal in the same clause ("don't move my meetings") does not count. Curia never offers a slot over an existing event unless it is moved first. What may move, in order: the principal's own blocks, then small internal meetings, then larger internal ones. External, many-stakeholder, and personal or medical events never move. At autonomy 80 or above (the high-risk floor for calendar writes, [spec 14](14-autonomy-engine.md)) Curia moves what is needed and tells the principal what moved. Below 80 it moves nothing and asks the principal privately with one specific proposal.
+- Leave signatures to the outbound gateway, which adds the office identity's `email_signature` below every email it sends or drafts ([spec 13](13-office-identity.md), prompt trim PR 6)
 - Check for pending Bullpen threads on every `agent.task` routing
 - Subscribe to `agent.error` and notify the user on the originating channel
 - Mediate Bullpen discussions — escalate to user if agents are stuck
 
 ---
 
-## Implementation Status
+## Known Deficiencies
 
-| Item | Status |
-|---|---|
-| Coordinator agent — `role: coordinator` routing, `coordinator.yaml` config | Done |
-| Specialist agents — YAML-only config (expense-tracker, research-analyst, etc.) | Done |
-| TypeScript handler escape hatch (`handler:` field, custom lifecycle hooks) | Done |
-| Agent YAML config validation against JSON Schema at startup | Done |
-| Lifecycle hooks (`beforeLLMCall`, `afterLLMCall`, `beforeSkillInvoke`, `afterSkillResult`, `onTaskComplete`, `onTaskError`) | Not Done — no hook system in `AgentRuntime` |
-| Agent state model — stateful per-conversation, Postgres-backed, restart-safe | Done |
-| Agent presence — `GET /api/agents/status` snapshot endpoint | Partial — endpoint exists but all agents return hardcoded `state: 'idle'`; real-time state machine not built |
-| Agent presence — SSE stream at `GET /api/agents/status/stream` | Not Done |
-| Execution mode: reactive (message → respond) | Done |
-| Execution mode: persistent tasks (burst execution, `intent_anchor`, `progress` JSONB) | Done |
-| LLM provider abstraction (`LLMProvider` interface, `provider.ts`) | Done |
-| Anthropic provider | Done |
-| OpenRouter provider (Gemini Flash, DeepSeek V3, GPT-4o via `OPENROUTER_API_KEY`) | Done |
-| Model registry — centralized pricing, context windows, capabilities for all models | Done |
-| Ollama (local model) provider | Not Done |
-| Fallback provider (`model.fallback` in agent config) | Not Done |
-| Token tracking per LLM call (input/output tokens via `llm.call` event) | Done |
-| Cost tracking per LLM call (estimated USD in `llm.call` event) | Done |
-| Dispatch layer — route all inbound to Coordinator, enforce rate limits and policy | Done |
-| Dispatch layer — translate `agent.response` → `outbound.message` | Done |
-| Dispatch layer — inject office identity (display name, email signature) into outbound | Done |
-| Dispatch layer — check pending Bullpen threads on every routing | Done |
-| Dispatch layer — subscribe to `agent.error` and notify user | Done |
-| Turn budget injection — agent runtime prepends a max-turns budget block to the system prompt, with proximity threshold and anti-retry guidance | Done |
-| CallerContext synthesis — delegated specialist tasks reconstruct a synthetic CallerContext from the originator so skills see consistent caller fields | Done |
+- **Lifecycle hooks** — no hook system in `AgentRuntime`; `beforeLLMCall`, `afterLLMCall`, `beforeSkillInvoke`, `afterToolResult`, `onTaskComplete`, and `onTaskError` are not implemented.
+- **Agent presence snapshot** — the `GET /api/agents/status` endpoint exists but all agents return hardcoded `state: 'idle'`; a real-time state machine has not been built.
+- **Agent presence SSE stream** — the `GET /api/agents/status/stream` endpoint is not implemented.
+- **Ollama provider** — the local-model provider is not implemented; no `ollama.ts` provider file exists.

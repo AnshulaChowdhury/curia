@@ -8,14 +8,14 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import pino from 'pino';
 import { ExecutionLayer } from '../../../src/skills/execution.js';
-import { SkillRegistry } from '../../../src/skills/registry.js';
-import type { SkillManifest, SkillHandler, SkillContext } from '../../../src/skills/types.js';
+import { ToolRegistry } from '../../../src/skills/registry.js';
+import type { ToolManifest, ToolHandler, ToolContext } from '../../../src/skills/types.js';
 import type { EntityContextAssembler } from '../../../src/entity-context/assembler.js';
 import type { EntityContext } from '../../../src/entity-context/types.js';
 
 const logger = pino({ level: 'silent' });
 
-function makeManifest(overrides: Partial<SkillManifest> = {}): SkillManifest {
+function makeManifest(overrides: Partial<ToolManifest> = {}): ToolManifest {
   return {
     name: 'test-skill',
     description: 'A test skill',
@@ -35,31 +35,57 @@ const sampleEntityContext: EntityContext = {
   entityId: 'node-1',
   entityType: 'person',
   label: 'Jenna Smith',
-  contact: { contactId: 'contact-1', displayName: 'Jenna Smith', role: null },
+  contact: {
+    contactId: 'contact-1',
+    displayName: 'Jenna Smith',
+    role: null,
+    preferredName: null,
+    title: null,
+    organization: null,
+    primaryEmail: null,
+    primaryPhone: null,
+    timezone: null,
+    locale: null,
+    location: null,
+    pronouns: null,
+    linkedinUrl: null,
+    bio: null,
+    birthday: null,
+  },
   facts: [{ label: 'timezone', value: 'America/Vancouver', category: 'scheduling', confidence: 0.9, lastConfirmedAt: '2026-01-01T00:00:00.000Z' }],
   connectedAccounts: [{ type: 'calendar', label: 'Work Calendar', serviceId: 'cal-abc', isPrimary: true, readOnly: false, metadata: {} }],
   relationships: [],
 };
 
-function makeMockAssembler(result: Awaited<ReturnType<EntityContextAssembler['assembleMany']>>): EntityContextAssembler {
+type AssembleManyResult = Awaited<ReturnType<EntityContextAssembler['assembleMany']>>;
+
+// Takes a partial so each test states only the bucket it cares about; the rest
+// default to empty. Keeps tests readable as assembleMany grows buckets.
+function makeMockAssembler(result: Partial<AssembleManyResult>): EntityContextAssembler {
+  const full: AssembleManyResult = {
+    entities: result.entities ?? [],
+    unresolved: result.unresolved ?? [],
+    nodeless: result.nodeless ?? [],
+    failed: result.failed ?? [],
+  };
   return {
-    assembleMany: vi.fn().mockResolvedValue(result),
+    assembleMany: vi.fn().mockResolvedValue(full),
     assembleOne: vi.fn(),
     clearCacheForEntity: vi.fn(),
   } as unknown as EntityContextAssembler;
 }
 
 describe('ExecutionLayer — entity_enrichment', () => {
-  let registry: SkillRegistry;
+  let registry: ToolRegistry;
 
   beforeEach(() => {
-    registry = new SkillRegistry();
+    registry = new ToolRegistry();
   });
 
   it('injects ctx.entityContext when manifest declares entity_enrichment', async () => {
-    let capturedCtx: SkillContext | undefined;
+    let capturedCtx: ToolContext | undefined;
 
-    const handler: SkillHandler = {
+    const handler: ToolHandler = {
       execute: async (ctx) => {
         capturedCtx = ctx;
         return { success: true, data: 'ok' };
@@ -85,9 +111,9 @@ describe('ExecutionLayer — entity_enrichment', () => {
   });
 
   it('uses caller contactId as default when param is empty and default=caller', async () => {
-    let capturedCtx: SkillContext | undefined;
+    let capturedCtx: ToolContext | undefined;
 
-    const handler: SkillHandler = {
+    const handler: ToolHandler = {
       execute: async (ctx) => {
         capturedCtx = ctx;
         return { success: true, data: 'ok' };
@@ -113,9 +139,9 @@ describe('ExecutionLayer — entity_enrichment', () => {
   });
 
   it('uses agentContactId as default when default=agent', async () => {
-    let capturedCtx: SkillContext | undefined;
+    let capturedCtx: ToolContext | undefined;
 
-    const handler: SkillHandler = {
+    const handler: ToolHandler = {
       execute: async (ctx) => {
         capturedCtx = ctx;
         return { success: true, data: 'ok' };
@@ -141,9 +167,9 @@ describe('ExecutionLayer — entity_enrichment', () => {
   });
 
   it('skips pre-enrichment when no assembler is configured', async () => {
-    let capturedCtx: SkillContext | undefined;
+    let capturedCtx: ToolContext | undefined;
 
-    const handler: SkillHandler = {
+    const handler: ToolHandler = {
       execute: async (ctx) => {
         capturedCtx = ctx;
         return { success: true, data: 'ok' };
@@ -164,7 +190,7 @@ describe('ExecutionLayer — entity_enrichment', () => {
   });
 
   it('does not call assembler when skill has no entity_enrichment declaration', async () => {
-    const handler: SkillHandler = {
+    const handler: ToolHandler = {
       execute: async () => ({ success: true, data: 'ok' }),
     };
 
@@ -184,7 +210,7 @@ describe('ExecutionLayer — entity_enrichment', () => {
   it('continues handler invocation when assembler throws (non-fatal)', async () => {
     let handlerCalled = false;
 
-    const handler: SkillHandler = {
+    const handler: ToolHandler = {
       execute: async () => {
         handlerCalled = true;
         return { success: true, data: 'ok' };
@@ -215,7 +241,7 @@ describe('ExecutionLayer — entity_enrichment', () => {
   });
 
   it('includes unresolved IDs in a debug log but does not fail the skill', async () => {
-    const handler: SkillHandler = {
+    const handler: ToolHandler = {
       execute: async () => ({ success: true, data: 'ok' }),
     };
 
@@ -237,10 +263,82 @@ describe('ExecutionLayer — entity_enrichment', () => {
     expect(result.success).toBe(true);
   });
 
-  it('exposes agentContactId on ctx for all skills', async () => {
-    let capturedCtx: SkillContext | undefined;
+  // #1694 / ADR-040 — a contact that exists but holds no KG node is a different
+  // operational signal from an ID that matches nothing, and the log has to say so:
+  // it is the only passive record that a real contact ran through a skill with no
+  // context attached.
+  it('logs nodeless contacts on their own line, not lumped into unresolved', async () => {
+    const warn = vi.fn();
+    const spyLogger = { ...logger, warn, child: () => spyLogger } as unknown as typeof logger;
 
-    const handler: SkillHandler = {
+    const handler: ToolHandler = { execute: async () => ({ success: true, data: 'ok' }) };
+    registry.register(makeManifest({ entity_enrichment: { param: 'contacts', default: 'caller' } }), handler);
+
+    const assembler = makeMockAssembler({
+      unresolved: ['ghost-id'],
+      nodeless: [{ inputId: 'contact-2', contactId: 'contact-2', displayName: 'Seth Berman', cause: 'missing' }],
+    });
+    const execution = new ExecutionLayer(registry, spyLogger, {
+      entityContextAssembler: assembler,
+    });
+
+    const result = await execution.invoke('test-skill', { contacts: ['ghost-id', 'contact-2'] });
+    expect(result.success).toBe(true);
+
+    const messages = warn.mock.calls.map(call => String(call[1]));
+    const nodelessLine = warn.mock.calls.find(call => /no KG node/i.test(String(call[1])));
+    expect(nodelessLine, `expected a nodeless warn line, got: ${messages.join(' | ')}`).toBeDefined();
+
+    // The nodeless line carries contact IDs, and does not also list the unknown ID.
+    const payload = nodelessLine![0] as { contactIds?: string[]; causes?: string[] };
+    expect(payload.contactIds).toEqual(['contact-2']);
+    expect(payload.causes).toEqual(['missing']);
+  });
+
+  it('does not emit a nodeless warn when every contact has a node', async () => {
+    const warn = vi.fn();
+    const spyLogger = { ...logger, warn, child: () => spyLogger } as unknown as typeof logger;
+
+    const handler: ToolHandler = { execute: async () => ({ success: true, data: 'ok' }) };
+    registry.register(makeManifest({ entity_enrichment: { param: 'contacts', default: 'caller' } }), handler);
+
+    const execution = new ExecutionLayer(registry, spyLogger, {
+      entityContextAssembler: makeMockAssembler({ entities: [sampleEntityContext] }),
+    });
+
+    await execution.invoke('test-skill', { contacts: ['contact-1'] });
+
+    expect(warn.mock.calls.filter(call => /no KG node/i.test(String(call[1])))).toHaveLength(0);
+  });
+
+  it('logs failed lookups on their own line, not lumped into unresolved', async () => {
+    const warn = vi.fn();
+    const spyLogger = { ...logger, warn, child: () => spyLogger } as unknown as typeof logger;
+
+    const handler: ToolHandler = { execute: async () => ({ success: true, data: 'ok' }) };
+    registry.register(makeManifest({ entity_enrichment: { param: 'contacts', default: 'caller' } }), handler);
+
+    const assembler = makeMockAssembler({
+      entities: [sampleEntityContext],
+      failed: [{ inputId: 'contact-2', retryable: true }],
+    });
+    const execution = new ExecutionLayer(registry, spyLogger, {
+      entityContextAssembler: assembler,
+    });
+
+    const result = await execution.invoke('test-skill', { contacts: ['contact-1', 'contact-2'] });
+    expect(result.success).toBe(true);
+
+    const failedLine = warn.mock.calls.find(call => /lookups failed/i.test(String(call[1])));
+    expect(failedLine).toBeDefined();
+    expect((failedLine![0] as { failedCount?: number; retryableCount?: number }).failedCount).toBe(1);
+    expect((failedLine![0] as { inputIds?: string[] }).inputIds).toBeUndefined();
+  });
+
+  it('exposes agentContactId on ctx for all skills', async () => {
+    let capturedCtx: ToolContext | undefined;
+
+    const handler: ToolHandler = {
       execute: async (ctx) => {
         capturedCtx = ctx;
         return { success: true, data: 'ok' };

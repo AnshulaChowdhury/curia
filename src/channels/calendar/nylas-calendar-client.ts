@@ -8,7 +8,29 @@
 // any other provider connected through Nylas.
 
 import NylasDefault from 'nylas';
+import type {
+  CreateEventQueryParams,
+  DestroyEventQueryParams,
+  FindEventQueryParams,
+  ListEventQueryParams,
+  SendRsvpQueryParams,
+  UpdateEventQueryParams,
+} from 'nylas';
 import type { Logger } from '../../logger.js';
+import { ATTENDEE_RSVP_STATUS_KEYS } from './attendee-input.js';
+import type { CalendarAttendeeInput } from './attendee-input.js';
+
+export type { CalendarAttendeeInput } from './attendee-input.js';
+
+/**
+ * True when `err` is a Nylas API error with HTTP 400: the request was rejected,
+ * so nothing changed. Timeouts, network errors and 5xx do not match; for those
+ * the outcome is unknown. Duck-typed on `statusCode` because the SDK is loaded
+ * through a CJS default import.
+ */
+export function isNylasBadRequest(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { statusCode?: unknown }).statusCode === 400;
+}
 
 /**
  * Minimal typed interface for the Nylas SDK calendar surface.
@@ -24,40 +46,57 @@ export interface NylasCalendarLike {
       identifier: string;
       calendarId: string;
     }): Promise<{ data: NylasRawCalendar }>;
+
+    // Free/busy lives on the `calendars` resource in the Nylas v8 SDK
+    // (POST /v3/grants/{identifier}/calendars/free-busy). There is no
+    // top-level `calendars_free_busy` resource — calling one crashes at runtime.
+    getFreeBusy(params: {
+      identifier: string;
+      requestBody: Record<string, unknown>;
+    }): Promise<{ data: NylasRawFreeBusy[] }>;
   };
 
   events: {
+    // `nextCursor` is the page token for the following page; absent on the last
+    // page. Needed because Nylas caps a single page at 200 events (see listEvents).
     list(params: {
       identifier: string;
-      queryParams?: Record<string, unknown>;
-    }): Promise<{ data: NylasRawEvent[] }>;
+      queryParams?: ListEventQueryParams;
+    }): Promise<{ data: NylasRawEvent[]; nextCursor?: string }>;
+
+    find(params: {
+      identifier: string;
+      eventId: string;
+      queryParams?: FindEventQueryParams;
+    }): Promise<{ data: NylasRawEvent }>;
 
     create(params: {
       identifier: string;
-      queryParams?: Record<string, unknown>;
+      queryParams?: CreateEventQueryParams;
       requestBody: Record<string, unknown>;
     }): Promise<{ data: NylasRawEvent }>;
 
     update(params: {
       identifier: string;
       eventId: string;
-      queryParams?: Record<string, unknown>;
+      queryParams?: UpdateEventQueryParams;
       requestBody: Record<string, unknown>;
     }): Promise<{ data: NylasRawEvent }>;
+
+    sendRsvp(params: {
+      identifier: string;
+      eventId: string;
+      queryParams: SendRsvpQueryParams;
+      requestBody: { status: NylasRsvpStatus };
+    }): Promise<NylasRawRsvpResponse>;
 
     destroy(params: {
       identifier: string;
       eventId: string;
-      queryParams?: Record<string, unknown>;
+      queryParams?: DestroyEventQueryParams;
     }): Promise<void>;
   };
 
-  calendars_free_busy: {
-    list(params: {
-      identifier: string;
-      requestBody: Record<string, unknown>;
-    }): Promise<{ data: NylasRawFreeBusy[] }>;
-  };
 }
 
 // -- Raw Nylas SDK types (subset we use) --
@@ -87,6 +126,8 @@ interface NylasRawEvent {
     // Timespan — regular timed events
     startTime?: number;
     endTime?: number;
+    // Time — single point-in-time events (Nylas `when.object === 'time'`)
+    time?: number;
     // Date — single all-day events
     date?: string;
     // Datespan — multi-day all-day events
@@ -104,15 +145,30 @@ interface NylasRawEvent {
   calendarId?: string;
   busy?: boolean;
   metadata?: Record<string, string>;
+  // Recurring events: masters carry `recurrence`; expanded instances carry
+  // `masterEventId` and `originalStartTime` (unix seconds).
+  recurrence?: string[];
+  masterEventId?: string;
+  originalStartTime?: number;
 }
 
 interface NylasRawFreeBusy {
   email: string;
+  // Nylas returns a discriminated array: success entries (object "free_busy", with
+  // timeSlots) and per-calendar error entries (object "error", carrying `error` and
+  // no timeSlots). Both fields are optional so the error variant can be detected.
+  object?: string;
+  error?: string;
   timeSlots?: Array<{
     startTime: number;
     endTime: number;
     status: string;
   }>;
+}
+
+interface NylasRawRsvpResponse {
+  requestId?: string;
+  sendIcsError?: unknown;
 }
 
 // -- Normalized types --
@@ -141,6 +197,17 @@ export interface NylasCalendarEvent {
   status: string;
   calendarId: string;
   busy: boolean;
+  /** Arbitrary string key/value pairs attached to the event by Curia (e.g. `{ "curia-hold": "true" }`). Null when absent. */
+  metadata: Record<string, string> | null;
+  /** RFC 5545 RRULE/EXDATE/RDATE lines. Present only on a recurring series' master event. */
+  recurrence?: string[];
+  /** The series' master event ID. Present only on an instance of a recurring event. */
+  masterEventId?: string;
+  /**
+   * Unix seconds: the slot this occurrence holds in the series, even after it was moved.
+   * Instances only. Skills localize it with localizeEventTimes before returning it.
+   */
+  originalStartTime?: number;
 }
 
 export interface NylasFreeBusyResult {
@@ -152,14 +219,35 @@ export interface NylasFreeBusyResult {
   }>;
 }
 
+export type NylasRsvpStatus = 'yes' | 'no' | 'maybe';
+
+export interface NylasRsvpResult {
+  requestId: string | null;
+  sendIcsError: unknown | null;
+}
+
 export interface CreateEventInput {
   title: string;
   start: string;
   end: string;
   description?: string;
   location?: string;
-  attendees?: Array<{ email: string; name?: string }>;
+  attendees?: CalendarAttendeeInput[];
   conferencing?: Record<string, unknown>;
+  /** Arbitrary string key/value pairs to attach to the event (e.g. `{ "curia-hold": "true" }`). Values must be strings (Nylas requirement). */
+  metadata?: Record<string, string>;
+  /** Event status (e.g. "tentative", "confirmed", "cancelled"). */
+  status?: string;
+  /** Whether the event should block calendar time. Defaults to true in Nylas. */
+  busy?: boolean;
+  /** RFC 5545 RRULE/EXDATE/RDATE lines that make this a recurring series. */
+  recurrence?: string[];
+  /**
+   * IANA timezone the series repeats in. Sent as `when.start_timezone`/`end_timezone`
+   * whenever `recurrence` is set (Nylas requires it, and it keeps occurrences at the
+   * same wall-clock time across DST). Ignored for one-off events.
+   */
+  timezone?: string;
 }
 
 // -- SDK constructor workaround (same as email NylasClient) --
@@ -172,6 +260,25 @@ const NylasSDK = NylasDefault as unknown as new (config: { apiKey: string }) => 
 // ---------------------------------------------------------------------------
 // NylasCalendarClient
 // ---------------------------------------------------------------------------
+
+/**
+ * Largest page Nylas v3 accepts. Sending more returns HTTP 400
+ * "limit must be lower than or equal to 200".
+ */
+export const NYLAS_MAX_PAGE_SIZE = 200;
+
+/**
+ * Ceiling on the total events one listEvents call will page for, so an
+ * oversized `maxResults` costs a bounded number of round trips.
+ */
+export const LIST_EVENTS_MAX_TOTAL = 1000;
+
+/**
+ * Hard bound on requests per listEvents call. A full 1000-event fetch needs 5
+ * pages; the slack covers sparse pages, and the bound is what guarantees the
+ * loop ends when a cursor keeps arriving with nothing behind it.
+ */
+export const LIST_EVENTS_MAX_PAGES = 25;
 
 export class NylasCalendarClient {
   private readonly nylas: NylasCalendarLike;
@@ -210,7 +317,14 @@ export class NylasCalendarClient {
     }
   }
 
-  /** List events for a calendar within a time range. */
+  /**
+   * List events for a calendar within a time range.
+   *
+   * `opts.limit` is the **total** number of events wanted, not a page size.
+   * Nylas v3 rejects any page larger than 200 (`limit must be lower than or
+   * equal to 200`), so a bigger total is satisfied by paging with `pageToken`
+   * rather than by asking for a bigger page (#1798).
+   */
   async listEvents(
     calendarId: string,
     timeMin: string,
@@ -223,19 +337,119 @@ export class NylasCalendarClient {
     if (endUnix <= startUnix) {
       throw new Error(`Invalid time range: timeMax must be after timeMin (timeMin="${timeMin}", timeMax="${timeMax}")`);
     }
+
+    const requested = typeof opts?.limit === 'number' && opts.limit > 0
+      ? Math.floor(opts.limit)
+      : NYLAS_MAX_PAGE_SIZE;
+    // maxResults reaches us straight from an LLM tool call and is unbounded in
+    // the manifest, so cap the paging work a single call can trigger.
+    const wanted = Math.min(requested, LIST_EVENTS_MAX_TOTAL);
+    if (requested > LIST_EVENTS_MAX_TOTAL) {
+      this.log.warn(
+        { calendarId, requested, cap: LIST_EVENTS_MAX_TOTAL },
+        'listEvents limit exceeds the per-call cap — truncating',
+      );
+    }
+
     try {
-      const response = await this.nylas.events.list({
-        identifier: this.grantId,
-        queryParams: {
-          calendar_id: calendarId,
-          start: startUnix,
-          end: endUnix,
-          limit: opts?.limit ?? 200,
-        },
-      });
-      return (response?.data ?? []).map((evt) => this.normalizeEvent(evt));
+      const raw: NylasRawEvent[] = [];
+      // `nextCursor` is Nylas's end-of-results signal, not the page contents: an
+      // empty page can still be followed by one holding events, so paging stops
+      // on a missing cursor rather than on an empty page. Both guards below exist
+      // because that alone cannot terminate — a cursor returned forever alongside
+      // empty pages never grows `raw`, so the `raw.length < wanted` test never trips.
+      const seenCursors = new Set<string>();
+      let pageToken: string | undefined;
+      let pages = 0;
+      do {
+        const queryParams: ListEventQueryParams = {
+          calendarId,
+          // The SDK types these as strings; the wire value is the same unix timestamp.
+          start: String(startUnix),
+          end: String(endUnix),
+          limit: Math.min(wanted - raw.length, NYLAS_MAX_PAGE_SIZE),
+          // Omitted on the first request — Nylas treats an empty page_token as invalid.
+          ...(pageToken ? { pageToken } : {}),
+        };
+        const response = await this.nylas.events.list({
+          identifier: this.grantId,
+          queryParams,
+        });
+        raw.push(...(response?.data ?? []));
+        pages++;
+        pageToken = response?.nextCursor;
+
+        if (pageToken && seenCursors.has(pageToken)) {
+          this.log.warn({ calendarId, pageToken }, 'Nylas repeated a page cursor — stopping');
+          break;
+        }
+        if (pageToken) seenCursors.add(pageToken);
+
+        if (pageToken && pages >= LIST_EVENTS_MAX_PAGES) {
+          this.log.warn(
+            { calendarId, pages, collected: raw.length },
+            'listEvents hit the page cap — returning partial results',
+          );
+          break;
+        }
+      } while (raw.length < wanted && pageToken);
+
+      // The last page can overshoot if Nylas returns more than we asked for.
+      // Suppress per-event warns here — a systemic SDK regression would otherwise
+      // emit up to LIST_EVENTS_MAX_TOTAL identical lines. Aggregate once below.
+      const slice = raw.slice(0, wanted);
+      const normalized = slice.map((evt) => this.normalizeEvent(evt, { warn: false }));
+
+      const orphans = normalized.filter((e) => !e.calendarId);
+      if (orphans.length > 0) {
+        this.log.warn(
+          {
+            calendarId,
+            count: orphans.length,
+            total: normalized.length,
+            sampleEventIds: orphans.slice(0, 5).map((e) => e.id),
+          },
+          'normalizeEvent: calendarId missing from Nylas events — possible SDK casing mismatch',
+        );
+      }
+
+      const timingGaps = slice
+        .map((evt, i) => ({ evt, event: normalized[i]! }))
+        .filter(({ event }) => event.startTime === null && event.startDate === null);
+      if (timingGaps.length > 0) {
+        this.log.warn(
+          {
+            calendarId,
+            count: timingGaps.length,
+            total: normalized.length,
+            sampleEventIds: timingGaps.slice(0, 5).map(({ evt }) => evt.id),
+            // A handful of samples is enough to recognize an unmodelled shape
+            // without dumping up to 1000 nested `when` objects into the log.
+            sampleWhen: timingGaps.slice(0, 3).map(({ evt }) => evt.when ?? null),
+          },
+          'normalizeEvent: unrecognized when shape — all timing fields are null',
+        );
+      }
+
+      return normalized;
     } catch (err) {
       this.log.error({ err, calendarId }, 'Nylas listEvents failed');
+      throw err;
+    }
+  }
+
+  /** Fetch one event by ID from a calendar. */
+  async getEvent(calendarId: string, eventId: string): Promise<NylasCalendarEvent> {
+    this.log.debug({ calendarId, eventId }, 'Fetching event');
+    try {
+      const response = await this.nylas.events.find({
+        identifier: this.grantId,
+        eventId,
+        queryParams: { calendarId },
+      });
+      return this.normalizeEvent(response.data);
+    } catch (err) {
+      this.log.error({ err, calendarId, eventId }, 'Nylas getEvent failed');
       throw err;
     }
   }
@@ -254,21 +468,26 @@ export class NylasCalendarClient {
         when: {
           start_time: startUnix,
           end_time: endUnix,
+          ...(event.recurrence && event.timezone
+            ? { start_timezone: event.timezone, end_timezone: event.timezone }
+            : {}),
         },
       };
+      if (event.recurrence) requestBody.recurrence = event.recurrence;
       if (event.description) requestBody.description = event.description;
       if (event.location) requestBody.location = event.location;
       if (event.attendees) {
-        requestBody.participants = event.attendees.map((a) => ({
-          email: a.email,
-          name: a.name ?? '',
-        }));
+        requestBody.participants = this.toWritableParticipants(event.attendees);
       }
       if (event.conferencing) requestBody.conferencing = event.conferencing;
+      // Conditionally include metadata/status/busy so existing create calls are byte-for-byte unchanged.
+      if (event.metadata) requestBody.metadata = event.metadata;
+      if (event.status) requestBody.status = event.status;
+      if (typeof event.busy === 'boolean') requestBody.busy = event.busy;
 
       const response = await this.nylas.events.create({
         identifier: this.grantId,
-        queryParams: { calendar_id: calendarId },
+        queryParams: { calendarId },
         requestBody,
       });
       return this.normalizeEvent(response.data);
@@ -278,13 +497,21 @@ export class NylasCalendarClient {
     }
   }
 
-  /** Update an existing event. */
+  /**
+   * Update an existing event.
+   *
+   * `notifyAttendees` maps to Nylas `notifyParticipants` (wire `notify_participants`).
+   * Default (omit) is provider-true. Google and EWS honour `false`; Microsoft
+   * rejects it with a 400; iCloud ignores it and still emails. Guest-list writes replace the entire `participants` array
+   * (Nylas PUT nested-object replace) with email/name only — never RSVP status.
+   */
   async updateEvent(
     calendarId: string,
     eventId: string,
     changes: Partial<CreateEventInput>,
+    notifyAttendees?: boolean,
   ): Promise<NylasCalendarEvent> {
-    this.log.debug({ calendarId, eventId }, 'Updating event');
+    this.log.debug({ calendarId, eventId, notifyAttendees }, 'Updating event');
     try {
       const requestBody: Record<string, unknown> = {};
       if (changes.title !== undefined) requestBody.title = changes.title;
@@ -294,20 +521,30 @@ export class NylasCalendarClient {
         requestBody.when = {
           ...(changes.start ? { start_time: this.toUnixSeconds(changes.start, 'start') } : {}),
           ...(changes.end ? { end_time: this.toUnixSeconds(changes.end, 'end') } : {}),
+          ...(changes.recurrence && changes.timezone
+            ? { start_timezone: changes.timezone, end_timezone: changes.timezone }
+            : {}),
         };
       }
+      if (changes.recurrence) requestBody.recurrence = changes.recurrence;
       if (changes.attendees) {
-        requestBody.participants = changes.attendees.map((a) => ({
-          email: a.email,
-          name: a.name ?? '',
-        }));
+        requestBody.participants = this.toWritableParticipants(changes.attendees);
       }
       if (changes.conferencing !== undefined) requestBody.conferencing = changes.conferencing;
+      // Conditionally include metadata/status/busy so existing update calls are byte-for-byte unchanged.
+      if (changes.metadata) requestBody.metadata = changes.metadata;
+      if (changes.status) requestBody.status = changes.status;
+      if (typeof changes.busy === 'boolean') requestBody.busy = changes.busy;
+
+      const queryParams: UpdateEventQueryParams = { calendarId };
+      if (notifyAttendees !== undefined) {
+        queryParams.notifyParticipants = notifyAttendees;
+      }
 
       const response = await this.nylas.events.update({
         identifier: this.grantId,
         eventId,
-        queryParams: { calendar_id: calendarId },
+        queryParams,
         requestBody,
       });
       return this.normalizeEvent(response.data);
@@ -317,14 +554,44 @@ export class NylasCalendarClient {
     }
   }
 
-  /** Delete an event. Pass notifyAttendees=false to suppress Nylas cancellation emails. */
+  /** Respond to an event invitation as the authenticated attendee. */
+  async sendRsvp(calendarId: string, eventId: string, status: NylasRsvpStatus): Promise<NylasRsvpResult> {
+    this.log.debug({ calendarId, eventId, status }, 'Sending event RSVP');
+    try {
+      const response = await this.nylas.events.sendRsvp({
+        identifier: this.grantId,
+        eventId,
+        queryParams: { calendarId },
+        requestBody: { status },
+      });
+      return {
+        requestId: typeof response.requestId === 'string' ? response.requestId : null,
+        sendIcsError: response.sendIcsError ?? null,
+      };
+    } catch (err) {
+      this.log.error({ err, calendarId, eventId, status }, 'Nylas sendRsvp failed');
+      throw err;
+    }
+  }
+
+  /**
+   * Delete an event.
+   *
+   * `notifyAttendees` maps to Nylas `notifyParticipants` (wire
+   * `notify_participants`). Default (omit) notifies attendees. Only `false`
+   * sets the flag. Google and EWS honour `false`; Microsoft rejects it with a
+   * 400, so the delete fails; iCloud ignores it and still emails attendees.
+   * Callers deleting attendee-less events (holds) should omit the flag so the
+   * delete works on every provider. `notify_event_creator` is not a v3 delete
+   * parameter and Nylas rejects the request.
+   */
   async deleteEvent(calendarId: string, eventId: string, notifyAttendees?: boolean): Promise<void> {
     this.log.debug({ calendarId, eventId, notifyAttendees }, 'Deleting event');
     try {
-      const queryParams: Record<string, unknown> = { calendar_id: calendarId };
+      const queryParams: DestroyEventQueryParams = { calendarId };
       // Nylas sends cancellation emails by default; only override when explicitly suppressed.
       if (notifyAttendees === false) {
-        queryParams.notify_event_creator = false;
+        queryParams.notifyParticipants = false;
       }
       await this.nylas.events.destroy({
         identifier: this.grantId,
@@ -350,7 +617,7 @@ export class NylasCalendarClient {
       throw new Error(`Invalid time range: timeMax must be after timeMin (timeMin="${timeMin}", timeMax="${timeMax}")`);
     }
     try {
-      const response = await this.nylas.calendars_free_busy.list({
+      const response = await this.nylas.calendars.getFreeBusy({
         identifier: this.grantId,
         requestBody: {
           start_time: startUnix,
@@ -358,7 +625,24 @@ export class NylasCalendarClient {
           emails: calendarIds,
         },
       });
-      return (response?.data ?? []).map((fb) => ({
+      const entries = response?.data ?? [];
+      // A per-calendar error entry (object "error" / has `error`, no timeSlots) must
+      // NOT be collapsed to an empty slot list — that would read an unreadable
+      // calendar as fully free and let a conflict check double-book the principal.
+      // Fail loud so the caller (calendar-check-conflicts / -find-free-time) surfaces
+      // it instead of silently scheduling over an unknown.
+      const errored = entries.filter((fb) => fb.object === 'error' || fb.error != null);
+      if (errored.length > 0) {
+        // Log counts + provider reasons, not the mailbox identifiers (PII / CWE-532).
+        this.log.error(
+          { erroredCount: errored.length, totalCount: entries.length, reasons: errored.map((e) => e.error) },
+          'Nylas getFreeBusy returned error entries for one or more calendars',
+        );
+        // Keep the thrown message free of email addresses — it propagates up into the
+        // skill result and agent context, not just logs.
+        throw new Error(`Free/busy lookup failed for ${errored.length} of ${entries.length} calendar(s)`);
+      }
+      return entries.map((fb) => ({
         email: fb.email,
         timeSlots: (fb.timeSlots ?? []).map((ts) => ({
           startTime: ts.startTime,
@@ -373,6 +657,40 @@ export class NylasCalendarClient {
   }
 
   // -- Helpers --
+
+  /**
+   * Map Curia attendees to the Nylas write shape (email + name only).
+   *
+   * Why status is omitted (Nylas path, not a live PUT in this repo):
+   * - Nylas support (updated 2024-04-24) documents PUT /events rejecting
+   *   organizer-set participant status with
+   *   "Updating the status for participants is not allowed, only participants
+   *   can rsvp or change the status of an event":
+   *   https://support.nylas.com/hc/en-us/articles/4429255774865-Updating-the-status-for-participants-is-not-allowed-only-participants-can-rsvp-or-change-the-status-of-an-event
+   *   That article is v2-shaped (`PUT /events`); it has not been re-verified
+   *   against v3 on a live grant here.
+   * - v3 send-rsvp is the documented RSVP write:
+   *   https://developer.nylas.com/docs/reference/api/events/send-rsvp/
+   * - v3 PUT example participants are email/name/comment only (no status):
+   *   https://developer.nylas.com/docs/reference/api/events/put-events-id/
+   *
+   * Google Calendar API can write attendees[].responseStatus as organizer; that
+   * is a different integration than this Nylas client. First-person RSVP here
+   * is sendRsvp.
+   */
+  private toWritableParticipants(
+    attendees: CalendarAttendeeInput[],
+  ): Array<{ email: string; name: string }> {
+    return attendees.map((a) => {
+      const extra = a as unknown as Record<string, unknown>;
+      if (ATTENDEE_RSVP_STATUS_KEYS.some((key) => key in extra)) {
+        throw new Error(
+          'Cannot set attendee response status on create/update; Nylas allows RSVP only via sendRsvp',
+        );
+      }
+      return { email: a.email, name: a.name ?? '' };
+    });
+  }
 
   /** Convert an ISO 8601 string to Unix seconds, throwing on unparseable input. */
   private toUnixSeconds(iso: string, label: string): number {
@@ -402,17 +720,48 @@ export class NylasCalendarClient {
     };
   }
 
-  private normalizeEvent(evt: NylasRawEvent): NylasCalendarEvent {
+  private normalizeEvent(
+    evt: NylasRawEvent,
+    opts?: { warn?: boolean },
+  ): NylasCalendarEvent {
+    // Time-type events expose a single `time` field; treat it as startTime.
+    // Deliberate asymmetry: endTime stays null. Overlap helpers in holds.ts
+    // require both bounds, so Time events never conflict / are treated as stale
+    // by isHoldStale — fine today because Curia creates holds as timespans.
+    const startTime = evt.when?.startTime ?? evt.when?.time ?? null;
+    const endTime = evt.when?.endTime ?? null;
+    // For single all-day events (Date type), expose the date as both startDate and endDate
+    const startDate = evt.when?.startDate ?? evt.when?.date ?? null;
+    const endDate = evt.when?.endDate ?? evt.when?.date ?? null;
+
+    // Default warn=true for single-event paths (get/create/update). listEvents
+    // opts out and aggregates — see call site — to avoid log floods.
+    if (opts?.warn !== false) {
+      // Absent `when` is as anomalous as an unrecognized shape (Nylas requires it).
+      if (startTime === null && startDate === null) {
+        this.log.warn(
+          { eventId: evt.id, when: evt.when ?? null },
+          'normalizeEvent: unrecognized when shape — all timing fields are null',
+        );
+      }
+
+      if (!evt.calendarId) {
+        this.log.warn(
+          { eventId: evt.id },
+          'normalizeEvent: calendarId missing from Nylas event — possible SDK casing mismatch',
+        );
+      }
+    }
+
     return {
       id: evt.id,
       title: evt.title ?? '',
       description: evt.description ?? '',
       location: evt.location ?? '',
-      startTime: evt.when?.startTime ?? null,
-      endTime: evt.when?.endTime ?? null,
-      // For single all-day events (Date type), expose the date as both startDate and endDate
-      startDate: evt.when?.startDate ?? evt.when?.date ?? null,
-      endDate: evt.when?.endDate ?? evt.when?.date ?? null,
+      startTime,
+      endTime,
+      startDate,
+      endDate,
       participants: (evt.participants ?? []).map((p) => ({
         email: p.email,
         name: p.name ?? '',
@@ -422,6 +771,11 @@ export class NylasCalendarClient {
       status: evt.status ?? 'confirmed',
       calendarId: evt.calendarId ?? '',
       busy: evt.busy ?? true,
+      metadata: evt.metadata ?? null,
+      // Included only when present, so one-off events read exactly as before.
+      ...(evt.recurrence && evt.recurrence.length > 0 ? { recurrence: evt.recurrence } : {}),
+      ...(evt.masterEventId ? { masterEventId: evt.masterEventId } : {}),
+      ...(typeof evt.originalStartTime === 'number' ? { originalStartTime: evt.originalStartTime } : {}),
     };
   }
 }

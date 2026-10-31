@@ -1,10 +1,81 @@
 import type { DbPool } from '../db/connection.js';
 import type { Logger } from '../logger.js';
 import type { LLMProvider } from '../agents/llm/provider.js';
+import { NO_REASONING } from '../agents/llm/sampling-options.js';
+import {
+  createDbUnavailableAgentError,
+  isDbUnavailableError,
+  withDbRetry,
+} from '../db/resilience.js';
+import { rewriteLlmFailureTurns } from './llm-failure-turn.js';
+import { isUuid } from '../util/uuid.js';
+import {
+  CONTACT_RECENT_HISTORY_MAX_TURNS,
+  normalizeAddTurnAttribution,
+  persistableContactId,
+  selectContactRecentTurns,
+  type AddTurnAttribution,
+  type ContactRecentHistoryQuery,
+  type ContactRecentSourceTurn,
+  type ContactRecentTurn,
+} from './contact-recent-history.js';
+
+export type { AddTurnAttribution, ContactRecentHistoryQuery, ContactRecentTurn };
+
+/**
+ * One stored working-memory row for a meeting transcript (#2322).
+ * Kept on this module so the memory layer does not import meetings.
+ */
+export interface TranscriptSourceRow {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  createdAt: Date;
+  senderContactId: string | null;
+  synthetic: boolean;
+  archived: boolean;
+}
 
 export interface ConversationTurn {
   role: 'user' | 'assistant' | 'system';
   content: string;
+  /**
+   * True when this user row was drained into a host turn (#2018).
+   * Set only from `working_memory.injected_into_task_id`. Absent on a normal
+   * turn, so existing readers that compare `{ role, content }` stay valid.
+   * The host task id itself stays in the column; model history only needs
+   * the flag to keep the follow-up grouped with the turn it joined.
+   */
+  injected?: true;
+}
+
+/**
+ * Map a stored row to a turn. `injected` is set only when the column is a
+ * UUID. A sentence written into the column by a path that skipped the
+ * normalizer stays a normal turn — message text must not form a group.
+ */
+function conversationTurnFromStored(
+  role: string,
+  content: string,
+  injectedIntoTaskId: string | null | undefined,
+): ConversationTurn {
+  const turn: ConversationTurn = {
+    role: role as ConversationTurn['role'],
+    content,
+  };
+  if (isUuid(injectedIntoTaskId)) {
+    turn.injected = true;
+  }
+  return turn;
+}
+
+export interface GetHistoryOptions {
+  maxTurns?: number;
+  /**
+   * Skip {@link rewriteLlmFailureTurns} and return stored protocol envelopes.
+   * Default false — new call sites see the user-facing error text.
+   * Opt-out must be visible at the call site (`{ raw: true }`).
+   */
+  raw?: boolean;
 }
 
 /**
@@ -24,10 +95,29 @@ export interface SummarizationConfig {
 }
 
 interface StorageBackend {
-  add(conversationId: string, agentId: string, turn: ConversationTurn): Promise<void>;
+  add(
+    conversationId: string,
+    agentId: string,
+    turn: ConversationTurn,
+    meta?: AddTurnAttribution,
+  ): Promise<void>;
   get(conversationId: string, agentId: string, maxTurns?: number): Promise<ConversationTurn[]>;
+  /** Contact-scoped turns from other conversations. See selectContactRecentTurns. */
+  getContactRecent(query: ContactRecentHistoryQuery): Promise<ContactRecentTurn[]>;
+  /** Content of the active turns a person sent. See WorkingMemory.getPersonTurns. */
+  getPersonTurns(conversationId: string, agentId: string): Promise<string[]>;
   /** Delete all turns whose expires_at is in the past. Returns the number of rows deleted. */
   purgeExpired(): Promise<number>;
+  /**
+   * Every stored row for a transcript, archived included, ordered by
+   * created_at then id. Does not rewrite llm-failure markers (#2322).
+   */
+  getTranscriptRows(conversationId: string, agentId: string): Promise<TranscriptSourceRow[]>;
+  /**
+   * Wait for in-flight background summarization. Resolves when every pass
+   * that was queued at the call has settled, or when `timeoutMs` elapses.
+   */
+  drainSummarization(timeoutMs: number): Promise<void>;
 }
 
 /**
@@ -38,8 +128,11 @@ interface StorageBackend {
  * while production uses Postgres.
  *
  * When a `SummarizationConfig` is provided, the Postgres backend automatically
- * summarizes old turns once the active count exceeds `threshold`. Summarized turns
- * are marked `archived = true` in the DB (retained for audit) and replaced in active
+ * summarizes old turns once the active count exceeds `threshold`. A write that
+ * passes `summarize: 'background'` (voice does) returns after the insert and
+ * runs that pass in the background; other writes wait for it. Passes for one
+ * conversation and agent are serialized. Summarized turns are marked
+ * `archived = true` in the DB (retained for audit) and replaced in active
  * context by a condensed synthetic system turn. See spec §01-memory-system.md.
  */
 export class WorkingMemory {
@@ -68,23 +161,176 @@ export class WorkingMemory {
     conversationId: string,
     agentId: string,
     turn: ConversationTurn,
+    meta?: AddTurnAttribution,
   ): Promise<void> {
-    await this.backend.add(conversationId, agentId, turn);
+    await this.backend.add(conversationId, agentId, turn, meta);
   }
 
   async getHistory(
     conversationId: string,
     agentId: string,
-    options?: { maxTurns?: number },
+    options?: GetHistoryOptions,
   ): Promise<ConversationTurn[]> {
-    return this.backend.get(conversationId, agentId, options?.maxTurns);
+    const turns = await this.backend.get(conversationId, agentId, options?.maxTurns);
+    // Default: rewrite `_curia_protocol: llm_failure` envelopes so LLM context,
+    // summarization, and new readers never see the raw marker (#1775). Callers
+    // that must inspect storage (persist pairing, diagnostics, tests) pass `{ raw: true }`.
+    if (options?.raw) return turns;
+    return rewriteLlmFailureTurns(turns);
+  }
+
+  /**
+   * Recent turns this contact authored in other conversations, plus assistant
+   * replies from conversations where they are the only attributed sender.
+   * Non-UUID contact ids return [] without touching the database.
+   */
+  async getContactRecentHistory(query: ContactRecentHistoryQuery): Promise<ContactRecentTurn[]> {
+    const contactId = persistableContactId(query.contactId);
+    if (!contactId) return [];
+    if (!(query.since instanceof Date) || Number.isNaN(query.since.getTime())) return [];
+    const requested = query.maxTurns ?? CONTACT_RECENT_HISTORY_MAX_TURNS;
+    if (!Number.isFinite(requested) || requested <= 0) return [];
+    const normalized: ContactRecentHistoryQuery = {
+      ...query,
+      contactId,
+      maxTurns: Math.min(50, Math.floor(requested)),
+      excludeConversationId: query.excludeConversationId ?? '',
+    };
+    const turns = await this.backend.getContactRecent(normalized);
+    if (query.raw) return turns;
+    return rewriteLlmFailureTurns(turns);
+  }
+
+  /**
+   * Content of the active `user` turns a person sent in this conversation, newest first,
+   * for identifier provenance (#2061, ADR-047). Excludes turns Curia wrote to itself
+   * (`synthetic`), turns on a channel only agents write to (NON_PERSON_CHANNELS: a
+   * delegation brief, a bullpen post, a scheduled payload), rows with no channel, and
+   * archived turns (their summary is model-written). Content is returned as stored,
+   * dispatcher preambles included.
+   */
+  async getPersonTurns(conversationId: string, agentId: string): Promise<string[]> {
+    return this.backend.getPersonTurns(conversationId, agentId);
   }
 
   /** Delete all turns whose expires_at is in the past. Called by DreamEngine nightly. */
   async purgeExpired(): Promise<number> {
     return this.backend.purgeExpired();
   }
+
+  /**
+   * Raw rows for a meeting transcript. Archived, system, and synthetic rows
+   * are included; llm-failure markers are left as stored (#2322).
+   */
+  async getTranscriptRows(conversationId: string, agentId: string): Promise<TranscriptSourceRow[]> {
+    return this.backend.getTranscriptRows(conversationId, agentId);
+  }
+
+  /**
+   * Wait for background summarization before the pool closes. The default
+   * covers one condensation call. A pass still running after that is left
+   * in flight.
+   */
+  async drainSummarization(timeoutMs = 5_000): Promise<void> {
+    await this.backend.drainSummarization(timeoutMs);
+  }
 }
+
+/**
+ * Channels whose `user` turns an agent wrote: a delegated specialist's brief arrives on
+ * `internal`, a bullpen post on `bullpen`, a scheduled payload on `scheduler`. None is
+ * a message a person sent (#2061).
+ */
+export const NON_PERSON_CHANNELS: readonly string[] = ['internal', 'bullpen', 'scheduler'];
+
+/** Most person turns getPersonTurns reads: the active window is far smaller after summarization. */
+const PERSON_TURNS_LIMIT = 200;
+
+/**
+ * Conversations the shared-conversation check removed from this contact's recall,
+ * one row each, with the counts that explain why (#1887).
+ *
+ * The tier's failure mode is silence: an excluded conversation still produces a
+ * well-formed, plausible block that is simply missing Curia's replies, with
+ * nothing in the logs to distinguish it from a contact who genuinely said less.
+ * That is what made an entire class of attribution bug invisible until someone
+ * went looking. This query is what makes an incomplete block diagnosable.
+ *
+ * Same parameters and same participated set as {@link CONTACT_RECENT_HISTORY_SQL},
+ * so it reads the same index and cannot disagree with it about which
+ * conversations are in scope.
+ */
+export const CONTACT_RECENT_HISTORY_EXCLUSIONS_SQL = `SELECT
+           wm2.conversation_id,
+           count(*) FILTER (WHERE wm2.sender_contact_id IS NULL)     AS unattributed_turns,
+           count(*) FILTER (WHERE wm2.sender_contact_id IS NOT NULL) AS other_sender_turns
+         FROM working_memory wm2
+         JOIN (
+           SELECT DISTINCT conversation_id
+           FROM working_memory
+           WHERE sender_contact_id = $1::uuid
+             AND agent_id = $2
+             AND role = 'user'
+             AND archived = false
+             AND created_at >= $3
+             AND conversation_id <> $4
+         ) participated ON participated.conversation_id = wm2.conversation_id
+         WHERE wm2.agent_id = $2
+           AND wm2.role = 'user'
+           AND wm2.synthetic = false
+           AND (
+             wm2.sender_contact_id IS NULL
+             OR wm2.sender_contact_id <> $1::uuid
+           )
+         GROUP BY wm2.conversation_id`;
+
+/**
+ * SQL twin of {@link selectContactRecentTurns}. `$3` is the channel window.
+ * The participation lookup is the scan `idx_wm_sender_active` exists for.
+ *
+ * A row flagged `synthetic` is one Curia wrote to itself, so it is not evidence
+ * of another participant (#1892). Reading the column rather than the content is
+ * deliberate: see `synthetic-user-turn.ts`.
+ */
+export const CONTACT_RECENT_HISTORY_SQL = `SELECT role, content, conversation_id, channel_id, created_at, id
+         FROM (
+           SELECT wm.role, wm.content, wm.conversation_id, wm.channel_id, wm.created_at, wm.id
+           FROM working_memory wm
+           JOIN (
+             SELECT DISTINCT conversation_id
+             FROM working_memory
+             WHERE sender_contact_id = $1::uuid
+               AND agent_id = $2
+               AND role = 'user'
+               AND archived = false
+               AND created_at >= $3
+               AND conversation_id <> $4
+           ) participated ON participated.conversation_id = wm.conversation_id
+           WHERE wm.agent_id = $2
+             AND wm.archived = false
+             AND wm.created_at >= $3
+             AND (
+               (wm.role = 'user' AND wm.sender_contact_id = $1::uuid)
+               OR (
+                 wm.role IN ('assistant', 'system')
+                 AND wm.conversation_id NOT IN (
+                   SELECT wm2.conversation_id
+                   FROM working_memory wm2
+                   WHERE wm2.agent_id = $2
+                     AND wm2.role = 'user'
+                     AND wm2.conversation_id = wm.conversation_id
+                     AND wm2.synthetic = false
+                     AND (
+                       wm2.sender_contact_id IS NULL
+                       OR wm2.sender_contact_id <> $1::uuid
+                     )
+                 )
+               )
+             )
+           ORDER BY wm.created_at DESC, wm.id DESC
+           LIMIT $5
+         ) recent
+         ORDER BY created_at ASC, id ASC`;
 
 /**
  * Postgres-backed storage. Conversation turns are rows in the working_memory table.
@@ -95,6 +341,15 @@ export class WorkingMemory {
  * every write. Archived rows stay in the DB but are excluded from `get()` results.
  */
 class PostgresBackend implements StorageBackend {
+  /**
+   * Tail of the summarization chain for one conversation and agent.
+   * The next pass starts only after the previous one settles, so two voice
+   * turns that both cross the threshold cannot archive at the same time (#2266).
+   * The kept-row check in the archive transaction is the backstop for a writer
+   * outside this process.
+   */
+  private summarizationTail = new Map<string, Promise<void>>();
+
   constructor(
     private pool: DbPool,
     private logger: Logger,
@@ -102,25 +357,94 @@ class PostgresBackend implements StorageBackend {
     private ttlDays?: number,
   ) {}
 
-  async add(conversationId: string, agentId: string, turn: ConversationTurn): Promise<void> {
+  async add(
+    conversationId: string,
+    agentId: string,
+    turn: ConversationTurn,
+    meta?: AddTurnAttribution,
+  ): Promise<void> {
     this.logger.debug({ conversationId, agentId, role: turn.role }, 'working_memory: adding turn');
     const expiresAt = this.ttlDays != null
       ? new Date(Date.now() + this.ttlDays * 24 * 60 * 60 * 1000)
       : null;
-    await this.pool.query(
-      `INSERT INTO working_memory (conversation_id, agent_id, role, content, expires_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [conversationId, agentId, turn.role, turn.content, expiresAt],
-    );
+    const attribution = normalizeAddTurnAttribution(meta);
+    if (attribution.senderDropped) {
+      this.logger.warn(
+        { conversationId, agentId },
+        'working_memory: ignoring non-UUID sender_contact_id',
+      );
+    }
+    // Critical path: reading/writing working memory must fail fast with a
+    // classified DATABASE_UNAVAILABLE error so the runtime can publish
+    // agent.error rather than hang (#1381 / spec 05).
+    try {
+      if (attribution.createdAt) {
+        await this.pool.query(
+          `INSERT INTO working_memory (
+             conversation_id, agent_id, role, content, expires_at, sender_contact_id, channel_id, synthetic, created_at, injected_into_task_id
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [
+            conversationId,
+            agentId,
+            turn.role,
+            turn.content,
+            expiresAt,
+            attribution.senderContactId,
+            attribution.channelId,
+            attribution.synthetic,
+            attribution.createdAt,
+            attribution.injectedIntoTaskId,
+          ],
+        );
+      } else {
+        await this.pool.query(
+          `INSERT INTO working_memory (
+             conversation_id, agent_id, role, content, expires_at, sender_contact_id, channel_id, synthetic, injected_into_task_id
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            conversationId,
+            agentId,
+            turn.role,
+            turn.content,
+            expiresAt,
+            attribution.senderContactId,
+            attribution.channelId,
+            attribution.synthetic,
+            attribution.injectedIntoTaskId,
+          ],
+        );
+      }
+    } catch (err) {
+      if (isDbUnavailableError(err)) {
+        const agentErr = createDbUnavailableAgentError('working-memory', err);
+        this.logger.error(
+          { err: agentErr, conversationId, agentId },
+          'working_memory: add failed — database unavailable',
+        );
+        throw Object.assign(new Error(agentErr.message), {
+          code: agentErr.context.code,
+          agentError: agentErr,
+        });
+      }
+      throw err;
+    }
 
     // After writing, check whether we've crossed the summarization threshold.
-    // Summarization is best-effort — a failure must not abort the agent turn since
-    // the turn has already been persisted. Catch here (not inside maybeSummarize)
-    // so errors propagate cleanly out of the private method and the non-fatal
-    // decision is explicit and visible at the call site.
+    // Summarization is best-effort: the turn row is already stored.
+    // `summarize: 'background'` (set by VoiceRuntime) returns here and runs
+    // the pass off this call — awaiting the condensation call is 4–5s of
+    // silence before a spoken reply (#2266). Other writes still wait.
+    // A failure of an inline pass is logged and swallowed here so the caller
+    // is not failed for a condensation error; a background failure is logged
+    // at warn on the chain instead.
+    // DB retries for the post-LLM persistence half live inside maybeSummarize —
+    // wrapping the whole call would re-bill the summarization LLM on a DB blip.
     if (this.summarization) {
+      const background = attribution.summarize === 'background';
       try {
-        await this.maybeSummarize(conversationId, agentId, this.summarization);
+        await this.scheduleSummarization(conversationId, agentId, background);
       } catch (err) {
         this.logger.error(
           { err, conversationId, agentId },
@@ -130,29 +454,277 @@ class PostgresBackend implements StorageBackend {
     }
   }
 
+  /**
+   * Queue a summarization pass behind any in-flight pass for this conversation
+   * and agent. Background callers get a resolved promise immediately; the pass
+   * continues on the chain. Inline callers wait until this pass settles.
+   */
+  private scheduleSummarization(
+    conversationId: string,
+    agentId: string,
+    background: boolean,
+  ): Promise<void> {
+    const config = this.summarization;
+    if (!config) return Promise.resolve();
+
+    const key = `${conversationId}\0${agentId}`;
+    const previous = this.summarizationTail.get(key) ?? Promise.resolve();
+    const run = previous
+      .then(() => undefined, () => undefined)
+      .then(() => this.maybeSummarize(conversationId, agentId, config));
+
+    // The tail always fulfills, so a failed pass does not reject the next one
+    // and does not surface as an unhandled rejection when nobody awaits `run`.
+    const tail = run.then(
+      () => undefined,
+      (err: unknown) => {
+        if (!background) return;
+        this.logger.warn(
+          { err, conversationId, agentId },
+          'working_memory: background summarization failed — turn written, context window will grow until next successful pass',
+        );
+      },
+    );
+    this.summarizationTail.set(key, tail);
+    // `finally` returns a new promise. If `tail` rejects (the warn call threw)
+    // that promise rejects too, and voiding it would be an unhandledRejection
+    // (#983). Cleanup failure is logged and swallowed: nothing is awaiting this.
+    void tail.finally(() => {
+      if (this.summarizationTail.get(key) === tail) {
+        this.summarizationTail.delete(key);
+      }
+    }).catch((err: unknown) => {
+      this.logger.error(
+        { err, conversationId, agentId },
+        'working_memory: detached summarization chain rejected',
+      );
+    });
+
+    if (background) return Promise.resolve();
+    return run;
+  }
+
+  async drainSummarization(timeoutMs: number): Promise<void> {
+    const pending = [...this.summarizationTail.values()];
+    if (pending.length === 0) return;
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(pending),
+        new Promise<void>(resolve => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            resolve();
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    if (timedOut) {
+      this.logger.warn(
+        { pending: pending.length },
+        'working_memory: summarization drain timed out before in-flight passes finished',
+      );
+    }
+  }
+
+  async getTranscriptRows(conversationId: string, agentId: string): Promise<TranscriptSourceRow[]> {
+    const result = await this.pool.query<{
+      role: string;
+      content: string;
+      created_at: Date;
+      sender_contact_id: string | null;
+      synthetic: boolean;
+      archived: boolean;
+    }>(
+      `SELECT role, content, created_at, sender_contact_id, synthetic, archived
+         FROM working_memory
+        WHERE conversation_id = $1 AND agent_id = $2
+        ORDER BY created_at, id`,
+      [conversationId, agentId],
+    );
+    const rows: TranscriptSourceRow[] = [];
+    for (const row of result.rows) {
+      if (row.role !== 'user' && row.role !== 'assistant' && row.role !== 'system') continue;
+      rows.push({
+        role: row.role,
+        content: row.content,
+        createdAt: row.created_at,
+        senderContactId: row.sender_contact_id,
+        synthetic: row.synthetic,
+        archived: row.archived,
+      });
+    }
+    return rows;
+  }
+
+  async getPersonTurns(conversationId: string, agentId: string): Promise<string[]> {
+    const result = await this.pool.query<{ content: string }>(
+      `SELECT content
+       FROM working_memory
+       WHERE conversation_id = $1
+         AND agent_id = $2
+         AND role = 'user'
+         AND archived = false
+         AND synthetic = false
+         AND channel_id IS NOT NULL
+         AND NOT (channel_id = ANY($3::text[]))
+       ORDER BY created_at DESC
+       LIMIT $4`,
+      [conversationId, agentId, NON_PERSON_CHANNELS, PERSON_TURNS_LIMIT],
+    );
+    return result.rows.map((row) => row.content);
+  }
+
   async get(conversationId: string, agentId: string, maxTurns?: number): Promise<ConversationTurn[]> {
     const limit = maxTurns ?? 50;
 
-    // Subquery gets the most recent N active (non-archived) rows (newest first),
-    // then the outer query reverses to chronological order for LLM context.
-    // Archived rows are excluded — they're represented by the synthetic summary turn.
-    const result = await this.pool.query<{ role: string; content: string }>(
-      `SELECT role, content FROM (
-         SELECT role, content, created_at
-         FROM working_memory
-         WHERE conversation_id = $1
-           AND agent_id = $2
-           AND archived = false
-         ORDER BY created_at DESC
-         LIMIT $3
-       ) sub ORDER BY created_at ASC`,
-      [conversationId, agentId, limit],
-    );
+    // Critical path: history load must fail fast on DB outage (#1381).
+    try {
+      // Subquery gets the most recent N active (non-archived) rows (newest first),
+      // then the outer query reverses to chronological order for LLM context.
+      // Archived rows are excluded — they're represented by the synthetic summary turn.
+      const result = await this.pool.query<{
+        role: string;
+        content: string;
+        injected_into_task_id: string | null;
+      }>(
+        `SELECT role, content, injected_into_task_id FROM (
+           SELECT role, content, injected_into_task_id, created_at
+           FROM working_memory
+           WHERE conversation_id = $1
+             AND agent_id = $2
+             AND archived = false
+           ORDER BY created_at DESC
+           LIMIT $3
+         ) sub ORDER BY created_at ASC`,
+        [conversationId, agentId, limit],
+      );
 
-    return result.rows.map((row) => ({
-      role: row.role as ConversationTurn['role'],
-      content: row.content,
-    }));
+      return result.rows.map((row) => conversationTurnFromStored(
+        row.role,
+        row.content,
+        row.injected_into_task_id,
+      ));
+    } catch (err) {
+      if (isDbUnavailableError(err)) {
+        const agentErr = createDbUnavailableAgentError('working-memory', err);
+        this.logger.error(
+          { err: agentErr, conversationId, agentId },
+          'working_memory: get failed — database unavailable',
+        );
+        throw Object.assign(new Error(agentErr.message), {
+          code: agentErr.context.code,
+          agentError: agentErr,
+        });
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * SQL twin of selectContactRecentTurns. User turns must match the contact.
+   * Assistant and system turns come only from conversations with no other
+   * sender and no unattributed user turn (including archived rows). The
+   * synthetic voice greeting cue ($6) is not a participant.
+   *
+   * `injected_into_task_id` is not part of this predicate (#2018). A drained
+   * follow-up is still that sender's words, and a null sender still shares
+   * the conversation. Consulting the column here would let a follow-up hide
+   * a second person from recall.
+   *
+   * `id` is only a stable tie-break when two rows share `created_at`. It is
+   * not insertion order. The privacy predicate does not depend on that order.
+   */
+  /**
+   * Name the conversations the shared check removed, and why (#1887).
+   *
+   * Diagnostics only: a failure here must never fail a recall that already
+   * succeeded, and must never be mistaken for "nothing was excluded", so the
+   * error path says so explicitly rather than logging an empty result.
+   */
+  private async logSharedExclusions(query: ContactRecentHistoryQuery): Promise<void> {
+    try {
+      const { rows } = await this.pool.query<{
+        conversation_id: string;
+        unattributed_turns: string;
+        other_sender_turns: string;
+      }>(
+        CONTACT_RECENT_HISTORY_EXCLUSIONS_SQL,
+        [query.contactId, query.agentId, query.since, query.excludeConversationId ?? ''],
+      );
+      if (rows.length === 0) return;
+      this.logger.info(
+        {
+          contactId: query.contactId,
+          agentId: query.agentId,
+          excluded: rows.map((row) => ({
+            conversationId: row.conversation_id,
+            // Both can be non-zero: a thread may hold an unknown sender and a
+            // different known contact.
+            unattributedTurns: Number(row.unattributed_turns),
+            otherSenderTurns: Number(row.other_sender_turns),
+          })),
+        },
+        'contact recall: conversations excluded by the shared-conversation check — their assistant turns are not in the block',
+      );
+    } catch (err) {
+      this.logger.warn(
+        { err, contactId: query.contactId, agentId: query.agentId },
+        'contact recall: could not determine which conversations the shared check excluded',
+      );
+    }
+  }
+
+  async getContactRecent(query: ContactRecentHistoryQuery): Promise<ContactRecentTurn[]> {
+    const limit = query.maxTurns ?? CONTACT_RECENT_HISTORY_MAX_TURNS;
+    try {
+      const result = await this.pool.query<{
+        role: string;
+        content: string;
+        conversation_id: string;
+        channel_id: string | null;
+        created_at: Date;
+      }>(
+        CONTACT_RECENT_HISTORY_SQL,
+        [
+          query.contactId,
+          query.agentId,
+          query.since,
+          query.excludeConversationId ?? '',
+          limit,
+        ],
+      );
+
+      // Deliberately not awaited: this is a log line, and voice runs this read
+      // under a history deadline (spec 01) — a second sequential round trip to
+      // say what was excluded must not be what makes the recall miss it.
+      // logSharedExclusions catches its own errors, so nothing can reject here.
+      void this.logSharedExclusions(query);
+
+      return result.rows.map((row) => ({
+        role: row.role as ContactRecentTurn['role'],
+        content: row.content,
+        conversationId: row.conversation_id,
+        channelId: row.channel_id,
+        createdAt: row.created_at instanceof Date ? row.created_at : new Date(row.created_at),
+      }));
+    } catch (err) {
+      if (isDbUnavailableError(err)) {
+        const agentErr = createDbUnavailableAgentError('working-memory', err);
+        this.logger.error(
+          { err: agentErr, contactId: query.contactId, agentId: query.agentId },
+          'working_memory: contact recent history failed — database unavailable',
+        );
+        throw Object.assign(new Error(agentErr.message), {
+          code: agentErr.context.code,
+          agentError: agentErr,
+        });
+      }
+      throw err;
+    }
   }
 
   async purgeExpired(): Promise<number> {
@@ -173,8 +745,10 @@ class PostgresBackend implements StorageBackend {
    * If so, archive the oldest (count - keepWindow) turns and replace them with
    * a condensed synthetic system turn at the head of the kept window.
    *
-   * Failures are logged but do NOT propagate — a failed summarization is preferable
-   * to aborting the agent turn. The next add() will retry automatically.
+   * Failures propagate to {@link scheduleSummarization}. An inline caller logs
+   * them and continues; a background caller has already returned, and the chain
+   * logs them at warn. The next add() retries. A failed pass is preferable to
+   * failing the turn: the row is already stored.
    */
   private async maybeSummarize(
     conversationId: string,
@@ -238,12 +812,25 @@ class PostgresBackend implements StorageBackend {
 
     // Build the summarization prompt from the turns being archived.
     // Prior summaries (system role) are labelled distinctly so the LLM carries them forward.
-    const transcript = turnsToArchive
+    // This path reads the archive window via raw SQL (oldest N, not getHistory),
+    // so it must apply the sanitizer explicitly — same rewrite getHistory does
+    // by default (#1775). Protocol JSON is never condensed; the question is kept.
+    const forSummary = rewriteLlmFailureTurns(turnsToArchive);
+    const transcript = forSummary
       .map((t) => {
         const label = t.role === 'system' ? 'PRIOR SUMMARY' : t.role.toUpperCase();
         return `[${label}]: ${t.content}`;
       })
       .join('\n\n');
+
+    if (!transcript.trim()) {
+      // An all-empty window (or one that rewrites to nothing) must still be
+      // archived so it is not reprocessed, but must not be sent to the
+      // summariser — that would store a hallucinated summary as real history.
+      const archiveIds = turnsToArchive.map((t) => t.id);
+      await withDbRetry(() => this.archiveTurnsOnly(archiveIds));
+      return;
+    }
 
     const summaryPrompt = [
       'You are a precise summarizer. Condense the following conversation excerpt into a concise narrative.',
@@ -257,10 +844,13 @@ class PostgresBackend implements StorageBackend {
     const response = await provider.chat({
       messages: [{ role: 'user', content: summaryPrompt }],
       model,
+      // Summarization is infrastructure, not an agent turn (ADR-048 §3).
+      options: { reasoning: NO_REASONING },
     });
 
     if (response.type === 'error') {
-      // Propagates to add()'s catch — full AgentError struct preserved in the log there.
+      // Propagates to scheduleSummarization (inline: add()'s error log; background: chain warn).
+      // The full AgentError struct is preserved on the thrown error for that log.
       throw Object.assign(
         new Error(`working_memory: summarization LLM call failed — ${response.error.message}`),
         { agentError: response.error },
@@ -273,6 +863,39 @@ class PostgresBackend implements StorageBackend {
     }
     const summaryContent = response.content.trim();
 
+    // Persist only — retry transient DB blips here without re-running the LLM
+    // call above (#1381 review). The transaction is atomic, so a failed attempt
+    // rolls back cleanly before the next retry.
+    const archiveIds = turnsToArchive.map((t) => t.id);
+    await withDbRetry(() =>
+      this.persistSummary(
+        conversationId,
+        agentId,
+        archiveIds,
+        summaryContent,
+      ),
+    );
+  }
+
+  /** Archive rows without inserting a synthetic summary (empty-window path). */
+  private async archiveTurnsOnly(archiveIds: string[]): Promise<void> {
+    await this.pool.query(
+      `UPDATE working_memory SET archived = true WHERE id = ANY($1::uuid[])`,
+      [archiveIds],
+    );
+  }
+
+  /**
+   * Post-LLM half of summarization: anchor timestamp + archive/insert transaction.
+   * Idempotent across retries only when the prior attempt rolled back (COMMIT
+   * success means withDbRetry does not re-enter).
+   */
+  private async persistSummary(
+    conversationId: string,
+    agentId: string,
+    archiveIds: string[],
+    summaryContent: string,
+  ): Promise<void> {
     // The synthetic summary is inserted 1ms before the oldest *kept* turn so that
     // chronological ordering places it at the head of the active window.
     const oldestKeptResult = await this.pool.query<{ created_at: Date }>(
@@ -284,7 +907,7 @@ class PostgresBackend implements StorageBackend {
          AND id != ALL($3::uuid[])
        ORDER BY created_at ASC
        LIMIT 1`,
-      [conversationId, agentId, turnsToArchive.map((t) => t.id)],
+      [conversationId, agentId, archiveIds],
     );
 
     // If toArchiveCount < activeCount, there must always be at least one kept row.
@@ -299,7 +922,6 @@ class PostgresBackend implements StorageBackend {
 
     // Atomic transaction: archive old turns + insert synthetic summary.
     // If either step fails the whole operation rolls back — no partial state.
-    const archiveIds = turnsToArchive.map((t) => t.id);
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -336,7 +958,7 @@ class PostgresBackend implements StorageBackend {
           'working_memory: ROLLBACK failed after transaction error — connection may be in bad state',
         );
       }
-      // Propagate to add()'s catch so the non-fatal policy is applied at the call site.
+      // Propagate to scheduleSummarization (inline: add()'s error log; background: chain warn).
       throw err;
     } finally {
       // Guard release() so it cannot replace the original error with its own exception.
@@ -358,30 +980,92 @@ class PostgresBackend implements StorageBackend {
  * Does not implement summarization — use integration tests for end-to-end coverage.
  */
 class InMemoryBackend implements StorageBackend {
-  private store = new Map<string, ConversationTurn[]>();
+  private store = new Map<string, ContactRecentSourceTurn[]>();
+  private seq = 0;
 
   private key(conversationId: string, agentId: string): string {
     return `${conversationId}:${agentId}`;
   }
 
-  async add(conversationId: string, agentId: string, turn: ConversationTurn): Promise<void> {
+  async add(
+    conversationId: string,
+    agentId: string,
+    turn: ConversationTurn,
+    meta?: AddTurnAttribution,
+  ): Promise<void> {
+    const attribution = normalizeAddTurnAttribution(meta);
     const k = this.key(conversationId, agentId);
     const turns = this.store.get(k) ?? [];
-    turns.push(turn);
+    turns.push({
+      conversationId,
+      agentId,
+      role: turn.role,
+      content: turn.content,
+      senderContactId: attribution.senderContactId,
+      channelId: attribution.channelId,
+      createdAt: attribution.createdAt ?? new Date(),
+      archived: false,
+      synthetic: attribution.synthetic,
+      injectedIntoTaskId: attribution.injectedIntoTaskId,
+      seq: this.seq++,
+    });
     this.store.set(k, turns);
   }
 
   async get(conversationId: string, agentId: string, maxTurns?: number): Promise<ConversationTurn[]> {
     const k = this.key(conversationId, agentId);
     const turns = this.store.get(k) ?? [];
-    if (maxTurns && turns.length > maxTurns) {
+    const visible = turns.map((row) => conversationTurnFromStored(
+      row.role,
+      row.content,
+      row.injectedIntoTaskId,
+    ));
+    if (maxTurns && visible.length > maxTurns) {
       // Return the last N turns (most recent), preserving chronological order
-      return turns.slice(-maxTurns);
+      return visible.slice(-maxTurns);
     }
-    return [...turns];
+    return visible;
+  }
+
+  async getContactRecent(query: ContactRecentHistoryQuery): Promise<ContactRecentTurn[]> {
+    const rows: ContactRecentSourceTurn[] = [];
+    for (const turns of this.store.values()) rows.push(...turns);
+    return selectContactRecentTurns(rows, query);
+  }
+
+  async getPersonTurns(conversationId: string, agentId: string): Promise<string[]> {
+    const turns = this.store.get(this.key(conversationId, agentId)) ?? [];
+    return turns
+      .filter((row) =>
+        row.role === 'user'
+        && !row.archived
+        && !row.synthetic
+        && row.channelId !== null
+        && !NON_PERSON_CHANNELS.includes(row.channelId))
+      .reverse()
+      .slice(0, PERSON_TURNS_LIMIT)
+      .map((row) => row.content);
+  }
+
+  async getTranscriptRows(conversationId: string, agentId: string): Promise<TranscriptSourceRow[]> {
+    const turns = this.store.get(this.key(conversationId, agentId)) ?? [];
+    return [...turns]
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.seq - b.seq)
+      .map((row) => ({
+        role: row.role,
+        content: row.content,
+        createdAt: row.createdAt,
+        senderContactId: row.senderContactId,
+        synthetic: row.synthetic,
+        archived: row.archived,
+      }));
   }
 
   async purgeExpired(): Promise<number> {
     return 0; // No expiry mechanism in in-memory backend
+  }
+
+  async drainSummarization(): Promise<void> {
+    // In-memory storage does not summarize.
   }
 }

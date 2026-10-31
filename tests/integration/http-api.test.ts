@@ -1,33 +1,55 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import Fastify from 'fastify';
+import type { Pool } from 'pg';
 import { EventBus } from '../../src/bus/bus.js';
 import { AgentRuntime } from '../../src/agents/runtime.js';
 import { AgentRegistry } from '../../src/agents/agent-registry.js';
 import { EventRouter } from '../../src/channels/http/event-router.js';
-import { messageRoutes } from '../../src/channels/http/routes/messages.js';
+import { chatRoutes } from '../../src/channels/http/routes/chat.js';
 import { healthRoutes } from '../../src/channels/http/routes/health.js';
 import { agentRoutes } from '../../src/channels/http/routes/agents.js';
 import { Dispatcher } from '../../src/dispatch/dispatcher.js';
 import { validateBearerToken } from '../../src/channels/http/auth.js';
 import type { LLMProvider } from '../../src/agents/llm/provider.js';
 const MOCK_PROVENANCE = { requestedModel: 'mock-model', actualModel: 'mock-model', providerRequestId: 'msg_mock_000' } as const;
-import type { ContactResolver } from '../../src/contacts/contact-resolver.js';
-import type { InboundSenderContext } from '../../src/contacts/types.js';
-import type { AgentTaskEvent } from '../../src/bus/events.js';
-import type { Pool } from 'pg';
 import pino from 'pino';
+import type { HealthService } from '../../src/health/health-service.js';
+import { makePrincipalContactResolver } from '../helpers/principal-contact-resolver.js';
+import type { SessionStore } from '../../src/channels/http/session-auth.js';
+
+// Minimal HealthService stub for integration tests that don't test health behavior.
+// Returns a minimal ok response so GET /api/health stays up without a real DB.
+function makeHealthServiceStub(): HealthService {
+  return {
+    getStatus: vi.fn().mockResolvedValue({
+      status: 'ok',
+      uptime_s: 0,
+      checks: {
+        db: 'ok', bus: 'ok', signal: 'skipped',
+        email: 'skipped', browser: 'skipped',
+        mcp: {},
+        nylas_calendar: 'skipped',
+        scheduler: 'ok',
+      },
+    }),
+  } as unknown as HealthService;
+}
 
 const logger = pino({ level: 'silent' });
+const WEB_SECRET = 'test-web-secret';
+
+function chatAuthHeader(): Record<string, string> {
+  return { 'x-web-bootstrap-secret': WEB_SECRET };
+}
 
 describe('HTTP API integration', () => {
-  const app = Fastify();
+  // forceCloseConnections: an SSE socket left open would otherwise stall app.close().
+  const app = Fastify({ forceCloseConnections: true });
   const bus = new EventBus(logger);
   const agentRegistry = new AgentRegistry();
   agentRegistry.register('coordinator', { role: 'coordinator', description: 'Main' });
-
-  const mockPool = {
-    query: async () => ({ rows: [{ '?column?': 1 }] }),
-  } as unknown as Pool;
 
   const eventRouter = new EventRouter(logger);
 
@@ -53,11 +75,23 @@ describe('HTTP API integration', () => {
     });
     coordinator.register();
 
-    const dispatcher = new Dispatcher({ bus, logger });
+    // Principal resolver so Gate C on the relay (#1733) allows the reply.
+    const dispatcher = new Dispatcher({
+      bus,
+      logger,
+      contactResolver: makePrincipalContactResolver(),
+    });
     dispatcher.register();
 
-    app.register(messageRoutes, { bus, logger, eventRouter });
-    app.register(healthRoutes, { pool: mockPool, logger, agentNames: ['coordinator'], skillNames: ['web-fetch'] });
+    app.register(chatRoutes, {
+      pool: { query: vi.fn() } as unknown as Pool,
+      logger,
+      webAppBootstrapSecret: WEB_SECRET,
+      sessions: new Map() as SessionStore,
+      bus,
+      eventRouter,
+    });
+    app.register(healthRoutes, { healthService: makeHealthServiceStub() });
     app.register(agentRoutes, { agentRegistry });
 
     await app.ready();
@@ -67,32 +101,69 @@ describe('HTTP API integration', () => {
     await app.close();
   });
 
-  it('POST /api/messages returns agent response', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/messages',
-      payload: {
-        content: 'Hello!',
-        conversation_id: 'test-conv-1',
-      },
-    });
+  it('POST /api/chat/messages acks 202 and the reply arrives on /api/chat/stream', async () => {
+    await app.listen({ port: 0, host: '127.0.0.1' });
+    const port = (app.server.address() as AddressInfo).port;
+    const chunks: string[] = [];
+    let connected: () => void = () => {};
+    const sawConnected = new Promise<void>((resolve) => { connected = resolve; });
 
-    expect(response.statusCode).toBe(200);
-    const body = JSON.parse(response.body);
-    expect(body.content).toBe('Hello from the HTTP API!');
-    expect(body.conversation_id).toBe('test-conv-1');
+    const stream = http.request(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path: '/api/chat/stream?conversationId=test-conv-1',
+        headers: chatAuthHeader(),
+      },
+      (res) => {
+        expect(res.statusCode).toBe(200);
+        res.setEncoding('utf8');
+        res.on('data', (chunk: string) => {
+          chunks.push(chunk);
+          if (chunk.includes(':connected') || chunks.join('').includes(':connected')) connected();
+        });
+      },
+    );
+    stream.on('error', () => { /* closed by the test */ });
+    stream.end();
+
+    try {
+      await sawConnected;
+      // :connected is written just before the client is registered. Yield so
+      // addSseClient has run before the POST, or the reply can be missed.
+      await new Promise((resolve) => { setImmediate(resolve); });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/chat/messages',
+        headers: chatAuthHeader(),
+        payload: {
+          message: 'Hello!',
+          conversationId: 'test-conv-1',
+        },
+      });
+
+      expect(response.statusCode).toBe(202);
+      expect(response.json()).toMatchObject({ conversationId: 'test-conv-1' });
+      await vi.waitFor(() => {
+        expect(chunks.join('')).toContain('Hello from the HTTP API!');
+      }, { timeout: 5_000 });
+    } finally {
+      stream.destroy();
+    }
   });
 
-  it('POST /api/messages returns 400 for missing content', async () => {
+  it('POST /api/chat/messages returns 400 for missing message', async () => {
     const response = await app.inject({
       method: 'POST',
-      url: '/api/messages',
+      url: '/api/chat/messages',
+      headers: chatAuthHeader(),
       payload: {},
     });
 
     expect(response.statusCode).toBe(400);
     const body = JSON.parse(response.body);
-    expect(body.error).toContain('content');
+    expect(body.error).toContain('message');
   });
 
   it('GET /api/health returns system status', async () => {
@@ -104,8 +175,7 @@ describe('HTTP API integration', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.status).toBe('ok');
-    expect(body.agents).toContain('coordinator');
-    expect(body.skills).toContain('web-fetch');
+    expect(body.checks.db).toBe('ok');
   });
 
   it('GET /api/agents/status returns agent list', async () => {
@@ -122,107 +192,16 @@ describe('HTTP API integration', () => {
   });
 });
 
-// Issue #47: HTTP callers hang on rejected unknown-sender messages.
-// This suite verifies that the ignore policy returns 403 immediately
-// instead of hanging until the 120-second response timeout (504).
-describe('HTTP API — unknown_sender: ignore policy', () => {
-  const app = Fastify();
-  const bus = new EventBus(logger);
-  const eventRouter = new EventRouter(logger);
-
-  const mockPool = {
-    query: async () => ({ rows: [{ '?column?': 1 }] }),
-  } as unknown as Pool;
-
-  beforeAll(async () => {
-    eventRouter.setupSubscriptions(bus);
-
-    // Resolver always returns unknown sender
-    const mockResolver = {
-      resolve: vi.fn().mockResolvedValue({
-        resolved: false,
-        channel: 'http',
-        senderId: 'stranger',
-      } satisfies InboundSenderContext),
-    } as unknown as ContactResolver;
-
-    // Dispatcher configured with ignore policy for the http channel
-    const dispatcher = new Dispatcher({
-      bus,
-      logger,
-      contactResolver: mockResolver,
-      channelPolicies: { http: { trust: 'low', unknownSender: 'ignore', threaded: false } },
-    });
-    dispatcher.register();
-
-    app.register(messageRoutes, { bus, logger, eventRouter });
-    app.register(healthRoutes, { pool: mockPool, logger, agentNames: [], skillNames: [] });
-
-    await app.ready();
-  });
-
-  afterAll(async () => {
-    await app.close();
-  });
-
-  it('POST /api/messages returns 403 immediately when sender is rejected', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/messages',
-      payload: {
-        content: 'Hello from unknown sender',
-        conversation_id: 'reject-test-conv-1',
-        sender_id: 'stranger',
-      },
-    });
-
-    // Must be 403, not 504 (timeout) — the response should come immediately
-    expect(response.statusCode).toBe(403);
-    const body = JSON.parse(response.body);
-    expect(body.error).toContain('sender not authorized');
-  });
-});
-
-// Issue #189: HTTP API channel must require token-based authentication.
-// This suite exercises the auth middleware (onRequest hook) end-to-end.
-// It builds a minimal Fastify app with the same hook as HttpAdapter
-// to test auth independently from the message flow.
+// Issue #189: routes that do not authenticate themselves must require a bearer token.
+// /api/messages was the old sample route; /api/agents/status is the one that remains.
 describe('HTTP API — bearer token authentication', () => {
   const TEST_TOKEN = 'test-secret-token-abc123';
 
   // Build a minimal Fastify app with the same onRequest hook as HttpAdapter.
-  // We test auth in isolation here — message routing is covered by other suites.
   async function buildApp(token: string | undefined) {
     const app = Fastify();
-    const bus = new EventBus(logger);
-    const eventRouter = new EventRouter(logger);
-    const mockPool = {
-      query: async () => ({ rows: [{ '?column?': 1 }] }),
-    } as unknown as Pool;
-
-    eventRouter.setupSubscriptions(bus);
-
-    // Register a minimal agent so POST /api/messages can return a response.
-    const mockProvider: LLMProvider = {
-      id: 'mock',
-      chat: async () => ({
-        type: 'text' as const,
-        content: 'auth test response',
-        usage: { inputTokens: 1, outputTokens: 1, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
-        provenance: MOCK_PROVENANCE,
-      }),
-    };
-
-    const coordinator = new AgentRuntime({
-      agentId: 'coordinator',
-      systemPrompt: 'You are a test agent.',
-      provider: mockProvider,
-      bus,
-      logger,
-    });
-    coordinator.register();
-    const dispatcher = new Dispatcher({ bus, logger });
-    dispatcher.register();
+    const agentRegistry = new AgentRegistry();
+    agentRegistry.register('coordinator', { role: 'coordinator', description: 'Main' });
 
     // Auth hook — same logic as HttpAdapter.start()
     app.addHook('onRequest', async (request, reply) => {
@@ -245,21 +224,19 @@ describe('HTTP API — bearer token authentication', () => {
       }
     });
 
-    app.register(messageRoutes, { bus, logger, eventRouter });
-    app.register(healthRoutes, { pool: mockPool, logger, agentNames: ['coordinator'], skillNames: [] });
+    app.register(healthRoutes, { healthService: makeHealthServiceStub() });
+    app.register(agentRoutes, { agentRegistry });
 
     await app.ready();
     return app;
   }
 
-  it('rejects POST /api/messages with no Authorization header (401)', async () => {
+  it('rejects GET /api/agents/status with no Authorization header (401)', async () => {
     const app = await buildApp(TEST_TOKEN);
     try {
       const response = await app.inject({
-        method: 'POST',
-        url: '/api/messages',
-        payload: { content: 'hello' },
-        // No headers — no Authorization
+        method: 'GET',
+        url: '/api/agents/status',
       });
       expect(response.statusCode).toBe(401);
       const body = JSON.parse(response.body);
@@ -269,13 +246,12 @@ describe('HTTP API — bearer token authentication', () => {
     }
   });
 
-  it('rejects POST /api/messages with a wrong token (401)', async () => {
+  it('rejects GET /api/agents/status with a wrong token (401)', async () => {
     const app = await buildApp(TEST_TOKEN);
     try {
       const response = await app.inject({
-        method: 'POST',
-        url: '/api/messages',
-        payload: { content: 'hello' },
+        method: 'GET',
+        url: '/api/agents/status',
         headers: { authorization: 'Bearer wrong-token' },
       });
       expect(response.statusCode).toBe(401);
@@ -286,14 +262,13 @@ describe('HTTP API — bearer token authentication', () => {
     }
   });
 
-  it('rejects POST /api/messages with empty bearer value (401)', async () => {
+  it('rejects GET /api/agents/status with empty bearer value (401)', async () => {
     const app = await buildApp(TEST_TOKEN);
     try {
       const response = await app.inject({
-        method: 'POST',
-        url: '/api/messages',
-        payload: { content: 'hello' },
-        headers: { authorization: 'Bearer ' }, // Empty token value — "Bearer " with no value
+        method: 'GET',
+        url: '/api/agents/status',
+        headers: { authorization: 'Bearer ' },
       });
       expect(response.statusCode).toBe(401);
       const body = JSON.parse(response.body);
@@ -303,18 +278,16 @@ describe('HTTP API — bearer token authentication', () => {
     }
   });
 
-  it('accepts POST /api/messages with a valid token (200)', async () => {
+  it('accepts GET /api/agents/status with a valid token (200)', async () => {
     const app = await buildApp(TEST_TOKEN);
     try {
       const response = await app.inject({
-        method: 'POST',
-        url: '/api/messages',
-        payload: { content: 'hello', conversation_id: 'auth-test-conv-1' },
+        method: 'GET',
+        url: '/api/agents/status',
         headers: { authorization: `Bearer ${TEST_TOKEN}` },
       });
       expect(response.statusCode).toBe(200);
-      const body = JSON.parse(response.body);
-      expect(body.conversation_id).toBe('auth-test-conv-1');
+      expect(response.json().agents).toHaveLength(1);
     } finally {
       await app.close();
     }
@@ -326,7 +299,6 @@ describe('HTTP API — bearer token authentication', () => {
       const response = await app.inject({
         method: 'GET',
         url: '/api/health',
-        // No Authorization header
       });
       expect(response.statusCode).toBe(200);
     } finally {
@@ -334,107 +306,16 @@ describe('HTTP API — bearer token authentication', () => {
     }
   });
 
-  it('accepts POST /api/messages when no token is configured (auth disabled)', async () => {
-    const app = await buildApp(undefined); // auth disabled
+  it('accepts GET /api/agents/status when no token is configured (auth disabled)', async () => {
+    const app = await buildApp(undefined);
     try {
       const response = await app.inject({
-        method: 'POST',
-        url: '/api/messages',
-        payload: { content: 'hello', conversation_id: 'auth-disabled-conv-1' },
-        // No Authorization header
+        method: 'GET',
+        url: '/api/agents/status',
       });
       expect(response.statusCode).toBe(200);
     } finally {
       await app.close();
     }
-  });
-});
-
-// Verifies that the Dispatcher attaches messageTrustScore to agent.task events
-// for unknown HTTP senders when the channel policy is 'allow'.
-//
-// Expected score: http medium (0.6) × channelWeight (0.4) + unknown confidence (0.0) × contactWeight (0.4) = 0.24
-describe('Trust scoring — unknown sender via HTTP', () => {
-  const app = Fastify();
-  const bus = new EventBus(logger);
-  const eventRouter = new EventRouter(logger);
-
-  const mockProvider: LLMProvider = {
-    id: 'mock',
-    chat: async () => ({
-      type: 'text' as const,
-      content: 'Trust test response',
-      usage: { inputTokens: 5, outputTokens: 3, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
-      provenance: MOCK_PROVENANCE,
-    }),
-  };
-
-  // Resolver always returns an unknown sender — simulates a fresh HTTP caller
-  // with no corresponding contact record in the DB.
-  const mockResolver: ContactResolver = {
-    resolve: vi.fn().mockResolvedValue({
-      resolved: false,
-      channel: 'http',
-      senderId: 'unknown-api-caller',
-    } satisfies InboundSenderContext),
-  } as unknown as ContactResolver;
-
-  beforeAll(async () => {
-    eventRouter.setupSubscriptions(bus);
-
-    const coordinator = new AgentRuntime({
-      agentId: 'coordinator',
-      systemPrompt: 'You are a test agent.',
-      provider: mockProvider,
-      bus,
-      logger,
-    });
-    coordinator.register();
-
-    // Channel policy: medium trust, allow unknown senders so the message reaches
-    // the coordinator (and trust score is computed). Without 'allow', unknown
-    // senders would be dropped at the policy gate and no agent.task would fire.
-    const dispatcher = new Dispatcher({
-      bus,
-      logger,
-      contactResolver: mockResolver,
-      channelPolicies: { http: { trust: 'medium', unknownSender: 'allow', threaded: false } },
-    });
-    dispatcher.register();
-
-    app.register(messageRoutes, { bus, logger, eventRouter });
-
-    await app.ready();
-  });
-
-  afterAll(async () => {
-    await app.close();
-  });
-
-  it('agent.task carries messageTrustScore for unknown HTTP sender', async () => {
-    const tasks: AgentTaskEvent[] = [];
-
-    // Subscribe before injecting the request so we don't miss a fast delivery.
-    // bus.subscribe() returns void (no unsubscribe) — the subscription is scoped
-    // to this describe block's bus instance which is discarded after afterAll.
-    bus.subscribe('agent.task', 'agent', (e) => { tasks.push(e as AgentTaskEvent); });
-
-    await app.inject({
-      method: 'POST',
-      url: '/api/messages',
-      payload: {
-        content: 'What time is it?',
-        conversation_id: 'trust-int-test-1',
-        sender_id: 'unknown-api-caller',
-      },
-    });
-
-    // The inject() call awaits the agent response, so by the time we reach this
-    // line the agent.task event has already been delivered to our subscriber.
-    expect(tasks.length).toBeGreaterThan(0);
-
-    // http medium=0.6, unknown contact confidence=0.0
-    // score = (0.6 × 0.4) + (0.0 × 0.4) − (0 × 0.2) = 0.24
-    expect(tasks[0]!.payload.messageTrustScore).toBeCloseTo(0.24, 1);
   });
 });

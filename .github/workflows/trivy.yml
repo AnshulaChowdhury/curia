@@ -37,7 +37,7 @@ jobs:
       # 'true'  -> trivy-image should run; 'false' -> it should be skipped.
       image: ${{ steps.decide.outputs.image }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # Full history so we can diff a push against its "before" commit even
@@ -98,7 +98,7 @@ jobs:
       contents: read
       security-events: write  # Upload SARIF step writes to the Security tab
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -115,7 +115,7 @@ jobs:
           exit-code: '0'  # findings surfaced via SARIF, not exit code
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
         with:
           sarif_file: trivy-fs.sarif
           category: trivy-fs
@@ -143,7 +143,7 @@ jobs:
       contents: read
       security-events: write  # Upload SARIF step writes to the Security tab
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -159,10 +159,34 @@ jobs:
           output: 'trivy-image.sarif'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          # /root/.cache/pnpm is pnpm's registry METADATA cache. Its
+          # v11/metadata-full/*.jsonl files hold one JSONL per package containing every
+          # published version's manifest — README text included. The secret scanner reads
+          # those READMEs and reports the example tokens in them as leaked credentials:
+          # @octokit/auth-token's `createTokenAuth("ghp_…")` documentation snippet alone
+          # produced twelve CRITICAL github-pat / github-app-token findings
+          # (code-scanning #271-#282), which were the only CRITICALs in the tab and buried
+          # everything else.
+          #
+          # This is scanner scoping, not an exception for real findings. The content is
+          # public npm README prose in a build cache, and nothing in this directory is
+          # reachable at runtime — CMD invokes ./node_modules/.bin/tsx directly.
+          #
+          # The cache was deleted from the image first, which is the fix we would prefer.
+          # It broke the deploy: curia-deploy's downstream image re-resolves the entire
+          # workspace and verifies ~1300 lockfile entries, and without this cache it does
+          # that over the network. drizzle-orm's 64 MB packument then exceeded
+          # fetchTimeout, and fail-closed trustPolicy verification turned that into
+          # ERR_PNPM_TRUST_DOWNGRADE (#1758). Narrow the scanner until the downstream
+          # stops needing the cache (curia-deploy#220), then delete it for real.
+          #
+          # Deliberately scoped to this one path — NOT /root or /root/.cache — so a
+          # secret written anywhere else in the image is still caught.
+          skip-dirs: '/root/.cache/pnpm'
           exit-code: '0'  # findings surfaced via SARIF, not exit code
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image

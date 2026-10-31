@@ -70,13 +70,28 @@ export type IdentitySource =
   | 'ceo_stated'
   | 'email_participant'
   | 'signal_participant'
+  | 'slack_participant'
+  /** Inbound SMS peer (Telnyx From). Spoofable — not auto-verified (ADR-036). */
+  | 'sms_participant'
   | 'crm_import'
   | 'calendar_attendee'
   | 'self_claimed'
   // Contact registered by an agent calling the contact-register skill directly,
-  // outside the normal dispatcher pipeline. Treated with the same trust as
-  // email_participant — the agent is responsible for sourcing the identifier.
-  | 'agent_called';
+  // outside the normal dispatcher pipeline (ceo-inbox triage). The agent copied the
+  // identifier from mail, so it is verified only when it occurs in mail read in the
+  // conversation (#2061, ADR-047); otherwise it is stored unverified.
+  | 'agent_called'
+  // Contact or address an agent entered with contact-create or contact-link-identity
+  // (#2041). An agent typed it, so it is not the principal's own statement (ceo_stated).
+  // Written, verified, only after the duplicate check passes and the identifier is found
+  // in a message a person sent or a source-tool result (#2061); see ADR-047.
+  | 'agent_stated'
+  // First-time outbound recipient the gateway recorded when the caller did not
+  // name another source (promoteOrCreateRecipientContact): send-draft, a raw
+  // send before #2041, or an email-reply whose From failed the auth, ownership,
+  // or duplicate check. Not auto-verified (#2033, #2071, ADR-047). A later
+  // reply that passes those checks verifies this identity in place.
+  | 'outbound_recipient';
 
 // -- Identity status --
 // active: address is believed to be valid and usable (default)
@@ -166,6 +181,12 @@ export interface SenderContext {
   /** Facts from the KG about this person, formatted for prompt inclusion */
   knowledgeSummary: string;
   authorization: AuthorizationResult | null;
+  /**
+   * True when AuthorizationService.evaluate threw (or override lookup failed).
+   * authorization is null in that case; the dispatcher emits a fail-closed
+   * authorization.decision deny so the gap is auditable (#1379).
+   */
+  authorizationEvalFailed?: boolean;
   // Trust scoring inputs — available when contact was found in DB. Not propagated to bus events.
   contactConfidence: number;      // 0.0–1.0
   // Capability axis (issue #945). Canonical read path; the legacy status/trust_level
@@ -187,7 +208,7 @@ export type InboundSenderContext = SenderContext | UnknownSenderContext;
  * on every task — not just principal-originated ones. Survives task delegation
  * when the creating code copies originator from the parent task.
  *
- * See docs/wip/2026-05-10-principal-identity-design.md
+ * See docs/specs/09-contacts-and-identity.md § Principal Contact Resolution
  */
 export interface TaskOriginator {
   /** Contact ID of the person or agent that started this chain */
@@ -204,6 +225,13 @@ export interface TaskOriginator {
    * Used by execution-layer Gate C to apply the action policy from issue #948.
    */
   tier?: ContactTier | null;
+  /**
+   * The originating message authenticated its sender (inboundSenderAuthenticated: Signal and
+   * Slack, email only when the adapter verified it; never SMS or voice). Missing reads as false:
+   * originators stamped before #2312, system/console originators, and anything not proven.
+   * Travels with the originator to child tasks, like the rest of the lineage.
+   */
+  authenticated?: boolean;
 }
 
 // -- Authorization types --
@@ -222,7 +250,7 @@ export interface PermissionDef {
 export type TrustLevel = 'ceo' | 'high' | 'medium' | 'low';
 
 /** System designation — drives authorization. Separate from the free-text `role` field.
- *  - 'principal' — the human CEO who Curia serves
+ *  - 'principal' — the person Curia serves
  *  - 'agent'     — Curia itself or another autonomous agent
  *  - 'system'    — operator-configured, platform-executed (e.g. declarative YAML jobs)
  *
@@ -249,13 +277,14 @@ export const TRUST_RANK: Record<TrustLevel, number> = {
  * Unified capability axis replacing the old `status` / `trust_level` split.
  * Ordered ascending: blocked < unknown < known < trusted < principal.
  *
- * - 'blocked'   — CEO explicitly rejected this contact; messages are dropped.
+ * - 'blocked'   — principal explicitly rejected this contact; messages are dropped.
  * - 'unknown'   — contact exists but has not been confirmed (was: 'provisional' / trust_level='low').
- * - 'known'     — CEO-confirmed, no special trust grant (was: 'confirmed' + no trust_level).
- * - 'trusted'   — CEO granted elevated trust (was: trust_level='high').
- * - 'principal' — the human CEO Curia serves (was: system_role='principal' / trust_level='ceo').
+ * - 'known'     — principal-confirmed, no special trust grant (was: 'confirmed' + no trust_level).
+ * - 'trusted'   — principal granted elevated trust (was: trust_level='high').
+ * - 'principal' — the person Curia serves (was: system_role='principal' / trust_level='ceo').
  *
- * Added in migration 055. See docs/wip/ for the contacts redesign design memo.
+ * Added in migration 055. See docs/specs/09-contacts-and-identity.md § Data Model → contacts
+ * for the authoritative tier table.
  */
 export type ContactTier = 'blocked' | 'unknown' | 'known' | 'trusted' | 'principal';
 
@@ -267,7 +296,7 @@ export type ContactTier = 'blocked' | 'unknown' | 'known' | 'trusted' | 'princip
  * - 'person'       — individual human contact (default).
  * - 'organization' — a company or institution (linked KG node type='organization').
  * - 'automated'    — automated sender e.g. mailing list (exempts from unknown-tier gate in dispatcher.ts, #953).
- * - 'principal'    — the human CEO Curia serves.
+ * - 'principal'    — the person Curia serves.
  * - 'agent'        — Curia itself or another autonomous agent.
  *
  * Added in migration 055.
@@ -314,8 +343,19 @@ export function meetsMinimumTier(
  * skip tier gates for automated senders (noreply, newsletters, notifications).
  *
  * The dispatch tier gate bypass is wired in dispatcher.ts (#953).
- * TODO(#953): Wire into the outbound filter.
  */
+/**
+ * Why a contact was elevated from `unknown` to `known` (ContactService.elevateTierToKnown).
+ * principal-domain and principal-correspondence: evidence the principal knows the sender
+ * (src/contacts/principal-acquaintance.ts, #2227).
+ */
+export type TierElevationReason =
+  | 'correspondence'
+  | 'domain-validated'
+  | 'judgment'
+  | 'principal-domain'
+  | 'principal-correspondence';
+
 export function isAutomatedKind(kind: ContactKind): boolean {
   return kind === 'automated';
 }
@@ -323,7 +363,7 @@ export function isAutomatedKind(kind: ContactKind): boolean {
 export interface AuthorizationResult {
   allowed: string[];
   denied: string[];
-  /** Permissions that require escalation (not in role defaults, needs CEO decision) */
+  /** Permissions that require escalation (not in role defaults, needs principal decision) */
   escalate: string[];
   /** Channel trust level for this message's originating channel */
   channelTrust: TrustLevel;
@@ -378,6 +418,29 @@ export interface DuplicatePair {
   reason: string;        // human-readable: "Same email address", "Similar name (0.91)"
 }
 
+/** Why an existing contact may be the person an agent is about to add (#2041). */
+export type DuplicateReason =
+  | { kind: 'same_name' }
+  | { kind: 'similar_name' }
+  | { kind: 'similar_address'; channel: string }
+  | { kind: 'same_number'; channel: string };
+
+export interface DuplicateCandidate {
+  contact: Contact;
+  /** In the order found: identity reasons first, then the name. */
+  reasons: DuplicateReason[];
+}
+
+/**
+ * Result of ContactService.findLikelyDuplicates. `taken` blocks the write outright:
+ * another contact already holds the identifier on that channel. `candidates` block
+ * it until the agent names each one in distinct_from.
+ */
+export interface DuplicateCheck {
+  taken: Array<{ contact: Contact; channel: string }>;
+  candidates: DuplicateCandidate[];
+}
+
 // -- Merge types --
 
 export interface MergeGoldenRecord {
@@ -417,6 +480,72 @@ export class IdentityNotFoundError extends Error {
   }
 }
 
+/** Thrown when a contact id does not resolve (merge / lookup paths). */
+export class ContactNotFoundError extends Error {
+  readonly code = 'CONTACT_NOT_FOUND' as const;
+
+  constructor(contactId: string) {
+    super(`Contact not found: ${contactId}`);
+    this.name = 'ContactNotFoundError';
+  }
+}
+
+/**
+ * Thrown when mergeContacts would delete a structural contact (principal/agent).
+ * The structural row must be the primary (survivor), never the secondary.
+ */
+export class StructuralContactMergeError extends Error {
+  readonly code = 'STRUCTURAL_CONTACT_MERGE' as const;
+
+  constructor(secondaryId: string) {
+    super(
+      `Cannot merge structural contact ${secondaryId} (principal/agent/system-role) — a merge ` +
+        `deletes the secondary, which would destroy the structural row. Make it the primary instead.`,
+    );
+    this.name = 'StructuralContactMergeError';
+  }
+}
+
+/**
+ * Mutable holder for the principal's verified email so post-boot identity
+ * refreshes propagate to consumers that captured a reference at construction
+ * (#1514). Prefer this over a reassigned string primitive.
+ */
+export interface PrincipalEmailRef {
+  current: string;
+}
+
+/**
+ * Mutable holder for the principal's `contacts.primary_email`.
+ * Distinct from {@link PrincipalEmailRef}, which is the first verified email
+ * and is used as an allow-list, not as the designated primary. (#1950)
+ */
+export interface PrincipalPrimaryEmailRef {
+  current: string | null;
+}
+
+/**
+ * How the principal is to be referred to, read from their contact row.
+ * `displayName` is always set on a contact; the rest are null until someone states them.
+ */
+export interface PrincipalProfile {
+  displayName: string;
+  preferredName: string | null;
+  title: string | null;
+  pronouns: string | null;
+}
+
+/** Mutable holder for the principal's profile, refreshed in place like {@link PrincipalEmailRef}. */
+export interface PrincipalProfileRef {
+  current: PrincipalProfile | null;
+}
+
+/** Resolve a ceoEmail config that may be a plain string (tests) or a live ref. */
+export function resolvePrincipalEmail(email: string | PrincipalEmailRef | undefined): string {
+  if (email === undefined) return '';
+  return typeof email === 'string' ? email : email.current;
+}
+
 // -- Grant recommendation types (issue #952) --
 
 export type GrantRecommendationStatus = 'pending' | 'approved' | 'declined';
@@ -426,7 +555,7 @@ export interface GrantRecommendation {
   contactId: string;
   /** The permission string being recommended (e.g. 'schedule_meetings'). */
   permission: string;
-  /** LLM-authored rationale surfaced to the CEO for context. */
+  /** LLM-authored rationale surfaced to the principal for context. */
   reasoning: string;
   status: GrantRecommendationStatus;
   suggestedAt: Date;
@@ -449,7 +578,11 @@ export interface ContactServiceOptions {
   /** Called when a verified identity is linked — triggers confidence recompute.
    *  May return a Promise; rejections are caught by ContactService (non-fatal). */
   onIdentityVerified?: (contactId: string) => void | Promise<void>;
+  /** Called after any channel-identity mutation (link / unlink / status / verify / merge).
+   *  Used to hot-reload the startup-cached principalIdentities array (#1514).
+   *  May return a Promise; rejections are caught by ContactService (non-fatal). */
+  onIdentitiesChanged?: (contactId: string) => void | Promise<void>;
   /** Called after a contact's tier is automatically elevated to 'known'.
    *  Fired with the reason for observability/audit trail. Non-throwing. */
-  onContactElevated?: (contactId: string, reason: 'correspondence' | 'domain-validated' | 'judgment') => void;
+  onContactElevated?: (contactId: string, reason: TierElevationReason) => void;
 }

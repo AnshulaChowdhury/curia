@@ -1,9 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { BULLPEN_REPLY_RULE } from '../../../src/agents/prompts/bullpen-reply-rule.js';
 import { BullpenDispatcher } from '../../../src/dispatch/bullpen-dispatcher.js';
 import { BullpenService } from '../../../src/memory/bullpen.js';
+import { AgentRegistry } from '../../../src/agents/agent-registry.js';
 import { createLogger } from '../../../src/logger.js';
 import { createAgentDiscuss } from '../../../src/bus/events.js';
 import type { EventBus } from '../../../src/bus/bus.js';
+import type { Logger } from '../../../src/logger.js';
+
+/** Tests that do not model a roster. Production passes the real registry. */
+const allowAllAgents = { has: () => true } as unknown as AgentRegistry;
 
 function makeBus() {
   const handlers = new Map<string, ((event: unknown) => void)[]>();
@@ -30,7 +36,7 @@ describe('BullpenDispatcher', () => {
   beforeEach(() => {
     bus = makeBus();
     bullpenService = BullpenService.createInMemory();
-    dispatcher = new BullpenDispatcher(bus as unknown as EventBus, createLogger('error'), bullpenService);
+    dispatcher = new BullpenDispatcher(bus as unknown as EventBus, createLogger('error'), bullpenService, allowAllAgents);
     dispatcher.register();
   });
 
@@ -78,6 +84,61 @@ describe('BullpenDispatcher', () => {
     expect(task?.payload.channelId).toBe('bullpen');
     expect(task?.payload.metadata?.taskOrigin).toBe('bullpen');
     expect(task?.payload.metadata?.threadId).toBe(thread.id);
+  });
+
+  it('stamps the agent that opened the thread on every task (#1972)', async () => {
+    // A send the coordinator makes on this wake is a relay for the thread's opener,
+    // even when a later post in the thread came from someone else.
+    const { thread } = await bullpenService.openThread(
+      'Urgent: Dana', 'agent-b', ['agent-b', 'coordinator', 'agent-c'], 'Please tell the principal', ['coordinator'],
+    );
+    const event = createAgentDiscuss({
+      threadId: thread.id, messageId: 'msg-2', topic: 'Urgent: Dana',
+      senderAgentId: 'agent-c', participants: ['agent-b', 'coordinator', 'agent-c'],
+      mentionedAgentIds: ['coordinator'], content: 'Adding context', parentEventId: 'task-1',
+    });
+    await bus._trigger('agent.discuss', event);
+    const tasks = (bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([_l, e]) => (e as { type: string }).type === 'agent.task')
+      .map(([_l, e]) => e as { payload: { agentId: string; metadata: Record<string, unknown> } });
+    expect(tasks.length).toBeGreaterThan(0);
+    for (const t of tasks) {
+      expect(t.payload.metadata?.threadCreatorAgentId).toBe('agent-b');
+    }
+  });
+
+  // #1959: the reply rule left the coordinator's always-on prompt for the wake itself.
+  it('carries the bullpen reply rule on open-thread wakes, mentioned and FYI alike', async () => {
+    const { thread } = await bullpenService.openThread(
+      'Rule test', 'coordinator', ['coordinator', 'agent-b', 'agent-c'], 'Hi', ['agent-b'],
+    );
+    const event = createAgentDiscuss({
+      threadId: thread.id, messageId: 'msg-1', topic: 'Rule test',
+      senderAgentId: 'coordinator', participants: ['coordinator', 'agent-b', 'agent-c'],
+      mentionedAgentIds: ['agent-b'], content: 'Hi', parentEventId: 'task-1',
+    });
+    await bus._trigger('agent.discuss', event);
+    const tasks = (bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([_l, e]) => (e as { type: string }).type === 'agent.task')
+      .map(([_l, e]) => e as { payload: { content: string } });
+    expect(tasks).toHaveLength(2);
+    for (const t of tasks) expect(t.payload.content).toContain(BULLPEN_REPLY_RULE);
+  });
+
+  it('leaves the reply rule off a closed-thread wake, which takes no reply', async () => {
+    const { thread } = await bullpenService.openThread(
+      'Closed rule test', 'coordinator', ['coordinator', 'agent-b'], 'Start', [],
+    );
+    await bullpenService.postMessage(thread.id, 'agent-b', 'Done', [], true);
+    const event = createAgentDiscuss({
+      threadId: thread.id, messageId: 'msg-closed', topic: 'Closed rule test',
+      senderAgentId: 'agent-b', participants: ['coordinator', 'agent-b'],
+      mentionedAgentIds: ['coordinator'], content: 'Done', threadClosed: true, parentEventId: 'task-1',
+    });
+    await bus._trigger('agent.discuss', event);
+    const task = (bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .find(([_l, e]) => (e as { type: string }).type === 'agent.task')?.[1] as { payload: { content: string } };
+    expect(task.payload.content).not.toContain(BULLPEN_REPLY_RULE);
   });
 
   it('marks mentioned agents with mentioned: true in metadata', async () => {
@@ -215,21 +276,172 @@ describe('BullpenDispatcher', () => {
     expect(tasks).toHaveLength(0);
   });
 
-  it('skips task creation when the thread is closed (e.g. reply with close_after)', async () => {
-    // A close_after reply closes the thread atomically and then publishes the concluding
-    // agent.discuss; the dispatcher must not fan out reply tasks for a closed thread. (#881)
+  it('creates agent.task for originator when thread is closed via close_after', async () => {
+    // Handler auto-mentions the thread opener on close_after; dispatcher acts only on mentions.
     const { thread } = await bullpenService.openThread(
-      'Close-after dispatch test', 'coordinator', ['coordinator', 'agent-b'], 'Start', [],
+      'Scheduling consult', 'ceo-inbox', ['ceo-inbox', 'calendar'], 'CONSULT REQUEST', [],
     );
-    await bullpenService.postMessage(thread.id, 'agent-b', 'Concluding reply', [], true);
+    await bullpenService.postMessage(thread.id, 'calendar', 'CONSULT REPLY\nResult: ok\n...', [], true);
     const event = createAgentDiscuss({
-      threadId: thread.id, messageId: 'msg-closed', topic: 'Close-after dispatch test',
-      senderAgentId: 'agent-b', participants: ['coordinator', 'agent-b'],
-      mentionedAgentIds: ['coordinator'], content: 'Concluding reply', parentEventId: 'task-1',
+      threadId: thread.id, messageId: 'msg-closed', topic: 'Scheduling consult',
+      senderAgentId: 'calendar', participants: ['ceo-inbox', 'calendar'],
+      mentionedAgentIds: ['ceo-inbox'], content: 'CONSULT REPLY\nResult: ok', threadClosed: true,
+      parentEventId: 'task-1',
     });
     await bus._trigger('agent.discuss', event);
     const tasks = (bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([_l, e]) => (e as { type: string }).type === 'agent.task')
+      .map(([_l, e]) => e as { payload: { agentId: string; content: string; metadata: Record<string, unknown> } });
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]!.payload.agentId).toBe('ceo-inbox');
+    expect(tasks[0]!.payload.content).toContain('thread is now closed');
+    expect(tasks[0]!.payload.content).toContain('bullpen-read');
+    expect(tasks[0]!.payload.content).toContain('do not reply in-thread');
+    expect(tasks[0]!.payload.content).not.toContain('reply with bullpen-reply');
+    expect(tasks[0]!.payload.metadata?.threadClosed).toBe(true);
+  });
+
+  it('closed thread with no mentions: non-mentioned participants get FYI only', async () => {
+    const { thread } = await bullpenService.openThread(
+      'Closed FYI test', 'coordinator', ['coordinator', 'agent-b', 'agent-c'], 'Start', [],
+    );
+    await bullpenService.postMessage(thread.id, 'agent-b', 'Done', [], true);
+    const event = createAgentDiscuss({
+      threadId: thread.id, messageId: 'msg-closed', topic: 'Closed FYI test',
+      senderAgentId: 'agent-b', participants: ['coordinator', 'agent-b', 'agent-c'],
+      mentionedAgentIds: [], content: 'Done', threadClosed: true,
+      parentEventId: 'task-1',
+    });
+    await bus._trigger('agent.discuss', event);
+    const tasks = (bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([_l, e]) => (e as { type: string }).type === 'agent.task')
+      .map(([_l, e]) => e as { payload: { agentId: string; content: string } });
+    expect(tasks).toHaveLength(2);
+    for (const task of tasks) {
+      expect(task.payload.content).toContain('FYI: Final message');
+      expect(task.payload.content).not.toContain('act on the conclusion');
+    }
+  });
+
+  it('closed thread with explicit mentions: only mentioned agents get act prompt', async () => {
+    const { thread } = await bullpenService.openThread(
+      'Multi-party close', 'coordinator', ['coordinator', 'agent-b', 'agent-c'], 'Start', [],
+    );
+    await bullpenService.postMessage(thread.id, 'agent-b', 'Done', ['coordinator'], true);
+    const event = createAgentDiscuss({
+      threadId: thread.id, messageId: 'msg-closed', topic: 'Multi-party close',
+      senderAgentId: 'agent-b', participants: ['coordinator', 'agent-b', 'agent-c'],
+      mentionedAgentIds: ['coordinator'], content: 'Done', threadClosed: true,
+      parentEventId: 'task-1',
+    });
+    await bus._trigger('agent.discuss', event);
+    const tasks = (bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([_l, e]) => (e as { type: string }).type === 'agent.task')
+      .map(([_l, e]) => e as { payload: { agentId: string; content: string } });
+    expect(tasks).toHaveLength(2);
+    const coordTask = tasks.find(t => t.payload.agentId === 'coordinator');
+    const cTask = tasks.find(t => t.payload.agentId === 'agent-c');
+    expect(coordTask?.payload.content).toContain('act on the conclusion');
+    expect(cTask?.payload.content).toContain('FYI: Final message');
+    expect(cTask?.payload.content).not.toContain('act on the conclusion');
+  });
+
+  it('skips an unresolvable participant and still dispatches the rest (#1898)', async () => {
+    const localBus = makeBus();
+    const localService = BullpenService.createInMemory();
+    const error = vi.fn();
+    const logger = { info: vi.fn(), warn: vi.fn(), error, debug: vi.fn() } as unknown as Logger;
+    const registry = new AgentRegistry();
+    registry.register('coordinator', { role: 'coordinator', description: 'Coordinator' });
+    registry.register('agent-b', { role: 'specialist', description: 'B' });
+    const localDispatcher = new BullpenDispatcher(
+      localBus as unknown as EventBus,
+      logger,
+      localService,
+      registry,
+    );
+    localDispatcher.register();
+
+    const { thread } = await localService.openThread(
+      'Mixed roster', 'coordinator', ['coordinator', 'agent-b', 'ghost-agent'], 'Hello', ['agent-b', 'ghost-agent'],
+    );
+    const event = createAgentDiscuss({
+      threadId: thread.id,
+      messageId: 'msg-1',
+      topic: 'Mixed roster',
+      senderAgentId: 'coordinator',
+      participants: ['coordinator', 'agent-b', 'ghost-agent'],
+      mentionedAgentIds: ['agent-b', 'ghost-agent'],
+      content: 'Hello',
+      parentEventId: 'task-1',
+    });
+    await localBus._trigger('agent.discuss', event);
+
+    const tasks = (localBus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([_l, e]) => (e as { type: string }).type === 'agent.task')
+      .map(([_l, e]) => (e as { payload: { agentId: string } }).payload.agentId);
+    expect(tasks).toEqual(['agent-b']);
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: thread.id, agentId: 'ghost-agent' }),
+      'BullpenDispatcher: participant is not a registered agent — skipping task',
+    );
+  });
+
+  it('logs one error when the only other participant is unregistered (#1898)', async () => {
+    const localBus = makeBus();
+    const localService = BullpenService.createInMemory();
+    const error = vi.fn();
+    const logger = { info: vi.fn(), warn: vi.fn(), error, debug: vi.fn() } as unknown as Logger;
+    const registry = new AgentRegistry();
+    registry.register('coordinator', { role: 'coordinator', description: 'Coordinator' });
+    const localDispatcher = new BullpenDispatcher(
+      localBus as unknown as EventBus,
+      logger,
+      localService,
+      registry,
+    );
+    localDispatcher.register();
+
+    const { thread } = await localService.openThread(
+      'Solo ghost', 'coordinator', ['coordinator', 'ghost-agent'], 'Hello', ['ghost-agent'],
+    );
+    const event = createAgentDiscuss({
+      threadId: thread.id,
+      messageId: 'msg-1',
+      topic: 'Solo ghost',
+      senderAgentId: 'coordinator',
+      participants: ['coordinator', 'ghost-agent'],
+      mentionedAgentIds: ['ghost-agent'],
+      content: 'Hello',
+      parentEventId: 'task-1',
+    });
+    await localBus._trigger('agent.discuss', event);
+
+    const tasks = (localBus.publish as ReturnType<typeof vi.fn>).mock.calls
       .filter(([_l, e]) => (e as { type: string }).type === 'agent.task');
     expect(tasks).toHaveLength(0);
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: thread.id, agentId: 'ghost-agent' }),
+      'BullpenDispatcher: participant is not a registered agent — skipping task',
+    );
+  });
+
+  it('sets threadClosed false on open-thread dispatch tasks', async () => {
+    const { thread } = await bullpenService.openThread(
+      'Open thread', 'coordinator', ['coordinator', 'agent-b'], 'Hi', ['agent-b'],
+    );
+    const event = createAgentDiscuss({
+      threadId: thread.id, messageId: 'msg-1', topic: 'Open thread',
+      senderAgentId: 'coordinator', participants: ['coordinator', 'agent-b'],
+      mentionedAgentIds: ['agent-b'], content: 'Hi', threadClosed: false,
+      parentEventId: 'task-1',
+    });
+    await bus._trigger('agent.discuss', event);
+    const task = (bus.publish as ReturnType<typeof vi.fn>).mock.calls
+      .find(([_l, e]) => (e as { type: string }).type === 'agent.task')?.[1] as
+      { payload: { metadata: Record<string, unknown> } };
+    expect(task?.payload.metadata?.threadClosed).toBe(false);
   });
 });

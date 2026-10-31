@@ -1,12 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
-import { CalendarCreateEventHandler } from '../../../skills/calendar-create-event/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { CalendarCreateEventHandler } from '../../../skills/calendar/tools/calendar-create-event/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
 
-function makeCtx(input: Record<string, unknown>, overrides?: Partial<SkillContext>): SkillContext {
-  return { input, secret: () => { throw new Error('no secrets'); }, log: logger, ...overrides };
+function makeCtx(input: Record<string, unknown>, overrides?: Partial<ToolContext>): ToolContext {
+  return { toolName: 'calendar-create-event', toolVersion: '1.1.0', input, secret: () => { throw new Error('no secrets'); }, log: logger, ...overrides };
 }
 
 describe('CalendarCreateEventHandler', () => {
@@ -84,5 +84,25 @@ describe('CalendarCreateEventHandler', () => {
       { nylasCalendarClient: nylasCalendarClient as never },
     ));
     expect(result.success).toBe(true);
+  });
+
+  it('rejects attendee RSVP status instead of sending it to createEvent', async () => {
+    const nylasCalendarClient = { createEvent: vi.fn() };
+    const result = await handler.execute(makeCtx(
+      {
+        calendarId: 'cal-1',
+        title: 'Test',
+        start: '2026-04-01T09:00:00Z',
+        end: '2026-04-01T10:00:00Z',
+        attendees: [{ email: 'a@example.test', status: 'yes' }],
+      },
+      { nylasCalendarClient: nylasCalendarClient as never },
+    ));
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toMatch(/response status cannot be set/i);
+      expect(result.error).toContain('calendar-respond-to-invite');
+    }
+    expect(nylasCalendarClient.createEvent).not.toHaveBeenCalled();
   });
 });

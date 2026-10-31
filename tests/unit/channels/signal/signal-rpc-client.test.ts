@@ -27,10 +27,18 @@ function tmpSocketPath() {
 function createMockServer(socketPath: string) {
   const server = net.createServer();
   let clientSocket: net.Socket | null = null;
+  const accepted: net.Socket[] = [];
   const requestQueue: Array<{ id: string; method: string; params: unknown }> = [];
 
   server.on('connection', (socket) => {
     clientSocket = socket;
+    accepted.push(socket);
+    // Client teardown destroys its end. The peer read emits ECONNRESET, and
+    // an unhandled 'error' on this socket fails the suite after the tests pass.
+    socket.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'ECONNRESET' || err.code === 'EPIPE') return;
+      throw err;
+    });
     let buf = '';
     socket.on('data', (chunk) => {
       buf += chunk.toString('utf8');
@@ -50,7 +58,12 @@ function createMockServer(socketPath: string) {
   return {
     server,
     listen: () => new Promise<void>((resolve) => server.listen(socketPath, resolve)),
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    close: () => new Promise<void>((resolve, reject) => {
+      for (const sock of accepted) sock.destroy();
+      accepted.length = 0;
+      clientSocket = null;
+      server.close(err => (err ? reject(err) : resolve()));
+    }),
     push: (obj: unknown) => {
       if (clientSocket) {
         clientSocket.write(JSON.stringify(obj) + '\n');
@@ -153,7 +166,7 @@ describe('SignalRpcClient', () => {
     expect(req!.method).toBe('send');
     mock.respondSuccess(req!.id, { timestamp: 1700000000000 });
 
-    await expect(sendPromise).resolves.toBeUndefined();
+    await expect(sendPromise).resolves.toBe('1700000000000');
   });
 
   it('rejects a send request when signal-cli returns an error', async () => {

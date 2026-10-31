@@ -1,0 +1,357 @@
+// src/channels/slack/slack-client.ts
+//
+// Thin wrapper over @slack/web-api + @slack/socket-mode.
+// Mirrors SignalRpcClient's EventEmitter lifecycle: connect() starts in the
+// background with reconnect; disconnect() is idempotent teardown.
+
+import { EventEmitter } from 'node:events';
+import { WebClient } from '@slack/web-api';
+import { SocketModeClient } from '@slack/socket-mode';
+import type { Logger } from '../../logger.js';
+import type {
+  SlackAuthIdentity,
+  SlackInboundEvent,
+  SlackInboundKind,
+  SlackMessageEvent,
+  SlackPostMessageParams,
+  SlackPostMessageResult,
+  SlackUserInfo,
+} from './types.js';
+import { MAX_VOICE_NOTE_BYTES } from '../inbound-voice-note.js';
+
+export interface SlackClientConfig {
+  botToken: string;
+  appToken: string;
+  logger: Logger;
+}
+
+export interface SlackClientEvents {
+  connected: [];
+  disconnected: [];
+  /** kind distinguishes DM / mention / thread reply / reaction for the converter. */
+  event: [event: SlackInboundEvent, kind: SlackInboundKind];
+}
+
+/** Timeout for Slack private-file downloads — STT's 60s bound does not cover this hop. */
+const FILE_DOWNLOAD_TIMEOUT_MS = 15_000;
+
+const BODY_OVERSIZE_ERROR = 'Slack file download refused: body exceeds voice-note cap';
+
+/**
+ * Read a fetch body incrementally and abort as soon as it exceeds `maxBytes`.
+ * Chunked responses have no Content-Length, so buffering via `arrayBuffer()`
+ * would otherwise hold the full payload before the size check could fire.
+ */
+async function readBodyCapped(response: Response, maxBytes: number): Promise<Uint8Array> {
+  const body = response.body;
+  if (!body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > maxBytes) {
+      throw new Error(BODY_OVERSIZE_ERROR);
+    }
+    return bytes;
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        throw new Error(BODY_OVERSIZE_ERROR);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // Stream may already be closed or cancelled.
+    }
+  }
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+export class SlackFileDownloadError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message?: string) {
+    super(message ?? `Slack file download failed with HTTP ${status}`);
+    this.name = 'SlackFileDownloadError';
+    this.status = status;
+  }
+}
+
+function assertSlackFileUrl(url: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error('Slack file download refused: invalid URL');
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Slack file download refused: URL must be https');
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (host !== 'files.slack.com' && !host.endsWith('.files.slack.com')) {
+    throw new Error('Slack file download refused: URL host is not files.slack.com');
+  }
+  return parsed;
+}
+
+export class SlackClient extends EventEmitter {
+  private readonly web: WebClient;
+  private readonly socket: SocketModeClient;
+  private readonly log: Logger;
+  private readonly botToken: string;
+  private stopping = false;
+  private identity: SlackAuthIdentity | undefined;
+  private started = false;
+  /** Socket Mode link state — health probes (#1567) and outbound queue readiness (#1380). */
+  private socketConnected = false;
+
+  constructor(config: SlackClientConfig) {
+    super();
+    this.log = config.logger.child({ component: 'slack-client' });
+    this.botToken = config.botToken;
+    this.web = new WebClient(config.botToken);
+    this.socket = new SocketModeClient({ appToken: config.appToken });
+    // Register socket handlers exactly once, tied to the SocketModeClient's own
+    // lifetime (it outlives connect/disconnect). Registering inside connect()
+    // stacked a fresh listener on every stop→start, so a toggled channel would
+    // ack + emit each Slack event N times. The `stopping` flag gates emission
+    // during teardown; the `started` guard in connect() prevents a double start().
+    this.registerSocketHandlers();
+  }
+
+  /** Attach the Socket Mode event handlers. Called once from the constructor. */
+  private registerSocketHandlers(): void {
+    this.socket.on('connected', () => {
+      this.socketConnected = true;
+      this.log.info('Slack Socket Mode connected');
+      this.emit('connected');
+    });
+    this.socket.on('disconnected', () => {
+      this.socketConnected = false;
+      if (this.stopping) return;
+      this.log.warn('Slack Socket Mode disconnected — client will reconnect');
+      this.emit('disconnected');
+    });
+
+    // message events: DMs (im) and channel/group traffic (for active-thread replies).
+    this.socket.on('message', async ({ event, ack }) => {
+      try {
+        await ack();
+      } catch (err) {
+        this.log.warn({ err }, 'Slack Socket Mode ack failed for message event');
+      }
+      if (this.stopping) return;
+      if (!event || typeof event !== 'object') return;
+      const payload = event as SlackMessageEvent;
+      if (payload.type !== 'message') return;
+
+      const isDm =
+        payload.channel?.startsWith('D') ||
+        payload.channel_type === 'im';
+      this.emit('event', payload, isDm ? 'dm' : 'thread');
+    });
+
+    // Channel @mentions.
+    this.socket.on('app_mention', async ({ event, ack }) => {
+      try {
+        await ack();
+      } catch (err) {
+        this.log.warn({ err }, 'Slack Socket Mode ack failed for app_mention event');
+      }
+      if (this.stopping) return;
+      if (!event || typeof event !== 'object') return;
+      const payload = event as SlackInboundEvent;
+      if (payload.type !== 'app_mention') return;
+      this.emit('event', payload, 'mention');
+    });
+
+    // Reactions — normalized to inbound.reaction; emoji→intent is dispatch-side.
+    this.socket.on('reaction_added', async ({ event, ack }) => {
+      try {
+        await ack();
+      } catch (err) {
+        this.log.warn({ err }, 'Slack Socket Mode ack failed for reaction_added event');
+      }
+      if (this.stopping) return;
+      if (!event || typeof event !== 'object') return;
+      const payload = event as SlackInboundEvent;
+      if (payload.type !== 'reaction_added') return;
+      this.emit('event', payload, 'reaction');
+    });
+  }
+
+  /** Resolved after successful auth.test during start. */
+  getBotIdentity(): SlackAuthIdentity | undefined {
+    return this.identity;
+  }
+
+  /**
+   * Whether Socket Mode is currently connected.
+   * Outbound uses the Web API, but Socket Mode down is the channel-health signal
+   * we use for durable queueing (#1380) — the same network partition typically
+   * affects both paths, and it matches Signal's reconnect lifecycle.
+   */
+  isConnected(): boolean {
+    return this.socketConnected;
+  }
+
+  /** True after connect() until disconnect() — used by health probes (#1567). */
+  isStarted(): boolean {
+    return this.started;
+  }
+
+  /** True while Socket Mode is connected — used by health probes (#1567). */
+  isSocketConnected(): boolean {
+    return this.socketConnected;
+  }
+
+  /**
+   * Start Socket Mode. Resolves after auth.test + socket start attempt begins.
+   * Does not block boot on a live Slack connection — Socket Mode reconnects
+   * internally; we surface connected/disconnected for operators.
+   */
+  async connect(): Promise<void> {
+    this.stopping = false;
+    if (this.started) return;
+
+    try {
+      const auth = await this.web.auth.test();
+      const botUserId = typeof auth.user_id === 'string' ? auth.user_id : undefined;
+      if (!botUserId) {
+        throw new Error('auth.test did not return user_id — check bot token');
+      }
+      this.identity = {
+        botUserId,
+        teamId: typeof auth.team_id === 'string' ? auth.team_id : undefined,
+        botName: typeof auth.user === 'string' ? auth.user : undefined,
+      };
+      this.log.info(
+        { botUserId: this.identity.botUserId, botName: this.identity.botName, teamId: this.identity.teamId },
+        'Slack auth.test succeeded',
+      );
+    } catch (err) {
+      this.log.error({ err }, 'Slack auth.test failed — Socket Mode will still attempt to connect');
+    }
+
+    // Socket handlers are registered once in the constructor (see registerSocketHandlers).
+    this.started = true;
+    // start() reconnects with backoff internally — do not await forever on boot.
+    void this.socket.start().catch((err: unknown) => {
+      if (this.stopping) return;
+      this.log.error({ err }, 'Slack Socket Mode start failed');
+    });
+  }
+
+  async disconnect(): Promise<void> {
+    this.stopping = true;
+    if (!this.started) return;
+    try {
+      await this.socket.disconnect();
+    } catch (err) {
+      this.log.warn({ err }, 'Slack Socket Mode disconnect error');
+    }
+    this.started = false;
+    this.socketConnected = false;
+    this.log.info('Slack client disconnected');
+  }
+
+  async postMessage(params: SlackPostMessageParams): Promise<SlackPostMessageResult> {
+    try {
+      const result = await this.web.chat.postMessage({
+        channel: params.channel,
+        text: params.text,
+        thread_ts: params.threadTs,
+        // Avoid unfurling links into noisy previews in executive threads.
+        unfurl_links: false,
+        unfurl_media: false,
+      });
+      if (!result.ok) {
+        return { ok: false, error: result.error ?? 'unknown_error' };
+      }
+      return {
+        ok: true,
+        ts: typeof result.ts === 'string' ? result.ts : undefined,
+        channel: typeof result.channel === 'string' ? result.channel : params.channel,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.warn({ err }, 'Slack chat.postMessage failed');
+      return { ok: false, error: message };
+    }
+  }
+
+  async lookupUser(userId: string): Promise<SlackUserInfo | null> {
+    try {
+      const result = await this.web.users.info({ user: userId });
+      if (!result.ok || !result.user) return null;
+      const user = result.user;
+      const profile = user.profile;
+      const displayName =
+        profile?.display_name?.trim() ||
+        profile?.real_name?.trim() ||
+        user.real_name?.trim() ||
+        user.name?.trim() ||
+        userId;
+      return { id: userId, displayName };
+    } catch (err) {
+      this.log.warn({ err, userId }, 'Slack users.info failed');
+      return null;
+    }
+  }
+
+  /**
+   * Download a Slack-hosted file. Private URLs require the bot token as a
+   * Bearer Authorization header — they are not publicly fetchable (#1600).
+   *
+   * Host is asserted to `files.slack.com` before the token is attached.
+   * Bounded by `FILE_DOWNLOAD_TIMEOUT_MS` and `MAX_VOICE_NOTE_BYTES`.
+   */
+  async downloadFile(url: string): Promise<Uint8Array> {
+    assertSlackFileUrl(url);
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${this.botToken}` },
+      signal: AbortSignal.timeout(FILE_DOWNLOAD_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      try {
+        await response.body?.cancel();
+      } catch {
+        // Best-effort drain so undici does not pin the socket on error paths.
+      }
+      throw new SlackFileDownloadError(response.status);
+    }
+    const contentLengthHeader = response.headers.get('content-length');
+    if (contentLengthHeader) {
+      const contentLength = Number(contentLengthHeader);
+      if (Number.isFinite(contentLength) && contentLength > MAX_VOICE_NOTE_BYTES) {
+        try {
+          await response.body?.cancel();
+        } catch {
+          // Best-effort drain so undici does not pin the socket on error paths.
+        }
+        throw new Error('Slack file download refused: content-length exceeds voice-note cap');
+      }
+    }
+    const bytes = await readBodyCapped(response, MAX_VOICE_NOTE_BYTES);
+    if (bytes.byteLength === 0) {
+      throw new Error('Slack file download returned empty body');
+    }
+    return bytes;
+  }
+}

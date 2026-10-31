@@ -18,63 +18,120 @@
  */
 
 import * as path from 'node:path';
+import { createRequire } from 'node:module';
 import { runner } from 'node-pg-migrate';
-import { ceoPrimaryEmailIsPlaceholder, loadConfig, loadYamlConfig, resolveChannelAccounts, resolveTasksConfig } from './config.js';
+import { loadConfig, loadYamlConfig, resolveTasksConfig, resolveHealthConfig, resolveLateDeliveryConfig, resolveApprovalExpiryConfig, resolveReportFallbackConfig, resolveIdentityGateMode, resolveAutonomyGating, resolveVerificationConfig, resolveRelayBudgetConfig, resolveTurnInjectionConfig, resolveOutboundJudgeConfig, resolveOutboundRedactionConfig, OutboundConfigError, type OutboundJudgeSettings, type OutboundRedactionSettings } from './config.js';
+import { createVerificationRuntime } from './verification/index.js';
 import { createLogger } from './logger.js';
 import { HttpAdapter } from './channels/http/http-adapter.js';
+import { resolveMemoryRetentionSnapshot } from './channels/http/routes/memory-retention.js';
+import { resolveSystemSnapshot } from './channels/http/routes/system.js';
 import { createPool } from './db/connection.js';
+import { CURIA_APPLICATION_NAME, holdInstanceLock } from './db/instance-lock.js';
+import { DbAvailabilityMonitor } from './db/availability-monitor.js';
+import { MemorySampler } from './monitoring/memory-sampler.js';
 import { EventBus } from './bus/bus.js';
 import { AuditLogger } from './audit/logger.js';
+import { AuditLogRepo } from './audit/audit-log-repo.js';
+import { DiagnosticsRepo } from './diagnostics/diagnostics-repo.js';
 import { AnthropicProvider } from './agents/llm/anthropic.js';
 import { OpenRouterProvider } from './agents/llm/openrouter.js';
+import { BedrockProvider } from './agents/llm/bedrock.js';
 import { AgentRuntime } from './agents/runtime.js';
 import { Dispatcher } from './dispatch/dispatcher.js';
+import { TurnLanes } from './dispatch/turn-lanes.js';
+import { createPrincipalBacklogSource } from './dispatch/principal-backlog.js';
 import { CliAdapter } from './channels/cli/cli-adapter.js';
-import { discoverAgentManifests, interpolateRuntimeContext } from './agents/loader.js';
+import { discoverAgentManifests } from './agents/loader.js';
+import { createPinnedContextReader } from './agents/pinned-context.js';
 import type { AgentYamlConfig, AgentDiscovery } from './agents/loader.js';
 import { ModelRouter } from './agents/llm/model-router.js';
+import { smallCapModelSlots, smallCapThinkingViolations, voiceModelSlot } from './agents/llm/small-cap-models.js';
 import { ModelRegistry } from './agents/llm/model-registry.js';
 import { createEstimateCostUsd } from './agents/llm/pricing.js';
 import type { LLMProvider } from './agents/llm/provider.js';
 import { LLMProviderRouter } from './agents/llm/provider-router.js';
 import { TelemetryLlmProvider } from './agents/llm/telemetry-provider.js';
+import { watchProvider } from './agents/llm/reasoning-watchdog-provider.js';
 import { InfraLlmService } from './skills/infra-llm.js';
-import { AgentRegistry } from './agents/agent-registry.js';
+import { AgentRegistry, missingDurationHintWarning } from './agents/agent-registry.js';
+import {
+  DELEGATE_DEFAULT_TIMEOUT_FLOOR_MS,
+  isDelegateDefaultBelowFloor,
+} from './agents/delegate-timeout.js';
 import { WorkingMemory } from './memory/working-memory.js';
-import { EmbeddingService } from './memory/embedding.js';
+import { sharedIdentifierSourceIndex } from './agents/identifier-source-index.js';
+import { createIdentifierSources } from './agents/identifier-sources.js';
+import { EmbeddingService, redactUrlUserinfo } from './memory/embedding.js';
+import { resolveKnowledgeGraphEmbedding } from './memory/embedding-schema.js';
 import { KnowledgeGraphStore } from './memory/knowledge-graph.js';
 import { MemoryValidator } from './memory/validation.js';
 import { EntityMemory } from './memory/entity-memory.js';
 import { ConfigStore } from './memory/config-store.js';
-import { SkillRegistry } from './skills/registry.js';
+import { ToolRegistry } from './skills/registry.js';
 import { ExecutionLayer } from './skills/execution.js';
-import { loadSkillsFromDirectory, discoverSkillManifests, validateAllowedCallers } from './skills/loader.js';
-import type { SkillDiscovery } from './skills/loader.js';
-import { loadMcpServers } from './skills/mcp-loader.js';
+import { resolveBypassLadder } from './autonomy/effective-standing.js';
+import { loadToolsFromDirectory, discoverToolManifests, validateAllowedCallers } from './skills/loader.js';
+import type { ToolDiscovery } from './skills/loader.js';
+import { loadMcpServers, loadSkillsConfig, registerMcpProjectedSkills, type McpServerLoadStatus } from './skills/mcp-loader.js';
 import type { McpSession } from './skills/mcp-client.js';
 import { ContactService } from './contacts/contact-service.js';
-import type { ChannelIdentity, Contact } from './contacts/types.js';
+import { NodeMergeService } from './kg-merge/service.js';
+import type { ChannelIdentity, Contact, PrincipalEmailRef, PrincipalPrimaryEmailRef, PrincipalProfileRef } from './contacts/types.js';
 import { ConfidencePipeline } from './contacts/confidence-pipeline.js';
 import { DedupService } from './contacts/dedup-service.js';
 import { ContactResolver } from './contacts/contact-resolver.js';
 import { createContactDuplicateDetected, createContactElevated, createContactMerged } from './bus/events.js';
 import { NylasClient } from './channels/email/nylas-client.js';
 import { NylasCalendarClient } from './channels/calendar/nylas-calendar-client.js';
+import { resolvePrincipalCalendarGrant } from './channels/calendar/resolve-calendar-grant.js';
+import { PrincipalAcquaintanceCheck } from './contacts/principal-acquaintance.js';
+import { NylasPrincipalMailbox } from './contacts/nylas-principal-mailbox.js';
 import { EmailAdapter } from './channels/email/email-adapter.js';
+import { EmailAccountsRepo } from './channels/email/email-accounts-repo.js';
+import { resolveEmailAccounts } from './channels/email/resolve-email-accounts.js';
 import { SignalRpcClient } from './channels/signal/signal-rpc-client.js';
 import { SignalAdapter } from './channels/signal/signal-adapter.js';
+import { SlackClient } from './channels/slack/slack-client.js';
+import { SlackAdapter } from './channels/slack/slack-adapter.js';
+import { SmsClient } from './channels/sms/sms-client.js';
+import { SmsAdapter } from './channels/sms/sms-adapter.js';
+import { SmsWebhookBridge } from './channels/sms/webhook-bridge.js';
+import { VoiceAdapter } from './channels/voice/voice-adapter.js';
+import { VoiceSessionBridge } from './channels/voice/session-bridge.js';
+import { VoiceSessionStore } from './channels/voice/session-store.js';
+import { VoiceRuntime } from './channels/voice/voice-runtime.js';
+import { VOICE_TOOL_NAMES } from './channels/voice/voice-tools.js';
+import { invokeVoiceToolAudited } from './channels/voice/voice-tool-audit.js';
+import { evaluateVoiceModelCapabilities } from './channels/voice/voice-model-capabilities.js';
+import { DeepgramSttProvider, CartesiaTtsProvider, SpeechMediaService } from './speech/index.js';
+import { LiveKitRoomSession } from './channels/voice/livekit/room-session.js';
+import { deleteVoiceRoom, listVoiceRooms } from './channels/voice/livekit/token.js';
+import { SignalCallBridge } from './channels/voice/signal/signal-call-bridge.js';
+import { AgendaStore } from './meetings/agenda-store.js';
+import { MinutesPipeline } from './meetings/minutes-pipeline.js';
+import { MeetingPipelineRecovery } from './meetings/recovery.js';
+import { MeetingSessionEndedSubscriber, MinutesReadySubscriber } from './meetings/subscribers.js';
 import { loadAuthConfig } from './contacts/config-loader.js';
 import { AuthorizationService } from './contacts/authorization.js';
-import { DEFAULT_ERROR_BUDGET } from './errors/types.js';
-import { OutboundContentFilter } from './dispatch/outbound-filter.js';
+import type { OutboundContentFilter } from './dispatch/outbound-filter.js';
+import { buildEscalationJudge, buildOutboundContentFilter, EscalationJudgeConfigError } from './dispatch/outbound-filter-wiring.js';
+import { extractPromptExfiltrationMarkers } from './dispatch/prompt-exfiltration-markers.js';
+import { TRIGGER_GUIDANCE_MARKER_SOURCES } from './agents/prompts/trigger-guidance-sources.js';
 import { OutboundLlmJudge } from './dispatch/outbound-judge.js';
 import type { JudgeConfig } from './dispatch/outbound-judge.js';
-import { EscalationJudge } from './autonomy/escalation-judge.js';
-import type { EscalationJudgeConfig } from './autonomy/escalation-judge.js';
+import type { EscalationJudge } from './autonomy/escalation-judge.js';
+import { FailOpenLimiter } from './autonomy/band-policy.js';
+import { RelayBudget } from './autonomy/relay-budget.js';
+import { checkBandGatingReady } from './autonomy/band-wiring.js';
+import { SendEvidenceCollector } from './autonomy/send-evidence.js';
+import { BandSendReview } from './dispatch/band-send-review.js';
+import { formatWhoYouServeBlock } from './agents/principal-contact-block.js';
 import { OutboundGateway } from './skills/outbound-gateway.js';
-import { InboundScanner } from './dispatch/inbound-scanner.js';
+import { OutboundQueueRepo } from './skills/outbound-queue-repo.js';
+import { ExportControlService, resolveExportControls } from './security/export-controls.js';
+import { createInboundScanner } from './dispatch/security-config-loader.js';
 import { RateLimiter } from './dispatch/rate-limiter.js';
-import { loadExtraInjectionPatterns, type ExtraInjectionPattern } from './dispatch/security-config-loader.js';
 import { parseExtraPiiPatterns, getMissingBuiltInPatterns, getBuiltInPatternCount } from './pii/scrubber.js';
 import type { PiiPattern } from './pii/scrubber.js';
 import { PiiRedactor } from './dispatch/pii-redactor.js';
@@ -87,13 +144,26 @@ import { SuspensionNotifier } from './scheduler/suspension-notifier.js';
 import { RecoveryNotifier } from './scheduler/recovery-notifier.js';
 import type { DriftConfig } from './scheduler/drift-detector.js';
 import { EntityContextAssembler } from './entity-context/assembler.js';
+import { ConversationEntityState } from './entity-context/conversation-entities.js';
 import { bootstrapAgentIdentity } from './entity-context/bootstrap.js';
-import { bootstrapCeoContact } from './contacts/ceo-bootstrap.js';
+import { repairPrincipalMetadata } from './contacts/ceo-bootstrap.js';
 import { AutonomyService } from './autonomy/autonomy-service.js';
 import { ActionLogRepo } from './autonomy/action-log-repo.js';
 import { TaskRepo } from './db/task-repo.js';
+import { TaskOutreachRepo } from './dispatch/task-outreach.js';
+import { DisclosureDecisionRecorder, DisclosureDecisionsRepo } from './autonomy/disclosure-decisions.js';
+import { OutreachMatcher } from './dispatch/outreach-matcher.js';
+import { principalOrgDomainSet } from './contacts/non-org-domains.js';
+import { TaskOutreachService, taskLookupFrom } from './dispatch/task-outreach-capability.js';
+import { WorkingDocsRepo } from './db/working-docs-repo.js';
 import { ApprovalTriggerService } from './autonomy/approval-trigger.js';
+import { ApprovalDelivery } from './autonomy/approval-delivery.js';
+import { ReactionApprovalMapper } from './autonomy/reaction-approval-mapper.js';
+import { DEFAULT_REACTION_INTENTS } from './autonomy/reaction-intent.js';
 import { AutonomyScoringPass } from './autonomy/scoring-pass.js';
+import { ActivityService } from './activity/activity-service.js';
+import { BriefingService } from './dashboard/briefing-service.js';
+import { ActivitySummarizer } from './activity/summarizer.js';
 import type { ScoringPassConfig } from './autonomy/scoring-pass.js';
 import { BrowserService } from './browser/browser-service.js';
 import { OfficeIdentityService } from './identity/service.js';
@@ -104,8 +174,10 @@ import { SecretCaptureService } from './secrets/secret-capture-service.js';
 import { SecretCaptureResumeSubscriber } from './secrets/secret-capture-resume-subscriber.js';
 import { channelCredentialKeys } from './channels/http/routes/vault.js';
 import { applyVaultSecrets } from './secrets/apply-vault-secrets.js';
+import { applyChannelVaultSecrets } from './channels/apply-channel-vault-secrets.js';
 import { SensitivityClassifier } from './memory/sensitivity.js';
 import { DreamEngine } from './memory/dream-engine.js';
+import { backfillDirectChannelSenders } from './memory/direct-sender-backfill.js';
 import type { DecayConfig } from './memory/dream-engine.js';
 import type { AgentPersona } from './skills/types.js';
 import type { ConfigChangeEvent } from './bus/events.js';
@@ -115,21 +187,67 @@ import { TempFileStore } from './skills/temp-file-store.js';
 import { ConversationCheckpointProcessor } from './checkpoint/processor.js';
 import { runStartupValidation } from './startup/validator.js';
 import { runReadinessChecks } from './startup/readiness.js';
-import { compileSecurityContextBlock } from './security/security-context.js';
+import { compileSecurityContextBlock, resolveSecurityThresholds } from './security/security-context.js';
 import { OutboundContextService } from './dispatch/outbound-context.js';
-import { applyTaskManagement } from './agents/task-management.js';
+import { DEFAULT_SCRATCH_DOC_TTL_DAYS } from './agents/document-workspace.js';
+import { SkillRegistry } from './skills/skill-registry.js';
+import {
+  discoverSkillManifests,
+  loadSkillsFromDiscovery,
+  registerSyntheticSingletonSkills,
+} from './skills/skill-loader.js';
+import { collectPinnedByBundle } from './skills/pin-resolution.js';
+import {
+  AgentAssemblyError,
+  assembleAgent,
+  principalIdentitySnapshotGaps,
+  readPrincipalIdentitySnapshot,
+  registerAgentRoster,
+  type AgentAssemblyContext,
+  type AssembledAgent,
+} from './startup/agent-assembly.js';
 import { BacklogHeartbeat } from './scheduler/backlog-heartbeat.js';
-import * as fs from 'node:fs';
-import yaml from 'js-yaml';
+import { taskHasPendingWake } from './agents/resumable-continuation.js';
+import { ResumableContinuationSubscriber } from './agents/resumable-continuation-subscriber.js';
+import { LateDelegationSubscriber } from './agents/late-delegation-subscriber.js';
+import {
+  acquireRunningDelegation,
+  findInFlightPendingDelegation,
+  findRunningOriginTurns,
+  releaseRunningDelegation,
+} from './db/queries/pending-delegations.js';
+import { LateDelegationSweep } from './agents/late-delegation-sweep.js';
+import { ApprovalExpirySweep } from './autonomy/approval-expiry-sweep.js';
+import { ReportQueue } from './reports/report-queue.js';
+import { ReportFallbackDigest } from './reports/report-fallback-digest.js';
+import { registerSpotCheckBinder } from './reports/spot-check-binder.js';
+import { SpotCheckSampler } from './reports/spot-check-sampler.js';
+import { describeEmailVia } from './reports/describe-email.js';
+import { SpotCheckStore } from './reports/spot-check-store.js';
+import { PlanFrontierSubscriber } from './agents/plan-frontier-subscriber.js';
+import {
+  DeliverableKgPromotionSubscriber,
+  resolveKgPromotionConfig,
+} from './agents/deliverable-kg-promotion.js';
 import { RegistryRepo } from './registry/registry-repo.js';
 import { RegistryService } from './registry/registry-service.js';
-import { reconcileRegistries, type RegistryDefaults } from './registry/reconcile.js';
+import { BundleCascadeRepo } from './registry/bundle-cascade-repo.js';
+import {
+  bundleMembersFromDiscovery, loadRegistryDefaults, reconcileRegistries, toolManifestsFromDiscovery,
+  type RegistryDefaults,
+} from './registry/reconcile.js';
 import type { Discovery, RegistryRow } from './registry/types.js';
 import { CHANNEL_CATALOG, type ChannelDescriptor } from './channels/catalog.js';
 import { channelCredentialStatus } from './channels/credential-resolver.js';
 import { ChannelRegistryRepo } from './registry/channel-registry-repo.js';
 import { ChannelRegistryService } from './registry/channel-registry-service.js';
 import { reconcileChannelRegistry } from './registry/channel-reconcile.js';
+import { gateOutboundClientsForRegistry, hasRegistryGatedOutboundClient } from './registry/channel-outbound-gate.js';
+import { McpRegistryRepo } from './registry/mcp-registry-repo.js';
+import { McpRegistryService } from './registry/mcp-registry-service.js';
+import { reconcileMcpRegistry } from './registry/mcp-reconcile.js';
+import { HealthService } from './health/health-service.js';
+import { CanarySchedule } from './health/canary-schedule.js';
 
 async function main(): Promise<void> {
   // Captured at the very start of main() so the wizard's post-setup polling
@@ -145,6 +263,10 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const configDir = path.resolve(import.meta.dirname, '../config');
   const yamlConfig = loadYamlConfig(configDir);
+  const voiceModel = yamlConfig.channels?.voice?.model?.trim();
+  config.voiceModel = voiceModel ? voiceModel : undefined;
+  const voiceMgmtUrl = yamlConfig.channels?.voice?.livekit_management_url?.trim();
+  config.voiceLivekitManagementUrl = voiceMgmtUrl || config.voiceLivekitManagementUrl;
   const logger = createLogger(config.logLevel);
   logger.info('Curia starting...');
 
@@ -168,60 +290,36 @@ async function main(): Promise<void> {
     );
   });
 
-  // Surface the `.env.example` placeholder case so it's obvious in logs why
-  // CEO_PRIMARY_EMAIL appears to be ignored. loadConfig() normalized the value
-  // to undefined silently because the logger doesn't exist yet at that point;
-  // warn here once the logger is available.
-  if (ceoPrimaryEmailIsPlaceholder()) {
-    logger.warn(
-      'CEO_PRIMARY_EMAIL is the literal .env.example placeholder ("you@yourdomain.com") — treating as unset. ' +
-        'Comment the line out or set a real address; fresh installs should rely on the /setup wizard to create the principal.',
-    );
-  }
-
   // Compile the security context block from config at startup.
   // runStartupValidation (below) enforces the JSON schema, which requires trust_thresholds
   // whenever the `security:` block is present. But `security:` itself is optional at the
   // root (extra_injection_patterns et al. are also optional), and this block runs *before*
   // schema validation, so guard explicitly here rather than relying on a non-null assertion
   // that would crash unhelpfully.
-  const rawThresholds = yamlConfig.security?.trust_thresholds;
-  // Explicit undefined check first so TypeScript narrows rawThresholds below.
-  if (rawThresholds === undefined) {
-    logger.fatal(
-      'Missing required config: security.trust_thresholds is absent from config/default.yaml — startup aborted',
-    );
+  // Validation is shared with the test-mode stack (resolveSecurityThresholds) so the
+  // two cannot disagree about what a valid config is (#1966).
+  const thresholdResolution = resolveSecurityThresholds(yamlConfig.security?.trust_thresholds);
+  if (!thresholdResolution.ok) {
+    if (thresholdResolution.reason === 'absent') {
+      logger.fatal(
+        'Missing required config: security.trust_thresholds is absent from config/default.yaml — startup aborted',
+      );
+    } else if (thresholdResolution.reason === 'missing_fields') {
+      logger.fatal(
+        { missingFields: thresholdResolution.fields },
+        'Missing required config fields in security.trust_thresholds in config/default.yaml — startup aborted',
+      );
+    } else {
+      // Schema validation (below) also checks ranges, but runs after this block.
+      // Catching out-of-range values here gives a clearer error.
+      logger.fatal(
+        { outOfRangeFields: thresholdResolution.fields },
+        'Invalid security.trust_thresholds values — all must be numbers in [0.0, 1.0]',
+      );
+    }
     process.exit(1);
   }
-  const missingFields = (['information_query', 'scheduling', 'data_export', 'financial'] as const)
-    .filter(f => rawThresholds[f] === undefined);
-  if (missingFields.length > 0) {
-    logger.fatal(
-      { missingFields },
-      'Missing required config fields in security.trust_thresholds in config/default.yaml — startup aborted',
-    );
-    process.exit(1);
-  }
-  // Validate ranges — schema validation (below) also checks this, but runs
-  // after this block. Catching out-of-range values here gives a clearer error.
-  const outOfRangeFields = (['information_query', 'scheduling', 'data_export', 'financial'] as const)
-    .filter(f => {
-      const v = rawThresholds[f];
-      return v < 0 || v > 1;
-    });
-  if (outOfRangeFields.length > 0) {
-    logger.fatal(
-      { outOfRangeFields },
-      'Invalid security.trust_thresholds values — all must be numbers in [0.0, 1.0]',
-    );
-    process.exit(1);
-  }
-  const securityContextBlock = compileSecurityContextBlock({
-    information_query: rawThresholds.information_query,
-    scheduling:        rawThresholds.scheduling,
-    data_export:       rawThresholds.data_export,
-    financial:         rawThresholds.financial,
-  });
+  const securityContextBlock = compileSecurityContextBlock(thresholdResolution.thresholds);
 
   // 1b. Startup validation — fail fast before any I/O if configs are malformed.
   // Only validates config/default.yaml and config/skills.yaml here. Agent and skill
@@ -232,7 +330,7 @@ async function main(): Promise<void> {
     await runStartupValidation({
       configDir,
       // agentsDir / skillsDir intentionally omitted — manifest schema validation now
-      // happens inside discoverAgentManifests / discoverSkillManifests so that broken
+      // happens inside discoverAgentManifests / discoverToolManifests so that broken
       // uninstalled manifests don't block startup.
       // `schemasDir` is computed here (the entrypoint) — not inside the validator —
       // because tsup bundles every source file into a single `dist/index.js`,
@@ -252,7 +350,7 @@ async function main(): Promise<void> {
   // 2. Database — needed by audit logger before the bus can accept events.
   // We probe with SELECT 1 to distinguish a misconfigured URL (fast fail)
   // from a legitimate connection that might be retried later.
-  const pool = createPool(config.databaseUrl, logger);
+  const pool = createPool(config.databaseUrl, logger, { applicationName: CURIA_APPLICATION_NAME });
   try {
     await pool.query('SELECT 1');
     logger.info('Database connected');
@@ -276,15 +374,22 @@ async function main(): Promise<void> {
 
   // Autonomy service — manages the global autonomy score (0–100).
   // Instantiated early (right after DB connect) so it's ready before agents start.
-  const autonomyService = new AutonomyService(pool, logger);
+  // Which policy decides when Curia asks first (#2159, ADR-049). Ships as 'tier'. Resolved here
+  // because the autonomy service stamps it on the config the prompt block reads.
+  const autonomyGating = resolveAutonomyGating(yamlConfig.autonomy);
+  const autonomyService = new AutonomyService(pool, logger, { gating: autonomyGating });
 
   // Run pending migrations so the schema is always current when the process starts.
   // Uses node-pg-migrate's programmatic runner with the same DATABASE_URL.
   // This is safe for single-process deployments; node-pg-migrate acquires an
   // advisory lock to prevent concurrent migration runs.
+  //
+  // Migrations are mostly plain .sql; rare .js wrappers (e.g. 081) exist when
+  // pgm.noTransaction() is required (CREATE INDEX CONCURRENTLY). The runner
+  // loads every file in the directory — it does not filter by language.
   try {
     // Resolve from the project root (one level up from src/ or dist/) so the
-    // path works both in dev (tsx src/index.ts) and production (node dist/index.js).
+    // path works both in dev (tsx src/index.ts) and production (tsx dist/index.js).
     const migrationsDir = path.resolve(import.meta.dirname, '..', 'src', 'db', 'migrations');
     const applied = await runner({
       databaseUrl: config.databaseUrl,
@@ -303,6 +408,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Instance lock (ADR-051): held for the process's life so maintenance commands such as
+  // pnpm reembed:kg refuse to run beside a live Curia. Advisory only — a failure to take
+  // it, or its loss later, is logged and Curia keeps running.
+  const releaseInstanceLock = await holdInstanceLock(pool, logger);
+
   // Resolve bootstrap/config secrets from the vault now that migrations have run
   // (the `secrets` table exists) and before any consumer reads config (#911).
   // Vault-only: a missing required secret leaves config undefined, failing closed at
@@ -311,6 +421,11 @@ async function main(): Promise<void> {
   // with a structured fatal line to match the migration/encryption-key blocks above.
   try {
     await applyVaultSecrets(config, secretsService, logger);
+    // Overlay channel-scoped vault creds (channel.email.* / channel.signal.*, written by the
+    // Channels UI) onto config so the email/signal adapters boot from console-configured
+    // creds. Same fatal-on-error contract as applyVaultSecrets. Must run before
+    // resolveChannelAccounts and adapter/gateway construction below. (#964)
+    await applyChannelVaultSecrets(config, secretsService, process.env, logger);
   } catch (err) {
     logger.fatal({ err }, 'Failed to resolve bootstrap secrets from vault');
     process.exit(1);
@@ -329,12 +444,21 @@ async function main(): Promise<void> {
   // 3. Audit logger — must be ready before the bus starts accepting events.
   // The bus's write-ahead hook calls auditLogger.log() synchronously before
   // delivering to any subscriber, so this must exist when the bus is constructed.
-  const auditLogger = new AuditLogger(pool, logger);
+  const llmCallArchiveCfg = yamlConfig.audit?.llmCallArchive;
+  const auditLogger = new AuditLogger(pool, logger, {
+    llmCallArchiveEnabled: llmCallArchiveCfg?.enabled !== false,
+    llmCallArchiveIncludeReasoning: llmCallArchiveCfg?.includeReasoning !== false,
+  });
+
+  // 3a. Confirm hash-chain schema + log head (spec 10). Chain state lives in the
+  // DB only — every write re-reads the head under the advisory lock.
+  await auditLogger.seedHashChain();
 
   // 3b. Startup scan — flag any events that were written but never acknowledged.
   // These indicate the process crashed between write-ahead and delivery on a
-  // previous run. Logged at warn level for operator visibility; replay is a
-  // separate future feature.
+  // previous run. Logged at warn level for operator visibility. Email adapters
+  // replay their own unacknowledged inbound.message rows on start; every other
+  // event type stays diagnostic here.
   await auditLogger.scanForUnacknowledged();
 
   // 4. Message bus — the write-ahead hook ensures every event is durably
@@ -364,7 +488,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 4c. Executive profile — System-layer service that owns the executive (CEO)
+  // 4c. Executive profile — System-layer service that owns the executive (principal)
   // writing voice and style preferences. Separate from office identity (which is
   // the assistant's persona). The executive's identity (name, title) lives in the
   // contact system — this is purely about how the system represents them.
@@ -380,7 +504,7 @@ async function main(): Promise<void> {
     await executiveProfileService.initialize();
     logger.info('Executive profile initialized');
   } catch (err) {
-    logger.error({ err }, 'Failed to initialize executive profile service — CEO voice guidance unavailable; drafts will use generic voice');
+    logger.error({ err }, 'Failed to initialize executive profile service — principal voice guidance unavailable; drafts will use generic voice');
     executiveProfileService = undefined;
   }
 
@@ -396,15 +520,19 @@ async function main(): Promise<void> {
   }
   const modelRegistry = new ModelRegistry(logger);
 
-  // 5. LLM provider — hard fail early rather than discovering the missing
-  // key only when the first user message arrives.
-  // modelRegistry must be instantiated first (above) — the provider uses it
-  // to look up maxOutputTokens per model rather than using a hardcoded constant.
-  if (!config.anthropicApiKey) {
-    logger.fatal('ANTHROPIC_API_KEY is required');
-    process.exit(1);
-  }
-  const llmProvider = new AnthropicProvider(config.anthropicApiKey, logger, modelRegistry);
+  // 5. LLM providers — hard fail early rather than discovering a missing key only
+  // when the first user message arrives.
+  // modelRegistry must be instantiated first (above) — providers use it to look
+  // up maxOutputTokens per model rather than using a hardcoded constant.
+  //
+  // Providers register symmetrically: each one is conditional on its own credentials,
+  // and no vendor is mandatory. What a deployment actually needs is enforced by the
+  // tier validation below, which fails with the tier, model and provider named when a
+  // tier maps to a provider that has no credentials. AWS Bedrock credentials are
+  // vault-only (ADR-021); region and timeout are non-secret env config.
+  const bedrockCreds = config.awsAccessKeyId && config.awsSecretAccessKey && config.awsRegion
+    ? { accessKeyId: config.awsAccessKeyId, secretAccessKey: config.awsSecretAccessKey, region: config.awsRegion }
+    : undefined;
   // estimateCostUsd is a closure pre-wired with the model registry. Passed to
   // AgentRuntime as config (dependency injection) so the runtime stays testable
   // without importing pricing.ts directly.
@@ -412,9 +540,18 @@ async function main(): Promise<void> {
   // for unrecognised models track operator routing rather than hardcoding Sonnet.
   const estimateCostUsd = createEstimateCostUsd(modelRegistry, modelRoutingConfig.tiers.standard.model);
   const modelRouter = new ModelRouter(modelRoutingConfig, modelRegistry, logger);
-  const providerRegistry = new Map<string, LLMProvider>([
-    ['anthropic', llmProvider],
-  ]);
+  // A model that cannot turn thinking off spends the small output caps of the classifier,
+  // judges and drift detector on thinking (#2224). The voice override is checked where
+  // the voice adapter is built.
+  const smallCapViolations = smallCapThinkingViolations(smallCapModelSlots(yamlConfig), modelRegistry);
+  if (smallCapViolations.length > 0) {
+    logger.fatal({ violations: smallCapViolations }, `Model cannot turn thinking off on a small-cap call site — ${smallCapViolations.join(' ')}`);
+    process.exit(1);
+  }
+  const providerRegistry = new Map<string, LLMProvider>();
+  if (config.anthropicApiKey) {
+    providerRegistry.set('anthropic', watchProvider(new AnthropicProvider(config.anthropicApiKey, logger, modelRegistry), logger));
+  }
 
   // OpenRouter — optional second provider for non-Claude models.
   // Only instantiated when OPENROUTER_API_KEY is present. If absent, OpenRouter
@@ -422,8 +559,36 @@ async function main(): Promise<void> {
   // only checks models that are actually mapped to a tier.
   if (config.openrouterApiKey) {
     const openrouterProvider = new OpenRouterProvider(config.openrouterApiKey, logger, modelRegistry);
-    providerRegistry.set('openrouter', openrouterProvider);
+    providerRegistry.set('openrouter', watchProvider(openrouterProvider, logger));
     logger.info('OpenRouter provider registered — non-Claude models available');
+  }
+
+  // AWS Bedrock — optional. Registered only when both vault secrets and a region
+  // are present; the tier validation below fails loudly if a tier is mapped to a
+  // Bedrock model without it.
+  if (bedrockCreds) {
+    // Bedrock has no stream(), so the wrapper passes its chat() through unwatched.
+    providerRegistry.set('bedrock', watchProvider(new BedrockProvider(
+      bedrockCreds.accessKeyId,
+      bedrockCreds.secretAccessKey,
+      bedrockCreds.region,
+      config.awsBedrockTimeoutMs,
+      logger,
+      modelRegistry,
+    ), logger));
+    logger.info({ region: bedrockCreds.region }, 'AWS Bedrock provider registered — Bedrock-hosted models available');
+  } else if (config.awsAccessKeyId || config.awsSecretAccessKey) {
+    // Partial config is almost certainly a mistake — say so rather than leaving
+    // Bedrock silently unavailable.
+    logger.warn('AWS Bedrock credentials are incomplete (need aws_access_key_id + aws_secret_access_key in the vault, and AWS_REGION set) — Bedrock provider not registered');
+  }
+
+  if (providerRegistry.size === 0) {
+    logger.fatal(
+      'No LLM provider is configured — seed anthropic_api_key, openrouter_api_key, or aws_access_key_id + '
+      + 'aws_secret_access_key (with AWS_REGION) in the vault.',
+    );
+    process.exit(1);
   }
 
   // Validate that every model mapped to a tier has a registered provider.
@@ -435,8 +600,8 @@ async function main(): Promise<void> {
     if (meta && !providerRegistry.has(meta.provider)) {
       logger.fatal(
         { tier: tierName, model: tierModel, provider: meta.provider },
-        'Tier-mapped model references a provider that is not registered — cannot start. '
-        + 'Set the provider API key or remap the tier to a model with a registered provider.',
+        `Tier '${tierName}' maps to model '${tierModel}', whose provider '${meta.provider}' is not registered — cannot start. `
+        + 'Seed that provider\'s credentials in the vault or remap the tier to a model with a registered provider.',
       );
       process.exit(1);
     }
@@ -498,30 +663,42 @@ async function main(): Promise<void> {
     workingMemoryTtlDays,
   );
 
-  // Entity memory — optional, requires OPENAI_API_KEY for embeddings.
+  // Entity memory — optional, requires an embedding endpoint and a profile for its model.
   // If not configured, agents still work — they just don't have KG access.
   let entityMemory: EntityMemory | undefined;
-  if (config.openaiApiKey) {
-    // Sensitivity classifier — loads rules from config/default.yaml at startup (#200).
-    // Resolved from __dirname so the path is stable regardless of which directory the
-    // process was launched from (systemd, Docker, worktree, test harness, etc.).
-    // Fail fast with a structured log if the file is missing or malformed — the service
-    // cannot safely protect sensitive data without classification rules.
-    let sensitivityClassifier: SensitivityClassifier;
-    const sensitivityConfigPath = path.resolve(import.meta.dirname, '../config/default.yaml');
-    try {
-      sensitivityClassifier = SensitivityClassifier.fromYaml(sensitivityConfigPath);
-      logger.info({ configPath: sensitivityConfigPath }, 'Sensitivity classifier loaded');
-    } catch (err) {
+  // Sensitivity classifier — declared outside the if-block (like entityMemory above) so it
+  // stays in scope for the ExecutionLayer construction further down (#1419), which exposes
+  // it to skills as the 'sensitivityClassifier' capability. Same availability as entityMemory:
+  // both require an embedding endpoint (the vault's openai_api_key or EMBEDDING_BASE_URL)
+  // and a profile for its model, because the classifier is currently only built inside this
+  // branch — see the sensitivity_rules guard below for why it can't be built earlier.
+  let sensitivityClassifier: SensitivityClassifier | undefined;
+  // Hoisted for the KG node merge (#2233), which re-embeds a renamed survivor. Same
+  // availability as entityMemory; without it the merge keeps the old embedding.
+  let embeddingService: EmbeddingService | undefined;
+  // The schema gate (ADR-051): a width or model the stored vectors do not match, or an
+  // unfinished re-embed, keeps the knowledge graph off until a person runs the command.
+  const embedding = await resolveKnowledgeGraphEmbedding(pool, config, yamlConfig.embedding?.profiles, logger);
+  if (embedding.ok) {
+    // Sensitivity classifier — built from the already-merged config (default.yaml +
+    // local.yaml, see loadYamlConfig()) so operator overrides in local.yaml actually
+    // take effect rather than being silently ignored (#1369). Malformed rules already
+    // failed startup inside loadYamlConfig(); we still guard against an absent or empty
+    // rules list, since the service cannot safely protect sensitive data without any.
+    // (`![]` is false — an explicit `sensitivity_rules: []` override must be checked
+    // via .length, not truthiness, or it would slip past this guard.)
+    if (!yamlConfig.sensitivity_rules || yamlConfig.sensitivity_rules.length === 0) {
       logger.fatal(
-        { err, configPath: sensitivityConfigPath },
-        'Failed to load sensitivity classifier — check that config/default.yaml exists and contains a valid sensitivity_rules array',
+        'sensitivity_rules missing or empty in merged config — check that config/default.yaml contains a sensitivity_rules array',
       );
       process.exit(1);
     }
+    sensitivityClassifier = SensitivityClassifier.fromRules(yamlConfig.sensitivity_rules);
+    logger.info({ ruleCount: yamlConfig.sensitivity_rules.length }, 'Sensitivity classifier loaded');
 
-    const embeddingService = EmbeddingService.createWithOpenAI(
-      config.openaiApiKey,
+    embeddingService = EmbeddingService.createWithEndpoint(
+      embedding.endpoint,
+      embedding.profile,
       logger,
       bus,           // EventBus — wired at line 234
       modelRegistry, // ModelRegistry — wired at line 281
@@ -529,9 +706,23 @@ async function main(): Promise<void> {
     const kgStore = KnowledgeGraphStore.createWithPostgres(pool, embeddingService, logger);
     const validator = new MemoryValidator(kgStore, embeddingService);
     entityMemory = new EntityMemory(kgStore, validator, embeddingService, logger, sensitivityClassifier);
-    logger.info('Entity memory initialized with knowledge graph');
+    logger.info(
+      {
+        embeddingBaseUrl: redactUrlUserinfo(embedding.endpoint.baseUrl),
+        embeddingModel: embedding.endpoint.model,
+        embeddingDimensions: embedding.profile.dimensions,
+      },
+      'Entity memory initialized with knowledge graph',
+    );
+  } else if (embedding.gate === 'config') {
+    logger.warn(`${embedding.message} Entity memory is disabled (knowledge graph unavailable).`);
+  } else if (embedding.err) {
+    logger.error({ err: embedding.err }, `${embedding.message} Entity memory is disabled (knowledge graph unavailable).`);
   } else {
-    logger.warn('OPENAI_API_KEY not set — entity memory disabled (knowledge graph unavailable)');
+    logger.warn(
+      { embeddingSchema: embedding.state },
+      `${embedding.message} Until then entity memory is disabled (knowledge graph unavailable), and the sensitivity classifier and the setup wizard are off with it.`,
+    );
   }
 
   // Bullpen service — Tier 2 inter-agent discussion. Always initialized (no
@@ -542,6 +733,18 @@ async function main(): Promise<void> {
   // Contact confidence scoring pipeline — needs late-binding because the
   // callback references the pipeline, which depends on contactService.
   let confidencePipeline: ConfidencePipeline | undefined;
+
+  // Hot-reload holder for principal identities (#1514). Assigned after the principal
+  // contact is resolved below; ContactService callbacks close over this object so
+  // agent-skill identity writes (link/unlink/merge) refresh the shared cache without
+  // a process restart.
+  const principalIdentityHotReload: {
+    contactId: string | null;
+    refresh: () => Promise<void>;
+  } = {
+    contactId: null,
+    refresh: async () => { /* wired after principal resolution */ },
+  };
 
   // Contact system — provides identity resolution and contact management.
   // Always initialized (contacts work even without entity memory / KG).
@@ -570,6 +773,14 @@ async function main(): Promise<void> {
       confidencePipeline?.incrementalUpdate(contactId, { type: 'pairing_confirmed' })
         .catch(err => logger.warn({ err, contactId }, 'pairing_confirmed pipeline update failed (non-fatal)'));
     },
+    onIdentitiesChanged: async (contactId: string) => {
+      if (
+        principalIdentityHotReload.contactId
+        && contactId === principalIdentityHotReload.contactId
+      ) {
+        await principalIdentityHotReload.refresh();
+      }
+    },
     onContactMerged: (primaryContactId, secondaryContactId, mergedAt) => {
       const event = createContactMerged({
         primaryContactId,
@@ -591,6 +802,16 @@ async function main(): Promise<void> {
 
   // Now that contactService exists, wire up the confidence pipeline.
   confidencePipeline = contactService ? new ConfidencePipeline(contactService, logger) : undefined;
+
+  // KG node merge for the console (#2233). Writes nodes, facts, edges and contacts in one
+  // transaction; publishes kg.nodes_merged through the system layer after commit.
+  const nodeMergeService = new NodeMergeService({
+    pool,
+    contactService,
+    bus,
+    logger,
+    embedder: embeddingService,
+  });
 
   // Authorization config — load role defaults, permissions, and channel trust.
   // These YAML files define the deterministic permission model.
@@ -635,79 +856,140 @@ async function main(): Promise<void> {
     logger.warn({ err }, 'Agent self-identity bootstrap failed — entity_enrichment default=agent will not resolve; coordinator system prompt ${agent_contact_id} will be empty');
   }
 
-  // CEO contact bootstrap — ensures the CEO's primary email contact exists with
-  // status=confirmed and verified=true before the email adapter starts polling.
-  // Without this, the first inbound email from the CEO auto-creates them as
-  // provisional (the extractParticipants default), causing their messages to be held.
-  // Also creates (or backfills) a KG person node so entity context enrichment works
-  // for the CEO. See issue #380.
+  // Principal contact resolution — the single source of truth for principal identity (#1049).
   //
-  // Note: `config.ceoPrimaryEmail` is normalized in loadConfig() so the literal
-  // `.env.example` placeholder `you@yourdomain.com` reads as undefined here — this
-  // block is therefore a no-op for fresh installs that didn't customize that line.
-  let ceoContactId: string | undefined;
-  if (config.ceoPrimaryEmail) {
-    try {
-      const ceoBootstrap = await bootstrapCeoContact(config.ceoPrimaryEmail, 'CEO', pool, logger);
-      // Persist the CEO's contact UUID so PiiRedactor can bypass redaction using a stable
-      // UUID check rather than relying solely on trust_level. UUID is resolved once at startup
-      // from ceoPrimaryEmail and is tamper-proof (unlike trust_level, which has a setter API).
-      ceoContactId = ceoBootstrap.contactId;
-      logger.info({ contactId: ceoBootstrap.contactId, kgNodeId: ceoBootstrap.kgNodeId }, 'CEO identity ready');
-    } catch (err) {
-      // Non-fatal: log and continue. Severity depends on whether the email adapter is active:
-      // - With email configured: the CEO's first message will be held if the contact doesn't
-      //   exist yet — escalate to error so it shows up in log aggregators.
-      // - Without email: no adapter polls, so the risk is deferred and a warn suffices.
-      // A unique constraint violation (23505) indicates inconsistent DB state (e.g. a
-      // channel identity row with no matching contact), not a transient failure — flag it
-      // separately so operators know to inspect contact_channel_identities directly.
-      const pgCode = (err as { code?: string }).code;
-      if (pgCode === '23505') {
-        logger.error(
-          { err, ceoPrimaryEmail: config.ceoPrimaryEmail },
-          'CEO contact bootstrap failed with unique constraint violation — possible inconsistent DB state. Inspect contact_channel_identities for orphaned rows.',
-        );
-      } else if (config.nylasApiKey && config.nylasGrantId) {
-        logger.error(
-          { err, ceoPrimaryEmail: config.ceoPrimaryEmail },
-          'CEO contact bootstrap failed with email adapter active — CEO emails WILL be held if contact does not exist',
-        );
-      } else {
-        logger.warn(
-          { err, ceoPrimaryEmail: config.ceoPrimaryEmail },
-          'CEO contact bootstrap failed — inbound emails from CEO may route in low-trust mode',
-        );
-      }
+  // findContactBySystemRole('principal') replaces the former CEO_PRIMARY_EMAIL env-var
+  // bootstrap. The principal contact is created by the in-app onboarding wizard (#771);
+  // this block only *resolves* it once at startup and derives the runtime identity values
+  // used downstream:
+  //   - principalEmail        → outbound content filter allow-list, principal notifiers,
+  //                             email adapter, approval notifications
+  //   - principalIdentities   → runtime prompt injection + outbound recipient check,
+  //                             Drive grants to the principal raised to writer, and the
+  //                             PiiRedactor bypass (only when the principal is the send's sole
+  //                             recipient: principalIsSoleRecipient, #2312)
+  //
+  // A missing principal is NOT fatal here: the readiness check below converts it into
+  // setup-required mode so the operator can finish onboarding via the web UI. That keeps
+  // the env-var-unset and fresh-setup paths identical (principalEmail = '', no bypass),
+  // which is exactly the dual-path inconsistency #1049 removes.
+  //
+  // principalIdentities is a shared mutable array (never reassigned) so console / agent
+  // identity writes can hot-reload it in place (#1514) — OutboundGateway, ExecutionLayer,
+  // AgentRuntime and the MCP tool handlers all hold a reference to this same array.
+  //
+  // principalEmail is a mutable holder (never replaced) for the same reason: OutboundContentFilter,
+  // EmailAdapter, notifiers, and ApprovalTrigger read `.current` at use time so binding an
+  // email identity post-boot updates the allow-list / notification target without restart.
+  let principalContact: Contact | null = null;
+  const principalIdentities: ChannelIdentity[] = [];
+  // Empty string when there is no principal or no verified email (fresh setup, Signal-only).
+  // Downstream consumers already treat '' as "absent" — the same contract the old unset
+  // CEO_PRIMARY_EMAIL had.
+  const principalEmail: PrincipalEmailRef = { current: '' };
+  // Designated primary (contacts.primary_email), not the first verified email.
+  // Same mutable-holder pattern so the prompt block sees a post-boot update (#1950).
+  const principalPrimaryEmail: PrincipalPrimaryEmailRef = { current: null };
+  // Name, preferred name, title and pronouns, refreshed with the identities (#2226).
+  const principalProfile: PrincipalProfileRef = { current: null };
+
+  // Monotonic guard against overlapping refreshes (#1514). onIdentitiesChanged is
+  // fire-and-forget, so two mutations in quick succession (e.g. add + verify, or a
+  // merge racing a direct link) can start two refreshes; if their DB reads settle out
+  // of order the stale one would clobber the fresher state. Each refresh claims a
+  // generation and discards its result if a newer refresh has since started.
+  let refreshGeneration = 0;
+
+  async function refreshPrincipalIdentities(): Promise<void> {
+    if (!principalContact) {
+      principalIdentities.length = 0;
+      principalEmail.current = '';
+      principalPrimaryEmail.current = null;
+      principalProfile.current = null;
+      return;
     }
-  } else {
-    // No CEO_PRIMARY_EMAIL configured (or it was the .env.example placeholder, which
-    // loadConfig() normalizes to undefined). This is the normal path for fresh
-    // installs post-#771 — the in-app onboarding wizard creates the principal without
-    // an email channel binding; per-channel verification flows attach identities later.
-    // Only operators running the historical email-channel back-compat path need to
-    // set CEO_PRIMARY_EMAIL.
-    logger.info('CEO_PRIMARY_EMAIL not set — CEO contact bootstrap skipped (principal will be created via the onboarding wizard at /setup).');
+    const myGeneration = ++refreshGeneration;
+    // Same verified + active filter the test-mode stack uses (#1966).
+    const snapshot = await readPrincipalIdentitySnapshot(contactService, principalContact.id);
+    // A newer refresh started while this one awaited the DB — its result is fresher,
+    // so drop ours rather than overwrite the shared array/holder with a stale snapshot.
+    if (myGeneration !== refreshGeneration) return;
+    principalIdentities.length = 0;
+    principalIdentities.push(...snapshot.identities);
+    principalEmail.current =
+      principalIdentities.find((id) => id.channel === 'email')?.channelIdentifier ?? '';
+    principalPrimaryEmail.current = snapshot.primaryEmail;
+    principalProfile.current = snapshot.profile;
+    // The prompt builder drops an unmatched primary and an empty identity set quietly
+    // (it must never render an unverified address or a complete-set claim over
+    // nothing), so every agent's prompt changes with no signal. Say so here instead.
+    for (const gap of principalIdentitySnapshotGaps(snapshot)) {
+      logger.warn({ contactId: principalContact.id, identityCount: principalIdentities.length }, gap);
+    }
+    logger.info(
+      {
+        contactId: principalContact.id,
+        identityCount: principalIdentities.length,
+        hasEmail: !!principalEmail.current,
+      },
+      'Principal identities refreshed',
+    );
   }
 
-  // Email channel — optional. Supports N named accounts via channel_accounts.email in
-  // config/default.yaml, or falls back to the legacy NYLAS_GRANT_ID + NYLAS_SELF_EMAIL
-  // env vars for single-account backward compatibility.
-  //
+  try {
+    principalContact = await contactService.findContactBySystemRole('principal');
+    if (principalContact) {
+      // Self-heal capability metadata (role/system_role/tier/kind) in case an older writer
+      // left the row at migration-055 defaults. Idempotent — a no-op when already canonical.
+      // Preserved from the deleted ceo-bootstrap path. Fatal on failure (repairPrincipalMetadata
+      // rethrows): a mis-tiered principal means trust gates like the PII-redaction bypass may
+      // silently not apply, which is worse than refusing to boot.
+      await repairPrincipalMetadata(principalContact.id, pool, logger);
+
+      await refreshPrincipalIdentities();
+
+      logger.info(
+        { contactId: principalContact.id, kgNodeId: principalContact.kgNodeId, hasEmail: !!principalEmail.current },
+        'Principal identity resolved',
+      );
+    } else {
+      logger.info('No principal contact found — startup will enter setup-required mode (complete onboarding at /setup).');
+    }
+  } catch (err) {
+    // This catch spans findContactBySystemRole, getContactWithIdentities, AND
+    // repairPrincipalMetadata — any of which throwing is fatal (a mis-resolved or
+    // mis-tiered principal is worse than booting with trust gates that may not apply).
+    // Don't assert a single root cause; the env-var bootstrap this replaces was
+    // non-fatal, so this is a deliberate fail-closed change.
+    logger.fatal(
+      { err },
+      "Failed to resolve or repair the principal contact at startup — inspect the principal row " +
+        "(contacts WHERE system_role = 'principal') and verify migration 035 (add_system_role) is applied",
+    );
+    process.exit(1);
+  }
+
+  // Wire hot-reload so post-boot identity mutations update the shared cache (#1514).
+  principalIdentityHotReload.contactId = principalContact?.id ?? null;
+  principalIdentityHotReload.refresh = refreshPrincipalIdentities;
+
+  // Email channel — optional. Accounts are managed via the console (email_accounts table,
+  // migration 064). Grants live in the vault under channel.email.<name>.nylas_grant_id.
   // One NylasClient is constructed per account (needed by OutboundGateway's client map).
   // EmailAdapters are constructed further below, after OutboundGateway is ready,
   // and started after the dispatcher is registered to avoid dropping inbound messages.
-  const resolvedEmailAccounts = resolveChannelAccounts(yamlConfig, config);
+  const emailAccountsRepo = new EmailAccountsRepo(pool);
+  const resolvedEmailAccounts = await resolveEmailAccounts(emailAccountsRepo, secretsService, logger);
   const nylasClientMap = new Map<string, NylasClient>();
 
   if (!config.nylasApiKey) {
     if (resolvedEmailAccounts.length > 0) {
       logger.warn('NYLAS_API_KEY not set — email channel disabled despite accounts being configured');
     } else {
-      logger.warn('NYLAS_API_KEY/NYLAS_GRANT_ID not set — email channel disabled');
+      logger.warn('NYLAS_API_KEY not set — email channel disabled');
     }
   } else if (resolvedEmailAccounts.length === 0) {
-    logger.warn('No email accounts resolved — email channel disabled. Set NYLAS_GRANT_ID + NYLAS_SELF_EMAIL, or configure channel_accounts.email in config/default.yaml');
+    logger.warn('No email accounts resolved — email channel disabled. Add an account via the console (Settings → Channels → Email).');
   } else {
     for (const account of resolvedEmailAccounts) {
       nylasClientMap.set(account.name, new NylasClient(config.nylasApiKey, account.nylasGrantId, logger));
@@ -744,17 +1026,146 @@ async function main(): Promise<void> {
     // in any log aggregation pipeline. The socket path is sufficient for diagnostics.
     logger.info({ socketPath: config.signalSocketPath }, 'Signal RPC client created');
   } else {
-    logger.warn('SIGNAL_SOCKET_PATH/SIGNAL_PHONE_NUMBER not set — Signal channel disabled');
+    // Point operators at the canonical config path first: the console writes
+    // channel.signal.socket_path / channel.signal.phone_number to the vault (#1140).
+    // SIGNAL_SOCKET_PATH / SIGNAL_PHONE_NUMBER env remain only as back-compat fallbacks.
+    logger.warn('Signal socket path or phone number not configured — Signal channel disabled. Set them in the console (Settings → Channels → Signal), or via the SIGNAL_SOCKET_PATH / SIGNAL_PHONE_NUMBER env fallbacks.');
   }
 
-  // Calendar client — uses the primary email account's Nylas credentials.
-  // For multi-account deployments the calendar is always associated with the first
-  // (primary) account; a future spec can extend this to per-account calendars.
+  // Slack channel — optional, requires channel.slack.bot_token + channel.slack.app_token.
+  // SlackClient is constructed here for OutboundGateway; SlackAdapter starts after dispatcher.
+  let slackClient: SlackClient | undefined;
+  let slackAdapter: SlackAdapter | undefined;
+  if (config.slackBotToken && config.slackAppToken) {
+    slackClient = new SlackClient({
+      botToken: config.slackBotToken,
+      appToken: config.slackAppToken,
+      logger,
+    });
+    logger.info('Slack client created (Socket Mode)');
+  } else {
+    logger.warn('Slack bot token or app token not configured — Slack channel disabled. Set them in the console (Settings → Channels → Slack), or via SLACK_BOT_TOKEN / SLACK_APP_TOKEN env fallbacks.');
+  }
+
+  // SMS channel — optional, requires channel.sms.api_key + from_number + webhook_public_key.
+  // SmsClient is constructed here for OutboundGateway; SmsAdapter starts after dispatcher.
+  // Webhook bridge is always created so HttpAdapter can mount the Telnyx route; the
+  // adapter installs the handler on start() when the channel is enabled.
+  const smsWebhookBridge = new SmsWebhookBridge();
+  const voiceSessionBridge = new VoiceSessionBridge();
+  const voiceSessionStore = new VoiceSessionStore(pool);
+  // Recover abandoned voice_sessions rows even when voice stays disabled this
+  // boot (lost credentials / toggled off) so starting/active rows do not linger.
+  {
+    const abandoned = await voiceSessionStore.markAbandonedOnRestart();
+    if (abandoned > 0) {
+      logger.warn({ count: abandoned }, 'Marked abandoned voice sessions failed on startup');
+    }
+  }
+  let smsClient: SmsClient | undefined;
+  let smsAdapter: SmsAdapter | undefined;
+  let voiceAdapter: VoiceAdapter | undefined;
+  // Hoisted so the Signal voice-call bridge (#1672) can reuse the same
+  // VoiceRuntime instance. NOTE: this is assigned only inside the voice-adapter
+  // construction block below, which is gated on the LiveKit credentials — so
+  // today enabling Signal voice calls also requires the LiveKit voice channel
+  // to be configured, even though Signal calls carry audio over PulseAudio and
+  // never open a LiveKit room. Constructing VoiceRuntime outside that gate
+  // (LiveKit only for the console transport) is a possible follow-up.
+  let voiceRuntimeRef: VoiceRuntime | undefined;
+  // Batch STT/TTS for text-channel voice notes (#1597). Needs Deepgram + Cartesia
+  // (+ voice id) only — not LiveKit. Signal/Slack inbound (#1600) injects this
+  // into the adapters; outbound voice notes (#1601) will too. Streaming voice
+  // still builds its own STT/TTS providers below.
+  let speechMediaService: SpeechMediaService | undefined;
+  if (config.smsApiKey && config.smsFromNumber && config.smsWebhookPublicKey) {
+    smsClient = new SmsClient({
+      apiKey: config.smsApiKey,
+      fromNumber: config.smsFromNumber,
+      webhookPublicKey: config.smsWebhookPublicKey,
+      logger,
+    });
+    logger.info('SMS client created (Telnyx Messaging)');
+  } else {
+    logger.warn('SMS Telnyx credentials not fully configured — SMS channel disabled. Set them in the console (Settings → Channels → SMS); Telnyx credentials are vault-only (no env fallback).');
+  }
+
+  if (config.voiceDeepgramApiKey && config.voiceCartesiaApiKey && config.voiceCartesiaVoiceId) {
+    speechMediaService = new SpeechMediaService({
+      stt: new DeepgramSttProvider(config.voiceDeepgramApiKey, logger),
+      tts: new CartesiaTtsProvider(config.voiceCartesiaApiKey, logger, config.voiceCartesiaVoiceId),
+      logger,
+    });
+    logger.info('Speech media service ready (batch STT/TTS for voice notes)');
+  } else {
+    logger.warn(
+      'Speech media credentials incomplete — batch STT/TTS unavailable. '
+      + 'Set Deepgram and Cartesia (including voice ID) under Settings → Channels → Voice.',
+    );
+  }
+
+  if (
+    config.voiceLivekitUrl &&
+    config.voiceLivekitApiKey &&
+    config.voiceLivekitApiSecret &&
+    config.voiceDeepgramApiKey &&
+    config.voiceCartesiaApiKey &&
+    config.voiceCartesiaVoiceId
+  ) {
+    logger.info({ hasVoiceModelOverride: config.voiceModel !== undefined }, 'Voice credentials configured (LiveKit + STT/TTS)');
+  } else {
+    logger.warn('Voice credentials not fully configured — voice channel disabled. Set the LiveKit, Deepgram, and Cartesia values (including the Cartesia voice ID) in the console (Settings → Channels → Voice); credentials are vault-only (no env fallback).');
+  }
+
+  // Calendar client — operates as the principal, not as Curia's mailbox.
+  // RSVP is first-person: Nylas/Google records the response of the attendee whose
+  // identity matches the authenticated grant. So the calendar client binds to the
+  // principal's OWN grant (ceo_nylas_grant_id) — the same identity ceo-inbox uses. Binding
+  // to Curia's mailbox grant made Curia a third-party delegate, and Google rejected
+  // RSVPs with `omittedAttendeesSpecified` (#1217).
+  //
+  // Fail closed: with no principal grant configured there is no principal to act as, so the
+  // client is left undefined and calendar skills return a clean "not configured"
+  // result via their existing `if (!ctx.nylasCalendarClient)` guard. We deliberately
+  // do NOT fall back to the email account grant — that is the delegate-identity bug
+  // this change removes.
+  // Every disabled path logs exactly once — none is silent. Guard on the API key first so
+  // we don't read the grant (or log a spurious read error) when Nylas isn't configured at all.
   let nylasCalendarClient: NylasCalendarClient | undefined;
-  if (config.nylasApiKey && primaryNylasClient && resolvedEmailAccounts.length > 0) {
-    const primaryAccount = resolvedEmailAccounts[0]!;
-    nylasCalendarClient = new NylasCalendarClient(config.nylasApiKey, primaryAccount.nylasGrantId, logger);
-    logger.info('Nylas calendar client initialized');
+  // The principal's own grant, kept for the dispatcher's principal-mailbox lookup (#2227).
+  let principalNylasGrantId: string | undefined;
+  if (!config.nylasApiKey) {
+    // Calendar shares the Nylas API key with email; its absence is already reported as a
+    // warning by the email-channel bootstrap above. Logged at debug here to keep this path
+    // non-silent without duplicating that warning for the common "no Nylas at all" case.
+    logger.debug('Calendar disabled — no Nylas API key configured');
+  } else {
+    // Read the principal grant. Absence -> undefined (calendar simply not set up). A DB or decrypt
+    // failure THROWS (SecretsService lets those propagate); catch it here so a single
+    // channel's secret read can't crash boot, but log at `error` with the real cause — a
+    // wrong SECRET_ENCRYPTION_KEY breaks every secret, and must not be mistaken for "the
+    // grant isn't set". Keep the causes distinct so the warn below only fires on genuine absence.
+    let principalCalendarGrant: string | undefined;
+    let grantReadFailed = false;
+    try {
+      principalCalendarGrant = await resolvePrincipalCalendarGrant(secretsService);
+    } catch (err) {
+      grantReadFailed = true;
+      logger.error(
+        { err },
+        'Failed to read ceo_nylas_grant_id — calendar disabled this boot. Check the database and SECRET_ENCRYPTION_KEY (a wrong key breaks all secrets, not just calendar).',
+      );
+    }
+    principalNylasGrantId = principalCalendarGrant;
+    if (principalCalendarGrant) {
+      nylasCalendarClient = new NylasCalendarClient(config.nylasApiKey, principalCalendarGrant, logger);
+      logger.info('Nylas calendar client initialized (bound to the principal\'s Nylas grant)');
+    } else if (!grantReadFailed) {
+      // Genuine absence (the read-failure path logged its own error above).
+      logger.warn(
+        'Calendar disabled — ceo_nylas_grant_id is not configured. Set the principal Nylas grant to enable calendar (RSVP/holds/events run as the principal).',
+      );
+    }
   }
 
   // Browser service — warm Playwright Chromium instance for the web-browser skill.
@@ -765,11 +1176,16 @@ async function main(): Promise<void> {
     const browserConfig = yamlConfig.browser;
     browserService = new BrowserService({
       logger,
-      sessionTtlMs: browserConfig?.sessionTtlMs ?? 600_000,
+      sessionTtlMs: browserConfig?.sessionTtlMs ?? 1_800_000, // 30 min — see BrowserServiceOptions
       sweepIntervalMs: browserConfig?.sweepIntervalMs ?? 120_000,
       profileDir: browserConfig?.profileDir,
       channel: browserConfig?.channel,
+      // Optional egress proxy (e.g. a residential home-network exit) so the browser doesn't
+      // present a datacenter IP to anti-bot systems. Empty in core; set per-deployment.
+      proxy: browserConfig?.proxy,
       locale: browserConfig?.locale,
+      languages: browserConfig?.languages,
+      settleCapMs: browserConfig?.settleCapMs,
       // Align the browser timezone with the principal's configured timezone.
       timezone: config.timezone,
     });
@@ -788,49 +1204,38 @@ async function main(): Promise<void> {
     browserService = undefined;
   }
 
-  // Skill registry — loads all skills from the skills/ directory.
-  // Skills are the framework's extension mechanism; agents invoke them
-  // via the LLM's tool-use API through the execution layer.
-  const skillRegistry = new SkillRegistry(config.timezone);
+  // Tool registry — loads all tools from the skills/ directory (flat + nested).
+  // Tools are the invocation atoms; agents invoke them via the LLM tool-use API
+  // through the execution layer. Skill bundles are a separate SkillRegistry.
+  const toolRegistry = new ToolRegistry(config.timezone);
+  const skillRegistry = new SkillRegistry();
   const skillsDir = path.resolve(import.meta.dirname, '../skills');
   const agentsDir = path.resolve(import.meta.dirname, '../agents');
 
   // --- Registry: discover everything on disk (lenient), reconcile the core set,
-  // then load+register ONLY enabled skills/agents. (Spec: skill/agent registry, #541.)
-  let skillDiscovery: SkillDiscovery[];
+  // then load+register ONLY enabled tools/skills/agents. (Spec: skill/agent registry, #541.)
+  let toolDiscovery: ToolDiscovery[];
+  let skillBundleDiscovery: ReturnType<typeof discoverSkillManifests>;
   let agentDiscovery: AgentDiscovery[];
   try {
-    skillDiscovery = discoverSkillManifests(skillsDir);
+    toolDiscovery = discoverToolManifests(skillsDir, logger);
+    skillBundleDiscovery = discoverSkillManifests(skillsDir, logger);
     agentDiscovery = discoverAgentManifests(agentsDir);
   } catch (err) {
-    logger.fatal({ err }, 'Failed to discover skills/agents on disk');
+    logger.fatal({ err }, 'Failed to discover tools/skills/agents on disk');
     process.exit(1);
   }
 
-  const skillRegistryRepo = new RegistryRepo(pool, 'skill_registry');
+  const toolRegistryRepo = new RegistryRepo(pool, 'tool_registry');
   const agentRegistryRepo = new RegistryRepo(pool, 'agent_registry');
+  const skillRegistryRepo = new RegistryRepo(pool, 'skill_registry');
 
   // Load the trusted fresh-install core set. The file MUST exist and be valid —
   // a missing file would silently leave nothing enrolled on a fresh DB, so treat
   // absence as a fatal misconfiguration rather than defaulting to empty.
   let registryDefaults: RegistryDefaults;
   try {
-    const defaultsPath = path.resolve(import.meta.dirname, '../config/registry-defaults.yaml');
-    if (!fs.existsSync(defaultsPath)) {
-      logger.fatal({ path: defaultsPath }, 'config/registry-defaults.yaml not found — cannot enroll core defaults');
-      process.exit(1);
-    }
-    const loaded = yaml.load(fs.readFileSync(defaultsPath, 'utf-8'));
-    if (!loaded) {
-      logger.fatal({ path: defaultsPath }, 'config/registry-defaults.yaml is empty or null');
-      process.exit(1);
-    }
-    const candidate = loaded as RegistryDefaults;
-    if (!Array.isArray(candidate.skills) || !Array.isArray(candidate.agents)) {
-      logger.fatal({ path: defaultsPath, loaded }, 'config/registry-defaults.yaml has wrong shape (expected {skills: [], agents: []})');
-      process.exit(1);
-    }
-    registryDefaults = candidate;
+    registryDefaults = loadRegistryDefaults(path.resolve(import.meta.dirname, '../config/registry-defaults.yaml'));
   } catch (err) {
     logger.fatal({ err }, 'Failed to read config/registry-defaults.yaml');
     process.exit(1);
@@ -838,10 +1243,22 @@ async function main(): Promise<void> {
 
   try {
     await reconcileRegistries({
-      skillRepo: skillRegistryRepo,
+      toolRepo: toolRegistryRepo,
       agentRepo: agentRegistryRepo,
-      skillDiscoveryNames: new Set(skillDiscovery.map(d => d.name)),
+      skillRepo: skillRegistryRepo,
+      toolManifests: toolManifestsFromDiscovery(toolDiscovery),
       agentDiscoveryNames: new Set(agentDiscovery.map(d => d.name)),
+      skillDiscoveryNames: new Set(skillBundleDiscovery.map(d => d.name)),
+      // Enabled bundles enroll their member tools, subject to each tool's own gates (#1974).
+      bundleMembers: bundleMembersFromDiscovery(skillBundleDiscovery),
+      secrets: secretsService,
+      // Calendar tools are held back until the calendar client exists (Nylas key + the
+      // principal grant, resolved above), so they don't sit in contacts/meeting-debrief
+      // tool lists failing closed. Gated on the BUILT client rather than vault key names
+      // because the key resolves from three sources (channel key, env, legacy key).
+      // entityMemory is deliberately not listed: the memory-* and setup-* tools are enabled
+      // without an embedding source and fail closed when entity memory is off.
+      unavailableCapabilities: new Set(nylasCalendarClient ? [] : ['nylasCalendarClient']),
       defaults: registryDefaults,
       logger,
     });
@@ -852,41 +1269,107 @@ async function main(): Promise<void> {
 
   // Ghost warnings: a registry row whose files are gone never loads.
   // One listRows() call per table; used for both ghost scan and enabled-name set.
-  let skillRows: RegistryRow[];
+  let toolRows: RegistryRow[];
   try {
-    skillRows = await skillRegistryRepo.listRows();
+    toolRows = await toolRegistryRepo.listRows();
+  } catch (err) {
+    logger.fatal({ err }, 'Failed to read tool_registry rows after reconciliation');
+    process.exit(1);
+  }
+  const toolDiscNames = new Set(toolDiscovery.map(d => d.name));
+  for (const row of toolRows) {
+    if (!toolDiscNames.has(row.name)) {
+      logger.warn({ tool: row.name }, 'registry: enabled/installed tool has no files on disk (ghost); not loaded');
+    }
+  }
+  const enabledToolNames = new Set(toolRows.filter(r => r.enabled).map(r => r.name));
+  try {
+    const toolCount = await loadToolsFromDirectory(toolDiscovery, toolRegistry, logger, enabledToolNames);
+    logger.info({ toolCount }, 'Tools loaded');
+  } catch (err) {
+    // Fail hard on tool loading errors — a broken tool.json or handler should
+    // not silently degrade the system to no-tools mode. Consistent with how we
+    // handle missing DATABASE_URL and ANTHROPIC_API_KEY.
+    logger.fatal({ err }, 'Failed to load tools');
+    process.exit(1);
+  }
+
+  // Skill (bundle) lifecycle — load enabled SKILL.md bundles, then wrap orphan
+  // tools as synthetic singleton skills so pinned_skills always resolves via SkillRegistry.
+  let skillBundleRows: RegistryRow[];
+  try {
+    skillBundleRows = await skillRegistryRepo.listRows();
   } catch (err) {
     logger.fatal({ err }, 'Failed to read skill_registry rows after reconciliation');
     process.exit(1);
   }
-  const skillDiscNames = new Set(skillDiscovery.map(d => d.name));
-  for (const row of skillRows) {
-    if (!skillDiscNames.has(row.name)) {
-      logger.warn({ skill: row.name }, 'registry: enabled/installed skill has no files on disk (ghost); not loaded');
+  const skillBundleDiscNames = new Set(skillBundleDiscovery.map(d => d.name));
+  for (const row of skillBundleRows) {
+    if (!skillBundleDiscNames.has(row.name)) {
+      logger.warn({ skill: row.name }, 'registry: enabled/installed skill bundle has no SKILL.md on disk (ghost); not loaded');
     }
   }
-  const enabledSkillNames = new Set(skillRows.filter(r => r.enabled).map(r => r.name));
+  const enabledSkillBundleNames = new Set(skillBundleRows.filter(r => r.enabled).map(r => r.name));
   try {
-    const skillCount = await loadSkillsFromDirectory(skillDiscovery, skillRegistry, logger, enabledSkillNames);
-    logger.info({ skillCount }, 'Skills loaded');
+    const skillCount = loadSkillsFromDiscovery(
+      skillBundleDiscovery,
+      skillRegistry,
+      logger,
+      enabledSkillBundleNames,
+    );
+    logger.info({ skillCount }, 'Skill bundles loaded');
   } catch (err) {
-    // Fail hard on skill loading errors — a broken skill.json or handler should
-    // not silently degrade the system to no-tools mode. Consistent with how we
-    // handle missing DATABASE_URL and ANTHROPIC_API_KEY.
-    logger.fatal({ err }, 'Failed to load skills');
+    logger.fatal({ err }, 'Failed to load skill bundles');
     process.exit(1);
   }
 
+  // ── MCP server registry ────────────────────────────────────────────────────
+  // Auto-installs all declared servers; auto-enables those whose required secrets resolve.
+  // Drives the /api/registry/mcp/* routes and gates which servers loadMcpServers spawns.
+  // Must run before loadMcpServers so the enabled set is ready to filter which servers start.
+  const mcpRegistryRepo = new McpRegistryRepo(pool);
+  const mcpConfig = loadSkillsConfig(configDir);
+  // skillDeclaredKeys is populated after registryService is built (below). Using a mutable
+  // binding + closure lets McpRegistryService call the getter at uninstall time (not at
+  // startup), so the value is always current even though registryService is constructed later.
+  let skillDeclaredKeys: string[] = [];
+  const mcpRegistryService = new McpRegistryService(
+    mcpRegistryRepo,
+    mcpConfig.servers ?? [],
+    secretsService,
+    () => skillDeclaredKeys,
+    logger,
+  );
+
+  let enabledMcpServers = new Set<string>();
+  try {
+    await reconcileMcpRegistry({ service: mcpRegistryService, servers: mcpConfig.servers ?? [], logger });
+    enabledMcpServers = await mcpRegistryService.enabledServerNames();
+  } catch (err) {
+    logger.fatal({ err }, 'MCP server registry reconciliation failed');
+    process.exit(1);
+  }
+  // ───────────────────────────────────────────────────────────────────────────
+
   // MCP server connections — connects to each server in config/skills.yaml,
-  // discovers tools via tools/list, and registers them in the skill registry
-  // alongside local skills. Agents don't know or care which kind they're using.
+  // discovers tools via tools/list, and registers them in the tool registry
+  // alongside local tools. Agents don't know or care which kind they're using.
   //
   // Connection failures are warn-not-crash: a missing MCP server shouldn't
   // take down the system. The failed server's tools are simply not available
   // until the next restart.
   let mcpSessions: McpSession[] = [];
+  let mcpProjectedTools = new Map<string, string[]>();
+  let mcpServerStatuses = new Map<string, McpServerLoadStatus>();
+  let mcpFixedInputs = new Map<string, Record<string, string>>();
   try {
-    mcpSessions = await loadMcpServers(configDir, skillRegistry, logger);
+    const mcpLoad = await loadMcpServers(
+      configDir, toolRegistry, logger, secretsService, enabledMcpServers, principalIdentities,
+    );
+    mcpSessions = mcpLoad.sessions;
+    mcpProjectedTools = mcpLoad.projectedTools;
+    mcpServerStatuses = mcpLoad.serverStatuses;
+    mcpFixedInputs = mcpLoad.fixedInputs;
   } catch (err) {
     // Malformed skills.yaml or unexpected loader error — degrade gracefully rather
     // than crashing. The startup validator catches schema violations, but a YAML
@@ -898,6 +1381,32 @@ async function main(): Promise<void> {
   if (mcpSessions.length > 0) {
     logger.info({ mcpServers: mcpSessions.map(s => s.serverId) }, 'MCP servers connected');
   }
+  const mcpUnhealthy = [...mcpServerStatuses.entries()].filter(([, s]) => s.status !== 'ok');
+  if (mcpUnhealthy.length > 0) {
+    logger.error(
+      {
+        servers: mcpUnhealthy.map(([name, s]) => ({
+          name,
+          status: s.status,
+          reason: s.status === 'unavailable' ? s.reason : undefined,
+        })),
+      },
+      'One or more enabled MCP servers failed to load tools — /api/health will report degraded',
+    );
+  }
+
+  // ADR-032: each connected MCP server projects a skill into SkillRegistry so
+  // agents can pin `google-workspace` (etc.) instead of listing every MCP tool.
+  // Must run before synthetic singletons so projected members are not re-wrapped.
+  const mcpSkillCount = registerMcpProjectedSkills(mcpProjectedTools, skillRegistry, logger, skillsDir);
+  if (mcpSkillCount > 0) {
+    logger.info({ mcpSkillCount }, 'MCP servers projected as skills');
+  }
+
+  // Wrap any tool (native orphan or MCP) that no real skill owns as a synthetic
+  // singleton skill so pinned_skills always resolves through SkillRegistry.
+  const syntheticCount = registerSyntheticSingletonSkills(toolRegistry, skillRegistry, logger);
+  logger.info({ syntheticCount }, 'Synthetic singleton skills registered');
 
   // Agent registry — tracks all running agents for delegation and listing.
   const agentRegistry = new AgentRegistry();
@@ -951,7 +1460,7 @@ async function main(): Promise<void> {
   const coordinatorConfig = agentConfigs.find(c => c.name === 'coordinator');
 
   // Extract agent persona from the identity service — the single source of truth
-  // for the agent's identity. Used by skills (via SkillContext.agentPersona) so
+  // for the agent's identity. Used by skills (via ToolContext.agentPersona) so
   // templates and outbound-facing code never hardcode the agent's name or title.
   const officeIdentity = officeIdentityService.get();
   const agentPersona: AgentPersona = {
@@ -976,46 +1485,82 @@ async function main(): Promise<void> {
     }
   });
 
+  // The EscalationJudge serves two gates, so it is built before the outbound filter that
+  // consumes it (#1870):
+  //  - #950 Gate C (action gate) decides deterministically when the tier × action_risk outcome
+  //    is obvious, and consults the judge only when the decision hinges on whether the action
+  //    is third-party-facing — a runtime property the manifest's action_risk cannot encode
+  //    (e.g. a `known` contact's reply to the sender is allowed, but emailing a third party
+  //    must escalate).
+  //  - #949 Stage 2.5 of the outbound filter classifies each send's disclosure class.
+  // The judge is fail-closed; a disabled/unconfigured judge makes Gate C escalate on ambiguous
+  // actions and leaves Stage 2.5 inactive.
+  let escalationJudge: EscalationJudge | undefined;
+  try {
+    escalationJudge = buildEscalationJudge({
+      yaml: yamlConfig.escalation?.judge,
+      modelRegistry,
+      providerRegistry,
+      bus,
+      logger,
+    });
+  } catch (err) {
+    if (!(err instanceof EscalationJudgeConfigError)) throw err;
+    logger.fatal(err.detail, err.message);
+    process.exit(1);
+  }
+
+  // Logged at boot so the live policy is visible; band with no working judge is logged at error.
+  checkBandGatingReady(autonomyGating, escalationJudge, logger);
+
   let outboundFilter: OutboundContentFilter | undefined;
   if (coordinatorConfig) {
-    const systemPromptMarkers = extractIdentityMarkers(officeIdentity);
-    // CEO_PRIMARY_EMAIL is the CEO's email — used to allow their address in outbound
-    // content without triggering the contact-data-leak rule. Must NOT be Curia's
-    // own Nylas address (nylasSelfEmail): using Curia's address here was a bug
-    // that (a) treated the CEO's email as a third-party leak and (b) routed
-    // blocked-content notifications to Curia's inbox instead of the CEO's.
-    const ceoEmail = config.ceoPrimaryEmail ?? '';
-    if (!ceoEmail) {
-      logger.warn('Outbound content filter initialized without CEO email (CEO_PRIMARY_EMAIL not set) — contact-data-leak rule may produce false positives');
+    // Extract exfiltration markers from BOTH the office identity (name, constraints,
+    // preferences — injected into the prompt at runtime) AND the coordinator's raw
+    // system prompt template (the provenance/never-name-internals/transfer-ownership
+    // instructions — the highest-value exfiltration target). Deriving from the live
+    // prompt means the markers track any operator customization instead of drifting
+    // from a hardcoded guess.
+    // Trigger guidance moved out of the prompt into injected blocks and tool results is
+    // scanned too (#1959), so a rule does not lose coverage by moving to its trigger.
+    const systemPromptMarkers = extractPromptExfiltrationMarkers(
+      officeIdentity,
+      coordinatorConfig.system_prompt,
+      TRIGGER_GUIDANCE_MARKER_SOURCES,
+    );
+    // The principal's email — used to allow their address in outbound content without
+    // triggering the contact-data-leak rule. Resolved from the principal contact (#1049),
+    // not from config. Must NOT be Curia's own Nylas address (nylasSelfEmail): using
+    // Curia's address here was a bug that (a) treated the principal's email as a third-party
+    // leak and (b) routed blocked-content notifications to Curia's inbox instead of the principal's.
+    // Pass the mutable PrincipalEmailRef so post-boot identity binds update the allow-list (#1514).
+    if (!principalEmail.current) {
+      logger.warn('Outbound content filter initialized without principal email (no verified principal email on file) — contact-data-leak rule may produce false positives');
     }
+    // Canary: with markers now derived from the identity AND the coordinator prompt,
+    // an empty list means extraction produced nothing — either the identity has no
+    // name/constraints and the prompt is empty, or extraction broke. Either way the
+    // system-prompt-fragment rule is silently disabled, so warn loudly. (The static
+    // fallback markers that previously kept this array non-empty — masking this exact
+    // condition — were removed because they matched no real prompt text.)
     if (systemPromptMarkers.length === 0) {
-      logger.warn('No system prompt markers extracted — system-prompt-fragment rule will not detect prompt leakage. Check that office identity has a name and title configured.');
+      logger.warn('No system prompt markers extracted — system-prompt-fragment rule will not detect prompt leakage. Check that the office identity has a name configured and the coordinator system prompt is non-empty.');
     }
     // Stage 2 LLM judge (issue #547). Constructed only when enabled. Routes through a
     // model→provider router so any registered model works. The judge model is validated
     // against the registry here so a typo fails fast at startup.
     let outboundJudge: OutboundLlmJudge | undefined;
-    const judgeYaml = yamlConfig.filter?.llmJudge;
-    const judgeEnabled = judgeYaml?.enabled ?? true;
-    if (judgeEnabled) {
-      const judgeConfig: JudgeConfig = {
-        enabled: true,
-        model: judgeYaml?.model ?? 'claude-haiku-4-5',
-        timeoutMs: judgeYaml?.timeout_ms ?? 5000,
-        failMode: judgeYaml?.failMode ?? 'split',
-      };
-      // Validate timeout_ms. local.yaml overrides are deep-merged but NOT schema-checked
-      // at startup, so a 0/negative/non-integer value could slip through — with the default
-      // 'split' failMode that would make every judge call time out instantly and silently
-      // fail open, disabling Stage 2. Fail fast instead. The 250ms floor rejects values too
-      // low for any real model round-trip (also a likely misconfiguration).
-      if (!Number.isInteger(judgeConfig.timeoutMs) || judgeConfig.timeoutMs < 250) {
-        logger.fatal(
-          { timeoutMs: judgeConfig.timeoutMs },
-          'filter.llmJudge.timeout_ms must be an integer >= 250 (ms) — fix config (default.yaml or local.yaml)',
-        );
-        process.exit(1);
-      }
+    // Defaults and the timeout floor live in resolveOutboundJudgeConfig, shared with test mode.
+    let judgeSettings: OutboundJudgeSettings;
+    try {
+      judgeSettings = resolveOutboundJudgeConfig(yamlConfig.filter, (detail, message) => logger.warn(detail, message));
+    } catch (err) {
+      if (!(err instanceof OutboundConfigError)) throw err;
+      logger.fatal(err.detail, err.message);
+      process.exit(1);
+    }
+    if (judgeSettings.enabled) {
+      const judgeConfig: JudgeConfig = { ...judgeSettings, enabled: true };
       if (!modelRegistry.isKnownModel(judgeConfig.model)) {
         logger.fatal(
           { model: judgeConfig.model },
@@ -1040,61 +1585,16 @@ async function main(): Promise<void> {
       logger.info('Outbound Stage 2 LLM judge disabled via config (filter.llmJudge.enabled=false)');
     }
 
-    outboundFilter = new OutboundContentFilter({
+    outboundFilter = buildOutboundContentFilter({
       systemPromptMarkers,
-      ceoEmail,
+      ceoEmail: principalEmail,
+      ownEmails: resolvedEmailAccounts.map(a => a.selfEmail),
       judge: outboundJudge,
+      escalationJudge,
+      logger,
+      gating: autonomyGating,
     });
-    logger.info({ markerCount: systemPromptMarkers.length }, 'Outbound content filter initialized');
   }
-  // #950 (action gate): Gate C decides deterministically when the tier × action_risk outcome
-  // is obvious, and consults the EscalationJudge only when the decision hinges on whether the
-  // action is third-party-facing — a runtime property the manifest's action_risk cannot encode
-  // (e.g. a `known` contact's reply to the sender is allowed, but emailing a third party must
-  // escalate). Construct the judge here from the escalation.judge config block, mirroring the
-  // outbound judge above. The judge is fail-closed; a disabled/unconfigured judge makes Gate C
-  // escalate on ambiguous actions. (#949 disclosure-gate wiring is still pending.)
-  let escalationJudge: EscalationJudge | undefined;
-  const escalationJudgeYaml = yamlConfig.escalation?.judge;
-  const escalationJudgeEnabled = escalationJudgeYaml?.enabled ?? true;
-  if (escalationJudgeEnabled) {
-    const escalationJudgeConfig: EscalationJudgeConfig = {
-      enabled: true,
-      model: escalationJudgeYaml?.model ?? 'claude-haiku-4-5',
-      timeoutMs: escalationJudgeYaml?.timeout_ms ?? 5000,
-    };
-    // Validate the same way as the outbound judge — a typo'd model or bad timeout should fail
-    // fast at startup rather than silently escalate every ambiguous Gate C decision later.
-    if (!Number.isInteger(escalationJudgeConfig.timeoutMs) || escalationJudgeConfig.timeoutMs < 250) {
-      logger.fatal(
-        { timeoutMs: escalationJudgeConfig.timeoutMs },
-        'escalation.judge.timeout_ms must be an integer >= 250 (ms) — fix config (default.yaml or local.yaml)',
-      );
-      process.exit(1);
-    }
-    if (!modelRegistry.isKnownModel(escalationJudgeConfig.model)) {
-      logger.fatal(
-        { model: escalationJudgeConfig.model },
-        'escalation.judge.model is not in the model registry — fix config (default.yaml or local.yaml)',
-      );
-      process.exit(1);
-    }
-    const escalationProviderName = modelRegistry.getProvider(escalationJudgeConfig.model);
-    if (!escalationProviderName || !providerRegistry.has(escalationProviderName)) {
-      logger.fatal(
-        { model: escalationJudgeConfig.model, provider: escalationProviderName },
-        'escalation.judge.model maps to a provider that is not registered — set the corresponding API key or change the model',
-      );
-      process.exit(1);
-    }
-    // Dedicated stateless router (same rationale as the outbound judge above).
-    const escalationJudgeRouter = new LLMProviderRouter(modelRegistry, providerRegistry);
-    escalationJudge = new EscalationJudge(escalationJudgeRouter, escalationJudgeConfig, bus, logger, modelRegistry);
-    logger.info({ model: escalationJudgeConfig.model }, 'Escalation judge enabled (Gate C third-party-facing classifier)');
-  } else {
-    logger.info('Escalation judge disabled via config (escalation.judge.enabled=false) — Gate C fails closed on ambiguous actions');
-  }
-
   // PII scrubbing for LLM-facing error strings — loads extra patterns from
   // config/default.yaml pii.extra_patterns and injects them into classify.ts.
   // An invalid extra pattern is treated as fatal: the operator's intent was to
@@ -1119,29 +1619,21 @@ async function main(): Promise<void> {
   // Outbound PII redactor — sits between the agent response and the channel
   // adapter. Strips PII from outbound messages based on channel policy before
   // content validation or delivery. The principal bypass is handled structurally
-  // via ceoContactId UUID match (set below), not a trust-level config field.
+  // via the principal contact UUID match (resolved above via
+  // findContactBySystemRole('principal'), #1049), not a trust-level config field.
   // Config defaults: enabled=true, default='block'.
   //
   // Must be constructed BEFORE OutboundGateway, which receives it as a constructor arg.
-  const outboundRedactionConfig = {
-    enabled: yamlConfig.pii?.outbound_redaction?.enabled ?? true,
-    default: (yamlConfig.pii?.outbound_redaction?.default ?? 'block') as 'block' | 'allow',
-    // Normalize channel_policies: the YAML type allows `allow` to be optional on
-    // each entry, but OutboundRedactionConfig requires it. Default to [] per entry.
-    channel_policies: Object.fromEntries(
-      Object.entries(yamlConfig.pii?.outbound_redaction?.channel_policies ?? {}).map(
-        ([ch, policy]) => [ch, { allow: policy.allow ?? [] }],
-      ),
-    ),
-  };
   let piiRedactor: PiiRedactor;
+  let outboundRedactionConfig: OutboundRedactionSettings;
   try {
+    // Shared with test mode: defaults, and an unknown `default` warned and read as 'block'.
+    outboundRedactionConfig = resolveOutboundRedactionConfig(yamlConfig.pii, (detail, message) => logger.warn(detail, message));
     piiRedactor = new PiiRedactor({
       config: outboundRedactionConfig,
       bus,
       logger,
       extraPatterns, // same patterns used by the inbound scrubber
-      ceoContactId,  // resolved from ceoPrimaryEmail at bootstrap; undefined if bootstrap failed or email not set
     });
   } catch (err) {
     logger.fatal({ err }, 'Failed to initialize PiiRedactor — check pii.outbound_redaction config');
@@ -1156,34 +1648,36 @@ async function main(): Promise<void> {
   // later by ApprovalTriggerService and AutonomyScoringPass. Instantiated here so it
   // can be passed to the gateway at construction time.
   const actionLogRepo = new ActionLogRepo(pool, logger);
+  const auditLogRepo = new AuditLogRepo(pool, logger);
+  // Read-only ops/agent-state reads for the (opt-in) diagnostics agent — #1356.
+  const diagnosticsRepo = new DiagnosticsRepo(pool, logger);
 
   // TaskRepo — used by task-create, task-list, task-update, task-complete skills.
-  const taskRepo = new TaskRepo(pool, bus, logger, config.timezone);
+  const workingDocsRepo = new WorkingDocsRepo(pool, logger);
+  // #2322: parked agendas and the post-call pipeline share this store.
+  const agendaStore = new AgendaStore(workingDocsRepo, logger);
+  // Who Curia contacted for a task (#2312): tools write it, and a task's rows close when it ends.
+  const taskOutreachRepo = new TaskOutreachRepo(pool);
+  // The principal's own company is never an outreach org domain, on either side (#2312).
+  const outreachNonOrgDomains = principalOrgDomainSet(yamlConfig.security?.principal_org_domains ?? []);
+  const taskRepo = new TaskRepo(pool, bus, logger, config.timezone, workingDocsRepo, taskOutreachRepo);
+  // The principal's yes or no on a personal-data ask, per thread (#2312): approve/deny write
+  // it, band review reads it. A yes on a strongly linked thread learns the requester onto the outreach row.
+  const disclosureDecisionsRepo = new DisclosureDecisionsRepo(pool);
+  const disclosureDecisions = new DisclosureDecisionRecorder({ repo: disclosureDecisionsRepo, taskOutreachRepo, logger });
+  const taskOutreach = new TaskOutreachService(taskOutreachRepo, {
+    principalIdentities,
+    selfEmails: resolvedEmailAccounts.map(a => a.selfEmail),
+    selfPhones: [config.signalPhoneNumber, config.smsFromNumber].filter((n): n is string => typeof n === 'string' && n !== ''),
+    lookupTask: taskLookupFrom(taskRepo),
+    nonOrgDomains: outreachNonOrgDomains,
+    log: logger,
+  });
 
-  // Load principal's channel identities for the outbound gateway recipient check.
-  // Cached for the lifetime of the process — restart picks up changes.
-  // Load principal contact reference and cache it for the readiness check below (avoid a redundant DB query).
-  let principalIdentities: ChannelIdentity[] = [];
-  let principalContact: Contact | null = null;
-  try {
-    principalContact = await contactService.findContactBySystemRole('principal');
-    if (principalContact) {
-      const withIdentities = await contactService.getContactWithIdentities(principalContact.id);
-      // Only use verified, active identities. Defunct/bounced addresses remain verified
-      // in the DB but are no longer reachable — presenting them as authoritative in the
-      // runtime prompt would cause agents to send to stale addresses with no fallback.
-      principalIdentities = (withIdentities?.identities ?? []).filter(
-        (id) => id.verified && id.status === 'active',
-      );
-    }
-  } catch (err) {
-    logger.fatal(
-      { err },
-      'Failed to load principal contact — check that migration 035 (add_system_role) has been applied',
-    );
-    process.exit(1);
-  }
-
+  // principalContact + principalIdentities were resolved once near the top of bootstrap
+  // (see the "Principal contact resolution" block above, #1049). They are reused here for
+  // the outbound gateway recipient check and the readiness gate — no redundant DB query.
+  //
   // Note: a missing principal does NOT degrade — the readiness check below
   // converts it into a fatal startup error with a searchable `check: principal-contact`
   // log line and aborts boot. No separate warn here; that would duplicate the
@@ -1193,7 +1687,7 @@ async function main(): Promise<void> {
 
   // --- Startup readiness checks ---
   // All checks must pass before the system accepts inbound messages.
-  // See docs/wip/2026-05-10-principal-identity-design.md
+  // See docs/specs/09-contacts-and-identity.md § Principal Contact Resolution
   const readinessChecks = [
     {
       name: 'principal-contact',
@@ -1244,63 +1738,9 @@ async function main(): Promise<void> {
     logger.info('All startup readiness checks passed');
   }
 
-  // Outbound gateway — single choke-point for all outbound external communication.
-  // Runs blocked-contact checks and content filtering before any message leaves Curia.
-  //
-  // Initialization guard:
-  //   Production assumption: Nylas + Signal are always configured together.
-  //   The guard initializes the gateway when either client is available + outboundFilter
-  //   is ready. This keeps the gateway functional for Signal-only setups (e.g., during
-  //   initial deployment before Nylas credentials are added) and for testing scenarios.
-  //
-  //   TODO: If the system ever runs in a Signal-only mode in production (no Nylas), the
-  //   blocked-content CEO notification path will silently degrade (no email to send it on).
-  //   In that mode, log.error is the fallback — see OutboundGateway.send() comments.
-  //   For now we assume Nylas + Signal together, so this path is only for dev flexibility.
-  let outboundGateway: OutboundGateway | undefined;
-  const hasAnyOutboundClient = nylasClientMap.size > 0 || !!signalRpcClient;
-  // Defense-in-depth for setup-required mode: even though inbound email/Signal
-  // adapters are skipped (so no inbound traffic should be triggering outbound
-  // replies), the OutboundGateway is also used by notifiers (suspension, recovery,
-  // approval) and skills that send directly. Skipping the gateway construction
-  // here closes those non-reply send paths too — there is no email/Signal
-  // egress at all until the operator completes setup and restarts.
-  if (setupRequiredAtBoot && hasAnyOutboundClient) {
-    logger.warn(
-      'SETUP-REQUIRED mode: outbound gateway NOT initialized — no email/Signal egress (notifiers, autonomy alerts) until restart',
-    );
-  }
-  if (hasAnyOutboundClient && outboundFilter && !setupRequiredAtBoot) {
-    outboundGateway = new OutboundGateway({
-      nylasClients: nylasClientMap.size > 0 ? nylasClientMap : undefined,
-      signalClient: signalRpcClient,
-      signalPhoneNumber: config.signalPhoneNumber,
-      contactService,
-      contentFilter: outboundFilter,
-      bus,
-      // principalIdentities loaded from the DB at startup — used by isPrincipalRecipient()
-      // to bypass the autonomy gate for agent-to-principal communications.
-      principalIdentities,
-      logger,
-      autonomyService,
-      piiRedactor,
-      // Wire action log repo so the gateway can write autonomy_action_log rows on
-      // gated sends and support two-step draft linkage (#435).
-      actionLogRepo,
-      confidencePipeline,
-    });
-    logger.info({
-      emailAccounts: [...nylasClientMap.keys()],
-      hasSignal: !!signalRpcClient,
-    }, 'Outbound gateway initialized');
-  } else if (nylasClientMap.size > 0 && !outboundFilter) {
-    // Nylas clients are available but outboundFilter is missing (no coordinator config found).
-    // Email skills will be unavailable because they check ctx.outboundGateway before sending.
-    logger.warn('Outbound gateway NOT initialized — outboundFilter not ready (coordinator config missing?). Outbound send skills will be unavailable.');
-  }
-
   // ── Channel registry ───────────────────────────────────────────────────────
   // Decide which channels start, from DB lifecycle state + resolvable credentials.
+  // Reconcile runs before OutboundGateway so inbound and outbound share one gate.
   // Credentials resolve vault-first, then env, then config (multi-account email).
   const channelRegistryRepo = new ChannelRegistryRepo(pool);
 
@@ -1331,7 +1771,6 @@ async function main(): Promise<void> {
     await reconcileChannelRegistry({
       repo: channelRegistryRepo,
       catalog: CHANNEL_CATALOG,
-      credentialStatus: channelCredentialStatusFn,
       logger,
     });
   } catch (err) {
@@ -1365,11 +1804,181 @@ async function main(): Promise<void> {
   );
   // ───────────────────────────────────────────────────────────────────────────
 
+  // Outbound gateway — single choke-point for all outbound external communication.
+  // Runs blocked-contact checks and content filtering before any message leaves Curia.
+  // Clients are gated on channelShouldStart so disabled/uninstalled channels cannot egress.
+  let outboundGateway: OutboundGateway | undefined;
+  const registryGatedOutbound = gateOutboundClientsForRegistry(
+    channelShouldStart,
+    nylasClientMap,
+    signalRpcClient,
+    config.signalPhoneNumber,
+    slackClient,
+    smsClient,
+  );
+  const hasAnyOutboundClient = hasRegistryGatedOutboundClient(registryGatedOutbound);
+  // Defense-in-depth for setup-required mode: even though inbound email/Signal
+  // adapters are skipped (so no inbound traffic should be triggering outbound
+  // replies), the OutboundGateway is also used by notifiers (suspension, recovery,
+  // approval) and skills that send directly. Skipping the gateway construction
+  // here closes those non-reply send paths too — there is no email/Signal/Slack/SMS
+  // egress at all until the operator completes setup and restarts.
+  if (setupRequiredAtBoot && hasAnyOutboundClient) {
+    logger.warn(
+      'SETUP-REQUIRED mode: outbound gateway NOT initialized — no email/Signal/Slack/SMS egress (notifiers, autonomy alerts) until restart',
+    );
+  }
+  const exportControlsConfig = resolveExportControls(yamlConfig);
+  const exportControlService = new ExportControlService(pool, exportControlsConfig, logger);
+
+  // Contact IDs resolved in a conversation, re-read from the contact row on
+  // each later turn (#1818). The coordinator records and re-injects them.
+  // The gateway reads the same store so a send in that turn sees identities
+  // the turn just resolved. Specialists are not wired: they run in a fresh
+  // delegate conversation, and begin() would arm the gate with an empty set.
+  const principalNames = [principalContact?.displayName, principalContact?.preferredName]
+    .filter((name): name is string => typeof name === 'string' && name.trim() !== '');
+  const conversationEntities = ConversationEntityState.createWithPostgres(pool, logger, principalNames);
+
+  // Band gating's send review (#2159). The evidence is what the drafting turn looked up.
+  const sendEvidence = new SendEvidenceCollector({
+    auditLogRepo,
+    taskRepo,
+    // A task-less reply-to-outreach link reads its originator from the outreach row (#2312).
+    taskOutreachRepo,
+    // The principal's earlier answers on this thread (#2312).
+    disclosureDecisionsRepo,
+    // Read per call: principal identities hot-reload in place (#1514).
+    principalBlock: () => formatWhoYouServeBlock(principalIdentities, principalPrimaryEmail.current, principalProfile.current),
+    logger,
+  });
+  const bandReview = autonomyGating === 'band'
+    ? new BandSendReview({
+      judge: escalationJudge,
+      // The principal's own domains never make a recipient a link's counterparty (#2312).
+      nonOrgDomains: outreachNonOrgDomains,
+      evidence: sendEvidence,
+      limiter: new FailOpenLimiter(),
+      // Once, when unreviewed sends pass the hourly cap: sends now hold until the reviewer
+      // answers again. Never throws — the review holds the send either way.
+      onLimiterTripped: async () => {
+        const to = principalEmail.current;
+        if (!outboundGateway || !to) {
+          logger.error('band review: fail-open cap tripped, and there is no gateway or principal email to tell — sends are holding');
+          return;
+        }
+        try {
+          const result = await outboundGateway.send({
+            channel: 'email',
+            to,
+            subject: 'Curia: sends are waiting for review',
+            body: 'The message reviewer failed on more than 5 sends in the last hour, so Curia is holding sends for your approval until it recovers.',
+          }, { isSystemNotification: true, skipNotificationOnBlock: true });
+          if (!result.success) {
+            logger.error({ reason: result.blockedReason }, 'band review: could not tell the principal that sends are holding');
+          }
+        } catch (err) {
+          logger.error({ err }, 'band review: could not tell the principal that sends are holding');
+        }
+      },
+      // Current tier, for a trusted contact's authority to direct a disclosure (#2312). A
+      // missing contact is no authority; a throw is caught by the review and treated the same.
+      contactTier: async (contactId) => (await contactService.getContact(contactId))?.tier ?? null,
+      logger,
+    })
+    : undefined;
+
+  if (hasAnyOutboundClient && outboundFilter && !setupRequiredAtBoot) {
+    const outboundQueue = new OutboundQueueRepo(pool);
+    // Channels that implement Channel.supportsOutboundQueue register readiness
+    // probes here (client-backed) or via setOutboundQueueReadiness after the
+    // adapter exists (SMS start/stop). Voice / http / cli intentionally omit.
+    const outboundQueueReadiness = new Map<string, () => boolean>();
+    if (registryGatedOutbound.signalClient) {
+      const signal = registryGatedOutbound.signalClient;
+      outboundQueueReadiness.set('signal', () => signal.isConnected());
+    }
+    if (registryGatedOutbound.slackClient) {
+      const slack = registryGatedOutbound.slackClient;
+      outboundQueueReadiness.set('slack', () => slack.isConnected());
+    }
+    outboundGateway = new OutboundGateway({
+      nylasClients: registryGatedOutbound.nylasClients,
+      // Each mailbox's own address, so the gateway can tell the principal's mailbox
+      // from Curia's own (prompt trim PR 6).
+      emailAccountAddresses: new Map(resolvedEmailAccounts.map(a => [a.name, a.selfEmail])),
+      // By reference: identity hot-reload mutates it in place, so the next email signs
+      // with the edited signature.
+      agentPersona,
+      signalClient: registryGatedOutbound.signalClient,
+      signalPhoneNumber: registryGatedOutbound.signalPhoneNumber,
+      slackClient: registryGatedOutbound.slackClient,
+      smsClient: registryGatedOutbound.smsClient,
+      contactService,
+      contentFilter: outboundFilter,
+      bus,
+      // principalIdentities loaded from the DB at startup — used by isPrincipalRecipient()
+      // to bypass the autonomy gate for agent-to-principal communications.
+      principalIdentities,
+      conversationEntities,
+      identityGate: resolveIdentityGateMode(yamlConfig.filter),
+      logger,
+      autonomyService,
+      piiRedactor,
+      // Wire action log repo so the gateway can write autonomy_action_log rows on
+      // gated sends and support two-step draft linkage (#435).
+      actionLogRepo,
+      confidencePipeline,
+      exportControlService,
+      outboundQueue,
+      outboundQueueReadiness,
+      gating: autonomyGating,
+      ...(bandReview ? { bandReview } : {}),
+      // Caps immediate relays to the principal per outside contact (#1320).
+      relayBudget: new RelayBudget({ perHour: resolveRelayBudgetConfig(yamlConfig.autonomy).perHour }),
+    });
+    outboundGateway.start();
+    logger.info({
+      emailAccounts: registryGatedOutbound.nylasClients ? [...registryGatedOutbound.nylasClients.keys()] : [],
+      hasSignal: !!registryGatedOutbound.signalClient,
+      hasSlack: !!registryGatedOutbound.slackClient,
+      hasSms: !!registryGatedOutbound.smsClient,
+      queueableChannels: [...outboundQueueReadiness.keys()],
+      channelShouldStart: [...channelShouldStart],
+    }, 'Outbound gateway initialized');
+  } else if (nylasClientMap.size > 0 && !outboundFilter) {
+    // Nylas clients are available but outboundFilter is missing (no coordinator config found).
+    // Email skills will be unavailable because they check ctx.outboundGateway before sending.
+    logger.warn('Outbound gateway NOT initialized — outboundFilter not ready (coordinator config missing?). Outbound send skills will be unavailable.');
+  } else if ((nylasClientMap.size > 0 || signalRpcClient || slackClient || smsClient) && !hasAnyOutboundClient) {
+    logger.info(
+      { channelShouldStart: [...channelShouldStart] },
+      'Outbound gateway NOT initialized — toggleable channels with credentials are disabled or uninstalled in the registry',
+    );
+  }
+
+  // Built before the email adapters so a same-thread follow-up can be released
+  // at the dispatcher's decision. The shipped config turns this on; an absent field stays off.
+  const turnInjection = resolveTurnInjectionConfig(yamlConfig.dispatch);
+  const turnLanes = new TurnLanes({
+    enabled: turnInjection.enabled,
+    maxInjectionsPerTurn: turnInjection.maxInjectionsPerTurn,
+    extraRoundsPerInjection: turnInjection.extraRoundsPerInjection,
+    laneWaitTimeoutMs: turnInjection.laneWaitTimeoutMs,
+    logger,
+  });
+  logger.info({ enabled: turnInjection.enabled }, 'Turn lanes initialized');
+
   // Construct one EmailAdapter per resolved account (but don't start any yet —
   // adapters must not poll until the dispatcher is registered, otherwise inbound.message
   // events have no subscriber and are permanently dropped because each adapter advances
   // its own high-water mark on poll).
   if (outboundGateway && channelShouldStart.has('email')) {
+    const emailAdaptersBefore = emailAdapters.length;
+    // Every mailbox the agent owns is suppressed as an inbound sender across ALL adapters,
+    // so an email from one owned account into another isn't processed as a third-party message
+    // (and so the agent never reacts to its own sends). The union is the same for each adapter.
+    const ownedMailboxAddresses = resolvedEmailAccounts.map(a => a.selfEmail);
     for (const account of resolvedEmailAccounts) {
       if (!nylasClientMap.has(account.name)) continue; // skip accounts with no client (NYLAS_API_KEY missing)
 
@@ -1381,16 +1990,51 @@ async function main(): Promise<void> {
         contactService,
         pollingIntervalMs: config.nylasPollingIntervalMs,
         selfEmail: account.selfEmail,
-        excludedSenderEmails: account.excludedSenderEmails,
-        ceoEmail: config.ceoPrimaryEmail,
+        suppressedSenderEmails: ownedMailboxAddresses,
+        // Principal's email, resolved from findContactBySystemRole('principal') (#1049).
+        // Mutable ref so post-boot email binds update rate-limit notifications (#1514).
+        ceoEmail: principalEmail,
         contactCreationMaxPerMessage: yamlConfig.contact_creation_limits?.max_per_message ?? 10,
         contactCreationMaxPerHour: yamlConfig.contact_creation_limits?.max_per_hour ?? 100,
+        // default.yaml is 4. Applying it here matches the neighbouring limits,
+        // so a config that omits the key still boots with a cap (#2254).
+        maxConcurrentTurns: yamlConfig.channels?.email?.max_concurrent_turns ?? 4,
         timezone: config.timezone,
         // Persist the poll high-water mark so restarts resume from where we left off
         // rather than silently dropping messages that arrived during downtime (#846).
         configStore: entityMemory ? new ConfigStore(entityMemory, logger) : undefined,
+        // Replay this account's unacknowledged inbound.message rows before the
+        // first poll, so a deploy cannot leave write-ahead mail behind the watermark.
+        unacknowledgedInbound: auditLogger,
+        turnLanes,
       }));
     }
+    // Divergence guard (#964): the registry gate marked email enabled + resolvable, yet no
+    // adapter constructed — the runtime config has no usable Nylas client. This is the silent
+    // no-op the channel-vault fix exists to prevent; it can still arise if a transient vault
+    // read error hit applyChannelVaultSecrets but not the gate's independent read. Surface it
+    // loudly instead of booting a dead channel, rather than letting the gate and runtime disagree.
+    if (emailAdapters.length === emailAdaptersBefore) {
+      logger.warn('channel email is enabled + resolvable but no Nylas client is configured at runtime; no email adapter constructed — check vault/env credentials and restart');
+    } else {
+      // Any started email account keeps the channel ready for queue flush (#1380).
+      outboundGateway.setOutboundQueueReadiness(
+        'email',
+        () => emailAdapters.some((a) => a.isOutboundReady()),
+      );
+    }
+  }
+
+  // The most dangerous email config: adapter(s) are live but the principal has no usable
+  // (verified + active) email, so the first inbound email from the principal is not matched
+  // to their contact and is held as provisional. Surface at error for log aggregators.
+  // Lives here (not in the principal-resolution block) because adapter activeness is only
+  // known after this point.
+  if (emailAdapters.length > 0 && principalContact && !principalEmail.current) {
+    logger.error(
+      { contactId: principalContact.id },
+      'Email adapter(s) active but the principal has no verified active email — inbound email from the principal WILL be held as provisional until an email identity is bound',
+    );
   }
 
   // Construct the Signal adapter (but don't start it yet — same ordering rule as email:
@@ -1403,7 +2047,213 @@ async function main(): Promise<void> {
       outboundGateway,
       contactService,
       phoneNumber: config.signalPhoneNumber,
+      speechMediaService,
     });
+  } else if (outboundGateway && channelShouldStart.has('signal') && (!signalRpcClient || !config.signalPhoneNumber)) {
+    // Divergence guard (#964): same silent-no-op class as the email block above — the gate
+    // says signal should start but its runtime client/credentials (socket path or phone
+    // number) are absent from config, so no adapter was constructed. Warn instead of skipping
+    // silently. (Only reachable outside setup-required mode, where outboundGateway is set.)
+    logger.warn('channel signal is enabled + resolvable but its runtime client/credentials are missing (socket path or phone number); no Signal adapter constructed — check vault/env credentials and restart');
+  }
+
+  // Construct the Slack adapter (same ordering rule: after gateway, before start).
+  if (outboundGateway && slackClient && channelShouldStart.has('slack')) {
+    slackAdapter = new SlackAdapter({
+      bus,
+      logger,
+      client: slackClient,
+      outboundGateway,
+      contactService,
+      allowedChannelIds: yamlConfig.channels?.slack?.allowed_channel_ids,
+      speechMediaService,
+    });
+  } else if (outboundGateway && channelShouldStart.has('slack') && !slackClient) {
+    logger.warn('channel slack is enabled + resolvable but its runtime client/credentials are missing (bot token or app token); no Slack adapter constructed — check vault/env credentials and restart');
+  }
+
+  // Construct the SMS adapter (after gateway; webhook handler installed on start).
+  if (outboundGateway && smsClient && channelShouldStart.has('sms')) {
+    smsAdapter = new SmsAdapter({
+      bus,
+      logger,
+      client: smsClient,
+      outboundGateway,
+      contactService,
+      webhookBridge: smsWebhookBridge,
+    });
+    // SMS readiness tracks adapter start/stop (no persistent socket) (#1380).
+    outboundGateway.setOutboundQueueReadiness('sms', () => smsAdapter!.isOutboundReady());
+  } else if (outboundGateway && channelShouldStart.has('sms') && !smsClient) {
+    logger.warn('channel sms is enabled + resolvable but its runtime client/credentials are missing (api key, from number, or webhook public key); no SMS adapter constructed — check vault/env credentials and restart');
+  }
+
+  // Outbound context bridge — delegation-aware context registry for
+  // specialist-initiated outbound. Requires pool (Postgres).
+  // Constructed before VoiceRuntime (so voice turns can inject active entries —
+  // #1594) and before Scheduler (startup + daily cleanup).
+  const outboundContextService = pool
+    ? new OutboundContextService(pool, logger, {
+        defaultExpiryHours: yamlConfig.contextBridge?.defaultExpiryHours,
+        explicitExpiryHours: yamlConfig.contextBridge?.explicitExpiryHours,
+        channelDefaultExpiryHours: yamlConfig.contextBridge?.channelDefaultExpiryHours,
+      })
+    : undefined;
+
+  // Construct the Voice adapter (HTTP session handler installed on start).
+  if (
+    channelShouldStart.has('voice') &&
+    config.voiceLivekitUrl &&
+    config.voiceLivekitApiKey &&
+    config.voiceLivekitApiSecret &&
+    config.voiceDeepgramApiKey &&
+    config.voiceCartesiaApiKey &&
+    config.voiceCartesiaVoiceId
+  ) {
+    // Voice turns use the 'fast' tier by default (ADR-037 §3), overridable via
+    // channels.voice.model. Need both a provider that exposes stream() and a
+    // registry entry advertising streaming+tools (#1553) — OpenRouter's
+    // stream() alone does not prove the resolved model can duplex or tool-call.
+    // Capability check runs BEFORE resolveProviderForModel so an unknown voice
+    // override warns and disables voice instead of process.exit(1) (#1553 review).
+    const voiceModel = config.voiceModel ?? modelRouter.resolve('fast').model;
+    // The override's small-cap check lives here, not with the early one, so it stops boot
+    // only when the voice adapter will actually start (#2224). Without an override, voice
+    // runs on the fast tier, which the early check covers.
+    if (config.voiceModel) {
+      const voiceViolations = smallCapThinkingViolations([voiceModelSlot(config.voiceModel)], modelRegistry);
+      if (voiceViolations.length > 0) {
+        logger.fatal({ violations: voiceViolations }, `Model cannot turn thinking off on a small-cap call site — ${voiceViolations.join(' ')}`);
+        process.exit(1);
+      }
+    }
+    const voiceCaps = evaluateVoiceModelCapabilities(
+      voiceModel,
+      modelRegistry.getModel(voiceModel)?.capabilities,
+    );
+    if (!voiceCaps.ok) {
+      logger.warn(
+        {
+          voiceModel,
+          missingCapabilities: voiceCaps.missing,
+          unknownModel: voiceCaps.unknownModel,
+        },
+        'Voice channel enabled but the resolved model lacks required capabilities '
+        + `(${voiceCaps.missing.join(', ')}); voice adapter not started. `
+        + 'Remap channels.voice.model / the fast tier to a model with streaming and tools.',
+      );
+    } else {
+      const voiceBaseProvider = resolveProviderForModel(voiceModel, 'VoiceRuntime');
+      if (typeof voiceBaseProvider.stream !== 'function') {
+        logger.warn(
+          { voiceModel, provider: voiceBaseProvider.id },
+          'Voice channel enabled but the resolved LLM provider does not support stream(); '
+          + 'voice adapter not started. Remap channels.voice.model / the fast tier to a streaming provider.',
+        );
+      } else {
+      // Wrap in telemetry so voice turns emit llm.call cost events like every other path.
+      const voiceLlmProvider = new TelemetryLlmProvider(voiceBaseProvider, bus, logger, 'voice-turn', modelRegistry);
+      const voiceLivekitUrl = config.voiceLivekitUrl;
+      const voiceRuntime = new VoiceRuntime({
+        bus,
+        logger,
+        sessionStore: voiceSessionStore,
+        stt: new DeepgramSttProvider(config.voiceDeepgramApiKey, logger),
+        tts: new CartesiaTtsProvider(config.voiceCartesiaApiKey, logger, config.voiceCartesiaVoiceId),
+        llm: voiceLlmProvider,
+        model: voiceModel,
+        livekitUrl: voiceLivekitUrl,
+        createTransport: ({ token, livekitUrl, callerIdentity }) =>
+          new LiveKitRoomSession({ url: livekitUrl, token, callerIdentity, logger }),
+        workingMemory: memory,
+        maxUtteranceBytes: yamlConfig.channels?.max_message_bytes ?? 102_400,
+        // Same per-turn date/timezone grounding the coordinator gets — without it
+        // "tomorrow / next week" is un-anchored for every voice tool call (#1551).
+        timezone: config.timezone,
+        // Cross-channel outbound-context bridge — voice bypasses the dispatcher,
+        // so VoiceRuntime reads getActive() itself (#1594).
+        outboundContextService,
+        deleteRoom: async (roomName) => {
+          await deleteVoiceRoom(
+            {
+              // RoomService must hit LiveKit on the internal network — not the
+              // browser-facing signaling URL (ADR-037 / #1555).
+              livekitManagementUrl: config.voiceLivekitManagementUrl,
+              apiKey: config.voiceLivekitApiKey!,
+              apiSecret: config.voiceLivekitApiSecret!,
+            },
+            roomName,
+          );
+        },
+        // Tools + coordinator context providers are late-bound via
+        // voiceRuntime.configureTools() after the coordinator is registered
+        // (ExecutionLayer + pinned tools + agent registry exist then).
+      });
+      voiceRuntimeRef = voiceRuntime;
+      logger.info({ voiceModel }, 'Voice runtime constructed (streaming provider + model capabilities ok)');
+
+      voiceAdapter = new VoiceAdapter({
+        bus,
+        logger,
+        sessionBridge: voiceSessionBridge,
+        sessionStore: voiceSessionStore,
+        livekitUrl: config.voiceLivekitUrl,
+        livekitApiKey: config.voiceLivekitApiKey,
+        livekitApiSecret: config.voiceLivekitApiSecret,
+        voiceModel: config.voiceModel,
+        voiceRuntime,
+      });
+      }
+    }
+  } else if (channelShouldStart.has('voice')) {
+    logger.warn('channel voice is enabled + resolvable but runtime credentials are missing (LiveKit, Deepgram, Cartesia, or the Cartesia voice ID); no Voice adapter constructed — check vault credentials and restart');
+  }
+
+  // Signal voice calls (#1672): bridge signal-cli callEvents into VoiceRuntime.
+  // Dark by default — requires the flag, the Signal RPC client, the voice
+  // runtime, the shared Pulse socket path, AND the Signal channel toggle
+  // (channelShouldStart), same as every other adapter gates its egress.
+  // Without this last check a disabled/uninstalled Signal channel could
+  // still answer and bridge voice calls.
+  let signalCallBridge: SignalCallBridge | undefined;
+  if (config.signalVoiceCallsEnabled) {
+    if (signalRpcClient && voiceRuntimeRef && config.signalPulseSocketPath && channelShouldStart.has('signal')) {
+      signalCallBridge = new SignalCallBridge({
+        bus,
+        logger,
+        rpcClient: signalRpcClient,
+        contactResolver,
+        voiceRuntime: voiceRuntimeRef,
+        sessionStore: voiceSessionStore,
+        agendaStore,
+        pulseServer: config.signalPulseSocketPath,
+        maxCallSeconds: config.signalVoiceMaxCallSeconds,
+        channelPolicies: authConfig!.channelPolicies,
+      });
+      // Constructed here (needs voiceRuntimeRef), but NOT started here: start()
+      // subscribes to call events and would answer a call. It must run after
+      // the dispatcher + configureTools wiring (below) so an answered call has
+      // coordinator tools, and it must respect setup-required mode like every
+      // other adapter. Started down beside the other channel adapters.
+      logger.info({ maxCallSeconds: config.signalVoiceMaxCallSeconds }, 'Signal voice-call bridge constructed');
+    } else {
+      logger.warn(
+        {
+          hasSignalRpc: !!signalRpcClient,
+          // False here usually means the voice channel isn't fully configured —
+          // most often missing LiveKit creds, since VoiceRuntime is built inside
+          // the LiveKit-gated block (see the voiceRuntimeRef note above).
+          hasVoiceRuntime: !!voiceRuntimeRef,
+          // Named for what it actually is: the CONFIG VALUE being present, not the
+          // socket being alive. Conflating those is what let curia-deploy#221 run for
+          // hours with a dead audio stack and a green dashboard. Liveness now has its
+          // own probe — the `signal_voice` check in /api/health (#1760).
+          hasPulseSocketPath: !!config.signalPulseSocketPath,
+          hasSignalChannel: channelShouldStart.has('signal'),
+        },
+        'SIGNAL_VOICE_CALLS_ENABLED is set but prerequisites are missing (needs the Signal channel + the full voice channel incl. LiveKit/Deepgram/Cartesia + the Pulse socket path); Signal voice calls disabled',
+      );
+    }
   }
 
   // Scheduler — Postgres-backed job scheduler for cron and one-shot tasks.
@@ -1414,8 +2264,9 @@ async function main(): Promise<void> {
   // Build the drift detector if enabled in config. Requires the LLM provider
   // (already created above). If enabled but no provider is available, the config
   // is still valid — drift checks will simply never trigger.
-  // The 'standard' tier is used for drift checks — they're concise JSON judgments
-  // that don't need the full flagship model.
+  // The 'fast' tier is used for drift checks — they're concise JSON judgments at 200
+  // tokens, and boot keeps fast on a model that can turn thinking off (#2224). On the
+  // standard tier a reasoning model returned no verdict, which reads as no drift.
   let driftDetector: DriftDetector | undefined;
   if (yamlConfig.intentDrift?.enabled !== false) {
     // Resolve effective drift config with defaults.
@@ -1423,9 +2274,9 @@ async function main(): Promise<void> {
       enabled: yamlConfig.intentDrift?.enabled ?? true,
       checkEveryNBursts: yamlConfig.intentDrift?.checkEveryNBursts ?? 1,
       minConfidenceToPause: yamlConfig.intentDrift?.minConfidenceToPause ?? 'high',
-      model: modelRouter.resolve('standard').model,
+      model: modelRouter.resolve('fast').model,
     };
-    // Resolve the provider from the registry so remapping 'standard' to an
+    // Resolve the provider from the registry so remapping 'fast' to an
     // OpenRouter model routes drift checks through OpenRouterProvider. (#646)
     const driftProvider = new TelemetryLlmProvider(resolveProviderForModel(driftConfig.model, 'DriftDetector'), bus, logger, 'drift-detector', modelRegistry);
     driftDetector = new DriftDetector(driftProvider, driftConfig, logger);
@@ -1468,9 +2319,10 @@ async function main(): Promise<void> {
     batchSize: yamlConfig.dreaming?.autonomy_scoring?.batchSize ?? 50,
     minScoredActions: yamlConfig.dreaming?.autonomy_scoring?.minScoredActions ?? 30,
     halfLifeDays: yamlConfig.dreaming?.autonomy_scoring?.halfLifeDays ?? 30,
-    weakExpiredWeight: yamlConfig.dreaming?.autonomy_scoring?.weakExpiredWeight ?? 0.3,
     ceoCooldownDays: yamlConfig.dreaming?.autonomy_scoring?.ceoCooldownDays ?? 7,
     errorRateThreshold: yamlConfig.dreaming?.autonomy_scoring?.errorRateThreshold ?? 0.20,
+    errorRateWindowDays: yamlConfig.dreaming?.autonomy_scoring?.errorRateWindowDays ?? 90,
+    unparseableAfterDays: yamlConfig.dreaming?.autonomy_scoring?.unparseableAfterDays ?? 3,
   };
   // Resolve the provider from the registry so remapping the scoring tier to an
   // OpenRouter model routes LLM-judge calls through OpenRouterProvider. (#646)
@@ -1478,66 +2330,249 @@ async function main(): Promise<void> {
   const scoringPass = new AutonomyScoringPass(actionLogRepo, autonomyService, scoringProvider, logger, scoringPassConfig);
   logger.info({ scoringPassConfig }, 'AutonomyScoringPass configured');
 
-  const dreamEngine = new DreamEngine(pool, bus, logger, decayConfig, scoringPass, memory);
-  logger.info({ decayConfig }, 'DreamEngine configured');
+  // Console activity feed (#2251). The summarizer writes a one-line activity.summary
+  // when a conversational job with no visible actions completes, on the fast tier so
+  // each chat turn adds one cheap call; the feed reads those rows and never calls a model.
+  const activitySummaryModel = modelRouter.resolve('fast').model;
+  const activitySummarizer = new ActivitySummarizer({
+    bus,
+    llm: new TelemetryLlmProvider(resolveProviderForModel(activitySummaryModel, 'ActivitySummarizer'), bus, logger, 'activity-summarizer', modelRegistry),
+    model: activitySummaryModel,
+    logger,
+  });
+  activitySummarizer.register();
+  const activityService = new ActivityService({
+    auditLogRepo,
+    actionLogRepo,
+    contactService,
+    schedulerService,
+    officeTimezone: config.timezone,
+    logger,
+  });
 
-  // Outbound context bridge — delegation-aware context registry for
-  // specialist-initiated outbound. Requires pool (Postgres).
-  // Constructed here (before Scheduler) so the scheduler can run startup + daily cleanup.
-  const outboundContextService = pool
-    ? new OutboundContextService(pool, logger, {
-        defaultExpiryHours: yamlConfig.contextBridge?.defaultExpiryHours,
-        explicitExpiryHours: yamlConfig.contextBridge?.explicitExpiryHours,
-      })
-    : undefined;
+  const llmCallArchiveRetentionDays = llmCallArchiveCfg?.hotRetentionDays ?? 90;
+  const dreamEngine = new DreamEngine(
+    pool,
+    bus,
+    logger,
+    decayConfig,
+    scoringPass,
+    memory,
+    workingDocsRepo,
+    yamlConfig.documentWorkspace?.scratchTtlDays ?? DEFAULT_SCRATCH_DOC_TTL_DAYS,
+    llmCallArchiveRetentionDays,
+  );
+  dreamEngine.setOnArchived(() => entityContextAssembler.clearCache());
+  logger.info(
+    {
+      decayConfig,
+      scratchTtlDays: yamlConfig.documentWorkspace?.scratchTtlDays ?? DEFAULT_SCRATCH_DOC_TTL_DAYS,
+      scratchTtlFromConfig: yamlConfig.documentWorkspace?.scratchTtlDays !== undefined,
+      llmCallArchiveEnabled: llmCallArchiveCfg?.enabled !== false,
+      llmCallArchiveIncludeReasoning: llmCallArchiveCfg?.includeReasoning !== false,
+      llmCallArchiveRetentionDays,
+    },
+    'DreamEngine configured',
+  );
 
-  const scheduler = new Scheduler({ pool, bus, logger, schedulerService, driftDetector, dreamEngine, outboundContextService, defaultExpectedDurationSeconds: yamlConfig.scheduler?.defaultExpectedDurationSeconds });
+  // Delegated sign-in verification (#2017): the table-backed service, the in-memory code
+  // tracker and the ask-channel choice. Built here, after channelShouldStart is known and
+  // before the scheduler (which scrubs tracked codes from the run records it stores); also
+  // handed to the execution layer for its default-deny scrub and the 'verification'
+  // capability, and to the dispatcher, checkpoint and late-delegation paths below.
+  // principalIdentities is the live array refreshed in place (#1514), and channelShouldStart
+  // is read per call, so the ask channel follows changes without a restart.
+  const verificationRuntime = createVerificationRuntime(
+    pool, logger, resolveVerificationConfig(yamlConfig.verification), principalIdentities, channelShouldStart,
+  );
 
-  // SuspensionNotifier — emails the CEO when a scheduled job is auto-suspended.
+  // principalContactId is the same value agents receive via interpolateRuntimeContext
+  // below — it lets the scheduler resolve ${principal_contact_id} in job payloads at fire
+  // time instead of shipping the literal token to the model (#1800).
+  const scheduler = new Scheduler({
+    pool,
+    bus,
+    logger,
+    schedulerService,
+    driftDetector,
+    dreamEngine,
+    outboundContextService,
+    defaultExpectedDurationSeconds: yamlConfig.scheduler?.defaultExpectedDurationSeconds,
+    maxInFlight: yamlConfig.scheduler?.maxInFlight,
+    principalContactId: principalContact?.id,
+    // Read at fire time, after pass-1 registration below fills the registry.
+    ownsAgent: (agentId) => agentRegistry.has(agentId),
+    taskRepo,
+    verification: verificationRuntime,
+  });
+
+  // SuspensionNotifier — emails the principal when a scheduled job is auto-suspended.
   // Bypasses the LLM pipeline: notifies even when Anthropic is the thing that's down.
-  // Skipped (with a warning) if outboundGateway or ceoPrimaryEmail is absent.
-  if (outboundGateway && config.ceoPrimaryEmail) {
+  // Always registered when the gateway exists; ceoEmail is a live ref so a post-boot
+  // email bind enables notifications without restart (#1514). Sends no-op/skip when
+  // current is empty.
+  if (outboundGateway) {
     const suspensionNotifier = new SuspensionNotifier({
       bus,
       outboundGateway,
-      ceoEmail: config.ceoPrimaryEmail,
+      schedulerService,
+      ceoEmail: principalEmail,
       logger,
+      appOrigin: config.appOrigin,
+      httpPort: config.httpPort,
     });
     suspensionNotifier.register();
+    if (!principalEmail.current) {
+      logger.warn(
+        'SuspensionNotifier registered without principal email yet — will notify once an email identity is bound',
+      );
+    }
   } else {
     logger.warn(
-      { hasGateway: !!outboundGateway, hasCeoEmail: !!config.ceoPrimaryEmail },
-      'SuspensionNotifier not registered — outboundGateway or ceoPrimaryEmail absent; suspended jobs will not trigger CEO email alerts',
+      { hasGateway: false, hasCeoEmail: !!principalEmail.current },
+      'SuspensionNotifier not registered — outboundGateway absent; suspended jobs will not trigger principal email alerts',
     );
   }
 
-  // RecoveryNotifier — emails the CEO when the watchdog auto-recovers a stuck job.
+  // RecoveryNotifier — emails the principal when the watchdog auto-recovers a stuck job.
   // Bypasses the LLM pipeline for the same reason as SuspensionNotifier: the LLM
   // may be the reason the job is stuck in the first place.
-  // Skipped (with a warning) if outboundGateway or ceoPrimaryEmail is absent.
-  if (outboundGateway && config.ceoPrimaryEmail) {
+  // Same live-ref pattern as SuspensionNotifier (#1514).
+  if (outboundGateway) {
     const recoveryNotifier = new RecoveryNotifier({
       bus,
       outboundGateway,
-      ceoEmail: config.ceoPrimaryEmail,
+      schedulerService,
+      ceoEmail: principalEmail,
       logger,
+      appOrigin: config.appOrigin,
+      httpPort: config.httpPort,
     });
     recoveryNotifier.register();
+    if (!principalEmail.current) {
+      logger.warn(
+        'RecoveryNotifier registered without principal email yet — will notify once an email identity is bound',
+      );
+    }
   } else {
     logger.warn(
-      { hasGateway: !!outboundGateway, hasCeoEmail: !!config.ceoPrimaryEmail },
-      'RecoveryNotifier not registered — outboundGateway or ceoPrimaryEmail absent; recovered stuck jobs will not trigger CEO email alerts',
+      { hasGateway: false, hasCeoEmail: !!principalEmail.current },
+      'RecoveryNotifier not registered — outboundGateway absent; recovered stuck jobs will not trigger principal email alerts',
     );
   }
 
-  // Approval trigger — creates pending_approval rows and notifies CEO
-  // when autonomy gates block a skill. See ADR-018 and issue #427.
+  // DbAvailabilityMonitor — probes Postgres and emails the principal after >5 min of
+  // continuous unavailability (#1381 / spec 05). LLM-free; retries notification
+  // until the bus/audit path can deliver (typically on recovery).
+  const dbAvailabilityMonitor = new DbAvailabilityMonitor({
+    pool,
+    logger,
+    outboundGateway,
+    ceoEmail: principalEmail,
+  });
+  dbAvailabilityMonitor.start();
+  if (!outboundGateway) {
+    logger.warn(
+      'DbAvailabilityMonitor started without outbound gateway — will log outages but cannot email principal',
+    );
+  } else if (!principalEmail.current) {
+    logger.warn(
+      'DbAvailabilityMonitor started without principal email yet — will notify once an email identity is bound',
+    );
+  }
+
+  // MemorySampler — periodically logs process.memoryUsage() so the prod heap
+  // leak (#1650) is measurable without a heap snapshot: watch whether
+  // external/arrayBuffers (SDK/undici response buffers) or heapUsed (JS objects)
+  // is what grows. Cheap and safe on the RAM-constrained host.
+  const memorySampler = new MemorySampler({ logger });
+  memorySampler.start();
+
+  // HealthService — observability layer for liveness probes and canary jobs (#434).
+  // Requires: pool, bus, logger (always available), scheduler (just constructed),
+  // mcpSessions (loaded at line 926), and modelRoutingConfig (from line 393).
+  // Tavily is configured as a vault secret (not a config field) — pass undefined;
+  // canary is skipped. Google Workspace MCP uses OAuth env vars (no credential file)
+  // — pass undefined; check falls back to a session ping if path is null.
+  const healthConfig = resolveHealthConfig(yamlConfig.health);
+  const healthService = new HealthService({
+    db: pool,
+    bus,
+    logger,
+    scheduler,
+    emailAdapter: emailAdapters[0],
+    nylasClient: primaryNylasClient,
+    nylasCalendarClient,
+    signalRpcClient,
+    browserService,
+    // Pass channel health deps only when the adapter was constructed (enabled +
+    // credentials) so disabled channels stay `skipped`, never `fail` (#1567).
+    slackClient: slackAdapter ? slackClient : undefined,
+    smsHealth: smsAdapter
+      ? { isWebhookInstalled: () => smsWebhookBridge.getHandler() !== null }
+      : undefined,
+    voiceLiveKit: voiceAdapter
+      ? {
+          listRooms: () => listVoiceRooms({
+            livekitManagementUrl: config.voiceLivekitManagementUrl,
+            apiKey: config.voiceLivekitApiKey!,
+            apiSecret: config.voiceLivekitApiSecret!,
+          }),
+        }
+      : undefined,
+    // Gated on the BRIDGE existing, not on the config value (#1760). The bridge is
+    // what carries call audio over this socket; if it was never constructed there is
+    // nothing to be unhealthy about, so health reports `skipped`. Keying off
+    // `config.signalPulseSocketPath` instead would report `fail` on any instance that
+    // merely has the env var set — the same conflation of "configured" with "alive"
+    // that let curia-deploy#221 sit green for hours.
+    signalPulseSocketPath: signalCallBridge ? config.signalPulseSocketPath : undefined,
+    mcpSessions,
+    mcpServerStatuses,
+    mcpFixedInputs,
+    modelRoutingConfig,
+    config: healthConfig,
+    openaiApiKey: config.openaiApiKey,
+    embeddingsEnabled: entityMemory !== undefined,
+    // Same order as the execution layer resolves web-search's secret: vault, then env.
+    resolveTavilyApiKey: async () =>
+      (await secretsService.get('tavily_api_key')) || process.env.TAVILY_API_KEY || null,
+  });
+  await healthService.start();
+
+  // Health canaries on their own wall-clock timer, not a scheduled_jobs row: no agent
+  // owns them, so the scheduler could never fire one (#2229). Same timezone as the
+  // scheduler, so health.canary_schedule reads like every other cron. Throws on an
+  // invalid schedule, which fails boot.
+  const canarySchedule = new CanarySchedule({
+    cron: healthConfig.canarySchedule,
+    timezone: config.timezone,
+    runCanaries: () => healthService.runCanaries(),
+    logger,
+  });
+  canarySchedule.start();
+
+  // Approval delivery (#2159) — one pending approval, one channel, chosen by the agent from
+  // the principal's standing preferences via deliver-approval. Absent without an outbound
+  // stack (setup-required mode); approvals are then still listed in the digest.
+  const approvalDelivery = outboundGateway
+    ? new ApprovalDelivery({ actionLogRepo, outboundGateway, principalIdentities, principalEmail, logger })
+    : undefined;
+  // The gateway's own gate sites register displays too; set after construction because
+  // ApprovalDelivery sends through the gateway.
+  if (outboundGateway && approvalDelivery) {
+    outboundGateway.setApprovalDelivery(approvalDelivery);
+  } else {
+    // Gate advisories still tell agents to call deliver-approval, which will fail; approvals
+    // then reach the principal only as digest mentions.
+    logger.warn('ApprovalDelivery not available — no outbound gateway; approvals will appear only in the digest');
+  }
+
+  // Approval trigger — creates pending_approval rows when autonomy gates block a skill
+  // (ADR-018, #427). It notifies no one (#2159): it queues the request's digest mention and
+  // registers the display; the agent delivers the approval with deliver-approval.
   // Constructed unconditionally — row creation does not depend on the outbound stack.
-  // outboundGateway and ceoEmail are optional: if absent, the row is created but
-  // notification is skipped (CEO will see it in the next digest, #429).
-  const approvalTrigger = new ApprovalTriggerService(
-    actionLogRepo, outboundGateway, logger, config.ceoPrimaryEmail || undefined,
-  );
+  const approvalTrigger = new ApprovalTriggerService(actionLogRepo, logger, bus, approvalDelivery);
 
   // Temp file store — secure tmpfs-backed storage for binary attachment handoff.
   // Skills declaring 'tempFileStore' capability get ctx.writeTempFile().
@@ -1580,59 +2615,141 @@ async function main(): Promise<void> {
   // entityContextAssembler enables entity_enrichment pre-enrichment and the
   // entity-context skill. agentContactId enables entity_enrichment default='agent'.
   // infraLlmService provides constrained LLM access (classify/extract) with telemetry.
-  const executionLayer = new ExecutionLayer(skillRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, actionLogRepo, taskRepo, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort });
+  // Bypass-ladder thresholds (#1125) — how much lineage standing a woken/derived task inherits
+  // at the live autonomy score. Falls back to the module defaults (70 / 90) per field and is
+  // validated here (the JSON-schema startup check only covers default.yaml, not local overrides,
+  // and cannot express the derived_child >= same_task invariant). Throws → boot fails loudly.
+  const bypassLadder = resolveBypassLadder(yamlConfig.autonomy?.bypass_ladder);
+  // Before the execution layer so the in-flight lookup (#1858) shares the same flag as
+  // the subscriber and sweep below. Wiring the lookup while those are off would let a
+  // pending row block that agent in that conversation with nothing left to resolve it.
+  const lateDeliveryConfig = resolveLateDeliveryConfig(yamlConfig.delegate);
+  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, taskRepo, workingDocsRepo, voiceSessions: voiceSessionStore, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
+    findInFlight: (targetAgent: string, originConversationId: string) =>
+      findInFlightPendingDelegation(pool, { targetAgent, originConversationId }),
+    acquireRunning: (params: Parameters<typeof acquireRunningDelegation>[1]) =>
+      acquireRunningDelegation(pool, params),
+    releaseRunning: (delegateEventId: string) => releaseRunningDelegation(pool, delegateEventId),
+  } } : {}) });
 
-  // Two-pass agent registration:
+  // Two-pass agent registration (src/startup/agent-assembly.ts, shared with the
+  // test-mode stack and the render script — #1966):
   // Pass 1: Register all agents in the registry so specialistSummary() is complete
   //         before the Coordinator's system prompt is interpolated.
-  // Pass 2: Create AgentRuntime instances with fully interpolated prompts.
-  // Without this split, the coordinator (alphabetically first) would be interpolated
-  // before any specialists are registered, resulting in an empty specialist list.
-
-  // Pass 1: Populate registry with all agent names, roles, and descriptions
+  // Pass 2: Assemble and start an AgentRuntime per agent (below).
   try {
-    for (const agentConfig of agentConfigs) {
-      agentRegistry.register(agentConfig.name, {
-        role: agentConfig.role ?? 'specialist',
-        description: agentConfig.description ?? agentConfig.name,
-        expectedDurationSeconds: agentConfig.expected_duration_seconds,
-      });
-    }
+    registerAgentRoster(agentRegistry, agentConfigs);
   } catch (err) {
     logger.fatal({ err }, 'Failed during agent registration');
     process.exit(1);
   }
 
+  // Inventory, not a misconfiguration: these specialists inherit the floor on
+  // purpose. info so a healthy boot does not train operators to ignore the
+  // below-floor warn underneath. (#1857)
+  const missingDurationHint = agentRegistry.specialistsWithoutDurationHint();
+  if (missingDurationHint.length > 0) {
+    logger.info(
+      { agents: missingDurationHint },
+      missingDurationHintWarning(missingDurationHint),
+    );
+  }
+  // curia-deploy pins 240000 in local.yaml, which shadows the shipped 450s floor.
+  // Say so at boot — otherwise that override keeps timing out healthy specialists.
+  if (isDelegateDefaultBelowFloor(yamlConfig.delegate?.defaultTimeoutMs)) {
+    const configured = yamlConfig.delegate?.defaultTimeoutMs;
+    logger.warn(
+      {
+        defaultTimeoutMs: configured ?? null,
+        floorMs: DELEGATE_DEFAULT_TIMEOUT_FLOOR_MS,
+      },
+      `delegate.defaultTimeoutMs (${configured === undefined ? 'unset' : String(configured)}) is below the pooled-p99 floor (${DELEGATE_DEFAULT_TIMEOUT_FLOOR_MS}ms) — specialists without expected_duration_seconds will time out healthy runs`,
+    );
+  }
+
+  // After pass-1 registration and before scheduler.start(). The registry holds
+  // enabled agents only (agentConfigs is filtered by enabledAgentNames) and has
+  // no unregister, so this predicate is fixed for the process lifetime. The bus
+  // is constructed before the registry exists, which is why this is a setter
+  // rather than a constructor argument. (#1898)
+  bus.setAgentOwner((agentId) => agentRegistry.has(agentId));
+
   // Cross-validate allowed_callers in skill manifests against known agent names.
   // Must run after both skills and agents are loaded. Unknown names → hard fail.
   try {
-    // Use ALL discovered agent names (enabled + disabled), not just enabled ones, so a
-    // skill that allows a currently-disabled agent as a caller doesn't trip the typo
-    // check. A genuinely unknown name still throws.
-    const knownAgentNames = new Set(agentDiscovery.map(d => d.name));
-    validateAllowedCallers(skillRegistry, knownAgentNames);
+    // Parsed configs only (enabled + disabled). A filename stem whose YAML failed
+    // to parse is not a loaded agent — naming it must say the config is unparseable. (#1898)
+    const knownAgentNames = new Set(
+      agentDiscovery.filter(d => d.config !== null).map(d => d.name),
+    );
+    const unparseableAgents = new Map(
+      agentDiscovery
+        .filter(d => d.config === null)
+        .map(d => [d.name, d.error ?? 'config failed to parse'] as const),
+    );
+    validateAllowedCallers(toolRegistry, knownAgentNames, unparseableAgents);
   } catch (err) {
     logger.fatal({ err }, 'allowed_callers validation failed — fix skill manifests');
     process.exit(1);
   }
 
+  // Which agents pin each skill bundle. Read from agent manifests on disk so the
+  // registry UI can flag a bundle that an agent depends on but which is not enabled —
+  // the condition that silently stripped ceo-inbox's 14 tools for a month (#1724).
+  const pinnedByBundle = collectPinnedByBundle(
+    agentDiscovery.map(agent => ({
+      name: agent.name,
+      pinnedSkills: agent.config ? (agent.config.pinned_skills ?? []) : null,
+      parseError: agent.error,
+    })),
+    logger,
+  );
+
   // RegistryService backs the /api/registry/* routes. Seed it with the discovery
   // captured above so the UI can show uninstalled/ghost/error items, not just enabled.
   const registryService = new RegistryService(
-    skillRegistryRepo,
+    toolRegistryRepo,
     agentRegistryRepo,
-    skillDiscovery as unknown as Discovery[],
+    toolDiscovery as unknown as Discovery[],
     agentDiscovery.map(d => ({
       name: d.name,
       metadata: d.config
-        ? { name: d.config.name, description: d.config.description ?? d.config.name, version: d.config.version ?? '0.0.0', role: d.config.role, modelTier: d.config.model?.tier, memoryScopes: d.config.memory?.scopes }
+        ? {
+            name: d.config.name,
+            description: d.config.description ?? d.config.name,
+            version: d.config.version ?? '0.0.0',
+            role: d.config.role,
+            modelTier: d.config.model?.tier,
+            // Raw pinned_skills, unfiltered — the console cross-references this against
+            // each bundle's members to warn before a disable strips a directly-pinned tool.
+            pinnedTools: d.config.pinned_skills ?? [],
+          }
         : null,
       error: d.error,
     })),
-    // PR2 (#939): backs the install/enable secrets gate — a skill declaring
+    // PR2 (#939): backs the install/enable secrets gate — a tool declaring
     // install.requires_secrets can't go live until those keys exist in the vault.
     secretsService,
+    skillRegistryRepo,
+    skillBundleDiscovery.map(d => ({
+      name: d.name,
+      metadata: d.metadata
+        ? {
+            name: d.metadata.name,
+            description: d.metadata.description,
+            version: d.metadata.version,
+            tools: d.metadata.tools,
+            pinnedBy: pinnedByBundle.get(d.name) ?? [],
+          }
+        : null,
+      error: d.error,
+    })),
+    new BundleCascadeRepo(pool, logger),
   );
+
+  // Wire skill-declared key names into McpRegistryService so uninstall
+  // doesn't delete vault keys still needed by local skills.
+  skillDeclaredKeys = registryService.declaredSecretNames();
 
   // Secret-capture service (#971) — mints one-time tokens for agent-initiated secret
   // capture and redeems submitted values into the vault. Shared by the public HTTP routes
@@ -1648,187 +2765,90 @@ async function main(): Promise<void> {
   // (which the allowlist thunk depends on). Mirrors setAgentContactId's post-hoc injection.
   executionLayer.setSecretCaptureService(secretCaptureService);
 
-  // Agents with enable_task_management: true — read by the BacklogHeartbeat to
+  // Agents that pin a skill with heartbeat: true — read by the BacklogHeartbeat to
   // know which source_agent_ids it may wake (and as the fallback target list).
   const taskManagementAgents = new Set<string>();
 
-  // Pass 2: Create AgentRuntime for each config (now all specialists are known)
+  // Pass 2: assemble each agent (pins, SKILL.md, interpolation, model binding,
+  // coordinator-only blocks) and start its runtime. All of that lives in
+  // assembleAgent() so smoke, scenarios and the render script get the same agents.
+  // `browserService` is a reassigned `let`; the liveness closure needs a stable binding.
+  const assemblyBrowserService = browserService;
+  const assemblyContext: AgentAssemblyContext = {
+    logger,
+    bus,
+    toolRegistry,
+    skillRegistry,
+    agentRegistry,
+    models: { modelRouter, modelRegistry, providerRegistry },
+    executionLayer,
+    memory,
+    entityMemory,
+    estimateCostUsd,
+    autonomyService,
+    officeIdentityService,
+    securityContextBlock,
+    timezone: config.timezone,
+    // Email: the first account's address for agent context injection. The numbers are
+    // gated on channelShouldStart like the outbound clients, so a disabled channel's
+    // number is never advertised. Signal and SMS are separate fields: SMS can run on
+    // a different number (Telnyx DID) from the Signal account.
+    channelAccounts: {
+      email: resolvedEmailAccounts[0]?.selfEmail,
+      signal: registryGatedOutbound.signalPhoneNumber,
+      sms: channelShouldStart.has('sms') ? config.smsFromNumber : undefined,
+    },
+    selfEmails: resolvedEmailAccounts.map(a => a.selfEmail),
+    // Shared hot-reload array/holder (#1514) — passed by reference.
+    principalIdentities,
+    principalPrimaryEmail,
+    principalProfile,
+    agentContactId: agentIdentityContactId,
+    principalContactId: principalContact?.id,
+    // Delegated sign-in verifications (#2017): coordinator and ceo-inbox get the live list
+    // injected per turn. A session is alive while the browser service still holds it.
+    verification: verificationRuntime,
+    browserSessionAlive: assemblyBrowserService
+      ? (sessionId: string) => assemblyBrowserService.getSession(sessionId) !== undefined
+      : undefined,
+    // Declared /shared/ documents and config keys, read fresh every turn (#2338).
+    pinnedContextReader: createPinnedContextReader({
+      workingDocsRepo,
+      entityMemory,
+      logger,
+      warnChars: yamlConfig.documentWorkspace?.pinnedContextWarnChars,
+    }),
+    defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs,
+    lateDelivery: {
+      enabled: lateDeliveryConfig.enabled,
+      ttlMinutes: lateDeliveryConfig.ttlMinutes,
+      sweepIntervalMinutes: lateDeliveryConfig.sweepIntervalMinutes,
+    },
+    bullpenService,
+    conversationEntities,
+    workingDocsRepo,
+    taskRepo,
+    turnLanes,
+  };
   for (const agentConfig of agentConfigs) {
-    // Build tool definitions from pinned skills
-    const agentPinnedSkills = agentConfig.pinned_skills ?? [];
-    for (const skillName of agentPinnedSkills) {
-      if (!skillRegistry.get(skillName)) {
-        logger.warn(
-          { agent: agentConfig.name, skill: skillName },
-          'Pinned skill not found in registry; skipping tool definition',
-        );
-      }
+    let assembled: AssembledAgent;
+    try {
+      assembled = assembleAgent(agentConfig, assemblyContext);
+    } catch (err) {
+      logger.fatal(
+        { err, agent: agentConfig.name, ...(err instanceof AgentAssemblyError ? err.details : {}) },
+        'Agent assembly failed',
+      );
+      process.exit(1);
     }
-    // For the coordinator, interpolate runtime context (just the principal contact ID).
-    // The specialist roster and the coordinator's own contact ID are no longer resolved
-    // here — they are injected per-turn by AgentRuntime (## Available Specialists block
-    // and the Contact ID line in ## Your Contact Details). Date and timezone are likewise
-    // appended fresh every task turn via formatTimeContextBlock() so they never go stale.
-    // This runs in pass 2 so all specialists are already in the registry.
-    let systemPrompt = agentConfig.system_prompt;
-    if (agentConfig.role === 'coordinator') {
-      // Do NOT pass officeIdentityBlock here. The coordinator YAML contains no
-      // identity placeholder; the identity block is prepended per-turn as a preamble
-      // in AgentRuntime.processTask() by the officeIdentityService passed below,
-      // enabling hot-reload without a restart.
-      systemPrompt = interpolateRuntimeContext(systemPrompt, {
-        principalContactId: principalContact?.id,
-      });
-    } else if (agentConfig.inject_specialists) {
-      // Specialists that need to know about available agents
-      // opt in via inject_specialists: true in their YAML.
-      // Pass agentContactId AND principalContactId so specialists can reference
-      // their own identity (${agent_contact_id}) and the principal's contact ID
-      // (${principal_contact_id}) without calling contact-lookup-by-role.
-      try {
-        systemPrompt = interpolateRuntimeContext(systemPrompt, {
-          availableSpecialists: agentRegistry.specialistSummary(),
-          agentContactId: agentIdentityContactId,
-          principalContactId: principalContact?.id,
-        });
-      } catch (err) {
-        logger.error({ err, agentName: agentConfig.name }, 'Failed to interpolate specialists into agent system prompt');
-        throw err;
-      }
-    } else {
-      // All other specialists: resolve ${agent_contact_id} (the agent's own
-      // identity, e.g. calendar.yaml's "Your contact ID is ${agent_contact_id}")
-      // and ${principal_contact_id} so both placeholders work without each
-      // specialist needing inject_specialists. interpolateRuntimeContext runs
-      // its full replace chain unconditionally — values not passed here would
-      // be blanked to empty string by the UUID-format check, so we MUST pass
-      // every contact ID the prompt could reference. Specialists list is
-      // omitted because non-inject_specialists agents don't route work.
-      systemPrompt = interpolateRuntimeContext(systemPrompt, {
-        agentContactId: agentIdentityContactId,
-        principalContactId: principalContact?.id,
-      });
-    }
-
-    // Apply the enable_task_management capability: auto-pin task skills, append the
-    // discipline block, and register heartbeat-eligibility. No-op when the flag is off.
-    const taskMgmt = applyTaskManagement(agentConfig, systemPrompt, agentPinnedSkills);
-    systemPrompt = taskMgmt.systemPrompt;
-    const effectivePinnedSkills = taskMgmt.pinnedSkills;
-    if (taskMgmt.heartbeatEligible) {
+    if (assembled.pinResolution.heartbeatEligible) {
       taskManagementAgents.add(agentConfig.name);
     }
 
-    // was: const agentToolDefs = skillRegistry.toToolDefinitions(agentPinnedSkills);
-    const agentToolDefs = skillRegistry.toToolDefinitions(effectivePinnedSkills);
+    new AgentRuntime(assembled.runtimeConfig).register();
 
-    // allow_discovery: true → inject the skill-registry discovery tool into the agent's
-    // tool list. Skipped if already pinned to avoid duplicate tool definitions.
-    // The skill-registry handler is loaded by the standard file loader like any other
-    // skill; this only controls whether it appears in the LLM's tool list for this agent.
-    if (agentConfig.allow_discovery && !effectivePinnedSkills.includes('skill-registry')) {
-      const discoveryToolDefs = skillRegistry.toToolDefinitions(['skill-registry']);
-      if (discoveryToolDefs.length === 0) {
-        // skill-registry is not in the registry — it either failed to load (bad manifest,
-        // missing handler) or was never registered. Error-level: a declared capability is
-        // unavailable for this agent's entire lifetime. Root cause will be in the earlier
-        // skill-loader error log; this connects the agent-level consequence to it.
-        logger.error({ agent: agentConfig.name }, 'allow_discovery is true but skill-registry is not registered — discovery unavailable; check startup logs for skill load errors');
-      } else {
-        agentToolDefs.push(...discoveryToolDefs);
-      }
-    }
-
-    // Resolve this agent's capability tier to a concrete model, then look up
-    // the provider from the model registry. This decouples tier→model from
-    // model→provider: the registry is the single source of truth for which
-    // provider serves each model.
-    const resolved = modelRouter.resolve(agentConfig.model.tier, agentConfig.model.needs);
-    const resolvedProvider = modelRegistry.getProvider(resolved.model);
-    if (!resolvedProvider) {
-      logger.fatal({ model: resolved.model, agent: agentConfig.name, tier: resolved.tier },
-        'Model not found in registry — cannot resolve provider');
-      process.exit(1);
-    }
-    const agentProvider = providerRegistry.get(resolvedProvider);
-    if (!agentProvider) {
-      logger.fatal({ provider: resolvedProvider, agent: agentConfig.name, tier: resolved.tier },
-        `No provider registered for model's provider`);
-      process.exit(1);
-    }
-
-    const agent = new AgentRuntime({
-      agentId: agentConfig.name,
-      systemPrompt,
-      provider: agentProvider,
-      resolvedModel: resolved.model,
-      bus,
-      logger,
-      memory,
-      entityMemory,
-      executionLayer,
-      pinnedSkills: effectivePinnedSkills,
-      skillToolDefs: agentToolDefs,
-      // Registry-backed context window lookups and cost estimation (DI so runtime is testable).
-      modelRegistry,
-      estimateCostUsd,
-      // Only the coordinator receives the autonomy service — it's the only agent
-      // that needs per-task autonomy prompt injection and the autonomy skills.
-      // Use role (same predicate as interpolateRuntimeContext above) so both
-      // branches stay in sync if the coordinator YAML is ever reconfigured.
-      autonomyService: agentConfig.role === 'coordinator' ? autonomyService : undefined,
-      // All agents receive per-turn time block injection so the current date/time
-      // and timezone are always accurate. Specialists need this too — scheduled
-      // agents in particular make time-sensitive decisions (backoff gates, date
-      // comparisons) that require a reliable "now".
-      timezone: config.timezone,
-      // The coordinator gets per-turn identity block injection via officeIdentityService.
-      // This prepends the identity block to the system prompt as a preamble on
-      // every task, so identity hot-reloads (file watcher or API PUT) take effect on the
-      // next turn without a restart.
-      officeIdentityService: agentConfig.role === 'coordinator' ? officeIdentityService : undefined,
-      // The coordinator gets per-turn security context block injection. The block is
-      // prepended to the system prompt (immediately after the identity block) on every task.
-      // Specialists do not receive this — they operate in a trust-elevated context (tasks
-      // arrive from the coordinator after the security layer has already evaluated the sender).
-      securityContextBlock: agentConfig.role === 'coordinator' ? securityContextBlock : undefined,
-      // Curia's own contact details — injected per-task so agents know which accounts to
-      // use when MCP tools ask for an email address or phone number. Injected into ALL
-      // agents (#387) — specialists like essay-editor need this to avoid hallucinating
-      // account identifiers.
-      // Email: use the first account's address for agent context injection.
-      channelAccounts: {
-        email: resolvedEmailAccounts[0]?.selfEmail || undefined,
-        phone: config.signalPhoneNumber || undefined,
-      },
-      // Principal's verified channel identities — injected per-task into ALL agents so
-      // every agent knows where to reach the CEO without inferring addresses. Sourced from
-      // the startup-cached principalIdentities array (already filtered to verified + active).
-      // Mirrors the channelAccounts pattern (#387). Fixes #786.
-      principalIdentities,
-      // Specialist roster — appended as "## Available Specialists" for the coordinator.
-      // Specialists that opt in via inject_specialists keep the bootstrap ${available_specialists}
-      // placeholder (resolved in interpolateRuntimeContext); this runtime path is coordinator-only.
-      availableSpecialists: agentConfig.role === 'coordinator' ? agentRegistry.specialistSummary() : undefined,
-      // The coordinator's own contact ID — surfaced in "## Your Contact Details".
-      // Specialists keep the ${agent_contact_id} bootstrap placeholder.
-      agentContactId: agentConfig.role === 'coordinator' ? agentIdentityContactId : undefined,
-      // Agent registry — allows the runtime to look up the target agent's
-      // expected_duration_seconds when injecting delegate timeouts (#387).
-      agentRegistry,
-      // Map YAML snake_case fields to AgentConfig camelCase, falling back to
-      // DEFAULT_ERROR_BUDGET values for any omitted fields.
-      errorBudget: agentConfig.error_budget ? {
-        maxTurns: agentConfig.error_budget.max_turns ?? DEFAULT_ERROR_BUDGET.maxTurns,
-        maxConsecutiveErrors: agentConfig.error_budget.max_errors ?? DEFAULT_ERROR_BUDGET.maxConsecutiveErrors,
-      } : undefined,
-      bullpenService,
-      bullpenWindowMinutes: 60,
-    });
-    agent.register();
-
-    if (agentToolDefs.length > 0) {
-      logger.info({ agent: agentConfig.name, skills: agentToolDefs.map(d => d.name) }, 'Agent tools configured');
+    if (assembled.toolDefs.length > 0) {
+      logger.info({ agent: agentConfig.name, skills: assembled.toolDefs.map(d => d.name) }, 'Agent tools configured');
     }
   }
 
@@ -1836,6 +2856,107 @@ async function main(): Promise<void> {
   if (!agentRegistry.has('coordinator')) {
     logger.fatal('No coordinator agent found in agents/ directory');
     process.exit(1);
+  }
+
+  // Wire coordinator tools into VoiceRuntime so spoken turns can invoke skills
+  // (#1414 AC6). ExecutionLayer still enforces autonomy / outbound gates.
+  // Only advertise tools when the resolved voice model declares `tools` (#1553).
+  {
+    const runtime = voiceAdapter?.getRuntime();
+    if (runtime) {
+      const resolvedVoiceModel = config.voiceModel ?? modelRouter.resolve('fast').model;
+      const voiceModelCaps = modelRegistry.getModel(resolvedVoiceModel)?.capabilities ?? [];
+      if (!voiceModelCaps.includes('tools')) {
+        logger.warn(
+          { voiceModel: resolvedVoiceModel },
+          'Voice runtime started without tool wiring — resolved model lacks tools capability',
+        );
+      } else {
+      // Voice's own tool list (#1968), not the coordinator's pin set: those 73
+      // definitions rode every spoken round. It includes the voice-only async
+      // off-ramp (#1614 / ADR-038), which is NOT a coordinator pin — the
+      // coordinator is the async destination and must not advertise it.
+      const voiceToolDefs = toolRegistry.toToolDefinitions([...VOICE_TOOL_NAMES]);
+      const missingVoiceTools = VOICE_TOOL_NAMES.filter(name => !voiceToolDefs.some(d => d.name === name));
+      if (missingVoiceTools.length > 0) {
+        logger.warn({ missingVoiceTools }, 'Voice tools not registered; spoken turns run without them');
+      }
+      runtime.configureTools({
+        resolveVoiceTools: () => voiceToolDefs,
+        // Coordinator context providers for spoken-turn brain parity (#1551).
+        // Per-turn closures so identity hot-reloads take effect on the next
+        // spoken turn, same as AgentRuntime's preamble injection.
+        identityBlock: () => officeIdentityService.compileSystemPromptBlock(),
+        // Roster gated on actual specialists so the delegation guidance never
+        // ships alongside a "No specialist agents..." placeholder.
+        specialistRoster: () =>
+          agentRegistry.listSpecialists().length > 0 ? agentRegistry.specialistSummary() : null,
+        invokeTool: async (call, ctx) => {
+          // Use the per-session resolved caller from VoiceCallerContext (#1598).
+          // liveTurn and originator come from the shared stampOriginator derivation —
+          // one source of truth for the elevated gate instead of the prior literals.
+          const { caller: sessionCaller } = ctx;
+          // CallerContext.role is a job role ('ceo', 'cfo', …), not systemRole.
+          // Prefer the resolved senderContext.role when available.
+          const executionCaller = {
+            contactId: sessionCaller.originator.contactId,
+            role: sessionCaller.senderContext.resolved
+              ? sessionCaller.senderContext.role
+              : null,
+            channel: 'voice',
+          };
+          // Identifier provenance (#2061): the caller's spoken turns are stored under the
+          // coordinator in this conversation, as a text turn's are.
+          const identifierSources = createIdentifierSources({
+            index: sharedIdentifierSourceIndex,
+            sourceConversation: ctx.conversationId,
+            personTurns: { conversationId: ctx.conversationId, agentId: 'coordinator' },
+            memory,
+            logger,
+          });
+          // tool.invoke / tool.result around the call, as a text turn records them (#1968).
+          const result = await invokeVoiceToolAudited({
+            bus,
+            call,
+            conversationId: ctx.conversationId,
+            sessionId: ctx.sessionId,
+            turnEventId: ctx.turnEventId,
+            invoke: (invokeEventId) => executionLayer.invoke(call.name, call.input, executionCaller, {
+              agentId: 'coordinator',
+              channelId: 'voice',
+              conversationId: ctx.conversationId,
+              taskEventId: ctx.sessionId,
+              parentEventId: invokeEventId,
+              liveTurn: sessionCaller.liveTurn,
+              turnDateResolveResults: ctx.turnDateResolveResults,
+              taskMetadata: {
+                originator: sessionCaller.originator,
+                voiceSessionId: ctx.sessionId,
+              },
+              identifierSources,
+            }),
+          });
+          if (result.success) {
+            const data = result.data;
+            try {
+              const sourceText = executionLayer.provenanceSourceText(call.name, call.input, data);
+              if (sourceText) sharedIdentifierSourceIndex.record(ctx.conversationId, sourceText);
+            } catch (err) {
+              logger.warn({ err, toolName: call.name }, 'identifier provenance: could not record a voice source-tool result');
+            }
+            const content = typeof data === 'string'
+              ? data
+              : JSON.stringify(data ?? { ok: true });
+            return { content };
+          }
+          return {
+            content: result.error ?? `Tool '${call.name}' failed`,
+            is_error: true,
+          };
+        },
+      });
+      }
+    }
   }
 
   // Load declarative schedules from agent YAML configs and start the scheduler loop.
@@ -1853,7 +2974,7 @@ async function main(): Promise<void> {
   }
   // Autonomous task execution: the deterministic hourly heartbeat that wakes idle/stale
   // tasks. Reads the tasks table, writes one-shot scheduled_jobs rows; the scheduler
-  // dispatches them. See docs/wip/2026-06-04-task-execution-heartbeat-design.md §3.
+  // dispatches them. See docs/specs/19-tasks-and-backlog.md §5 The BacklogHeartbeat.
   const tasksConfig = resolveTasksConfig(yamlConfig.tasks);
   const backlogHeartbeat = new BacklogHeartbeat({
     pool,
@@ -1866,9 +2987,80 @@ async function main(): Promise<void> {
     staleWaitThresholdHours: tasksConfig.staleWaitThresholdHours,
   });
 
-  scheduler.start();
   backlogHeartbeat.start();
-  logger.info('Scheduler started');
+
+  const resumableContinuationSubscriber = new ResumableContinuationSubscriber({
+    pool,
+    bus,
+    logger,
+    schedulerService,
+    taskRepo,
+    eligibleAgents: taskManagementAgents,
+    continuationDelaySeconds: tasksConfig.resumableContinuationSeconds,
+    resumableCeilings: tasksConfig.resumableCeilings,
+  });
+  resumableContinuationSubscriber.start();
+
+  const planFrontierSubscriber = new PlanFrontierSubscriber({
+    pool,
+    bus,
+    logger,
+    schedulerService,
+    taskRepo,
+    eligibleAgents: taskManagementAgents,
+    continuationDelaySeconds: tasksConfig.resumableContinuationSeconds,
+    resumableCeilings: tasksConfig.resumableCeilings,
+  });
+  planFrontierSubscriber.start();
+
+
+  let meetingRecovery: MeetingPipelineRecovery | undefined;
+  if (workingDocsRepo) {
+    const deliverableKgPromotionSubscriber = new DeliverableKgPromotionSubscriber({
+      bus,
+      taskRepo,
+      workingDocsRepo,
+      executionLayer,
+      config: resolveKgPromotionConfig(yamlConfig.documentWorkspace?.kgPromotion),
+      logger,
+    });
+    deliverableKgPromotionSubscriber.start();
+
+    const minutesPipeline = new MinutesPipeline({
+      sessionStore: voiceSessionStore,
+      workingMemory: memory,
+      repo: workingDocsRepo,
+      agendaStore,
+      llm: infraLlmService.scoped({ toolName: 'meeting-minutes' }),
+      taskRepo,
+      contactService,
+      bus,
+      timezone: () => principalContact?.timezone ?? config.timezone,
+      hasActiveWake: (taskId) => taskHasPendingWake(pool, taskId),
+      logger,
+    });
+    new MeetingSessionEndedSubscriber({ bus, pipeline: minutesPipeline, logger }).start();
+    new MinutesReadySubscriber({
+      bus,
+      taskRepo,
+      schedulerService,
+      logger,
+      pool,
+      hasActiveWake: (taskId) => taskHasPendingWake(pool, taskId),
+      appOrigin: config.appOrigin,
+      httpPort: config.httpPort,
+    }).start();
+    meetingRecovery = new MeetingPipelineRecovery({
+      sessionStore: voiceSessionStore,
+      agendaStore,
+      repo: workingDocsRepo,
+      pipeline: minutesPipeline,
+      logger,
+    });
+  }
+
+  // Deferred-delegation routing is registered with the scheduler below, after
+  // the dispatcher exists. The poll loop starts only once that registrar is set.
 
   // Log the scrubber status after the logger is available (patterns are loaded at module
   // init time, before pino exists, so any load-time failures are deferred to here).
@@ -1887,25 +3079,12 @@ async function main(): Promise<void> {
     'PII scrubber active',
   );
 
-  // Layer 1 inbound injection scanner — loads extra patterns from config/default.yaml
-  // and constructs the scanner. Non-fatal on loader error: a broken custom pattern
-  // entry should warn loudly but not prevent startup (built-in defaults still protect).
-  // configDir is already defined above (used for auth config and yaml config loading).
-  // Narrow the try block to loadExtraInjectionPatterns() only — the constructor and
-  // logger.info are not config-loading concerns and should not be silenced by this catch.
-  let extraInjectionPatterns: ExtraInjectionPattern[] = [];
-  try {
-    extraInjectionPatterns = loadExtraInjectionPatterns(configDir);
-  } catch (err) {
-    // Warn and fall back to zero extra patterns — built-in defaults still protect.
-    // A misconfigured extra pattern entry should not block startup entirely.
-    logger.warn({ err }, 'Failed to load extra injection patterns from config — using built-in defaults only');
-  }
-  const injectionScanner = new InboundScanner({ extraPatterns: extraInjectionPatterns });
-  logger.info(
-    { builtInPatterns: InboundScanner.DEFAULT_PATTERN_COUNT, extraPatterns: extraInjectionPatterns.length },
-    'Inbound injection scanner initialized',
-  );
+  // Layer 1 inbound injection scanner — extra patterns come from the already-merged
+  // config (default.yaml + local.yaml, see loadYamlConfig()) so operator overrides in
+  // local.yaml actually take effect (#1397). A broken custom pattern warns and the
+  // built-in defaults still protect. createInboundScanner keeps that try around the
+  // parse only.
+  const injectionScanner = createInboundScanner(yamlConfig, logger);
 
   // Parse trust scorer weights from config (security.trust_score section in default.yaml).
   // Falls back to DEFAULT_TRUST_WEIGHTS (0.4/0.4/0.2) if the section is absent.
@@ -1953,8 +3132,81 @@ async function main(): Promise<void> {
     contactService,
     selfEmail: resolvedEmailAccounts[0]?.selfEmail,
     outboundContextService,
+    approvalTrigger,
+    escalationJudge,
+    gating: autonomyGating,
+    bullpenService,
+    principalIdentities,
+    // Absent without a contact service (nothing to elevate). Without the principal's Nylas
+    // grant only the org-domain rule applies; with no org domains configured, only the
+    // mailbox rule does.
+    principalAcquaintance: contactService
+      ? {
+          check: new PrincipalAcquaintanceCheck({
+            orgDomains: yamlConfig.security?.principal_org_domains ?? [],
+            principalEmails: () =>
+              principalIdentities.filter((id) => id.channel === 'email').map((id) => id.channelIdentifier),
+            mailbox: config.nylasApiKey && principalNylasGrantId
+              ? new NylasPrincipalMailbox(config.nylasApiKey, principalNylasGrantId, logger)
+              : undefined,
+            logger,
+          }),
+          contacts: contactService,
+        }
+      : undefined,
+    principalBacklog: createPrincipalBacklogSource(pool, actionLogRepo),
+    verification: verificationRuntime,
+    turnLanes,
+    // A non-principal email that replies to Curia's outreach arrives linked to its task
+    // (#2312). Webmail, form, tenant and private-suffix hosts are excluded by
+    // isNonOrgDomain inside the matcher; this set adds the principal's own domains.
+    outreachMatcher: new OutreachMatcher({
+      repo: taskOutreachRepo,
+      // One scope for the process: the matcher's model check runs outside any skill call.
+      infraLlm: infraLlmService.scoped({ toolName: 'outreach-matcher' }),
+      logger,
+      nonOrgDomains: outreachNonOrgDomains,
+      taskStatus: (id) => taskRepo.getTask(id).then((t) => t?.status ?? null),
+    }),
+    taskProgress: taskRepo,
   });
   dispatcher.register();
+  // Deferred delegations wake in the originating conversation (#1893). The
+  // dispatcher never saw that task arrive, so the reply needs a routing entry.
+  scheduler.setExternalRoutingRegistrar(
+    (taskEventId, routing) => dispatcher.registerExternalTaskRouting(taskEventId, routing),
+  );
+  // Arm the poll only after the registrar is set. The first tick is one interval
+  // later; starting the clock earlier lets a boot that overruns that interval
+  // fire a due retry whose reply has no dispatcher routing.
+  scheduler.start();
+  logger.info('Scheduler started');
+
+  // Reaction → approval mapper (#1479): channel-agnostic inbound.reaction handling.
+  // Registered after ExecutionLayer so approve can re-invoke the blocked skill.
+  const reactionIntentsConfig = yamlConfig.autonomy?.reaction_intents;
+  const reactionApprovalMapper = new ReactionApprovalMapper({
+    bus,
+    logger,
+    actionLogRepo,
+    contactService,
+    executionLayer,
+    principalIdentities,
+    disclosureDecisions,
+    reactionIntents: {
+      approve: reactionIntentsConfig?.approve ?? [...DEFAULT_REACTION_INTENTS.approve],
+      reject: reactionIntentsConfig?.reject ?? [...DEFAULT_REACTION_INTENTS.reject],
+    },
+  });
+  reactionApprovalMapper.register();
+
+  // Spot-check binder (#2159): records which delivered message (and email thread) carried a
+  // digest's spot-check set, so a numbered reply resolves against the right digest, and marks
+  // the bound set's rows sampled. It needs the KG-backed config store (where the sets live),
+  // the gateway (to read an email's thread id) and the action log. principalIdentities is the
+  // live, hot-reloaded array (only the principal's digests are bound), so it is passed even
+  // when empty at boot; registerSpotCheckBinder warns when anything else is missing.
+  registerSpotCheckBinder({ bus, entityMemory, outboundGateway, actionLogRepo, principalIdentities, logger });
 
   // Resume-after-capture subscriber (#972) — listens for secret.captured (published by the
   // capture endpoint on a successful redeem) and re-enters the originating agent with a synthetic
@@ -1968,13 +3220,136 @@ async function main(): Promise<void> {
   );
   secretCaptureResumeSubscriber.start();
 
+  // Late delegation delivery (#1799): a delegate wait that times out abandons a specialist that
+  // keeps running. The subscriber opens a durable handle at timeout, and when the specialist
+  // finally responds it re-enters the ORIGINATING agent in its original conversation with the
+  // result — so the follow-up steps that died with the timed-out turn actually run — then closes
+  // the escalation review task. The sweep covers what an in-process subscriber cannot: a response
+  // that landed while we were down (recovered from audit_log), an actor that died mid-delivery,
+  // and a handle whose specialist never delivered at all.
+  //
+  // Wired AFTER the dispatcher for the same reason as the secret-capture resume above: a woken
+  // agent's reply needs a routing entry seeded via registerExternalTaskRouting, or the dispatcher
+  // finds none for a task it never saw arrive and drops it.
+  let lateDelegationSweep: LateDelegationSweep | undefined;
+  if (lateDeliveryConfig.enabled) {
+    // Every registered agent, not just the heartbeat-eligible ones: the question here is only
+    // whether a wake would reach a live subscriber.
+    const knownAgents = new Set(agentRegistry.list().map((a) => a.name));
+    const registerLateWakeRouting = (
+      taskEventId: string,
+      routing: Parameters<typeof dispatcher.registerExternalTaskRouting>[1],
+    ): void => dispatcher.registerExternalTaskRouting(taskEventId, routing);
+
+    const lateDelegationSubscriber = new LateDelegationSubscriber({
+      pool,
+      bus,
+      logger,
+      taskRepo,
+      ttlMinutes: lateDeliveryConfig.ttlMinutes,
+      maxResultChars: lateDeliveryConfig.maxResultChars,
+      timezone: config.timezone,
+      knownAgents,
+      registerRouting: registerLateWakeRouting,
+      verification: verificationRuntime,
+    });
+    lateDelegationSubscriber.start();
+
+    lateDelegationSweep = new LateDelegationSweep({
+      pool,
+      bus,
+      logger,
+      taskRepo,
+      intervalMinutes: lateDeliveryConfig.sweepIntervalMinutes,
+      ttlMinutes: lateDeliveryConfig.ttlMinutes,
+      maxResultChars: lateDeliveryConfig.maxResultChars,
+      timezone: config.timezone,
+      knownAgents,
+      registerRouting: registerLateWakeRouting,
+      verification: verificationRuntime,
+    });
+    lateDelegationSweep.start();
+  } else {
+    logger.warn(
+      'delegate.lateDelivery.enabled is false — late specialist responses will be orphaned, and in-flight duplicate protection is off (#1799, #1858)',
+    );
+  }
+
+  // Approval expiry — marks pending approvals past expires_at as expired and queues a digest
+  // item for each (#2013, #2159). Deterministic, so it runs as a system interval rather than
+  // the hourly coordinator turn it replaced.
+  const approvalExpirySweep = new ApprovalExpirySweep({
+    actionLogRepo,
+    bus,
+    // Safety net: approvals no agent delivered within 15 minutes go out once by email.
+    approvalDelivery,
+    logger,
+    intervalMinutes: resolveApprovalExpiryConfig(yamlConfig.autonomy).sweepIntervalMinutes,
+  });
+  approvalExpirySweep.start();
+
+  // Weekly fallback digest (#2159) — report items wait for the principal's digest job. With
+  // no such job (or a broken one) they would wait forever, so once the oldest is a week old
+  // this sends a plain summary itself. Needs the KG-backed config store for its marker.
+  const reportFallbackConfig = resolveReportFallbackConfig(yamlConfig.autonomy);
+  const reportFallbackDigest = entityMemory
+    ? new ReportFallbackDigest({
+      queue: new ReportQueue({ auditLogRepo, configStore: new ConfigStore(entityMemory, logger), logger }),
+      outboundGateway,
+      ceoEmail: principalEmail,
+      logger,
+      maxAgeDays: reportFallbackConfig.maxAgeDays,
+      checkIntervalHours: reportFallbackConfig.checkIntervalHours,
+      timezone: config.timezone,
+      // Same sampler wiring as the list-spot-checks tool; the binder above ties the delivered
+      // summary back to the set it draws.
+      spotChecks: new SpotCheckSampler({
+        actionLogRepo,
+        store: new SpotCheckStore(new ConfigStore(entityMemory, logger), logger),
+        logger,
+        ...(outboundGateway ? { describeEmail: describeEmailVia(outboundGateway) } : {}),
+      }),
+    })
+    : undefined;
+  if (reportFallbackDigest) {
+    reportFallbackDigest.start();
+  } else {
+    // Without entity memory the digest tools can't keep a marker either, so queued notices
+    // would reach no one. Loud, not a warning.
+    logger.error('ReportFallbackDigest not started — no entity memory for its marker; queued notices will not reach the principal');
+  }
+
   // Conversation checkpoint processor — System Layer subscriber that runs background
   // memory skills (extract-relationships, etc.) at end of each conversation.
-  const checkpointProcessor = new ConversationCheckpointProcessor(bus, executionLayer, pool, logger);
+  const checkpointProcessor = new ConversationCheckpointProcessor(
+    bus, executionLayer, pool, logger, authConfig?.channelPolicies, verificationRuntime,
+  );
   checkpointProcessor.register();
 
+  // Recover calls that died before minutes.ready. Fire-and-forget so boot
+  // does not wait on the minutes model (#2322).
+  if (meetingRecovery) {
+    void meetingRecovery.sweep(new Date()).catch((err: unknown) => {
+      logger.error({ err }, 'meeting pipeline: startup sweep failed');
+    });
+  }
+
   // BullpenDispatcher — routes agent.discuss → agent.task for inter-agent Bullpen discussions.
-  const bullpenDispatcher = new BullpenDispatcher(bus, logger, bullpenService);
+  // The origin-turn lookup shares the late-delivery flag with the running claim
+  // it reads. That claim is not written when late delivery is off, so the lookup
+  // stays unwired too. (#1917)
+  const bullpenDispatcher = new BullpenDispatcher(
+    bus,
+    logger,
+    bullpenService,
+    agentRegistry,
+    lateDeliveryConfig.enabled
+      ? {
+          findRunning: (targetAgent, originAgentIds) =>
+            findRunningOriginTurns(pool, { targetAgent, originAgentIds }),
+        }
+      : undefined,
+  );
   bullpenDispatcher.register();
 
   // HTTP API channel — started BEFORE channel adapters so the health check endpoint
@@ -1983,6 +3358,41 @@ async function main(): Promise<void> {
   // the health check fired during a multi-minute catch-up and marked the container
   // unhealthy before the API was even bound. All HTTP adapter dependencies (bus,
   // pool, services, registries) are fully initialized by this point.
+  // Resolve retention snapshot once at boot for the read-only Memory settings API (#1376).
+  // Editing these values still requires a config change + restart.
+  const memoryRetention = resolveMemoryRetentionSnapshot(yamlConfig);
+
+  // Read-only system snapshot for the console System settings page (#1376).
+  // Version comes from the root package.json (resolved at runtime relative to the
+  // built module — same createRequire pattern the console's vite config uses).
+  const appPackage = createRequire(import.meta.url)('../package.json') as { version: string };
+  const systemSnapshot = resolveSystemSnapshot({
+    version: appPackage.version,
+    nodeVersion: process.version,
+    timezone: config.timezone,
+    bootedAt: bootStartedAt,
+    modelRouting: modelRoutingConfig,
+  });
+
+  const briefingGateway = outboundGateway;
+  const briefingService = new BriefingService({
+    pool,
+    actionLogRepo,
+    taskRepo,
+    contactService,
+    executionLayer,
+    disclosureDecisions,
+    deleteMailboxDraft: briefingGateway
+      ? (account, draftId) => briefingGateway.deleteMailboxDraft(account, draftId)
+      : undefined,
+    loadHeldDraft: briefingGateway
+      ? (account, draftId) => briefingGateway.readHeldDraft(account, draftId)
+      : undefined,
+    bus,
+    officeTimezone: config.timezone,
+    logger,
+  });
+
   const httpAdapter = new HttpAdapter({
     bus,
     logger,
@@ -1993,18 +3403,45 @@ async function main(): Promise<void> {
     webAppBootstrapSecret: config.webAppBootstrapSecret,
     appOrigin: config.appOrigin,
     agentNames: agentConfigs.map(c => c.name),
-    skillNames: skillRegistry.list().map(s => s.manifest.name),
+    toolNames: toolRegistry.list().map(s => s.manifest.name),
     schedulerService,
     identityService: officeIdentityService,
     executiveProfileService,
     contactService,
+    nodeMergeService,
     autonomyService,
     registryService,
     channelRegistryService,
+    mcpRegistryService,
     secretsService,
     secretCaptureService,
     setupRequiredAtBoot,
     bootStartedAt,
+    // Powers POST /api/setup/suggest-name (wizard starter-name suggestion, #799).
+    infraLlmService,
+    // Powers principal profile endpoints in setup routes (#392). Undefined when
+    // entity memory is off (no usable embedding source, ADR-051); individual
+    // endpoints handle the absent case in Tasks 3–5.
+    entityMemory,
+    // Powers GET /api/health with real probes and canary state (#434).
+    healthService,
+    auditLogRepo,
+    activityFeed: activityService,
+    briefing: briefingService,
+    taskRepo,
+    smsWebhookBridge,
+    memoryRetention,
+    // Console Memory → Documents (#1821, #1822).
+    workingDocsRepo,
+    documentsEditMaxBytes: yamlConfig.documentWorkspace?.consoleEditMaxBytes,
+    system: systemSnapshot,
+    // POST /api/system/restart (#1765) — SIGTERM so the graceful shutdown()
+    // handler registered below runs. Docker `restart: unless-stopped` brings
+    // the process back; no Docker socket is mounted.
+    scheduleShutdown: () => {
+      process.kill(process.pid, 'SIGTERM');
+    },
+    voiceSessionBridge,
   });
 
   try {
@@ -2021,11 +3458,25 @@ async function main(): Promise<void> {
   // the HTTP server, pool, and other already-started resources are closed cleanly.
   const shutdown = async (exitCode = 0) => {
     logger.info('Shutting down...');
-    for (const adapter of emailAdapters) {
+    // Parallel so several mailboxes share one drain budget. A sequential stop
+    // waits 5s per hung account and can outlast Docker's default 10s grace
+    // before Signal, Slack, and the pool close (#2254).
+    await Promise.allSettled(emailAdapters.map(async (adapter) => {
       try {
         await adapter.stop();
       } catch (err) {
         logger.error({ err }, 'Error stopping email adapter during shutdown');
+      }
+    }));
+    if (signalCallBridge) {
+      try {
+        // Stop before signalAdapter/voiceAdapter: the bridge shares the Signal
+        // RPC client with signalAdapter (which disconnects the socket below)
+        // and owns any live call, so it must hang up and tear down its
+        // VoiceRuntime session while the socket is still connected.
+        await signalCallBridge.stop();
+      } catch (err) {
+        logger.error({ err }, 'Error stopping Signal voice-call bridge during shutdown');
       }
     }
     if (signalAdapter) {
@@ -2033,6 +3484,27 @@ async function main(): Promise<void> {
         await signalAdapter.stop();
       } catch (err) {
         logger.error({ err }, 'Error stopping Signal adapter during shutdown');
+      }
+    }
+    if (slackAdapter) {
+      try {
+        await slackAdapter.stop();
+      } catch (err) {
+        logger.error({ err }, 'Error stopping Slack adapter during shutdown');
+      }
+    }
+    if (smsAdapter) {
+      try {
+        await smsAdapter.stop();
+      } catch (err) {
+        logger.error({ err }, 'Error stopping SMS adapter during shutdown');
+      }
+    }
+    if (voiceAdapter) {
+      try {
+        await voiceAdapter.stop();
+      } catch (err) {
+        logger.error({ err }, 'Error stopping Voice adapter during shutdown');
       }
     }
     try {
@@ -2062,6 +3534,24 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.error({ err }, 'Error stopping backlog heartbeat during shutdown');
     }
+    if (lateDelegationSweep) {
+      try {
+        lateDelegationSweep.stop();
+      } catch (err) {
+        logger.error({ err }, 'Error stopping late delegation sweep during shutdown');
+      }
+    }
+    try {
+      canarySchedule.stop();
+    } catch (err) {
+      logger.error({ err }, 'Error stopping health canary schedule during shutdown');
+    }
+    try {
+      approvalExpirySweep.stop();
+      reportFallbackDigest?.stop();
+    } catch (err) {
+      logger.error({ err }, 'Error stopping approval expiry sweep during shutdown');
+    }
     if (browserService) {
       try {
         await browserService.stop();
@@ -2085,6 +3575,17 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.error({ err }, 'Error clearing checkpoint timers during shutdown');
     }
+    // Stop DB probes before closing the pool so the last SELECT 1 isn't racing end().
+    try {
+      dbAvailabilityMonitor.stop();
+    } catch (err) {
+      logger.error({ err }, 'Error stopping DB availability monitor during shutdown');
+    }
+    try {
+      memorySampler.stop();
+    } catch (err) {
+      logger.error({ err }, 'Error stopping memory sampler during shutdown');
+    }
     // Purge temp files and stop the sweep timer before exit.
     if (tempFileStore) {
       try {
@@ -2092,6 +3593,20 @@ async function main(): Promise<void> {
       } catch (err) {
         logger.error({ err }, 'Error shutting down temp file store during shutdown');
       }
+    }
+    // The lock's client is checked out, and pool.end() waits for every checked-out client.
+    try {
+      await releaseInstanceLock();
+    } catch (err) {
+      logger.error({ err }, 'Error releasing the instance lock during shutdown');
+    }
+    // A background summarization pass may still be inside its LLM call. Wait
+    // for it to persist before pool.end(), or the persist fails and logs a
+    // warn on every deploy (#2266).
+    try {
+      await memory.drainSummarization();
+    } catch (err) {
+      logger.error({ err }, 'Error draining working-memory summarization during shutdown');
     }
     try {
       await pool.end();
@@ -2146,9 +3661,55 @@ async function main(): Promise<void> {
     } else if (signalAdapter && setupRequiredAtBoot) {
       logger.warn('SETUP-REQUIRED mode: skipping Signal adapter startup — restart after setup to enable');
     }
+
+    if (slackAdapter && !setupRequiredAtBoot) {
+      await slackAdapter.start();
+      logger.info('Slack channel adapter started');
+    } else if (slackAdapter && setupRequiredAtBoot) {
+      logger.warn('SETUP-REQUIRED mode: skipping Slack adapter startup — restart after setup to enable');
+    }
+
+    if (smsAdapter && !setupRequiredAtBoot) {
+      await smsAdapter.start();
+      logger.info('SMS channel adapter started');
+    } else if (smsAdapter && setupRequiredAtBoot) {
+      logger.warn('SETUP-REQUIRED mode: skipping SMS adapter startup — restart after setup to enable');
+    }
+
+    if (voiceAdapter && !setupRequiredAtBoot) {
+      await voiceAdapter.start();
+      logger.info('Voice channel adapter started');
+    } else if (voiceAdapter && setupRequiredAtBoot) {
+      logger.warn('SETUP-REQUIRED mode: skipping Voice adapter startup — restart after setup to enable');
+    }
+
+    // Signal voice-call bridge (#1672): started here, alongside the other
+    // adapters and after dispatcher.register() + voiceRuntime.configureTools(),
+    // so an answered call has coordinator tools — and gated on setup-required
+    // like every other channel (no principal/tools/gateway exist in that mode,
+    // so answering a call would be answering with nobody home).
+    if (signalCallBridge && !setupRequiredAtBoot) {
+      signalCallBridge.start();
+      logger.info('Signal voice-call bridge started');
+    } else if (signalCallBridge && setupRequiredAtBoot) {
+      logger.warn('SETUP-REQUIRED mode: skipping Signal voice-call bridge startup — restart after setup to enable');
+    }
   } catch (err) {
     logger.fatal({ err }, 'Fatal error during channel adapter startup — invoking shutdown');
     await shutdown(1);
+  }
+
+  // Historical Signal 1:1 and SMS senders. Migration 090 only stamps seven
+  // days inside the boot transaction; older null rows would mark those
+  // threads shared. Batched and idempotent, and not awaited — a large table
+  // must not delay listen. The next start continues anything left null.
+  if (!setupRequiredAtBoot) {
+    void backfillDirectChannelSenders(pool, logger).catch((err) => {
+      logger.error(
+        { err },
+        'Direct-channel sender backfill failed — long-lived Signal and SMS replies stay hidden until the next start',
+      );
+    });
   }
 
   // 8. CLI channel — only started when stdin is an interactive TTY (i.e., local dev).
@@ -2171,34 +3732,6 @@ async function main(): Promise<void> {
     cli.prompt();
   }
 }
-
-/**
- * Extract distinctive marker phrases from the office identity that would
- * indicate system prompt leakage if they appeared in an outbound email.
- * These are identity-specific strings that wouldn't occur in normal business writing.
- *
- * @TODO: The current markers only cover name and title. The full system prompt contains
- * many more distinctive instruction phrases, but extracting arbitrary sentences risks
- * false positives. This gap is intentionally left for the Stage 2 LLM-as-judge to cover.
- */
-function extractIdentityMarkers(
-  identity: import('./identity/types.js').OfficeIdentity,
-): string[] {
-  const markers: string[] = [];
-
-  // Full instruction phrases — distinctive enough to not appear in business email.
-  // We use the full instruction form ("You are X") rather than just the name
-  // to avoid false positives on email signatures.
-  if (identity.assistant.name) {
-    markers.push(`You are ${identity.assistant.name}`);
-  }
-  if (identity.assistant.name && identity.assistant.title) {
-    markers.push(`${identity.assistant.name}, ${identity.assistant.title}`);
-  }
-
-  return markers;
-}
-
 // Pre-logger fallback — if main() throws during config loading (before the
 // proper logger is constructed), pino may not be initialized. We create a
 // minimal error-level logger here so fatal startup errors are still structured

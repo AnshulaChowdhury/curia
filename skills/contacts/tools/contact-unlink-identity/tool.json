@@ -1,0 +1,17 @@
+{
+  "name": "contact-unlink-identity",
+  "description": "Remove a channel identity from a contact. Use when the principal says an email/phone is wrong or no longer valid for a contact. It cannot change the principal's own addresses.",
+  "version": "1.0.2",
+  "sensitivity": "normal",
+  "action_risk": "low",
+  "inputs": {
+    "contact_id": "string",
+    "identity_id": "string"
+  },
+  "outputs": {
+    "removed": "boolean"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 10000
+}

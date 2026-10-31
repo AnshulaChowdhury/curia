@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
-import { ExecutiveProfileUpdateHandler } from '../../../skills/executive-profile-update/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { ExecutiveProfileUpdateHandler } from '../../../skills/executive-profile/tools/executive-profile-update/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import type { ExecutiveProfile } from '../../../src/executive/types.js';
 import pino from 'pino';
 
@@ -16,6 +16,7 @@ const baseProfile: ExecutiveProfile = {
       avoid: ['leverage', 'synergy'],
     },
     signOff: '-- Joseph',
+    guide: '',
   },
 };
 
@@ -26,8 +27,10 @@ function makeCtx(
     update: (config: ExecutiveProfile, changedBy: string, note?: string) => Promise<void>;
   },
   caller?: { contactId?: string; role?: string },
-): SkillContext {
+): ToolContext {
   return {
+    toolName: 'executive-profile-update',
+    toolVersion: '1.1.0',
     input,
     secret: () => { throw new Error('no secrets'); },
     log: logger,
@@ -69,7 +72,7 @@ describe('ExecutiveProfileUpdateHandler', () => {
     expect(service.update).toHaveBeenCalledOnce();
 
     // Check that only formality changed — tone, patterns, vocab, signOff preserved
-    const updatedConfig = service.update.mock.calls[0][0] as ExecutiveProfile;
+    const updatedConfig = (service.update.mock.calls as unknown[][])[0]![0] as unknown as ExecutiveProfile;
     expect(updatedConfig.writingVoice.formality).toBe(25);
     expect(updatedConfig.writingVoice.tone).toEqual(['direct', 'warm']);
     expect(updatedConfig.writingVoice.patterns).toEqual(['Short sentences', 'Uses em dashes freely']);
@@ -88,7 +91,7 @@ describe('ExecutiveProfileUpdateHandler', () => {
       service,
     ));
 
-    const updatedConfig = service.update.mock.calls[0][0] as ExecutiveProfile;
+    const updatedConfig = (service.update.mock.calls as unknown[][])[0]![0] as unknown as ExecutiveProfile;
     expect(updatedConfig.writingVoice.tone).toEqual(['confident', 'casual']);
     // Other fields unchanged
     expect(updatedConfig.writingVoice.formality).toBe(50);
@@ -105,7 +108,7 @@ describe('ExecutiveProfileUpdateHandler', () => {
       service,
     ));
 
-    const updatedConfig = service.update.mock.calls[0][0] as ExecutiveProfile;
+    const updatedConfig = (service.update.mock.calls as unknown[][])[0]![0] as unknown as ExecutiveProfile;
     // avoid updated, prefer unchanged
     expect(updatedConfig.writingVoice.vocabulary.avoid).toEqual(['utilize', 'circle back']);
     expect(updatedConfig.writingVoice.vocabulary.prefer).toEqual(['straightforward', 'folks']);
@@ -122,7 +125,7 @@ describe('ExecutiveProfileUpdateHandler', () => {
       service,
     ));
 
-    const updatedConfig = service.update.mock.calls[0][0] as ExecutiveProfile;
+    const updatedConfig = (service.update.mock.calls as unknown[][])[0]![0] as unknown as ExecutiveProfile;
     expect(updatedConfig.writingVoice.signOff).toBe('Best, Joseph');
   });
 
@@ -137,7 +140,7 @@ describe('ExecutiveProfileUpdateHandler', () => {
       service,
     ));
 
-    const updatedConfig = service.update.mock.calls[0][0] as ExecutiveProfile;
+    const updatedConfig = (service.update.mock.calls as unknown[][])[0]![0] as unknown as ExecutiveProfile;
     expect(updatedConfig.writingVoice.signOff).toBe('Cheers,\n\nJoseph');
   });
 
@@ -152,7 +155,7 @@ describe('ExecutiveProfileUpdateHandler', () => {
       service,
     ));
 
-    const updatedConfig = service.update.mock.calls[0][0] as ExecutiveProfile;
+    const updatedConfig = (service.update.mock.calls as unknown[][])[0]![0] as unknown as ExecutiveProfile;
     expect(updatedConfig.writingVoice.signOff).toBe('from snake_case');
   });
 
@@ -174,7 +177,7 @@ describe('ExecutiveProfileUpdateHandler', () => {
     }
   });
 
-  it('uses fixed "skill" label for changedBy, puts actor in note', async () => {
+  it('uses fixed "tool" label for changedBy, puts actor in note', async () => {
     const service = {
       get: () => baseProfile,
       update: vi.fn(async () => {}),
@@ -187,9 +190,9 @@ describe('ExecutiveProfileUpdateHandler', () => {
     ));
 
     // changedBy is a fixed source label, not the caller identity
-    expect(service.update.mock.calls[0][1]).toBe('skill');
+    expect((service.update.mock.calls as unknown[][])[0]![1]).toBe('tool');
     // Actor identity goes in the note
-    const note = service.update.mock.calls[0][2] as string;
+    const note = (service.update.mock.calls as unknown[][])[0]![2] as string;
     expect(note).toContain('ceo-contact-uuid');
   });
 
@@ -204,8 +207,32 @@ describe('ExecutiveProfileUpdateHandler', () => {
       service,
     ));
 
-    const updatedConfig = service.update.mock.calls[0][0] as ExecutiveProfile;
+    const updatedConfig = (service.update.mock.calls as unknown[][])[0]![0] as unknown as ExecutiveProfile;
     expect(updatedConfig.writingVoice.formality).toBe(35);
+  });
+
+  it('carries forward a previously-learned guide when an unrelated field is updated', async () => {
+    // guide is populated by the weekly voice-learn pass, not by this skill's
+    // input schema — a human-facing formality edit must not clobber it.
+    const profileWithGuide: ExecutiveProfile = {
+      writingVoice: {
+        ...baseProfile.writingVoice,
+        guide: 'Learned guide: prefers short paragraphs and concrete examples.',
+      },
+    };
+    const service = {
+      get: () => profileWithGuide,
+      update: vi.fn(async () => {}),
+    };
+
+    await handler.execute(makeCtx(
+      { writing_voice: { formality: 65 } },
+      service,
+    ));
+
+    const updatedConfig = (service.update.mock.calls as unknown[][])[0]![0] as unknown as ExecutiveProfile;
+    expect(updatedConfig.writingVoice.formality).toBe(65);
+    expect(updatedConfig.writingVoice.guide).toBe('Learned guide: prefers short paragraphs and concrete examples.');
   });
 
   it('returns changes as "no changes" when input matches current profile', async () => {

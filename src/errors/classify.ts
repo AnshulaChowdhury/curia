@@ -4,7 +4,8 @@
 // structured AgentError values. The runtime uses these for retry decisions,
 // budget tracking, and structured error injection into LLM history.
 //
-// Classification uses status codes and error codes — never string matching.
+// Classification uses status codes, system error codes, and stable Error.name
+// discriminants for AbortSignal DOMExceptions — never message-string matching.
 // This prevents the fragile pattern matching Zora suffered from.
 
 import type { AgentError, ErrorType } from './types.js';
@@ -55,6 +56,14 @@ const CODE_MAP: Record<string, ErrorType> = {
   EPERM: 'AUTH_FAILURE',
 };
 
+// AbortSignal DOMException.name → ErrorType. These errors expose a numeric
+// `.code` (e.g. 23) that CODE_MAP cannot see — name is the stable discriminant.
+// TimeoutError: AbortSignal.timeout(). AbortError: caller abort / AbortSignal.any.
+const ABORT_NAME_MAP: Record<string, ErrorType> = {
+  TimeoutError: 'TIMEOUT',
+  AbortError: 'TIMEOUT',
+};
+
 // Max length for sanitized error messages injected into LLM context.
 // sanitizeOutput() appends '[truncated — output exceeded limit]' (35 chars) when it truncates,
 // so the actual output can be up to maxLength + 35 chars. We use 400
@@ -92,7 +101,13 @@ function sanitizeMessage(message: string): string {
  * Classification priority:
  * 1. HTTP status code (most reliable — from API responses)
  * 2. Node.js error code (system-level failures)
- * 3. Fallback to UNKNOWN
+ * 3. AbortSignal DOMException name (TimeoutError / AbortError)
+ * 4. Fallback to UNKNOWN
+ *
+ * Note: Postgres outages are classified at DB call sites via
+ * `createDbUnavailableAgentError` / `isDbUnavailableError` (#1381). Generic
+ * ECONNREFUSED here remains PROVIDER_ERROR so LLM/network failures are not
+ * mislabeled as DATABASE_UNAVAILABLE.
  */
 export function classifyError(err: unknown, source: string): AgentError {
   const rawMessage = extractMessage(err);
@@ -117,6 +132,25 @@ export function classifyError(err: unknown, source: string): AgentError {
     }
   }
 
+  // 3. AbortSignal timeout / abort DOMExceptions. `.code` is numeric here, so
+  // step 2 cannot see them — use the stable Error.name discriminant (#1597).
+  // Object.hasOwn: a bare map lookup walks Object.prototype, so a weird
+  // err.name like `toString` must not resolve to an inherited function.
+  if (
+    type === 'UNKNOWN'
+    && err instanceof Error
+    && Object.hasOwn(ABORT_NAME_MAP, err.name)
+  ) {
+    type = ABORT_NAME_MAP[err.name]!;
+    context.abortName = err.name;
+  }
+
+  // 4. Prefer an AgentError already attached by a DB call site (#1381).
+  const attached = (err as { agentError?: AgentError })?.agentError;
+  if (attached && attached.type === 'DATABASE_UNAVAILABLE') {
+    return attached;
+  }
+
   return {
     type,
     source,
@@ -131,13 +165,13 @@ export function classifyError(err: unknown, source: string): AgentError {
  * Classify a skill failure into an AgentError.
  * Skills return { success: false, error: string } — always SKILL_ERROR.
  */
-export function classifySkillError(skillName: string, error: string): AgentError {
+export function classifySkillError(toolName: string, error: string): AgentError {
   return {
     type: 'SKILL_ERROR',
-    source: `skill:${skillName}`,
+    source: `skill:${toolName}`,
     message: sanitizeMessage(error),
     retryable: isRetryable('SKILL_ERROR'),
-    context: { skillName },
+    context: { toolName },
     timestamp: new Date(),
   };
 }
@@ -155,8 +189,31 @@ function escapeXml(text: string): string {
 }
 
 /**
+ * Reporting constraint carried by every <task_error> (#1546).
+ *
+ * The prod incident behind #1546 was not a missing-information failure: the
+ * `<task_error>` block was already in context, with `is_error: true`, when the
+ * coordinator told the principal "Got it — I've noted the dismissal." The model had
+ * the evidence and did not weight it. So this states the reporting rule at the
+ * point of maximum salience — the last line the model reads before resuming
+ * generation — rather than relying on a rule several hundred lines up in the
+ * system prompt.
+ *
+ * Deliberately scoped in two directions: a later successful attempt at the same
+ * action IS reportable as success, and other actions in the same turn are
+ * unaffected. Without those carve-outs the constraint would suppress honest
+ * reporting of the work that did land.
+ */
+const TASK_ERROR_REPORTING_CONSTRAINT =
+  'This call did not succeed. Do not state or imply to the user that this action '
+  + 'was completed unless a later attempt at it succeeds. Work that did succeed in '
+  + 'this turn may be reported normally.';
+
+/**
  * Format a structured <task_error> XML block for injection into LLM history.
  * Terminal leaf — no nested XML, no child tags inside <message>.
+ *
+ * <reporting_constraint> is last so it sits closest to the resumption point.
  */
 export function formatTaskError(
   toolName: string,
@@ -171,6 +228,7 @@ export function formatTaskError(
     `  <error_type>${escapeXml(errorType)}</error_type>`,
     `  <message>${escapeXml(message)}</message>`,
     `  <attempt>${attempt} of ${maxAttempts}</attempt>`,
+    `  <reporting_constraint>${TASK_ERROR_REPORTING_CONSTRAINT}</reporting_constraint>`,
     '</task_error>',
   ].join('\n');
 }

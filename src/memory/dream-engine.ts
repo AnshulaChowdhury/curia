@@ -1,10 +1,12 @@
 import type { Pool, PoolClient } from 'pg';
+import { purgeExpiredLlmCallArchive } from '../audit/llm-call-archive.js';
 import type { EventBus } from '../bus/bus.js';
 import { createMemoryDecayWarning } from '../bus/events.js';
 import type { MemoryDecayWarningPayload } from '../bus/events.js';
 import type { Logger } from '../logger.js';
 import type { AutonomyScoringPass } from '../autonomy/scoring-pass.js';
 import type { WorkingMemory } from './working-memory.js';
+import type { WorkingDocsRepo } from '../db/working-docs-repo.js';
 
 // Config shape mirrors YamlConfig.dreaming.decay — all fields required at construction
 // time (caller resolves defaults before passing in).
@@ -23,7 +25,7 @@ export interface DecayConfig {
   /** Minimum edge count for the high-connectivity criterion regardless of percentile.
    *  Prevents warnings on trivially-connected nodes in a sparse graph. Default: 5. */
   edgeCountFloor: number;
-  /** Days a warned node is held back from archiving while awaiting CEO re-confirmation.
+  /** Days a warned node is held back from archiving while awaiting principal re-confirmation.
    *  After this window, the node is archived by the next decay pass. Default: 7. */
   warnHoldBackDays: number;
 }
@@ -44,9 +46,9 @@ export interface DecayPassResult {
  * Named after the neuroscience analogy: sleep is when the brain consolidates
  * short-term experiences into long-term memory and prunes weak connections.
  *
- * Currently implements one pass: memory decay (issue #27).
- * Future passes (decay warning #280, contradiction resolution, synthesis) will
- * be added as sibling methods with their own config keys under `dreaming`.
+ * Currently implements memory decay (issue #27) with decay warnings (#280).
+ * Future passes (contradiction resolution, synthesis) will be added as sibling
+ * methods with their own config keys under `dreaming`.
  *
  * EventBus is injected and used by the decay warning pass (#280) to emit
  * `memory.decay_warning` before archiving important nodes.
@@ -65,14 +67,43 @@ export class DreamEngine {
   // limit backoff) could let two passes read the same unscored rows concurrently,
   // wasting LLM spend and applying the adjustment formula twice.
   private scoringPassInFlight = false;
+  private workingDocsRepo?: WorkingDocsRepo;
+  private scratchTtlDays?: number;
+  private llmCallArchiveRetentionDays?: number;
+  /** Called after a decay pass COMMITs at least one node or edge archive. */
+  private onArchived?: () => void;
 
-  constructor(pool: Pool, bus: EventBus, logger: Logger, config: DecayConfig, scoringPass?: AutonomyScoringPass, workingMemory?: WorkingMemory) {
+  constructor(
+    pool: Pool,
+    bus: EventBus,
+    logger: Logger,
+    config: DecayConfig,
+    scoringPass?: AutonomyScoringPass,
+    workingMemory?: WorkingMemory,
+    workingDocsRepo?: WorkingDocsRepo,
+    scratchTtlDays?: number,
+    /** When set, purge llm_call_archive rows older than this many days each decay pass. */
+    llmCallArchiveRetentionDays?: number,
+  ) {
     this.pool = pool;
     this.bus = bus;
     this.logger = logger;
     this.config = config;
     this.scoringPass = scoringPass;
     this.workingMemory = workingMemory;
+    this.workingDocsRepo = workingDocsRepo;
+    this.scratchTtlDays = scratchTtlDays;
+    this.llmCallArchiveRetentionDays = llmCallArchiveRetentionDays;
+  }
+
+  /**
+   * Register a callback fired after a decay pass commits at least one archive.
+   * Used to drop the entity-context TTL cache so retired nodes/facts cannot
+   * keep assembling from a hit (#1707). Invoked after COMMIT so a rolled-back
+   * pass cannot evict live cache, and a failure here cannot roll back decay.
+   */
+  setOnArchived(handler: () => void): void {
+    this.onArchived = handler;
   }
 
   /**
@@ -115,6 +146,8 @@ export class DreamEngine {
         scoringIntervalMs: this.scoringPass?.intervalMs ?? null,
         archiveThreshold: this.config.archiveThreshold,
         hasScoringPass: !!this.scoringPass,
+        hasScratchDocPurge: !!(this.workingDocsRepo && this.scratchTtlDays != null),
+        scratchTtlDays: this.scratchTtlDays ?? null,
       },
       'DreamEngine started (decay pass scheduled)',
     );
@@ -157,6 +190,20 @@ export class DreamEngine {
 
       await client.query('COMMIT');
 
+      // Entity-context cache is a correctness boundary once archival retires
+      // knowledge (#1707). Flush after COMMIT so a rolled-back pass cannot
+      // evict live entries, and a callback failure cannot roll back decay.
+      if (result.nodesArchived + result.nodesExpired + result.edgesArchived > 0) {
+        try {
+          this.onArchived?.();
+        } catch (err) {
+          this.logger.error(
+            { err },
+            'DreamEngine: entity-context cache invalidation after archive failed',
+          );
+        }
+      }
+
       // Emit bus events AFTER commit — DB state is now authoritative.
       // Bus/audit failures here don't affect the committed warn state.
       // We catch per-node to ensure one bad publish doesn't prevent the rest.
@@ -196,6 +243,46 @@ export class DreamEngine {
         }
       }
 
+      if (this.workingDocsRepo && this.scratchTtlDays != null) {
+        try {
+          const purgedScratchDocs = await this.workingDocsRepo.purgeExpiredScratch(this.scratchTtlDays);
+          this.logger.info(
+            { purgedScratchDocs, scratchTtlDays: this.scratchTtlDays },
+            'DreamEngine: scratch document purge complete',
+          );
+        } catch (purgeErr) {
+          this.logger.error(
+            { err: purgeErr, scratchTtlDays: this.scratchTtlDays },
+            'DreamEngine: scratch document purge failed — will retry on next pass. ' +
+            'To check backlog: SELECT COUNT(*) FROM working_documents WHERE path LIKE \'/scratch/%\' AND archived_at IS NULL',
+          );
+        }
+      }
+
+      // Bound the plaintext llm_call_archive store (spec 10). Best-effort: a purge
+      // failure must not roll back committed decay state.
+      if (this.llmCallArchiveRetentionDays != null) {
+        try {
+          const purgedArchiveRows = await purgeExpiredLlmCallArchive(
+            this.pool,
+            this.llmCallArchiveRetentionDays,
+            this.logger,
+          );
+          this.logger.info(
+            {
+              purgedArchiveRows,
+              llmCallArchiveRetentionDays: this.llmCallArchiveRetentionDays,
+            },
+            'DreamEngine: llm_call_archive purge complete',
+          );
+        } catch (purgeErr) {
+          this.logger.error(
+            { err: purgeErr, llmCallArchiveRetentionDays: this.llmCallArchiveRetentionDays },
+            'DreamEngine: llm_call_archive purge failed — will retry on next pass',
+          );
+        }
+      }
+
       const durationMs = Date.now() - start;
       const { nodesDecayed, edgesDecayed, nodesWarned, nodesExpired, nodesArchived, edgesArchived } = result;
       this.logger.info(
@@ -217,6 +304,27 @@ export class DreamEngine {
     archiveThreshold: number,
     halfLifeDays: DecayConfig['halfLifeDays'],
   ): Promise<Omit<DecayPassResult, 'durationMs'> & { warnedRows: Array<{ id: string; type: string; label: string; confidence: number; sensitivity: string; edge_count: string; warn_reason: string; warned_at: Date }> }> {
+    // ADR-040 — "Identity does not decay". Every node pass that decays or archives is
+    // restricted to identity_source = 'label'. A contact's node is the container for its memory, not a
+    // memory itself: nothing refreshes an entity node's last_confirmed_at through ordinary
+    // interaction (storeFact updates the FACT node), so decay here is monotonic and
+    // universal — a contact emailed daily ages at exactly the rate of one met once. Left
+    // in, every contact anchor would eventually archive out from under a live contact, and
+    // archived_at would stop meaning "this contact is gone".
+    //
+    // Facts hanging off an anchored node are label-tier and keep decaying as before, so
+    // this bounds nothing but the anchor. Edge passes (1c, 1d, 3) are untouched: edges
+    // have no identity tier, and Pass 3 still archives edges incident to an archived node.
+    //
+    // The filter is on every node pass that decays OR archives — 1a, 1b, the Pass 1.5 warn
+    // candidates, 2a and 2b. An earlier version of this change guarded only 1a/1b/2b, on the
+    // reasoning that warning requires confidence <= archiveThreshold and an undecayed
+    // anchored node never reaches it. That was wrong in the direction that matters: freezing
+    // decay does not RAISE confidence, and 478 of 532 contact nodes in production were
+    // already at or below the threshold when they were anchored. Pass 1.5 would re-warn the
+    // sensitive or well-connected ones on the next run and Pass 2a would archive them
+    // warnHoldBackDays later — the exclusion defeated by the one path left open.
+    //
     // Pass 1a: Decay slow_decay nodes
     // Uses COALESCE(last_decayed_at, last_confirmed_at) so each run only applies
     // decay for the interval since the last run rather than re-applying the full
@@ -229,6 +337,7 @@ export class DreamEngine {
              EXTRACT(EPOCH FROM (now() - COALESCE(last_decayed_at, last_confirmed_at))) / 86400.0 / $1),
              last_decayed_at = now()
        WHERE archived_at IS NULL
+         AND identity_source = 'label'
          AND decay_class = $2
          AND confidence > $3`,
       [halfLifeDays.slow_decay, 'slow_decay', archiveThreshold],
@@ -241,6 +350,7 @@ export class DreamEngine {
              EXTRACT(EPOCH FROM (now() - COALESCE(last_decayed_at, last_confirmed_at))) / 86400.0 / $1),
              last_decayed_at = now()
        WHERE archived_at IS NULL
+         AND identity_source = 'label'
          AND decay_class = $2
          AND confidence > $3`,
       [halfLifeDays.fast_decay, 'fast_decay', archiveThreshold],
@@ -330,6 +440,7 @@ export class DreamEngine {
                   ON (e.source_node_id = n.id OR e.target_node_id = n.id)
                  AND e.archived_at IS NULL
           WHERE n.archived_at IS NULL
+            AND n.identity_source = 'label'
             AND n.warned_at IS NULL
             AND n.decay_class != 'permanent'
             AND n.confidence <= $1
@@ -359,13 +470,17 @@ export class DreamEngine {
     // so a publish failure cannot roll back committed DB state or cause audit/DB divergence.
 
     // Pass 2a: Archive expired warnings — nodes whose hold-back window has closed
-    // without a CEO response. These were warned but never confirmed or dismissed.
+    // without a principal response. These were warned but never confirmed or dismissed.
+    // Also excludes contact-anchored nodes: a warning raised before the node was adopted
+    // (anchorNode clears warned_at, but a row could still slip through a concurrent pass)
+    // must not become the one archival path that survives ADR-040.
     const archiveExpiredResult = await client.query(
       `UPDATE kg_nodes
           SET archived_at = now(),
               warned_at = NULL,
               warn_reason = NULL
         WHERE archived_at IS NULL
+          AND identity_source = 'label'
           AND warned_at IS NOT NULL
           AND warned_at <= now() - ($1 * INTERVAL '1 day')`,
       [this.config.warnHoldBackDays],
@@ -373,12 +488,14 @@ export class DreamEngine {
     const nodesExpired = archiveExpiredResult.rowCount ?? 0;
 
     // Pass 2b: Archive regular nodes at or below threshold. Excludes:
+    // - contact-anchored nodes (identity_source, ADR-040 — see the note above Pass 1a)
     // - permanent nodes (never archived by design)
     // - nodes with an active warning still within hold-back window (warned_at IS NOT NULL)
     const archiveNodeResult = await client.query(
       `UPDATE kg_nodes
           SET archived_at = now()
         WHERE archived_at IS NULL
+          AND identity_source = 'label'
           AND decay_class != 'permanent'
           AND confidence <= $1
           AND warned_at IS NULL`,

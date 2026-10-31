@@ -47,7 +47,7 @@ export interface CreateEntityOptions {
 export interface StoreFactResult {
   stored: boolean;
   /** The pipeline outcome — lets callers distinguish create/update from conflict / entity_not_found / rate_limited
-   *  and take action accordingly (e.g. surfacing a conflict to the CEO). */
+   *  and take action accordingly (e.g. surfacing a conflict to the principal). */
   action: 'created' | 'updated' | 'conflict' | 'auto_rejected' | 'auto_resolved' | 'entity_not_found' | 'rate_limited';
   /** The ID of the persisted (or existing) fact node, if stored is true. */
   nodeId?: string;
@@ -58,8 +58,15 @@ export interface StoreFactResult {
    *  The emitted audit event sensitivity may differ from what is stored on the node.
    *  The caller should log a warning when this is true. */
   sensitivityFallback?: boolean;
-  /** Human-readable reason for a conflict or rate-limit rejection. */
+  /** Human-readable contradiction message. Set only for the contradiction outcomes
+   *  (`conflict` and `auto_rejected`) — never for operational rejections, so that a caller
+   *  can treat a truthy `conflict` as "there is a contradiction to surface to the principal".
+   *  See #472: this field used to double as the reason carrier for entity_not_found and
+   *  rate_limited, which made that check fire on outcomes that are not contradictions. */
   conflict?: string;
+  /** Human-readable operational reason for a non-contradiction rejection — set for
+   *  `entity_not_found` and `rate_limited`. Kept separate from `conflict` (see #472). */
+  reason?: string;
   /** The ID of the existing fact node involved in a contradiction.
    *  Populated when action === 'conflict' or action === 'auto_rejected' — lets
    *  the caller surface details or record the superseded node. */
@@ -98,16 +105,6 @@ const FACT_TYPE: NodeType = 'fact';
  *  real entities rarely have more than 3-4 name variants. */
 export const MAX_ALIASES_PER_ENTITY = 10;
 
-/** Cosine similarity threshold for auto-resolving a fuzzy entity match.
- *  At or above this, the match is confident enough to return 'found' without
- *  asking the CEO. Lower than the 0.92 fact dedup threshold because entity
- *  labels are shorter phrases with less semantic signal. */
-export const FUZZY_RESOLVE_THRESHOLD = 0.90;
-
-/** Cosine similarity floor for surfacing ambiguous fuzzy candidates.
- *  Below this, names are too different to be plausible variants. */
-export const FUZZY_AMBIGUITY_FLOOR = 0.75;
-
 /** Max candidates to retrieve from semantic search during fuzzy resolution.
  *  Kept small — we only need the top few potential matches. */
 const FUZZY_SEARCH_LIMIT = 5;
@@ -127,13 +124,15 @@ const FUZZY_SEARCH_LIMIT = 5;
  * when the caller does not specify one. Without a classifier, nodes default to 'internal'.
  */
 export class EntityMemory {
+  /** Settles when the last queued exact-key write in this process finishes; see storeFact(). */
+  private exactKeyWriteTail: Promise<void> = Promise.resolve();
+
   constructor(
     private store: KnowledgeGraphStore,
     private validator: MemoryValidator,
-    // embeddingService is accepted to keep the constructor signature stable for callers
-    // that wire the dependency graph. All embedding work is currently delegated to the
-    // store (createNode embeds labels; semanticSearch embeds query strings internally).
-    _embeddingService: EmbeddingService,
+    // Read for its profile's fuzzy-resolution thresholds only. All embedding work is
+    // delegated to the store (createNode embeds labels; semanticSearch embeds queries).
+    private embeddingService: EmbeddingService,
     private logger: Logger,
     private sensitivityClassifier?: SensitivityClassifier,
   ) {}
@@ -165,6 +164,56 @@ export class EntityMemory {
       sensitivity,
     });
     return { entity: node, created };
+  }
+
+  /**
+   * Mint a contact-anchored entity node (ADR-040).
+   *
+   * Unlike createEntity(), this never deduplicates by label: anchored nodes sit outside
+   * idx_kg_nodes_unique precisely so two contacts sharing a display name can each hold
+   * their own. Callers that want label dedup want createEntity().
+   *
+   * Only ContactService and the principal/agent bootstrap paths should call this — the
+   * node it creates is meaningless until a contact points at it.
+   */
+  async createAnchoredEntity(options: CreateEntityOptions): Promise<KgNode> {
+    const sensitivity: Sensitivity = options.sensitivity
+      ?? this.sensitivityClassifier?.classify(options.label, options.properties, options.sensitivityCategory)
+      ?? 'internal';
+
+    return this.store.createNode({
+      type: options.type,
+      label: options.label,
+      properties: options.properties,
+      source: options.source,
+      confidence: options.confidence ?? 0.7,
+      sensitivity,
+      identitySource: 'contact',
+    });
+  }
+
+  /**
+   * Adopt an existing label-tier node as a contact's identity (ADR-040).
+   *
+   * This is what preserves the good part of the old behaviour: Curia learns about
+   * "Dana Wu" from an email body, Dana later emails in, and her new contact inherits the
+   * facts already accumulated about her rather than starting empty.
+   *
+   * Returns false when the node is gone, archived, or already anchored to another
+   * contact — the caller must then mint a fresh node rather than share an identity.
+   */
+  async adoptEntity(nodeId: string): Promise<boolean> {
+    return this.store.anchorNode(nodeId);
+  }
+
+  /**
+   * Archive an entity node and cascade to its incident edges.
+   *
+   * Used when a contact is deleted: an anchored node's whole meaning is "this contact",
+   * so it retires with the contact rather than lingering as an orphan (ADR-040).
+   */
+  async archiveEntity(nodeId: string): Promise<void> {
+    return this.store.archiveNode(nodeId);
   }
 
   /** Retrieve an entity node by ID. Returns undefined if not found. */
@@ -280,11 +329,13 @@ export class EntityMemory {
    *
    * Resolution logic (in order):
    *   1 exact match  → return { kind: 'found', node }
-   *   2+ exact matches, one has the expected type → return { kind: 'found', node: typeMatch }
-   *   2+ exact matches, no type match → return { kind: 'ambiguous', candidates }
-   *   0 exact matches, fuzzy score ≥ 0.90 → auto-resolve, learn alias, return { kind: 'found', node }
-   *   0 exact matches, fuzzy score 0.75–0.90 → return { kind: 'ambiguous', candidates }
-   *   0 exact matches, fuzzy score < 0.75 → create via createEntity(), return { kind: 'created', node }
+   *   2+ exact matches, exactly one has the expected type → { kind: 'found', node: typeMatch }
+   *   2+ exact matches, several share the expected type → { kind: 'ambiguous', candidates }
+   *   2+ exact matches, none has the expected type → { kind: 'ambiguous', candidates }
+   *   0 exact matches, fuzzy score ≥ fuzzyResolve → auto-resolve, learn alias, return { kind: 'found', node }
+   *   0 exact matches, fuzzy score in [fuzzyAmbiguityFloor, fuzzyResolve) → return { kind: 'ambiguous', candidates }
+   *   0 exact matches, fuzzy score < fuzzyAmbiguityFloor → create via createEntity(), return { kind: 'created', node }
+   *   (both thresholds come from the embedding profile; 0.90 and 0.75 for OpenAI's model)
    *
    * Three phases: (1) exact label match via findNodesByLabel, (2) embedding-based fuzzy
    * resolution when exact match finds nothing, (3) create if no plausible candidate exists.
@@ -292,7 +343,8 @@ export class EntityMemory {
    * This is the shared primitive used by both memory-store (agent-directed writes)
    * and extract-facts (background batch extraction). Callers handle 'ambiguous'
    * differently: memory-store surfaces candidates to the agent for disambiguation;
-   * extract-facts takes candidates[0] to avoid stalling a batch job.
+   * extract-facts tries its optional subject_contact_id tiebreaker and otherwise skips
+   * the fact, counting it. Neither guesses — see #1694.
    */
   async resolveOrCreate(options: ResolveOrCreateOptions): Promise<ResolveOrCreateResult> {
     // Phase 1: exact match on canonical label + aliases
@@ -309,7 +361,9 @@ export class EntityMemory {
       // See: https://github.com/josephfung/curia/issues/474
       if (node.type !== options.type) {
         this.logger.warn(
-          { label: options.label, expectedType: options.type, actualType: node.type, nodeId: node.id },
+          // nodeId, not label: the caller-supplied name is PII and the
+          // pino redact list does not cover it.
+          { expectedType: options.type, actualType: node.type, nodeId: node.id },
           'resolveOrCreate: single match type differs from caller hint',
         );
       }
@@ -317,19 +371,43 @@ export class EntityMemory {
     }
 
     if (matches.length > 1) {
-      // 2+ matches — prefer a node whose type matches the caller's expected type.
-      const typeMatch = matches.find(n => n.type === options.type);
-      if (typeMatch) {
-        return { kind: 'found', node: typeMatch };
+      // 2+ matches — type is the discriminator, but only when it actually discriminates.
+      //
+      // Exactly one candidate of the requested type is unambiguous: a person "River" and
+      // an organization "River" are different entities, and a caller asking for a person
+      // means the person. Treating that as ambiguous would make every cross-type label
+      // collision unresolvable.
+      //
+      // Two or more candidates of the requested type is a different situation entirely.
+      // Nothing in the label, the type, or the ordering distinguishes them, so returning
+      // the first is not a resolution — it is a coin flip that silently attaches the
+      // caller's fact to whichever node the backend happened to return first. Under
+      // ADR-040, where two contacts named "Seth Berman" each hold their own person node,
+      // that coin flip is the misattribution the whole change exists to prevent. It is
+      // also already reachable today through shared aliases, which carry no cross-node
+      // uniqueness. Declining and letting the caller disambiguate loses a fact; guessing
+      // corrupts one. (#1694)
+      const typeMatches = matches.filter(n => n.type === options.type);
+      if (typeMatches.length === 1) {
+        return { kind: 'found', node: typeMatches[0]! };
       }
-      // No type match — caller must ask the user to pick one.
-      return { kind: 'ambiguous', candidates: matches };
+      // Either nothing matched the requested type, or several did. Both need the caller
+      // to pick. When several share the type, surface only those — the cross-type
+      // candidates are noise for a caller that already told us which type it wants.
+      return {
+        kind: 'ambiguous',
+        candidates: typeMatches.length > 1 ? typeMatches : matches,
+      };
     }
 
     // Phase 2: no exact match — try embedding-based fuzzy resolution.
     // semanticSearch() embeds the query and returns results sorted by score desc.
-    // Does not filter by type — consistent with single-match behavior above (which
+    // Does not filter by entity type — consistent with single-match behavior above (which
     // also returns 'found' across types). Type is only used as a tiebreaker.
+    //
+    // Facts are excluded in the query, not afterwards: facts often name their entity and
+    // can outscore it, so dropping them from the top FUZZY_SEARCH_LIMIT left no candidate
+    // and phase 3 created a duplicate (#2248).
     //
     // The entire phase is wrapped so that embedding API failures or transient DB
     // errors fall through gracefully to Phase 3 (entity creation). This preserves
@@ -338,15 +416,15 @@ export class EntityMemory {
     try {
       const fuzzyResults = await this.store.semanticSearch(options.label, {
         limit: FUZZY_SEARCH_LIMIT,
+        entitiesOnly: true,
+        purpose: 'similarity',
       });
-
-      // Filter out fact nodes — we only want entity nodes for disambiguation
-      const entityCandidates = fuzzyResults.filter(r => r.node.type !== FACT_TYPE);
+      const { fuzzyResolve, fuzzyAmbiguityFloor } = this.embeddingService.profile.thresholds;
 
       // Partition candidates by threshold
-      const autoResolve = entityCandidates.filter(r => r.score >= FUZZY_RESOLVE_THRESHOLD);
-      const ambiguous = entityCandidates.filter(
-        r => r.score >= FUZZY_AMBIGUITY_FLOOR && r.score < FUZZY_RESOLVE_THRESHOLD,
+      const autoResolve = fuzzyResults.filter(r => r.score >= fuzzyResolve);
+      const ambiguous = fuzzyResults.filter(
+        r => r.score >= fuzzyAmbiguityFloor && r.score < fuzzyResolve,
       );
 
       if (autoResolve.length > 0) {
@@ -356,7 +434,7 @@ export class EntityMemory {
 
         if (best.node.type !== options.type) {
           this.logger.warn(
-            { label: options.label, expectedType: options.type, actualType: best.node.type, nodeId: best.node.id },
+            { expectedType: options.type, actualType: best.node.type, nodeId: best.node.id },
             'resolveOrCreate: fuzzy auto-resolve type differs from caller hint',
           );
         }
@@ -384,7 +462,10 @@ export class EntityMemory {
       }
     } catch (err) {
       this.logger.warn(
-        { label: options.label, error: err instanceof Error ? err.message : String(err) },
+        // No node id yet — log the type hint, not the raw label.
+        // errorName, not err.message: embedding/DB errors can echo the query
+        // (the caller-supplied name) and pino does not redact it.
+        { expectedType: options.type, errorName: err instanceof Error ? err.name : typeof err },
         'resolveOrCreate: fuzzy semantic search failed — falling back to entity creation',
       );
       // Fall through to Phase 3 intentionally: fact storage must not block on
@@ -426,7 +507,8 @@ export class EntityMemory {
       // the backend, so this read is for logging only — not for correctness.
       const node = await this.store.getNode(nodeId);
       if (!node) {
-        this.logger.warn({ nodeId, alias }, 'addAlias: entity node not found');
+        // nodeId, not alias: the variant is PII and the pino redact list does not cover it.
+        this.logger.warn({ nodeId }, 'addAlias: entity node not found');
         return;
       }
 
@@ -438,7 +520,7 @@ export class EntityMemory {
       // Log before delegating so the warning appears even if the backend silently rejects.
       if (node.aliases.length >= MAX_ALIASES_PER_ENTITY) {
         this.logger.warn(
-          { nodeId, alias, count: node.aliases.length, max: MAX_ALIASES_PER_ENTITY },
+          { nodeId, count: node.aliases.length, max: MAX_ALIASES_PER_ENTITY },
           'addAlias: alias cap reached — skipping',
         );
         return;
@@ -449,13 +531,13 @@ export class EntityMemory {
         // Backend rejected — likely a dedup or cap race between our pre-flight read and this write.
         // The backend's atomic predicate handled it correctly; this is just for observability.
         this.logger.debug(
-          { nodeId, alias: lowerAlias },
+          { nodeId },
           'addAlias: backend rejected (dedup or cap race)',
         );
       }
     } catch (err) {
       this.logger.warn(
-        { nodeId, alias, error: err instanceof Error ? err.message : String(err) },
+        { nodeId, errorName: err instanceof Error ? err.name : typeof err },
         'addAlias: unexpected error — skipping',
       );
       // Best-effort: do not rethrow
@@ -469,7 +551,8 @@ export class EntityMemory {
    * Returns:
    * - { stored: true, nodeId, sensitivity } on create (new fact node + edge persisted)
    * - { stored: true, nodeId, sensitivity } on update (duplicate merged into existing node)
-   * - { stored: false, conflict } on rate-limit rejection or contradiction
+   * - { stored: false, conflict } on contradiction (conflict / auto_rejected)
+   * - { stored: false, reason } on operational rejection (rate_limited / entity_not_found)
    *
    * The sensitivity field in the result is what was actually assigned to the node —
    * the execution layer uses this to populate memory.store audit events.
@@ -478,8 +561,45 @@ export class EntityMemory {
    * deduplication but NOT contradiction detection. Contradiction detection
    * requires callers to invoke validator.validateContradiction() directly when
    * they have attribute metadata and a confidence value to compare against.
+   *
+   * Exact-key writes (#2252) are serialized per (entity, key): the validator's
+   * find-or-create is check-then-act, so two overlapping writes of a missing key
+   * would otherwise both create a fact. The write runs under a database advisory
+   * lock named for the entity and key, which also excludes a second Curia process
+   * — the instance lock (ADR-051) is advisory and does not stop one from starting.
    */
   async storeFact(options: StoreFactOptions): Promise<StoreFactResult> {
+    const exactKey = options.exactKey === true
+      ? (options.properties as Record<string, unknown> | undefined)?.key
+      : undefined;
+    if (typeof exactKey === 'string') {
+      return this.withExactKeyLock(`kg-exact-key:${options.entityNodeId}:${exactKey}`, () =>
+        this.storeFactUnserialized(options),
+      );
+    }
+    return this.storeFactUnserialized(options);
+  }
+
+  /**
+   * Runs `fn` under the database lock `lockKey`. Exact-key writes in this process
+   * also queue behind one another first, so it holds at most one lock connection
+   * at a time and cannot drain the pool while `fn` needs connections of its own.
+   * Config writes are low-volume, so queueing different keys costs little.
+   */
+  private async withExactKeyLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.exactKeyWriteTail;
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.exactKeyWriteTail = previous.then(() => current);
+    await previous;
+    try {
+      return await this.store.withAdvisoryLock(lockKey, fn);
+    } finally {
+      release();
+    }
+  }
+
+  private async storeFactUnserialized(options: StoreFactOptions): Promise<StoreFactResult> {
     // Use contradiction detection when the fact carries `attribute` metadata,
     // since an attribute-based fact can directly contradict an existing one
     // (same entity, same attribute, different value). For facts without attribute
@@ -518,8 +638,8 @@ export class EntityMemory {
           confidence: result.validated.provenance.confidence,
           decayClass: result.validated.provenance.decayClass,
           source: result.validated.provenance.source,
-          // Pass the pre-computed embedding from the validator's dedup check
-          // to avoid a redundant OpenAI API call.
+          // The validator's dedup vector when it is also the storable one; otherwise
+          // the store embeds the label as a document.
           embedding: result.validated.embedding,
           sensitivity,
         });
@@ -555,9 +675,12 @@ export class EntityMemory {
       }
 
       case 'update': {
-        // Near-duplicate detected — merge properties into the existing node.
+        // Near-duplicate (or exact-key match) — merge properties into the existing
+        // node. exactKey upserts also pass newLabel so label stays aligned with
+        // properties.key (#2252); semantic merges leave the label alone.
         await this.store.updateNode(result.existingNodeId, {
           properties: result.mergedProperties,
+          ...(result.newLabel !== undefined ? { label: result.newLabel } : {}),
         });
         this.validator.recordWrite(options.source);
 
@@ -597,10 +720,12 @@ export class EntityMemory {
         };
 
       case 'entity_not_found':
-        return { stored: false, action: 'entity_not_found', conflict: result.reason };
+        // Operational rejection, not a contradiction — reason rides on `reason` (#472).
+        return { stored: false, action: 'entity_not_found', reason: result.reason };
 
       case 'rate_limited':
-        return { stored: false, action: 'rate_limited', conflict: result.reason };
+        // Operational rejection, not a contradiction — reason rides on `reason` (#472).
+        return { stored: false, action: 'rate_limited', reason: result.reason };
 
       case 'auto_rejected':
         // Spec line 121: incoming confidence was lower — write dropped, no store update.
@@ -677,31 +802,10 @@ export class EntityMemory {
    * returned by query() as relationships instead.
    */
   async getFacts(entityNodeId: string): Promise<KgNode[]> {
-    const edges = await this.store.getEdgesForNode(entityNodeId);
-    const facts: KgNode[] = [];
-
-    for (const edge of edges) {
-      // Edges are bidirectional — find the node on the other side of each edge
-      const otherId = edge.sourceNodeId === entityNodeId
-        ? edge.targetNodeId
-        : edge.sourceNodeId;
-
-      const node = await this.store.getNode(otherId);
-      if (!node) {
-        // Dangling edge — referenced node no longer exists (referential integrity violation).
-        // @TODO: emit a bus event for the audit logger once bus access is available here.
-        this.logger.error(
-          { edgeId: edge.id, nodeId: otherId, entityNodeId },
-          'getFacts: dangling edge detected — referenced node does not exist',
-        );
-        continue;
-      }
-      if (node.type === FACT_TYPE) {
-        facts.push(node);
-      }
-    }
-
-    return facts;
+    // Single JOIN (Postgres) / one walk (in-memory) — avoids N getNode round
+    // trips on large config anchors (#2252). Dangling edges are simply absent
+    // from the join result rather than logged here.
+    return this.store.getConnectedFacts(entityNodeId);
   }
 
   /**
@@ -1036,17 +1140,17 @@ export class EntityMemory {
     return merged.slice(0, limit);
   }
 
-  /** List KG nodes flagged for CEO re-confirmation by the decay warning pass. */
+  /** List KG nodes flagged for principal re-confirmation by the decay warning pass. */
   async listDecayWarnings(): Promise<DecayWarningRow[]> {
     return this.store.listDecayWarnings();
   }
 
-  /** Confirm a warned node: reset its decay clock. Called when CEO verifies the fact is still current. */
+  /** Confirm a warned node: reset its decay clock. Called when principal verifies the fact is still current. */
   async confirmDecayWarning(nodeId: string): Promise<DecayWarningActionResult> {
     return this.store.confirmDecayWarning(nodeId);
   }
 
-  /** Dismiss a warned node: archive it immediately. Called when CEO says it's no longer relevant. */
+  /** Dismiss a warned node: archive it immediately. Called when principal says it's no longer relevant. */
   async dismissDecayWarning(nodeId: string): Promise<DecayWarningActionResult> {
     return this.store.dismissDecayWarning(nodeId);
   }

@@ -10,9 +10,9 @@
 // LLM calls go through the constrained InfraLlm service (classify + extract only),
 // which routes through ModelRouter and publishes llm.call bus events for telemetry.
 
-import type { SkillHandler, SkillContext, SkillResult } from '../../src/skills/types.js';
+import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
 import { DECAY_CLASSES, NODE_TYPES } from '../../src/memory/types.js';
-import type { DecayClass, NodeType } from '../../src/memory/types.js';
+import type { DecayClass, NodeType, KgNode } from '../../src/memory/types.js';
 import { buildCanonicalPatch } from '../../src/contacts/canonical-attribute-guard.js';
 import type { Contact } from '../../src/contacts/types.js';
 import { ContactValidationError } from '../../src/contacts/contact-service.js';
@@ -27,15 +27,29 @@ interface ExtractedFact {
   decayClass: DecayClass;
 }
 
+// LLM-extracted attribute keys are supposed to be snake_case (`home_city`).
+// The model can ignore that and put a name in the field; pino does not redact
+// `attribute`. Only log the key when it matches the trusted shape.
+const LOG_SAFE_ATTRIBUTE = /^[a-z][a-z0-9_]{0,62}$/;
+
+function logSafeAttribute(attribute: string): { attribute?: string } {
+  return LOG_SAFE_ATTRIBUTE.test(attribute) ? { attribute } : {};
+}
+
 // 'fact' is excluded from the prompt's subject-type list so the LLM never emits
 // subjectType:"fact" in its output — entity subjects must be non-fact nodes.
 // The ENTITY_NODE_TYPES Set below is the runtime safety net for the same constraint.
 const NODE_TYPES_LIST = NODE_TYPES.filter(t => t !== 'fact').join(', ');
 const DECAY_CLASSES_LIST = DECAY_CLASSES.join(', ');
 
-export class ExtractFactsHandler implements SkillHandler {
-  async execute(ctx: SkillContext): Promise<SkillResult> {
-    const { text, source } = ctx.input as { text?: string; source?: string };
+export class ExtractFactsHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
+    const { text, source, max_stored, subject_contact_id } = ctx.input as {
+      text?: string;
+      source?: string;
+      max_stored?: number;
+      subject_contact_id?: string;
+    };
 
     if (!text || typeof text !== 'string') {
       // Log only safe metadata — never log ctx.input directly (contains full transcript)
@@ -51,13 +65,22 @@ export class ExtractFactsHandler implements SkillHandler {
       return { success: false, error: 'Entity memory not available — database not configured' };
     }
 
-    // Guard: infraLlm is a required capability declared in skill.json.
+    // Guard: infraLlm is a required capability declared in tool.json.
     if (!ctx.infraLlm) {
       ctx.log.error('extract-facts: infraLlm capability missing — execution layer misconfigured');
       return { success: false, error: 'extract-facts requires infraLlm capability' };
     }
 
     try {
+      const maxStored = typeof max_stored === 'number' && Number.isFinite(max_stored) && max_stored >= 0
+        ? Math.floor(max_stored)
+        : undefined;
+
+      if (maxStored === 0) {
+        ctx.log.info({ stored: 0, redirected: 0, failed: 0 }, 'extract-facts: complete');
+        return { success: true, data: { stored: 0, redirected: 0, skipped: false, failed: 0, ambiguous: 0 } };
+      }
+
       // -- Step 1: Classifier gate --
       // Cheap fast-tier call — exits early on messages that carry no facts about a
       // single entity (e.g. action requests, scheduling, relationship-only text).
@@ -74,11 +97,12 @@ export class ExtractFactsHandler implements SkillHandler {
 
       if (!classifierAnswer.startsWith('yes')) {
         ctx.log.debug({ textPreview: text.slice(0, 80) }, 'extract-facts: classifier gate — no facts, skipping');
-        return { success: true, data: { stored: 0, redirected: 0, skipped: true, failed: 0 } };
+        return { success: true, data: { stored: 0, redirected: 0, skipped: true, failed: 0, ambiguous: 0 } };
       }
 
       // -- Step 2: Extraction prompt --
-      // Standard-tier call with the full vocabulary. Returns JSON array of facts.
+      // Fast-tier call with the full vocabulary. Returns JSON array of facts. 1000 tokens
+      // leaves no room for thinking, so it runs where boot guarantees thinking can be off (#2224).
       const extractionResult = await ctx.infraLlm.extract(
         `Extract single-entity attribute facts from the text below. Return a JSON array of fact objects.
 
@@ -94,7 +118,7 @@ Rules:
 - Only extract facts about a SINGLE entity (person, organization, etc.)
 - Do NOT extract relationships between two entities — those are handled elsewhere
 - attribute should be a short snake_case key (e.g. "home_city", "job_title", "dietary_preference")
-- value should be a concise string (e.g. "Toronto", "CEO", "vegetarian")
+- value should be a concise string (e.g. "Toronto", "Director", "vegetarian")
 - Set confidence between 0.0 and 1.0 based on how explicitly the fact is stated
 - Return ONLY valid JSON, no explanation or markdown fences
 
@@ -103,7 +127,7 @@ Format:
 
 Text:
 ${text}`,
-        { maxTokens: 1000 },
+        { maxTokens: 1000, tier: 'fast' },
       );
 
       if (!extractionResult.ok) {
@@ -139,6 +163,11 @@ ${text}`,
       // Contradictions (action:'conflict') are NOT counted as failed — they are expected
       // semantic outcomes logged at warn.
       let failed = 0;
+      // ambiguous counts facts dropped because the subject label matched several
+      // entity nodes of the same type and nothing could break the tie. Deliberately
+      // separate from `failed`: nothing malfunctioned, and the caller's remedy is to
+      // supply subject_contact_id (or disambiguate the entities), not to retry. (#1694)
+      let ambiguous = 0;
 
       // Entity node types (fact nodes themselves are excluded as subjects —
       // we look up or create entity nodes, then attach facts to them).
@@ -158,6 +187,9 @@ ${text}`,
         // below fires correctly when subject or attribute could not be determined.
         let subject = typeof fact?.subject === 'string' ? fact.subject.trim() : '';
         let attribute = typeof fact?.attribute === 'string' ? fact.attribute.trim() : '';
+        // Hoisted so catch can log entityNodeId when resolution completed.
+        // Undefined until then — never log the raw subject name (PII).
+        let entityNode: KgNode | undefined;
 
         try {
           // Guard: skip malformed entries where required string fields are absent or blank.
@@ -201,20 +233,54 @@ ${text}`,
             : 0.7;
 
           // Resolve entity node — finds or auto-creates via resolveOrCreate().
-          // Ambiguous case (2+ nodes, no type match) takes candidates[0] rather than
-          // stalling the background batch job with a disambiguation loop.
+          //
+          // On ambiguity this used to take candidates[0] "to avoid stalling a batch
+          // job". Under ADR-040 two contacts named "Seth Berman" each hold their own
+          // person node, so that is a coin flip that writes the fact onto whichever
+          // node sorted first. A dropped fact can be re-extracted; a fact silently
+          // attached to the wrong person cannot be found again to correct. (#1694)
           const resolved = await ctx.entityMemory.resolveOrCreate({
             label: subject,
             type: subjectType,
             source,
             confidence: 0.6,
           });
-          let entityNode;
+
           if (resolved.kind === 'ambiguous') {
-            entityNode = resolved.candidates[0]!;
-            ctx.log.warn(
-              { subject, candidateCount: resolved.candidates.length, chosenId: entityNode.id },
-              'extract-facts: ambiguous subject entity — taking first candidate',
+            // The only admissible tiebreaker is the caller's subject-contact hint, and
+            // only when one candidate IS that contact's node. The hint identifies the
+            // conversation's counterpart, which is not a claim that every fact in the
+            // transcript is about them — so a hint that matches nothing tells us
+            // nothing, and must not be used to pick.
+            const hinted = await this.resolveHintedNodeId(ctx, subject_contact_id);
+            const match = hinted
+              ? resolved.candidates.find(n => n.id === hinted)
+              : undefined;
+
+            if (!match) {
+              ambiguous++;
+              ctx.log.warn(
+                {
+                  // Deliberately not `subject`: it is an LLM-extracted entity name lifted
+                  // from a transcript, so it is usually a person's name, and the pino
+                  // redact list covers senderId/email/phoneNumber but not this. The node
+                  // ids identify the same entities without the PII, and are strictly more
+                  // useful for diagnosis — an operator can look each one up.
+                  candidateIds: resolved.candidates.map(n => n.id),
+                  candidateCount: resolved.candidates.length,
+                  hadContactHint: subject_contact_id !== undefined,
+                  hintResolvedToNode: hinted !== undefined,
+                },
+                'extract-facts: ambiguous subject entity — skipping fact rather than guessing',
+              );
+              continue;
+            }
+
+            entityNode = match;
+            ctx.log.debug(
+              // Same reasoning as the warn above — chosenId identifies the entity.
+              { chosenId: match.id, candidateCount: resolved.candidates.length },
+              'extract-facts: ambiguous subject resolved via subject_contact_id',
             );
           } else {
             entityNode = resolved.node;
@@ -230,7 +296,10 @@ ${text}`,
             if (patch !== null) {
               if (patch.fallbackToKg) {
                 ctx.log.warn(
-                  { subject, attribute, reason: patch.reason },
+                  // entityNodeId, not subject: the LLM-extracted name is PII and the
+                  // pino redact list does not cover it. attribute is logged only when
+                  // it matches snake_case — otherwise it may itself be a name.
+                  { entityNodeId: entityNode.id, ...logSafeAttribute(attribute), reason: patch.reason },
                   'extract-facts: canonical attribute normalization failed — falling back to KG write',
                 );
               } else {
@@ -248,7 +317,7 @@ ${text}`,
                     contactLookupCache.set(entityNode.id, contact ?? null);
                   } catch (lookupErr) {
                     ctx.log.warn(
-                      { subject, attribute, entityNodeId: entityNode.id, err: lookupErr },
+                      { entityNodeId: entityNode.id, ...logSafeAttribute(attribute), err: lookupErr },
                       'extract-facts: findContactByKgNodeId failed — falling back to KG write',
                     );
                     // Leave contact undefined — the guard below treats undefined the same as null.
@@ -256,27 +325,29 @@ ${text}`,
                 }
 
                 if (contact) {
+                  if (maxStored !== undefined && stored + redirected >= maxStored) break;
                   try {
                     await ctx.contactService.updateContactFields(contact.id, patch.fields);
                     ctx.log.info(
-                      { subject, attribute, contactId: contact.id },
+                      { entityNodeId: entityNode.id, ...logSafeAttribute(attribute), contactId: contact.id },
                       'extract-facts: canonical attribute redirected to ContactService',
                     );
                     redirected++;
+                    if (maxStored !== undefined && stored + redirected >= maxStored) break;
                     continue;
                   } catch (err) {
                     if (err instanceof ContactValidationError) {
                       // Validation failure (e.g. primaryEmail not in CCI) — this is expected
                       // for some inputs; fall through so the information is preserved in the KG.
                       ctx.log.warn(
-                        { subject, attribute, contactId: contact.id, reason: err.message },
+                        { entityNodeId: entityNode.id, ...logSafeAttribute(attribute), contactId: contact.id, reason: err.message },
                         'extract-facts: canonical attribute validation failed — falling back to KG write',
                       );
                     } else {
                       // Infrastructure or programming error — do not silently diverge the
                       // contacts table from the KG. Increment failed and skip the KG write.
                       ctx.log.error(
-                        { subject, attribute, contactId: contact.id, err },
+                        { entityNodeId: entityNode.id, ...logSafeAttribute(attribute), contactId: contact.id, err },
                         'extract-facts: canonical attribute redirect failed with unexpected error — skipping fact',
                       );
                       failed++;
@@ -304,6 +375,8 @@ ${text}`,
             );
           }
 
+          if (maxStored !== undefined && stored + redirected >= maxStored) break;
+
           const result = await ctx.entityMemory.storeFact({
             entityNodeId: entityNode.id,
             label,
@@ -317,24 +390,28 @@ ${text}`,
             if (result.action === 'auto_resolved') {
               // Incoming fact superseded a lower-confidence existing fact — audit trail preserved.
               ctx.log.info(
-                { subject, attribute, source: effectiveSource, nodeId: result.nodeId },
+                { entityNodeId: entityNode.id, ...logSafeAttribute(attribute), source: effectiveSource, nodeId: result.nodeId },
                 'extract-facts: fact auto-resolved — existing superseded by higher-confidence incoming',
               );
             }
             stored++;
+            if (maxStored !== undefined && stored + redirected >= maxStored) break;
           } else if (result.action === 'rate_limited') {
             // The 50-writes-per-task limit is exhausted — all remaining storeFact calls
             // in this batch will also fail, so break immediately rather than burning
             // through the rest of the loop and mis-reporting them as conflicts.
             ctx.log.error(
-              { subject, attribute, source: effectiveSource, reason: result.conflict },
+              { entityNodeId: entityNode.id, ...logSafeAttribute(attribute), source: effectiveSource, reason: result.reason },
               'extract-facts: write rate limit exceeded — aborting remaining facts in batch',
             );
             failed++;
             break;
           } else {
             // conflict, auto_rejected, or entity_not_found — expected semantic outcomes, not infra failures.
-            ctx.log.warn({ subject, attribute, conflict: result.conflict, action: result.action, source: effectiveSource }, 'extract-facts: fact not stored');
+            // The two carriers are disjoint (#472): contradictions populate `conflict`,
+            // operational rejections populate `reason`. Log both so the branch stays
+            // one log line regardless of which outcome landed here.
+            ctx.log.warn({ entityNodeId: entityNode.id, ...logSafeAttribute(attribute), conflict: result.conflict, reason: result.reason, action: result.action, source: effectiveSource }, 'extract-facts: fact not stored');
           }
         } catch (err) {
           // Re-throw programming errors — these indicate bugs in this handler (wrong
@@ -348,19 +425,34 @@ ${text}`,
             err instanceof EvalError ||
             err instanceof URIError
           ) {
-            ctx.log.error({ err, subject, attribute }, 'extract-facts: unexpected programming error in fact loop — re-throwing');
+            ctx.log.error(
+              {
+                err,
+                // Never the raw subject name. entityNodeId is set after resolveOrCreate
+                // succeeds; undefined here is the pre-resolve signal.
+                entityNodeId: entityNode?.id,
+                ...logSafeAttribute(attribute),
+              },
+              'extract-facts: unexpected programming error in fact loop — re-throwing',
+            );
             throw err;
           }
           // Infrastructure errors (DB outage, connection loss) — log at error so they
           // surface in Sentry, then continue processing the remaining facts in the batch.
-          // subject and attribute are always in scope here (declared before this try).
-          ctx.log.error({ err, subject, attribute }, 'extract-facts: failed to persist fact, skipping');
+          ctx.log.error(
+            {
+              err,
+              entityNodeId: entityNode?.id,
+              ...logSafeAttribute(attribute),
+            },
+            'extract-facts: failed to persist fact, skipping',
+          );
           failed++;
         }
       }
 
-      ctx.log.info({ stored, redirected, failed }, 'extract-facts: complete');
-      return { success: true, data: { stored, redirected, skipped: false, failed } };
+      ctx.log.info({ stored, redirected, failed, ambiguous }, 'extract-facts: complete');
+      return { success: true, data: { stored, redirected, skipped: false, failed, ambiguous } };
     } catch (err) {
       // Two categories of errors reach here:
       // 1. LLMProvider errors (rate limits, auth, timeouts, 5xx) — these are returned as
@@ -370,6 +462,47 @@ ${text}`,
       //    re-thrown from the per-fact loop — indicate bugs in this handler, not infra issues.
       ctx.log.error({ err }, 'extract-facts: unexpected error');
       return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Resolve `subject_contact_id` to the KG node that contact holds, or undefined.
+   *
+   * Undefined for every "we cannot tell" case, and they are deliberately not
+   * distinguished here: no hint supplied, no ContactService wired, the contact does
+   * not exist, the contact holds no node (#1694's population), or the lookup failed.
+   * All of them mean the same thing to the caller — there is no tiebreaker — and the
+   * caller's response is identical: skip the fact rather than guess.
+   *
+   * Never throws. A contacts-table hiccup must not fail a whole extraction batch;
+   * it degrades to "no hint available", which is the safe direction.
+   */
+  private async resolveHintedNodeId(
+    ctx: ToolContext,
+    subjectContactId: string | undefined,
+  ): Promise<string | undefined> {
+    if (!subjectContactId || !ctx.contactService) return undefined;
+
+    try {
+      const contact = await ctx.contactService.getContact(subjectContactId);
+      if (!contact) {
+        ctx.log.debug({ subjectContactId }, 'extract-facts: subject_contact_id matched no contact');
+        return undefined;
+      }
+      if (!contact.kgNodeId) {
+        ctx.log.debug(
+          { subjectContactId },
+          'extract-facts: subject contact holds no KG node — cannot disambiguate',
+        );
+        return undefined;
+      }
+      return contact.kgNodeId;
+    } catch (err) {
+      ctx.log.warn(
+        { err, subjectContactId },
+        'extract-facts: subject contact lookup failed — proceeding without a tiebreaker',
+      );
+      return undefined;
     }
   }
 }

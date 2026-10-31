@@ -96,7 +96,7 @@ expanded to all tiers).
      non-approval rows.
    - `resolved_at TIMESTAMPTZ` — when the approval request reached a terminal
      state. Null for non-approval rows and for pending rows.
-   - `resolved_by TEXT` — `'ceo'`, `'system'` (expiry), or null.
+   - `resolved_by TEXT` — `'coordinator'` (a resolve tool), `'principal'` (a reaction), `'system'` (expiry), or null. Rows before #2159 say `'ceo'`.
    - `expires_at TIMESTAMPTZ` — when the pending request auto-expires. Null
      for non-approval rows.
    - `parent_action_id BIGINT REFERENCES autonomy_action_log(id)` — links the
@@ -161,7 +161,7 @@ expanded to all tiers).
       ambiguous, the skill returns an error listing the pending requests
       so the coordinator can ask the CEO to clarify.
    b. Transitions it to `outcome = 'approved'`, sets `resolved_at` and
-      `resolved_by = 'ceo'`.
+      `resolved_by = 'coordinator'` (#2159).
    c. Re-executes the original skill with the stored `payload`, passing
       `humanApproved: true` to bypass the autonomy gates. See "Where
       `humanApproved` is enforced" below for details.
@@ -173,7 +173,7 @@ expanded to all tiers).
 5. **CEO denial path.** The CEO says "no" or "don't do that". The coordinator
    invokes a `deny-action` skill (or the same `approve-action` skill with a
    deny flag) that transitions the row to `outcome = 'denied'`, sets
-   `resolved_at` and `resolved_by = 'ceo'`.
+   `resolved_at` and `resolved_by = 'coordinator'` (#2159).
 
 6. **CEO dismiss path.** The CEO handled the action outside Curia (e.g.,
    created the calendar event directly in Google Calendar). The coordinator
@@ -310,3 +310,29 @@ send mechanism.
 - The `approve-action`, `deny-action`, and `dismiss-action` skills must be
   `sensitivity: 'elevated'` (CEO-only) to prevent non-CEO contacts from
   approving actions. Same security model as `set-autonomy`.
+
+## Update (#1126): the approval loop gains its consequential actors, and `elevated` is sharpened
+
+PR #1126 makes this flow do more work. Consequential *mutations* that previously hid behind the
+overloaded `elevated` gate (`contact-merge`, `contact-update`, `contact-rename`,
+`behavioral-preferences-update`, `executive-profile-update`, `scheduler-create`/`-cancel`) moved
+to `normal` + `action_risk`, so a woken/autonomous attempt that lacks the score now **blocks →
+files an approval request → the CEO's reply (a live principal turn) re-executes it** — exactly
+this ADR's flow, with no per-skill work. (For example, a heartbeat-woken contact-dedup task that
+can't clear `contact-merge`'s `medium` threshold surfaces the golden-record preview for
+confirmation rather than auto-merging.)
+
+The authorization-*altering* contact skills (`contact-set-tier`, `contact-set-role`,
+`contact-grant-permission`, `contact-revoke-permission`) deliberately do **not** join this flow:
+they stay `elevated` (live principal only), so Curia never proposes an authorization change
+autonomously at all. The "Curia proposes a grant" path is the separate grant-*recommendation*
+flow (`approve-grant-recommendation`), which is itself `elevated` — the CEO approving a
+recommendation is the live turn that performs the grant.
+
+Conversely, `elevated` was sharpened to mean a **live principal turn** (ADR-017 update):
+`approve-action` / `deny-action` / `dismiss-action` now require the CEO acting *now* — a
+woken principal-*lineage* task can never approve its own pending action (the self-approval
+hole closes with zero exceptions). The `humanApproved: true` re-execution path is unchanged
+and still bypasses the autonomy and caller gates; it does not bypass the `elevated` gate,
+but the queued skills are always `normal` (elevated skills are autonomy-exempt and so are
+never blocked into the queue).

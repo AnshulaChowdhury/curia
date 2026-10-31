@@ -1,17 +1,28 @@
-# 19 — Tasks & Backlog
+# 19 — Tasks, Backlog & Resumable Projects
 
-**Date:** 2026-06-04
-**Status:** Shipped (v0.33)
+**Date:** 2026-06-04 (backlog); extended 2026-06-30 (resumable execution)
+**Status:** Shipped (backlog v0.33; resumable execution Phases 0–3)
+**Builds on:** [spec 07 — Scheduler](07-scheduler.md), [spec 14 — Autonomy Engine](14-autonomy-engine.md), [spec 01 — Memory System](01-memory-system.md)
 
 ## Overview
 
 Curia is good at acting on a single request but historically lost fidelity across
-sessions because there was no canonical place to track work. The Tasks system gives
-the platform a shared primitive for deferred, multi-step, and waiting work: a single
-`tasks` table, four `task-*` skills, a deterministic hourly heartbeat that keeps open
-work moving, and a CEO-visible backlog surfaced through the daily digest.
+sessions because there was no canonical place to track work — and it could not carry a
+single job across more than one executor invocation. This spec covers the full task
+system in two layers built on the same spine:
 
-It addresses four recurring failure modes:
+- **Tasks & backlog (§§1–8)** — a shared primitive for deferred, multi-step, and waiting
+  work: a single `tasks` table, four `task-*` skills, a deterministic hourly heartbeat that
+  keeps open work moving, and a CEO-visible backlog surfaced through the daily digest.
+- **Resumable tasks & projects (§§9–16)** — the checkpoint/pause contract, the `plan`
+  primitive, frontier advancement, throughput telemetry, adaptive re-planning, and
+  principal-facing escalation that let a single goal run across many bursts without failing
+  when it exceeds one budget.
+
+The two shipped in sequence (the backlog layer in v0.33, resumable execution across Phases
+0–3), but they are one system and are documented together here.
+
+### The backlog layer addresses four recurring failure modes
 
 1. **No ownership distinction.** "I should do this" vs. "the CEO should do this" vs.
    "we're waiting on someone else" were all rendered the same way. Tasks make the
@@ -29,11 +40,38 @@ The design leans on infrastructure that already existed: the Postgres-backed sch
 ([spec 07](07-scheduler.md)), the daily `pending-actions-digest`, the autonomy engine
 ([spec 14](14-autonomy-engine.md)), and the audit trail.
 
-**Companion design docs** (the dated record of how this was designed and sequenced):
-[2026-06-01-tasks-and-backlog-design.md](../wip/2026-06-01-tasks-and-backlog-design.md),
-[2026-06-03-digest-backlog-sections-design.md](../wip/2026-06-03-digest-backlog-sections-design.md),
-[2026-06-04-meeting-debrief-tasks-migration-design.md](../wip/2026-06-04-meeting-debrief-tasks-migration-design.md),
-[2026-06-04-task-execution-heartbeat-design.md](../wip/2026-06-04-task-execution-heartbeat-design.md).
+### Resumable execution: work that exceeds a single invocation
+
+The backlog layer (§§1–8) gave the platform a durable place to track work. It did not solve
+**work that exceeds a single executor invocation**. A specialist sized as a lightweight
+heartbeat (`max_turns: 25`) that is handed an unbounded job (audit ~1,300 follows, read 40
+docs, dedupe 500 contacts) runs out of turns mid-work; the budget-hit was reported to the
+coordinator as "didn't respond," which it confabulated into an external API timeout and
+then blind-retried 51 times over 5 hours, leaving an orphaned subtask the heartbeat
+re-poked indefinitely.
+
+Sections 9–16 describe the resumable-task model that fixes that class of failure. The spine
+is one idea: **a goal becomes a plan, progress is tracked as "X of Y done," and resumption
+advances the frontier until done.** Both quantitative sweeps ("process 1,300 follows") and
+qualitative goals ("design the kickoff with the 6 execs") are the same thing at the right
+altitude — a planner breaking a goal into trackable units. The only thing that
+distinguishes "kinds" of work is **materialization**: ~10 heterogeneous steps of a kickoff
+become child task rows; a 1,300-item sweep stays a single leaf that loops over a cursor (no
+row per item).
+
+Two principles shaped the resumable model:
+
+- **(A) No project foresight in agent authors.** You write a generic `social-media` agent;
+  you never anticipate a follow-audit. The structure of a project is decided at runtime by
+  the LLM through generic harness primitives, steered by platform guidance, and *guaranteed*
+  by a deterministic safety-net — never by author-declared iteration.
+- **(B) Materialization is the only reason to distinguish kinds of work.** A planned step
+  becomes a real child row (dispatchable, blockable, schedulable). A high-count homogeneous
+  step is one leaf with a cursor. One progress notion, one resume loop.
+
+**Companion spec & ADR:** [spec 20 — Agent Document Workspace (OKF)](20-agent-document-workspace.md),
+[ADR-024 — `plan` writes rows directly](../adr/024-plan-rows-direct.md). Resumable-execution
+tracking epic: #1150.
 
 ---
 
@@ -46,7 +84,7 @@ The design leans on infrastructure that already existed: the Postgres-backed sch
 - **Four skills.** `task-create`, `task-list`, `task-update`, `task-complete` — granular
   domain skills matching the existing `calendar-*` / `ceo-inbox-*` pattern.
 - **No new specialist agent.** Task management is a platform-level capability available
-  to any agent (like memory), gated by the `enable_task_management` flag (§4).
+  to any agent (like memory), gated by pinning the `tasks` skill (§4).
 - **Three reactivation channels drain the backlog** (§5): an inbound event, a per-task
   `wake_at` timer, and the deterministic `BacklogHeartbeat` backstop.
 
@@ -107,11 +145,21 @@ adjacent migration `048_add_contact_canonical_attributes.sql` (see [spec 09](09-
 | `blocked_by_task_id` | `UUID REFERENCES tasks(id)` | Single-dependency ordering. |
 | `waiting_on_contact_id` | `UUID REFERENCES contacts(id)` | Preferred way to record "waiting on a person." |
 | `waiting_on_text` | `TEXT` | Soft alternative when no contact row exists yet. |
-| `tags` | `TEXT[] NOT NULL DEFAULT '{}'` | Lightweight clustering (`'debrief-pending'`, `'inbox-overflow'`) without a goals entity. |
+| `tags` | `TEXT[] NOT NULL DEFAULT '{}'` | Lightweight clustering (`'debrief-pending'`, `'inbox-drain'`) without a goals entity. |
+| `originator` | `JSONB` | **Lineage** (migration 065, #1125): the chain's `TaskOriginator`, copied from the creating event's originator at creation; child tasks copy the parent's lineage, never above it. Immutable; pure audit + the *ceiling* an effective-standing computation may inherit. NULL on pre-065 / unstamped rows → treated as agent / no-bypass. |
 
 Preserved verbatim from `agent_tasks`: `intent_anchor` (durable goal statement),
 `progress` JSONB (multi-burst execution state), `error_budget`, `conversation_id`,
 `agent_id`, timestamps.
+
+`progress` keys used by the platform (all optional; absent when unused):
+
+| Key | Purpose |
+|-----|---------|
+| `notes` | Human-readable progress notes (`task-update`) |
+| `resumable` | Checkpoint cursor / accumulator (§10) |
+| `plan` | Planned child-step descriptors (§13) |
+| `activeSkills` | Tier-1 skill activations for this task — MRU list of `{ name, activatedAt }`, capped; re-loaded on wake with relevance re-check (spec 03 / #1495) |
 
 ### 2.2 Status lifecycle
 
@@ -141,47 +189,59 @@ bus events for audit and future subscribers.
 | Skill | `action_risk` | Notes |
 |---|---|---|
 | `task-create` | `low` | Auto-fills `source` / `source_agent_id` from caller context. `wake_at` is a convenience arg: when set, the skill creates the task **and** a one-shot `scheduled_jobs` row (with `task_id`) in one transaction. The wake time lives on the schedule row, not the task. |
-| `task-list` | `none` | Default sort `priority DESC, due_at ASC NULLS LAST`. Returns title, status, owner, due_at, age, last progress note, and the next pending wake-up if any. Timestamps via `toLocalIso()`. |
-| `task-update` | `low` | Appends `progress_note` to `progress`. Setting `wake_at` cancels any existing pending wake and creates a fresh one-shot. Status transitions validated (`done → open` rejected). Completing/cancelling auto-cancels pending `scheduled_jobs` rows where `task_id = ?`. |
+| `task-list` | `none` | Default sort `priority DESC, due_at ASC NULLS LAST`. Returns title, status, owner, due_at, age, last progress note, and the next wake if any — a pending row, or a running row that already carries `deferred_wake_at` (#1938). Timestamps via `toLocalIso()`. |
+| `task-update` | `low` | Appends `progress_note` to `progress`. Setting `wake_at` updates a pending wake in place, revives the latest terminal wake, or — while that wake is `running` — records `deferred_wake_at` for the completion path to arm (#1938). A failed or timed-out run still increments `consecutive_failures`; at the suspend threshold the deferral is kept and the job suspends. A `done`/`cancelled` transition cancels a pending, suspended, or paused wake and drops any deferred time, including on a wake that is still running. Status transitions validated (`done → open` rejected). |
 | `task-complete` | `low` | Sets `status='done'`, captures the note in audit + progress, auto-cancels pending wake-ups. A separate skill so the coordinator prompt can reason about completion cleanly and the audit log distinguishes completion from a generic update. |
 
 Cancellation is `status='cancelled'` (no `task-delete`, to preserve the audit trail).
 Single-row reads use `task-list` with a filter (no `task-get`). The skills are pinned to
-participating agents via `enable_task_management` (§4).
+participating agents via the `tasks` skill bundle (§4); document workspace is a separate
+`documents` skill.
 
 ---
 
-## 4. The `enable_task_management` Capability
+## 4. The `tasks` and `documents` Skills
 
 The executor discipline (§6) is behavioral; hand-injecting it into each agent prompt
-would drift the moment someone hand-builds a custom agent. Instead a single declarative
-flag on the agent YAML bundles the whole capability:
+would drift the moment someone hand-builds a custom agent. Instead agents pin skill
+bundles:
 
 ```yaml
 # agents/<name>.yaml
-enable_task_management: true   # default: false
+pinned_skills:
+  - tasks       # heartbeat + task-* tools + Task Management instructions
+  - documents   # doc-* tools + Document Workspace instructions
 ```
 
-When `true`, the agent runtime does three things:
+These replace the former `enable_task_management` flag (two capabilities welded together).
 
-1. **Auto-pins** `task-create`, `task-list`, `task-update`, `task-complete` (merged and
-   deduped with the agent's explicit `pinned_skills`).
-2. **Auto-injects** the single `task_management` guidance block (§6) at a fixed slot in
-   the effective system prompt (after the identity / security blocks). A fixed slot, not
-   a `${placeholder}` — for a discipline block, "flag set but author forgot the
-   placeholder" would reintroduce exactly the inconsistency this eliminates.
-3. **Marks the agent heartbeat-eligible** — only enabled agents appear in the heartbeat's
-   `source_agent_id` allow-list (§5).
+**`tasks`** (`skills/tasks/SKILL.md`):
 
-Shipped enabled on **`coordinator`** and **`ceo-inbox`**. The coordinator drops its
-now-redundant manual `task-*` pins and gains a bounded `error_budget` for project bursts.
-An agent may still list individual `task-*` skills in `pinned_skills` *without* the flag
-for a bespoke need (e.g. read-only `task-list`) — that agent is not heartbeat-eligible and
-gets no injected block. If a task's `source_agent_id` points at a non-enabled or null
+1. **Expands** to `task-create`, `task-list`, `task-update`, `task-complete`.
+2. **Injects** the Task Management guidance block from the SKILL.md body.
+3. **Marks the agent heartbeat-eligible** — only agents that pin a skill with
+   `heartbeat: true` appear in the heartbeat's `source_agent_id` allow-list (§5).
+
+**`documents`** (`skills/documents/SKILL.md`):
+
+1. **Expands** to `doc-read`, `doc-list`, `doc-write`, `doc-search`, `doc-place`.
+2. **Injects** the Document Workspace guidance block.
+3. **Enables** the document-workspace runtime surface (`documentWorkspaceEnabled`).
+
+`taskRepo` is wired whenever **either** skill is pinned (task-wake scheduler refresh and
+document project-root resolution both need it). `workingDocsRepo` stays documents-only.
+
+Shipped on **`coordinator`**, **`ceo-inbox`**, and **`contacts`** (both pins). An agent
+may still list individual `task-*` tool names in `pinned_skills` *without* the bundle for
+a bespoke need (e.g. read-only `task-list`) — that agent is not heartbeat-eligible and
+gets no injected block. If a task's `source_agent_id` points at a non-eligible or null
 agent, the heartbeat routes the wake to the coordinator.
 
-The `task_management` block is platform code, versioned with the platform, so every
-opted-in agent gets the identical current rules.
+The SKILL.md bodies hold what applies on every turn. Text only a task wake needs rides on
+the wake instead (prompt trim PR 9): how to resume and how to end the run are in
+`WAKE_DISPOSITION_INSTRUCTION` (`src/scheduler/wake-disposition.ts`), which every ordinary
+task-wake body carries, and the projects catalog, placement policy and workspace manifest
+are appended to the wake's task message by the runtime (§ placement, spec 20).
 
 ---
 
@@ -229,12 +289,26 @@ have idle work. Two candidate populations:
 | **Idle-unblocked** | `owner='curia'`, `status IN ('open','in_progress')`, unblocked, no pending/running wake, `updated_at` older than `idleThresholdHours` (default 4h) | advances the work |
 | **Orphaned wait** | `owner='curia'`, `status IN ('waiting','blocked')`, `waiting_on_contact_id IS NULL`, no pending/running wake, `updated_at` older than `staleWaitThresholdHours` (default 48h) | re-evaluates: escalate, or re-park with a proper `wake_at` |
 
+A task tagged `needs-disposition` is excluded from both populations (#1951). The scheduler applies that tag when a task wake and its one disposition follow-up both leave the task `open` or `in_progress`. The heartbeat does not revive it; a CEO review row is the surface. A task parked with a progress note and no such tag is still resurfaced after its threshold. A task wake that parks its task with no `wake_at` and nothing it waits on gets one disposition follow-up asking for `wake_at`. If that also sets none, the task is left untagged on purpose, so this threshold stays its backstop (#2084).
+
 Both populations are scoped to `owner='curia'` — the heartbeat never chases work the CEO or
 an external party owns. The orphaned-wait path additionally requires `waiting_on_contact_id
 IS NULL`: a task explicitly waiting on a specific person is **excluded entirely**, not merely
 delayed, so the heartbeat never re-pings a human (that nudge is the owner's job via a
 `wake_at`). The two thresholds differ deliberately — poke an in-flight task within half a
 workday, but give a forgotten timer 48h before the backstop fires.
+
+### 5.3 Lineage on the wake (#1125)
+
+The candidate query returns each task's `originator` (lineage) plus a `derived` flag
+(`source = 'agent' OR parent_task_id IS NOT NULL`). `enqueueTaskWake` persists the originator
+onto the wake `scheduled_jobs` row and carries `derived` in its `task_payload.standing`; when
+the scheduler fires the wake it stamps a `wakeContext` onto the `agent.task` metadata. The
+execution layer reads that marker and applies the autonomy **bypass ladder** — the woken task's
+effective standing is the lineage downgraded by the live score, never raised. See
+[14-autonomy-engine.md](14-autonomy-engine.md#effective-standing--the-bypass-ladder-wokenderived-tasks).
+A specific `wake_at` job and a `scheduler-create` job are *not* heartbeat wakes: they carry no
+`wakeContext` and keep their originator at fire time.
 
 ---
 
@@ -272,7 +346,8 @@ Plan the first wave only and add subtasks as reality reveals them. For a project
 specialists, the coordinator owns the parent and subtasks may carry different
 `source_agent_id`s so each wakes the right owner. The parent is itself heartbeat-eligible,
 so once its children are done the heartbeat wakes its owner to close it out — no special
-parent-rollup machinery in v1.
+parent-rollup machinery in v1. Complex goals graduate to the `plan` primitive (§13), which
+materializes and advances that decomposition automatically.
 
 ---
 
@@ -286,8 +361,17 @@ approvals block, each rendered only when non-empty and capped at 5 with a `+N mo
   `waiting_on_contact_id` to a display name, falling back to `waiting_on_text`.
 - **What I'm working on** — `owner='curia'`, status `open`/`in_progress`, top 5 by priority.
 
+Email-observation learning (ADR-029) adds two further sections, also rendered only when
+items exist:
+
+- **Proposed voice diffs** — `WritingVoice` changes that need one-tap approve/dismiss
+  ([spec 13](13-office-identity.md)).
+- **Task-completion candidates / undo notes** — sent-mail matches awaiting confirm, plus
+  reversible notes for auto-completes (see §8 below).
+
 This reuses the existing digest the CEO already reads; no parallel digest or new channel
-was introduced. Interactive controls (snooze / done / reassign) are explicitly deferred.
+was introduced. Interactive controls (snooze / done / reassign) beyond approve/dismiss/undo
+for these learning surfaces are explicitly deferred.
 
 ---
 
@@ -302,41 +386,288 @@ was introduced. Interactive controls (snooze / done / reassign) are explicitly d
   `pendingDebriefs` / `judgedEvents` state maps were deleted in favor of platform tasks
   (`tag='debrief-pending'`, per-meeting wake-ups). Pending debriefs now appear in the
   digest's "For you to do."
-- **`ceo-inbox`** joins the system (`enable_task_management: true`): reification in the
+- **`ceo-inbox`** joins the system (`pinned_skills` includes `tasks` + `documents`): reification in the
   NEEDS DRAFT path prevents bare forward commitments; resume mode drafts the complete reply
-  when a deferred follow-up task wakes; overflow load-shedding above ~10 unread defers the
-  tail as `tag='inbox-overflow'` tasks so per-burst LLM time no longer scales linearly.
+  when a deferred follow-up task wakes. Large unread bursts are handled by **batch draining**
+  rather than load-shedding: each run fully triages one fixed-size batch and, if more unread
+  remain, self-wakes via a single `tag='inbox-drain'` continuation task (`owner='curia'`,
+  near-term `wake_at`) until the inbox is empty. There is no watermark — read/archive status
+  is the "already-triaged" marker — and no per-message overflow to-do tasks.
+- **Sent-mail task-completion (ADR-029).** The daily `ceo-inbox-sent-observe` job
+  ([spec 04](04-channels.md)) correlates new Sent messages to open `owner='ceo'` tasks by
+  recipient + subject + semantic similarity of body to title/description. Action is
+  **hybrid by match confidence and task risk** (risk inferred from the task — has a
+  `plan`/subtasks, high `priority`, or sensitive tags such as `board`/`legal` = high-risk;
+  no new risk column):
+
+  | | Low-risk task | High-risk task |
+  |---|---|---|
+  | High-confidence match | Auto-`task-complete` with reversible digest undo note | Confirm in digest |
+  | Low-confidence match | Confirm in digest | Confirm in digest |
+
+  High-risk tasks (e.g. "Plan AGM") never auto-complete. Fuzzy candidates are recorded in the
+  `sent_observe.asked_task_ids` guard set (config-store, `ceo_inbox`) so they are not
+  re-surfaced every run. Auto-completes remain reversible via reopen from the digest undo note.
 - **Autonomy** ([spec 14](14-autonomy-engine.md)). The "execute the safe stuff, escalate
   the rest" behavior is the existing autonomy engine — `action_risk` per skill against the
   live score. Drafting (low) just happens; outbound (medium) is gated; spending money
-  (high/critical) escalates via the pending-approval flow. This design adds zero new
-  autonomy mechanics.
+  (high/critical) escalates via the pending-approval flow. Task-completion and voice
+  write-back reuse existing floors (`task-complete` = `low`/60, profile update = `medium`/70);
+  this design adds zero new autonomy mechanics for those loops. Shadow-draft competence
+  feeds Phase 3 only (ADR-029).
 
 ---
 
-## 9. Configuration
+## 9. The resumable-execution contract
+
+An executor invocation returns one of three outcomes (`src/agents/resumable-task.ts`):
+
+| Outcome | Meaning | Effect |
+|---|---|---|
+| `done` | Work complete | Task → `done`; carries the final summary/deliverable |
+| `paused` | Real progress made, more remains | Task stays `in_progress`; checkpoint persisted; continuation scheduled. **Success at the delegation layer, not a timeout.** |
+| `failed` | Genuine error | Carries a structured `reason` (the executor-contract `ExecutorFailureReason`: `budget_max_turns`, `tool_error`, `api_error`, `blocked`) and `retryable: bool`, propagated honestly upward |
+
+`paused` **reuses the existing `in_progress` status** — no new task status, no schema churn.
+It is signalled through the `EXECUTION_PAUSED_PROTOCOL` marker on the `agent.response`
+(`buildExecutionPausedResponse` / `parseExecutionPausedPayload`). The delegate layer treats
+`paused` as success (no re-delegation); `failed{retryable:false}` escalates without blind
+retry; `failed{retryable:true}` gets a bounded retry then escalates (`DelegationGuard`,
+`src/agents/delegation-guard.ts`). This ends the confabulation: the coordinator now receives
+a real failure `reason` (e.g. `maxTurns` for turn-budget exhaustion) and reports the truth.
+
+> **Two `reason` vocabularies — mind which surface you're reading.** The `failed`
+> reason is spelled differently on the two surfaces it crosses, and the coordinator
+> sees the second one:
+>
+> - **Executor contract** — `ExecutorFailureReason` = `budget_max_turns | tool_error | api_error | blocked` (`src/agents/resumable-task.ts`). The outcome-contract token on `ExecutorOutcome.failed`.
+> - **Coordinator-facing** — `AgentResponseFailureReason` = `maxTurns | maxConsecutiveErrors | tool_error | api_error | blocked` (`src/bus/events.ts`). What actually rides the `agent.response` event to the coordinator / delegate skill; the runtime derives it from the classified `AgentError` (`mapAgentErrorToResponseFields`, #1170).
+>
+> Mapping between them: the executor's `budget_max_turns` corresponds to the
+> coordinator-facing `maxTurns` (turn-budget exhaustion); `tool_error`, `api_error`,
+> and `blocked` are shared verbatim. `maxConsecutiveErrors` is an *additional*
+> coordinator-facing reason (the consecutive-error ceiling was hit) with no distinct
+> executor-contract token.
+
+## 10. Resumable state — the `progress.resumable` block
+
+Resumable state lives in the existing `tasks.progress` JSONB under a `resumable` block (no
+migration), defined and bounded in `src/db/resumable-progress.ts`:
+
+- `cursor` (opaque, LLM-authored), `done` / `total`, `lastSliceUnits`, a one-line `next`,
+  `checkpointedAt`, and an `accumulator`.
+- The accumulator is **bounded**: an inline cap (4 KB) and an overall block cap (8 KB). On
+  overflow it spills to the document workspace (`working_documents`, [spec 20](20-agent-document-workspace.md))
+  and the block stores a `{ kind: 'document', path, section? }` pointer instead.
+
+`TaskRepo.getResumableBlock` / `setResumableBlock` are the only read/write path; writes
+publish `task.updated` for audit. A task is "resumable" when `error_budget.resumable=true`,
+a `resumable` tag is present, or a checkpoint already exists (`isResumableTask`).
+
+## 11. Checkpointing — a harness guarantee, not an author convention
+
+- **Cooperative.** The platform injects a fixed-slot resumable-task guidance block
+  (`buildResumableTaskGuidanceBlock`, `src/agents/runtime.ts`) — *not* author-editable — plus
+  a generic `checkpoint(progress)` skill (`skills/checkpoint/`, `action_risk: low`) dynamically
+  pinned per-turn for resumable tasks. When remaining budget drops below ~15%, a one-time
+  "checkpoint and pause now" nudge is appended to the **message tail** (never the cached
+  tools/system prefix, so prefix caching survives across providers).
+- **Safety-net (the real guarantee).** If the runtime hits the hard budget wall anyway,
+  `handleBudgetExceeded()` converts the budget-hit into `paused` from the last persisted
+  checkpoint instead of emitting `BUDGET_EXCEEDED`. With no checkpoint, it is an honest
+  `failed`. Correctness rests on the safety-net; the nudge is a latency optimization.
+- **Throughput-informed (#1264/#1265).** Each pause computes rolling throughput
+  (`computeResumableThroughput`, `src/agents/resumable-throughput.ts`) — units/slice,
+  cost/unit, and an ETA — and emits a `task.resumable_throughput` audit event
+  (`src/bus/events.ts`). The resume-guidance block and the budget nudge carry those
+  figures plus an **advisory** suggested slice size derived from the measured units/slice
+  (`suggestedSliceSize`; cold start falls back to the fixed turn fraction), so the next
+  continuation is sized from evidence rather than a guess.
+
+## 12. The resume loop & circuit-breaker
+
+A `paused` task schedules its **own near-term continuation** wake (`scheduled_jobs`,
+default `tasks.resumableContinuationSeconds: 30`) routed to its `source_agent_id`
+(`src/agents/resumable-continuation.ts` + `resumable-continuation-subscriber.ts`), rather
+than waiting for the hourly `BacklogHeartbeat`, which remains the backstop. A partial unique
+index (migration 067) enforces at most one active wake per task.
+
+The circuit-breaker keys on **progress, not error count** (`src/agents/resumable-circuit-breaker.ts`,
+state in `progress.resumableCircuit`). A continuation that makes no forward progress (cursor
+unchanged and done-count flat) increments a stall counter; after K stalls, or on breach of a
+hard per-task ceiling, the task is failed and escalated via the existing `needs-attention`
+backlog path. The escalation carries a structured, principal-facing payload
+(`src/agents/task-escalation.ts`, #1267) — one of four real failure modes (**stalled** /
+**hit-a-limit** / **blocked-on-a-person** / **agent-couldn't-finish**), progress, throughput +
+ETA (resumable leaves) or X-of-Y (planned parents), and suggested next actions — stored at
+`progress.escalation` and rendered into the CEO row's `last_progress_note` so the daily digest
+surfaces real detail, not a bare row. Defaults (`tasks.resumableCeilings`): `maxStalls: 3`, `maxIterations: 100`,
+`maxWallclockHours: 24`, `maxCostUsd: 10`; each is overridable per task through the
+`error_budget` keys validated in `src/tasks/task-error-budget.ts` (per #883: per-task keys
+only — per-invocation `max_turns`/`max_errors` belong to agent config and are rejected on
+task rows).
+
+## 13. The `plan` primitive
+
+For goals too complex for a single leaf, the runtime LLM calls `plan(goal)` (`skills/plan/`,
+`action_risk: low`), symmetric with `checkpoint` and dynamically pinned for complex/planned
+tasks (`shouldOfferPlanSkill` / `applyPlanHarness`, `src/agents/planned-task.ts`).
+
+- **Rows-direct** ([ADR-024](../adr/024-plan-rows-direct.md)): `plan` writes child task rows
+  itself via `TaskRepo` (reusing `task-create` internals), rather than proposing a tree the
+  coordinator commits — keeping the decomposition loop out of the prompt layer that
+  confabulated. Children carry `parent_task_id`, `blocked_by_task_id`, and
+  `waiting_on_contact_id` (human-input steps the heartbeat already treats specially).
+- **Progressive & lazy** — a step decomposes further only when picked up (`materialize:false`
+  leaves it unmaterialized in the plan block until then).
+- **Adaptive** — re-running `plan` on a planned parent reconciles steps against existing
+  children by step id (reuse, cancel drift, cancel removed) without duplicating.
+- **Materialization altitude** — a high-count homogeneous step is created as a single
+  iterate leaf (`resumable=true`), not one row per item.
+
+Planned-step state lives in `tasks.progress.plan` (`src/db/plan-progress.ts`,
+`PlanProgressBlock`): the ordered step descriptors (each pointing at its child row id),
+`deliverableStepId`, and an "X of Y" rollup (`computePlanRollup`, resolved = `done`/`cancelled`).
+A task is a planned step iff this block is present (`isPlannedStep`) — no new column/status.
+The block is bounded; wide plans store references, never per-item data.
+
+## 14. Frontier advancement, reconciliation, and the deliverable
+
+- **Frontier advancement** (`PlanFrontierSubscriber`, `src/agents/plan-frontier-subscriber.ts`; the
+  advance logic is `advancePlanFrontier` in `src/agents/plan-frontier.ts`). When a
+  child resolves, the subscriber wakes its planned parent (reusing the continuation wake +
+  dedup) routed to the parent's `source_agent_id`. On the wake, `advancePlanFrontier`
+  recomputes the rollup, dispatches newly-unblocked children, and re-evaluates the plan. The
+  heartbeat is the backstop.
+- **Completion reconciliation.** When a parent reaches a **terminal** state — `done`,
+  `cancelled` (`updateTask`/`completeTask`) **or `failed`** (`failResumableTask`, the
+  circuit-breaker path) — its open descendant children are recursively cancelled with a
+  reason and their pending wakes cancelled, in one transaction (`reconcileChildren` /
+  `runReconcileChildrenQuery`). This is the direct fix for the orphaned-subtask futility loop:
+  no terminal parent leaves children for the heartbeat to re-poke.
+- **Auto-complete + deliverable.** When the subtree is resolved and the deliverable step is
+  done, the parent auto-completes (`isPlanReadyForAutoComplete`). The parent's result is the
+  `deliverableStepId` step's output, or a rollup of child summaries in plan order when no
+  deliverable is marked (`resolvePlanCompletionNote`, `src/agents/plan-execution.ts`).
+  Synthesis is not special machinery — it is just the last planned step, surfaced through the
+  existing completion path.
+- **Adaptive re-planning (#1266).** On each frontier wake, `detectPlanDivergence`
+  (`src/agents/plan-adaptive-replan.ts`) raises advisory divergence signals — a `child_failed`
+  or `child_cancelled` child, `throughput_below_estimate` (measured pace under
+  `throughputDivergenceRatio` of the implied pace), or a `step_over_blocked` child past
+  `blockedStepHours`. `buildPlanDivergenceGuidanceBlock` injects them into the planned-parent
+  harness (`src/agents/planned-task.ts`) as a **non-authoritative** hint for the LLM's next
+  `plan` call — the runtime never rewrites the plan itself. Re-planning is bounded:
+  `detectPlanAdaptiveBreach` / `escalatePlanAdaptiveBreach` escalate when a subtree exceeds
+  `maxPlanDepth` or `maxReplansPerSubtree`, so a diverging plan escalates instead of thrashing.
+
+## 15. Promoting the deliverable to the knowledge graph
+
+On a planned parent's completion, `DeliverableKgPromotionSubscriber`
+(`src/agents/deliverable-kg-promotion.ts`) distils the **curated deliverable** (never the
+per-item worklog) into the KG through the existing `extract-facts` / `extract-relationships`
+gates — typed, source-attributed, and **capped per project** (`documentWorkspace.kgPromotion`:
+`maxFacts: 50`, `maxRelationships: 50`). Promotion is **best-effort and non-fatal**
+(fire-and-forget with a catch; it can never fail the parent's completion), is disableable
+globally (`documentWorkspace.kgPromotion.enabled: false`), disableable per task
+(`error_budget.kg_promotion: false`), and archives the project's
+workspace docs (`archived_at`) afterward.
+
+## 16. Task-wake clarifications
+
+A woken task that needs input it cannot supply itself asks the principal a question and suspends
+until the answer returns — the clarification counterpart of the resume loop in §12.
+
+The question is sent from the task's scheduler conversation, but the principal answers on their own
+channel (Signal, email), so the reply cannot be matched back to the task structurally. Instead, the
+outbound question registers a **durable reply binding** on the originating task: an outbound-context
+entry recording the task id and a short preview of the question, held for 7 days (long enough that a
+principal may take days to answer). When an inbound reply arrives, the coordinator decides whether it
+answers an outstanding question and, if so, writes the answer back to the bound task through
+`context-bridge-release`; binding is a judged relevance decision, not an automatic structural match.
+With several questions outstanding at once, the coordinator matches the reply to the right task by
+content, using the stored preview. A binding whose task no longer exists is released rather than
+retried.
+
+A milestone subtask whose due date has already passed at creation wakes immediately to be worked,
+rather than being treated as already complete.
+
+### 16.1 Sign-in verifications suppress the reply binding (#2017)
+
+A task-wake turn that signs in somewhere can hit a second factor and ask the principal for a
+code. The binding above would route that reply through `task-wake-reply` into the task and wake
+it on the next BacklogHeartbeat, hours after any code expires. So while a verification carrying
+this `task_id` **is pending, or expired within the recent window** (expiry is a soft hint and a
+late code can still work; satisfied and abandoned rows do not count), a send from the task's
+turn skips the binding entirely: no auto-bind,
+and no merge of the task binding into an explicit `context_bridge`. The check keys on the
+verification row, not on a flag the model must remember to set. The principal's reply then
+arrives as an ordinary live turn, which the per-turn `## Sign-in verifications` block equips to
+type the code into the waiting browser session. A failed lookup binds as before. The turn that
+finishes the errand completes the task with a note that says what was done and carries no code
+(the execution layer scrubs tracked codes from the note regardless); if it cannot finish, it
+updates the task to say exactly that, so the next heartbeat does not re-run the sign-in on stale
+assumptions. See [ADR-050](../adr/050-external-verifications-as-first-class-state.md) and
+[spec 03](03-tools-and-execution.md#sign-in-code-scrub-2017).
+
+---
+
+## 17. Configuration
 
 `config/default.yaml`:
 
 ```yaml
 tasks:
+  # Backlog heartbeat (§5)
   heartbeatIntervalMinutes: 60      # hourly tick
   heartbeatMaxWakesPerTick: 5       # global cap; per-agent cap is always 1
   idleThresholdHours: 4             # active idle (open/in_progress, curia-owned)
   staleWaitThresholdHours: 48       # orphaned waits (waiting/blocked, no wake set)
+  # Resumable execution (§§9–16)
+  resumableContinuationSeconds: 30  # near-term continuation cadence (vs. hourly heartbeat)
+  resumableCeilings:
+    maxStalls: 3                    # K consecutive no-progress continuations → escalate
+    maxIterations: 100              # hard cap on continuation slices
+    maxWallclockHours: 24           # elapsed cap from first pause
+    maxCostUsd: 10.00               # aggregate LLM cost cap across slices
+    maxPlanDepth: 3                 # max plan-decomposition depth per subtree (#1266)
+    maxReplansPerSubtree: 5         # max adaptive re-plans per planned subtree (#1266)
+    blockedStepHours: 48            # blocked-child hours before a divergence signal (#1266)
+    throughputDivergenceRatio: 0.5  # measured/implied pace floor before flagging (#1266)
+
+documentWorkspace:
+  kgPromotion:
+    enabled: true
+    maxFacts: 50
+    maxRelationships: 50
 ```
 
 Priority bands, default `owner='curia'`, and other nuance are handled by LLM judgment, not
-config — the LLM handles nuance, config handles mechanics.
+config — the LLM handles nuance, config handles mechanics. Per-task overrides live in
+`tasks.error_budget` (`resumable`, `kg_promotion`, `max_stalls`, `max_iterations`,
+`max_wallclock_hours`, `max_cost_usd`, `max_plan_depth`, `max_replans_per_subtree`,
+`blocked_step_hours`, `throughput_divergence_ratio`) — the keys validated in
+`src/tasks/task-error-budget.ts`.
 
 ---
 
-## 10. Deferred (post-v1)
+## 18. Deferred (post-v1)
 
-Captured so future readers do not relitigate the scope decisions: a `goals` table and
-weighted progress rollup (tags carry us until a durable cluster appears); autonomous task
-generation from inferred needs; a first-class `commitments` entity (modeled today as a task
-with `owner='external'` + `waiting_on_contact_id`); DAG dependencies beyond a single
-`blocked_by_task_id`; an LLM groomer that dedupes/re-prioritizes/promotes clusters; an
-interactive digest surface; and a `last_advanced_at` column should `updated_at` prove a
-noisy proxy for real progress.
+The resumable-execution model (§§9–16) covers what an earlier draft of this spec deferred:
+durable multi-step projects with a weighted progress rollup (the `progress.plan` "X of Y")
+and decomposition with dependencies. It reuses the `tasks` + `scheduled_jobs` + heartbeat
+spine above — no parallel "project runner" subsystem was introduced (explicitly rejected in
+the design memo).
+
+What genuinely remains deferred, captured so future readers do not relitigate the scope
+decisions:
+
+- a first-class `goals` table with a weighted progress rollup (tags carry us until a durable
+  cluster appears);
+- a first-class `commitments` entity (modeled today as a task with `owner='external'` +
+  `waiting_on_contact_id`);
+- DAG dependencies beyond a single `blocked_by_task_id`;
+- autonomous task generation from inferred needs;
+- an LLM groomer that dedupes / re-prioritizes / promotes clusters;
+- an interactive digest surface (snooze / done / reassign beyond approve/dismiss/undo);
+- a `last_advanced_at` column, should `updated_at` prove a noisy proxy for real progress.

@@ -1,5 +1,7 @@
+import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { AgentRegistry } from '../../../src/agents/agent-registry.js';
+import { AgentRegistry, missingDurationHintWarning } from '../../../src/agents/agent-registry.js';
+import { loadAllAgentConfigs } from '../../../src/agents/loader.js';
 
 describe('AgentRegistry', () => {
   let registry: AgentRegistry;
@@ -48,6 +50,43 @@ describe('AgentRegistry', () => {
     expect(registry.has('nonexistent')).toBe(false);
   });
 
+  it('stores an optional principal-facing display name (#1860)', () => {
+    registry.register('social-media', {
+      role: 'specialist',
+      description: 'Drafts posts',
+      displayName: 'social team',
+    });
+    expect(registry.get('social-media')?.displayName).toBe('social team');
+  });
+
+  it('names specialists that declare no duration hint, excluding the coordinator (#1857)', () => {
+    registry.register('coordinator', { role: 'coordinator', description: 'Main' });
+    registry.register('calendar', { role: 'specialist', description: 'Calendar', expectedDurationSeconds: 300 });
+    registry.register('contacts', { role: 'specialist', description: 'Contacts' });
+    registry.register('diagnostics', { role: 'specialist', description: 'Diagnostics', expectedDurationSeconds: 0 });
+    expect(registry.specialistsWithoutDurationHint()).toEqual(['contacts', 'diagnostics']);
+    expect(missingDurationHintWarning(registry.specialistsWithoutDurationHint()))
+      .toBe('Specialists with no expected_duration_seconds inherit delegate.defaultTimeoutMs: contacts, diagnostics');
+  });
+
+  it('names the shipped specialists that still inherit the floor (#1857)', () => {
+    const registry = new AgentRegistry();
+    for (const config of loadAllAgentConfigs(join(import.meta.dirname, '../../../agents'))) {
+      registry.register(config.name, {
+        role: config.role ?? 'specialist',
+        description: config.description ?? config.name,
+        expectedDurationSeconds: config.expected_duration_seconds,
+      });
+    }
+    // contacts (p99 155s), diagnostics (p99 47s), and setup-wizard (unmeasured)
+    // are covered by the 450s floor. A new specialist without a hint fails this list.
+    expect(registry.specialistsWithoutDurationHint()).toEqual([
+      'contacts',
+      'diagnostics',
+      'setup-wizard',
+    ]);
+  });
+
   it('generates a specialist summary for LLM context', () => {
     registry.register('coordinator', { role: 'coordinator', description: 'Main coordinator' });
     registry.register('research-analyst', { role: 'specialist', description: 'Conducts web research and summarizes findings' });
@@ -57,5 +96,27 @@ describe('AgentRegistry', () => {
     expect(summary).toContain('Conducts web research');
     expect(summary).toContain('expense-tracker');
     expect(summary).not.toContain('coordinator');
+  });
+
+  it('renders delegate_when as the roster line, and the description without one', () => {
+    registry.register('calendar', {
+      role: 'specialist',
+      description: 'Calendar domain specialist with a long operational account',
+      delegateWhen: 'The principal\'s calendar.\n',
+    });
+    registry.register('expense-tracker', { role: 'specialist', description: 'Tracks expenses\n' });
+    expect(registry.specialistSummary()).toBe(
+      '- @calendar: The principal\'s calendar.\n- @expense-tracker: Tracks expenses',
+    );
+  });
+
+  it('keeps a multi-line value on its own roster line', () => {
+    // A YAML literal block (`|`) keeps its line breaks; the roster must not spill them
+    // onto lines with no `- @name:` label.
+    registry.register('setup', { role: 'specialist', description: 'x', delegateWhen: 'First line\nsecond line\n\n  third\n' });
+    registry.register('expense-tracker', { role: 'specialist', description: 'Tracks\nexpenses\n' });
+    expect(registry.specialistSummary()).toBe(
+      '- @setup: First line second line third\n- @expense-tracker: Tracks expenses',
+    );
   });
 });

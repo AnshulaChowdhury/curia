@@ -24,6 +24,14 @@ function Icon({ children, size = 16, viewBox = '0 0 24 24', strokeWidth = 2, ...
   );
 }
 
+export function IconHome({ size }: IconProps) {
+  return (
+    <Icon size={size}>
+      <path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z" />
+    </Icon>
+  );
+}
+
 export function IconChat({ size }: IconProps) {
   return (
     <Icon size={size}>
@@ -54,6 +62,17 @@ export function IconGraph({ size }: IconProps) {
       <line x1="18.6" y1="5.4" x2="13.4" y2="10.6" />
       <line x1="10.6" y1="13.4" x2="5.4" y2="18.6" />
       <line x1="18.6" y1="18.6" x2="13.4" y2="13.4" />
+    </Icon>
+  );
+}
+
+export function IconDocument({ size }: IconProps) {
+  return (
+    <Icon size={size}>
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <polyline points="14 3 14 8 19 8" />
+      <line x1="9" y1="13" x2="15" y2="13" />
+      <line x1="9" y1="17" x2="13" y2="17" />
     </Icon>
   );
 }
@@ -138,11 +157,52 @@ export function IconPlus({ size }: IconProps) {
   );
 }
 
-export function IconSend({ size }: IconProps) {
+export function IconSend({ size, ...rest }: IconProps) {
   return (
-    <Icon size={size}>
+    <Icon size={size} {...rest}>
       <line x1="22" y1="2" x2="11" y2="13" />
       <polygon points="22 2 15 22 11 13 2 9" />
+    </Icon>
+  );
+}
+
+export function IconPhone({ size, ...rest }: IconProps) {
+  return (
+    <Icon size={size} {...rest}>
+      <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z" />
+    </Icon>
+  );
+}
+
+export function IconPhoneOff({ size, ...rest }: IconProps) {
+  return (
+    <Icon size={size} {...rest}>
+      <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7a2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-3.33-2.67" />
+      <path d="M5.53 9.65a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91" />
+      <line x1="23" y1="1" x2="1" y2="23" />
+    </Icon>
+  );
+}
+
+export function IconMic({ size, ...rest }: IconProps) {
+  return (
+    <Icon size={size} {...rest}>
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+      <line x1="12" y1="19" x2="12" y2="22" />
+    </Icon>
+  );
+}
+
+export function IconMicOff({ size, ...rest }: IconProps) {
+  return (
+    <Icon size={size} {...rest}>
+      <line x1="2" y1="2" x2="22" y2="22" />
+      <path d="M8.89 9.11A3 3 0 0 0 9 10v2a3 3 0 0 0 5.19 2.06" />
+      <path d="M12 2a3 3 0 0 1 3 3v3.34" />
+      <path d="M19 10v2a7 7 0 0 1-9.96 6.27" />
+      <path d="M5 10v2a7 7 0 0 0 .78 3.2" />
+      <line x1="12" y1="19" x2="12" y2="22" />
     </Icon>
   );
 }
@@ -154,6 +214,44 @@ export function IconAutonomy({ size }: IconProps) {
       <path d="M4.62 18.75A10 10 0 0 1 12 2" />
       <circle cx="12" cy="12" r="1" />
       <line x1="12" y1="11" x2="16" y2="7" />
+    </Icon>
+  );
+}
+
+export function IconPlug({ size }: IconProps) {
+  return (
+    <Icon size={size}>
+      <path d="M12 22v-5" />
+      <path d="M9 8V2" />
+      <path d="M15 8V2" />
+      <path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" />
+    </Icon>
+  );
+}
+
+export function IconServer({ size }: IconProps) {
+  return (
+    <Icon size={size}>
+      <rect width="20" height="8" x="2" y="2" rx="2" ry="2" />
+      <rect width="20" height="8" x="2" y="14" rx="2" ry="2" />
+      <line x1="6" x2="6.01" y1="6" y2="6" />
+      <line x1="6" x2="6.01" y1="18" y2="18" />
+    </Icon>
+  );
+}
+
+export function IconBrain({ size }: IconProps) {
+  return (
+    <Icon size={size}>
+      <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
+      <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
+      <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
+      <path d="M17.599 6.5a3 3 0 0 0 .399-1.375" />
+      <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
+      <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
+      <path d="M19.938 10.5a4 4 0 0 1 .585.396" />
+      <path d="M6 18a4 4 0 0 1-1.967-.516" />
+      <path d="M19.967 17.484A4 4 0 0 1 18 18" />
     </Icon>
   );
 }

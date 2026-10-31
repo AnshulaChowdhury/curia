@@ -17,6 +17,8 @@ channels:
     trust: high
     unknown_sender: allow
     threaded: false
+  # unknown_sender also governs Signal voice calls (#1626): ignore drops
+  # stranger texts AND unanswered incoming calls (same dispatcher gate).
   signal:
     trust: high
     unknown_sender: allow
@@ -29,3 +31,19 @@ channels:
     trust: low
     unknown_sender: allow
     threaded: true
+  # Slack workspace OAuth / bot token — medium trust (ADR-033). Native threads
+  # (threaded: true). Unknown workspace members may DM; they land as tier=unknown.
+  slack:
+    trust: medium
+    unknown_sender: allow
+    threaded: true
+  # SMS via Telnyx office DID — medium trust (spoofable From; not E2E). ADR-036.
+  # Non-threaded → context bridging. Unknown senders may text; land as tier=unknown.
+  sms:
+    trust: medium
+    unknown_sender: allow
+    threaded: false
+  voice:
+    trust: high
+    unknown_sender: ignore
+    threaded: false

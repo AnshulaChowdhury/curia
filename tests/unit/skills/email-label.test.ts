@@ -1,12 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
-import { EmailLabelHandler } from '../../../skills/email-label/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { EmailLabelHandler } from '../../../skills/email/tools/email-label/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
 
-function makeCtx(input: Record<string, unknown>, overrides?: Partial<SkillContext>): SkillContext {
-  return { input, secret: () => { throw new Error('no secrets'); }, log: logger, ...overrides };
+function makeCtx(input: Record<string, unknown>, overrides?: Partial<ToolContext>): ToolContext {
+  return { toolName: 'email-label', toolVersion: '1.0.0', input, secret: () => { throw new Error('no secrets'); }, log: logger, ...overrides };
 }
 
 describe('EmailLabelHandler', () => {
@@ -61,7 +61,7 @@ describe('EmailLabelHandler', () => {
       expect(data.applied).toEqual(['SECURITY']);
       expect(data.created).toEqual([]);
     }
-    expect(gateway.labelEmailMessage).toHaveBeenCalledWith('msg-1', ['SECURITY'], undefined);
+    expect(gateway.labelEmailMessage).toHaveBeenCalledWith('msg-1', ['SECURITY'], undefined, expect.anything());
   });
 
   it('passes accountId when account is provided', async () => {
@@ -80,7 +80,7 @@ describe('EmailLabelHandler', () => {
       ),
     );
     expect(result.success).toBe(true);
-    expect(gateway.labelEmailMessage).toHaveBeenCalledWith('msg-1', ['SECURITY'], 'curia');
+    expect(gateway.labelEmailMessage).toHaveBeenCalledWith('msg-1', ['SECURITY'], 'curia', expect.anything());
   });
 
   it('returns failure when gateway returns an error', async () => {
@@ -126,6 +126,6 @@ describe('EmailLabelHandler', () => {
       ),
     );
     expect(result.success).toBe(true);
-    expect(gateway.labelEmailMessage).toHaveBeenCalledWith('msg-1', ['SECURITY'], undefined);
+    expect(gateway.labelEmailMessage).toHaveBeenCalledWith('msg-1', ['SECURITY'], undefined, expect.anything());
   });
 });

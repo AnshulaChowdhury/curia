@@ -1,0 +1,615 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { REDACTION_NOTE } from '../../../../src/skills/_shared/principal-directed.js';
+import { EmailSendHandler } from './handler.js';
+import type { ToolContext } from '../../../../src/skills/types.js';
+import type { OutboundGateway } from '../../../../src/skills/outbound-gateway.js';
+import pino from 'pino';
+import { TaskOutreachService } from '../../../../src/dispatch/task-outreach-capability.js';
+import type { TaskOutreachInput, TaskOutreachRepo, TaskOutreachRow } from '../../../../src/dispatch/task-outreach.js';
+import type { ChannelIdentity } from '../../../../src/contacts/types.js';
+
+function makeLogger() {
+  return pino({ level: 'silent' });
+}
+
+const ALICE_ID = '11111111-1111-4111-8111-111111111111';
+const MACHINE_ID = '22222222-2222-4222-8222-222222222222';
+
+/**
+ * Stands in for the gateway's reference resolver (#2033). The real resolution
+ * rules are tested in tests/unit/skills/recipient-reference.test.ts; here only
+ * the handler's use of the result matters.
+ */
+const resolveRecipientReference = vi.fn(async (_channel: string, value: string) => {
+  if (value === 'principal') return { ok: true, kind: 'principal', contactId: 'principal-id', identifier: 'ceo@example.com', displayName: 'Principal' };
+  if (value === ALICE_ID) return { ok: true, kind: 'contact', contactId: ALICE_ID, identifier: 'alice@example.com', displayName: 'Alice' };
+  if (value === MACHINE_ID) return { ok: true, kind: 'contact', contactId: MACHINE_ID, identifier: 'machine@exchange.example', displayName: 'Exchange' };
+  return { ok: false, error: `No contact for "${value}". Nothing was sent.` };
+});
+
+function makeCtx(input: Record<string, unknown>, opts?: { taskMetadata?: Record<string, unknown> }): ToolContext {
+  const gateway = {
+    send: vi.fn().mockResolvedValue({ success: true }),
+    resolveRecipientReference,
+  } as unknown as OutboundGateway;
+
+  return {
+    input,
+    secret: (name: string) => { throw new Error(`Missing secret: ${name}`); },
+    log: makeLogger(),
+    outboundGateway: gateway,
+    taskMetadata: opts?.taskMetadata,
+  } as unknown as ToolContext;
+}
+
+describe('EmailSendHandler', () => {
+  let handler: EmailSendHandler;
+
+  beforeEach(() => {
+    handler = new EmailSendHandler();
+    resolveRecipientReference.mockClear();
+  });
+
+  it('returns error when to is missing', async () => {
+    const ctx = makeCtx({ subject: 'Hello', body: 'Body text' });
+    const result = await handler.execute(ctx);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(/contact-create/);
+    expect(ctx.outboundGateway!.send).not.toHaveBeenCalled();
+  });
+
+  it('returns error when subject is missing', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, body: 'Body text' });
+    const result = await handler.execute(ctx);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(/subject/);
+  });
+
+  it('returns error when body is missing', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Hello' });
+    const result = await handler.execute(ctx);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(/body/);
+  });
+
+  it('returns error when outboundGateway is not available', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Hello', body: 'Body' });
+    (ctx as unknown as Record<string, unknown>).outboundGateway = undefined;
+    const result = await handler.execute(ctx);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(/outboundGateway/);
+  });
+
+  it('sends an email and returns message_id, to, and subject', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Hello', body: 'Hi there' });
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true, messageId: 'msg-123',
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as Record<string, unknown>).message_id).toBe('msg-123');
+      expect((result.data as Record<string, unknown>).to).toBe('alice@example.com');
+      expect((result.data as Record<string, unknown>).subject).toBe('Hello');
+    }
+    expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'email', to: 'alice@example.com', subject: 'Hello', body: 'Hi there' }),
+      {
+        taskEventId: undefined, conversationId: undefined, principalDirected: false,
+        // Replayed on approval if band review holds the send (#2159).
+        holdRecipe: { toolName: 'email-send', partialPayload: ctx.input, description: 'Email to alice@example.com — "Hello"' },
+      },
+    );
+  });
+
+  it('reads the quoted original and sends from the named account (#1832)', async () => {
+    const ctx = makeCtx({
+      to: ALICE_ID,
+      subject: 'Re: Hello',
+      body: 'Hi there',
+      reply_to_message_id: 'msg-sec',
+      account: 'personal',
+    });
+    const getEmailMessage = vi.fn().mockResolvedValue({
+      from: [{ email: 'alice@example.com' }],
+      to: [],
+      cc: [],
+      subject: 'Hello',
+      body: '<p>Original</p>',
+      date: 1700000000,
+    });
+    (ctx.outboundGateway as unknown as { getEmailMessage: ReturnType<typeof vi.fn> }).getEmailMessage = getEmailMessage;
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true, messageId: 'msg-123',
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(true);
+    expect(getEmailMessage).toHaveBeenCalledWith('msg-sec', 'personal');
+    expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(
+      expect.objectContaining({ accountId: 'personal', replyToMessageId: 'msg-sec' }),
+      expect.anything(),
+    );
+  });
+
+  it('rejects account on a new email that is not a threaded reply (#1832)', async () => {
+    const ctx = makeCtx({
+      to: ALICE_ID,
+      subject: 'Hello',
+      body: 'Hi there',
+      account: 'ceo',
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(/reply_to_message_id/);
+    expect(ctx.outboundGateway!.send).not.toHaveBeenCalled();
+  });
+
+  it('returns error when gateway blocks the send', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Hello', body: 'Body' });
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: false, blockedReason: 'Recipient is blocked',
+    });
+
+    const result = await handler.execute(ctx);
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(/blocked/i);
+  });
+
+  describe('attachments', () => {
+    it('passes attachments to the gateway when provided', async () => {
+      const ctx = makeCtx({
+        to: ALICE_ID,
+        subject: 'See attached',
+        body: 'Please find attached.',
+        attachments: [
+          { file_url: 'file:///tmp/report.pdf', filename: 'report.pdf', content_type: 'application/pdf' },
+        ],
+      });
+      (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+        success: true, messageId: 'msg-attach-1',
+      });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      const callArgs = (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mock.calls[0]![0] as Record<string, unknown>;
+      expect(callArgs.attachments).toEqual([
+        { fileUrl: 'file:///tmp/report.pdf', filename: 'report.pdf', contentType: 'application/pdf' },
+      ]);
+    });
+
+    it('does not include attachments key when attachments is undefined', async () => {
+      const ctx = makeCtx({
+        to: ALICE_ID,
+        subject: 'Hello',
+        body: 'Hi there',
+      });
+      (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+        success: true, messageId: 'msg-1',
+      });
+
+      await handler.execute(ctx);
+
+      const callArgs = (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mock.calls[0]![0] as Record<string, unknown>;
+      expect(callArgs.attachments).toBeUndefined();
+    });
+
+    it('returns error when attachments is not an array', async () => {
+      const ctx = makeCtx({
+        to: ALICE_ID,
+        subject: 'Hello',
+        body: 'Hi',
+        attachments: 'not-an-array',
+      });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain('array');
+      expect(ctx.outboundGateway!.send).not.toHaveBeenCalled();
+    });
+
+    it('returns error when an attachment entry is missing file_url', async () => {
+      const ctx = makeCtx({
+        to: ALICE_ID,
+        subject: 'Hello',
+        body: 'Hi',
+        attachments: [{ filename: 'a.pdf', content_type: 'application/pdf' }],
+      });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain('file_url');
+      expect(ctx.outboundGateway!.send).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('context_bridge', () => {
+    it('registers a context bridge entry after successful send', async () => {
+      const ctx = makeCtx({
+        to: ALICE_ID,
+        subject: 'Meeting follow-up',
+        body: 'Any thoughts on the proposal?',
+        context_bridge: JSON.stringify({
+          agent_id: 'meeting-debrief',
+          expected_reply: 'Proposal feedback',
+          delegation_hint: 'Delegate to meeting-debrief',
+          expires_in_hours: 72,
+        }),
+      });
+      (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+        success: true, messageId: 'msg-1',
+      });
+      const mockRegister = vi.fn().mockResolvedValue('entry-1');
+      (ctx as unknown as Record<string, unknown>).outboundContext = {
+        register: mockRegister,
+        release: vi.fn(),
+        defaultExpiryHours: 6,
+        explicitExpiryHours: 24,
+        defaultExpiryHoursFor: (channelId: string) => (channelId === 'email' ? 72 : 6),
+      };
+      (ctx as unknown as Record<string, unknown>).agentId = 'coordinator';
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(mockRegister).toHaveBeenCalledWith({
+        channelId: 'email',
+        agentId: 'meeting-debrief',
+        content: 'Any thoughts on the proposal?',
+        expectedReply: 'Proposal feedback',
+        delegationHint: 'Delegate to meeting-debrief',
+        expiresInHours: 72,
+        ttlSource: 'agent',
+        // Who it went to, so a reply from them is shown this entry (#2261).
+        recipientContactIds: [ALICE_ID],
+      });
+    });
+
+    it('registers a minimal entry when context_bridge is absent', async () => {
+      const ctx = makeCtx({
+        to: ALICE_ID,
+        subject: 'Hello',
+        body: 'Hi there',
+      });
+      (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+        success: true, messageId: 'msg-1',
+      });
+      const mockRegister = vi.fn().mockResolvedValue('entry-1');
+      (ctx as unknown as Record<string, unknown>).outboundContext = {
+        register: mockRegister,
+        release: vi.fn(),
+        defaultExpiryHours: 6,
+        explicitExpiryHours: 24,
+        defaultExpiryHoursFor: (channelId: string) => (channelId === 'email' ? 72 : 6),
+      };
+      (ctx as unknown as Record<string, unknown>).agentId = 'coordinator';
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(mockRegister).toHaveBeenCalledWith({
+        channelId: 'email',
+        agentId: 'coordinator',
+        content: 'Hi there',
+        // Email's channel default, not the flat 6h that expired before
+        // next-business-day replies could land (#1816).
+        expiresInHours: 72,
+        ttlSource: 'channel-default',
+        recipientContactIds: [ALICE_ID],
+      });
+    });
+
+    it('logs warning but succeeds when bridge registration fails', async () => {
+      const ctx = makeCtx({
+        to: ALICE_ID,
+        subject: 'Hello',
+        body: 'Hi there',
+        context_bridge: JSON.stringify({ agent_id: 'coordinator' }),
+      });
+      (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+        success: true, messageId: 'msg-1',
+      });
+      const mockRegister = vi.fn().mockRejectedValue(new Error('DB error'));
+      (ctx as unknown as Record<string, unknown>).outboundContext = {
+        register: mockRegister,
+        release: vi.fn(),
+        defaultExpiryHours: 6,
+        explicitExpiryHours: 24,
+        defaultExpiryHoursFor: (channelId: string) => (channelId === 'email' ? 72 : 6),
+      };
+      (ctx as unknown as Record<string, unknown>).agentId = 'coordinator';
+
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(true);
+    });
+  });
+
+  describe('send by reference (#2033)', () => {
+    it('resolves to through the gateway and sends to the looked-up address', async () => {
+      const ctx = makeCtx({ to: ALICE_ID, subject: 'Hello', body: 'Hi there' });
+      (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'msg-9' });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(resolveRecipientReference).toHaveBeenCalledWith('email', ALICE_ID, { field: 'to' });
+      expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(
+        expect.objectContaining({ to: 'alice@example.com', cc: undefined }),
+        expect.anything(),
+      );
+      if (result.success) expect(result.data).toMatchObject({ to: 'alice@example.com', contact_id: ALICE_ID });
+    });
+
+    it('resolves cc references', async () => {
+      const ctx = makeCtx({
+        to: 'principal',
+        cc: ALICE_ID,
+        subject: 'Hello',
+        body: 'Hi there',
+      });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(resolveRecipientReference).toHaveBeenCalledWith('email', ALICE_ID, { field: 'cc' });
+      expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(
+        expect.objectContaining({ to: 'ceo@example.com', cc: ['alice@example.com'] }),
+        expect.anything(),
+      );
+    });
+
+    it('sends nothing when a reference does not resolve', async () => {
+      const ctx = makeCtx({ to: 'principle', subject: 'Hello', body: 'Hi there' });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/Nothing was sent/);
+      expect(ctx.outboundGateway!.send).not.toHaveBeenCalled();
+    });
+
+    it('sends nothing when one cc reference does not resolve', async () => {
+      const ctx = makeCtx({ to: 'principal', cc: `${ALICE_ID}, nobody`, subject: 'Hello', body: 'Hi there' });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect(ctx.outboundGateway!.send).not.toHaveBeenCalled();
+    });
+
+    it('refuses a retired input beside to (#2041)', async () => {
+      const ctx = makeCtx({ to: 'principal', to_address: 'alice@example.com', subject: 'Hello', body: 'Hi' });
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toMatch(/no longer accepted/);
+        expect(result.error).toMatch(/contact-create/);
+      }
+      expect(ctx.outboundGateway!.send).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['to_address', { to_address: 'a@x.example' }],
+      ['cc_addresses', { to: ALICE_ID, cc_addresses: 'b@x.example' }],
+      ['cc_addresses as an array', { to: ALICE_ID, cc_addresses: ['b@x.example'] }],
+    ])('refuses retired %s (#2041)', async (_label, fields) => {
+      const ctx = makeCtx({ ...fields, subject: 'S', body: 'B' });
+      const result = await handler.execute(ctx);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/no longer accepted/);
+      expect(ctx.outboundGateway!.send).not.toHaveBeenCalled();
+    });
+
+    it.each([[{ to_address: '' }], [{ cc_addresses: '  ' }], [{ cc_addresses: [] }], [{ to_address: null }]])(
+      'ignores a blank retired input %o (Review Focus 1)',
+      async (fields) => {
+        const ctx = makeCtx({ to: ALICE_ID, ...fields, subject: 'S', body: 'B' });
+        const result = await handler.execute(ctx);
+        expect(result.success).toBe(true);
+        // A blank retired input must not leak into the recipients that are sent to.
+        expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(
+          expect.objectContaining({ to: 'alice@example.com', cc: undefined }),
+          expect.anything(),
+        );
+      },
+    );
+
+    it('rejects more than one reference in to', async () => {
+      const ctx = makeCtx({ to: `principal, ${ALICE_ID}`, subject: 'Hello', body: 'Hi' });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/single To recipient/);
+    });
+
+    it('omits contact_id for the principal alias', async () => {
+      const ctx = makeCtx({ to: 'principal', subject: 'Hello', body: 'Hi' });
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data).not.toHaveProperty('contact_id');
+    });
+  });
+
+  describe('auto-generated sender suppress (#1734)', () => {
+    it('blocks email-send to the machine sender when autoGeneratedSuppress is stamped', async () => {
+      const ctx = makeCtx(
+        { to: MACHINE_ID, subject: 'Ack', body: 'Got it' },
+        {
+          taskMetadata: {
+            autoGeneratedSuppress: true,
+            autoGeneratedSenderId: 'machine@exchange.example',
+          },
+        },
+      );
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/auto-generated/i);
+      expect(ctx.outboundGateway!.send).not.toHaveBeenCalled();
+    });
+
+    it('allows email-send to the principal on an auto-generated turn', async () => {
+      const ctx = makeCtx(
+        { to: 'principal', subject: 'Escalation', body: 'Calendar decline from Alice' },
+        {
+          taskMetadata: {
+            autoGeneratedSuppress: true,
+            autoGeneratedSenderId: 'machine@exchange.example',
+          },
+        },
+      );
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(ctx.outboundGateway!.send).toHaveBeenCalled();
+    });
+  });
+});
+
+describe('email-send relay budget (#1320)', () => {
+  const OUTSIDER = { originator: { contactId: 'dana-contact', systemRole: null, channel: 'email', initiatedAt: '2026-10-19T12:00:00Z', tier: 'known' } };
+
+  it('passes the task originator to the gateway and surfaces a relay-budget deferral', async () => {
+    const ctx = makeCtx({ to: 'principal', subject: 'Update', body: 'Hello' }, { taskMetadata: OUTSIDER });
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, deferredToDigest: true });
+    const outboundContext = { register: vi.fn().mockResolvedValue('entry-1'), release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6 };
+    (ctx as unknown as Record<string, unknown>).outboundContext = outboundContext;
+    const result = await new EmailSendHandler().execute(ctx);
+    expect(ctx.outboundGateway!.send).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ originator: OUTSIDER.originator }));
+    expect(result.success).toBe(true);
+    // Nothing reached the principal, so no reply should bind to it.
+    expect(outboundContext.register).not.toHaveBeenCalled();
+    if (result.success) expect(result.data).toMatchObject({ deferred_to_digest: true, note: expect.stringMatching(/digest/) });
+  });
+});
+
+// #2312: the agent is told what was removed, and the entry records what was delivered.
+describe('EmailSendHandler redactions (#2312)', () => {
+  const RED = [{ label: 'phone_us', field: 'body' as const }];
+  const SENT = 'x [REDACTED: PHONE_US]';
+
+  function withContext(ctx: ToolContext) {
+    const register = vi.fn().mockResolvedValue('entry-1');
+    (ctx as unknown as Record<string, unknown>).outboundContext = {
+      register, release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6,
+    };
+    return register;
+  }
+
+  it('reports the redactions and records the delivered content', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'S', body: 'x 519-555-0100' });
+    const register = withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'm', redactions: RED, sentContent: SENT });
+    const result = await new EmailSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toMatchObject({ redactions: RED, redaction_note: REDACTION_NOTE });
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: SENT }));
+  });
+
+  it('returns the subject as delivered when redaction changed it', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Call 519-555-0100', body: 'x' });
+    withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true, messageId: 'm', redactions: [{ label: 'phone_us', field: 'subject' }], sentContent: 'x', sentSubject: 'Call [REDACTED: PHONE_US]',
+    });
+    const result = await new EmailSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toMatchObject({ subject: 'Call [REDACTED: PHONE_US]' });
+  });
+
+  it('adds no redactions key when nothing was removed', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'S', body: 'hello' });
+    const register = withContext(ctx);
+    (ctx.outboundGateway!.send as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true, messageId: 'm' });
+    const result = await new EmailSendHandler().execute(ctx);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).not.toHaveProperty('redactions');
+      expect(result.data).not.toHaveProperty('redaction_note');
+    }
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ content: 'hello' }));
+  });
+});
+
+describe('EmailSendHandler task outreach (#2312)', () => {
+  const TASK_ID = '33333333-3333-4333-8333-333333333333';
+  const PAL_ID = '44444444-4444-4444-8444-444444444444';
+  const principal = { contactId: 'principal-id', systemRole: 'principal', channel: 'email', initiatedAt: '2026-10-26T00:00:00Z', tier: 'principal' };
+  const outsider = { contactId: ALICE_ID, systemRole: null, channel: 'email', initiatedAt: '2026-10-26T00:00:00Z', tier: 'known' };
+
+  function withOutreach(ctx: ToolContext) {
+    const record = vi.fn(async (input: TaskOutreachInput) => ({ id: 'outreach-1', ...input } as unknown as TaskOutreachRow));
+    (ctx as unknown as Record<string, unknown>).taskOutreach = new TaskOutreachService({ record } as unknown as TaskOutreachRepo, {
+      principalIdentities: [{ contactId: 'principal-id', channel: 'email', channelIdentifier: 'ceo@example.com' } as unknown as ChannelIdentity],
+      selfEmails: ['curia@office.example'],
+      lookupTask: async () => ({ title: 'Book physio', rootTaskId: TASK_ID }),
+      log: makeLogger(),
+    });
+    (ctx as unknown as Record<string, unknown>).conversationId = 'conv-1';
+    (ctx as unknown as Record<string, unknown>).taskEventId = 'evt-1';
+    return record;
+  }
+
+  beforeEach(() => {
+    resolveRecipientReference.mockImplementation(async (_channel: string, value: string) => {
+      if (value === 'principal') return { ok: true, kind: 'principal', contactId: 'principal-id', identifier: 'ceo@example.com', displayName: 'Principal' };
+      if (value === ALICE_ID) return { ok: true, kind: 'contact', contactId: ALICE_ID, identifier: 'Bookings@Acme.example', displayName: 'Acme' };
+      if (value === PAL_ID) return { ok: true, kind: 'contact', contactId: PAL_ID, identifier: 'pal@gmail.com', displayName: 'Pal' };
+      return { ok: false, error: 'No contact' };
+    });
+  });
+
+  it('on a task wake, records the task, the recipients and their org domain (gmail excluded)', async () => {
+    const ctx = makeCtx(
+      { to: ALICE_ID, cc: `${PAL_ID},principal`, subject: 'Appointment', body: 'Could we book Tuesday?' },
+      { taskMetadata: { originator: principal, boundTask: { taskId: TASK_ID } } },
+    );
+    const record = withOutreach(ctx);
+
+    expect((await new EmailSendHandler().execute(ctx)).success).toBe(true);
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: TASK_ID,
+      via: 'email',
+      // The principal, copied in, is not a counterparty.
+      addresses: ['bookings@acme.example', 'pal@gmail.com'],
+      contactIds: [ALICE_ID, PAL_ID],
+      domains: ['acme.example'],
+      summary: 'Book physio',
+    }));
+  });
+
+  it('on a live principal turn with no task, records against the conversation, summarised by subject not body', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Appointment', body: 'Could we book Tuesday?' }, { taskMetadata: { originator: principal } });
+    (ctx as unknown as Record<string, unknown>).liveTurn = true;
+    const record = withOutreach(ctx);
+
+    await new EmailSendHandler().execute(ctx);
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: null, conversationId: 'conv-1', directingEventId: 'evt-1', summary: 'Appointment',
+    }));
+    expect(JSON.stringify(record.mock.calls)).not.toContain('Could we book Tuesday?');
+  });
+
+  it('on an outsider turn with no task, records nothing', async () => {
+    const ctx = makeCtx({ to: ALICE_ID, subject: 'Re', body: 'Thanks' }, { taskMetadata: { originator: outsider } });
+    (ctx as unknown as Record<string, unknown>).liveTurn = true;
+    const record = withOutreach(ctx);
+
+    expect((await new EmailSendHandler().execute(ctx)).success).toBe(true);
+    expect(record).not.toHaveBeenCalled();
+  });
+});

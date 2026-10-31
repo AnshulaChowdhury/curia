@@ -1,16 +1,18 @@
 // tests/unit/skills/calendar-list-events.test.ts
 import { describe, it, expect, vi } from 'vitest';
-import { CalendarListEventsHandler } from '../../../skills/calendar-list-events/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { CalendarListEventsHandler } from '../../../skills/calendar/tools/calendar-list-events/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
 
 function makeCtx(
   input: Record<string, unknown>,
-  overrides?: Partial<SkillContext>,
-): SkillContext {
+  overrides?: Partial<ToolContext>,
+): ToolContext {
   return {
+    toolName: 'calendar-list-events',
+    toolVersion: '1.1.0',
     input,
     secret: () => { throw new Error('no secrets'); },
     log: logger,
@@ -481,5 +483,68 @@ describe('CalendarListEventsHandler', () => {
       expect(data.events).toHaveLength(2);
       expect(data.count).toBe(2);
     }
+  });
+
+  it('fails closed when principal-scoped explicit calendarId belongs to the agent (#1854)', async () => {
+    const { makeSystemOriginator } = await import('../../../src/contacts/principal.js');
+    const principalId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+    const agentContactId = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+    const listEvents = vi.fn().mockResolvedValue([]);
+    const contactService = {
+      findContactBySystemRole: vi.fn().mockResolvedValue({ id: principalId }),
+      resolveCalendar: vi.fn().mockResolvedValue({
+        contactId: agentContactId,
+        label: 'Curia',
+        isPrimary: true,
+        readOnly: false,
+      }),
+    };
+
+    const result = await handler.execute(makeCtx(
+      { calendarId: 'cal-curia', timeMin: '2026-04-01T00:00:00Z', timeMax: '2026-04-02T00:00:00Z' },
+      {
+        nylasCalendarClient: { listEvents } as never,
+        contactService: contactService as never,
+        agentContactId,
+        taskMetadata: { originator: makeSystemOriginator() },
+      },
+    ));
+
+    expect(listEvents).not.toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.errorType).toBe('IDENTITY_MISMATCH');
+      expect(result.error).toContain('calendar_identity_mismatch');
+    }
+  });
+
+  it('allows principal-scoped reads of a third-party registered calendarId (#1854)', async () => {
+    const { makeSystemOriginator } = await import('../../../src/contacts/principal.js');
+    const principalId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+    const sarahId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+    const agentContactId = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+    const listEvents = vi.fn().mockResolvedValue(mockEvents);
+    const contactService = {
+      findContactBySystemRole: vi.fn().mockResolvedValue({ id: principalId }),
+      resolveCalendar: vi.fn().mockResolvedValue({
+        contactId: sarahId,
+        label: "Sarah's calendar",
+        isPrimary: true,
+        readOnly: false,
+      }),
+    };
+
+    const result = await handler.execute(makeCtx(
+      { calendarId: 'cal-sarah', timeMin: '2026-04-01T00:00:00Z', timeMax: '2026-04-02T00:00:00Z' },
+      {
+        nylasCalendarClient: { listEvents } as never,
+        contactService: contactService as never,
+        agentContactId,
+        taskMetadata: { originator: makeSystemOriginator() },
+      },
+    ));
+
+    expect(listEvents).toHaveBeenCalledOnce();
+    expect(result.success).toBe(true);
   });
 });

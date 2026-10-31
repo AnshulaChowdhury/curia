@@ -32,6 +32,16 @@ export type DisclosureClass =
   // Financials, legal, private-thread content.
   | 'confidential';
 
+// Keyed by DisclosureClass so the compiler rejects this table if a class is added to the
+// union and not here — tierPermitsAllDisclosure() depends on it being complete.
+const DISCLOSURE_CLASS_KEYS: Record<DisclosureClass, true> = {
+  'public': true,
+  'principal-context': true,
+  'third-party': true,
+  'confidential': true,
+};
+const ALL_DISCLOSURE_CLASSES = Object.keys(DISCLOSURE_CLASS_KEYS) as DisclosureClass[];
+
 // ---------------------------------------------------------------------------
 // Action-consequence classes
 // ---------------------------------------------------------------------------
@@ -54,6 +64,13 @@ export type ActionConsequenceClass =
 
 export type EscalationDecision = 'allow' | 'escalate';
 
+/** Skills that persist durable KG facts/edges — require tier >= known for external originators (#1290). */
+export const KG_WRITE_TOOLS = new Set([
+  'memory-store',
+  'extract-facts',
+  'extract-relationships',
+]);
+
 // ---------------------------------------------------------------------------
 // Disclosure policy
 // ---------------------------------------------------------------------------
@@ -66,7 +83,7 @@ export type EscalationDecision = 'allow' | 'escalate';
  *   unknown   — public/logistics only. Availability is principal-context and escalates.
  *   known     — + principal availability and light context. No third-party, no confidential.
  *   trusted   — all classes, including confidential. Third-party PII stops escalating here.
- *   principal — all classes (the CEO sees everything).
+ *   principal — all classes (the principal sees everything).
  */
 const DISCLOSURE_ALLOWED: Record<ContactTier, ReadonlySet<DisclosureClass>> = {
   blocked:   new Set<DisclosureClass>(),
@@ -93,6 +110,20 @@ export function applyDisclosurePolicy(
   return allowed.has(disclosureClass) ? 'allow' : 'escalate';
 }
 
+/**
+ * True when the tier's DISCLOSURE_ALLOWED entry covers every DisclosureClass, so the
+ * disclosure gate can only ever allow. Callers skip classification for such tiers: the
+ * judge is fail-closed, so calling it could only add a spurious block on a timeout or a
+ * malformed verdict (#1870). Derived from the table rather than a tier list, so a tier
+ * added later is short-circuited exactly when its policy entry is unrestricted.
+ */
+export function tierPermitsAllDisclosure(tier: ContactTier): boolean {
+  const allowed = DISCLOSURE_ALLOWED[tier];
+  // Unrecognized tier → not unrestricted (fail closed, mirrors applyDisclosurePolicy).
+  if (!allowed) return false;
+  return ALL_DISCLOSURE_CLASSES.every((c) => allowed.has(c));
+}
+
 // ---------------------------------------------------------------------------
 // Action policy
 // ---------------------------------------------------------------------------
@@ -108,6 +139,10 @@ export function applyDisclosurePolicy(
  *                             inviting a new attendee, emailing someone new, committing
  *                             on the principal's behalf to external parties). A plain reply
  *                             to the sender is false.
+ * @param isPrincipalSoleRecipient - When true, the action's recipient set is exclusively
+ *                                   the structurally-verified principal. Heads-up comms to
+ *                                   the principal are not third-party-facing (#1301). Irreversible
+ *                                   actions still escalate.
  *
  * Policy (issue #948 resolved section):
  *   blocked   — nothing; blocked contacts cannot initiate tasks.
@@ -183,6 +218,7 @@ export function applyActionPolicy(
   initiatingTier: ContactTier,
   actionClass: ActionConsequenceClass,
   isThirdPartyFacing: boolean,
+  isPrincipalSoleRecipient = false,
 ): EscalationDecision {
   // Belt-and-suspenders: unrecognized tier → fail closed (mirrors applyDisclosurePolicy guard).
   // TIER_RANK is the canonical tier registry; a tier absent from it is not a valid ContactTier.
@@ -190,7 +226,7 @@ export function applyActionPolicy(
 
   if (initiatingTier === 'blocked') return 'escalate';
 
-  // Principal bypasses all action gates — the CEO can request anything.
+  // Principal bypasses all action gates — the principal can request anything.
   if (meetsMinimumTier(initiatingTier, 'principal')) return 'allow';
 
   switch (actionClass) {
@@ -202,6 +238,8 @@ export function applyActionPolicy(
     case 'reversible-external':
       if (meetsMinimumTier(initiatingTier, 'trusted')) return 'allow';
       if (meetsMinimumTier(initiatingTier, 'known')) {
+        // Delivery exclusively to the principal is not third-party-facing (#1301).
+        if (isPrincipalSoleRecipient) return 'allow';
         // Known contacts: reply to the sender is fine; third-party-facing escalates.
         return isThirdPartyFacing ? 'escalate' : 'allow';
       }

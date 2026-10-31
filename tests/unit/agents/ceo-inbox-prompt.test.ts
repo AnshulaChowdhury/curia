@@ -1,0 +1,436 @@
+// tests/unit/agents/ceo-inbox-prompt.test.ts
+//
+// Structural contract tests for the ceo-inbox agent prompt.
+// These assert that the YAML system_prompt text satisfies specific ordering and
+// content requirements — without invoking an LLM. They are fast, deterministic,
+// and serve as a living spec for the Branch A resume section. Since #2025 the consult-timeout
+// steps ride on that task's wake (src/agents/prompts/ceo-inbox-wake-guidance.ts), so the
+// tests that pinned them in the YAML pin them there.
+
+import { describe, it, expect } from 'vitest';
+import { loadAgentConfig } from '../../../src/agents/loader.js';
+import { CEO_INBOX_CONSULT_TIMEOUT_LINES } from '../../../src/agents/prompts/ceo-inbox-wake-guidance.js';
+import * as path from 'node:path';
+
+const agentsDir = path.resolve(import.meta.dirname, '../../../agents');
+
+function loadCeoInboxPrompt(): string {
+  const config = loadAgentConfig(path.join(agentsDir, 'ceo-inbox.yaml'));
+  return config.system_prompt;
+}
+
+// Extract the text of the Branch A section from the ceo-inbox prompt.
+// Branch A runs from its header to the start of the "Branch B — Task wakes" anchor.
+// Note: "Branch B" alone appears earlier ("do not fall through to Branch B"), so the
+// delimiter is the full anchor heading.
+function extractResumePreamble(prompt: string): string {
+  const start = prompt.indexOf('**Resume mode**');
+  const branchAStart = prompt.indexOf('**Branch A — Calendar consult reply');
+  if (start === -1) throw new Error('Resume mode section not found');
+  if (branchAStart === -1 || branchAStart <= start)
+    throw new Error('Branch A header not found after Resume mode');
+  return prompt.slice(start, branchAStart);
+}
+
+function extractBranchASection(prompt: string): string {
+  const branchAStart = prompt.indexOf('**Branch A — Calendar consult reply');
+  // "**Branch B — Task wakes" marks the boundary between Branch A and Branch B.
+  const branchBStart = prompt.indexOf('**Branch B — Task wakes');
+  if (branchAStart === -1) throw new Error('Branch A section not found in prompt');
+  if (branchBStart === -1 || branchBStart <= branchAStart)
+    throw new Error('Branch B section not found after Branch A in prompt');
+  return prompt.slice(branchAStart, branchBStart);
+}
+
+// The consult-timeout steps, which ride on that task's wake since #2025.
+function extractScheduledWakeSection(_prompt: string): string {
+  return CEO_INBOX_CONSULT_TIMEOUT_LINES.join('\n');
+}
+
+function extractSchedulingConsultSection(prompt: string): string {
+  const start = prompt.indexOf('### Scheduling-specific drafting rules');
+  const end = prompt.indexOf('**📌 Seen**');
+  if (start === -1) throw new Error('Scheduling-specific drafting rules not found');
+  if (end === -1 || end <= start)
+    throw new Error('Scheduling section end not found after scheduling rules');
+  return prompt.slice(start, end);
+}
+
+// Find the position of a string within a section, returning -1 if not found.
+function posIn(section: string, term: string): number {
+  return section.indexOf(term);
+}
+
+describe('ceo-inbox consult-timeout self-healing', () => {
+  it('documents consult-timeout scheduled wake with configurable delay', () => {
+    const prompt = loadCeoInboxPrompt();
+    const schedulingSection = extractSchedulingConsultSection(prompt);
+    const scheduledWake = extractScheduledWakeSection(prompt);
+
+    expect(schedulingSection).toContain('consult-timeout');
+    expect(schedulingSection).toContain('consult_timeout_minutes');
+    expect(schedulingSection).toContain('consult_kind=scheduling');
+    expect(schedulingSection).toContain('source_message_id=<id>');
+    expect(schedulingSection).toContain('thread_id=<bullpen thread id');
+    expect(scheduledWake).toContain('`consult-timeout` task');
+    expect(scheduledWake).toContain('pending your calendar');
+    expect(scheduledWake).toContain('consult already resolved');
+  });
+
+  it('checks bullpen-read for a late CONSULT REPLY before blind-drafting', () => {
+    const prompt = loadCeoInboxPrompt();
+    const scheduledWake = extractScheduledWakeSection(prompt);
+    const getThreadPos = posIn(scheduledWake, 'bullpen-read');
+    const blindDraftPos = posIn(scheduledWake, 'pending your calendar');
+    expect(getThreadPos).toBeGreaterThan(-1);
+    expect(blindDraftPos).toBeGreaterThan(getThreadPos);
+    expect(scheduledWake).toContain('CONSULT REPLY');
+    expect(scheduledWake).toContain('run Branch A');
+    expect(scheduledWake).toContain('draft-existence check');
+  });
+
+  it('cancels consult-timeout tasks when Branch A handles a CONSULT REPLY', () => {
+    const prompt = loadCeoInboxPrompt();
+    const branchA = extractBranchASection(prompt);
+    expect(branchA).toContain('Cancel consult-timeout safety task');
+    expect(branchA).toContain('consult-timeout');
+    expect(branchA).toContain('task-complete');
+  });
+
+  it('escalates invite consult timeouts instead of blind-drafting', () => {
+    const prompt = loadCeoInboxPrompt();
+    const scheduledWake = extractScheduledWakeSection(prompt);
+    expect(scheduledWake).toContain('consult_kind=invite');
+    expect(scheduledWake).toContain('Do NOT draft a blind email reply');
+  });
+
+  it('runs idempotent no-op before timeout fallback and checks DRAFTS folder', () => {
+    const prompt = loadCeoInboxPrompt();
+    const scheduledWake = extractScheduledWakeSection(prompt);
+    const getThreadPos = posIn(scheduledWake, 'bullpen-read');
+    const noopPos = posIn(scheduledWake, 'Idempotent no-op');
+    const fallbackPos = posIn(scheduledWake, 'Still parked');
+    expect(getThreadPos).toBeGreaterThan(-1);
+    expect(noopPos).toBeGreaterThan(getThreadPos);
+    expect(fallbackPos).toBeGreaterThan(noopPos);
+    expect(scheduledWake).toContain('ceo-inbox-list');
+    expect(scheduledWake).toContain('folder: "DRAFTS"');
+  });
+
+  it('does not slide consult-timeout wake_at forward while still pending', () => {
+    const prompt = loadCeoInboxPrompt();
+    const schedulingSection = extractSchedulingConsultSection(prompt);
+    expect(schedulingSection).toContain('next_wake_at');
+    expect(schedulingSection).toContain('still in the future');
+  });
+
+  it('schedules consult-timeout on formal invite park', () => {
+    const prompt = loadCeoInboxPrompt();
+    const inviteStart = posIn(prompt, '### 4d-invite. Formal meeting invitation path');
+    const inviteEnd = posIn(prompt, '### 4e-pre. Automated / auto-generated mail check');
+    const inviteSection = prompt.slice(inviteStart, inviteEnd);
+    expect(inviteSection).toContain('Schedule consult-timeout safety wake');
+    expect(inviteSection).toContain('consult_kind=invite');
+  });
+});
+
+describe('ceo-inbox closed bullpen wake routing (#1256)', () => {
+  it('routes threadClosed wakes to bullpen-read before the Branch A content gate', () => {
+    const prompt = loadCeoInboxPrompt();
+    const preamble = extractResumePreamble(prompt);
+
+    expect(preamble).toContain('Closed bullpen thread wake');
+    expect(preamble).toContain('threadClosed: true');
+    expect(preamble).toContain('bullpen-read');
+    expect(preamble).toMatch(/Branch A[\s\n]+sub-steps/);
+
+    const closedGetThreadPos = posIn(preamble, 'bullpen-read');
+    const closedHeaderAbsPos = prompt.indexOf('**Closed bullpen thread wake');
+    const closedGetThreadAbsPos = prompt.indexOf('bullpen-read', closedHeaderAbsPos);
+    const branchAContentGateAbsPos = prompt.indexOf(
+      'If the bullpen message body visible in injected context is a CONSULT REPLY',
+    );
+    expect(closedHeaderAbsPos).toBeGreaterThan(-1);
+    expect(closedGetThreadPos).toBeGreaterThan(-1);
+    expect(branchAContentGateAbsPos).toBeGreaterThan(-1);
+    expect(closedGetThreadAbsPos).toBeGreaterThan(closedHeaderAbsPos);
+    expect(branchAContentGateAbsPos).toBeGreaterThan(closedGetThreadAbsPos);
+  });
+
+  it('closed wake path enters full Branch A protocol (not a shortcut)', () => {
+    const prompt = loadCeoInboxPrompt();
+    const preamble = extractResumePreamble(prompt);
+    expect(preamble).toContain('verbatim slots');
+    expect(preamble).toContain('date-resolve');
+    expect(preamble).toContain('no "pending your calendar" qualifier');
+    expect(preamble).toContain('consult-timeout cancellation');
+  });
+});
+
+describe('ceo-inbox Branch A prompt — memory-query contract', () => {
+  it('loads the full bullpen thread via bullpen-read before acting', () => {
+    const prompt = loadCeoInboxPrompt();
+    const branchA = extractBranchASection(prompt);
+    const getThreadPos = posIn(branchA, 'bullpen-read');
+    const readEmailPos = posIn(branchA, 'ceo-inbox-read');
+    expect(getThreadPos).toBeGreaterThan(-1);
+    expect(readEmailPos).toBeGreaterThan(getThreadPos);
+    expect(branchA).toContain('closed wake path above');
+  });
+
+  it('Branch A section contains a memory-query call', () => {
+    const prompt = loadCeoInboxPrompt();
+    const branchA = extractBranchASection(prompt);
+    expect(branchA).toContain('memory-query');
+  });
+
+  it('memory-query appears before ceo-inbox-draft-reply in Branch A', () => {
+    const prompt = loadCeoInboxPrompt();
+    const branchA = extractBranchASection(prompt);
+    const memoryQueryPos = posIn(branchA, 'memory-query');
+    const draftReplyPos = posIn(branchA, 'ceo-inbox-draft-reply');
+    expect(memoryQueryPos).toBeGreaterThan(-1);
+    expect(draftReplyPos).toBeGreaterThan(-1);
+    expect(memoryQueryPos).toBeLessThan(draftReplyPos);
+  });
+
+  it('Branch A memory-query is anchored on sender and subject context', () => {
+    const prompt = loadCeoInboxPrompt();
+    const branchA = extractBranchASection(prompt);
+    // The recall query must reference both the sender and email subject so it
+    // surfaces relevant stored facts (Calendly links, venue preferences, etc.).
+    const memoryQueryPos = posIn(branchA, 'memory-query');
+    const nearbyText = branchA.slice(memoryQueryPos, memoryQueryPos + 600);
+    const mentionsSender =
+      nearbyText.toLowerCase().includes('sender') ||
+      nearbyText.toLowerCase().includes('contact');
+    const mentionsSubject =
+      nearbyText.toLowerCase().includes('subject') ||
+      nearbyText.toLowerCase().includes('email');
+    expect(mentionsSender).toBe(true);
+    expect(mentionsSubject).toBe(true);
+  });
+
+  it('Result: no_slots step references memory-query (via cross-reference to confirmed-path steps)', () => {
+    const prompt = loadCeoInboxPrompt();
+    const branchA = extractBranchASection(prompt);
+    // Anchor on the no_slots header to avoid matching the Branch A intro sentence
+    // which also mentions "no_slots" but is not the step body.
+    const noSlotsStart = posIn(branchA, '7. **Result: no_slots');
+    const escalateStart = posIn(branchA, '8. **Result: escalate');
+    expect(noSlotsStart).toBeGreaterThan(-1);
+    expect(escalateStart).toBeGreaterThan(noSlotsStart);
+    const noSlotsSection = branchA.slice(noSlotsStart, escalateStart);
+    // The no_slots path pulls in the voice-profile + memory-query +
+    // date-resolve steps from step 2 via a cross-reference. Assert both
+    // the cross-reference and that memory-query is mentioned by name in the step body.
+    expect(noSlotsSection).toContain('memory-query');
+    // The cross-reference must enumerate steps 2a through at least 2c (which now
+    // includes the memory-query step introduced by this fix).
+    expect(noSlotsSection).toContain('5a-c');
+  });
+
+  it('memory-query failure in Branch A is non-blocking (proceed-normally instruction)', () => {
+    const prompt = loadCeoInboxPrompt();
+    const branchA = extractBranchASection(prompt);
+    const memoryQueryPos = posIn(branchA, 'memory-query');
+    // Look for language indicating a no-match is gracefully handled.
+    const nearbyText = branchA.slice(memoryQueryPos, memoryQueryPos + 800);
+    const hasNoMatchGuidance =
+      nearbyText.toLowerCase().includes('no match') ||
+      nearbyText.toLowerCase().includes('no result') ||
+      nearbyText.toLowerCase().includes('proceed normally') ||
+      nearbyText.toLowerCase().includes('if nothing') ||
+      nearbyText.toLowerCase().includes('not found');
+    expect(hasNoMatchGuidance).toBe(true);
+  });
+});
+
+describe('ceo-inbox scheduling consult prompt — proposed-time protocol', () => {
+  it('CONSULT REQUEST bullpen-post sets participants to calendar', () => {
+    const prompt = loadCeoInboxPrompt();
+    const schedulingSection = extractSchedulingConsultSection(prompt);
+    expect(schedulingSection).toContain("participants: ['calendar']");
+    expect(schedulingSection).toContain('routing field');
+  });
+
+  it('CONSULT REQUEST includes an optional Proposed block for sender-suggested times', () => {
+    const prompt = loadCeoInboxPrompt();
+    const schedulingSection = extractSchedulingConsultSection(prompt);
+
+    expect(schedulingSection).toContain('Proposed:');
+    expect(schedulingSection).toContain('start=<resolved timestamp>');
+    expect(schedulingSection).toContain('end=<resolved timestamp>');
+    expect(schedulingSection).toContain('source="<original phrase>"');
+    expect(schedulingSection).toContain('Include the optional `Proposed:` block only when');
+    expect(schedulingSection).toContain('specific times');
+    expect(schedulingSection).toContain('Do NOT include');
+    expect(schedulingSection).toContain('vague windows');
+  });
+
+  it('requires date-resolve when posting relative proposed times', () => {
+    const prompt = loadCeoInboxPrompt();
+    const schedulingSection = extractSchedulingConsultSection(prompt);
+    const tapStart = posIn(schedulingSection, '1. **Tap — post a CONSULT REQUEST');
+    const parkStart = posIn(schedulingSection, '2. **Park — label + mark-read');
+    expect(tapStart).toBeGreaterThan(-1);
+    expect(parkStart).toBeGreaterThan(tapStart);
+    const tapSection = schedulingSection.slice(tapStart, parkStart);
+    const proposedPos = posIn(tapSection, 'Proposed:');
+    const dateResolvePos = posIn(tapSection, 'date-resolve');
+    const bullpenPostPos = posIn(tapSection, 'bullpen-post');
+
+    expect(proposedPos).toBeGreaterThan(-1);
+    expect(dateResolvePos).toBeGreaterThan(proposedPos);
+    expect(bullpenPostPos).toBeGreaterThan(-1);
+  });
+
+  it('Branch A accepts confirmed proposed slots instead of counter-proposing', () => {
+    const prompt = loadCeoInboxPrompt();
+    const branchA = extractBranchASection(prompt);
+    const confirmedStart = posIn(branchA, '5. **Result: confirmed');
+    const okStart = posIn(branchA, '6. **Result: ok');
+    expect(confirmedStart).toBeGreaterThan(-1);
+    expect(okStart).toBeGreaterThan(confirmedStart);
+
+    const confirmedSection = branchA.slice(confirmedStart, okStart);
+    expect(confirmedSection).toContain('`Confirmed:` slot display string VERBATIM');
+    expect(confirmedSection).toContain('clean confirmation');
+    expect(confirmedSection).toContain('rather than offering alternatives');
+    expect(confirmedSection).toContain('Do NOT mention holds');
+  });
+
+  it('Branch A still counter-proposes for Result: ok alternatives', () => {
+    const prompt = loadCeoInboxPrompt();
+    const branchA = extractBranchASection(prompt);
+    const okStart = posIn(branchA, '6. **Result: ok');
+    const noSlotsStart = posIn(branchA, '7. **Result: no_slots');
+    expect(okStart).toBeGreaterThan(-1);
+    expect(noSlotsStart).toBeGreaterThan(okStart);
+
+    const okSection = branchA.slice(okStart, noSlotsStart);
+    expect(okSection).toContain('counter-proposal');
+    expect(okSection).toMatch(/new\s+alternatives/);
+    expect(okSection).toContain('hold placed');
+    expect(okSection).toContain('Do NOT include any "pending your calendar"');
+  });
+});
+
+describe('ceo-inbox formal invite prompt — RSVP consult contract', () => {
+  it('detects formal meeting invites before generic scheduling classification', () => {
+    const prompt = loadCeoInboxPrompt();
+    const invitePos = posIn(prompt, '### 4d-invite. Formal meeting invitation path');
+    const schedulingPos = posIn(prompt, '### Scheduling-specific drafting rules');
+
+    expect(invitePos).toBeGreaterThan(-1);
+    expect(schedulingPos).toBeGreaterThan(invitePos);
+    expect(prompt).toContain('isCalendarInvite: true');
+    expect(prompt).toContain('extract_as: "calendar_invite"');
+  });
+
+  it('parks formal invites for calendar consults instead of archiving as handled', () => {
+    const prompt = loadCeoInboxPrompt();
+    const inviteStart = posIn(prompt, '### 4d-invite. Formal meeting invitation path');
+    const inviteEnd = posIn(prompt, '### 4e-pre. Automated / auto-generated mail check');
+    expect(inviteStart).toBeGreaterThan(-1);
+    expect(inviteEnd).toBeGreaterThan(inviteStart);
+    const inviteSection = prompt.slice(inviteStart, inviteEnd);
+
+    expect(inviteSection).toContain("participants: ['calendar']");
+    expect(inviteSection).toContain('routing field');
+    expect(inviteSection).toContain('Need: RSVP for formal calendar invite');
+    expect(inviteSection).toContain('Standing: <accept|decline|tentative instruction text, or none>');
+    expect(inviteSection).toContain('Do NOT archive');
+    expect(inviteSection).toContain('Do NOT classify it as ✅ Handled');
+    expect(inviteSection).toContain('ceo-inbox-update-folders');
+    expect(inviteSection).not.toContain('ceo-inbox-label (⏳ In Progress)');
+  });
+
+  it('handles invite recommendation and pending approval replies without archiving', () => {
+    const prompt = loadCeoInboxPrompt();
+    const branchA = extractBranchASection(prompt);
+    expect(branchA).toContain('Result: invite_pending_approval');
+    expect(branchA).toContain('Result: invite_recommendation');
+    expect(branchA).toContain('Do NOT archive');
+    expect(branchA).toContain('pending approval');
+  });
+
+  // ── peer requests (Branch A0) ────────────────────────────────────────────
+  //
+  // Before this branch existed, a bullpen body matching neither the closed-thread
+  // gate nor Branch A's `CONSULT REPLY` fell through to "normal resume routing" —
+  // i.e. a full inbox drain — and the asker never got an answer. The ambient
+  // protocol alone is not enough here: this agent's own prompt routes unmatched
+  // wakes into triage, and its own prompt outranks an ambient convention.
+
+  it('answers a peer request instead of falling through to triage', () => {
+    const prompt = loadCeoInboxPrompt();
+    expect(prompt).toContain('Branch A0 — Peer request');
+    expect(prompt).toMatch(/do NOT fall\s+through to Branch B and do NOT start a triage run/);
+  });
+
+  it('restates the reply shape rather than relying on the ambient block', () => {
+    // A closed-thread wake is excluded from pending injection, so on that path the
+    // ambient protocol is absent. Branch A0 is reachable from it, so it has to be
+    // self-sufficient.
+    const prompt = loadCeoInboxPrompt();
+    expect(prompt).toContain('PEER REPLY');
+    expect(prompt).toMatch(/Result:\s*ok \| nothing \| error/);
+    expect(prompt).toMatch(/a closed-thread wake gets no ambient copy of it/);
+  });
+
+  it('keys Branch A0 on injected context, not on the wake body', () => {
+    // The wake body is a stock "You've been mentioned in Bullpen thread ..." string;
+    // the request text only ever appears in the injected thread context.
+    const prompt = loadCeoInboxPrompt();
+    expect(prompt).toMatch(/message in the injected thread context[^.]*contains a line `PEER REQUEST`/);
+  });
+
+  it('treats a peer as carrying no principal authority', () => {
+    const prompt = loadCeoInboxPrompt();
+    expect(prompt).toMatch(/a question,\s+not work from the principal/);
+  });
+
+  it('extracts archives and tells the agent to pass filename', () => {
+    const prompt = loadCeoInboxPrompt();
+    expect(prompt).toMatch(/`archive-extract` on `temp_file_url`/);
+    expect(prompt).toMatch(/Always pass `filename`/);
+  });
+
+  it('bumps the ceo-inbox version for the peer-request capability', () => {
+    // Exact-version tripwire, matching calendar-prompt.test.ts's convention.
+    // 0.17.0 = answers a generic PEER REQUEST, a new capability, so minor.
+    // 0.17.1 = principal vocabulary in the prompt (#1950).
+    // 0.18.0 = context-bridge-keep-open joins its pinned bundle; the platform
+    //          releases delegated exchange entries (#1972).
+    // 0.19.0 = resolves a compose recipient's address from mail history (#2014).
+    // 0.19.1 = memory/contact-update how-to moved into the tool descriptions (#1960).
+    // 0.20.0 = drafts address recipients by contact ID; raw addresses and one-at-a-time
+    //          recipient edits use the new draft-tool inputs (#2053).
+    // 0.21.0 = the bullpen tool is split into bullpen-post/-reply/-read/-close (#2126).
+    // 0.21.1 = ADR-046 trim: restatements of payloads, tool descriptions and other
+    //          sections removed from the always-on prompt (#2025).
+    // 0.22.0 = the consult-timeout, inbox-drain and inbox-follow-up steps ride on the task
+    //          wake by tag (#2025).
+    // 0.23.0 = archive-extract joins the pinned tools so standing rules can read
+    //          zip and gzip attachments (#2208).
+    // 0.23.1 = hourly triage cron and a 450s delegate-wait hint (#1915).
+    // 0.24.0 = standing rules and decision tagging arrive through pinned_context, and
+    //          rules are edited as sections of a /shared/ document (#2339).
+    // 0.24.1 = decision tagging reads `enabled` from a richer value, and toggling it keeps
+    //          the other fields (#2339 follow-up: prod's value carries needs_decision).
+    const config = loadAgentConfig(path.join(agentsDir, 'ceo-inbox.yaml'));
+    expect(config.version).toBe('0.24.1');
+  });
+});
+
+// Cold-compose recipient resolution (#2014): the coordinator delegates a compose whose
+// recipient has no address, so ceo-inbox is the agent that finds one.
+describe('ceo-inbox prompt — cold-compose recipient resolution (#2014)', () => {
+  it('looks a missing address up in mail headers and registers it', () => {
+    const prompt = loadCeoInboxPrompt();
+    expect(prompt).toMatch(/If a recipient arrives without a contact ID, find them with\s+`ceo-inbox-search`/);
+    expect(prompt).toMatch(/copy the address from a matching message's headers into\s+`to_addresses`/);
+    expect(prompt).toMatch(/[Rr]egister it with `contact-register` as in step 4b/);
+  });
+});

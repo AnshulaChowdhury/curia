@@ -1,0 +1,253 @@
+// skills/activity-log/handler.test.ts
+
+import { describe, it, expect, vi } from 'vitest';
+import { ActivityLogHandler } from './handler.js';
+import type { ToolContext } from '../../src/skills/types.js';
+import type { AuditLogRepo, AuditLogRow } from '../../src/audit/audit-log-repo.js';
+import type { ActionLogRepo } from '../../src/autonomy/action-log-repo.js';
+import { createSilentLogger } from '../../src/logger.js';
+
+function makeCtx(overrides?: Partial<ToolContext>): ToolContext {
+  return {
+    input: {
+      since: '2026-06-25T00:00:00.000Z',
+      until: '2026-06-26T00:00:00.000Z',
+    },
+    secret: (name: string) => { throw new Error(`secret '${name}' not configured in test`); },
+    log: createSilentLogger(),
+    timezone: 'America/New_York',
+    ...overrides,
+  } as ToolContext;
+}
+
+function makeAuditRow(overrides?: Partial<AuditLogRow>): AuditLogRow {
+  return {
+    id: 'audit-1',
+    timestamp: new Date('2026-06-25T18:00:00.000Z'),
+    eventType: 'tool.result',
+    sourceLayer: 'execution',
+    sourceId: 'calendar',
+    conversationId: 'conv-1',
+    taskId: null,
+    parentEventId: null,
+    payload: {
+      toolName: 'calendar-respond-to-invite',
+      result: {
+        success: true,
+        data: {
+          response: 'accept',
+          event: { title: 'Sync with John Doe' },
+          releasedHolds: ['hold-1'],
+        },
+      },
+    },
+    action: null,
+    outcome: null,
+    targetType: null,
+    targetId: null,
+    initiatorType: null,
+    initiatorId: null,
+    entryHash: null,
+    ...overrides,
+  };
+}
+
+describe('ActivityLogHandler', () => {
+  it('returns error when auditLogRepo is unavailable', async () => {
+    const handler = new ActivityLogHandler();
+    const result = await handler.execute(makeCtx({ auditLogRepo: undefined }));
+    expect(result.success).toBe(false);
+  });
+
+  it('returns RSVP actions with summarized target and detail', async () => {
+    const auditLogRepo = {
+      findToolResults: vi.fn().mockResolvedValue([makeAuditRow()]),
+    } as unknown as AuditLogRepo;
+    const actionLogRepo = {
+      findTerminalBetween: vi.fn().mockResolvedValue([
+        {
+          id: 1,
+          toolName: 'calendar-respond-to-invite',
+          outcome: 'success',
+          conversationId: 'conv-1',
+          createdAt: new Date('2026-06-25T18:00:00.000Z'),
+        },
+      ]),
+    } as unknown as ActionLogRepo;
+
+    const handler = new ActivityLogHandler();
+    const result = await handler.execute(makeCtx({ auditLogRepo, actionLogRepo }));
+
+    expect(result.success).toBe(true);
+    const data = (result as { success: true; data: { actions: Array<Record<string, unknown>> } }).data;
+    expect(data.actions).toHaveLength(1);
+    expect(data.actions[0]).toMatchObject({
+      tool: 'calendar-respond-to-invite',
+      target: 'accept — Sync with John Doe',
+      outcome: 'completed',
+      autonomy: 'autonomous',
+    });
+    expect(data.actions[0]!.detail).toContain('RSVP accept');
+  });
+
+  it('filters to calendar-respond-to-invite when tool_name is provided', async () => {
+    const auditLogRepo = {
+      findToolResults: vi.fn().mockResolvedValue([makeAuditRow()]),
+    } as unknown as AuditLogRepo;
+
+    const handler = new ActivityLogHandler();
+    const result = await handler.execute(makeCtx({
+      auditLogRepo,
+      input: {
+        since: '2026-06-25T00:00:00.000Z',
+        tool_name: 'calendar-respond-to-invite',
+      },
+    }));
+
+    expect(result.success).toBe(true);
+    const data = (result as { success: true; data: { actions: Array<Record<string, unknown>> } }).data;
+    expect(data.actions).toHaveLength(1);
+    expect(data.actions[0]!.tool).toBe('calendar-respond-to-invite');
+    expect(auditLogRepo.findToolResults).toHaveBeenCalledWith(expect.objectContaining({
+      toolNames: ['calendar-respond-to-invite'],
+    }));
+  });
+
+  it('prefers structured columns when present, falls back to payload when NULL', async () => {
+    const auditLogRepo = {
+      findToolResults: vi.fn().mockResolvedValue([
+        makeAuditRow({
+          action: 'execute',
+          outcome: 'success',
+          targetType: 'skill',
+          targetId: 'calendar-respond-to-invite',
+          initiatorType: 'agent',
+          initiatorId: 'calendar',
+          // payload toolName deliberately different — column should win
+          payload: {
+            toolName: 'wrong-from-payload',
+            result: {
+              success: true,
+              data: { response: 'accept', event: { title: 'From Columns' } },
+            },
+          },
+        }),
+        makeAuditRow({
+          id: 'audit-legacy',
+          action: null,
+          outcome: null,
+          targetType: null,
+          targetId: null,
+          initiatorType: null,
+          initiatorId: null,
+          payload: {
+            toolName: 'calendar-respond-to-invite',
+            result: {
+              success: true,
+              data: { response: 'decline', event: { title: 'From Payload' } },
+            },
+          },
+        }),
+      ]),
+    } as unknown as AuditLogRepo;
+
+    const handler = new ActivityLogHandler();
+    const result = await handler.execute(makeCtx({
+      auditLogRepo,
+      input: {
+        since: '2026-06-25T00:00:00.000Z',
+        tool_name: 'calendar-respond-to-invite',
+      },
+    }));
+
+    expect(result.success).toBe(true);
+    const data = (result as { success: true; data: { actions: Array<Record<string, unknown>> } }).data;
+    expect(data.actions).toHaveLength(2);
+    expect(data.actions[0]).toMatchObject({
+      tool: 'calendar-respond-to-invite',
+      target: 'accept — From Columns',
+      outcome: 'completed',
+      agent_id: 'calendar',
+    });
+    expect(data.actions[1]).toMatchObject({
+      tool: 'calendar-respond-to-invite',
+      target: 'decline — From Payload',
+      outcome: 'completed',
+    });
+  });
+
+  it('excludes non-recap skills by default', async () => {
+    const auditLogRepo = {
+      findToolResults: vi.fn().mockResolvedValue([
+        makeAuditRow({
+          payload: {
+            toolName: 'memory-query',
+            result: { success: true, data: {} },
+          },
+        }),
+      ]),
+    } as unknown as AuditLogRepo;
+
+    const handler = new ActivityLogHandler();
+    const result = await handler.execute(makeCtx({ auditLogRepo }));
+
+    expect(result.success).toBe(true);
+    const data = (result as { success: true; data: { count: number } }).data;
+    expect(data.count).toBe(0);
+  });
+
+  it('labels approved actions when autonomy log matches conversation_id', async () => {
+    const auditLogRepo = {
+      findToolResults: vi.fn().mockResolvedValue([makeAuditRow()]),
+    } as unknown as AuditLogRepo;
+    const actionLogRepo = {
+      findTerminalBetween: vi.fn().mockResolvedValue([
+        {
+          id: 1,
+          toolName: 'calendar-respond-to-invite',
+          outcome: 'approved',
+          conversationId: 'conv-1',
+          createdAt: new Date('2026-06-25T18:00:01.000Z'),
+        },
+        {
+          id: 2,
+          toolName: 'calendar-respond-to-invite',
+          outcome: 'success',
+          conversationId: 'conv-other',
+          createdAt: new Date('2026-06-25T18:00:01.000Z'),
+        },
+      ]),
+    } as unknown as ActionLogRepo;
+
+    const handler = new ActivityLogHandler();
+    const result = await handler.execute(makeCtx({ auditLogRepo, actionLogRepo }));
+
+    expect(result.success).toBe(true);
+    const data = (result as { success: true; data: { actions: Array<{ autonomy: string }> } }).data;
+    expect(data.actions[0]!.autonomy).toBe('approved');
+  });
+
+  it('returns unknown autonomy when conversation_id does not match', async () => {
+    const auditLogRepo = {
+      findToolResults: vi.fn().mockResolvedValue([makeAuditRow({ conversationId: 'conv-1' })]),
+    } as unknown as AuditLogRepo;
+    const actionLogRepo = {
+      findTerminalBetween: vi.fn().mockResolvedValue([
+        {
+          id: 1,
+          toolName: 'calendar-respond-to-invite',
+          outcome: 'success',
+          conversationId: 'conv-other',
+          createdAt: new Date('2026-06-25T18:00:00.000Z'),
+        },
+      ]),
+    } as unknown as ActionLogRepo;
+
+    const handler = new ActivityLogHandler();
+    const result = await handler.execute(makeCtx({ auditLogRepo, actionLogRepo }));
+
+    expect(result.success).toBe(true);
+    const data = (result as { success: true; data: { actions: Array<{ autonomy: string }> } }).data;
+    expect(data.actions[0]!.autonomy).toBe('unknown');
+  });
+});

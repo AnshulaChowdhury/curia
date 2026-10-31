@@ -1,0 +1,458 @@
+// tests/scenarios/stub-layer.ts — the ExecutionLayer wrapper the scenario runner
+// hands to createTestModeStack (#1956).
+//
+// The stack is booted once and reused across every case and run, so the stubs live
+// on a controller: beginRun(stubs, conversationId) installs a run's stubs, endRun()
+// returns how each call was answered and clears them. Several runs can be open at once
+// (#1980): each call is answered by the run whose conversation made it. With stubbed
+// delegation (the default) that is the run's own conversation. With real delegation
+// (#2027) `delegate` runs, and each specialist works in a conversation the layer names
+// for it (scenario-delegate-…) and files under the run: the specialist's calls get the
+// same stubs and the same fail-closed policy as the coordinator's.
+//
+// Policy for a call:
+//   1. A matching stub answers it. The real tool never runs.
+//   2. No stub, and the tool must be stubbed (mustStub) → a <skill_error>. It never
+//      falls through to the real tool. This is the fail-closed rule: a send, a write
+//      or a delegation the case did not plan for is refused, not performed. "Write" is
+//      judged by action_risk and by dangerous capabilities; a tool that misdeclares
+//      both is still bounded by the test-mode stack (no transport, withheld services).
+//   3. No stub, read-only tool → the real layer runs it (memory reads, date-resolve…).
+//      web-search is read-only too, but each call spends a Tavily credit, so `defaults`
+//      stubs it and only a `live_search` case reaches it (#2106); `liveSearch` counts those.
+//      So does a tool the stack serves from an MCP snapshot (#2024): its session returns
+//      a canned result and reaches no account, whatever its action_risk says. The call
+//      is recorded as `canned`, a stub hole like a refusal: the model acted on an empty
+//      stand-in result, not on data the case chose. In a real-delegation run, so do
+//      `delegate` and the outbound-context tools in REAL_IN_DELEGATION.
+//   4. In a `through_gateway` run (#2312), the THROUGH_GATEWAY_TOOLS skip 1 and 2: the send
+//      tools and the approval tools run their real handlers through production's gateway
+//      review, whose recording transports keep what passes. Every other run is unchanged.
+//
+// Stubs can be scoped to an agent (`agent: calendar`); an unscoped stub answers every
+// agent. Everything other than invoke() goes to the real layer, so tool definitions,
+// skill activation and the runtime's <task_error> formatting are production's.
+import { randomUUID } from 'node:crypto';
+import type { ExecutionLayer } from '../../src/skills/execution.js';
+import type { ToolRegistry } from '../../src/skills/registry.js';
+import type { ToolResult } from '../../src/skills/types.js';
+import { newLiveSearchTally, recordLiveCall, type LiveSearchTally } from '../shared/live-search.js';
+import { applyCaseWrites, recordedDraftRead, CaseToolState } from '../shared/tool-state.js';
+import { emailAttachmentRefusal } from './attachment-guard.js';
+import { recipientReferenceRefusal } from '../shared/recipient-guard.js';
+import { matchToolStub } from './stub-matcher.js';
+import type { ToolStub } from './types.js';
+
+/**
+ * Tools that must be stubbed even though their manifest says action_risk: none.
+ * `delegate` is "none" because routing itself has no external effect, but it wakes a
+ * real specialist, and the suite tests the coordinator's decisions, not a specialist's.
+ */
+const ALWAYS_STUB: ReadonlySet<string> = new Set(['delegate']);
+
+/**
+ * Tools that run for real, unstubbed, in a real-delegation run (#2027). `delegate` is the
+ * point of the mode. The two outbound-context tools are how a specialist holds or clears
+ * an entry the run seeded; they write only `outbound_context`, and the harness hands the
+ * ExecutionLayer a view narrowed to the run's own entries (seed.ts:
+ * scopedOutboundContext), so they cannot touch a real one. A stub still wins.
+ * (context-bridge-release also needs the task repo, which test mode never has.)
+ */
+export const REAL_IN_DELEGATION: ReadonlySet<string> = new Set([
+  'delegate',
+  'context-bridge-keep-open',
+  'context-bridge-clear',
+]);
+
+/**
+ * The send tools a `through_gateway` case runs for real (#2312): they skip the stub table and
+ * go through production's gateway review, whose recording transports keep what passes in the
+ * run. Never sent anywhere: the stack has no real transport and no outbound queue.
+ */
+export const THROUGH_GATEWAY_SEND_TOOLS: ReadonlySet<string> = new Set([
+  'email-send',
+  'email-reply',
+  'signal-send',
+  'sms-send',
+  'slack-send',
+  'send-draft',
+]);
+
+/**
+ * What runs for real in a through-gateway case: the sends, and the approval tools that act on
+ * what they hold. list-pending-actions lists the run's own approvals, so a principal's later
+ * "yes" can be matched to the one a send raised (the default stub always said there were none);
+ * deliver-approval sends the approval to the principal (recorded too);
+ * approve-action and deny-action resolve it on a later live principal turn (the execution
+ * layer's elevated gate still applies) and replay or refuse the send. Their action log is
+ * narrowed to the run's own rows (seed.ts: scopedActionLog).
+ */
+export const THROUGH_GATEWAY_TOOLS: ReadonlySet<string> = new Set([
+  ...THROUGH_GATEWAY_SEND_TOOLS,
+  'list-pending-actions',
+  'deliver-approval',
+  'approve-action',
+  'deny-action',
+]);
+
+/**
+ * conversation_id prefix of every specialist conversation in a real-delegation run. It
+ * starts with `scenario-`, so the start-up sweep finds a crashed run's rows by it.
+ */
+export const SCENARIO_DELEGATE_PREFIX = 'scenario-delegate-';
+
+/**
+ * Capabilities that let a tool act beyond its own inputs: re-invoke other tools
+ * (approve-action holds the UNWRAPPED layer), send, resolve approvals, capture secrets.
+ * Several such tools declare action_risk "none" and are harmless today only because
+ * test mode withholds the service they need. Refusing on the capability keeps the
+ * fail-closed guarantee from resting on what the stack happens to wire.
+ */
+const DANGEROUS_CAPABILITIES: ReadonlySet<string> = new Set([
+  'executionLayer',
+  'outboundGateway',
+  'actionLogRepo',
+  'secretCapture',
+  // The recording review layer wires these (#2312): deliver-approval sends, the recorder resolves.
+  'approvalDelivery',
+  'disclosureDecisions',
+]);
+
+/**
+ * True when an unstubbed call to `toolName` must be refused rather than run.
+ * `unavailable` names tools test mode cannot serve (missing capabilities): running one
+ * only produces a failure production never shows, so it is refused — and counted as a
+ * stub hole — instead. `inert` names tools whose real handler reaches nothing (the
+ * stack's snapshot-served MCP tools, #2024), so they run. `realDelegation` lets the
+ * REAL_IN_DELEGATION tools run; `throughGateway` the THROUGH_GATEWAY_TOOLS (#2312).
+ */
+export function mustStub(
+  toolName: string,
+  registry: ToolRegistry,
+  unavailable: ReadonlySet<string> = new Set(),
+  inert: ReadonlySet<string> = new Set(),
+  options: { realDelegation?: boolean; throughGateway?: boolean } = {},
+): boolean {
+  // The review layer serves these (#2312), whatever the layer agents call lacks.
+  if (options.throughGateway && THROUGH_GATEWAY_TOOLS.has(toolName)) return false;
+  if (unavailable.has(toolName)) return true;
+  if (options.realDelegation && REAL_IN_DELEGATION.has(toolName)) return false;
+  if (ALWAYS_STUB.has(toolName)) return true;
+  if (inert.has(toolName)) return false;
+  const tool = registry.get(toolName);
+  // Not registered: the real layer answers "not found", which is what production does.
+  if (!tool) return false;
+  const caps = [...(tool.manifest.capabilities ?? []), ...(tool.manifest.optional_capabilities ?? [])];
+  if (caps.some(c => DANGEROUS_CAPABILITIES.has(c))) return true;
+  const risk = tool.manifest.action_risk;
+  return typeof risk === 'number' ? risk > 0 : risk !== 'none';
+}
+
+export interface StubbedCall {
+  agentId: string | undefined;
+  /** The tool.invoke event id (InvokeOptions.parentEventId) — how capture joins the two views. */
+  invokeEventId: string | undefined;
+  toolName: string;
+  input: Record<string, unknown>;
+  disposition: 'stubbed' | 'passthrough' | 'canned' | 'refused';
+}
+
+export interface StubController {
+  /** Wrap the real layer. Pass the result as createTestModeStack's wrapExecutionLayer. */
+  /**
+   * `reviewLayer`: the stack's recording review layer (#2312), where a through-gateway run's
+   * THROUGH_GATEWAY_TOOLS go. Every other call goes to `layer`.
+   */
+  wrap(layer: ExecutionLayer, reviewLayer?: ExecutionLayer): ExecutionLayer;
+  /**
+   * Install a run's stubs for its conversation. Throws if that conversation already has
+   * an open run. A call from a conversation with no open run — a timed-out turn from a
+   * run already closed — is refused and not recorded: it must never be answered by
+   * another run's stubs. `realDelegation` runs `delegate` for real (#2027); `throughGateway`
+   * runs the THROUGH_GATEWAY_TOOLS for real (#2312).
+   */
+  beginRun(stubs: Record<string, ToolStub[]>, conversationId: string, options?: { realDelegation?: boolean; throughGateway?: boolean }): void;
+  /** Close the conversation's run (and its specialists' conversations) and return its calls in order. */
+  endRun(conversationId: string): StubbedCall[];
+  /**
+   * File `conversationId` under the open run of `rootConversationId` (#2312): an `inbound.then`
+   * principal turn. Its calls get the run's stubs and are recorded with the run's.
+   */
+  attach(rootConversationId: string, conversationId: string): void;
+  /** The conversation of the open run `conversationId` belongs to: itself, or a specialist's run's root. */
+  rootOf(conversationId: string): string | undefined;
+  /**
+   * The specialists an open run's `delegate` calls are still waiting on (#2027): a run
+   * that times out with one is waiting on a slow specialist, not stuck.
+   */
+  pendingDelegations(conversationId: string): string[];
+  /**
+   * The first tool call of this run does not return until `until` settles (#2018).
+   * The harness uses that gap to publish a follow-up while the call is in flight.
+   */
+  holdFirstCall(conversationId: string, until: Promise<void>): void;
+  /** Resolves when this run has recorded its first tool call. */
+  whenFirstCall(conversationId: string): Promise<void>;
+  /** Calls refused because they came from a conversation with no open run. */
+  readonly staleCalls: number;
+  /** web-search calls that ran the real tool, across every run (#2106). */
+  readonly liveSearch: Readonly<LiveSearchTally>;
+}
+
+function deferredVoid(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => {};
+  const promise = new Promise<void>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+function skillError(message: string): string {
+  // Same envelope ExecutionLayer.wrapSkillError produces, so the runtime classifies
+  // and formats a stubbed failure exactly as it would a real one.
+  return `<skill_error>${message}</skill_error>`;
+}
+
+/**
+ * `registry` is a getter because the stub layer is created inside createTestModeStack's
+ * wrapExecutionLayer hook, before the stack (and its tool registry) is returned.
+ */
+export function createStubController(
+  registry: () => ToolRegistry,
+  unavailable: () => ReadonlySet<string> = () => new Set(),
+  inert: () => ReadonlySet<string> = () => new Set(),
+  hooks: {
+    /** A real-delegation run started a specialist in `delegateConversationId` (#2027). */
+    onDelegate?: (rootConversationId: string, delegateConversationId: string) => void;
+  } = {},
+): StubController {
+  interface OpenRun {
+    root: string;
+    stubs: Record<string, ToolStub[]>;
+    calls: StubbedCall[];
+    tools: CaseToolState;
+    realDelegation: boolean;
+    /** THROUGH_GATEWAY_TOOLS run for real, past the stub table (#2312). */
+    throughGateway: boolean;
+    /** Specialist conversations this run started, each also a key of `delegated`. */
+    specialists: Set<string>;
+    /** Real delegate calls not yet returned, one entry (the target agent) per call. */
+    waiting: string[];
+    /** Makes a model-chosen specialist conversation id unique to this run. */
+    token: string;
+    /** Resolved on the first recorded call. The harness waits on it to publish a follow-up. */
+    firstCall: { promise: Promise<void>; resolve: () => void };
+    /** When set, the first call awaits this before it returns. */
+    holdFirst?: Promise<void>;
+    gateOpened: boolean;
+  }
+  const runs = new Map<string, OpenRun>();
+  /** A specialist's conversation → the run it works for (#2027). */
+  const delegated = new Map<string, OpenRun>();
+  let staleCalls = 0;
+  const liveSearch = newLiveSearchTally();
+
+  const runFor = (conversationId: string | undefined): OpenRun | undefined =>
+    conversationId === undefined ? undefined : runs.get(conversationId) ?? delegated.get(conversationId);
+
+  /**
+   * The specialist's conversation: one the layer names, so its rows carry the suite's
+   * prefix. A conversation_id the model chose keeps its identity within the run (two
+   * delegations that share one still share it), but never across runs: a model that
+   * picks the same id every run must not land in another run's conversation. This is the
+   * isolation boundary, so an id another open run already owns (a token collision) is never
+   * reused: the specialist gets a fresh conversation instead.
+   */
+  const specialistConversation = (run: OpenRun, given: unknown): string => {
+    const fresh = (): string => `${SCENARIO_DELEGATE_PREFIX}${randomUUID()}`;
+    if (typeof given !== 'string' || given.trim() === '') return fresh();
+    if (run.specialists.has(given)) return given;
+    const named = `${SCENARIO_DELEGATE_PREFIX}${run.token}-${given}`;
+    const owner = delegated.get(named);
+    return owner === undefined || owner === run ? named : fresh();
+  };
+
+  const invokeStubbed = async (
+    real: ExecutionLayer,
+    review: ExecutionLayer | undefined,
+    args: Parameters<ExecutionLayer['invoke']>,
+  ): Promise<ToolResult> => {
+    const [toolName, input, , options] = args;
+    const run = runFor(options?.conversationId);
+
+    if (!run && runs.size > 0) {
+      staleCalls++;
+      return {
+        success: false,
+        error: skillError(`Tool '${toolName}' was called from a conversation outside every open scenario run; refused.`),
+      };
+    }
+    const stubs = run?.stubs ?? null;
+
+    const record = (disposition: StubbedCall['disposition']): void => {
+      run?.calls.push({
+        agentId: options?.agentId,
+        invokeEventId: options?.parentEventId,
+        toolName,
+        input: structuredClone(input),
+        disposition,
+      });
+    };
+    // The first call of the run waits here when the harness asked it to, so a
+    // follow-up can be published before the model sees this result (#2018).
+    const note = async (disposition: StubbedCall['disposition']): Promise<void> => {
+      record(disposition);
+      if (!run || run.gateOpened || run.calls.length !== 1) return;
+      run.gateOpened = true;
+      run.firstCall.resolve();
+      if (run.holdFirst) await run.holdFirst;
+    };
+
+    // A through-gateway send skips the stub table (#2312): production's handler and review
+    // decide, and the recording transports keep what passes.
+    const realSend = run?.throughGateway === true && THROUGH_GATEWAY_TOOLS.has(toolName);
+    const stub = stubs && !realSend ? matchToolStub(toolName, input, stubs, options?.agentId) : undefined;
+    // Same write-then-read replay as smoke (#2074). A stub that names draft_id
+    // still answers that ceo-inbox-read itself.
+    if (run && !realSend) {
+      const draft = recordedDraftRead(toolName, input, run.tools, stub?.match);
+      if (draft) {
+        await note('stubbed');
+        return { success: true, data: draft };
+      }
+    }
+    if (stub) {
+      await note('stubbed');
+      if (stub.error !== undefined) return { success: false, error: skillError(stub.error) };
+      // A success stub stands in for the send, not for the attachment check the
+      // gateway runs first. A file_url outside the temp store is refused with
+      // production's error, and recorded as stubbed: the model can recover, and
+      // the miss is not a hole in the stub table (#2059).
+      const attachmentError = emailAttachmentRefusal(toolName, input);
+      if (attachmentError) return { success: false, error: skillError(attachmentError) };
+      // Likewise the recipient check: a typed address in a reference field is refused
+      // in production's words (#2149).
+      const recipientError = recipientReferenceRefusal(toolName, input);
+      if (recipientError) return { success: false, error: skillError(recipientError) };
+      // Clone so a handler-side mutation in one run cannot leak into the next.
+      const data = structuredClone(stub.return ?? null);
+      if (run && data !== null && typeof data === 'object' && !Array.isArray(data)) {
+        return { success: true, data: applyCaseWrites(toolName, data as Record<string, unknown>, input, run.tools) };
+      }
+      return { success: true, data };
+    }
+
+    if (stubs === null || mustStub(toolName, registry(), unavailable(), inert(), { realDelegation: run?.realDelegation, throughGateway: run?.throughGateway })) {
+      await note('refused');
+      return {
+        success: false,
+        error: skillError(
+          stubs === null
+            ? `Tool '${toolName}' was called outside a scenario run; the scenario layer refuses it.`
+            : `Tool '${toolName}' has no stub for this call and is not read-only, so the scenario ` +
+              'layer refused it (no stub matched these arguments).',
+        ),
+      };
+    }
+
+    await note(inert().has(toolName) ? 'canned' : 'passthrough');
+    if (toolName === 'delegate' && run) {
+      // Only a real-delegation run gets here: mustStub refuses delegate otherwise.
+      const conversationId = specialistConversation(run, input['conversation_id']);
+      if (!delegated.has(conversationId)) {
+        delegated.set(conversationId, run);
+        run.specialists.add(conversationId);
+        hooks.onDelegate?.(run.root, conversationId);
+      }
+      const [, , caller] = args;
+      const agent = typeof input['agent'] === 'string' ? input['agent'] : '(unnamed agent)';
+      run.waiting.push(agent);
+      try {
+        return await real.invoke(toolName, { ...input, conversation_id: conversationId }, caller, options);
+      } finally {
+        // indexOf is -1 only on a harness bug; splice(-1) would drop another agent's wait.
+        const i = run.waiting.indexOf(agent);
+        if (i >= 0) run.waiting.splice(i, 1);
+      }
+    }
+    if (realSend) {
+      if (!review) {
+        return { success: false, error: skillError(`Tool '${toolName}' runs through the gateway, but this stack has no review layer.`) };
+      }
+      return review.invoke(...args);
+    }
+    const result = await real.invoke(...args);
+    recordLiveCall(liveSearch, toolName, result);
+    return result;
+  };
+
+  return {
+    wrap(layer, reviewLayer) {
+      return new Proxy(layer, {
+        get(target, prop, receiver) {
+          if (prop === 'invoke') {
+            return (...args: Parameters<ExecutionLayer['invoke']>) => invokeStubbed(target, reviewLayer, args);
+          }
+          const value: unknown = Reflect.get(target, prop, receiver);
+          return typeof value === 'function'
+            ? (value as (...a: unknown[]) => unknown).bind(target)
+            : value;
+        },
+      });
+    },
+    beginRun(next, conversationId, options = {}) {
+      if (runs.has(conversationId)) throw new Error(`StubController.beginRun: conversation ${conversationId} already has an open run`);
+      runs.set(conversationId, {
+        root: conversationId,
+        stubs: next,
+        calls: [],
+        tools: new CaseToolState(),
+        realDelegation: options.realDelegation === true,
+        throughGateway: options.throughGateway === true,
+        specialists: new Set(),
+        waiting: [],
+        token: randomUUID().slice(0, 8),
+        firstCall: deferredVoid(),
+        gateOpened: false,
+      });
+    },
+    attach(rootConversationId, conversationId) {
+      const run = runs.get(rootConversationId);
+      if (!run) throw new Error(`StubController.attach: no open run for ${rootConversationId}`);
+      if (runFor(conversationId)) throw new Error(`StubController.attach: ${conversationId} already belongs to a run`);
+      delegated.set(conversationId, run);
+      // endRun releases it with the run's specialists.
+      run.specialists.add(conversationId);
+    },
+    holdFirstCall(conversationId, until) {
+      const run = runs.get(conversationId);
+      if (!run) throw new Error(`StubController.holdFirstCall: no open run for ${conversationId}`);
+      run.holdFirst = until;
+    },
+    whenFirstCall(conversationId) {
+      const run = runs.get(conversationId);
+      if (!run) return Promise.resolve();
+      if (run.calls.length > 0) run.firstCall.resolve();
+      return run.firstCall.promise;
+    },
+    endRun(conversationId) {
+      const run = runs.get(conversationId);
+      runs.delete(conversationId);
+      // Unblock a follow-up waiter. The harness disarms before this, so the
+      // waiter does not publish after the run (#2018).
+      run?.firstCall.resolve();
+      for (const specialist of run?.specialists ?? []) delegated.delete(specialist);
+      return run?.calls ?? [];
+    },
+    rootOf(conversationId) {
+      return runFor(conversationId)?.root;
+    },
+    pendingDelegations(conversationId) {
+      return [...(runs.get(conversationId)?.waiting ?? [])];
+    },
+    get staleCalls() {
+      return staleCalls;
+    },
+    get liveSearch() {
+      return liveSearch;
+    },
+  };
+}

@@ -8,6 +8,16 @@
     "name": { "type": "string", "minLength": 1 },
     "version": { "type": "string" },
     "description": { "type": "string", "minLength": 1 },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Principal-facing label for replies (#1860). Not persona.display_name, which is prompt text only."
+    },
+    "delegate_when": {
+      "type": "string",
+      "pattern": "\\S",
+      "description": "When to delegate to this agent: its line in the specialist roster. Without it the roster shows description."
+    },
     "role": { "type": "string" },
     "persona": {
       "type": "object",
@@ -43,17 +53,6 @@
       "items": { "type": "string" }
     },
     "allow_discovery": { "type": "boolean" },
-    "enable_task_management": { "type": "boolean" },
-    "memory": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "scopes": {
-          "type": "array",
-          "items": { "type": "string" }
-        }
-      }
-    },
     "schedule": {
       "type": "array",
       "items": {
@@ -94,7 +93,40 @@
       "type": "boolean",
       "description": "When true, ${available_specialists} in the system_prompt is replaced at bootstrap with the list of registered specialist agents."
     },
+    "pinned_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Shared documents and config-store keys injected into every turn (ADR-056). Shape only: loadAgentConfig (src/agents/pinned-context.ts) checks paths, keys, descriptions and duplicates.",
+      "properties": {
+        "docs": { "$ref": "#/definitions/pinnedContextList" },
+        "configs": { "$ref": "#/definitions/pinnedContextList" }
+      }
+    },
     "install":   { "type": "object" },
     "uninstall": { "type": "object" }
+  },
+  "definitions": {
+    "pinnedContextList": {
+      "description": "One entry or a list. An entry is a string, or a mapping with the string plus a one-line description.",
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/pinnedContextEntry" },
+        { "type": "array", "items": { "$ref": "#/definitions/pinnedContextEntry" } }
+      ]
+    },
+    "pinnedContextEntry": {
+      "anyOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "key": { "type": "string", "minLength": 1 },
+            "description": { "type": "string" }
+          }
+        }
+      ]
+    }
   }
 }

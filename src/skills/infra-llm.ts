@@ -6,17 +6,20 @@
 // 3. Do NOT expose raw chat() — skills cannot use this for arbitrary LLM access
 //
 // This is the replacement for the raw llmProvider + modelRouter capabilities
-// that were temporarily exposed on SkillContext (#637). The narrow API surface
+// that were temporarily exposed on ToolContext (#637). The narrow API surface
 // IS the security policy: any skill can declare 'infraLlm', but all it gets
 // is classify/extract with full telemetry, not unbounded LLM access.
 
 import { createHash } from 'node:crypto';
 import type { EventBus } from '../bus/bus.js';
-import type { LLMProvider, LLMUsage, LLMCallProvenance } from '../agents/llm/provider.js';
+import type { LLMProvider, LLMResponse, LLMUsage } from '../agents/llm/provider.js';
 import type { ModelRouter } from '../agents/llm/model-router.js';
 import type { ModelRegistry } from '../agents/llm/model-registry.js';
+import { buildLlmArchiveResponse } from '../audit/llm-archive-response.js';
 import { createLlmCall } from '../bus/events.js';
 import { createEstimateCostUsd } from '../agents/llm/pricing.js';
+import { llmCallReasoningFields } from '../agents/llm/llm-call-reasoning.js';
+import { NO_REASONING } from '../agents/llm/sampling-options.js';
 import type { Logger } from '../logger.js';
 
 /**
@@ -26,6 +29,19 @@ export type InfraLlmResult =
   | { ok: true; text: string }
   | { ok: false; error: string };
 
+export interface InfraLlmExtractOptions {
+  maxTokens?: number;
+  /** For vision: base64 image + MIME type. */
+  image?: { base64: string; mediaType: string };
+  /**
+   * Model tier. Default 'standard'. Pick 'fast' for short structured verdicts: every call
+   * here asks for no reasoning, but a model whose registry entry can't turn reasoning off
+   * (the standard tier can be one) ignores that and may spend the whole output budget
+   * thinking. The shadow judge did exactly that for a month (#2191).
+   */
+  tier?: 'fast' | 'standard';
+}
+
 /**
  * Constrained LLM interface exposed to skills via ctx.infraLlm.
  * Only classify and extract operations — no raw chat.
@@ -34,23 +50,19 @@ export interface InfraLlm {
   /** Quick yes/no classification — routed to 'fast' tier. */
   classify(prompt: string): Promise<InfraLlmResult>;
 
-  /** Structured extraction — routed to 'standard' tier. */
-  extract(prompt: string, options?: {
-    maxTokens?: number;
-    /** For vision: base64 image + MIME type. */
-    image?: { base64: string; mediaType: string };
-  }): Promise<InfraLlmResult>;
+  /** Structured extraction — routed to the 'standard' tier unless `tier` says otherwise. */
+  extract(prompt: string, options?: InfraLlmExtractOptions): Promise<InfraLlmResult>;
 }
 
 /**
  * Per-invocation telemetry context — set by ExecutionLayer when injecting
- * infraLlm into SkillContext, so bus events carry the correct IDs.
+ * infraLlm into ToolContext, so bus events carry the correct IDs.
  */
 export interface InfraLlmScope {
   agentId?: string;
   taskEventId?: string;
   conversationId?: string;
-  skillName: string;
+  toolName: string;
 }
 
 /**
@@ -92,12 +104,13 @@ export class InfraLlmService {
       response = await this.providerRouter.chat({
         model: resolved.model,
         messages: [{ role: 'user', content: prompt }],
-        options: { max_tokens: 10 },
+        // A 10-token classifier cap leaves no room for thinking (ADR-048 §3).
+        options: { max_tokens: 10, reasoning: NO_REASONING },
       });
     } catch (err) {
       // LLMProvider contract says chat() never throws, but network-level exceptions
       // can slip through. Catch here to honour our own errors-as-values contract.
-      this.logger.error({ err, skillName: scope.skillName }, 'infraLlm.classify: provider threw unexpectedly');
+      this.logger.error({ err, toolName: scope.toolName }, 'infraLlm.classify: provider threw unexpectedly');
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
 
@@ -106,22 +119,30 @@ export class InfraLlmService {
     if (response.type !== 'text') {
       const errorMsg = response.type === 'error' ? response.error.message : 'Unexpected non-text response';
       this.logger.error(
-        { type: response.type, skillName: scope.skillName, model: resolved.model },
+        { type: response.type, toolName: scope.toolName, model: resolved.model },
         'infraLlm.classify failed',
       );
       return { ok: false, error: errorMsg };
     }
 
-    await this.publishTelemetry(response.usage, response.provenance, latencyMs, prompt, response.content, scope);
+    await this.publishTelemetry(response, latencyMs, prompt, scope);
     return { ok: true, text: response.content };
   }
 
   private async doExtract(
     prompt: string,
-    options: { maxTokens?: number; image?: { base64: string; mediaType: string } } | undefined,
+    options: InfraLlmExtractOptions | undefined,
     scope: InfraLlmScope,
   ): Promise<InfraLlmResult> {
-    const resolved = this.modelRouter.resolve('standard');
+    // Validate before resolve(): resolve throws on an unknown tier, and this service returns
+    // errors as values. Only fast and standard are offered — not powerful — to keep the
+    // surface (and its cost) narrow.
+    const tier = options?.tier ?? 'standard';
+    if (tier !== 'fast' && tier !== 'standard') {
+      this.logger.error({ tier, toolName: scope.toolName }, 'infraLlm.extract: invalid tier');
+      return { ok: false, error: `invalid infraLlm tier "${String(tier)}"` };
+    }
+    const resolved = this.modelRouter.resolve(tier);
     const start = Date.now();
 
     // Build message — plain text or mixed vision content
@@ -147,10 +168,10 @@ export class InfraLlmService {
       response = await this.providerRouter.chat({
         model: resolved.model,
         messages: [message],
-        options: { max_tokens: options?.maxTokens ?? 4000 },
+        options: { max_tokens: options?.maxTokens ?? 4000, reasoning: NO_REASONING },
       });
     } catch (err) {
-      this.logger.error({ err, skillName: scope.skillName }, 'infraLlm.extract: provider threw unexpectedly');
+      this.logger.error({ err, toolName: scope.toolName }, 'infraLlm.extract: provider threw unexpectedly');
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
 
@@ -159,26 +180,25 @@ export class InfraLlmService {
     if (response.type !== 'text') {
       const errorMsg = response.type === 'error' ? response.error.message : 'Unexpected non-text response';
       this.logger.error(
-        { type: response.type, skillName: scope.skillName, model: resolved.model },
+        { type: response.type, toolName: scope.toolName, model: resolved.model },
         'infraLlm.extract failed',
       );
       return { ok: false, error: errorMsg };
     }
 
-    await this.publishTelemetry(response.usage, response.provenance, latencyMs, prompt, response.content, scope, options?.image);
+    await this.publishTelemetry(response, latencyMs, prompt, scope, options?.image);
     return { ok: true, text: response.content };
   }
 
   private async publishTelemetry(
-    usage: LLMUsage,
-    provenance: LLMCallProvenance,
+    response: Extract<LLMResponse, { type: 'text' }>,
     latencyMs: number,
     prompt: string,
-    responseText: string,
     scope: InfraLlmScope,
     image?: { base64: string; mediaType: string },
   ): Promise<void> {
     try {
+      const { usage, provenance } = response;
       // Include image data in the hash when present — without this, two different
       // images with the same text prompt would produce identical promptHash values,
       // breaking audit traceability for vision calls.
@@ -188,10 +208,10 @@ export class InfraLlmService {
         hasher.update(image.base64);
       }
       const promptHash = hasher.digest('hex');
-      const responseHash = createHash('sha256').update(responseText).digest('hex');
+      const responseHash = createHash('sha256').update(response.content).digest('hex');
 
       const event = createLlmCall({
-        agentId: scope.agentId ?? `skill:${scope.skillName}`,
+        agentId: scope.agentId ?? `skill:${scope.toolName}`,
         conversationId: scope.conversationId ?? 'system',
         requestedModel: provenance.requestedModel,
         actualModel: provenance.actualModel,
@@ -205,14 +225,23 @@ export class InfraLlmService {
         providerRequestId: provenance.providerRequestId,
         promptHash,
         responseHash,
+        // Infra extract calls do not set temperature — record the omission.
+        temperature: null,
+        ...llmCallReasoningFields(usage, provenance),
         parentEventId: scope.taskEventId ?? 'system',
+        archive: {
+          prompt: image
+            ? { text: prompt, image: { mediaType: image.mediaType, base64: '[omitted from archive — binary]' } }
+            : { text: prompt },
+          response: buildLlmArchiveResponse(response),
+        },
       });
 
       await this.bus.publish('agent', event);
     } catch (err) {
       // Telemetry failure must not break the skill — log and continue.
       this.logger.warn(
-        { err, skillName: scope.skillName },
+        { err, toolName: scope.toolName },
         'infraLlm: failed to publish llm.call telemetry event',
       );
     }

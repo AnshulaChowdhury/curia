@@ -1,8 +1,13 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
-import { BullpenService } from '../../src/memory/bullpen.js';
+import { BULLPEN_PENDING_WINDOW_MINUTES, BullpenService } from '../../src/memory/bullpen.js';
 import { createLogger } from '../../src/logger.js';
+import { AgentRuntime } from '../../src/agents/runtime.js';
+import { EventBus } from '../../src/bus/bus.js';
+import { createAgentTask } from '../../src/bus/events.js';
+import type { LLMProvider } from '../../src/agents/llm/provider.js';
+import type { ExecutionLayer } from '../../src/skills/execution.js';
 
 const { Pool } = pg;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -56,16 +61,121 @@ describeIf('BullpenService integration (Postgres)', () => {
     expect(after!.thread.lastMessageAt!.getTime()).toBeGreaterThanOrEqual(before!.thread.lastMessageAt!.getTime());
   });
 
-  it('getPendingThreadsForAgent respects time window', async () => {
-    const { thread } = await service.openThread(`${runId} — Old thread`, 'coordinator', ['coordinator', 'agent-b'], 'Old', []);
-    // Force last_message_at to be 2 hours ago
+  async function backdateThread(threadId: string, age: string): Promise<void> {
     await pool.query(
-      `UPDATE bullpen_threads SET last_message_at = NOW() - INTERVAL '2 hours' WHERE id = $1`,
-      [thread.id],
+      `UPDATE bullpen_threads SET last_message_at = NOW() - $2::interval WHERE id = $1`,
+      [threadId, age],
     );
-    // 60-minute window should exclude this thread
-    const pending = await service.getPendingThreadsForAgent('agent-b', 60);
-    expect(pending.find(p => p.threadId === thread.id)).toBeUndefined();
+  }
+
+  // The recency predicate runs in Postgres. A mock cannot tell minutes from
+  // milliseconds: excluding a two-hour-old row also passes when `60` is read as
+  // 60ms. The 30-minute row is what fails that regression. (#1899)
+  it('getPendingThreadsForAgent applies the window in minutes against real rows (#1899)', async () => {
+    const agentId = `agent-${runId}-minutes`;
+    const creator = `creator-${runId}-minutes`;
+    const { thread: inside } = await service.openThread(
+      `${runId} — 30 min`,
+      creator,
+      [creator, agentId],
+      'recent',
+      [agentId],
+    );
+    const { thread: outside } = await service.openThread(
+      `${runId} — 90 min`,
+      creator,
+      [creator, agentId],
+      'stale',
+      [agentId],
+    );
+    await backdateThread(inside.id, '30 minutes');
+    await backdateThread(outside.id, '90 minutes');
+
+    const ids = (await service.getPendingThreadsForAgent(agentId, 60)).map(p => p.threadId);
+    expect(ids).toContain(inside.id);
+    expect(ids).not.toContain(outside.id);
+  });
+
+  it('default window recovers an hours-old handoff and keeps the seen and self-sender guards (#1899)', async () => {
+    const agentId = `agent-${runId}-default`;
+    const creator = `creator-${runId}-default`;
+
+    const { thread: halfHour } = await service.openThread(
+      `${runId} — 30 min default`,
+      creator,
+      [creator, agentId],
+      'please handle this',
+      [agentId],
+    );
+    const { thread: elevenHours } = await service.openThread(
+      `${runId} — 11 hours`,
+      creator,
+      [creator, agentId],
+      'please handle this',
+      [agentId],
+    );
+    const { thread: eightDays } = await service.openThread(
+      `${runId} — 8 days`,
+      creator,
+      [creator, agentId],
+      'please handle this',
+      [agentId],
+    );
+    const { thread: seen } = await service.openThread(
+      `${runId} — seen`,
+      creator,
+      [creator, agentId],
+      'please handle this',
+      [agentId],
+    );
+    const { thread: selfLast } = await service.openThread(
+      `${runId} — self last`,
+      creator,
+      [creator, agentId],
+      'please handle this',
+      [agentId],
+    );
+    await service.postMessage(selfLast.id, agentId, 'done', []);
+
+    await backdateThread(halfHour.id, '30 minutes');
+    await backdateThread(elevenHours.id, '11 hours');
+    await backdateThread(eightDays.id, '8 days');
+    await backdateThread(seen.id, '11 hours');
+    await service.markThreadsSeen(agentId, [seen.id]);
+    await backdateThread(selfLast.id, '11 hours');
+
+    const ids = (await service.getPendingThreadsForAgent(agentId, BULLPEN_PENDING_WINDOW_MINUTES)).map(p => p.threadId);
+    expect(ids).toContain(halfHour.id);
+    expect(ids).toContain(elevenHours.id);
+    expect(ids).not.toContain(eightDays.id);
+    expect(ids).not.toContain(seen.id);
+    expect(ids).not.toContain(selfLast.id);
+  });
+
+  it('reserves one of the five slots for the oldest eligible thread (#1899)', async () => {
+    const agentId = `agent-${runId}-cap`;
+    const creator = `creator-${runId}-cap`;
+    const idsByAge = new Map<number, string>();
+    for (let ageDays = 1; ageDays <= 6; ageDays++) {
+      const { thread } = await service.openThread(
+        `${runId} — age ${ageDays}d`,
+        creator,
+        [creator, agentId],
+        `message ${ageDays}`,
+        [agentId],
+      );
+      await backdateThread(thread.id, `${ageDays} days`);
+      idsByAge.set(ageDays, thread.id);
+    }
+
+    const ids = (await service.getPendingThreadsForAgent(agentId, BULLPEN_PENDING_WINDOW_MINUTES)).map(p => p.threadId);
+    expect(ids).toContain(idsByAge.get(6));
+    expect(ids).toContain(idsByAge.get(1));
+    expect(ids).toContain(idsByAge.get(2));
+    expect(ids).toContain(idsByAge.get(3));
+    expect(ids).toContain(idsByAge.get(4));
+    expect(ids).not.toContain(idsByAge.get(5));
+    expect(ids).toHaveLength(5);
   });
 
   it('closeThread prevents further posts', async () => {
@@ -133,4 +243,291 @@ describeIf('BullpenService integration (Postgres)', () => {
     // A different participant who never saw it still has it pending.
     expect((await service.getPendingThreadsForAgent('agent-c', 60)).map(p => p.threadId)).toContain(thread.id);
   });
+
+  // #1901: an ignored ambient @mention stays pending; an out-of-band handle is
+  // watermarked until a newer message; the thread a bullpen wake was for is
+  // watermarked even when the agent does not reply. Real Postgres, mock LLM.
+  it('keeps an ignored @mention pending and watermarks a handled out-of-band thread (#1901)', async () => {
+    const agentId = `agent-${runId}-wm`;
+    const creator = `creator-${runId}-wm`;
+    const ignoredText = 'qqqq ignored-alpha-1901-token qqqq keep this mention pending qqqq';
+    const handledText = 'zzzz handled-beta-1901-token zzzz relay this mention out of band zzzz';
+    const originText = 'yyyy origin-gamma-1901-token yyyy this wake belongs to the thread yyyy';
+
+    const { thread: ignored } = await service.openThread(
+      `${runId} — ignored mention`,
+      creator,
+      [creator, agentId],
+      ignoredText,
+      [agentId],
+    );
+    const { thread: handled } = await service.openThread(
+      `${runId} — handled mention`,
+      creator,
+      [creator, agentId],
+      handledText,
+      [agentId],
+    );
+    const { thread: origin } = await service.openThread(
+      `${runId} — origin mention`,
+      creator,
+      [creator, agentId],
+      originText,
+      [agentId],
+    );
+
+    const pendingIds = async (): Promise<string[]> => (
+      await service.getPendingThreadsForAgent(agentId, BULLPEN_PENDING_WINDOW_MINUTES)
+    ).map(p => p.threadId);
+
+    // One wake does both jobs: the handled thread is quoted out of band, and the
+    // other two mentions are left untouched. A second wake of those same messages
+    // would be the bounded retry and would watermark them (#1901).
+    await runBullpenWake({
+      agentId,
+      service,
+      provider: toolThenTextProvider('signal-send', { to: '+15551212', message: handledText }),
+      executionLayer: {
+        invoke: vi.fn().mockResolvedValue({ success: true, data: 'sent' }),
+      } as unknown as ExecutionLayer,
+      content: 'anything waiting?',
+      conversationId: `conv-${runId}-1`,
+      channelId: 'signal',
+    });
+    let ids = await pendingIds();
+    expect(ids).toContain(ignored.id);
+    expect(ids).not.toContain(handled.id);
+    expect(ids).toContain(origin.id);
+    expect((await service.getThread(handled.id))!.thread.status).toBe('open');
+    expect((await service.getPendingThreadsForAgent(agentId, BULLPEN_PENDING_WINDOW_MINUTES))
+      .find(p => p.threadId === ignored.id)?.alreadyInjected).toBe(true);
+
+    await service.postMessage(
+      handled.id,
+      creator,
+      'wwww newest-delta-1901-token wwww a newer message brings the thread back wwww',
+      [agentId],
+    );
+    ids = await pendingIds();
+    expect(ids).toContain(handled.id);
+
+    await runBullpenWake({
+      agentId,
+      service,
+      provider: textProvider('nothing to add'),
+      content: 'You were mentioned. No reply required.',
+      conversationId: origin.id,
+      channelId: 'bullpen',
+      metadata: { taskOrigin: 'bullpen', threadId: origin.id },
+    });
+    ids = await pendingIds();
+    expect(ids).not.toContain(origin.id);
+    // This wake is the second look at the ignored mention, so the bounded retry
+    // marks it seen. The handled thread's newer message is a new state and stays.
+    expect(ids).not.toContain(ignored.id);
+    expect(ids).toContain(handled.id);
+  });
+
+  it('watermarks an ignored @mention the second time the same messages are shown (#1901)', async () => {
+    const agentId = `agent-${runId}-retry`;
+    const creator = `creator-${runId}-retry`;
+    const { thread } = await service.openThread(
+      `${runId} — retry mention`,
+      creator,
+      [creator, agentId],
+      'qqqq retry-once-1901-token qqqq please relay this mention qqqq',
+      [agentId],
+    );
+
+    await runBullpenWake({
+      agentId,
+      service,
+      provider: textProvider('busy'),
+      content: 'unrelated',
+      conversationId: `conv-${runId}-retry-1`,
+      channelId: 'signal',
+    });
+    const afterFirst = await service.getPendingThreadsForAgent(agentId, BULLPEN_PENDING_WINDOW_MINUTES);
+    expect(afterFirst.map(p => p.threadId)).toContain(thread.id);
+    expect(afterFirst.find(p => p.threadId === thread.id)?.alreadyInjected).toBe(true);
+
+    await runBullpenWake({
+      agentId,
+      service,
+      provider: textProvider('still busy'),
+      content: 'still unrelated',
+      conversationId: `conv-${runId}-retry-2`,
+      channelId: 'signal',
+    });
+    const afterSecond = await service.getPendingThreadsForAgent(agentId, BULLPEN_PENDING_WINDOW_MINUTES);
+    expect(afterSecond.map(p => p.threadId)).not.toContain(thread.id);
+  });
+
+  it('markThreadsSeen stops at the message the agent was shown (#1901)', async () => {
+    const agentId = `agent-${runId}-shown`;
+    const creator = `creator-${runId}-shown`;
+    const { thread } = await service.openThread(
+      `${runId} — shown bound`,
+      creator,
+      [creator, agentId],
+      'status only',
+      [],
+    );
+    const shown = (await service.getThread(thread.id))!.messages[0]!.createdAt;
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(shown.getTime() + 5_000));
+    try {
+      await service.postMessage(thread.id, creator, 'please handle this new mention', [agentId]);
+      await service.markThreadsSeen(agentId, [thread.id], new Map([[thread.id, shown]]));
+    } finally {
+      vi.useRealTimers();
+    }
+    expect((await service.getPendingThreadsForAgent(agentId, 60)).map(p => p.threadId)).toContain(thread.id);
+  });
+
+  it('does not give the oldest slot to a handoff already shown and left untouched (#1901)', async () => {
+    const agentId = `agent-${runId}-age`;
+    const creator = `creator-${runId}-age`;
+    const idsByAge = new Map<number, string>();
+    for (let ageDays = 1; ageDays <= 6; ageDays++) {
+      const { thread } = await service.openThread(
+        `${runId} — shown-age ${ageDays}d`,
+        creator,
+        [creator, agentId],
+        `message ${ageDays}`,
+        [agentId],
+      );
+      await backdateThread(thread.id, `${ageDays} days`);
+      idsByAge.set(ageDays, thread.id);
+    }
+    const oldestId = idsByAge.get(6)!;
+    const shown = (await service.getThread(oldestId))!.thread.lastMessageAt!;
+    await service.recordUnhandledInjection(agentId, [{ threadId: oldestId, shownThrough: shown }]);
+
+    const ids = (await service.getPendingThreadsForAgent(agentId, BULLPEN_PENDING_WINDOW_MINUTES)).map(p => p.threadId);
+    expect(ids).toContain(idsByAge.get(5));
+    expect(ids).toContain(idsByAge.get(1));
+    expect(ids).toContain(idsByAge.get(2));
+    expect(ids).toContain(idsByAge.get(3));
+    expect(ids).toContain(idsByAge.get(4));
+    expect(ids).not.toContain(oldestId);
+    expect(ids).toHaveLength(5);
+  });
+
+  it('keeps five slots when every thread older than the four newest was already shown (#1901)', async () => {
+    const agentId = `agent-${runId}-age7`;
+    const creator = `creator-${runId}-age7`;
+    const idsByAge = new Map<number, string>();
+    // Hours, not days: a thread exactly seven days old is outside the window.
+    for (const ageHours of [10, 20, 30, 40, 50, 60, 70]) {
+      const { thread } = await service.openThread(
+        `${runId} — filled-age ${ageHours}h`,
+        creator,
+        [creator, agentId],
+        `message ${ageHours}`,
+        [agentId],
+      );
+      await backdateThread(thread.id, `${ageHours} hours`);
+      idsByAge.set(ageHours, thread.id);
+    }
+    const injected = await Promise.all([50, 60, 70].map(async ageHours => {
+      const threadId = idsByAge.get(ageHours)!;
+      const shown = (await service.getThread(threadId))!.thread.lastMessageAt!;
+      return { threadId, shownThrough: shown };
+    }));
+    await service.recordUnhandledInjection(agentId, injected);
+
+    const ids = (await service.getPendingThreadsForAgent(agentId, BULLPEN_PENDING_WINDOW_MINUTES)).map(p => p.threadId);
+    expect(ids).toContain(idsByAge.get(70));
+    expect(ids).toContain(idsByAge.get(10));
+    expect(ids).toContain(idsByAge.get(20));
+    expect(ids).toContain(idsByAge.get(30));
+    expect(ids).toContain(idsByAge.get(40));
+    expect(ids).not.toContain(idsByAge.get(50));
+    expect(ids).not.toContain(idsByAge.get(60));
+    expect(ids).toHaveLength(5);
+  });
 });
+
+const MOCK_PROVENANCE = {
+  requestedModel: 'mock-model',
+  actualModel: 'mock-model',
+  providerRequestId: 'msg_mock_000',
+} as const;
+
+function textProvider(content: string): LLMProvider {
+  return {
+    id: 'mock',
+    chat: vi.fn().mockResolvedValue({
+      type: 'text' as const,
+      content,
+      usage: { inputTokens: 10, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+      provenance: MOCK_PROVENANCE,
+    }),
+  };
+}
+
+function toolThenTextProvider(name: string, input: Record<string, unknown>): LLMProvider {
+  let calls = 0;
+  return {
+    id: 'mock',
+    chat: vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          type: 'tool_use' as const,
+          toolCalls: [{ id: 'call-1', name, input }],
+          usage: { inputTokens: 10, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+          provenance: MOCK_PROVENANCE,
+        };
+      }
+      return {
+        type: 'text' as const,
+        content: 'done',
+        usage: { inputTokens: 10, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+        provenance: MOCK_PROVENANCE,
+      };
+    }),
+  };
+}
+
+async function runBullpenWake(args: {
+  agentId: string;
+  service: BullpenService;
+  provider: LLMProvider;
+  executionLayer?: ExecutionLayer;
+  content: string;
+  conversationId: string;
+  channelId: string;
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  const logger = createLogger('error');
+  const bus = new EventBus(logger);
+  bus.subscribe('agent.response', 'dispatch', () => {});
+  const agent = new AgentRuntime({
+    agentId: args.agentId,
+    systemPrompt: 'You are the coordinator.',
+    provider: args.provider,
+    resolvedModel: 'mock-model',
+    bus,
+    logger,
+    ...(args.executionLayer ? { executionLayer: args.executionLayer } : {}),
+    bullpenService: args.service,
+    pinnedTools: ['signal-send'],
+    skillToolDefs: [{
+      name: 'signal-send',
+      description: 'Send a Signal message',
+      input_schema: { type: 'object' as const, properties: {}, required: [] },
+    }],
+  });
+  agent.register();
+  await bus.publish('dispatch', createAgentTask({
+    agentId: args.agentId,
+    conversationId: args.conversationId,
+    channelId: args.channelId,
+    senderId: 'user',
+    content: args.content,
+    parentEventId: randomUUID(),
+    ...(args.metadata ? { metadata: args.metadata } : {}),
+  }));
+}

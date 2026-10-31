@@ -1,0 +1,18 @@
+{
+  "name": "contact-update",
+  "description": "Update canonical profile attributes (job title, organization, timezone, phone, LinkedIn, etc.) on an existing contact. contact_id is a UUID from contact-lookup or entity-context — do not invent IDs — or \"principal\" for the principal's own contact. For a new email or phone not yet associated with the contact, use contact-link-identity first; setting primaryEmail or primaryPhone requires the address to already be registered as a contact identity. primaryPhone is normalized to E.164; a number that cannot be normalized, or an address that is not registered, returns an error. Note it and do not retry, and do not fall back to memory-store for the same field.",
+  "version": "0.3.0",
+  "sensitivity": "normal",
+  "action_risk": "low",
+  "inputs": {
+    "contact_id": "string (UUID from contact-lookup or entity-context, or \"principal\")",
+    "fields": "object (canonical fields to write — include only the fields being changed. Valid keys: preferredName, title, organization, primaryEmail, primaryPhone, timezone, locale, location, pronouns, linkedinUrl, bio, birthday. Pass null to clear a field.)"
+  },
+  "outputs": {
+    "contact_id": "string",
+    "updated_fields": "string[] (list of field keys written)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 15000
+}

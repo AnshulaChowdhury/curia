@@ -49,10 +49,13 @@ The audit logger extracts structured fields from each event payload before INSER
 | `inbound.message` | `receive` | `success` | `conversation` / conversationId | `human` / senderId |
 | `agent.task` | `delegate` | `pending` | `agent` / agentId | `system` / `dispatch` |
 | `agent.response` | `respond` | `success` | `conversation` / conversationId | `agent` / agentId |
+| `agent.task.input_injected` | `inject` | `success` | `conversation` / conversationId | `human` / senderContactId |
 | `outbound.message` | `send` | `success` | `conversation` / conversationId | `system` / `dispatch` |
+| `outbound.no_reply` | `suppress` | `success` | `conversation` / conversationId | `system` / `dispatch` |
 | `outbound.delivered` | `deliver` | `success` | `conversation` / conversationId | `channel` / channelId |
-| `skill.invoke` | `execute` | `pending` | `skill` / skillName | `agent` / agentId |
-| `skill.result` | `execute` | from `result.success` | `skill` / skillName | `agent` / agentId |
+| `outbound.judge` | `judge` | from payload.outcome (`success`/`denied`/`error`) | `conversation` / conversationId | `system` / `dispatch` |
+| `tool.invoke` | `execute` | `pending` | `skill` / toolName | `agent` / agentId |
+| `tool.result` | `execute` | from `result.success` | `skill` / toolName | `agent` / agentId |
 | `memory.store` | `create` | `success` | `kg_node` / nodeId | `agent` / agentId |
 | `memory.query` | `read` | `success` | `knowledge_graph` / queryType | `agent` / agentId |
 | `contact.resolved` | `resolve` | `success` | `contact` / contactId | `system` / `dispatch` |
@@ -88,7 +91,9 @@ A controlled vocabulary for the `action` column. Inspired by CADF and FHIR Audit
 | `delegate` | Task routed to an agent |
 | `respond` | Agent produced a response |
 | `send` | Outbound message delivered |
+| `suppress` | Outbound delivery explicitly declined (`NO_REPLY`) or otherwise withheld by policy |
 | `receive` | Inbound message accepted |
+| `inject` | A same-contact follow-up was drained into a live turn (`agent.task.input_injected`, #2018). `task_id` is the host turn, not a payload field named `taskId` |
 | `resolve` | Identity or contact resolution attempted |
 | `hold` | Message held pending human review |
 | `approve` | Human approved a pending action |
@@ -96,6 +101,8 @@ A controlled vocabulary for the `action` column. Inspired by CADF and FHIR Audit
 | `authenticate` | Authentication attempted |
 | `escalate` | Action escalated to human oversight |
 | `configure` | System configuration changed |
+| `judge` | Stage-2 outbound LLM judge recorded a decision (#1911) |
+| `record` | Harness recorded the requester evidence shown to a delegated specialist (`delegation.requester_context`, #1859) |
 
 New actions can be added as new event types are introduced. The `action` column is a TEXT field, not an enum, to avoid migration churn.
 
@@ -129,6 +136,13 @@ interface LlmCallPayload {
   // but enough to verify integrity
   promptHash: string;           // SHA-256 of the full prompt (system + messages + tools)
   responseHash: string;         // SHA-256 of the full response content
+  // Sampling — what was actually sent on the provider request (#2038)
+  temperature?: number | null;  // finite number when set; null when the request omitted it
+  // Reasoning (ADR-048 §5)
+  reasoningTokens?: number | null;      // subset of outputTokens; null when the provider reported none
+  reasoningEffort?: ReasoningEffort | null; // effort sent; null when the request sent none (provider default)
+  upstreamProvider?: string | null;     // OpenRouter's serving endpoint (e.g. 'CoreWeave'); null elsewhere
+  reasoningBlocksDropped?: number;      // passed-back blocks the prefix guard dropped; 0 when none
 }
 ```
 
@@ -162,7 +176,13 @@ CREATE TABLE llm_call_archive (
 
 **Redaction:** The existing redaction layer processes prompts and responses before archive write. Secrets and PII patterns are stripped per the same rules used for audit log payloads. **If redaction fails** (malformed content, unexpected binary data), the archive write is skipped — never fall back to writing unredacted content. The `audit_log` row for the `llm.call` event is still written (it contains hashes, not raw content). A high-severity error is logged via pino with the event ID and redaction failure reason.
 
-**Retention:** The `llm_call_archive` is large (prompts and responses can be several KB each). Retention policy: 90 days hot (in Postgres), then archived to compressed JSONL on disk. The `audit_log` row (with hashes) is retained per the standard audit retention schedule.
+**Config kill-switch:** `audit.llmCallArchive.enabled` in `config/default.yaml` (default `true`). When `false`, `AuditLogger` skips archive writes even if the `llm.call` event carries archive content — operators can kill the store fast if redaction misses something. Provenance hashes on the `llm.call` audit row still write.
+
+**Reasoning:** OpenRouter responses may include the model's reasoning. The archive response records that text, the reasoning-token count, and `reasoningOmitted` (`empty` or `encrypted`) when the token count is non-zero but no readable reasoning came back. `audit.llmCallArchive.includeReasoning` (default `true`) drops the reasoning string from new rows when `false`; token counts and the rest of the archive still write. The text is redacted with the rest of the row and is not encrypted at rest. Null bytes are stripped from prompt, response, and tool definitions before insert so one U+0000 cannot roll back the `llm.call` audit row.
+
+**Retention:** The `llm_call_archive` is large (prompts and responses can be several KB each). Hot retention is `audit.llmCallArchive.hotRetentionDays` (default 90); DreamEngine's decay pass DELETEs older rows. Cold archive to compressed JSONL on disk remains a later-phase job. The `audit_log` row (with hashes) is retained per the standard audit retention schedule.
+
+**Encryption-at-rest:** Phase 1 stores redacted JSONB in Postgres plaintext (same class as other sensitive tables). Application-level or column encryption for the archive is an explicit follow-up — until then treat the table as a plaintext concentration of conversational content with best-effort redaction.
 
 **Why separate tables:** The audit log is optimized for fast, indexed queries ("show me all actions by agent X on contact Y"). Storing multi-KB prompts inline would bloat the table and slow scans. The archive is optimized for replay ("show me exactly what the LLM saw when it made decision Z"). Different access patterns, different tables.
 
@@ -197,11 +217,11 @@ This creates a traceable link from any response back to its data sources. Memory
 
 ### Skill Data Access Logging
 
-Skills that read external data (email-reader, calendar-reader, web-fetcher) should include a `sourcesAccessed` field in their `skill.result` payload:
+Skills that read external data (email-reader, calendar-reader, web-fetcher) should include a `sourcesAccessed` field in their `tool.result` payload:
 
 ```typescript
 // Convention for skill result data when external sources are consulted
-interface SkillResultWithSources {
+interface ToolResultWithSources {
   success: true;
   data: unknown;
   sourcesAccessed?: Array<{
@@ -211,17 +231,17 @@ interface SkillResultWithSources {
 }
 ```
 
-This is a convention, not a type enforcement — skills are responsible for populating it. The audit log captures whatever the skill returns. Skills that don't access external sources omit the field. To prevent silent omission, skills whose manifests declare external data sources (via a `dataSources` field in `skill.json`) should be validated at test time: a lint/test checks that their results include `sourcesAccessed` when `success: true`.
+This is a convention, not a type enforcement — skills are responsible for populating it. The audit log captures whatever the skill returns. Skills that don't access external sources omit the field. To prevent silent omission, skills whose manifests declare external data sources (via a `dataSources` field in `tool.json`) should be validated at test time: a lint/test checks that their results include `sourcesAccessed` when `success: true`.
 
 ---
 
 ## Tamper Evidence
 
-*Required by NIST SP 800-92, SOC 2 CC7.2, recommended by AuditableLLM (2024).*
+*Informs NIST SP 800-92 / SOC 2 CC7.2 integrity controls. Phase 1 is an honesty-scoped foundation — see "What Phase 1 detects" below.*
 
 ### Hash Chain
 
-Each audit log entry includes a SHA-256 hash computed over its content and the previous entry's hash, forming a verifiable chain. Any modification to a historical record invalidates every subsequent hash.
+Each hashed audit log entry includes a SHA-256 hash computed over its content and the previous hashed entry's hash, forming a verifiable chain. Chain order is the monotonic `seq` BIGSERIAL column — **not** wall-clock `timestamp`. `timestamp` always stores the factual `event.timestamp` verbatim.
 
 **Computation:**
 
@@ -234,23 +254,29 @@ entry_hash = SHA-256(canonical_json({
 }) + previous_entry_hash)
 ```
 
-- The first entry chains from a fixed genesis constant: `SHA-256("curia-audit-genesis-v1")`
-- `canonical_json` sorts keys alphabetically and uses deterministic formatting (no whitespace) to prevent false positive tampering alerts from JSON key-ordering variations
-- The `entry_hash` column stores the computed hash of the current record. To chain, the audit logger reads the most recent `entry_hash` value before computing the new one. This means each record's hash incorporates the entire history of the chain — modifying any past record invalidates every hash after it
+- The first hashed entry chains from a fixed public genesis constant: `SHA-256("curia-audit-genesis-v1")`
+- `canonical_json` sorts keys alphabetically and uses deterministic formatting (no whitespace) to prevent false positive alerts from JSON key-ordering variations
+- `seq` is **not** part of the hashed field set (ordering key only)
+- Pre-hardening rows with NULL `entry_hash` are skipped by verify; the chain is defined only over hashed rows
+- Head select / verify walk: `ORDER BY seq` (ASC for verify, DESC LIMIT 1 for head)
 
-**Serialization:** All audit writes are serialized through a single writer (the `AuditLogger` instance). This is already the case — the bus's write-ahead hook calls `AuditLogger.log()` sequentially before delivering each event. The hash chain computation reads the previous `entry_hash` and writes the new one in the same INSERT. At current throughput (~425 events/day), serialization has negligible performance impact. If throughput ever becomes a concern, the INSERT can use an advisory lock or CTE to atomically read-then-write without external serialization.
+**What Phase 1 detects (and what it does not):** The public genesis + public SHA-256 algorithm detect **accidental corruption and naive / unsophisticated tampering** (e.g. flipping a column without recomputing hashes). They do **not** stop a knowledgeable insider with DB write access: that actor can disable the append-only trigger, edit a row, and recompute every subsequent `entry_hash` into a chain that verifies clean. Truncation is also invisible today — deleting all hashed rows makes verify pass vacuously; deleting a contiguous recent suffix leaves a shorter but internally consistent chain. Phase 1 therefore must **not** be claimed as SOC 2 CC7.2 / NIST 800-92 "tamper evidence" on its own.
 
-**Bootstrapping:** On startup, the audit logger queries `SELECT entry_hash FROM audit_log ORDER BY timestamp DESC LIMIT 1` to seed the chain. If the table is empty (fresh deployment), the genesis constant is used. This query runs once at boot, before the bus starts accepting events.
+**Next phase (genuine tamper evidence) — not in Phase 1:**
+1. **HMAC-SHA256** with a key held outside the DB (vault/KMS), so re-deriving the chain requires stealing the key too
+2. **External head-hash anchoring** — periodically publish `(head_hash, count)` to an append-only out-of-band store (object-lock/WORM, transparency log, or signed daily artifact) so truncation and wholesale rewrite are detectable
 
-**Implementation:** ~30 lines in the audit logger using Node.js native `crypto.createHash('sha256')`. Zero external dependencies.
+**Serialization ceiling:** Every bus event's write-ahead path does `pool.connect()` → `BEGIN` → `pg_advisory_xact_lock(global)` → head SELECT → INSERT → COMMIT before subscriber delivery. At ~425 events/day this is fine; the lock is a known global-serialization ceiling if throughput grows by orders of magnitude. **Invariant:** never publish a bus event from inside the audit write transaction — that re-enters `log()` on another pooled client and deadlocks on the same advisory lock. `AuditLogger` asserts this with `AsyncLocalStorage` depth tracking. Chain head is always re-read under the lock; there is no in-memory previous-hash cache.
 
-**Verification:** A CLI command `curia audit verify` walks the chain from genesis, recomputing hashes and reporting the first broken link (if any). This is O(n) over the full audit log — acceptable for periodic verification runs, not for real-time checking.
+**Bootstrapping:** On startup, `seedHashChain()` confirms the schema and logs the current head (`ORDER BY seq DESC LIMIT 1`). It does not cache chain state — every write re-reads under the lock. Empty table → genesis.
+
+**Verification:** `pnpm audit:verify` (`scripts/audit-verify.ts`) walks hashed rows `ORDER BY seq ASC`, recomputing hashes and reporting the first broken link (if any). O(n) over the full audit log — periodic runs only. Run locally with `pnpm audit:verify`, or against a deployed instance with `pnpm --prefix /opt/curia tsx --env-file=.env scripts/audit-verify.ts`.
 
 ### Merkle Checkpoints (Future)
 
 For efficient single-entry verification without walking the full chain, periodically compute Merkle tree roots over batches of entries (e.g., every 1000 records or every hour). Store roots in a separate `audit_checkpoints` table. This enables O(log n) verification of any individual entry via a Merkle proof.
 
-For launch, the linear hash chain is sufficient. Merkle checkpoints become valuable when the audit log grows past ~1M entries (~6 years at current rates).
+Merkle checkpoints complement (they do not replace) HMAC + external anchoring for insider-resistant integrity.
 
 ---
 
@@ -376,7 +402,7 @@ This table maps each change in this spec to the standards that require or recomm
 | LLM call provenance (model, tokens, cost, provider ID) | AI 600-1 | Art. 12 | LLM10 | -- | -- |
 | Prompt/response archive | AI 600-1 | Art. 12 | LLM01, LLM09 | -- | -- |
 | Source attribution (resultIds on memory queries) | -- | Art. 12 | LLM08 | -- | -- |
-| Hash-chain tamper evidence | -- | -- | -- | CC7.2 | Yes |
+| Hash-chain integrity check (Phase 1: accidental/naive tampering only; HMAC + external anchor required for CC7.2 / 800-92-grade evidence) | -- | -- | -- | Partial* | Partial* |
 | HITL decision records | -- | Art. 14 | LLM06 | CC7.2 | -- |
 | Agent config change tracking | -- | Art. 19 | LLM03 | CC7.2 | Yes |
 | Retention tiers | -- | Art. 19 | -- | 12-month | Yes |
@@ -402,11 +428,11 @@ This spec is designed to be implemented incrementally. Each phase is independent
 
 6. Migration: add `entry_hash` column to `audit_log`
 7. Hash chain computation in `AuditLogger.log()` (~30 lines)
-8. `curia audit verify` CLI command
+8. `pnpm audit:verify` maintenance script (`scripts/audit-verify.ts`)
 9. Extend `MemoryQueryPayload` with `results` array (id + optional score)
 10. `sourcesAccessed` convention for skill results
 
-**Validates:** NIST 800-92 integrity, SOC 2 CC7.2 tamper detection, EU AI Act Article 12 reference data tracking.
+**Validates (Phase 1 scope):** accidental/naive chain breakage detection + EU AI Act Article 12 reference data tracking. Full NIST 800-92 / SOC 2 CC7.2 tamper evidence waits on HMAC + external head-hash anchoring (next phase).
 
 ### Phase C: HITL Records + Config Tracking
 
@@ -425,24 +451,34 @@ This spec is designed to be implemented incrementally. Each phase is independent
 
 ---
 
-## Implementation Status
+## Status
 
-| Item | Status |
-|---|---|
-| Migration: structured columns on `audit_log` (`action`, `outcome`, `target_type`, `target_id`, `initiator_type`, `initiator_id`) | Not Done |
-| Field extraction logic in `AuditLogger.log()` | Not Done |
-| `llm.call` event type added to `events.ts` | Done |
-| LLM providers emit `llm.call` events with provenance fields | Not Done |
-| `llm_call_archive` table created and populated | Not Done |
-| Redaction applied to prompt/response archive writes | Not Done |
-| `entry_hash` column added and hash chain computed on every write | Not Done |
-| `curia audit verify` CLI command implemented and tested | Not Done |
-| `MemoryQueryPayload` extended with `results` array (id + optional score) | Not Done |
-| `sourcesAccessed` convention documented and adopted in existing skills | Not Done |
-| `human.decision` event type added and emitted from approval gates | Not Done |
-| `config.change` event type added and emitted at startup | Done |
-| Retention tiers defined in `config/default.yaml` | Not Done |
-| All new event types covered by tests | Not Done |
-| Hash chain verification tested (insert, verify, detect tamper) | Not Done |
-| Monitoring query: detect `[EXTRACTION_FAILED]` values in structured columns | Not Done |
-| Monitoring query: detect `llm.call` audit rows with no corresponding `llm_call_archive` row | Not Done |
+Phase 1 of this spec (#1383) — structured columns, field extraction, hash chain,
+`llm_call_archive`, and `pnpm audit:verify` — has shipped. Remaining items below
+are later phases and should be filed as GitHub issues (labeled `audit`) as they're
+prioritized.
+
+### Shipped — Phase 1 ([#1383](https://github.com/josephfung/curia/issues/1383))
+
+- Migration: structured columns on `audit_log` (`action`, `outcome`, `target_type`, `target_id`, `initiator_type`, `initiator_id`) plus `entry_hash`
+- Migration: monotonic `seq` BIGSERIAL for chain/verify order (timestamp stays factual)
+- Field extraction logic in `AuditLogger.log()` (spec mapping + `[EXTRACTION_FAILED]` sentinel)
+- `llm.call` event emission with provenance fields (already present before #1383; typed non-persisted `archive` field)
+- `llm_call_archive` table + redacted atomic write; config kill-switch + hot TTL purge via DreamEngine
+- Hash chain on every write (`ORDER BY seq`); advisory-lock serialization; nested-publish deadlock assertion
+- Offline verify via `pnpm audit:verify` (`scripts/audit-verify.ts`) — not a `curia` CLI (no CLI harness exists)
+- Consumer adoption: `AuditLogRepo`, activity-log, diagnostics audit-query/audit-trace, trust-gate, antfarm interpreter, diagnostics agent prompt
+- `resolve-time-window` (#1592) — turns a natural-language time reference ("around 11:44am", "8-9am yesterday", "last 2 hours") into the strict zone-bearing ISO `since`/`until` pair `audit-query` requires, plus a human-readable `interpretation` so a wrong window is visible rather than silently searched. Read-only, `allowed_callers: ["diagnostics"]`. Without it the diagnostics agent could not query a past time window at all — hand-formatted timestamps were rejected and the failure read as "nothing happened".
+
+### Outstanding work — later phases
+
+- **HMAC-SHA256 + external head-hash anchoring** (upgrade Phase 1 chain to genuine tamper evidence)
+- Encryption-at-rest for `llm_call_archive`
+- Cold archive of purged archive rows to compressed JSONL
+- `MemoryQueryPayload` extended with `results` array (id + optional score)
+- `sourcesAccessed` convention documented and adopted in existing skills
+- `human.decision` event type emitted from approval gates (event type exists; emission coverage may still be incomplete)
+- `config.change` event type + startup detection
+- Monitoring query: detect `[EXTRACTION_FAILED]` values in structured columns
+- Monitoring query: detect `llm.call` audit rows with no corresponding `llm_call_archive` row
+- Merkle checkpoints / CloudEvents export / partitioning (Phase D)

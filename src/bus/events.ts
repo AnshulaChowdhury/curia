@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { ErrorType } from '../errors/types.js';
-import type { DedupConfidence } from '../contacts/types.js';
+import type { ContactTier, DedupConfidence, SystemRole, TierElevationReason, TrustLevel } from '../contacts/types.js';
 import type { Sensitivity, NodeType } from '../memory/types.js';
 import type { ActionRisk } from '../skills/types.js';
+import type { ReasoningEffort } from '../agents/llm/sampling-options.js';
+import type { ReasoningWatchdogRecord } from '../agents/llm/reasoning-watchdog.js';
 
 // -- Base event shape --
 // Every event on the bus shares these fields; parentEventId forms the causal chain.
@@ -33,7 +35,24 @@ interface InboundMessagePayload {
   metadata?: Record<string, unknown>;
 }
 
-interface AgentTaskPayload {
+/**
+ * Channel-agnostic reaction signal (emoji on a prior outbound/inbound message).
+ * Adapters normalize platform reaction events into this shape; emoji→intent
+ * mapping (e.g. 👍 → approve) lives in dispatch/approval — never in adapters.
+ */
+interface InboundReactionPayload {
+  conversationId: string;
+  channelId: string;
+  /** Platform sender id (Slack U…, Signal ACI, …). Resolve via contacts/tier. */
+  senderId: string;
+  /** Emoji shortcode or unicode without surrounding colons (e.g. "thumbsup"). */
+  emoji: string;
+  /** Provider message id of the reacted-to message (Slack ts, …). */
+  targetMessageId: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AgentTaskPayload {
   agentId: string;
   conversationId: string;
   channelId: string;
@@ -43,6 +62,31 @@ interface AgentTaskPayload {
   senderId: string;
   content: string;
   metadata?: Record<string, unknown>;
+  /** Live-principal-turn signal (#1126). A DISTINCT top-level field — deliberately NOT part of
+   *  `metadata` — so it can never be swept into a persisted row by a skill that forwards the
+   *  metadata bag (jobs/tasks/bullpen copy `originator` by name; they don't see this field).
+   *  Stamped `true` ONLY by the dispatcher on a fresh principal inbound, and forwarded by the
+   *  `delegate` skill across a SYNCHRONOUS delegation (so a specialist acting inside the principal's
+   *  live turn inherits it). Structurally absent from every wake, scheduler fire, and persisted
+   *  task — those construct their own agent.task without it. The elevated-skill gate requires it. */
+  liveTurn?: boolean;
+  /** Synthetic-turn signal (#1892). Like `liveTurn`, a DISTINCT top-level field rather than a
+   *  `metadata` key, so a skill forwarding the metadata bag cannot set it by accident. Stamped
+   *  `true` when an internal producer re-enters an agent with a brief Curia wrote to itself,
+   *  rather than a person's message. The runtime forwards it to `working_memory.synthetic`,
+   *  where contact recall reads it to tell Curia's own row apart from an unattributed human
+   *  message. Absent means "a person said this", which is the fail-closed reading — a
+   *  mislabelled human turn would drop its conversation from the shared-conversation check
+   *  and leak that person's words into another contact's recall. */
+  syntheticTurn?: boolean;
+  /** When this turn's caller will stop waiting, epoch ms (#2371). Like `liveTurn`, a DISTINCT
+   *  top-level field rather than a `metadata` key, so a skill forwarding the metadata bag
+   *  cannot copy a stale deadline into another task. Set by the `delegate` skill (dispatch time
+   *  plus the resolved wait) and by the scheduler (fire time plus the slot timeout). The runtime
+   *  hands it to the LLM call as `options.deadlineAt`, where the reasoning watchdog positions
+   *  its time trigger against it. It never cancels the turn; turns stay non-cancellable.
+   *  Absent means no deadline is known. */
+  turnDeadlineAt?: number;
   /** Resolved sender context from the contact resolver. Undefined if contacts not configured. */
   senderContext?: import('../contacts/types.js').InboundSenderContext;
   /** Original task intent for persistent scheduler tasks. Undefined for one-shot and direct tasks.
@@ -57,7 +101,49 @@ interface AgentTaskPayload {
    *  to automatically widen the delegate skill timeout for long-running scheduled tasks.
    *  Absent for interactive tasks (direct messages, bullpen, etc.). */
   expectedDurationSeconds?: number;
+  /**
+   * When set, this turn may call only these tools (#1951). A distinct top-level
+   * field, like `syntheticTurn`, so a skill that forwards the metadata bag
+   * cannot set or drop it. The scheduler's task-wake disposition follow-up
+   * sets it to the task tools so that turn cannot repeat the wake's sends.
+   * Absent means the agent's normal tool set.
+   */
+  toolAllowlist?: string[];
+  /**
+   * Trigger guidance for this turn (#1959): which blocks of
+   * src/agents/prompts/turn-guidance.ts apply, set by the dispatcher from what it already
+   * knows about the inbound (principal or not, outbound context injected, email, CC'd).
+   * The runtime renders them at the head of the user message for this turn only. They are
+   * never part of `content`, so working memory and every other reader of the content stay
+   * free of them. Absent means none.
+   */
+  turnGuidance?: import('../agents/prompts/turn-guidance.js').TurnGuidanceKey[];
+  /**
+   * What is waiting on the principal (prompt trim PR 7): set by the dispatcher on a live
+   * principal turn when anything is. The runtime renders it as the backlog line at the end
+   * of the turn guidance (src/agents/prompts/backlog-line.ts); like `turnGuidance`, it is
+   * never part of `content`. Absent means nothing is waiting, or the count failed.
+   */
+  principalBacklog?: import('../agents/prompts/backlog-line.js').PrincipalBacklogCounts;
+  /**
+   * The approvals the principal has been shown and not answered (#2333): set by the
+   * dispatcher on a live principal turn when there are any, newest first, the one replied
+   * to on its email thread marked. The runtime renders them with the turn guidance
+   * (src/agents/prompts/awaiting-answers.ts); never part of `content`.
+   */
+  awaitingAnswers?: import('../agents/prompts/awaiting-answers.js').AwaitingAnswer[];
 }
+
+/** Coarse failure reason propagated on agent.response when isError is true.
+ *  Lets delegation consumers (e.g. the delegate skill) report the real cause
+ *  instead of confabulating an external timeout or generic error. */
+export type AgentResponseFailureReason =
+  | 'maxTurns'
+  | 'maxConsecutiveErrors'
+  | 'tool_error'
+  | 'api_error'
+  | 'blocked'
+  | 'timeout';
 
 interface AgentResponsePayload {
   agentId: string;
@@ -67,10 +153,62 @@ interface AgentResponsePayload {
   // is a generic fallback message rather than a real response. Consumers (e.g. the
   // delegate skill) should treat this as a failure rather than a usable result.
   isError?: boolean;
+  /** Structured error type from the originating AgentError. Present when isError is true
+   *  and the runtime had a classified failure (budget exhaustion, LLM error, etc.). */
+  errorType?: ErrorType;
+  /** Coarse failure reason for planner consumption. Present when isError is true and
+   *  the runtime could determine the cause (see AgentResponseFailureReason). */
+  reason?: AgentResponseFailureReason;
+  /** Whether retrying the same delegation may succeed. Mirrors AgentError.retryable. */
+  retryable?: boolean;
   // Names of skills invoked during the task (in call order, may contain duplicates).
-  // Populated by the agent runtime's tool-use loop; absent on error-path responses
-  // where the runtime bailed before completing the loop.
+  // Populated by the agent runtime's tool-use loop. Present on end-of-loop responses
+  // (including `isError: true` fallbacks); absent on early-bail `sendErrorResponse`
+  // paths where the runtime never entered / finished the loop.
   skillsCalled?: string[];
+  /**
+   * Skills whose successful call sent a message or calendar notification to someone, in
+   * call order (see `isMessageSend` in src/agents/message-sends.ts). Set on responses that
+   * end the tool-use loop without an error; absent on paused and `isError` responses.
+   * `[]` means the task sent nothing. The delegate skill reports it to the caller so
+   * composed text is not mistaken for a send (#2055).
+   */
+  sends?: string[];
+  /**
+   * The channel of the agent.task this answers. Set on responses that carry reply text:
+   * the end of the tool-use loop and the delegation-failure reply, not the structured
+   * clarification pause. The dispatcher reads it to tell a scheduler turn, whose reply
+   * text has no route to anyone, from other unrouted responses such as bullpen and
+   * delegation (#2091).
+   */
+  channelId?: string;
+  /**
+   * Skills that returned `{ success: false }` during the tool-use loop.
+   * Populated alongside `skillsCalled` so the scheduler can persist visibility
+   * into `last_run_context` without flipping job health (#1830). Absent when
+   * no tool failed. Same presence rule as `skillsCalled`: set on end-of-loop
+   * responses (including `isError: true`), absent on early-bail error responses.
+   * Capped to distinct skill names (first failure wins); further failures are
+   * counted in `failedSkillsOmitted`.
+   */
+  failedSkills?: Array<{ name: string; error: string }>;
+  /** Count of tool failures not represented in `failedSkills` (cap overflow / duplicates). */
+  failedSkillsOmitted?: number;
+  /**
+   * Set by the agent runtime when it detects a no-reply sentinel (or a near-miss)
+   * in the model output. Dispatch honours this the same way it honours the
+   * in-band `NO_REPLY` token. Other `agent.response` subscribers (scheduler,
+   * resumable-continuation) must not parse `content` for the token — read this
+   * flag, and treat blank `content` as "nothing to summarise". See #1732.
+   */
+  suppressDelivery?: boolean;
+  /**
+   * A note for the principal, cut out of a response that goes to someone else
+   * (<note_for_principal>, #1990, prompt trim PR 5). `content` never contains it. The
+   * dispatcher delivers it to the principal, whatever happens to the relay itself.
+   * Absent when the response carries no note.
+   */
+  principalNote?: string;
 }
 
 interface OutboundMessagePayload {
@@ -94,6 +232,23 @@ interface OutboundMessagePayload {
   /** The agent.task event ID that originated this outbound message.
    *  Stamped by the dispatcher for traceability and action_log context. */
   taskEventId?: string;
+  /**
+   * When true, the email adapter saves the content as a draft instead of sending.
+   * Set by the dispatcher after content-filter retries are exhausted (#1355).
+   */
+  contentBlockSalvage?: boolean;
+  /**
+   * True when the principal approved this exact text (#2159). Set only by the
+   * dispatcher-relay skill, which approve-action re-invokes. Adapters send it as
+   * humanApproved, so band review does not hold an approved reply a second time.
+   */
+  principalApproved?: boolean;
+  /**
+   * The principal note the dispatcher cut from this reply and queued for the principal
+   * (#2312). The adapter hands it to the gateway so the send review counts it as evidence
+   * that Curia told the principal; it is never part of the outbound text.
+   */
+  reportedToPrincipal?: string;
 }
 
 // OutboundDeliveredPayload — emitted by OutboundGateway after a successful
@@ -104,28 +259,52 @@ interface OutboundMessagePayload {
 // or a skill calling gateway.send() directly. See issue #729.
 interface OutboundDeliveredPayload {
   /** Channel that carried the message — matches OutboundSendRequest.channel. */
-  channel: 'signal' | 'email';
+  channel: 'signal' | 'email' | 'slack' | 'sms';
   /** External recipient identifier: E.164 (signal 1:1), base64 group ID
-   *  (signal group), or email address. */
+   *  (signal group), email address, or Slack conversation id (D…/C…). */
   recipientId: string;
   /** Resolved during the gateway's blocked-contact check (Step 1). Absent
    *  when no contact record existed for the recipient at send time —
    *  promoteOrCreateRecipientContact() runs after dispatch, so v1 does not
    *  resolve twice. */
   recipientContactId?: string;
-  /** Message body that actually went on the wire. For sends routed through
-   *  OutboundGateway.send(), this is the post-PII-redaction body. For
-   *  sendEmailDraft(), PII redaction is skipped (draft content passed
-   *  through the pipeline at creation time). */
+  /** Message body that went on the wire, or its redacted copy when personal data
+   *  the review authorized went out raw: this event never carries the values
+   *  (#2312). Applies to send() and sendEmailDraft() alike. */
   content: string;
   /** Conversation ID when available (dispatcher-routed and skill-invoked
    *  sends initiated from a coordinator task both have one). */
   conversationId?: string;
   /** Originating agent.task event ID, when available. */
   taskEventId?: string;
-  /** Provider message ID — Nylas message ID for email, absent for
-   *  signal-cli (the RPC call returns no ID). */
+  /** Provider message ID — Nylas message ID for email, Slack `ts`, or
+   *  signal-cli send timestamp (stringified) for Signal. */
   messageId?: string;
+  /** Email only: the provider thread the message went out on (#2333), which a reply joins. */
+  threadId?: string;
+  /** Bulk-export audit fields (#201) — populated when attachments leave the system. */
+  exportAudit?: {
+    destination: string;
+    items: Array<{ nodeId?: string; label: string; sensitivity: string }>;
+    toolName?: string;
+    agentId?: string;
+  };
+  /** Personal details that went out as written (authorized by the band review, or a draft
+   *  the principal directed), by label and field, never the values (#2312). `content` is the
+   *  redacted body and cannot show a quote's, so this does. */
+  disclosed?: Array<{ label: string; field: 'body' | 'subject' | 'quote' }>;
+}
+
+// ExportDeliveredPayload — emitted by ExecutionLayer after a successful MCP
+// bulk-record export (Drive/Sheets). Mirrors outbound.delivered for non-channel sinks.
+interface ExportDeliveredPayload {
+  toolName: string;
+  agentId?: string;
+  taskEventId?: string;
+  conversationId?: string;
+  destination: string;
+  items: Array<{ nodeId?: string; label: string; sensitivity: string }>;
+  maxSensitivity: string;
 }
 
 // OutboundPiiRedactedPayload — emitted by the dispatch layer (via PiiRedactor)
@@ -166,27 +345,69 @@ interface OutboundSuppressedDuplicatePayload {
   reason: 'human_reply_already_sent';
 }
 
+// OutboundNoReplyPayload — emitted by the dispatch layer when an agent.response would have
+// produced an outbound.message, but the agent explicitly declined to reply (entire content
+// is the NO_REPLY sentinel). Distinct from outbound.suppressed_duplicate: nothing was sent
+// on this turn, whereas the reply-lock fires after a human-facing skill already succeeded.
+// See #1732.
+interface OutboundNoReplyPayload {
+  /** agent.task event ID whose routing entry was skipped (no outbound.message). */
+  routingTaskId: string;
+  /** Agent that produced the response whose delivery was suppressed. */
+  agentId: string;
+  conversationId: string;
+  channelId: string;
+  /**
+   * `agent_declined` = exact `NO_REPLY` on a normal turn.
+   * `content_block_abandoned` = exact `NO_REPLY` on the rewrite path.
+   * `empty_response` = whitespace-only content (a blank email is not a reply).
+   * `ambiguous_decline` = near-miss sentinel (fenced token plus prose, or the
+   * token appearing as a standalone word) — send suppressed, draft salvaged.
+   * `auto_generated` = inbound was message-derived auto-generated mail and the
+   * agent produced relay text instead of declining; the dispatcher suppressed
+   * delivery and recorded the narrated body on `abandonedContent` so audit can
+   * distinguish preamble compliance (`agent_declined`) from backstop catches
+   * (#1734). Agent always ran — `routingTaskId` / `agentId` are real.
+   * `scheduler_undelivered` = a scheduler-channel turn ended with reply text instead
+   * of declining. Nothing routes a scheduler turn's reply anywhere, so the text
+   * reached no one, whatever else the turn sent; it is kept on `abandonedContent` (#2091).
+   */
+  reason: 'agent_declined' | 'content_block_abandoned' | 'empty_response' | 'ambiguous_decline' | 'auto_generated' | 'scheduler_undelivered';
+  /** Raw text preserved for recoverability (blocked draft, near-miss body,
+   *  narrated auto-gen reply caught by the relay backstop, or an undelivered
+   *  scheduler-turn reply). */
+  abandonedContent?: string;
+}
+
 // OutboundNotificationPayload — published by the dispatch layer (via OutboundGateway.sendNotification)
-// when a system-level CEO alert needs to be sent. Routing through the bus ensures the notification
+// when a system-level principal alert needs to be sent. Routing through the bus ensures the notification
 // goes through the same safety pipeline as regular outbound messages, closing the prior direct
 // dispatchEmail() bypass. See #206.
 //
 // notificationType discriminates between alert categories:
-//   - 'blocked_content': CEO alert that an outbound message was blocked by the content filter
-//   - 'contact_rate_limited': CEO alert that contact auto-creation was throttled due to rate limits
-//   - 'approval_requested':   CEO alert that an autonomy gate blocked a skill and approval is needed
-//   - 'approval_expired':     CEO alert that pending approvals expired without response (approval-expiry-sweep)
-//   - 'schedule_suspended': CEO alert that a scheduled job was auto-suspended after consecutive failures (#538)
-//   - 'schedule_recovered': CEO alert that a stuck job was auto-recovered (reset to pending or suspended) (#207)
+//   - 'blocked_content': no longer emitted (#2159: block notices go to the digest queue); kept for historical audit rows
+//   - 'contact_rate_limited': principal alert that contact auto-creation was throttled due to rate limits
+//   - 'approval_requested':   principal alert that an autonomy gate blocked a skill and approval is needed
+//   - 'approval_expired':     no longer emitted (#2159: expiries go to the digest queue); kept for historical audit rows
+//   - 'schedule_suspended': principal alert that a scheduled job was auto-suspended after consecutive failures (#538)
+//   - 'schedule_recovered': principal alert that a stuck job was auto-recovered (reset to pending or suspended) (#207)
+//   - 'learning_proposal':  principal alert surfacing a learning-digest item (voice-guide proposal or sent-mail
+//                           task-completion undo/confirm) event-driven when produced, after #1464 removed
+//                           the scheduled digest that used to surface them (#1466)
+//   - 'database_unavailable': principal alert that Postgres has been unreachable for >5 minutes (#1381)
+//   - 'principal_note':     no longer emitted (#2159: notes go to the digest queue); kept for historical audit rows
 export interface OutboundNotificationPayload {
   notificationType:
-    | 'blocked_content'
+    | 'blocked_content'         // no longer emitted (#2159); kept for historical audit rows
     | 'contact_rate_limited'
     | 'approval_requested'
-    | 'approval_expired'        // batched expiry notification (approval-expiry-sweep)
+    | 'approval_expired'        // no longer emitted (#2159); kept for historical audit rows
     | 'schedule_suspended'      // scheduled job auto-suspended after consecutive failures (#538)
-    | 'schedule_recovered';     // stuck job auto-recovered after exceeding timeout threshold (#207)
-  /** Recipient email for this notification (always the CEO email today). */
+    | 'schedule_recovered'      // stuck job auto-recovered after exceeding timeout threshold (#207)
+    | 'learning_proposal'       // learning-digest item surfaced event-driven when produced (#1466)
+    | 'database_unavailable'  // Postgres unreachable beyond escalation threshold (#1381)
+    | 'principal_note';       // no longer emitted (#2159); kept for historical audit rows
+  /** Recipient email for this notification (always the principal email today). */
   ceoEmail: string;
   subject: string;
   body: string;
@@ -198,20 +419,42 @@ export interface OutboundNotificationPayload {
   originalRecipientId?: string;
 }
 
-interface SkillInvokePayload {
+interface ToolInvokePayload {
   agentId: string;
   conversationId: string;
-  skillName: string;
+  toolName: string;
   input: Record<string, unknown>;
   taskEventId: string;  // traces back to the agent.task that triggered this
 }
 
-interface SkillResultPayload {
+interface ToolResultPayload {
   agentId: string;
   conversationId: string;
-  skillName: string;
-  result: { success: true; data: unknown } | { success: false; error: string };
+  toolName: string;
+  /**
+   * Skill/tool outcome. Failure may carry `errorType` (e.g. IDENTITY_MISMATCH #1854)
+   * so audit_log can query structured classifications without parsing prose in `error`.
+   */
+  result:
+    | { success: true; data: unknown }
+    | {
+        success: false;
+        error: string;
+        errorType?: ErrorType;
+      };
   durationMs: number;
+  /**
+   * Principal conversation when this skill ran inside a delegated specialist
+   * (#1860). Reply-lock matches it so a specialist send can suppress the
+   * coordinator's relay. Absent on direct-coordinator calls.
+   */
+  originConversationId?: string;
+  /**
+   * `agent.task` id whose relay this send may lock (#1860). For a specialist
+   * this is the coordinator task that delegated, not the specialist's own task.
+   * Absent on publishers that predate the field; the dispatcher then scans.
+   */
+  routingTaskId?: string;
 }
 
 // Agent error payload — published by the agent runtime when an error occurs
@@ -237,6 +480,9 @@ interface AgentDiscussPayload {
   participants: string[];      // all thread participants
   mentionedAgentIds: string[]; // subset that get reply-expected tasks (empty = broadcast)
   content: string;
+  /** True when the reply closed the thread atomically (close_after: true). BullpenDispatcher
+   *  uses this to deliver a read-and-act wake without inviting an in-thread reply. */
+  threadClosed?: boolean;
   /** TaskOriginator of the task that published this discuss event. Forwarded by
    *  BullpenDispatcher into the resulting agent.task metadata so that skills invoked
    *  during bullpen work can pass the elevated-skill gate for principal-authorized tasks. */
@@ -285,11 +531,99 @@ interface ContactMergedPayload {
   mergedAt: Date;
 }
 
+// activity.summary — published by ActivitySummarizer (src/activity/summarizer.ts) once a
+// conversational job with no visible actions completes (#2251). The console activity feed
+// reads it back from audit_log, so the feed itself never calls a model. parentEventId is the
+// job's agent.task id, which is how the feed finds it.
+interface ActivitySummaryPayload {
+  agentId: string;
+  conversationId: string;
+  /** The agent.task event id the summary describes (also the event's parentEventId). */
+  taskEventId: string;
+  /** Short past-tense phrase: "provided two essay ideas". Never a quote of the conversation. */
+  summary: string;
+}
+
+// minutes.ready — the meetings pipeline finished a call's transcript and minutes (#2322).
+// System publishes and subscribes only. The structuring subscriber creates one coordinator task.
+interface MinutesReadyPayload {
+  minutesRef: string;
+  sessionId: string;
+  conversationId: string;
+  sources: Array<'principal' | 'routine' | 'coordinator' | 'ad_hoc'>;
+  sensitivity: 'internal' | 'confidential' | 'shareable';
+  /** Whether the follow-up sends a recap, and why (#2347). See MinutesRecap in src/meetings/types.ts. */
+  recap: 'requested' | 'topic_covered' | 'not_earned' | 'unknown';
+}
+
+// minutes.pipeline_failed — a transcript, minutes, settle, or structuring step failed (#2322).
+// Publishing is the audit trail. Agendas stay recoverable by the startup sweep.
+interface MinutesPipelineFailedPayload {
+  sessionId: string;
+  stage: 'transcript' | 'minutes' | 'settle' | 'structuring';
+  error: string;
+}
+
+// kg.nodes_merged — published by NodeMergeService after the principal merges two
+// knowledge-graph nodes from the console (#2233). Committed state only: the publish runs
+// after COMMIT. This is an audit record of what the merge decided, not an undo log: the
+// absorbed node survives as an archived tombstone with properties.merged_into, but dropped
+// facts, collapsed edges and merged-away contact rows are deleted and cannot be restored
+// from this payload.
+interface KgNodesMergedPayload {
+  /** Duplicated at the top level for audit field extraction (target_id). */
+  survivorId: string;
+  absorbedId: string;
+  survivor: { id: string; type: string; label: string };
+  absorbed: { id: string; type: string; label: string };
+  resultLabel: string;
+  crossType: boolean;
+  /** Null when no contact changed. survivingContactId is null for an organization re-point. */
+  contactMerge: {
+    survivingContactId: string | null;
+    mergedContactIds: string[];
+    repointedContactIds: string[];
+  } | null;
+  summary: {
+    factsMoved: number;
+    factsCollapsed: number;
+    edgesMoved: number;
+    edgesCollapsed: number;
+    edgesDropped: number;
+    conflictsResolved: number;
+    contactReferencesRepointed: number;
+  };
+  /** Every resolution as applied, defaults filled in. */
+  resolutions: {
+    label: string;
+    properties: Record<string, string>;
+    facts: Record<string, string>;
+    nearDuplicateFacts: Record<string, string>;
+    contactFields: Record<string, string>;
+    authOverrides: Record<string, string>;
+    acknowledgements: string[];
+  };
+  /**
+   * Principal trust audit: when the surviving contact is the principal, every folded
+   * identity that became a principal identity, as "channel: identifier". Empty otherwise.
+   */
+  principalIdentitiesTransferred: string[];
+  /**
+   * Principal trust audit: the principal's primary_email / primary_phone the merge wrote a
+   * new value into (filled, or replaced by a resolved conflict), with that value. Empty
+   * unless the surviving contact is the principal.
+   */
+  principalPrimaryFieldsFilled: { primary_email?: string; primary_phone?: string };
+  /** The console originator (resolveConsoleOriginator); null when no principal resolved. */
+  actor: import('../contacts/types.js').TaskOriginator | null;
+  mergedAt: string;
+}
+
 // contact.elevated — published when a contact is automatically promoted from 'unknown' to 'known'.
 // Fired by ContactService.elevateTierToKnown() on success via the onContactElevated callback.
 interface ContactElevatedPayload {
   contactId: string;
-  reason: 'correspondence' | 'domain-validated' | 'judgment';
+  reason: TierElevationReason;
 }
 
 // MessageRejectedPayload — emitted by the dispatch layer when a message is rejected
@@ -367,6 +701,11 @@ interface ScheduleRecoveredPayload {
   consecutiveFailures: number;
   /** True if the job was suspended rather than reset to pending. */
   suspended: boolean;
+  /**
+   * True when recovery armed a deferred_wake_at instead of re-firing immediately.
+   * Absent on events written before this field existed.
+   */
+  rearmed?: boolean;
 }
 
 interface ScheduleDriftPausedPayload {
@@ -394,6 +733,90 @@ interface ConfigChangePayload {
   note?: string;                // optional human-readable reason
   diff_summary: string;         // human-readable summary of what changed
 }
+
+// SystemRestartPayload — operator-initiated graceful process restart from the
+// console System page (#1765). Lands in audit_log via the write-ahead hook.
+interface SystemRestartPayload {
+  /** ISO timestamp of the process being shut down. */
+  bootedAt: string;
+  /** Who triggered it — 'operator' for the console Restart control. */
+  initiatedBy: string;
+}
+
+// DocumentConsoleActionPayload — the principal changed or bulk-read the OKF working-
+// document store from the console Documents page (#1822, #1823). Audit-only: nothing
+// subscribes to act on it. The store holds sensitive personal content, so an export is
+// audited like a write.
+//
+// Each edit is recorded in two stages, like tool.invoke / tool.result. `requested` is
+// published BEFORE the store is touched, and the console refuses the change if it cannot
+// be recorded — so no mutation exists without a durable audit row. `completed` follows a
+// successful write. A `requested` with no matching `completed` is a change that was not
+// made (a version conflict, a reused path, or a failure).
+interface DocumentConsoleActorFields {
+  /** The console session is principal-only (see console-originator.ts). */
+  initiatedBy: 'principal';
+  channel: 'console';
+}
+
+interface DocumentConsoleRequestedPayload extends DocumentConsoleActorFields {
+  stage: 'requested';
+  action: 'create' | 'update' | 'archive' | 'restore';
+  /** Store path of the document to act on. */
+  path: string;
+  /** Row id, when the target row is known up front (not for create). */
+  documentId: string | null;
+  /** Version the change is conditioned on, when it has one. */
+  baseVersion: number | null;
+  /** Serialized OKF size of the new content, for create/update. */
+  byteSize: number | null;
+}
+
+interface DocumentConsoleCompletedPayload extends DocumentConsoleActorFields {
+  stage: 'completed';
+  action: 'create' | 'update' | 'archive' | 'restore';
+  /** Store path of the document acted on. */
+  path: string;
+  /** working_documents row id. */
+  documentId: string;
+  /** Document version after the action. */
+  version: number;
+  /** Serialized OKF size after the action. */
+  byteSize: number;
+}
+
+interface DocumentConsoleExportPayload extends DocumentConsoleActorFields {
+  action: 'export';
+  /** Path prefix exported — `/` for the whole workspace. */
+  scope: string;
+  includeArchived: boolean;
+  documentCount: number;
+  /** Sum of the exported documents' serialized OKF sizes. */
+  byteTotal: number;
+}
+
+interface DocumentConsoleImportPayload extends DocumentConsoleActorFields {
+  /** Two-stage like edits: `requested` carries the plan's counts, `completed` what landed. */
+  stage: 'requested' | 'completed';
+  action: 'import';
+  /** `bundle` for a zip, or the target path for a single-document upload. */
+  scope: string;
+  created: number;
+  updated: number;
+  unchanged: number;
+  conflicts: number;
+  /** Planned writes that errored; the rest of the import still landed. */
+  failed: number;
+  skipped: number;
+  /** Serialized OKF bytes written. */
+  byteTotal: number;
+}
+
+type DocumentConsoleActionPayload =
+  | DocumentConsoleRequestedPayload
+  | DocumentConsoleCompletedPayload
+  | DocumentConsoleExportPayload
+  | DocumentConsoleImportPayload;
 
 // LlmCallPayload — emitted by the agent runtime after every LLM API call completes.
 // Provides model provenance, token accounting, timing, and content fingerprints for audit.
@@ -423,13 +846,74 @@ interface LlmCallPayload {
   // full prompts/responses go in llm_call_archive, see spec 10)
   promptHash: string;
   responseHash: string;
+  /**
+   * Sampling temperature actually sent on the provider request.
+   * `null` means the caller left it unset (provider default). Optional for
+   * test fixtures; every `createLlmCall` site in `src/` sets it. Making this
+   * required (`temperature: number | null`) is a follow-up so absent vs. null
+   * cannot become ambiguous in audit_log.
+   */
+  temperature?: number | null;
+  /**
+   * Reasoning tokens the provider reported, a subset of `outputTokens`.
+   * `null` when the provider reported no count. Optional for test fixtures,
+   * like `temperature` (ADR-048).
+   */
+  reasoningTokens?: number | null;
+  /**
+   * Reasoning effort sent on the provider request. `null` means the request
+   * sent none, so the provider default applied.
+   */
+  reasoningEffort?: ReasoningEffort | null;
+  /**
+   * Upstream endpoint that served an OpenRouter call (OpenRouter's `provider`
+   * field, e.g. 'DeepSeek' or 'CoreWeave'). `null` for other providers.
+   */
+  upstreamProvider?: string | null;
+  /**
+   * Passed-back reasoning blocks the provider dropped from this request because
+   * the request prefix changed (ADR-048 §1, prefix guard). 0 when none.
+   */
+  reasoningBlocksDropped?: number;
+  /**
+   * Requests sent for this call, counting retries. `null` where the provider
+   * does not count them (only OpenRouter chat() does today, #1915).
+   */
+  attempts?: number | null;
+  /**
+   * Time spent on failed attempts and the backoff after each; `latencyMs` minus
+   * this is the attempt that succeeded. `null` where `attempts` is.
+   */
+  failedAttemptsMs?: number | null;
+  /**
+   * Set when the reasoning watchdog stopped a call and made a forced attempt
+   * (#2371); `null` otherwise.
+   */
+  reasoningWatchdog?: ReasoningWatchdogRecord | null;
+}
+
+// ModelFallbackEngagedPayload — emitted by the agent runtime when the primary
+// model for a tier returns NOT_FOUND and execution is re-routed to the fallback
+// tier's model (#813). Visible in audit_log for operator alerting and post-incident
+// analysis without requiring a grep across pino logs.
+interface ModelFallbackEngagedPayload {
+  agentId: string;
+  conversationId: string;
+  /** Capability tier whose primary model failed. 'unknown' only when tier was not configured. */
+  tier: 'fast' | 'standard' | 'powerful' | 'unknown';
+  /** Primary model that returned NOT_FOUND. */
+  failedModel: string;
+  /** Fallback model being attempted. */
+  fallbackModel: string;
+  /** Error type that triggered the fallback — currently always NOT_FOUND. */
+  reason: 'NOT_FOUND';
 }
 
 // ContextBudgetPayload — emitted by the agent runtime after assembling context
 // for each LLM call. Reports per-tier token estimates, budget utilization, and
 // which tiers were dropped. Co-located with llm.call events in audit_log for
 // correlating budget utilization with actual token usage.
-// Design: docs/wip/2026-05-12-context-budget-design.md
+// Design: docs/specs/01-memory-system.md § Context Budget
 interface ContextBudgetPayload {
   agentId: string;
   conversationId: string;
@@ -453,7 +937,7 @@ interface ContextBudgetPayload {
 // Records which skill accessed which secret, from which agent/task — never the secret value.
 // This is the primary audit trail for secrets isolation (spec 06, Secrets Isolation).
 interface SecretAccessedPayload {
-  skillName: string;
+  toolName: string;
   secretName: string;     // the declared key name — never the resolved value
   agentId?: string;       // agent that invoked the skill
   taskEventId?: string;   // causal chain: the agent.task that triggered this invocation
@@ -474,7 +958,7 @@ interface SecretAccessedPayload {
 interface SecretCapturedPayload {
   secretName: string;     // the resolved vault key (e.g. 'user.aeroplan_password') — never the value
   label: string | null;   // human-friendly label shown on the form
-  // Routing context captured at mint time from SkillContext. All optional: a token minted
+  // Routing context captured at mint time from ToolContext. All optional: a token minted
   // outside an agent context (or before #972) has no routable origin and is simply not resumed.
   conversationId?: string;
   agentId?: string;
@@ -482,14 +966,165 @@ interface SecretCapturedPayload {
   taskEventId?: string;   // originating agent.task event id — threaded as parentEventId on resume
   resumeIntent?: string;  // NL description of what the agent was trying to do
   originator?: Record<string, unknown>;  // TaskOriginator that started the chain (preserved on resume)
+  /** Base64 delegate resume_token (#995). Present only for a delegated-specialist-minted link;
+   *  carries no secret value. The resume subscriber decodes it to recover the specialist name and
+   *  instructs the coordinator to re-delegate with it. */
+  resumeToken?: string;
+}
+
+// -- Late delegation (#1799) --
+//
+// A delegate wait that times out leaves the specialist running: it finishes later and
+// publishes an agent.response nothing consumes (#1288 keeps the run alive by design).
+// These two events make that lifecycle observable and correlatable. `delegation.timed_out`
+// carries the one key that identifies the eventual response — the delegate agent.task event
+// id the specialist stamps as its parentEventId — plus the originating routing needed to act
+// on it. `delegation.late_resolved` records what was ultimately done with the late response.
+//
+// Field naming is deliberate: `agentId` and `conversationId` describe the ORIGINATING
+// (delegating) agent and conversation, because AuditLogger derives source_id from agentId and
+// the indexed conversation_id column from conversationId. That is what links a late response
+// back to the conversation or scheduled job that asked for the work.
+
+/** How a pending delegation handle was ultimately resolved (#1799). */
+export type LateDelegationResolution =
+  /** Late result was delivered back to the originating agent (Phase 2). */
+  | 'delivered'
+  /** Late result recorded on the escalation review task for a human to act on. */
+  | 'annotated_result'
+  /** The specialist ultimately failed — recorded, nothing to deliver. */
+  | 'annotated_error'
+  /** Originator was itself a delegated specialist on an internal channel — nowhere to deliver. */
+  | 'annotated_unroutable'
+  /** A human already closed the review task; their intervention wins. */
+  | 'annotated_review_closed'
+  /** The specialist came back asking a question, not with a result. */
+  | 'annotated_clarification'
+  /** The specialist paused mid-task; the resumable continuation path owns it. */
+  | 'annotated_paused'
+  /** Nothing arrived before the handle expired — the work was lost. */
+  | 'abandoned_ttl';
+
+/** What happened to the escalation review task while resolving the handle (#1799). */
+export type LateDelegationReviewOutcome =
+  | 'closed'
+  | 'annotated'
+  | 'no_review_task'
+  | 'review_task_terminal'
+  | 'update_failed';
+
+// DelegationTimedOutPayload — published by the agent layer (runtime) when a delegate wait
+// ends with the specialist still running. A timer expiry is escalated to the principal
+// backlog first. An interrupted wait (a same-contact follow-up queued on the turn) is not
+// a failure and opens no review task. The LateDelegationSubscriber turns either into a
+// durable handle; `cause` does not change that handle.
+interface DelegationTimedOutPayload {
+  /** The delegate agent.task event id — the specialist stamps it as parentEventId on its
+   *  eventual agent.response, so it is the correlation key for the whole mechanism. */
+  delegateEventId: string;
+  /** Throwaway conversation the delegated specialist ran in (delegate-<uuid>). */
+  delegateConversationId: string;
+  /** The specialist that was delegated to. */
+  targetAgent: string;
+  /** The raw `task` input as passed to the delegate skill — rebuilds delegationKey(). */
+  delegateTask: string;
+  /** The delegating agent (audit source_id). */
+  agentId: string;
+  /** The delegating conversation (indexed audit conversation_id). */
+  conversationId: string;
+  /** Channel of the originating turn — 'scheduler', 'signal', 'internal', … */
+  channelId: string;
+  /** Sender of the originating agent.task. */
+  senderId: string;
+  /** The originating agent.task event id. */
+  originTaskEventId: string;
+  /** TaskOriginator of the originating turn, forwarded opaquely so a later resume can
+   *  restore lineage rather than fabricate one. */
+  originator?: Record<string, unknown>;
+  /** principal review task created by the escalation. Absent when task-create failed. */
+  reviewTaskId?: string;
+  /** The delegate wait that elapsed, in ms — sets the handle's TTL floor. */
+  waitTimeoutMs?: number;
+  /**
+   * Why the wait ended. `wait_timeout` is the delegate timer. `interrupted` is a
+   * queued same-contact follow-up; the specialist keeps running and nothing is
+   * escalated. Callers may omit it: `createDelegationTimedOut` fills `wait_timeout`.
+   */
+  cause?: 'wait_timeout' | 'interrupted';
+}
+
+// DelegationLateResolvedPayload — published by the system layer when a pending delegation
+// handle reaches a terminal state, whether the late response was delivered, recorded for a
+// human, or never arrived. Every branch emits one so suppressed and abandoned outcomes are
+// queryable in audit_log rather than living only in logs.
+interface DelegationLateResolvedPayload {
+  delegateEventId: string;
+  targetAgent: string;
+  resolution: LateDelegationResolution;
+  reviewTaskOutcome: LateDelegationReviewOutcome;
+  /** The delegating agent (audit source_id). */
+  agentId: string;
+  /** The delegating conversation (indexed audit conversation_id). */
+  conversationId: string;
+  reviewTaskId?: string;
+  /** The late agent.response that resolved the handle. Absent for abandoned_ttl. */
+  lateResponseEventId?: string;
+  /** The wake agent.task published back to the originator (Phase 2 / 'delivered' only). */
+  wakeTaskEventId?: string;
+  /** Short machine-readable note for the non-delivered branches. */
+  note?: string;
+}
+
+// AuthorizationDecisionPayload — published when an authorization gate decides
+// allow / deny / escalate (#1379, spec 09). Emitted by the dispatch layer after
+// AuthorizationService.evaluate (Gate-1 + three-layer check) and by the
+// execution layer for Gate C (contact-tier gate). Flows to audit_log via the
+// write-ahead bus hook like every other system event.
+interface AuthorizationDecisionPayload {
+  /** Primary decision for this check. */
+  decision: 'allow' | 'deny' | 'escalate';
+  /** Which gate produced the decision. */
+  gate: 'authorization' | 'gate_c';
+  /** Contact under evaluation (absent when originator tier is unresolved). */
+  contactId?: string;
+  role?: string | null;
+  /** Contact capability tier at decision time (or 'unresolved' for Gate C #1059). */
+  tier: ContactTier | 'unresolved';
+  channel?: string;
+  channelTrust?: TrustLevel;
+  /** Skill name (Gate C) or omitted for the multi-permission AuthorizationService snapshot. */
+  action?: string;
+  /** Full AuthorizationService lists — present when gate === 'authorization'. */
+  allowed?: string[];
+  denied?: string[];
+  escalate?: string[];
+  trustBlocked?: string[];
+  /** Human-readable summary for audit UI / queries. */
+  subjectSummary: string;
+  agentId?: string;
+  taskEventId?: string;
+  /**
+   * Conversation this decision applies to (ADR-034 Gate C / #1733).
+   * Preferred correlation key when consumers cannot rely on taskEventId alone
+   * (e.g. dispatcher relay suppression when a reply skill ran under a
+   * different task id than the coordinator routing entry).
+   */
+  conversationId?: string;
+  /**
+   * Count of resolved outbound recipients at Gate C decision time (#1815).
+   * Absent when recipients could not be resolved (fail-closed / no parser),
+   * and when Gate C skipped resolution because the third-party axis cannot
+   * change the decision (e.g. trusted / unknown / blocked).
+   */
+  recipientCount?: number;
 }
 
 // AutonomySkillBlockedPayload — published by the execution layer when a skill
 // invocation is blocked because the live autonomy score is below the skill's
 // action_risk threshold. Advisory-only — the agent receives a { success: false }
-// result and can escalate to the CEO.
+// result and can escalate to the principal.
 interface AutonomySkillBlockedPayload {
-  skillName: string;
+  toolName: string;
   actionRisk: ActionRisk;
   currentScore: number;
   requiredScore: number;
@@ -506,6 +1141,20 @@ interface AutonomySendBlockedPayload {
   requiredScore: number;
   agentId?: string;
   taskEventId?: string;
+}
+
+// AutonomyRelayDeferredPayload — published by the outbound gateway when a relay to the
+// principal that an outside contact caused was over that contact's relay budget and went to
+// the digest instead (#1320). Names the originator, never the message.
+export interface AutonomyRelayDeferredPayload {
+  originatorContactId: string;
+  /** The originator's tier; a missing tier is reported as 'unknown'. */
+  tier: ContactTier;
+  channel: string;
+  conversationId?: string;
+  taskEventId?: string;
+  /** Whether the once-per-window "holding them for your digest" line went out with it. */
+  noticeSent: boolean;
 }
 
 // HumanDecisionPayload — emitted by the dispatch layer when a human approves, denies, or
@@ -565,6 +1214,26 @@ interface TaskCompletedPayload {
   agentId: string | null;
 }
 
+// task.resumable_throughput — emitted when a resumable task pauses mid-work (#1264).
+// Derived telemetry from progress.resumable + progress.resumableCircuit for audit trails.
+interface TaskResumableThroughputPayload {
+  taskId: string;
+  agentId: string;
+  done: number;
+  total: number;
+  lastSliceUnits: number;
+  iterationCount: number;
+  stallCount: number;
+  totalCostUsd: number;
+  startedAt: string;
+  estimateAvailable: boolean;
+  unitsPerSlice: number | null;
+  unitsPerWallclockMinute: number | null;
+  costPerUnit: number | null;
+  etaSlices: number | null;
+  etaWallclockMinutes: number | null;
+}
+
 // -- Discriminated union --
 // The `type` field is the discriminant; `sourceLayer` records which layer emitted the event.
 
@@ -574,10 +1243,52 @@ export interface InboundMessageEvent extends BaseEvent {
   payload: InboundMessagePayload;
 }
 
+export interface InboundReactionEvent extends BaseEvent {
+  type: 'inbound.reaction';
+  sourceLayer: 'channel';
+  payload: InboundReactionPayload;
+}
+
 export interface AgentTaskEvent extends BaseEvent {
   type: 'agent.task';
   sourceLayer: 'dispatch';
   payload: AgentTaskPayload;
+}
+
+/**
+ * Where a same-contact follow-up was drained into the host turn (#2018).
+ * `round:N` is the 0-based tool-loop round. `exit` is the draft that had
+ * not been sent yet.
+ */
+export type InjectionDrainPoint = 'turn_start' | 'exit' | `round:${number}`;
+
+const INJECTION_DRAIN_POINT_RE = /^round:(0|[1-9]\d*)$/;
+
+export function isInjectionDrainPoint(value: string): value is InjectionDrainPoint {
+  return value === 'turn_start' || value === 'exit' || INJECTION_DRAIN_POINT_RE.test(value);
+}
+
+/**
+ * A follow-up was drained into a live turn (#2018).
+ *
+ * No message body. The text stays in working_memory, attributed to
+ * `senderContactId`. This event only records that the drain happened, so
+ * one contact's words cannot ride into another turn's audit row.
+ * `parentEventId` is `inboundEventId`. `hostTaskEventId` is the audit `task_id`.
+ */
+interface AgentTaskInputInjectedPayload {
+  hostTaskEventId: string;
+  inboundEventId: string;
+  conversationId: string;
+  agentId: string;
+  drainPoint: InjectionDrainPoint;
+  senderContactId: string;
+}
+
+export interface AgentTaskInputInjectedEvent extends BaseEvent {
+  type: 'agent.task.input_injected';
+  sourceLayer: 'agent';
+  payload: AgentTaskInputInjectedPayload;
 }
 
 export interface AgentResponseEvent extends BaseEvent {
@@ -602,6 +1313,12 @@ export interface OutboundDeliveredEvent extends BaseEvent {
   payload: OutboundDeliveredPayload;
 }
 
+export interface ExportDeliveredEvent extends BaseEvent {
+  type: 'export.delivered';
+  sourceLayer: 'execution';
+  payload: ExportDeliveredPayload;
+}
+
 // OutboundBlockedEvent — published by the dispatch layer when the content filter
 // intercepts and blocks an outbound message. Channel adapters subscribe to this so
 // they can surface a failure signal to the user (e.g., "message could not be sent").
@@ -612,11 +1329,53 @@ export interface OutboundBlockedEvent extends BaseEvent {
   payload: OutboundBlockedPayload;
 }
 
+// OutboundJudgePayload — Stage-2 LLM audience-leak judge decision (#1911).
+// Emitted for every outbound that reaches the Stage-2 decision point so a skip,
+// pass, block, and fail-open/fail-closed delivery are distinguishable in audit_log
+// without correlating llm.call rows or container logs.
+export type OutboundJudgeOutcome =
+  | 'judged_pass'
+  | 'judged_block'
+  | 'skipped_principal_sole'
+  | 'failed_open'
+  | 'failed_closed';
+
+/** Machine-readable cause — keeps queries off free-text `reason`. */
+export type OutboundJudgeReasonCode =
+  | 'audience_leak'
+  | 'unreachable'
+  | 'unparseable';
+
+interface OutboundJudgePayload {
+  conversationId: string;
+  channelId: string;
+  /**
+   * Stage-2 decision.
+   * `failed_open` = unreachable/malformed + deliver (split/open).
+   * `failed_closed` = unreachable + block (closed) — not a model verdict.
+   */
+  outcome: OutboundJudgeOutcome;
+  /** Configured failMode at decision time (absent for principal-sole skip). */
+  failMode?: 'split' | 'open' | 'closed';
+  /** Stable discriminator for non-skip outcomes. Absent on principal-sole skip. */
+  reasonCode?: OutboundJudgeReasonCode;
+  /** Short non-sensitive reason (rule name / truncated cause). Never quotes body. */
+  reason?: string;
+}
+
+// OutboundJudgeEvent — published by the dispatch-layer Stage-2 judge after each
+// decision (including explicit skips). System layer gets it via write-ahead audit.
+export interface OutboundJudgeEvent extends BaseEvent {
+  type: 'outbound.judge';
+  sourceLayer: 'dispatch';
+  payload: OutboundJudgePayload;
+}
+
 // OutboundPiiRedactedEvent — published by the dispatch layer when PII is redacted from
 // an outbound message before delivery. The message is still sent (with redacted content).
 // No subscriber initially — event is available for future audit UI and alerting rules.
 export interface OutboundPiiRedactedEvent extends BaseEvent {
-  type: 'outbound.pii-redacted';
+  type: 'outbound.pii_redacted';
   sourceLayer: 'dispatch';
   payload: OutboundPiiRedactedPayload;
 }
@@ -631,7 +1390,16 @@ export interface OutboundSuppressedDuplicateEvent extends BaseEvent {
   payload: OutboundSuppressedDuplicatePayload;
 }
 
-// OutboundNotificationEvent — published by the dispatch layer when a system-level CEO
+// OutboundNoReplyEvent — published by the dispatch layer when handleAgentResponse honours
+// the NO_REPLY sentinel instead of publishing outbound.message. System layer subscribes
+// for audit logging. See #1732.
+export interface OutboundNoReplyEvent extends BaseEvent {
+  type: 'outbound.no_reply';
+  sourceLayer: 'dispatch';
+  payload: OutboundNoReplyPayload;
+}
+
+// OutboundNotificationEvent — published by the dispatch layer when a system-level principal
 // notification needs to be sent (blocked-content alert, group-held alert, etc.).
 // Channel adapters subscribe to route it through the outbound safety pipeline.
 // System layer subscribes for audit logging and security monitoring.
@@ -641,18 +1409,18 @@ export interface OutboundNotificationEvent extends BaseEvent {
   payload: OutboundNotificationPayload;
 }
 
-export interface SkillInvokeEvent extends BaseEvent {
-  type: 'skill.invoke';
+export interface ToolInvokeEvent extends BaseEvent {
+  type: 'tool.invoke';
   sourceLayer: 'agent';
-  payload: SkillInvokePayload;
+  payload: ToolInvokePayload;
 }
 
-export interface SkillResultEvent extends BaseEvent {
-  type: 'skill.result';
+export interface ToolResultEvent extends BaseEvent {
+  type: 'tool.result';
   // sourceLayer is 'execution' because the result logically comes from the execution layer,
   // even though the agent layer publishes it on behalf (execution layer has no bus access in Phase 3).
   sourceLayer: 'execution';
-  payload: SkillResultPayload;
+  payload: ToolResultPayload;
 }
 
 export interface AgentErrorEvent extends BaseEvent {
@@ -725,7 +1493,7 @@ export interface MemoryQueryEvent extends BaseEvent {
 }
 
 // memory.decay_warning — emitted by DreamEngine (system layer) when an important
-// KG node is flagged for CEO re-confirmation before archival (#280).
+// KG node is flagged for principal re-confirmation before archival (#280).
 // "important" = high sensitivity (confidential/restricted) OR high edge-count (top p95, floor 5).
 export interface MemoryDecayWarningPayload {
   nodeId: string;
@@ -780,12 +1548,110 @@ export interface ConfigChangeEvent extends BaseEvent {
   payload: ConfigChangePayload;
 }
 
+export interface SystemRestartEvent extends BaseEvent {
+  type: 'system.restart';
+  sourceLayer: 'system';
+  payload: SystemRestartPayload;
+}
+
+export interface DocumentConsoleActionEvent extends BaseEvent {
+  type: 'document.console_action';
+  sourceLayer: 'system';
+  payload: DocumentConsoleActionPayload;
+}
+
+export interface ActivitySummaryEvent extends BaseEvent {
+  type: 'activity.summary';
+  sourceLayer: 'system';
+  payload: ActivitySummaryPayload;
+}
+
+export interface MinutesReadyEvent extends BaseEvent {
+  type: 'minutes.ready';
+  sourceLayer: 'system';
+  payload: MinutesReadyPayload;
+}
+
+export interface MinutesPipelineFailedEvent extends BaseEvent {
+  type: 'minutes.pipeline_failed';
+  sourceLayer: 'system';
+  payload: MinutesPipelineFailedPayload;
+}
+
+export interface KgNodesMergedEvent extends BaseEvent {
+  type: 'kg.nodes_merged';
+  sourceLayer: 'system';
+  payload: KgNodesMergedPayload;
+}
+
+/**
+ * Full redacted LLM I/O for the `llm_call_archive` table. Carried on
+ * `llm.call` as a non-persisted top-level field — AuditLogger omits it from
+ * `audit_log.payload` while still writing the side table (spec 10).
+ */
+export interface LlmCallArchiveContent {
+  prompt: unknown;
+  response: unknown;
+  toolDefinitions?: unknown;
+}
+
 // LlmCallEvent — published by the agent layer after every LLM API call.
 // parentEventId references the agent.task that triggered it.
 export interface LlmCallEvent extends BaseEvent {
   type: 'llm.call';
   sourceLayer: 'agent';
   payload: LlmCallPayload;
+  /**
+   * Non-persisted archive payload. Not part of `payload` so AuditLogger can
+   * omit it from the bus/`audit_log` JSON while still writing the side table.
+   */
+  archive?: LlmCallArchiveContent;
+}
+
+// LlmErrorEvent — published by TelemetryLlmProvider and AgentRuntime on every
+// failed LLM call (response.type === 'error'). Used by HealthService to maintain
+// the per-tier outcome tracker without making billed probe calls.
+interface LlmErrorPayload {
+  agentId: string;
+  conversationId: string;
+  /** Model that was requested — used by HealthService to reverse-map to a tier. */
+  requestedModel: string;
+  provider: string;
+  errorType: string;
+  parentEventId: string;
+  /**
+   * Set when the reasoning watchdog stopped the call and its forced attempt then
+   * failed (`forcedOutcome: 'error'`, #2371); absent otherwise. Successful forced
+   * attempts are recorded on llm.call instead.
+   */
+  reasoningWatchdog?: ReasoningWatchdogRecord;
+}
+
+export interface LlmErrorEvent extends BaseEvent {
+  type: 'llm.error';
+  sourceLayer: 'agent';
+  payload: LlmErrorPayload;
+}
+
+export function createLlmError(
+  payload: LlmErrorPayload,
+): LlmErrorEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'llm.error',
+    sourceLayer: 'agent',
+    payload,
+    parentEventId: payload.parentEventId,
+  };
+}
+
+// ModelFallbackEngagedEvent — published when the primary tier model is unavailable
+// and execution falls through to the fallback tier's model (#813).
+export interface ModelFallbackEngagedEvent extends BaseEvent {
+  type: 'model.fallback';
+  sourceLayer: 'agent';
+  payload: ModelFallbackEngagedPayload;
 }
 
 // EmbeddingCallPayload — emitted by EmbeddingService (OpenAI backend) after each
@@ -813,6 +1679,35 @@ export interface EmbeddingCallEvent extends BaseEvent {
   payload: EmbeddingCallPayload;
 }
 
+// EmbeddingErrorEvent — published by the embedding backend on failure.
+// Used by HealthService to track embedding service health.
+// No parentEventId — embedding calls fire from KG/validator paths that
+// don't always have an agent.task event ID in scope.
+interface EmbeddingErrorPayload {
+  model: string;
+  errorType: string;
+}
+
+export interface EmbeddingErrorEvent extends BaseEvent {
+  type: 'embedding.error';
+  // sourceLayer 'system' because embedding errors fire from infrastructure paths
+  // (same as EmbeddingCallEvent) — not from agent tasks.
+  sourceLayer: 'system';
+  payload: EmbeddingErrorPayload;
+}
+
+export function createEmbeddingError(
+  payload: EmbeddingErrorPayload,
+): EmbeddingErrorEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'embedding.error',
+    sourceLayer: 'system',
+    payload,
+  };
+}
+
 // ContextBudgetEvent — published by the agent layer after assembling context for each LLM call.
 // parentEventId references the agent.task that triggered it.
 export interface ContextBudgetEvent extends BaseEvent {
@@ -829,6 +1724,15 @@ export interface HumanDecisionEvent extends BaseEvent {
   payload: HumanDecisionPayload;
 }
 
+// AuthorizationDecisionEvent — published when Gate-1 / AuthorizationService / Gate C decides.
+// sourceLayer is 'dispatch' for contact-resolution auth checks, 'execution' for Gate C.
+// parentEventId traces to the inbound.message (dispatch) or agent.task (execution) that triggered it.
+export interface AuthorizationDecisionEvent extends BaseEvent {
+  type: 'authorization.decision';
+  sourceLayer: 'dispatch' | 'execution';
+  payload: AuthorizationDecisionPayload;
+}
+
 // SecretAccessedEvent — published by the execution layer for every ctx.secret() call.
 // Goes through the write-ahead audit logger like all bus events, giving a durable
 // record of which skill accessed which secret without the value ever leaving the process.
@@ -836,6 +1740,120 @@ export interface SecretAccessedEvent extends BaseEvent {
   type: 'secret.accessed';
   sourceLayer: 'execution';
   payload: SecretAccessedPayload;
+}
+
+// DelegationTimedOutEvent — published by the agent layer: the runtime owns the escalation
+// decision and already holds the originating routing, and it stays database-free (spec 06
+// Layer 3 containment) by handing persistence to a system-layer subscriber (#1799).
+export interface DelegationTimedOutEvent extends BaseEvent {
+  type: 'delegation.timed_out';
+  sourceLayer: 'agent';
+  payload: DelegationTimedOutPayload;
+}
+
+// DelegationLateResolvedEvent — published by the system layer (LateDelegationSubscriber /
+// sweep) when a pending delegation handle is resolved (#1799).
+export interface DelegationLateResolvedEvent extends BaseEvent {
+  type: 'delegation.late_resolved';
+  sourceLayer: 'system';
+  payload: DelegationLateResolvedPayload;
+}
+
+// DelegationRequesterContextPayload — published by the agent runtime when a delegated
+// specialist task renders (or drops) the harness identity block (#1859, ADR-045).
+// Records the evidence the prompt was given so a past relay can be reconstructed
+// from audit_log without replaying the prompt. parentEventId is the specialist
+// agent.task id, which is also delegateEventId and taskId.
+interface DelegationRequesterContextPayload {
+  /** Specialist agent.task id — the delegation this evidence belongs to. */
+  delegateEventId: string;
+  /** Same id, so audit_log.task_id is populated. */
+  taskId: string;
+  agentId: string;
+  conversationId: string;
+  contactId: string | null;
+  channel: string | null;
+  systemRole: SystemRole | null;
+  /** Null when no named tier was rendered. See tierPresent. */
+  tier: ContactTier | null;
+  /** True when the identity block included a tier line. */
+  tierPresent: boolean;
+  /**
+   * True when the delegated-specialist addendum was inserted into the prompt.
+   * False when the context budget dropped it.
+   */
+  delegatedAddendumApplied: boolean;
+}
+
+export interface DelegationRequesterContextEvent extends BaseEvent {
+  type: 'delegation.requester_context';
+  sourceLayer: 'agent';
+  payload: DelegationRequesterContextPayload;
+}
+
+// DelegationPrincipalNotePayload — published by the agent runtime when a delegation-failure
+// reply written for an outside sender also carried a note for the principal (#1990). The
+// note is cut out of the reply, so this row is its record whether or not a review task
+// was logged to carry it too. parentEventId is the coordinator's agent.task.
+interface DelegationPrincipalNotePayload {
+  agentId: string;
+  conversationId: string;
+  /** The agent the failed delegation went to. */
+  targetAgent: string;
+  /** The delegation failure reason ('timeout', 'blocked', …). */
+  reason: string;
+  /** The note, sanitized, on one line, bounded. Never shown to the sender. */
+  note: string;
+  /** Whether a review task was logged for this failure. */
+  followUpLogged: boolean;
+  /** The review task logged for this failure; null when none was logged (or its id was unreadable). */
+  reviewTaskId: string | null;
+  /** True when the note was also added to that review task. False when there was none, or the update failed. */
+  addedToReviewTask: boolean;
+  /** Whether the sender got the model's reply or the deterministic fallback. */
+  replyVia: 'model' | 'fallback';
+}
+
+export interface DelegationPrincipalNoteEvent extends BaseEvent {
+  type: 'delegation.principal_note';
+  sourceLayer: 'agent';
+  payload: DelegationPrincipalNotePayload;
+}
+
+// PrincipalReportPayload — an item for the principal's next digest (#2159): something Curia
+// did on the principal's behalf, a notice (a note cut from a reply, a blocked send), or an
+// approval waiting or expired. Recorded in audit_log only; ReportQueue reads it back for
+// the digest and the weekly fallback. Never delivered on its own — the digest carries it.
+export type PrincipalReportUrgency = 'digest' | 'now';
+/** What produced the item. Agents use 'agent'; system paths name themselves. */
+export type PrincipalReportSource =
+  | 'agent'
+  | 'principal_note'
+  | 'blocked_content'
+  | 'approval_pending'
+  | 'approval_expired'
+  | 'gate_proceeded'       // band gating let through an action the tier policy would have held (#2159)
+  | 'sent_without_review'  // the judge was unavailable at 80+, so the send went out unreviewed (#2159)
+  | 'claim_trimmed'        // no longer emitted (#2312: Curia never cuts text); kept for historical audit rows
+  | 'relay_deferred';      // an outside contact used up their relay budget; the relay waits here (#1320)
+export interface PrincipalReportPayload {
+  /** One or two sentences, written for the principal. */
+  summary: string;
+  /** 'now' marks an item the principal was also pinged about directly. */
+  urgency: PrincipalReportUrgency;
+  source: PrincipalReportSource;
+  /** The thread or task this concerns, when there is one. */
+  conversationId?: string;
+  /** e.g. a console task URL. */
+  link?: string;
+  /** The approval's short_ref, for approval_* items. */
+  actionShortRef?: string;
+}
+
+export interface PrincipalReportEvent extends BaseEvent {
+  type: 'principal.report';
+  sourceLayer: 'dispatch' | 'system' | 'execution';
+  payload: PrincipalReportPayload;
 }
 
 // SecretCapturedEvent — published by the capture endpoint (trusted system infra) when a
@@ -848,10 +1866,10 @@ export interface SecretCapturedEvent extends BaseEvent {
   payload: SecretCapturedPayload;
 }
 
-// AutonomySkillBlockedEvent — execution layer blocked a skill invocation
+// AutonomyToolBlockedEvent — execution layer blocked a skill invocation
 // due to insufficient autonomy score.
-export interface AutonomySkillBlockedEvent extends BaseEvent {
-  type: 'autonomy.skill_blocked';
+export interface AutonomyToolBlockedEvent extends BaseEvent {
+  type: 'autonomy.tool_blocked';
   sourceLayer: 'execution';
   payload: AutonomySkillBlockedPayload;
 }
@@ -862,6 +1880,14 @@ export interface AutonomySendBlockedEvent extends BaseEvent {
   type: 'autonomy.send_blocked';
   sourceLayer: 'dispatch';
   payload: AutonomySendBlockedPayload;
+}
+
+// AutonomyRelayDeferredEvent — the gateway held a relay to the principal for the digest
+// because its outside originator was over the relay budget (#1320).
+export interface AutonomyRelayDeferredEvent extends BaseEvent {
+  type: 'autonomy.relay_deferred';
+  sourceLayer: 'dispatch';
+  payload: AutonomyRelayDeferredPayload;
 }
 
 interface ConversationCheckpointPayload {
@@ -884,6 +1910,24 @@ export interface ConversationCheckpointEvent extends BaseEvent {
   payload: ConversationCheckpointPayload;
 }
 
+// CheckpointExtractionSkippedPayload — emitted by the checkpoint processor when
+// extract-facts / extract-relationships are skipped due to untrusted sender policy (#1290).
+interface CheckpointExtractionSkippedPayload {
+  conversationId: string;
+  agentId: string;
+  channelId: string;
+  channelTrust: TrustLevel;
+  firstExternalTier: ContactTier | null;
+  skills: string[];
+  reason: 'untrusted_sender';
+}
+
+export interface CheckpointExtractionSkippedEvent extends BaseEvent {
+  type: 'checkpoint.extraction_skipped';
+  sourceLayer: 'system';
+  payload: CheckpointExtractionSkippedPayload;
+}
+
 // Task lifecycle events — emitted by TaskRepo (execution layer).
 export interface TaskCreatedEvent extends BaseEvent {
   type: 'task.created';
@@ -903,6 +1947,59 @@ export interface TaskCompletedEvent extends BaseEvent {
   payload: TaskCompletedPayload;
 }
 
+
+export interface TaskResumableThroughputEvent extends BaseEvent {
+  type: 'task.resumable_throughput';
+  sourceLayer: 'system';
+  payload: TaskResumableThroughputPayload;
+}
+
+interface VoiceSessionStartedPayload {
+  sessionId: string;
+  conversationId: string;
+  livekitRoom: string;
+}
+
+export interface VoiceSessionStartedEvent extends BaseEvent {
+  type: 'voice.session.started';
+  sourceLayer: 'channel';
+  payload: VoiceSessionStartedPayload;
+}
+
+/**
+ * Turn-taking counts for one voice session (#2240), so the fragment rate can be
+ * compared across deploys from audit_log. Absent when no runtime owned the session.
+ * `utterances` = `turns` + `joinedUtterances`, less any utterance the caller was
+ * still finishing at hang-up or that exceeded the size cap.
+ */
+export interface VoiceSessionTurnStats {
+  /** Speech-to-text end-of-speech signals that carried words. */
+  utterances: number;
+  /**
+   * User turns that reached an outcome — a reply, an error, or a hang-up. A turn
+   * cancelled before any audio and carried into the next one is not counted.
+   */
+  turns: number;
+  /** Assistant turns (or user-turn preambles) cancelled because the caller spoke over them. */
+  bargeInCancels: number;
+  /** Utterances folded into another utterance's turn instead of reaching their own outcome. */
+  joinedUtterances: number;
+}
+
+interface VoiceSessionEndedPayload {
+  sessionId: string;
+  conversationId: string;
+  reason: string;
+  durationMs?: number;
+  turnStats?: VoiceSessionTurnStats;
+}
+
+export interface VoiceSessionEndedEvent extends BaseEvent {
+  type: 'voice.session.ended';
+  sourceLayer: 'channel';
+  payload: VoiceSessionEndedPayload;
+}
+
 // ChannelPollEvent — emitted by EmailAdapter after each successful Nylas poll cycle.
 // Provides an observable heartbeat: if channel.poll stops appearing in the audit log,
 // the adapter has stalled. One event per poll regardless of whether messages were found.
@@ -910,9 +2007,20 @@ interface ChannelPollPayload {
   accountId: string;
   /** Channel identifier — always 'email' for this event. */
   channel: 'email';
-  /** Number of messages returned by Nylas (before any filtering). */
+  /**
+   * Messages returned by Nylas this cycle.
+   * `fetched = processed + sum(skipped)`. Mail left for a later poll is
+   * `skipped.deferred`, so a write-ahead retry or a mid-poll stop still
+   * satisfies the equality.
+   */
   fetched: number;
-  /** Messages that reached bus.publish('channel', inbound.message). */
+  /**
+   * Messages whose `inbound.message` write-ahead succeeded this cycle,
+   * including ones still queued for a free slot. Subscriber delivery is not
+   * awaited. A later delivery failure is logged and stays in this count; it
+   * is not moved into `skipped.failed` (#2254).
+   * `fetched = processed + sum(skipped)`.
+   */
   processed: number;
   /** Per-filter skip breakdown. */
   skipped: {
@@ -920,12 +2028,26 @@ interface ChannelPollPayload {
     recently_sent: number;
     self: number;
     excluded: number;
-    /** Messages that threw during per-message processing. */
+    /**
+     * Threw before handoff and will not be retried (conversion, contact
+     * extraction, or write-ahead past its retry budget).
+     */
     failed: number;
+    /**
+     * Left for a later poll: the message whose write-ahead will be retried,
+     * the unvisited tail behind it, or mail this poll dropped because the
+     * adapter had stopped.
+     */
+    deferred: number;
+    /**
+     * Already written ahead in this process (replay, or an earlier poll).
+     * Counted so the watermark can move past it without delivering it again.
+     */
+    already_staged: number;
   };
   /** High-water mark value (epoch seconds) after this poll cycle. */
   lastSeenAt: number;
-  /** Wall-clock duration of the poll cycle in milliseconds. */
+  /** Wall-clock time from fetch start through handoff, in milliseconds. Not the agent turn (#2254). */
   durationMs: number;
 }
 
@@ -954,18 +2076,46 @@ export interface ChannelStalledEvent extends BaseEvent {
   payload: ChannelStalledPayload;
 }
 
+// ChannelDisconnectedEvent — adapter lost its transport and cannot deliver (#1380).
+interface ChannelDisconnectedPayload {
+  /** Channel name (e.g. 'signal'). */
+  channel: string;
+  /** Optional human-readable reason for operators. */
+  reason?: string;
+}
+
+export interface ChannelDisconnectedEvent extends BaseEvent {
+  type: 'channel.disconnected';
+  sourceLayer: 'channel';
+  payload: ChannelDisconnectedPayload;
+}
+
+// ChannelReconnectEvent — adapter transport is live again; flush outbound_queue (#1380).
+interface ChannelReconnectPayload {
+  /** Channel name (e.g. 'signal'). */
+  channel: string;
+}
+
+export interface ChannelReconnectEvent extends BaseEvent {
+  type: 'channel.reconnect';
+  sourceLayer: 'channel';
+  payload: ChannelReconnectPayload;
+}
+
 export type BusEvent =
   | InboundMessageEvent
+  | InboundReactionEvent
   | AgentTaskEvent
+  | AgentTaskInputInjectedEvent
   | AgentResponseEvent
   | OutboundMessageEvent
-  | SkillInvokeEvent
-  | SkillResultEvent
+  | ToolInvokeEvent
+  | ToolResultEvent
   | AgentErrorEvent          // Error recovery: structured error events for audit and user notification
   | AgentDiscussEvent        // Bullpen: inter-agent discussion message
   | MemoryStoreEvent      // Phase 6: knowledge graph write audit
   | MemoryQueryEvent      // Phase 6: knowledge graph read audit
-  | MemoryDecayWarningEvent  // #280: DreamEngine flags important node for CEO re-confirmation
+  | MemoryDecayWarningEvent  // #280: DreamEngine flags important node for principal re-confirmation
   | ContactResolvedEvent  // Contacts Phase A: sender matched to a known contact
   | ContactUnknownEvent   // Contacts Phase A: sender has no contact record
   | ContactDuplicateDetectedEvent   // Dedup: new contact matches an existing one
@@ -973,9 +2123,12 @@ export type BusEvent =
   | ContactElevatedEvent            // #951: automatic tier elevation from unknown → known
   | MessageRejectedEvent  // Unknown sender policy: message rejected, signals HTTP adapter to return 403
   | OutboundBlockedEvent  // Outbound content filter: message blocked before delivery (#38)
+  | OutboundJudgeEvent    // Stage-2 LLM judge decision (pass/block/skip/failed_open|closed) (#1911)
   | OutboundDeliveredEvent // Outbound delivery: wire-level send succeeded (#729)
+  | ExportDeliveredEvent   // MCP bulk export: Drive/Sheets record export succeeded (#201)
   | OutboundPiiRedactedEvent // Outbound PII redaction: PII scrubbed before delivery (#249)
   | OutboundSuppressedDuplicateEvent  // #847: duplicate reply suppressed by reply-lock
+  | OutboundNoReplyEvent              // #1732: agent declined to reply (NO_REPLY sentinel)
   | OutboundNotificationEvent // System notifications routed through safety pipeline (#206)
   | ScheduleCreatedEvent   // Scheduler: job created
   | ScheduleFiredEvent     // Scheduler: job fired
@@ -983,20 +2136,42 @@ export type BusEvent =
   | ScheduleRecoveredEvent   // Scheduler: stuck job auto-recovered
   | ScheduleDriftPausedEvent  // Scheduler: job paused due to intent drift detection
   | ConfigChangeEvent        // System: config object changed (office identity, etc.)
+  | SystemRestartEvent       // System: operator-initiated process restart (#1765)
+  | DocumentConsoleActionEvent // System: principal edited the document store from the console (#1822)
+  | KgNodesMergedEvent       // Console: two knowledge-graph nodes merged (#2233)
+  | ActivitySummaryEvent     // System: one-line summary of a finished conversational job (#2251)
+  | MinutesReadyEvent        // System: a call's minutes are written (#2322)
+  | MinutesPipelineFailedEvent // System: meeting transcript, minutes, settle, or structuring failed (#2322)
   | ConversationCheckpointEvent // Checkpoint pipeline: Dispatch fires after inactivity window
+  | CheckpointExtractionSkippedEvent // Checkpoint pipeline: KG extraction skipped for trust policy (#1290)
   | LlmCallEvent             // Spec 10: LLM API call provenance (model, tokens, cost, hashes)
+  | LlmErrorEvent            // #434: failed LLM call — used by HealthService for tier health tracking
+  | ModelFallbackEngagedEvent  // #813: primary tier model unavailable, routing to fallback tier
   | ContextBudgetEvent        // #24: context budget utilization per LLM call
   | HumanDecisionEvent       // Spec 10: human-in-the-loop decision record (approve/deny/etc.)
+  | AuthorizationDecisionEvent // Spec 09 / #1379: authorization gate allow/deny/escalate audit
   | SecretAccessedEvent      // Spec 06: secrets isolation audit trail (name only, never value)
   | SecretCapturedEvent      // #972: one-time capture link redeemed (name/routing only, never value)
-  | AutonomySkillBlockedEvent  // Autonomy Phase 2: skill blocked by action_risk gate
+  | DelegationTimedOutEvent     // #1799: delegate wait timed out, specialist possibly still running
+  | DelegationLateResolvedEvent // #1799: a late specialist response was delivered, recorded, or lost
+  | DelegationRequesterContextEvent // #1859: identity evidence rendered into a delegated specialist prompt
+  | DelegationPrincipalNoteEvent // #1990: a sender reply's note for the principal, kept out of the reply
+  | PrincipalReportEvent     // #2159: an item for the principal's digest (report queue)
+  | AutonomyToolBlockedEvent  // Autonomy Phase 2: skill blocked by action_risk gate
   | AutonomySendBlockedEvent   // Autonomy Phase 2: outbound send blocked by score < 70 gate
+  | AutonomyRelayDeferredEvent // #1320: a relay to the principal went to the digest (relay budget)
   | EmbeddingCallEvent         // #654: embedding API call cost telemetry
+  | EmbeddingErrorEvent        // #434: failed embedding call — used by HealthService for health tracking
   | TaskCreatedEvent           // Tasks v1: task created via task-create skill (#835)
   | TaskUpdatedEvent           // Tasks v1: task fields updated via task-update skill (#835)
   | TaskCompletedEvent         // Tasks v1: task set to done via task-complete skill (#835)
+  | TaskResumableThroughputEvent // #1264: resumable pause throughput telemetry
+  | VoiceSessionStartedEvent    // #1414: voice channel session lifecycle
+  | VoiceSessionEndedEvent      // #1414: voice channel session lifecycle
   | ChannelPollEvent           // #846: email adapter poll heartbeat (one per cycle)
-  | ChannelStalledEvent;       // #846: email adapter stall detection (fire-once per lifecycle)
+  | ChannelStalledEvent        // #846: email adapter stall detection (fire-once per lifecycle)
+  | ChannelDisconnectedEvent   // #1380: channel transport lost
+  | ChannelReconnectEvent;     // #1380: channel transport restored — flush outbound queue
 
 // Convenience alias for use in handler maps / switch statements.
 export type EventType = BusEvent['type'];
@@ -1018,6 +2193,20 @@ export function createInboundMessage(
   };
 }
 
+export function createInboundReaction(
+  payload: InboundReactionPayload,
+  parentEventId?: string,
+): InboundReactionEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'inbound.reaction',
+    sourceLayer: 'channel',
+    payload,
+    parentEventId,
+  };
+}
+
 export function createAgentTask(
   // parentEventId is required for agent.task — every task must trace back to a trigger event.
   payload: AgentTaskPayload & { parentEventId: string },
@@ -1030,6 +2219,38 @@ export function createAgentTask(
     sourceLayer: 'dispatch',
     payload: rest,
     parentEventId,
+  };
+}
+
+export function createAgentTaskInputInjected(
+  payload: AgentTaskInputInjectedPayload,
+): AgentTaskInputInjectedEvent {
+  if (!isInjectionDrainPoint(payload.drainPoint)) {
+    throw new Error('agent.task.input_injected: invalid drainPoint');
+  }
+  for (const field of ['hostTaskEventId', 'inboundEventId', 'conversationId', 'agentId', 'senderContactId'] as const) {
+    // A non-string with a `.length` (an object carrying message text) must
+    // not be copied onto the audit event.
+    if (typeof payload[field] !== 'string' || payload[field].length === 0) {
+      throw new Error(`agent.task.input_injected: ${field} is required`);
+    }
+  }
+  // Copy field by field. A caller that spreads a wider object (a message,
+  // a task payload) must not be able to put that text on the audit event.
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'agent.task.input_injected',
+    sourceLayer: 'agent',
+    payload: {
+      hostTaskEventId: payload.hostTaskEventId,
+      inboundEventId: payload.inboundEventId,
+      conversationId: payload.conversationId,
+      agentId: payload.agentId,
+      drainPoint: payload.drainPoint,
+      senderContactId: payload.senderContactId,
+    },
+    parentEventId: payload.inboundEventId,
   };
 }
 
@@ -1080,6 +2301,20 @@ export function createOutboundDelivered(
   };
 }
 
+export function createExportDelivered(
+  payload: ExportDeliveredPayload & { parentEventId?: string },
+): ExportDeliveredEvent {
+  const { parentEventId, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'export.delivered',
+    sourceLayer: 'execution',
+    payload: rest,
+    parentEventId,
+  };
+}
+
 export function createOutboundBlocked(
   // parentEventId is required — every blocked event must trace back to the agent.response that was intercepted.
   payload: OutboundBlockedPayload & { parentEventId: string },
@@ -1095,6 +2330,22 @@ export function createOutboundBlocked(
   };
 }
 
+export function createOutboundJudge(
+  // parentEventId is optional — skill-invoked sends may lack a dispatch parent;
+  // conversationId + channelId in the payload still correlate the decision.
+  payload: OutboundJudgePayload & { parentEventId?: string },
+): OutboundJudgeEvent {
+  const { parentEventId, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'outbound.judge',
+    sourceLayer: 'dispatch',
+    payload: rest,
+    parentEventId,
+  };
+}
+
 export function createOutboundPiiRedacted(
   // parentEventId is optional — PII redaction events may trace back to the outbound.message
   // that triggered the redaction, but this link is advisory rather than required.
@@ -1104,7 +2355,7 @@ export function createOutboundPiiRedacted(
   return {
     id: randomUUID(),
     timestamp: new Date(),
-    type: 'outbound.pii-redacted',
+    type: 'outbound.pii_redacted',
     sourceLayer: 'dispatch',
     payload: rest,
     parentEventId,
@@ -1127,6 +2378,22 @@ export function createOutboundSuppressedDuplicate(
   };
 }
 
+export function createOutboundNoReply(
+  // parentEventId is required — the no-reply occupies the same causal slot outbound.message
+  // would have, tracing back to the agent.response that declined delivery. See #1732.
+  payload: OutboundNoReplyPayload & { parentEventId: string },
+): OutboundNoReplyEvent {
+  const { parentEventId, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'outbound.no_reply',
+    sourceLayer: 'dispatch',
+    payload: rest,
+    parentEventId,
+  };
+}
+
 export function createOutboundNotification(
   // parentEventId is optional — blocked_content notifications should pass the outbound.blocked
   // event's ID for traceability; other notification types may omit it.
@@ -1143,30 +2410,30 @@ export function createOutboundNotification(
   };
 }
 
-export function createSkillInvoke(
+export function createToolInvoke(
   // parentEventId is required — every skill invocation must trace back to the agent.task that triggered it.
-  payload: SkillInvokePayload & { parentEventId: string },
-): SkillInvokeEvent {
+  payload: ToolInvokePayload & { parentEventId: string },
+): ToolInvokeEvent {
   const { parentEventId, ...rest } = payload;
   return {
     id: randomUUID(),
     timestamp: new Date(),
-    type: 'skill.invoke',
+    type: 'tool.invoke',
     sourceLayer: 'agent',
     payload: rest,
     parentEventId,
   };
 }
 
-export function createSkillResult(
-  // parentEventId is required — results must reference the skill.invoke event they respond to.
-  payload: SkillResultPayload & { parentEventId: string },
-): SkillResultEvent {
+export function createToolResult(
+  // parentEventId is required — results must reference the tool.invoke event they respond to.
+  payload: ToolResultPayload & { parentEventId: string },
+): ToolResultEvent {
   const { parentEventId, ...rest } = payload;
   return {
     id: randomUUID(),
     timestamp: new Date(),
-    type: 'skill.result',
+    type: 'tool.result',
     sourceLayer: 'execution',
     payload: rest,
     parentEventId,
@@ -1432,15 +2699,43 @@ export function createConversationCheckpoint(
   };
 }
 
+export function createCheckpointExtractionSkipped(
+  payload: CheckpointExtractionSkippedPayload,
+): CheckpointExtractionSkippedEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    sourceLayer: 'system',
+    type: 'checkpoint.extraction_skipped',
+    payload,
+  };
+}
+
 export function createLlmCall(
   // parentEventId is required — every LLM call must trace back to the agent.task that triggered it.
-  payload: LlmCallPayload & { parentEventId: string },
+  // archive is optional and never persists into audit_log.payload.
+  payload: LlmCallPayload & { parentEventId: string; archive?: LlmCallArchiveContent },
 ): LlmCallEvent {
-  const { parentEventId, ...rest } = payload;
+  const { parentEventId, archive, ...rest } = payload;
   return {
     id: randomUUID(),
     timestamp: new Date(),
     type: 'llm.call',
+    sourceLayer: 'agent',
+    payload: rest,
+    parentEventId,
+    ...(archive !== undefined ? { archive } : {}),
+  };
+}
+
+export function createModelFallbackEngaged(
+  payload: ModelFallbackEngagedPayload & { parentEventId: string },
+): ModelFallbackEngagedEvent {
+  const { parentEventId, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'model.fallback',
     sourceLayer: 'agent',
     payload: rest,
     parentEventId,
@@ -1476,6 +2771,25 @@ export function createHumanDecision(
   };
 }
 
+export function createAuthorizationDecision(
+  // parentEventId traces to inbound.message (dispatch) or agent.task (execution).
+  // sourceLayer defaults to 'dispatch'; pass 'execution' for Gate C.
+  payload: AuthorizationDecisionPayload & {
+    parentEventId?: string;
+    sourceLayer?: 'dispatch' | 'execution';
+  },
+): AuthorizationDecisionEvent {
+  const { parentEventId, sourceLayer = 'dispatch', ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'authorization.decision',
+    sourceLayer,
+    payload: rest,
+    parentEventId,
+  };
+}
+
 export function createSecretAccessed(
   payload: SecretAccessedPayload,
   parentEventId?: string,
@@ -1504,14 +2818,92 @@ export function createSecretCaptured(
   };
 }
 
-export function createAutonomySkillBlocked(
-  payload: AutonomySkillBlockedPayload,
+export function createDelegationTimedOut(
+  payload: DelegationTimedOutPayload,
   parentEventId?: string,
-): AutonomySkillBlockedEvent {
+): DelegationTimedOutEvent {
   return {
     id: randomUUID(),
     timestamp: new Date(),
-    type: 'autonomy.skill_blocked',
+    type: 'delegation.timed_out',
+    sourceLayer: 'agent',
+    payload: {
+      ...payload,
+      cause: payload.cause ?? 'wait_timeout',
+    },
+    parentEventId,
+  };
+}
+
+export function createDelegationLateResolved(
+  payload: DelegationLateResolvedPayload,
+  parentEventId?: string,
+): DelegationLateResolvedEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'delegation.late_resolved',
+    sourceLayer: 'system',
+    payload,
+    parentEventId,
+  };
+}
+
+export function createDelegationRequesterContext(
+  // parentEventId is the specialist agent.task — the delegation being attested.
+  payload: DelegationRequesterContextPayload & { parentEventId: string },
+): DelegationRequesterContextEvent {
+  const { parentEventId, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'delegation.requester_context',
+    sourceLayer: 'agent',
+    payload: rest,
+    parentEventId,
+  };
+}
+
+export function createDelegationPrincipalNote(
+  // parentEventId is the coordinator's agent.task — the turn whose reply carried the note.
+  payload: DelegationPrincipalNotePayload & { parentEventId: string },
+): DelegationPrincipalNoteEvent {
+  const { parentEventId, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'delegation.principal_note',
+    sourceLayer: 'agent',
+    payload: rest,
+    parentEventId,
+  };
+}
+
+export function createPrincipalReport(
+  // sourceLayer is the publishing layer: dispatch for the dispatcher, gateway and report
+  // tools; system for interval jobs such as the approval expiry sweep; execution for Gate C
+  // under band gating (#2159).
+  payload: PrincipalReportPayload & { parentEventId: string; sourceLayer: 'dispatch' | 'system' | 'execution' },
+): PrincipalReportEvent {
+  const { parentEventId, sourceLayer, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'principal.report',
+    sourceLayer,
+    payload: rest,
+    parentEventId,
+  };
+}
+
+export function createAutonomySkillBlocked(
+  payload: AutonomySkillBlockedPayload,
+  parentEventId?: string,
+): AutonomyToolBlockedEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'autonomy.tool_blocked',
     sourceLayer: 'execution',
     payload,
     parentEventId,
@@ -1526,6 +2918,20 @@ export function createAutonomySendBlocked(
     id: randomUUID(),
     timestamp: new Date(),
     type: 'autonomy.send_blocked',
+    sourceLayer: 'dispatch',
+    payload,
+    parentEventId,
+  };
+}
+
+export function createAutonomyRelayDeferred(
+  payload: AutonomyRelayDeferredPayload,
+  parentEventId?: string,
+): AutonomyRelayDeferredEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'autonomy.relay_deferred',
     sourceLayer: 'dispatch',
     payload,
     parentEventId,
@@ -1590,6 +2996,40 @@ export function createTaskCompleted(
   };
 }
 
+export function createTaskResumableThroughput(
+  payload: TaskResumableThroughputPayload & { parentEventId?: string },
+): TaskResumableThroughputEvent {
+  const { parentEventId, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'task.resumable_throughput',
+    sourceLayer: 'system',
+    payload: rest,
+    parentEventId,
+  };
+}
+
+export function createVoiceSessionStarted(payload: VoiceSessionStartedPayload): VoiceSessionStartedEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'voice.session.started',
+    sourceLayer: 'channel',
+    payload,
+  };
+}
+
+export function createVoiceSessionEnded(payload: VoiceSessionEndedPayload): VoiceSessionEndedEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'voice.session.ended',
+    sourceLayer: 'channel',
+    payload,
+  };
+}
+
 export function createChannelPoll(payload: ChannelPollPayload): ChannelPollEvent {
   return {
     id: randomUUID(),
@@ -1606,6 +3046,92 @@ export function createChannelStalled(payload: ChannelStalledPayload): ChannelSta
     timestamp: new Date(),
     type: 'channel.stalled',
     sourceLayer: 'channel',
+    payload,
+  };
+}
+
+export function createChannelDisconnected(
+  payload: ChannelDisconnectedPayload,
+): ChannelDisconnectedEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'channel.disconnected',
+    sourceLayer: 'channel',
+    payload,
+  };
+}
+
+export function createChannelReconnect(payload: ChannelReconnectPayload): ChannelReconnectEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'channel.reconnect',
+    sourceLayer: 'channel',
+    payload,
+  };
+}
+
+export function createSystemRestart(payload: SystemRestartPayload): SystemRestartEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'system.restart',
+    sourceLayer: 'system',
+    payload,
+  };
+}
+
+export function createDocumentConsoleAction(payload: DocumentConsoleActionPayload): DocumentConsoleActionEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'document.console_action',
+    sourceLayer: 'system',
+    payload,
+  };
+}
+
+export function createActivitySummary(
+  payload: ActivitySummaryPayload & { parentEventId: string },
+): ActivitySummaryEvent {
+  const { parentEventId, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'activity.summary',
+    sourceLayer: 'system',
+    payload: rest,
+    parentEventId,
+  };
+}
+
+export function createMinutesReady(payload: MinutesReadyPayload): MinutesReadyEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'minutes.ready',
+    sourceLayer: 'system',
+    payload,
+  };
+}
+
+export function createMinutesPipelineFailed(payload: MinutesPipelineFailedPayload): MinutesPipelineFailedEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'minutes.pipeline_failed',
+    sourceLayer: 'system',
+    payload,
+  };
+}
+
+export function createKgNodesMerged(payload: KgNodesMergedPayload): KgNodesMergedEvent {
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'kg.nodes_merged',
+    sourceLayer: 'system',
     payload,
   };
 }

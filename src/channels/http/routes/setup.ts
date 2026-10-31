@@ -2,9 +2,8 @@
 //
 // These endpoints back the wizard's new "About you" step and let the frontend
 // decide which onboarding screen to land on. They are intentionally narrow:
-// no general-purpose contact CRUD, no channel-identity creation — that's the
-// job of bootstrapCeoContact (env-var bootstrap) and the future per-channel
-// verification flows respectively.
+// no general-purpose contact CRUD, no channel-identity creation — channel
+// identities are bound later via the per-channel verification flows.
 //
 // Endpoints:
 //   POST /api/setup/principal — name-only principal creation (idempotent)
@@ -22,12 +21,21 @@ import type { Logger } from '../../../logger.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
 import { ensurePrincipalContact } from '../../../contacts/ensure-principal.js';
 import { isIdentityConfigured } from './identity.js';
+import type { InfraLlmService } from '../../../skills/infra-llm.js';
+import { parseSuggestedFirstName, SUGGEST_NAME_PROMPT } from './suggest-name.js';
+import type { ContactService } from '../../../contacts/contact-service.js';
+import type { EntityMemory } from '../../../memory/entity-memory.js';
+import { validateWorkingHours, serializeWorkingHours } from '../../../contacts/working-hours.js';
 
 export interface SetupRouteOptions {
   webAppBootstrapSecret: string;
   sessions: SessionStore;
   pool: Pool;
   logger: Logger;
+  /** Canonical contact writes + identity linking for the principal profile step (#392). */
+  contactService: ContactService;
+  /** KG fact store for the principal's working-hours fact (#392). */
+  entityMemory: EntityMemory | undefined;
   /**
    * Whether the process booted in setup-required mode (no principal at boot, so
    * email + Signal adapters were skipped). Captured at startup and never changes
@@ -49,6 +57,14 @@ export interface SetupRouteOptions {
    * passes a small wrapper around process.exit; tests pass a spy.
    */
   scheduleProcessExit: (delayMs: number) => void;
+  /**
+   * Constrained LLM access used by POST /api/setup/suggest-name to propose a
+   * starter first name for the assistant (issue #799). Optional: when absent
+   * (e.g. no LLM provider configured) the endpoint reports "unavailable" and the
+   * wizard silently keeps its static placeholder — name suggestion is a
+   * nice-to-have, never a setup blocker.
+   */
+  infraLlmService?: InfraLlmService;
 }
 
 // Match identity.ts: tighter rate limit on auth-sensitive routes (10/min vs the
@@ -59,6 +75,10 @@ const AUTH_RATE = { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }
 
 const MAX_DISPLAY_NAME_LENGTH = 200;
 
+// Pragmatic address shape check — full RFC validation is unnecessary; the address is
+// the principal's own and is normalized to lowercase before linking.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export async function setupRoutes(
   app: FastifyInstance,
   options: SetupRouteOptions,
@@ -68,9 +88,12 @@ export async function setupRoutes(
     sessions,
     pool,
     logger,
+    contactService,
+    entityMemory,
     setupRequiredAtBoot,
     bootStartedAt,
     scheduleProcessExit,
+    infraLlmService,
   } = options;
 
   // Delay before process.exit so Fastify can finish flushing the 200 response.
@@ -88,7 +111,8 @@ export async function setupRoutes(
   // Creates the principal contact with `system_role='principal'` from a display
   // name alone. No channel identity is bound — verification flows handle that
   // later, per channel. Idempotent: a second call when the principal already
-  // exists returns the existing IDs and does not rename.
+  // exists returns the existing IDs. If the submitted name differs from the
+  // stored name, the contact is renamed so Step 1 can correct a typo (#392).
   app.post('/api/setup/principal', AUTH_RATE, async (request, reply) => {
     if (!requireAuth(request, reply)) return;
 
@@ -109,10 +133,44 @@ export async function setupRoutes(
 
     try {
       const result = await ensurePrincipalContact({ displayName: trimmed }, pool, logger);
+      let renamed = false;
+      if (result.alreadyExisted) {
+        // The principal already exists. Step 1 is no longer auto-skipped (#392), so a
+        // second submit is the operator correcting the name — apply it instead of no-op'ing.
+        const current = await contactService.findContactBySystemRole('principal');
+        if (current && current.displayName !== trimmed) {
+          await contactService.updateDisplayName(result.contactId, trimmed);
+          renamed = true;
+          // Best-effort: keep the KG person-node label in sync so KG browsing shows the
+          // corrected name. Since ADR-040 the principal's node is contact-anchored and so
+          // outside idx_kg_nodes_unique, meaning the rename normally succeeds even when
+          // another node owns that label. The catch stays for nodes still in the label
+          // tier — a rejected rename is non-fatal either way, because the contact column
+          // is the authoritative display name.
+          try {
+            await pool.query(
+              // A vector made from the old label no longer matches the node. Clearing
+              // both columns lets the next re-embed fill it, and keeps the CHECK from
+              // migration 103 satisfied.
+              `UPDATE kg_nodes SET label = $1, last_confirmed_at = now(),
+                   embedding = CASE WHEN label IS DISTINCT FROM $1 THEN NULL ELSE embedding END,
+                   embedding_model = CASE WHEN label IS DISTINCT FROM $1 THEN NULL ELSE embedding_model END
+                 WHERE id = $2 AND type = 'person'`,
+              [trimmed, result.kgNodeId],
+            );
+          } catch (kgErr) {
+            logger.warn(
+              { kgErr, kgNodeId: result.kgNodeId },
+              'POST /api/setup/principal: KG label rename skipped (likely label collision); contact display_name still updated',
+            );
+          }
+        }
+      }
       return reply.send({
         contactId: result.contactId,
         kgNodeId: result.kgNodeId,
         alreadyExisted: result.alreadyExisted,
+        renamed,
       });
     } catch (err) {
       logger.error({ err }, 'POST /api/setup/principal: failed to ensure principal contact');
@@ -121,6 +179,181 @@ export async function setupRoutes(
       return reply.status(500).send({
         error: 'Failed to create principal contact. Check server logs.',
       });
+    }
+  });
+
+  // -- GET /api/setup/principal --
+  //
+  // Loads the principal's name + operational profile so the wizard can pre-populate
+  // Steps 1 and 2 (#392). Returns { exists:false } (not 404) when no principal yet —
+  // the wizard treats that as a fresh install.
+  app.get('/api/setup/principal', AUTH_RATE, async (request, reply) => {
+    if (!requireAuth(request, reply)) return;
+    try {
+      const principal = await contactService.findContactBySystemRole('principal');
+      if (!principal) {
+        return reply.send({
+          exists: false, displayName: null, timezone: null,
+          preferredName: null, title: null, email: null, workingHours: null,
+        });
+      }
+      const withIdentities = await contactService.getContactWithIdentities(principal.id);
+      const email = (withIdentities?.identities ?? [])
+        .find((i) => i.channel === 'email' && i.verified && i.status === 'active')
+        ?.channelIdentifier ?? null;
+
+      // Working-hours fact: a 'fact' node linked to the principal's KG node whose
+      // properties.attribute === 'working_hours'. Mirrors the assembler's getFacts query.
+      let workingHours: string | null = null;
+      if (principal.kgNodeId) {
+        const facts = await pool.query<{ value: string | null }>(
+          `SELECT n.properties->>'value' AS value
+             FROM kg_edges e JOIN kg_nodes n ON n.id = e.target_node_id
+            WHERE e.source_node_id = $1 AND e.type = 'relates_to'
+              AND n.type = 'fact' AND lower(n.properties->>'attribute') = 'working_hours'
+            ORDER BY n.last_confirmed_at DESC LIMIT 1`,
+          [principal.kgNodeId],
+        );
+        workingHours = facts.rows[0]?.value ?? null;
+      }
+
+      return reply.send({
+        exists: true,
+        displayName: principal.displayName,
+        timezone: principal.timezone ?? null,
+        preferredName: principal.preferredName ?? null,
+        title: principal.title ?? null,
+        email,
+        workingHours,
+      });
+    } catch (err) {
+      logger.error({ err }, 'GET /api/setup/principal: failed to load principal profile');
+      return reply.status(500).send({ error: 'Failed to load principal profile. Check server logs.' });
+    }
+  });
+
+  // -- POST /api/setup/principal/profile --
+  //
+  // Persists the principal operational profile collected in the wizard's "Your details"
+  // step (#392): timezone + preferred name + title onto canonical contact columns; the
+  // email as a verified ceo_stated channel identity (so index.ts resolves principalEmail
+  // after the wizard-end restart); working hours as a KG fact surfaced by entity-context.
+  // Requires the principal to exist (created in Step 1). Omitted optional fields are not
+  // written, so a partial submit never clobbers an existing value.
+  app.post('/api/setup/principal/profile', AUTH_RATE, async (request, reply) => {
+    if (!requireAuth(request, reply)) return;
+
+    const body = (request.body ?? {}) as {
+      timezone?: unknown; email?: unknown; preferredName?: unknown;
+      title?: unknown; workingHours?: unknown;
+    };
+
+    // timezone is required and must be a real IANA zone (same guard as config.ts).
+    if (typeof body.timezone !== 'string' || body.timezone.trim().length === 0) {
+      return reply.status(400).send({ error: 'timezone is required.' });
+    }
+    const timezone = body.timezone.trim();
+    try {
+      Intl.DateTimeFormat(undefined, { timeZone: timezone });
+    } catch (err) {
+      if (err instanceof RangeError) {
+        return reply.status(422).send({ error: `"${timezone}" is not a recognized IANA timezone.` });
+      }
+      throw err; // unexpected — propagate to the outer catch for structured logging + 500
+    }
+
+    // Optional fields — validate shape before any write.
+    let email: string | undefined;
+    if (body.email !== undefined && body.email !== null && body.email !== '') {
+      // Trim once; also caps length before EMAIL_RE runs to avoid ReDoS — the domain
+      // portion is ambiguous across '.' chars, causing quadratic backtracking on crafted
+      // inputs. RFC 5321 caps email at 254 chars so this always finishes in O(1) time.
+      const trimmedEmail = typeof body.email === 'string' ? body.email.trim() : '';
+      if (!trimmedEmail || trimmedEmail.length > 254 || !EMAIL_RE.test(trimmedEmail)) {
+        return reply.status(422).send({ error: 'email is not a valid address.' });
+      }
+      email = trimmedEmail.toLowerCase();
+    }
+    const preferredName =
+      typeof body.preferredName === 'string' && body.preferredName.trim() ? body.preferredName.trim() : undefined;
+    const title =
+      typeof body.title === 'string' && body.title.trim() ? body.title.trim() : undefined;
+
+    let workingHoursValue: string | undefined;
+    if (body.workingHours !== undefined && body.workingHours !== null) {
+      const wh = validateWorkingHours(body.workingHours);
+      if (!wh) return reply.status(422).send({ error: 'workingHours is malformed.' });
+      workingHoursValue = serializeWorkingHours(wh);
+    }
+
+    try {
+      const principal = await contactService.findContactBySystemRole('principal');
+      if (!principal) {
+        return reply.status(409).send({ error: 'No principal exists yet — complete Step 1 first.' });
+      }
+
+      // Email first: updateContactFields validates primaryEmail against existing channel
+      // identities, so the identity must be linked before primary_email is set. ceo_stated
+      // is auto-verified (AUTO_VERIFIED_SOURCES), so this lands verified+active.
+      // Guard against re-running the wizard with the same email: linkIdentity does a plain
+      // INSERT and would hit the unique index on (channel, lower(channel_identifier)).
+      if (email) {
+        const existing = await contactService.getIdentitiesForContact(principal.id);
+        const alreadyLinked = existing.some(
+          (id) => id.channel === 'email' && id.channelIdentifier === email,
+        );
+        if (!alreadyLinked) {
+          await contactService.linkIdentity({
+            contactId: principal.id, channel: 'email', channelIdentifier: email,
+            source: 'ceo_stated', verified: true,
+          });
+        }
+      }
+
+      // Canonical columns — only defined fields are written (updateContactFields drops
+      // undefined entries, so omitted optionals are never clobbered).
+      await contactService.updateContactFields(principal.id, {
+        timezone,
+        ...(preferredName !== undefined ? { preferredName } : {}),
+        ...(title !== undefined ? { title } : {}),
+        ...(email !== undefined ? { primaryEmail: email } : {}),
+      });
+
+      // Working hours → KG fact on the principal's node. Carries properties.attribute so
+      // storeFact runs contradiction detection (a wizard re-run updates, not duplicates).
+      // entityMemory is optional (disabled when OPENAI_API_KEY is unset) — skip gracefully
+      // rather than failing the whole profile save; timezone/email/name don't need the KG.
+      if (workingHoursValue && principal.kgNodeId) {
+        if (entityMemory) {
+          await entityMemory.storeFact({
+            entityNodeId: principal.kgNodeId,
+            label: 'Working hours',
+            properties: { attribute: 'working_hours', value: workingHoursValue, category: 'preference' },
+            confidence: 1.0,
+            decayClass: 'permanent',
+            source: 'system:setup-wizard',
+          });
+        } else {
+          // KG is unavailable (no OPENAI_API_KEY) — log and continue. The canonical
+          // contact fields (timezone, email, name) are already persisted above.
+          logger.warn(
+            { kgNodeId: principal.kgNodeId },
+            'POST /api/setup/principal/profile: working hours not persisted — entityMemory is unavailable (KG disabled)',
+          );
+        }
+      } else if (workingHoursValue && !principal.kgNodeId) {
+        // Principal exists but has no KG node yet — working hours cannot be stored
+        // as a KG fact. The canonical contact fields are still persisted above.
+        logger.warn(
+          { contactId: principal.id },
+          'POST /api/setup/principal/profile: principal has no kg_node_id, working hours not persisted',
+        );
+      }
+
+      return reply.send({ ok: true });
+    } catch (err) {
+      logger.error({ err }, 'POST /api/setup/principal/profile: failed to persist profile');
+      return reply.status(500).send({ error: 'Failed to save profile. Check server logs.' });
     }
   });
 
@@ -236,5 +469,57 @@ export async function setupRoutes(
       logger.error({ err }, 'POST /api/setup/restart: scheduleProcessExit threw — restart will not occur');
     }
     return reply.send({ restarting: true, exitDelayMs: RESTART_EXIT_DELAY_MS });
+  });
+
+  // -- POST /api/setup/suggest-name --
+  //
+  // One-shot LLM call that proposes a starter first name for the assistant,
+  // shown by the wizard's identity step (issue #799). Two purposes: a touch of
+  // per-install personalization, and an early smoke test that the configured
+  // Anthropic key actually works before the operator commits anything.
+  //
+  // Best-effort by contract: every failure mode (no LLM service, provider error,
+  // an unparseable response) returns a non-2xx the frontend treats as "keep the
+  // static placeholder." No error is ever surfaced to the user from here —
+  // channel/key validation has its own surface later in the wizard. POST (not
+  // GET) because the call costs tokens and must not be cached by the browser.
+  app.post('/api/setup/suggest-name', AUTH_RATE, async (request, reply) => {
+    if (!requireAuth(request, reply)) return;
+
+    if (!infraLlmService) {
+      // No LLM provider wired — nothing to suggest. 503 → frontend falls back.
+      return reply.status(503).send({ error: 'Name suggestion is unavailable.' });
+    }
+
+    // extract() runs on the 'fast' tier here: 16 tokens leaves no room for thinking,
+    // and boot keeps fast on a model that can turn it off (#2224). It is errors-as-values: a provider
+    // failure is meant to come back as { ok: false }, never a throw. The
+    // try/catch is belt-and-suspenders — an unexpected rejection (e.g. a future
+    // provider impl, or a bug in the routing layer) is funneled into the same
+    // controlled 502 fallback rather than bubbling up as an uncontrolled 500.
+    // Cap the output hard: we only want a single word, and a tight ceiling keeps
+    // the smoke test cheap.
+    let result;
+    try {
+      result = await infraLlmService
+        .scoped({ toolName: 'wizard-suggest-name', conversationId: 'setup' })
+        .extract(SUGGEST_NAME_PROMPT, { maxTokens: 16, tier: 'fast' });
+    } catch (err) {
+      logger.warn({ err }, 'POST /api/setup/suggest-name: LLM call threw unexpectedly — frontend will fall back');
+      return reply.status(502).send({ error: 'Could not generate a suggestion.' });
+    }
+
+    if (!result.ok) {
+      logger.info({ error: result.error }, 'POST /api/setup/suggest-name: LLM call failed — frontend will fall back');
+      return reply.status(502).send({ error: 'Could not generate a suggestion.' });
+    }
+
+    const name = parseSuggestedFirstName(result.text);
+    if (!name) {
+      logger.info({ raw: result.text }, 'POST /api/setup/suggest-name: response was not a clean first name — frontend will fall back');
+      return reply.status(422).send({ error: 'Suggestion was not a usable name.' });
+    }
+
+    return reply.send({ name });
   });
 }

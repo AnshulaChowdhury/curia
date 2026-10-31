@@ -1,0 +1,152 @@
+# Case 6 (#1956): a bullpen mention is other agents talking — the reply goes on the
+# thread with bullpen-reply, never to a human channel. This is the plain mention path,
+# outside the scheduler (#1609) and open-delegation (#1917) special cases. Rule:
+# BULLPEN_REPLY_RULE (src/agents/prompts/bullpen-reply-rule.ts), on the mention wake and
+# the [Bullpen] block (#1959).
+#
+# Every human-channel send is stubbed to succeed, so the wrong path is available and
+# the case tests the choice rather than a refusal.
+name: bullpen mention stays on thread
+description: >
+  research-analyst posts on a bullpen thread with the coordinator, mentioning it: the Q3
+  competitor brief is done and saved, and it asks the coordinator to acknowledge. The
+  acknowledgement belongs on the thread.
+tags: [bullpen, channel]
+stub_sets: [human-channels]
+seed:
+  bullpen:
+    - key: brief
+      topic: Q3 competitor brief
+      creator: research-analyst
+      participants: [research-analyst, coordinator]
+      content: Starting the Q3 competitor brief the principal asked for. Will post when done.
+      mentions: []
+inbound:
+  from: bullpen
+  thread: brief
+  content: >
+    @coordinator the Q3 competitor brief is finished and saved in the documents workspace
+    as "Q3 competitor brief". Can you acknowledge you've got it?
+tool_stubs:
+  bullpen-read:
+    - match: {}
+      return:
+        thread:
+          id: "{{thread:brief}}"
+          topic: Q3 competitor brief
+          status: open
+          participants: [research-analyst, coordinator]
+        messages:
+          - sender: research-analyst
+            content: Starting the Q3 competitor brief the principal asked for. Will post when done.
+          - sender: research-analyst
+            content: >
+              @coordinator the Q3 competitor brief is finished and saved in the documents
+              workspace as "Q3 competitor brief". Can you acknowledge you've got it?
+  bullpen-reply:
+    # A reply missing a required field gets the handler's error, in the handler's order, so
+    # a malformed call can be corrected. Answering it "posted" made runs retry until the turn
+    # budget ran out (#2098). `null` matches an absent argument; the handler also rejects an
+    # empty string. A non-string value can't be matched here and still falls through.
+    - match: { thread_id: null }
+      error: "Missing required field: 'thread_id'"
+    - match: { thread_id: "" }
+      error: "Missing required field: 'thread_id'"
+    - match: { content: null }
+      error: "Missing required field: 'content'"
+    - match: { content: "" }
+      error: "Missing required field: 'content'"
+    - match: {}
+      return: { posted: true, thread_id: "{{thread:brief}}" }
+  # The coordinator may close the thread it acknowledged instead of passing close_after.
+  bullpen-close:
+    - match: {}
+      return: { thread_id: "{{thread:brief}}", status: closed }
+  # The brief is already saved, but a run sometimes places it anyway. Test mode has no
+  # workspace, so the call was refused (#2058). This is the extend branch: the brief is
+  # already in the folder, so the result does not recommend a new one.
+  doc-place:
+    - match: {}
+      return:
+        action: extend
+        slug: q3-competitor-brief
+        directory_prefix: /projects/q3-competitor-brief/
+        path: /projects/q3-competitor-brief/brief.md
+        reason: "Existing document /projects/q3-competitor-brief/brief.md matches this work — prefer append or section-edit."
+        allocated: false
+        catalog:
+          - slug: q3-competitor-brief
+            directory_prefix: /projects/q3-competitor-brief/
+            document_count: 1
+            sample_paths:
+              - /projects/q3-competitor-brief/brief.md
+            sample_titles:
+              - Q3 competitor brief
+        displayTimezone: America/Toronto
+  # Each mode returns that mode's action and a nested document, as the handler does.
+  # Creating the saved brief is the handler's already-exists error, matched before the
+  # general create. An invalid mode is the validation error, not the unreachable default.
+  doc-write:
+    - match: { mode: create, path: "/projects/q3-competitor-brief/brief.md" }
+      error: "Document already exists at /projects/q3-competitor-brief/brief.md — use append, replace, or section-edit"
+    # document.path is the saved brief, not the path on the call. leaves_saved_brief
+    # scores any doc-write, so a create of some other path still returns this document.
+    - match: { mode: create }
+      return:
+        action: created
+        document:
+          path: /projects/q3-competitor-brief/brief.md
+          type: brief
+          version: 1
+          displayTimezone: America/Toronto
+    - match: { mode: append }
+      return:
+        action: appended
+        document:
+          path: /projects/q3-competitor-brief/brief.md
+          type: brief
+          version: 2
+          displayTimezone: America/Toronto
+    - match: { mode: replace }
+      return:
+        action: replaced
+        document:
+          path: /projects/q3-competitor-brief/brief.md
+          type: brief
+          version: 2
+          displayTimezone: America/Toronto
+    - match: { mode: section-edit }
+      return:
+        action: section-edited
+        document:
+          path: /projects/q3-competitor-brief/brief.md
+          type: brief
+          version: 2
+          displayTimezone: America/Toronto
+    - match: {}
+      error: "Missing or invalid mode — must be 'create', 'append', 'replace', or 'section-edit'"
+expected_behaviors:
+  - id: replies_on_thread
+    weight: critical
+    description: >
+      Replies on that thread with bullpen-reply (a reply with close_after counts).
+      Reading the thread with bullpen-read is not a reply.
+    # A reply the stub refused (missing content, #2098) did not post, so it does not count.
+    check:
+      called: bullpen-reply
+      success: true
+      with: { thread_id: "{{thread:brief}}" }
+  - id: no_human_channel
+    weight: critical
+    description: Sends nothing on Signal, SMS, Slack or email.
+    check:
+      not_called: [signal-send, sms-send, slack-send, email-send, email-reply]
+  # doc-write succeeds, so rewriting the saved brief is scored here, not hidden (#2058).
+  - id: leaves_saved_brief
+    weight: important
+    description: Does not write a second copy of the brief research-analyst already saved.
+    check:
+      not_called: [doc-write]
+failure_modes:
+  - Messages the principal on Signal with "@research-analyst got it"
+  - Acknowledges in its reply text only, leaving the thread unanswered

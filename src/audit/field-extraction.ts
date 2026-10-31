@@ -1,0 +1,381 @@
+// field-extraction.ts — deterministic structured-field extraction for audit_log
+// (spec 10 §Field Extraction). Runs inside AuditLogger before INSERT.
+//
+// Extraction Failure Policy: missing/mistyped mapped fields become the sentinel
+// '[EXTRACTION_FAILED]' (not NULL — NULL means pre-migration). Unmapped event
+// types leave all structured columns NULL.
+
+import type { Logger } from '../logger.js';
+
+/** Sentinel written when a mapped field is missing or mistyped. */
+export const EXTRACTION_FAILED = '[EXTRACTION_FAILED]';
+
+/** Shared initiator literals for system/dispatch-originated events (queryable dimension). */
+export const INITIATOR_TYPE_SYSTEM = 'system';
+export const INITIATOR_ID_DISPATCH = 'dispatch';
+
+export interface StructuredAuditFields {
+  action: string | null;
+  outcome: string | null;
+  target_type: string | null;
+  target_id: string | null;
+  initiator_type: string | null;
+  initiator_id: string | null;
+}
+
+const ALL_NULL: StructuredAuditFields = {
+  action: null,
+  outcome: null,
+  target_type: null,
+  target_id: null,
+  initiator_type: null,
+  initiator_id: null,
+};
+
+type Extractor = (
+  payload: Record<string, unknown>,
+  fail: (field: string) => string,
+) => StructuredAuditFields;
+
+function str(
+  payload: Record<string, unknown>,
+  field: string,
+  fail: (field: string) => string,
+): string {
+  const v = payload[field];
+  return typeof v === 'string' && v.length > 0 ? v : fail(field);
+}
+
+/** toolName with legacy skillName fallback (pre-ADR-031 rows / dual vocabulary). */
+function toolName(
+  payload: Record<string, unknown>,
+  fail: (field: string) => string,
+): string {
+  if (typeof payload.toolName === 'string' && payload.toolName.length > 0) {
+    return payload.toolName;
+  }
+  if (typeof payload.skillName === 'string' && payload.skillName.length > 0) {
+    return payload.skillName;
+  }
+  return fail('toolName');
+}
+
+function toolResultOutcome(
+  payload: Record<string, unknown>,
+  fail: (field: string) => string,
+): string {
+  const result = payload.result;
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+    return fail('result.success');
+  }
+  const success = (result as Record<string, unknown>).success;
+  if (typeof success !== 'boolean') {
+    return fail('result.success');
+  }
+  return success ? 'success' : 'failure';
+}
+
+const extractToolInvoke: Extractor = (p, fail) => ({
+  action: 'execute',
+  outcome: 'pending',
+  target_type: 'skill',
+  target_id: toolName(p, fail),
+  initiator_type: 'agent',
+  initiator_id: str(p, 'agentId', fail),
+});
+
+const extractToolResult: Extractor = (p, fail) => ({
+  action: 'execute',
+  outcome: toolResultOutcome(p, fail),
+  target_type: 'skill',
+  target_id: toolName(p, fail),
+  initiator_type: 'agent',
+  initiator_id: str(p, 'agentId', fail),
+});
+
+/**
+ * Mapping table from spec 10. Also covers pre-ADR-031 `skill.*` aliases so any
+ * residual dual-vocabulary emitters still get structured columns.
+ */
+const EXTRACTORS: Readonly<Record<string, Extractor>> = {
+  // Console Documents page (#1822, #1823): the principal acting on one working document
+  // (target = its path) or on the store in bulk — export/import (target = the scope).
+  'document.console_action': (p, fail) => ({
+    action: str(p, 'action', fail),
+    // Two-stage, like agent.task: `requested` is written ahead of the change.
+    outcome: p.stage === 'requested' ? 'pending' : 'success',
+    target_type: typeof p.path === 'string' ? 'working_document' : 'working_document_store',
+    target_id: typeof p.path === 'string' ? p.path : str(p, 'scope', fail),
+    initiator_type: 'human',
+    initiator_id: str(p, 'initiatedBy', fail),
+  }),
+
+  // Same-contact follow-up drained into a live turn (#2018). The host task id
+  // is not a structured column here — the logger maps payload.hostTaskEventId
+  // onto task_id, and the factory sets parent_event_id to the inbound. No
+  // message body is extracted because the payload does not carry one.
+  'agent.task.input_injected': (p, fail) => ({
+    action: 'inject',
+    outcome: 'success',
+    target_type: 'conversation',
+    target_id: str(p, 'conversationId', fail),
+    initiator_type: 'human',
+    initiator_id: str(p, 'senderContactId', fail),
+  }),
+
+  'inbound.message': (p, fail) => ({
+    action: 'receive',
+    outcome: 'success',
+    target_type: 'conversation',
+    target_id: str(p, 'conversationId', fail),
+    initiator_type: 'human',
+    initiator_id: str(p, 'senderId', fail),
+  }),
+
+  // Spec 10 maps agent.task → system/dispatch. Originator (human vs principal
+  // vs scheduler) lives in payload.metadata.originator for trust-gate / Gate C;
+  // it is intentionally NOT mirrored into initiator_* (keeps extraction parent-
+  // lookup-free). trust-gate must not assume initiator_type = 'human' here.
+  'agent.task': (p, fail) => ({
+    action: 'delegate',
+    outcome: 'pending',
+    target_type: 'agent',
+    target_id: str(p, 'agentId', fail),
+    initiator_type: INITIATOR_TYPE_SYSTEM,
+    initiator_id: INITIATOR_ID_DISPATCH,
+  }),
+
+  'agent.response': (p, fail) => ({
+    action: 'respond',
+    outcome: 'success',
+    target_type: 'conversation',
+    target_id: str(p, 'conversationId', fail),
+    initiator_type: 'agent',
+    initiator_id: str(p, 'agentId', fail),
+  }),
+
+  'outbound.message': (p, fail) => ({
+    action: 'send',
+    outcome: 'success',
+    target_type: 'conversation',
+    target_id: str(p, 'conversationId', fail),
+    initiator_type: INITIATOR_TYPE_SYSTEM,
+    initiator_id: INITIATOR_ID_DISPATCH,
+  }),
+
+  // Agent explicitly declined to send (#1732). Action `suppress` is additive to
+  // spec 10's taxonomy — silence is the intended outcome, not a failed send.
+  'outbound.no_reply': (p, fail) => ({
+    action: 'suppress',
+    outcome: 'success',
+    target_type: 'conversation',
+    target_id: str(p, 'conversationId', fail),
+    initiator_type: INITIATOR_TYPE_SYSTEM,
+    initiator_id: INITIATOR_ID_DISPATCH,
+  }),
+
+  // Spec maps initiator to channel / channelId; outbound.delivered payload uses `channel`.
+  'outbound.delivered': (p, fail) => ({
+    action: 'deliver',
+    outcome: 'success',
+    target_type: 'conversation',
+    target_id: typeof p.conversationId === 'string' && p.conversationId.length > 0
+      ? p.conversationId
+      : fail('conversationId'),
+    initiator_type: 'channel',
+    initiator_id: str(p, 'channel', fail),
+  }),
+
+  // Stage-2 LLM judge decision (#1911). Fine-grained outcome stays in
+  // payload->>'outcome'; structured `outcome` maps into spec 10's enum.
+  // failed_open / failed_closed → error so a closed-mode outage is visible via
+  // `WHERE action = 'judge' AND outcome = 'error'` (not conflated with denied).
+  'outbound.judge': (p, fail) => ({
+    action: 'judge',
+    outcome: (() => {
+      switch (p.outcome) {
+        case 'judged_pass':
+        case 'skipped_principal_sole':
+          return 'success';
+        case 'judged_block':
+          return 'denied';
+        case 'failed_open':
+        case 'failed_closed':
+          return 'error';
+        default:
+          return fail('outcome');
+      }
+    })(),
+    target_type: 'conversation',
+    target_id: str(p, 'conversationId', fail),
+    initiator_type: INITIATOR_TYPE_SYSTEM,
+    initiator_id: INITIATOR_ID_DISPATCH,
+  }),
+
+  'tool.invoke': extractToolInvoke,
+  'skill.invoke': extractToolInvoke,
+
+  'tool.result': extractToolResult,
+  'skill.result': extractToolResult,
+
+  'memory.store': (p, fail) => ({
+    action: 'create',
+    outcome: 'success',
+    target_type: 'kg_node',
+    target_id: str(p, 'nodeId', fail),
+    initiator_type: 'agent',
+    initiator_id: str(p, 'agentId', fail),
+  }),
+
+  'memory.query': (p, fail) => ({
+    action: 'read',
+    outcome: 'success',
+    target_type: 'knowledge_graph',
+    target_id: str(p, 'queryType', fail),
+    initiator_type: 'agent',
+    initiator_id: str(p, 'agentId', fail),
+  }),
+
+  'contact.resolved': (p, fail) => ({
+    action: 'resolve',
+    outcome: 'success',
+    target_type: 'contact',
+    target_id: str(p, 'contactId', fail),
+    initiator_type: INITIATOR_TYPE_SYSTEM,
+    initiator_id: INITIATOR_ID_DISPATCH,
+  }),
+
+  'contact.unknown': (p, fail) => ({
+    action: 'resolve',
+    outcome: 'failure',
+    target_type: 'contact',
+    target_id: str(p, 'senderId', fail),
+    initiator_type: INITIATOR_TYPE_SYSTEM,
+    initiator_id: INITIATOR_ID_DISPATCH,
+  }),
+
+  // Late delegation (#1799). `outcome` stays inside spec 10's enum:
+  //   pending  — the delegation's fate is genuinely unknown at timeout time
+  //   success  — the handle resolved as designed (delivered, or recorded for a human)
+  //   failure  — abandoned: nothing arrived before the handle expired, so work was lost
+  // The fine-grained resolution stays queryable at payload->>'resolution'.
+  'delegation.timed_out': (p, fail) => ({
+    action: 'delegate',
+    outcome: 'pending',
+    target_type: 'delegation',
+    target_id: str(p, 'delegateEventId', fail),
+    initiator_type: 'agent',
+    initiator_id: str(p, 'agentId', fail),
+  }),
+
+  'delegation.late_resolved': (p, fail) => ({
+    action: 'resolve',
+    outcome: p.resolution === 'abandoned_ttl' ? 'failure' : 'success',
+    target_type: 'delegation',
+    target_id: str(p, 'delegateEventId', fail),
+    initiator_type: INITIATOR_TYPE_SYSTEM,
+    initiator_id: 'late-delegation',
+  }),
+
+  // Requester evidence rendered into a delegated specialist prompt (#1859).
+  // outcome is whether the addendum reached the model, not whether the audit
+  // write succeeded. The fine-grained identity stays in the payload.
+  'delegation.requester_context': (p, fail) => ({
+    action: 'record',
+    outcome: p.delegatedAddendumApplied === true
+      ? 'success'
+      : p.delegatedAddendumApplied === false
+        ? 'failure'
+        : fail('delegatedAddendumApplied'),
+    target_type: 'delegation',
+    target_id: str(p, 'delegateEventId', fail),
+    initiator_type: 'agent',
+    initiator_id: str(p, 'agentId', fail),
+  }),
+
+  // A sender reply's note for the principal (#1990). Recorded against the conversation
+  // the reply belongs to; the note itself and the review task id stay in the payload.
+  'delegation.principal_note': (p, fail) => ({
+    action: 'record',
+    outcome: 'success',
+    target_type: 'conversation',
+    target_id: str(p, 'conversationId', fail),
+    initiator_type: 'agent',
+    initiator_id: str(p, 'agentId', fail),
+  }),
+
+  // An item for the principal's digest (#2159). Keyed by what produced it, so the console
+  // timeline can filter notes, block notices and approval items apart.
+  'principal.report': (p, fail) => ({
+    action: 'report',
+    outcome: 'success',
+    target_type: 'principal',
+    target_id: str(p, 'source', fail),
+    initiator_type: INITIATOR_TYPE_SYSTEM,
+    initiator_id: str(p, 'source', fail),
+  }),
+
+  // Console node merge (#2233). The survivor is the target — it is the node that still
+  // exists; the absorbed id stays queryable at payload->>'absorbedId'. The principal is
+  // the only console user, so the initiator is the human, identified by contact id when
+  // the console originator resolved.
+  'kg.nodes_merged': (p, fail) => ({
+    action: 'merge',
+    outcome: 'success',
+    target_type: 'kg_node',
+    target_id: str(p, 'survivorId', fail),
+    initiator_type: 'human',
+    initiator_id: typeof p.actor === 'object' && p.actor !== null
+      && typeof (p.actor as Record<string, unknown>).contactId === 'string'
+      ? (p.actor as Record<string, unknown>).contactId as string
+      : 'console',
+  }),
+
+  // Spec lists message.held; the event type is reserved but not yet emitted.
+  // Keep the mapping ready so structured columns populate the day it ships.
+  'message.held': (p, fail) => ({
+    action: 'hold',
+    outcome: 'pending',
+    target_type: 'message',
+    target_id: str(p, 'heldMessageId', fail),
+    initiator_type: INITIATOR_TYPE_SYSTEM,
+    initiator_id: INITIATOR_ID_DISPATCH,
+  }),
+};
+
+/**
+ * Extract structured audit columns for an event. Never throws — failures become
+ * the EXTRACTION_FAILED sentinel and a warning log.
+ */
+export function extractStructuredFields(
+  eventType: string,
+  payload: Record<string, unknown>,
+  eventId: string,
+  logger: Logger,
+): StructuredAuditFields {
+  const extractor = EXTRACTORS[eventType];
+  if (!extractor) {
+    logger.debug(
+      { eventId, eventType },
+      'Audit field extraction: unmapped event type — structured columns left NULL',
+    );
+    return { ...ALL_NULL };
+  }
+
+  const failedFields: string[] = [];
+  const fail = (field: string): string => {
+    failedFields.push(field);
+    return EXTRACTION_FAILED;
+  };
+
+  const fields = extractor(payload, fail);
+
+  if (failedFields.length > 0) {
+    logger.warn(
+      { eventId, eventType, failedFields },
+      'Audit field extraction failed for one or more mapped fields — wrote [EXTRACTION_FAILED] sentinel',
+    );
+  }
+
+  return fields;
+}

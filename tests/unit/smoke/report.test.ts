@@ -2,30 +2,99 @@
 import { describe, it, expect } from 'vitest';
 import { generateReport } from '../../smoke/report.js';
 import type { RunResult, HistoricalEntry } from '../../smoke/types.js';
+import { emptyBreakdown } from '../../shared/usage.js';
 
 describe('Report generator', () => {
   const mockRun: RunResult = {
     timestamp: '2026-03-25T22:00:00.000Z',
+    model: 'deepseek/deepseek-v4.1-flash',
+    commit: 'abc1234',
+    filtered: false,
     durationMs: 45000,
     overallScore: 0.65,
+    passed: false,
+    concurrency: 4,
+    today: 'Wednesday, March 25, 2026 (America/Toronto)',
+    usage: { ...emptyBreakdown(), total: { calls: 3, inputTokens: 1000, outputTokens: 100, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, estimatedCostUsd: 1.5, reasoningTokens: 0, latenciesMs: [], upstreamProviders: {}, reasoningBlocksDropped: 0 } },
+    overheadUsage: emptyBreakdown(),
     cases: [
       {
         testCase: {
           name: 'Test Case 1',
           description: 'A test',
           tags: ['inference'],
+          sender: 'principal',
+          judgeToolCalls: false,
+          toolStubs: {},
           turns: [{ role: 'user', content: 'Hello' }],
           expectedBehaviors: [
             { id: 'greet', description: 'Greets back', weight: 'critical' },
           ],
           failureModes: ['Ignores greeting'],
         },
-        responses: [{ content: 'Hi there!', agentId: 'coordinator', durationMs: 1200 }],
+        responses: [{
+          prompt: 'Hello',
+          content: 'Hi there!',
+          agentId: 'coordinator',
+          durationMs: 1200,
+          toolCalls: [{ name: 'contact-lookup', input: {}, result: { success: false, error: 'nope' } }],
+        }],
         scores: [{ behaviorId: 'greet', rating: 'PASS', justification: 'Greeted warmly' }],
         weightedScore: 1.0,
+        agentCalls: [],
+        passed: true,
+        failures: [],
+        usage: emptyBreakdown(),
+        providerRetries: [],
+      },
+      {
+        testCase: {
+          name: 'Test Case 2',
+          description: 'Another',
+          tags: [],
+          sender: 'unknown',
+          judgeToolCalls: false,
+          toolStubs: {},
+          turns: [{ role: 'user', content: 'Who are you?' }],
+          expectedBehaviors: [{ id: 'careful', description: 'Is careful', weight: 'critical' }],
+          failureModes: [],
+        },
+        responses: [],
+        scores: [{ behaviorId: 'careful', rating: 'MISS', justification: 'Timed out' }],
+        weightedScore: 0,
+        error: 'Timeout',
+        agentCalls: [],
+        passed: false,
+        failures: ['did not complete: Timeout'],
+        usage: emptyBreakdown(),
+        providerRetries: [],
       },
     ],
   };
+
+  it('shows the gate failures and the tools a turn called', () => {
+    const html = generateReport(mockRun);
+    expect(html).toContain('did not complete: Timeout');
+    expect(html).toContain('contact-lookup (failed)');
+  });
+
+  it('shows the run\'s estimated model spend', () => {
+    expect(generateReport(mockRun)).toContain('Estimated model spend: $1.50');
+  });
+
+  it('labels each case with the gate verdict, including retries and known failures', () => {
+    const [first, second] = mockRun.cases;
+    const html = generateReport({
+      ...mockRun,
+      cases: [
+        { ...first!, firstAttempt: { weightedScore: 0.4, failures: ['weighted score 40% is below 80%'] } },
+        { ...second!, error: undefined, failures: ['critical behavior \'careful\' rated MISS'], testCase: { ...second!.testCase, knownFailure: { issue: '#1975' } } },
+      ],
+    });
+    expect(html).toContain('PASS*');
+    expect(html).toContain('First attempt 40%');
+    expect(html).toContain('KNOWN #1975');
+  });
 
   it('generates valid HTML with required sections', () => {
     const html = generateReport(mockRun);

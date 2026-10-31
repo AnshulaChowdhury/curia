@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { EventBus } from '../../../src/bus/bus.js';
+import { EventBus, UnownedAgentTaskError } from '../../../src/bus/bus.js';
 import { createInboundMessage, createAgentTask } from '../../../src/bus/events.js';
 import { createLogger } from '../../../src/logger.js';
 
@@ -155,5 +155,208 @@ describe('EventBus', () => {
 
     // Must resolve — not reject — even though onDelivered threw.
     await expect(bus.publish('channel', event)).resolves.toBeUndefined();
+  });
+
+  it('rejects a repeated unowned agent.task before the audit write (#1898)', async () => {
+    const errors: Array<{ obj: Record<string, unknown>; msg: string }> = [];
+    const logger = {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: (obj: Record<string, unknown>, msg: string) => { errors.push({ obj, msg }); },
+    };
+    // If publish wrote the row first, the second call would surface this
+    // unique violation instead of UnownedAgentTaskError. publishLateWake
+    // treats that violation as "already delivered".
+    const onEvent = vi.fn(async () => {
+      throw Object.assign(new Error('duplicate key'), { code: '23505' });
+    });
+    const onDelivered = vi.fn();
+    const handler = vi.fn();
+    bus = new EventBus(logger as unknown as ConstructorParameters<typeof EventBus>[0], onEvent, onDelivered);
+    bus.setAgentOwner((id) => id === 'coordinator');
+    bus.subscribe('agent.task', 'agent', handler);
+
+    const event = createAgentTask({
+      agentId: 'ghost-agent',
+      conversationId: 'scheduler:job-9:run-1',
+      channelId: 'scheduler',
+      senderId: 'scheduler',
+      content: 'do the thing',
+      parentEventId: 'fired-1',
+    });
+
+    const expected = {
+      msg: 'agent.task published for an agent no registered agent owns',
+      obj: {
+        agentId: 'ghost-agent',
+        layer: 'system',
+        eventId: event.id,
+        originatingEventId: 'fired-1',
+      },
+    };
+    await expect(bus.publish('system', event)).rejects.toBeInstanceOf(UnownedAgentTaskError);
+    await expect(bus.publish('system', event)).rejects.toBeInstanceOf(UnownedAgentTaskError);
+    expect(handler).not.toHaveBeenCalled();
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(onDelivered).not.toHaveBeenCalled();
+    expect(errors).toEqual([expected, expected]);
+  });
+
+  it('still acknowledges an agent.task a loaded runtime owns', async () => {
+    const onEvent = vi.fn();
+    const onDelivered = vi.fn();
+    const handler = vi.fn();
+    bus = new EventBus(createLogger('error'), onEvent, onDelivered);
+    bus.setAgentOwner((id) => id === 'coordinator');
+    bus.subscribe('agent.task', 'agent', handler);
+
+    const event = createAgentTask({
+      agentId: 'coordinator',
+      conversationId: 'conv-1',
+      channelId: 'cli',
+      senderId: 'user',
+      content: 'Hello',
+      parentEventId: 'parent-1',
+    });
+    await bus.publish('dispatch', event);
+
+    expect(handler).toHaveBeenCalledWith(event);
+    expect(onDelivered).toHaveBeenCalledWith(event.id);
+  });
+
+  it('publishDetached resolves after the write-ahead while a subscriber is still running (#2265)', async () => {
+    let releaseSubscriber = (): void => {};
+    const subscriberRunning = new Promise<void>((resolve) => {
+      releaseSubscriber = resolve;
+    });
+    const onEvent = vi.fn(async () => {});
+    const onDelivered = vi.fn(async () => {});
+    bus = new EventBus(createLogger('error'), onEvent, onDelivered);
+    let subscriberEntered = false;
+    bus.subscribe('inbound.message', 'dispatch', async () => {
+      subscriberEntered = true;
+      await subscriberRunning;
+    });
+
+    const event = createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'cli',
+      senderId: 'user',
+      content: 'Hello',
+    });
+
+    try {
+      await bus.publishDetached('channel', event);
+      expect(onEvent).toHaveBeenCalledWith(event);
+      expect(subscriberEntered).toBe(true);
+      expect(onDelivered).not.toHaveBeenCalled();
+    } finally {
+      releaseSubscriber();
+    }
+
+    await vi.waitFor(() => {
+      expect(onDelivered).toHaveBeenCalledWith(event.id);
+    });
+  });
+
+  it('publishDetached rejects a failing write-ahead before subscribers run (#2265)', async () => {
+    const onEvent = vi.fn(async () => {
+      throw new Error('audit insert failed');
+    });
+    const handler = vi.fn();
+    bus = new EventBus(createLogger('error'), onEvent);
+    bus.subscribe('inbound.message', 'dispatch', handler);
+
+    const event = createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'cli',
+      senderId: 'user',
+      content: 'Hello',
+    });
+
+    await expect(bus.publishDetached('channel', event)).rejects.toThrow(/audit insert failed/);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('stagePublish resolves after write-ahead and before deliver is called (#2254)', async () => {
+    const onEvent = vi.fn(async () => {});
+    const handler = vi.fn();
+    bus = new EventBus(createLogger('error'), onEvent);
+    bus.subscribe('inbound.message', 'dispatch', handler);
+
+    const event = createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'cli',
+      senderId: 'user',
+      content: 'Hello',
+    });
+
+    const staged = await bus.stagePublish('channel', event);
+    expect(onEvent).toHaveBeenCalledWith(event);
+    expect(handler).not.toHaveBeenCalled();
+
+    await staged.deliver();
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith(event);
+
+    await staged.deliver();
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it('stagePublish rejects a failing write-ahead before subscribers run (#2254)', async () => {
+    const onEvent = vi.fn(async () => {
+      throw new Error('audit insert failed');
+    });
+    const handler = vi.fn();
+    bus = new EventBus(createLogger('error'), onEvent);
+    bus.subscribe('inbound.message', 'dispatch', handler);
+
+    const event = createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'cli',
+      senderId: 'user',
+      content: 'Hello',
+    });
+
+    await expect(bus.stagePublish('channel', event)).rejects.toThrow(/audit insert failed/);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('a subscriber throw does not reject stagePublish or deliver (#2254)', async () => {
+    bus.subscribe('inbound.message', 'dispatch', async () => {
+      throw new Error('subscriber blew up');
+    });
+    const event = createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'cli',
+      senderId: 'user',
+      content: 'Hello',
+    });
+
+    const staged = await bus.stagePublish('channel', event);
+    await expect(staged.deliver()).resolves.toBeUndefined();
+  });
+
+  it('deliverPersisted skips the write-ahead and still acknowledges (#2254)', async () => {
+    const onEvent = vi.fn(async () => {});
+    const onDelivered = vi.fn(async () => {});
+    const handler = vi.fn();
+    bus = new EventBus(createLogger('error'), onEvent, onDelivered);
+    bus.subscribe('inbound.message', 'dispatch', handler);
+
+    const event = createInboundMessage({
+      conversationId: 'conv-1',
+      channelId: 'email',
+      senderId: 'ada@example.com',
+      content: 'Replay me',
+    });
+
+    await bus.deliverPersisted(event);
+
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith(event);
+    expect(onDelivered).toHaveBeenCalledWith(event.id);
   });
 });

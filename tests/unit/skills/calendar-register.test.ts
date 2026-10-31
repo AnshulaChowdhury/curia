@@ -1,16 +1,18 @@
 // tests/unit/skills/calendar-register.test.ts
 import { describe, it, expect, vi } from 'vitest';
-import { CalendarRegisterHandler } from '../../../skills/calendar-register/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { CalendarRegisterHandler } from '../../../skills/calendar/tools/calendar-register/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
 
 function makeCtx(
   input: Record<string, unknown>,
-  overrides?: Partial<SkillContext>,
-): SkillContext {
+  overrides?: Partial<ToolContext>,
+): ToolContext {
   return {
+    toolName: 'calendar-register',
+    toolVersion: '1.0.0',
     input,
     secret: () => { throw new Error('no secrets'); },
     log: logger,

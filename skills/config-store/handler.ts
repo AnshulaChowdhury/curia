@@ -1,28 +1,25 @@
 // skills/config-store/handler.ts
 //
 // Generic key-value configuration store backed by the knowledge graph.
+// Value get/set/list delegate to ConfigStore so exact-key semantics live in one
+// place (#2252). This handler owns input validation, the meta-index, and the
+// skill-facing ToolResult shape.
 //
 // KG storage model:
 //   Namespace anchor: type=concept, label="config:{namespace}"
 //     properties: { category: 'config', namespace }
-//   Per-key facts on the anchor:
-//     label=key, properties: { key, value, namespace }, decayClass=permanent
+//   Per-key facts on the anchor (via ConfigStore):
+//     label=key, properties: { key, value, namespace, exact_key: true }, decayClass=permanent
 //   Meta-index anchor: type=concept, label="config-store-index"
-//     Per-namespace facts: label=namespace, properties: { namespace }, decayClass=permanent
-//
-// The meta-index lets list_namespaces run as a single KG read rather than a
-// label-scan across all entities.
+//     Per-namespace facts: label=namespace, properties: { key, namespace }, exactKey
 
-import type { SkillHandler, SkillContext, SkillResult } from '../../src/skills/types.js';
+import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
+import { ConfigStore } from '../../src/memory/config-store.js';
 
 const INDEX_LABEL = 'config-store-index';
 
-function anchorLabel(namespace: string): string {
-  return `config:${namespace}`;
-}
-
-export class ConfigStoreHandler implements SkillHandler {
-  async execute(ctx: SkillContext): Promise<SkillResult> {
+export class ConfigStoreHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
     const { action } = ctx.input as { action?: string };
 
     if (!action || !['store', 'retrieve', 'list_namespaces'].includes(action)) {
@@ -42,7 +39,7 @@ export class ConfigStoreHandler implements SkillHandler {
     return this.listNamespaces(ctx);
   }
 
-  private async store(ctx: SkillContext): Promise<SkillResult> {
+  private async store(ctx: ToolContext): Promise<ToolResult> {
     const { namespace, key, value } = ctx.input as {
       namespace?: string;
       key?: string;
@@ -68,41 +65,27 @@ export class ConfigStoreHandler implements SkillHandler {
       return { success: false, error: 'value must be 2000 characters or fewer' };
     }
 
-    // Phase 1: write the value fact. If this fails, nothing was stored — return error.
-    // Declared before try so the return at the end of the method can reference them
-    // even though they are assigned inside the try block.
-    let anchor: { id: string };
-    let storeResult: { stored: boolean; action: string };
-
     // Use the context-aware source key so the rate limit counter matches what
     // AgentRuntime.resetRateLimit() clears. Without this, the counter accumulates
     // globally under 'skill:config-store' and is never reset.
-    // Declared before the try block so Phase 2 (registerNamespace) can reuse it.
     const writeSource = ctx.memoryWriteSource ?? 'skill:config-store';
     if (!ctx.memoryWriteSource) {
-      // memoryWriteSource is only absent in test/CLI contexts where no agentId or
-      // taskEventId is available. If this fires in production, it means channelId
-      // or agentId wasn't threaded through InvokeOptions — check the caller.
       ctx.log.debug({ namespace, key }, 'config-store: memoryWriteSource not set — using skill:config-store fallback');
     }
 
-    try {
-      anchor = await this.findOrCreateAnchor(ctx, namespace);
+    let storeResult: { stored: boolean; action: string };
 
-      storeResult = await ctx.entityMemory!.storeFact({
-        entityNodeId: anchor.id,
-        label: key,
-        properties: { key, value, namespace },
+    try {
+      // quiet: ConfigStore would otherwise duplicate the warn/error lines below.
+      const configStore = new ConfigStore(ctx.entityMemory!, ctx.log);
+      storeResult = await configStore.set(namespace, key, value, {
         confidence: 1.0,
-        // Config values are permanent — stable URLs / IDs the CEO provides once
-        decayClass: 'permanent',
         source: writeSource,
+        anchorSource: 'skill:config-store',
+        quiet: true,
       });
 
       if (!storeResult.stored) {
-        // The entity-memory validator rejected or rate-limited this write (e.g. an existing
-        // fact with equal or higher confidence blocked the update). The agent must know the
-        // write did not land so it can react — previously this was silently swallowed.
         ctx.log.warn(
           { namespace, key, action: storeResult.action },
           'Config value not written — storeFact rejected the write',
@@ -117,8 +100,7 @@ export class ConfigStoreHandler implements SkillHandler {
     }
 
     // Phase 2: register the namespace in the meta-index (best-effort), but only
-    // when the value write was actually accepted. Registering on rejection would
-    // leave list_namespaces advertising a namespace with no stored config values.
+    // when the value write was actually accepted.
     if (storeResult.stored) {
       try {
         await this.registerNamespace(ctx, namespace, writeSource);
@@ -127,7 +109,6 @@ export class ConfigStoreHandler implements SkillHandler {
           { err, namespace, key },
           'Config value stored but meta-index registration failed — list_namespaces may not include this namespace',
         );
-        // Still return success: the value IS stored. The meta-index is a projection.
       }
     } else {
       ctx.log.debug(
@@ -139,80 +120,52 @@ export class ConfigStoreHandler implements SkillHandler {
     return { success: true, data: { stored: storeResult.stored, action: storeResult.action, namespace, key } };
   }
 
-  private async retrieve(ctx: SkillContext): Promise<SkillResult> {
+  private async retrieve(ctx: ToolContext): Promise<ToolResult> {
     const { namespace, key } = ctx.input as { namespace?: string; key?: string };
 
     if (!namespace || typeof namespace !== 'string') {
       return { success: false, error: 'Missing required input: namespace' };
     }
 
-    // Declared before try so the catch block can include them even if the error
-    // occurs after they are assigned. If the error occurs before assignment,
-    // they remain undefined and pino will simply omit them from the log object.
-    let anchorIds: string[] | undefined;
     try {
-      const anchors = await ctx.entityMemory!.findEntities(anchorLabel(namespace));
-
-      if (anchors.length === 0) {
-        // Namespace has never been written to
-        ctx.log.debug({ namespace, key }, 'Namespace anchor not found — no config stored yet');
-        if (key) {
-          return { success: true, data: { found: false, key } };
-        }
-        return {
-          success: true,
-          data: {
-            entries: [],
-            message: `No config stored in namespace '${namespace}' yet.`,
-          },
-        };
-      }
-
-      // Collect facts across all anchor nodes for this namespace. Multiple anchors
-      // can exist if findOrCreateAnchor races (same pattern as knowledge-company-overview).
-      anchorIds = anchors.map((a) => a.id);
-      const allFacts = await Promise.all(anchors.map((a) => ctx.entityMemory!.getFacts(a.id)));
-      const facts = allFacts.flat();
+      const configStore = new ConfigStore(ctx.entityMemory!, ctx.log);
 
       if (key) {
-        // Primary match: label. Fallback: properties.key, which may differ from the label
-        // if a fact was stored with a mismatched label (e.g. a year-rollover bug that wrote
-        // label="sheet_id.2025" but properties.key="sheet_id.2026"). The fallback makes
-        // retrieve resilient to that class of data corruption.
-        const fact = facts.find((f) => f.label === key)
-          ?? facts.find((f) => (f.properties.key as string | undefined) === key);
-        if (!fact) {
+        const value = await configStore.get(namespace, key);
+        if (value === null) {
           return { success: true, data: { found: false, key } };
         }
         ctx.log.info({ namespace, key }, 'Retrieved config value');
-        return {
-          success: true,
-          data: {
-            found: true,
-            key,
-            value: fact.properties.value as string,
-          },
-        };
+        return { success: true, data: { found: true, key, value } };
       }
 
-      const entries = facts.map((f) => ({
-        // Fall back to label if properties.key is absent (forward-compat for hand-crafted nodes)
-        key: (f.properties.key as string | undefined) ?? f.label,
-        value: f.properties.value as string,
-      }));
+      const entries = await configStore.list(namespace);
+      if (entries.length === 0) {
+        // Distinguish empty namespace from never-written: list returns [] for both.
+        // Preserve the prior "not stored yet" message when the anchor is absent.
+        const anchors = await ctx.entityMemory!.findEntities(`config:${namespace}`);
+        if (anchors.length === 0) {
+          ctx.log.debug({ namespace }, 'Namespace anchor not found — no config stored yet');
+          return {
+            success: true,
+            data: {
+              entries: [],
+              message: `No config stored in namespace '${namespace}' yet.`,
+            },
+          };
+        }
+      }
 
       ctx.log.info({ namespace, entryCount: entries.length }, 'Retrieved config entries');
       return { success: true, data: { entries } };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      ctx.log.error({ err, namespace, anchorIds }, 'Failed to retrieve config');
+      ctx.log.error({ err, namespace }, 'Failed to retrieve config');
       return { success: false, error: `Failed to retrieve: ${message}` };
     }
   }
 
-  private async listNamespaces(ctx: SkillContext): Promise<SkillResult> {
-    // Declared before try so the catch block can include them even if the error
-    // occurs after they are assigned.
+  private async listNamespaces(ctx: ToolContext): Promise<ToolResult> {
     let indexNodeIds: string[] | undefined;
     try {
       const indexNodes = await ctx.entityMemory!.findEntities(INDEX_LABEL);
@@ -223,11 +176,13 @@ export class ConfigStoreHandler implements SkillHandler {
 
       indexNodeIds = indexNodes.map((n) => n.id);
       const allFacts = await Promise.all(indexNodes.map((n) => ctx.entityMemory!.getFacts(n.id)));
-      // Deduplicate — registerNamespace may have appended the same namespace more than once
-      // if storeFact does not enforce label uniqueness on the index node.
       const namespaces = [
         ...new Set(
-          allFacts.flat().map((f) => (f.properties.namespace as string | undefined) ?? f.label),
+          allFacts.flat().map((f) =>
+            (f.properties.key as string | undefined)
+            ?? (f.properties.namespace as string | undefined)
+            ?? f.label
+          ),
         ),
       ];
 
@@ -240,21 +195,7 @@ export class ConfigStoreHandler implements SkillHandler {
     }
   }
 
-  private async findOrCreateAnchor(ctx: SkillContext, namespace: string) {
-    const label = anchorLabel(namespace);
-    const existing = await ctx.entityMemory!.findEntities(label);
-    if (existing.length > 0) return existing[0]!;
-
-    const { entity } = await ctx.entityMemory!.createEntity({
-      type: 'concept',
-      label,
-      properties: { category: 'config', namespace },
-      source: 'skill:config-store',
-    });
-    return entity;
-  }
-
-  private async registerNamespace(ctx: SkillContext, namespace: string, writeSource: string): Promise<void> {
+  private async registerNamespace(ctx: ToolContext, namespace: string, writeSource: string): Promise<void> {
     const indexNodes = await ctx.entityMemory!.findEntities(INDEX_LABEL);
 
     let indexNodeId: string;
@@ -270,11 +211,21 @@ export class ConfigStoreHandler implements SkillHandler {
       indexNodeId = indexNodes[0]!.id;
     }
 
-    // Guard: only register if this namespace isn't already in the index.
-    // storeFact appends rather than upserts, so calling it repeatedly would
-    // accumulate duplicate facts and cause list_namespaces to return duplicates.
+    // Same rule as matchConfigFact: prefer properties.key / properties.namespace.
+    // Do NOT match on label alone — a fact corrupted by the old semantic merge
+    // can have label='travel_detection' with properties.namespace='travel_detection_v2',
+    // and a label-only guard would permanently block re-registering travel_detection.
     const existingFacts = await ctx.entityMemory!.getFacts(indexNodeId);
-    const alreadyRegistered = existingFacts.some((f) => f.label === namespace);
+    const alreadyRegistered = existingFacts.some((f) => {
+      const propKey = f.properties.key as string | undefined;
+      if (typeof propKey === 'string') return propKey === namespace;
+      const propNs = f.properties.namespace as string | undefined;
+      if (typeof propNs === 'string') return propNs === namespace;
+      // True legacy: neither key nor namespace property — label is the only signal.
+      return f.properties.key === undefined
+        && f.properties.namespace === undefined
+        && f.label === namespace;
+    });
     if (alreadyRegistered) {
       ctx.log.debug({ namespace }, 'Namespace already in meta-index — skipping duplicate registration');
       return;
@@ -283,10 +234,12 @@ export class ConfigStoreHandler implements SkillHandler {
     await ctx.entityMemory!.storeFact({
       entityNodeId: indexNodeId,
       label: namespace,
-      properties: { namespace },
+      // key mirrors namespace so exactKey can upsert; namespace kept for older readers.
+      properties: { key: namespace, namespace, exact_key: true },
       confidence: 1.0,
       decayClass: 'permanent',
       source: writeSource,
+      exactKey: true,
     });
   }
 }

@@ -5,6 +5,22 @@ describe('Bus Permissions', () => {
   it('allows channel to publish inbound.message', () => {
     expect(canPublish('channel', 'inbound.message')).toBe(true);
   });
+  it('allows channel to publish inbound.reaction', () => {
+    expect(canPublish('channel', 'inbound.reaction')).toBe(true);
+  });
+  it('allows channel to publish voice session lifecycle events', () => {
+    expect(canPublish('channel', 'voice.session.started')).toBe(true);
+    expect(canPublish('channel', 'voice.session.ended')).toBe(true);
+  });
+  it('allows system layer to publish and subscribe to voice session lifecycle events', () => {
+    expect(canPublish('system', 'voice.session.started')).toBe(true);
+    expect(canPublish('system', 'voice.session.ended')).toBe(true);
+    expect(canSubscribe('system', 'voice.session.started')).toBe(true);
+    expect(canSubscribe('system', 'voice.session.ended')).toBe(true);
+  });
+  it('allows dispatch to subscribe to inbound.reaction', () => {
+    expect(canSubscribe('dispatch', 'inbound.reaction')).toBe(true);
+  });
   it('blocks channel from publishing agent.task', () => {
     expect(canPublish('channel', 'agent.task')).toBe(false);
   });
@@ -36,29 +52,29 @@ describe('Bus Permissions', () => {
     expect(canSubscribe('channel', 'agent.task')).toBe(false);
   });
 
-  it('agent layer can publish skill.invoke', () => {
-    expect(canPublish('agent', 'skill.invoke')).toBe(true);
+  it('agent layer can publish tool.invoke', () => {
+    expect(canPublish('agent', 'tool.invoke')).toBe(true);
   });
 
-  it('agent layer can publish skill.result (on behalf of execution layer)', () => {
-    expect(canPublish('agent', 'skill.result')).toBe(true);
+  it('agent layer can publish tool.result (on behalf of execution layer)', () => {
+    expect(canPublish('agent', 'tool.result')).toBe(true);
   });
 
-  it('execution layer can publish skill.result', () => {
-    expect(canPublish('execution', 'skill.result')).toBe(true);
+  it('execution layer can publish tool.result', () => {
+    expect(canPublish('execution', 'tool.result')).toBe(true);
   });
 
-  it('agent layer can subscribe to skill.result', () => {
-    expect(canSubscribe('agent', 'skill.result')).toBe(true);
+  it('agent layer can subscribe to tool.result', () => {
+    expect(canSubscribe('agent', 'tool.result')).toBe(true);
   });
 
-  it('execution layer can subscribe to skill.invoke', () => {
-    expect(canSubscribe('execution', 'skill.invoke')).toBe(true);
+  it('execution layer can subscribe to tool.invoke', () => {
+    expect(canSubscribe('execution', 'tool.invoke')).toBe(true);
   });
 
   it('channel layer cannot publish skill events', () => {
-    expect(canPublish('channel', 'skill.invoke')).toBe(false);
-    expect(canPublish('channel', 'skill.result')).toBe(false);
+    expect(canPublish('channel', 'tool.invoke')).toBe(false);
+    expect(canPublish('channel', 'tool.result')).toBe(false);
   });
 
   it('agent layer can publish agent.error', () => {
@@ -80,20 +96,20 @@ describe('Bus Permissions', () => {
 
   // Explicit cross-layer violation cases called out in issue #187.
   // These confirm the hard boundaries between layers are enforced correctly.
-  // (channel/skill.invoke and channel/agent.task are already covered above.)
+  // (channel/tool.invoke and channel/agent.task are already covered above.)
 
-  it('dispatch layer cannot publish skill.result', () => {
-    // skill.result is owned by execution (and agent on its behalf); dispatch has no publish right
-    expect(canPublish('dispatch', 'skill.result')).toBe(false);
+  it('dispatch layer cannot publish tool.result', () => {
+    // tool.result is owned by execution (and agent on its behalf); dispatch has no publish right
+    expect(canPublish('dispatch', 'tool.result')).toBe(false);
   });
 
-  it('dispatch layer cannot publish skill.invoke', () => {
-    // skill.invoke is an agent-layer responsibility; dispatch cannot trigger skills directly
-    expect(canPublish('dispatch', 'skill.invoke')).toBe(false);
+  it('dispatch layer cannot publish tool.invoke', () => {
+    // tool.invoke is an agent-layer responsibility; dispatch cannot trigger skills directly
+    expect(canPublish('dispatch', 'tool.invoke')).toBe(false);
   });
 
   it('execution layer cannot publish agent.task', () => {
-    // execution only emits skill.result; it has no routing authority
+    // execution only emits tool.result; it has no routing authority
     expect(canPublish('execution', 'agent.task')).toBe(false);
   });
 
@@ -143,5 +159,132 @@ describe('Bus Permissions', () => {
   it('system layer can publish and subscribe to human.decision', () => {
     expect(canPublish('system', 'human.decision')).toBe(true);
     expect(canSubscribe('system', 'human.decision')).toBe(true);
+  });
+
+  // authorization.decision — #1379, dispatch (AuthorizationService) + execution (Gate C)
+
+  it('dispatch and execution layers can publish authorization.decision', () => {
+    expect(canPublish('dispatch', 'authorization.decision')).toBe(true);
+    expect(canPublish('execution', 'authorization.decision')).toBe(true);
+  });
+
+  it('agent and channel layers cannot publish authorization.decision', () => {
+    expect(canPublish('agent', 'authorization.decision')).toBe(false);
+    expect(canPublish('channel', 'authorization.decision')).toBe(false);
+  });
+
+  it('system layer can publish and subscribe to authorization.decision', () => {
+    expect(canPublish('system', 'authorization.decision')).toBe(true);
+    expect(canSubscribe('system', 'authorization.decision')).toBe(true);
+  });
+
+  it('dispatch layer can subscribe to authorization.decision for relay Gate C (#1733)', () => {
+    expect(canSubscribe('dispatch', 'authorization.decision')).toBe(true);
+  });
+
+  it('allows dispatch to publish outbound.no_reply and system to subscribe', () => {
+    expect(canPublish('dispatch', 'outbound.no_reply')).toBe(true);
+    expect(canPublish('system', 'outbound.no_reply')).toBe(true);
+    expect(canSubscribe('system', 'outbound.no_reply')).toBe(true);
+    expect(canPublish('agent', 'outbound.no_reply')).toBe(false);
+    expect(canPublish('channel', 'outbound.no_reply')).toBe(false);
+    expect(canSubscribe('channel', 'outbound.no_reply')).toBe(false);
+  });
+
+  it('allows dispatch to publish outbound.judge and system to subscribe (#1911)', () => {
+    expect(canPublish('dispatch', 'outbound.judge')).toBe(true);
+    expect(canPublish('system', 'outbound.judge')).toBe(true);
+    expect(canSubscribe('system', 'outbound.judge')).toBe(true);
+    expect(canPublish('agent', 'outbound.judge')).toBe(false);
+    expect(canPublish('channel', 'outbound.judge')).toBe(false);
+    expect(canSubscribe('channel', 'outbound.judge')).toBe(false);
+  });
+
+  it('allows the agent layer to publish delegation.requester_context (#1859)', () => {
+    expect(canPublish('agent', 'delegation.requester_context')).toBe(true);
+    expect(canPublish('system', 'delegation.requester_context')).toBe(true);
+    expect(canSubscribe('system', 'delegation.requester_context')).toBe(true);
+    expect(canPublish('dispatch', 'delegation.requester_context')).toBe(false);
+    expect(canPublish('execution', 'delegation.requester_context')).toBe(false);
+    expect(canPublish('channel', 'delegation.requester_context')).toBe(false);
+    expect(canSubscribe('agent', 'delegation.requester_context')).toBe(false);
+  });
+
+  it('allows the agent layer to publish delegation.principal_note (#1990)', () => {
+    expect(canPublish('agent', 'delegation.principal_note')).toBe(true);
+    expect(canPublish('system', 'delegation.principal_note')).toBe(true);
+    expect(canSubscribe('system', 'delegation.principal_note')).toBe(true);
+    expect(canPublish('dispatch', 'delegation.principal_note')).toBe(false);
+    expect(canPublish('execution', 'delegation.principal_note')).toBe(false);
+    expect(canPublish('channel', 'delegation.principal_note')).toBe(false);
+    // Nothing outside the system layer reads it: the note is never to reach a sender.
+    expect(canSubscribe('dispatch', 'delegation.principal_note')).toBe(false);
+    expect(canSubscribe('channel', 'delegation.principal_note')).toBe(false);
+    expect(canSubscribe('agent', 'delegation.principal_note')).toBe(false);
+  });
+
+  it('allows only the system layer to publish document.console_action (#1822)', () => {
+    expect(canPublish('system', 'document.console_action')).toBe(true);
+    expect(canSubscribe('system', 'document.console_action')).toBe(true);
+    for (const layer of ['channel', 'dispatch', 'agent', 'execution'] as const) {
+      expect(canPublish(layer, 'document.console_action')).toBe(false);
+    }
+  });
+
+  it('allows system layer to publish and subscribe to system.restart', () => {
+    expect(canPublish('system', 'system.restart')).toBe(true);
+    expect(canSubscribe('system', 'system.restart')).toBe(true);
+    expect(canPublish('channel', 'system.restart')).toBe(false);
+    expect(canPublish('dispatch', 'system.restart')).toBe(false);
+    expect(canPublish('agent', 'system.restart')).toBe(false);
+    expect(canPublish('execution', 'system.restart')).toBe(false);
+  });
+
+  it('lets the agent publish agent.task.input_injected and only system subscribe (#2018)', () => {
+    expect(canPublish('agent', 'agent.task.input_injected')).toBe(true);
+    expect(canPublish('system', 'agent.task.input_injected')).toBe(true);
+    expect(canSubscribe('system', 'agent.task.input_injected')).toBe(true);
+    // A channel must not be able to declare that its text was injected.
+    for (const layer of ['channel', 'dispatch', 'execution'] as const) {
+      expect(canPublish(layer, 'agent.task.input_injected')).toBe(false);
+      expect(canSubscribe(layer, 'agent.task.input_injected')).toBe(false);
+    }
+    expect(canSubscribe('agent', 'agent.task.input_injected')).toBe(false);
+  });
+
+  it('allows only the system layer to publish and subscribe to kg.nodes_merged (#2233)', () => {
+    expect(canPublish('system', 'kg.nodes_merged')).toBe(true);
+    expect(canSubscribe('system', 'kg.nodes_merged')).toBe(true);
+    for (const layer of ['channel', 'dispatch', 'agent', 'execution'] as const) {
+      expect(canPublish(layer, 'kg.nodes_merged')).toBe(false);
+      expect(canSubscribe(layer, 'kg.nodes_merged')).toBe(false);
+    }
+  });
+
+  it('allows only the system layer to publish and subscribe to activity.summary (#2251)', () => {
+    expect(canPublish('system', 'activity.summary')).toBe(true);
+    expect(canSubscribe('system', 'activity.summary')).toBe(true);
+    for (const layer of ['channel', 'dispatch', 'agent', 'execution'] as const) {
+      expect(canPublish(layer, 'activity.summary')).toBe(false);
+      expect(canSubscribe(layer, 'activity.summary')).toBe(false);
+    }
+  });
+
+  it('allows only the system layer to publish and subscribe to minutes.ready (#2322)', () => {
+    expect(canPublish('system', 'minutes.ready')).toBe(true);
+    expect(canSubscribe('system', 'minutes.ready')).toBe(true);
+    for (const layer of ['channel', 'dispatch', 'agent', 'execution'] as const) {
+      expect(canPublish(layer, 'minutes.ready')).toBe(false);
+      expect(canSubscribe(layer, 'minutes.ready')).toBe(false);
+    }
+  });
+
+  it('allows only the system layer to publish and subscribe to minutes.pipeline_failed (#2322)', () => {
+    expect(canPublish('system', 'minutes.pipeline_failed')).toBe(true);
+    expect(canSubscribe('system', 'minutes.pipeline_failed')).toBe(true);
+    for (const layer of ['channel', 'dispatch', 'agent', 'execution'] as const) {
+      expect(canPublish(layer, 'minutes.pipeline_failed')).toBe(false);
+      expect(canSubscribe(layer, 'minutes.pipeline_failed')).toBe(false);
+    }
   });
 });

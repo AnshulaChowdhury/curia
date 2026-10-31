@@ -3,7 +3,9 @@
 // fallback. loadConfig() no longer reads these from process.env; this is the single
 // place they enter Config. Must run after the vault is constructed and migrations
 // have run, and before any consumer reads config (anthropic provider, openai
-// embeddings, nylas/signal channels). Reads run concurrently; values are never logged.
+// embeddings, nylas channel). Reads run concurrently; values are never logged.
+// Note: the Signal phone number is NOT resolved here — it is owned by applyChannelVaultSecrets
+// under the canonical channel.signal.phone_number key (#1140).
 import type { Logger } from '../logger.js';
 import type { Config } from '../config.js';
 import type { SecretsService } from './secrets-service.js';
@@ -17,32 +19,35 @@ export async function applyVaultSecrets(
     anthropicApiKey,
     openaiApiKey,
     openrouterApiKey,
+    awsAccessKeyId,
+    awsSecretAccessKey,
+    embeddingApiKey,
     apiToken,
     webAppBootstrapSecret,
     nylasApiKey,
     nylasGrantId,
     nylasSelfEmail,
-    signalPhoneNumber,
   ] = await Promise.all([
     secrets.get('anthropic_api_key'),
     secrets.get('openai_api_key'),
     secrets.get('openrouter_api_key'),
+    secrets.get('aws_access_key_id'),
+    secrets.get('aws_secret_access_key'),
+    secrets.get('embedding_api_key'),
     secrets.get('api_token'),
     secrets.get('web_app_bootstrap_secret'),
     secrets.get('nylas_api_key'),
     secrets.get('nylas_grant_id'),
     secrets.get('nylas_self_email'),
-    secrets.get('signal_phone_number'),
   ]);
 
   // Normalize each vault value: trim surrounding whitespace (copy-paste artifacts) and
   // collapse a blank/whitespace-only result to `undefined` (absent). A whitespace-only
-  // secret is unusable at runtime — the Anthropic client and HTTP auth reject it, and a
-  // blank Signal phone number would otherwise stay truthy and wire up the channel with an
-  // invalid account id — so it must read as absent here, keeping the boot guards and the
-  // feature-on checks (`if (config.signalPhoneNumber)`) honest rather than letting a
-  // truthy-but-empty string slip through. The seeder already trims on write; this is the
-  // matching read-side guard for rows set by any other path.
+  // secret is unusable at runtime — the Anthropic client and HTTP auth both reject it — so
+  // it must read as absent here, keeping the boot guard (`if (!config.apiToken)`) and the
+  // feature-on checks honest rather than letting a truthy-but-empty string slip through.
+  // The seeder already trims on write; this is the matching read-side guard for rows set by
+  // any other path.
   const clean = (value: string | null): string | undefined => {
     const trimmed = value?.trim();
     return trimmed ? trimmed : undefined;
@@ -51,6 +56,9 @@ export async function applyVaultSecrets(
   config.anthropicApiKey = clean(anthropicApiKey);
   config.openaiApiKey = clean(openaiApiKey);
   config.openrouterApiKey = clean(openrouterApiKey);
+  config.awsAccessKeyId = clean(awsAccessKeyId);
+  config.awsSecretAccessKey = clean(awsSecretAccessKey);
+  config.embeddingApiKey = clean(embeddingApiKey);
   config.apiToken = clean(apiToken);
   config.webAppBootstrapSecret = clean(webAppBootstrapSecret);
   config.nylasApiKey = clean(nylasApiKey);
@@ -58,7 +66,6 @@ export async function applyVaultSecrets(
   // nylasSelfEmail is typed `string`, so it defaults to '' — matching the previous
   // `process.env.NYLAS_SELF_EMAIL ?? ''` behavior, not an env read.
   config.nylasSelfEmail = clean(nylasSelfEmail) ?? '';
-  config.signalPhoneNumber = clean(signalPhoneNumber);
 
   // Names only — never values. Lets an operator confirm what the vault supplied
   // vs. what's absent (feature-disabled), which is the whole debuggability win.
@@ -68,12 +75,14 @@ export async function applyVaultSecrets(
     anthropic_api_key: clean(anthropicApiKey) !== undefined,
     openai_api_key: clean(openaiApiKey) !== undefined,
     openrouter_api_key: clean(openrouterApiKey) !== undefined,
+    aws_access_key_id: clean(awsAccessKeyId) !== undefined,
+    aws_secret_access_key: clean(awsSecretAccessKey) !== undefined,
+    embedding_api_key: clean(embeddingApiKey) !== undefined,
     api_token: clean(apiToken) !== undefined,
     web_app_bootstrap_secret: clean(webAppBootstrapSecret) !== undefined,
     nylas_api_key: clean(nylasApiKey) !== undefined,
     nylas_grant_id: clean(nylasGrantId) !== undefined,
     nylas_self_email: clean(nylasSelfEmail) !== undefined,
-    signal_phone_number: clean(signalPhoneNumber) !== undefined,
   };
   logger.info({ present }, 'Resolved bootstrap secrets from vault (vault-only, no env fallback)');
 }

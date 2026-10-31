@@ -6,6 +6,15 @@
 //   Stage 2: LLM review (contextual appropriateness) — catches subtle leakage.
 //   Stage 2.5: Escalation judge (tier-sensitive disclosure gate) — classifies content
 //     by disclosure class and checks it against the recipient's tier policy table.
+//     Active only when an escalation judge is wired and enabled; disclosureGateStatus()
+//     reports which, and bootstrap logs it (#1870). Skipped for sends the principal
+//     directed — see FilterCheckInput.principalDirected.
+//
+// Under `autonomy.gating: band` (#2159, ADR-049) the contact-data-leak rule and Stage 2.5
+// are off: contact tier no longer decides what a recipient may be told. The gateway's
+// BandSendReview asks the escalation judge's brief instead. The integrity rules
+// (secret-pattern, system-prompt-fragment, internal-structure, principal-note-markup) and
+// Stage 2 run under both.
 //
 // Security principle: each stage is an independent boundary. Stage 1 failures
 // short-circuit immediately; Stages 2 and 2.5 only run on clean Stage 1 output.
@@ -14,10 +23,24 @@
 // The outbound filter is a separate security boundary — sharing code would couple
 // the two boundaries and risk one change silently weakening the other.
 
+import { createHash } from 'node:crypto';
+
 import type { ContactTier } from '../contacts/types.js';
-import { meetsMinimumTier } from '../contacts/types.js';
+import { meetsMinimumTier, resolvePrincipalEmail, type PrincipalEmailRef } from '../contacts/types.js';
+import type { Logger } from '../logger.js';
+import { normalizeFragmentText } from './prompt-exfiltration-markers.js';
 import type { OutboundJudge, JudgeInput } from './outbound-judge.js';
 import type { EscalationJudge } from '../autonomy/escalation-judge.js';
+import { tierPermitsAllDisclosure } from '../autonomy/escalation-policy.js';
+import { NOTE_TAG } from '../agents/principal-note.js';
+import type { AutonomyGating } from '../autonomy/band-policy.js';
+
+/**
+ * What the agent is told when the principal-note-markup rule blocks a send. Fixed text,
+ * so it is safe to surface whole (it quotes nothing from the message).
+ */
+export const PRINCIPAL_NOTE_MARKUP_DETAIL =
+  'A <note_for_principal> block goes only in your final response, which is where it is cut out and emailed to the principal. Send this message again without the note.';
 
 /**
  * A single resolved outbound recipient. `isPrincipal` is determined structurally
@@ -40,6 +63,25 @@ export interface FilterCheckInput {
   // Stage 2.5 escalation-judge disclosure gate.
   recipientTier: ContactTier;
   /**
+   * True when recipientTier is 'unknown' because contact resolution FAILED (DB or
+   * service error), not because the recipient has no contact record. The gateway
+   * fails open on that error so the send can still proceed. Stage 2.5 does not
+   * follow it: it evaluates at 'unknown' (fail-closed), because the gate is an
+   * allow-list keyed on tier. Skipping it would treat an unresolved recipient as
+   * trusted. The flag labels the finding so a block caused by the outage can be told
+   * apart from a block on the merits (#1870).
+   */
+  recipientTierUnresolved?: boolean;
+  /**
+   * True when the principal directed this send. Senders set it for a live principal
+   * turn (isLivePrincipalTurn) or when the principal approved the exact action
+   * (humanApproved). Principal lineage alone does not count: a woken task composes its
+   * content autonomously. Stage 2.5 does not block a principal-directed send: the
+   * principal may tell a `known` contact something about a third party. Absent means
+   * the gate applies, so a sender that omits it fails closed (#1870).
+   */
+  principalDirected?: boolean;
+  /**
    * Full recipient set (To + CC), each tagged isPrincipal structurally. Used by
    * Stage 2 (LLM judge). Optional: when absent (legacy callers / Stage-1-only unit
    * tests), Stage 2 treats the message as NOT principal-sole and the judge — if
@@ -48,6 +90,12 @@ export interface FilterCheckInput {
   recipients?: FilterRecipient[];
   principalIncluded?: boolean;
   principalIsSoleRecipient?: boolean;
+  /**
+   * The gating this send follows (#2312), as the gateway read it from the autonomy config
+   * for this call. Overrides the constructed `gating`: the scenario suite pins it per case
+   * on one shared filter. Absent: the constructed value, as before.
+   */
+  gating?: AutonomyGating;
 }
 
 export interface FilterFinding {
@@ -63,12 +111,25 @@ export interface FilterResult {
   stage?: 'deterministic' | 'llm-review' | 'disclosure-gate';
 }
 
+/**
+ * Whether Stage 2.5 can run. 'no-judge' means no escalation judge was wired;
+ * 'judge-disabled' means one was wired but the escalation.judge kill switch is off.
+ */
+export type DisclosureGateStatus = 'active' | 'no-judge' | 'judge-disabled' | 'band-review';
+
 export interface OutboundContentFilterConfig {
   // Phrases from the system prompt. If any appear in outbound content, it's
   // a signal the agent accidentally echoed its own instructions.
   systemPromptMarkers: string[];
-  // CEO email — allowed in outbound content (not a third-party leak).
-  ceoEmail: string;
+  // principal email — allowed in outbound content (not a third-party leak).
+  // Accepts a mutable PrincipalEmailRef so post-boot identity binds hot-reload (#1514).
+  ceoEmail: string | PrincipalEmailRef;
+  /**
+   * The assistant's own mailbox addresses — allowed in outbound content too. They are
+   * the sender's, not a third party's, and the email signature may carry one: a draft
+   * sent with send-draft is filtered with its signature (prompt trim PR 6).
+   */
+  ownEmails?: readonly string[];
   /** Optional Stage 2 LLM judge. When absent, Stage 2 is a no-op pass. */
   judge?: OutboundJudge;
   /**
@@ -79,6 +140,10 @@ export interface OutboundContentFilterConfig {
    * When absent, Stage 2.5 is a no-op pass.
    */
   escalationJudge?: EscalationJudge;
+  /** Optional logger for principal-bypass audit trails on Stage 1 rules. */
+  logger?: Logger;
+  /** 'band' (#2159): contact-data-leak and Stage 2.5 are off; BandSendReview reviews the send instead. Default 'tier'. */
+  gating?: AutonomyGating;
 }
 
 // Bus event type names that should never appear in outbound messages.
@@ -91,8 +156,8 @@ const BUS_EVENT_TYPE_NAMES: string[] = [
   'outbound.message',
   'outbound.blocked',
   'outbound.notification',
-  'skill.invoke',
-  'skill.result',
+  'tool.invoke',
+  'tool.result',
   'memory.store',
   'memory.query',
   'contact.resolved',
@@ -125,7 +190,7 @@ const INTERNAL_FIELD_NAMES: string[] = [
   'parent_event_id',
   'eventType',
   'event_type',
-  'skillName',
+  'toolName',
   'skill_name',
   'senderContext',
   'sender_context',
@@ -161,15 +226,38 @@ function normalizeForMatching(text: string): string {
     .replace(/[\u200B-\u200D\uFEFF\u00AD\u034F\u2060-\u2064\u206A-\u206F]/g, '');
 }
 
+/**
+ * Short, non-reversible fingerprint of a matched marker for use in finding
+ * details. A truncated SHA-256 identifies *which* marker fired (stable across
+ * process restarts, unlike an ordinal index that shifts when the prompt changes)
+ * and lets an operator correlate a suspected line by hashing it \u2014 without the
+ * detail itself ever containing system-prompt text.
+ */
+function fingerprintMarker(normalizedMarker: string): string {
+  return createHash('sha256').update(normalizedMarker).digest('hex').slice(0, 8);
+}
+
 export class OutboundContentFilter {
   private config: OutboundContentFilterConfig;
   private judge?: OutboundJudge;
   private escalationJudge?: EscalationJudge;
+  private logger?: Logger;
 
   constructor(config: OutboundContentFilterConfig) {
     this.config = config;
     this.judge = config.judge;
     this.escalationJudge = config.escalationJudge;
+    this.logger = config.logger;
+  }
+
+  /**
+   * Whether Stage 2.5 is reachable. Bootstrap logs this so an unwired gate shows up
+   * at boot, not only as an absence from the audit log (#1870).
+   */
+  disclosureGateStatus(): DisclosureGateStatus {
+    if (this.config.gating === 'band') return 'band-review';
+    if (!this.escalationJudge) return 'no-judge';
+    return this.escalationJudge.isEnabled() ? 'active' : 'judge-disabled';
   }
 
   /**
@@ -191,12 +279,19 @@ export class OutboundContentFilter {
     // between letters). All deterministic checks run on the normalized copy.
     const normalizedContent = normalizeForMatching(input.content);
 
+    const principalIsSoleRecipient = input.principalIsSoleRecipient ?? false;
+    const gating = input.gating ?? this.config.gating ?? 'tier';
+
     // Stage 1: deterministic rules
     const findings: FilterFinding[] = [
-      ...this.checkSystemPromptFragments(normalizedContent),
-      ...this.checkInternalStructure(normalizedContent),
+      ...this.checkSystemPromptFragments(normalizedContent, principalIsSoleRecipient),
+      ...this.checkInternalStructure(normalizedContent, principalIsSoleRecipient),
       ...this.checkSecretPatterns(normalizedContent),
-      ...this.checkContactDataLeak(normalizedContent, input.recipientEmail, input.recipientTier),
+      // Tier-keyed: off under band gating (#2159).
+      ...(gating === 'band'
+        ? []
+        : this.checkContactDataLeak(normalizedContent, input.recipientEmail, input.recipientTier)),
+      ...this.checkPrincipalNoteMarkup(normalizedContent, principalIsSoleRecipient),
     ];
 
     if (findings.length > 0) {
@@ -221,12 +316,12 @@ export class OutboundContentFilter {
     // Stage 2.5: escalation judge — tier-sensitive disclosure gate.
     // Classifies the content's disclosure class (public, principal-context, third-party,
     // confidential) and checks it against the tier's allowed set in DISCLOSURE_ALLOWED.
-    // Catches borderline disclosures (e.g. CEO availability shared with an 'unknown'
+    // Catches borderline disclosures (e.g. principal availability shared with an 'unknown'
     // recipient) that the deterministic email-pattern scan in Stage 1 misses.
     // No-op pass when no escalation judge is configured.
     let escalationFindings: FilterFinding[] = [];
     try {
-      escalationFindings = await this.runEscalationJudge({ ...input, content: normalizedContent });
+      escalationFindings = await this.runEscalationJudge({ ...input, content: normalizedContent, gating });
     } catch (err) {
       // Fail-closed: disclosure gate error blocks the message.
       const message = err instanceof Error ? err.message : String(err);
@@ -245,23 +340,43 @@ export class OutboundContentFilter {
   /**
    * Rule: system-prompt-fragment
    *
-   * Checks if any configured marker phrase appears in the content.
-   * Case-insensitive — the agent might reproduce markers in any casing.
+   * Checks if any configured marker phrase appears in the content. Matching is
+   * whitespace- and markdown-insensitive (see normalizeFragmentText): a leaking
+   * agent reproduces the words of its prompt but re-wraps lines and drops markdown
+   * decoration, so raw verbatim matching against the hard-wrapped source would
+   * miss real leaks.
+   *
+   * Principal bypass: the principal configured the system prompt and can read it
+   * at any time. Blocking principal-bound messages for identity phrasing is worse
+   * than useless — it suppresses legitimate output. Mirrors Stage 2's
+   * principalIsSoleRecipient short-circuit in OutboundLlmJudge.review().
    */
-  private checkSystemPromptFragments(content: string): FilterFinding[] {
+  private checkSystemPromptFragments(
+    content: string,
+    principalIsSoleRecipient: boolean,
+  ): FilterFinding[] {
     const findings: FilterFinding[] = [];
-    const lower = content.toLowerCase();
+    const normalizedContent = normalizeFragmentText(content);
 
     for (const marker of this.config.systemPromptMarkers) {
-      if (lower.includes(marker.toLowerCase())) {
+      const normalizedMarker = normalizeFragmentText(marker);
+      // A marker that normalizes to empty would match everything — skip it defensively.
+      if (!normalizedMarker) continue;
+      if (normalizedContent.includes(normalizedMarker)) {
+        // Do NOT echo the matched marker text: markers are live system-prompt lines,
+        // so putting one in the detail (which is logged and can reach block
+        // notifications) would re-disclose the very prompt content this rule exists
+        // to protect. Report a stable, non-reversible fingerprint instead — enough to
+        // correlate incidents and distinguish which marker fired, without leaking it.
+        // Mirrors the secret-pattern rule, which reports the pattern, never the secret.
         findings.push({
           rule: 'system-prompt-fragment',
-          detail: `Content contains system prompt marker: "${marker}"`,
+          detail: `Content contains a system prompt marker (fingerprint ${fingerprintMarker(normalizedMarker)}, ${normalizedMarker.length} chars)`,
         });
       }
     }
 
-    return findings;
+    return this.applyPrincipalBypass('system-prompt-fragment', findings, principalIsSoleRecipient);
   }
 
   /**
@@ -274,8 +389,16 @@ export class OutboundContentFilter {
    *    e.g., "conversationId" or channelId: — indicating JSON/object leakage.
    *    The structured-context restriction avoids false positives on bare words
    *    like "agent" that have legitimate uses in English.
+   *
+   * Principal bypass: echoing internal field names in a principal email is a bug, but
+   * silently blocking the message hides the problem — the principal needs the actual
+   * content, not a FYI notification. Stage 2/2.5 still run; secret-pattern still
+   * blocks credentials regardless of recipient.
    */
-  private checkInternalStructure(content: string): FilterFinding[] {
+  private checkInternalStructure(
+    content: string,
+    principalIsSoleRecipient: boolean,
+  ): FilterFinding[] {
     const findings: FilterFinding[] = [];
     // Lowercase once for the bus event type sub-check; the BUS_EVENT_TYPE_NAMES
     // are already lowercase so a single toLower on content is sufficient.
@@ -310,7 +433,50 @@ export class OutboundContentFilter {
       }
     }
 
-    return findings;
+    return this.applyPrincipalBypass('internal-structure', findings, principalIsSoleRecipient);
+  }
+
+  /**
+   * Rule: principal-note-markup (prompt trim PR 5)
+   *
+   * A <note_for_principal> block is cut out of the coordinator's final response, never out
+   * of a send skill's body. On a CC'd thread the reply is an `email-reply` call, so a note
+   * written "after the message" can land in that body and go to everyone on the thread.
+   * Any note tag in a send that reaches someone other than the principal is blocked; the
+   * agent is told where the note goes (PRINCIPAL_NOTE_MARKUP_DETAIL) and can resend.
+   *
+   * Principal bypass: a note tag in a message only the principal reads leaks nothing.
+   */
+  private checkPrincipalNoteMarkup(
+    content: string,
+    principalIsSoleRecipient: boolean,
+  ): FilterFinding[] {
+    if (!NOTE_TAG.test(content)) return [];
+    return this.applyPrincipalBypass(
+      'principal-note-markup',
+      [{ rule: 'principal-note-markup', detail: PRINCIPAL_NOTE_MARKUP_DETAIL }],
+      principalIsSoleRecipient,
+    );
+  }
+
+  /**
+   * Principal sole recipients bypass Stage 1 identity/structure blocks. When
+   * findings would have fired, emit a debug log so incident forensics can see
+   * the rule was intentionally skipped rather than clean.
+   */
+  private applyPrincipalBypass(
+    rule: string,
+    findings: FilterFinding[],
+    principalIsSoleRecipient: boolean,
+  ): FilterFinding[] {
+    if (!principalIsSoleRecipient) return findings;
+    if (findings.length > 0) {
+      this.logger?.debug(
+        { rule, suppressedFindings: findings.length },
+        'Stage 1 rule bypassed for principal sole recipient',
+      );
+    }
+    return [];
   }
 
   /**
@@ -342,7 +508,8 @@ export class OutboundContentFilter {
   /**
    * Rule: contact-data-leak
    *
-   * Finds any email address in the content that is not the recipient or CEO,
+   * Finds any email address in the content that is not the recipient, the principal or
+ * one of the assistant's own mailboxes,
    * then decides whether to block based on recipient tier.
    *
    * Block condition:
@@ -352,7 +519,7 @@ export class OutboundContentFilter {
    *   no third-party email OR recipient tier >= 'trusted'
    *
    * 'trusted' and 'principal' tiers may receive third-party contact data
-   * (emails of other people). This covers both "CEO asked for Hamilton's email"
+   * (emails of other people). This covers both "principal asked for Hamilton's email"
    * and "daily briefing lists meeting attendees". Tiers below 'trusted' never
    * receive third-party contact data.
    *
@@ -364,12 +531,14 @@ export class OutboundContentFilter {
     recipientEmail: string,
     recipientTier: ContactTier,
   ): FilterFinding[] {
-    // Only add ceoEmail if it is actually configured — an empty string (missing
-    // CEO_PRIMARY_EMAIL env var) would be a no-op entry that never matches but
-    // obscures the fact that the config is incomplete.
+    const ceoEmail = resolvePrincipalEmail(this.config.ceoEmail);
+    // Only add ceoEmail if it is actually known — an empty string (no verified
+    // principal email on file) would be a no-op entry that never matches but
+    // obscures the fact that the principal identity is incomplete.
     const allowedEmails = new Set([
       recipientEmail.toLowerCase(),
-      ...(this.config.ceoEmail ? [this.config.ceoEmail.toLowerCase()] : []),
+      ...(ceoEmail ? [ceoEmail.toLowerCase()] : []),
+      ...(this.config.ownEmails ?? []).map((email) => email.toLowerCase()),
     ]);
 
     // Recipients at 'trusted' or above may receive third-party email addresses.
@@ -383,7 +552,7 @@ export class OutboundContentFilter {
     }
 
     // Untrusted recipient: scan for third-party emails and block any that appear.
-    // The allowedEmails set still permits the recipient and CEO email addresses to
+    // The allowedEmails set still permits the recipient and principal email addresses to
     // appear in content without triggering a finding.
     const findings: FilterFinding[] = [];
     const seen = new Set<string>();
@@ -450,7 +619,7 @@ export class OutboundContentFilter {
    * (public / principal-context / third-party / confidential) and applies the
    * DISCLOSURE_ALLOWED policy table to determine if that class is permitted for
    * the recipient's tier. This catches borderline disclosures that the deterministic
-   * Stage 1 rules miss — e.g. the CEO's availability being shared with an 'unknown'
+   * Stage 1 rules miss — e.g. the principal's availability being shared with an 'unknown'
    * external recipient.
    *
    * When no escalation judge is configured, Stage 2.5 is a no-op pass.
@@ -460,10 +629,32 @@ export class OutboundContentFilter {
    * error). The outer try/catch in check() handles any truly unexpected throws.
    */
   private async runEscalationJudge(input: FilterCheckInput): Promise<FilterFinding[]> {
+    // Replaced by the gateway's BandSendReview under band gating (#2159); check() resolves gating.
+    if ((input.gating ?? this.config.gating) === 'band') return [];
     // Treat a disabled judge the same as an absent one — both are a no-op pass.
     // A disabled judge is an operator kill switch; we don't want it hard-blocking
     // every message (which is what classifyDisclosure returns when enabled=false).
     if (!this.escalationJudge || !this.escalationJudge.isEnabled()) return [];
+
+    // Tiers whose policy entry allows every disclosure class (principal, trusted). Calling
+    // the LLM is unnecessary and risky: classifyDisclosure() is fail-closed, so a transient
+    // LLM failure would return decision='escalate' without ever reaching applyDisclosurePolicy,
+    // incorrectly blocking a message the policy unconditionally permits (#1225, #1870).
+    if (tierPermitsAllDisclosure(input.recipientTier)) return [];
+
+    // Structural principal-sole recipient, mirroring Stage 2. Unlike recipientTier this does
+    // not depend on the contact DB, so principal-bound mail still passes when contact
+    // resolution failed and left the tier at 'unknown'.
+    if (input.principalIsSoleRecipient) return [];
+
+    // The principal directed this send, so it is not an autonomous disclosure (#1870).
+    if (input.principalDirected) {
+      this.logger?.info(
+        { recipientTier: input.recipientTier, channelId: input.channelId },
+        'Stage 2.5 disclosure gate skipped — send directed by the principal',
+      );
+      return [];
+    }
 
     const verdict = await this.escalationJudge.classifyDisclosure({
       content: input.content,
@@ -474,12 +665,17 @@ export class OutboundContentFilter {
     if (verdict.decision === 'escalate') {
       // Detail uses only deterministic enum values (class + tier), not verdict.reason.
       // The LLM-generated reason is available in structured logs from the judge's own
-      // logger but must not be forwarded to the CEO notification email — the disclosure
+      // logger but must not be forwarded to the principal notification email — the disclosure
       // judge prompt does not explicitly prohibit quoting from the evaluated content,
       // so verdict.reason could theoretically echo sensitive fragments.
+      // Same rule either way; the suffix lets the audit trail separate an outage-caused
+      // block from a block on the merits (#1870).
+      const unresolved = input.recipientTierUnresolved
+        ? ' (recipient tier unresolved: contact lookup failed)'
+        : '';
       return [{
         rule: 'disclosure-tier-gate',
-        detail: `Disclosure class '${verdict.disclosureClass ?? 'unknown'}' not permitted for tier '${input.recipientTier}'`,
+        detail: `Disclosure class '${verdict.disclosureClass ?? 'unknown'}' not permitted for tier '${input.recipientTier}'${unresolved}`,
       }];
     }
 

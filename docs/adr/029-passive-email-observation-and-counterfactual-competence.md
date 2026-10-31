@@ -1,0 +1,112 @@
+# ADR-029: Passive email observation and counterfactual competence
+
+Date: 2026-07-16
+Status: Accepted
+Amended: 2026-10-19 — shadow rows no longer feed the Phase 3 score or the error-rate guard (#2191)
+
+## Context
+
+The `ceo-inbox` agent drafts email well but learns nothing from what happens next. When the CEO edits a Curia draft in Gmail and sends it, or completes a to-do by emailing someone, or handles a message Curia punted — Curia has no feed of those outcomes. Three product loops depend on that feed:
+
+1. **Voice learning** — refine `ExecutiveProfile.WritingVoice` from draft→sent diffs.
+2. **Task-completion detection** — close or confirm open `owner='ceo'` tasks when a send fulfils them.
+3. **Capability growth** — for emails Curia triages but punts, silently shadow-draft what it *would* have sent, then score that counterfactual against the CEO's actual send so the global autonomy score can rise on evidence.
+
+Two architectural questions had to be settled before implementation:
+
+**A. Where do the intermediate evidence and learned outputs live?** Options considered:
+
+1. New memory/record types in the knowledge graph (or new tables) for draft snapshots, diffs, and competence evidence.
+2. Reuse existing stores: OKF scratch docs for evidence, `ExecutiveProfile.WritingVoice` for voice, `tasks` for completion, `autonomy_action_log` for competence — no new memory or event-record types.
+3. A dedicated "preference learning" subsystem with its own schema.
+
+**B. How should shadow (not-taken) actions feed autonomy?** Options considered:
+
+1. A new per-class competence model / graduation state machine for inbox handling.
+2. Treat shadow drafts as a valid Competence input to the *existing* Phase 3 scoring pass (`autonomy_action_log` → `computeCapabilityScore`), with no new score dial.
+3. Defer capability growth until a separate autonomy redesign.
+
+Design of record: this ADR together with specs 04 (channels), 13 (office identity),
+14 (autonomy engine), and 19 (tasks and backlog), where the observe → reflect → remember
+loop and its store mapping are specified. Epic #1419.
+
+## Decision
+
+**Reuse existing stores for a passive observe → reflect → remember loop; treat counterfactual (shadow) actions as a valid Phase 3 competence input.**
+
+### Passive observation / reuse-existing-stores
+
+> Curia observes a real-world side effect (the CEO's Sent folder via the existing `ceo-inbox` Nylas grant), accumulates freeform evidence in the OKF document workspace, and writes learned state only into stores that already exist — never inventing a parallel memory or record type for this feature.
+
+Concrete mapping:
+
+| Concern | Store |
+|---|---|
+| Draft snapshots + `(draft, sent)` diffs | OKF `/scratch/voice-learning/…` (spec 20) |
+| Learned voice | free-form `WritingVoice.guide`, maintained by a weekly batched LLM pass and approved via the digest |
+| Todo completion | `tasks` + `task-complete` / digest confirm |
+| Capability evidence | Pre-scored rows in `autonomy_action_log` |
+| Cadence / watermarks | Scheduler crons + `config-store` (`ceo_inbox`) |
+| Queue / status / guard state (completion candidates, digest items, voice proposal, matched-draft & asked-task guards) | `config-store` JSON (`ceo_inbox`), one whole-rewritten key per store |
+
+Machine-state keys use whole-object last-write-wins (no per-doc version check); acceptable because each key has effectively a single writer per cron tick and the queue key is keyed by task id so a held-watermark retry re-adds idempotently. Prose evidence (`pending-diffs.md`), snapshots, and shadow docs remain OKF.
+
+Rationale for rejecting new stores (options 1 and 3): the destinations already exist and are versioned/auditable; a parallel schema would duplicate versioning, digest surfacing, and autonomy gating. The KG is the wrong home for raw draft prose and edit diffs (spec 20: "the workspace is the scratchpad, the KG is the record").
+
+### Counterfactual competence
+
+> A silent shadow draft of a punted email, reconciled against the CEO's actual send, is a legitimate Competence signal for Phase 3. It answers the counterfactual the autonomy score exists to answer: "if we had let Curia handle this, would it have reached the same decision?"
+
+Mechanism (no new competence model):
+
+- On reconciliation, collect `(shadow draft, actual sent reply)` pairs and make a **batched LLM call** (`ctx.infraLlm.extract()`, batch size 20) that judges whether the shadow draft reached the same substantive decision/recommendation as the actual send. This is a semantic equivalence judgment, not token or approve/deny matching.
+- Write a **pre-scored** `autonomy_action_log` row with the resulting `competence_flag` (binary, `0` or `1`), `commitment_flag` and `compatibility` null, `scored_by = 'shadow-reconciler'`.
+- Mark rows unmistakably (`skill_name: 'shadow-draft-eval'`, `action_risk: 'none'`, `payload.shadow: true`, `outcome: 'shadow_evaluated'`).
+- `findUnscoredTerminal` skips them (no double-scoring); `findAllScored` includes them in the composite.
+- The global score remains the only dial; existing guards (≥30 scored, 20% error-rate block on increases, ±5/day, 7-day CEO cooldown) apply unchanged.
+- High-sensitivity threads (board / investors / legal / spouse) are **included** in shadow capture, not excluded. Those are the highest-stakes decisions, where competence evidence matters most.
+
+Rationale for rejecting a parallel competence model (option 1): Phase 3 already auto-adjusts one global score from competence evidence; a second dial would fight ADR-011's single-score design and invent graduation machinery the band injection already provides emergently.
+
+## Consequences
+
+- **Three loops share one observer.** Voice, task-completion, and shadow competence all hang off `ceo-inbox-sent-observe` + draft/shadow capture — one Sent-folder poll, not three pipelines.
+- **Privacy surface widens.** The observer reads *all* Sent mail (not only Curia-touched threads), and shadow capture now includes sensitive threads (board / investors / legal / spouse) since those are the highest-stakes decisions. Spec 04 records retention/TTL for raw OKF evidence, per OKF scratch conventions.
+- **Hybrid auto/confirm is required.** Voice and task-completion write-back are confidence- and risk-tiered so noisy signal cannot silently corrupt the profile or close high-risk tasks.
+- **`ceo-inbox` must become autonomy-band-aware.** Per the spec 14 checklist, scheduled specialists need explicit `autonomyService` injection so triage aggressiveness tracks the live band as shadow competence raises the score.
+- **No new public memory API.** Skills and bus events are additive (`ceo.sent_observed`, new skills); the skill/handler surfaces grow, but knowledge-graph and task schemas do not gain parallel "learning" tables.
+- **Accepted trade-off:** shadow rows are judged by a batched LLM assessment of substantive decision/recommendation equivalence at reconciliation time, not by the live per-action scoring-pass judge. They arrive pre-scored, so the scoring-pass judge path never sees them directly. Operators must understand `scored_by = 'shadow-reconciler'` in audits.
+
+## Amendment (2026-10-19) — shadows leave the score (#2191)
+
+**Decision B is reversed.** Shadow rows are still captured, judged and written to
+`autonomy_action_log`, but they no longer feed the Phase 3 pass: `countScored`,
+`findAllScored` and `getRecentCompetenceErrorRate` all leave out
+`outcome = 'shadow_evaluated'`. Passive observation (decision A) is unchanged.
+
+Why, from three months of prod data:
+
+- **The sample selects hard cases.** Shadows are drafted only for messages Curia chose
+  to punt (Seen, Urgent, Stuck). Seen means personal, sensitive or uncertain, and Urgent
+  means the principal has to decide. On those, a draft that differs from the principal's
+  reply mostly shows that punting was right. Counting it as a competence error penalized
+  correct caution.
+- **The signal was noisy.** 11 of the first 15 judged pairs scored as different
+  decisions. At least 3 of the 11 were artifacts: a send about a week after capture
+  paired as "the reply", one reply scored against two shadows, and a judge treating two
+  routes to the same outcome as opposite decisions. Most of the rest share one theme:
+  the shadow commits the principal, or asserts facts Curia could not know.
+- **It blocked the score.** Shadows were 11 of the 16 errors in the guard's 30-row
+  window (53%, against a 20% threshold), so they alone kept the score from rising.
+
+The rows stay useful as draft-quality evidence: the learning checkup reads their
+disagreement reasons. If shadows return to the score, it should be after the pairing is
+bounded (a send close to capture, one send per shadow) and the judge sees the inbound
+message, and probably at a reduced weight. The pairing was bounded in #2195: a shadow
+pairs only with a same-thread send within 72 hours of capture, and each send scores
+only the shadow captured closest before it. The judge still does not see the inbound
+message.
+
+The same change bounds the error-rate window by age (`errorRateWindowDays`, default 90)
+as well as count. Competence rows are sparse, so "the last 30" had reached back five
+months.

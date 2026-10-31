@@ -1,60 +1,72 @@
 // mcp-loader.ts — reads config/skills.yaml, connects to each MCP server,
-// discovers tools via tools/list, and registers them in the SkillRegistry.
+// discovers tools via tools/list, and registers them in the ToolRegistry.
 //
-// Called once at startup, right after loadSkillsFromDirectory. Returns the live
-// McpSession array so the bootstrap orchestrator can close them on shutdown.
+// Called once at startup, right after loadToolsFromDirectory. Returns live
+// McpSession objects plus per-server projected tool names so the bootstrap
+// orchestrator can close sessions and register MCP-as-skill projections
+// (ADR-032).
 //
-// Connection failures are warn-only — a missing MCP server should not take
-// down the whole system. The failed server's tools are simply not registered.
+// Connection failures are error-logged and tracked in serverStatuses for
+// /api/health (#1500) — a missing MCP server should not take down the whole
+// system, but it must not be silent either.
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import yaml from 'js-yaml';
-import type { SkillManifest, SkillHandler, SkillContext, SkillResult } from './types.js';
-import type { SkillRegistry } from './registry.js';
+import * as yaml from 'js-yaml';
+import type { ToolManifest, ToolHandler, ToolContext, ToolResult } from './types.js';
+import type { ToolRegistry } from './registry.js';
+import type { SkillRegistry } from './skill-registry.js';
 import { connectStdio, connectSse } from './mcp-client.js';
+import { discoverSkillResources } from './skill-resources.js';
 import type { McpSession } from './mcp-client.js';
 import type { Logger } from '../logger.js';
-import type { ActionRisk } from './types.js';
-import { resolveEnvValue } from '../config.js';
+import type { SecretsService } from '../secrets/secrets-service.js';
+import type { ChannelIdentity } from '../contacts/types.js';
+import { principalDriveGrantNote, raisePrincipalDriveGrant } from './_shared/drive-principal-access.js';
+import type {
+  McpSecretDeclaration,
+  McpServerEntry,
+  McpStdioServerEntry,
+  SkillsConfig,
+} from './mcp-config-types.js';
 
-// ---------------------------------------------------------------------------
-// Config types — mirrors schemas/skills-config.json
-// ---------------------------------------------------------------------------
+// No per-tool holdback at registration (#1957). Which google-workspace services load is
+// decided by the server's `--tools` allowlist in config/skills.yaml, guarded by
+// tests/unit/config.google-workspace-allowlist.test.ts. Calendar is never on it (#1853).
 
-interface McpStdioServerEntry {
-  name: string;
-  transport: 'stdio';
-  action_risk: ActionRisk;
-  sensitivity?: 'normal' | 'elevated';
-  timeout_ms?: number;
-  command: string;
-  args?: string[];
-  env?: Record<string, string>;
-  /** Constant parameter values injected into every tool call from this server.
-   *  Keys are parameter names; values are literal strings or "env:VAR_NAME" references.
-   *  Listed parameters are stripped from the tool schema — agents never see them. */
-  fixed_inputs?: Record<string, string>;
-}
+/**
+ * Calendar-shaped google-workspace tool names, matched by underscore segment so it
+ * covers upstream's whole calendar module (list_calendars, get_events, manage_event,
+ * query_freebusy, manage_out_of_office, ...) and renamed tools, without matching
+ * Drive/Docs/Sheets names. Used only to raise the drift alarm in loadMcpServers.
+ */
+export const GOOGLE_WORKSPACE_CALENDAR_TOOL_NAME =
+  /(^|_)(events?|calendars?|freebusy|out_of_office|focus_time)($|_)/;
 
-interface McpSseServerEntry {
-  name: string;
-  transport: 'sse';
-  action_risk: ActionRisk;
-  sensitivity?: 'normal' | 'elevated';
-  timeout_ms?: number;
-  url: string;
-  headers?: Record<string, string>;
-  /** Constant parameter values injected into every tool call from this server.
-   *  Keys are parameter names; values are literal strings or "env:VAR_NAME" references.
-   *  Listed parameters are stripped from the tool schema — agents never see them. */
-  fixed_inputs?: Record<string, string>;
-}
+/** Result of loading MCP servers: live sessions + tools registered per server. */
+export type McpServerLoadStatus =
+  | { status: 'ok'; toolCount: number }
+  | { status: 'zero_tools' }
+  | { status: 'unavailable'; reason: string };
 
-type McpServerEntry = McpStdioServerEntry | McpSseServerEntry;
-
-interface SkillsConfig {
-  servers?: McpServerEntry[];
+export interface McpLoadResult {
+  sessions: McpSession[];
+  /**
+   * Server name → tool names successfully registered this boot.
+   * Used to project each MCP server as a skill into SkillRegistry (ADR-032).
+   */
+  projectedTools: Map<string, string[]>;
+  /**
+   * Boot outcome for every **enabled** server that was attempted (not skipped
+   * by the registry filter). Consumed by HealthService so a silent 0-tool or
+   * connect failure surfaces on `/api/health` (#1500).
+   */
+  serverStatuses: Map<string, McpServerLoadStatus>;
+  /**
+   * Server name → fixed_inputs resolved this boot, for every server that registered
+   * tools. HealthService's google_workspace canary sends them with its live call (#2242).
+   */
+  fixedInputs: Map<string, Record<string, string>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -67,10 +79,13 @@ interface SkillsConfig {
  * configured is a valid deployment state.
  * Throws on YAML parse errors so startup fails loudly on broken config.
  */
-function loadSkillsConfig(configDir: string): SkillsConfig {
+export function loadSkillsConfig(configDir: string): SkillsConfig {
   const filePath = path.join(configDir, 'skills.yaml');
   try {
-    const parsed = yaml.load(fs.readFileSync(filePath, 'utf-8'));
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    // js-yaml v5 throws on empty input; treat an empty file as no MCP servers configured.
+    if (raw.trim() === '') return {};
+    const parsed = yaml.load(raw);
     if (parsed == null) return {};
     if (typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new Error('config/skills.yaml must contain a YAML mapping at the root');
@@ -92,7 +107,7 @@ function loadSkillsConfig(configDir: string): SkillsConfig {
 // ---------------------------------------------------------------------------
 
 /**
- * Map an MCP tools/call result to a Curia SkillResult.
+ * Map an MCP tools/call result to a Curia ToolResult.
  *
  * The MCP SDK returns:
  *   { content: Array<{ type: 'text' | 'image' | ..., text?: string }>, isError?: boolean }
@@ -107,7 +122,7 @@ function mapMcpResult(
   logger: Logger,
   serverId: string,
   toolName: string,
-): SkillResult {
+): ToolResult {
   // Legacy compatibility result shape from older MCP servers (toolResult wrapper).
   // The legacy protocol has no isError flag, so we cannot determine success/failure.
   // Log a warning so operators know which servers still need upgrading.
@@ -177,34 +192,285 @@ export function mergeFixedInputs(
 }
 
 // ---------------------------------------------------------------------------
+// Vault-backed secret resolution for MCP servers (#913) — exported for testing
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a single secret from the vault, vault-only — no process.env fallback.
+ * Trims the value and treats a blank/whitespace-only result as absent. Throws a
+ * descriptive error when the secret is missing so the caller can skip the whole
+ * server (the same loud-fail contract as a missing fixed_input) rather than
+ * spawn a third-party subprocess with a half-populated credential set.
+ */
+async function getRequiredVaultSecret(
+  vaultKey: string,
+  secrets: SecretsService,
+  context: string,
+): Promise<string> {
+  const value = (await secrets.get(vaultKey))?.trim();
+  if (!value) {
+    throw new Error(`${context}: secret "${vaultKey}" is not set in the vault`);
+  }
+  return value;
+}
+
+/**
+ * Resolve a stdio server's `env:` block from the vault. The empty-string
+ * sentinel (`KEY: ""` in config/skills.yaml) means "resolve KEY from the vault
+ * by its lowercased name" — vault-only, never process.env (#913). Non-empty
+ * values are literal passthroughs (e.g. ALLOWED_FILE_DIRS). Returns a fully
+ * resolved map of literals ready for buildChildEnv; throws if any referenced
+ * secret is missing so the caller skips the server.
+ *
+ * By design there is no way to express a literal empty-string env value: an
+ * empty value is always a vault-resolution request. No MCP server needs an empty
+ * literal today; if one ever does, give it a sentinel non-empty value instead.
+ */
+export async function resolveStdioEnvFromVault(
+  configEnv: Record<string, string>,
+  secrets: SecretsService,
+  serverName: string,
+): Promise<Record<string, string>> {
+  const resolved: Record<string, string> = {};
+  for (const [key, value] of Object.entries(configEnv)) {
+    if (value !== '') {
+      resolved[key] = value;
+      continue;
+    }
+    resolved[key] = await getRequiredVaultSecret(
+      key.toLowerCase(),
+      secrets,
+      `MCP server '${serverName}' env.${key}`,
+    );
+  }
+  return resolved;
+}
+
+/**
+ * Resolve a single fixed_inputs value from the vault. An "env:VAR" reference is
+ * resolved vault-only by VAR's lowercased name (#913); a literal string passes
+ * through unchanged. Throws if a referenced secret is missing. This is the
+ * vault-backed replacement for the process.env-based resolveEnvValue() that
+ * fixed_inputs used before the migration.
+ */
+export async function resolveFixedInputFromVault(
+  value: string,
+  secrets: SecretsService,
+  context: string,
+): Promise<string> {
+  if (value.startsWith('env:')) {
+    const varName = value.slice(4);
+    return getRequiredVaultSecret(varName.toLowerCase(), secrets, context);
+  }
+  return value;
+}
+
+/**
+ * Resolve all credentials declared in a server's `secrets:` block from the vault.
+ * For each declaration: reads `key` from vault; if `inject.env`, places the value in
+ * the returned `env` map under that var name; if `inject.fixed_input`, places it in
+ * `fixedInputs`. A missing required secret throws so the caller can skip the server.
+ * Missing optional secrets are silently skipped. Vault-only — no process.env fallback.
+ */
+export async function resolveSecretsBlock(
+  declarations: McpSecretDeclaration[],
+  secrets: SecretsService,
+  serverName: string,
+): Promise<{ env: Record<string, string>; fixedInputs: Record<string, string> }> {
+  const env: Record<string, string> = {};
+  const fixedInputs: Record<string, string> = {};
+
+  for (const decl of declarations) {
+    const value = (await secrets.get(decl.key))?.trim();
+    if (!value) {
+      if (decl.required) {
+        throw new Error(
+          `MCP server '${serverName}': required secret "${decl.key}" is not set in the vault`,
+        );
+      }
+      continue;
+    }
+    if (decl.inject.env !== undefined) {
+      env[decl.inject.env] = value;
+    } else if (decl.inject.fixed_input !== undefined) {
+      fixedInputs[decl.inject.fixed_input] = value;
+    } else {
+      // Unreachable for valid config: the startup JSON schema validator enforces
+      // exactly one of env/fixed_input. Guard defensively so malformed YAML fails
+      // loudly instead of silently producing a broken fixedInputs key.
+      throw new Error(
+        `MCP server '${serverName}': secret "${decl.key}" inject block has neither 'env' nor 'fixed_input'.`,
+      );
+    }
+  }
+
+  return { env, fixedInputs };
+}
+
+// ---------------------------------------------------------------------------
+// MCP tool handler
+// ---------------------------------------------------------------------------
+
+/** The subset of an {@link McpSession} the tool handler needs: a `callTool`-capable
+ *  client plus the server id for logs. Narrowed so unit tests can pass a mock
+ *  client without constructing a full SDK `Client`. */
+export type McpToolSession = {
+  serverId: string;
+  client: Pick<McpSession['client'], 'callTool'>;
+};
+
+/**
+ * Build the execution handler for a single MCP tool.
+ *
+ * Extracted from loadMcpServers so the request-cancellation behavior below can be
+ * unit-tested against a mock MCP client.
+ *
+ * #1666 — the execution layer races this handler against `manifest.timeout` and,
+ * when the timeout wins, rejects our promise WITHOUT cancelling the underlying MCP
+ * request. That leaves the SDK's pending-request entry (and the captured request +
+ * closures) alive until the SDK's own default timeout fires. We tie an
+ * AbortController to a timer set to the same `timeoutMs` the execution layer uses,
+ * and also pass an explicit `timeout`, so a timed-out tool call also tears down the
+ * in-flight MCP request instead of stranding it.
+ *
+ * `principalIdentities` is the hot-reloaded principal identity snapshot, read at call
+ * time. On google-workspace it raises a Drive grant to the principal to writer.
+ */
+export function buildMcpToolHandler(params: {
+  session: McpToolSession;
+  toolName: string;
+  resolvedFixedInputs: Record<string, string>;
+  timeoutMs: number;
+  logger: Logger;
+  principalIdentities?: readonly ChannelIdentity[];
+}): ToolHandler {
+  const { session, toolName, resolvedFixedInputs, timeoutMs, logger, principalIdentities = [] } = params;
+  return {
+    async execute(ctx: ToolContext): Promise<ToolResult> {
+      // No call-time calendar identity guard here (#1957): Calendar is never on the
+      // google-workspace --tools allowlist, so its tools are never registered. If #1330
+      // ever puts them back on purpose, restore guardMcpCalendarIdentity from history.
+
+      // The principal always gets edit access to a Drive file shared with them.
+      const grant = session.serverId === 'google-workspace'
+        ? raisePrincipalDriveGrant(toolName, ctx.input, principalIdentities)
+        : { input: ctx.input, raisedFrom: [] };
+      if (grant.raisedFrom.length > 0) {
+        logger.info(
+          { server: session.serverId, tool: toolName, raisedFrom: grant.raisedFrom },
+          'Drive grant to the principal raised to writer',
+        );
+      }
+
+      // Abort the MCP request if it outlives the execution-layer timeout (#1666).
+      const controller = new AbortController();
+      const abortTimer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        // Merge fixed_inputs into the tool call arguments. Fixed values take
+        // precedence — even if an agent somehow passed a value for a stripped
+        // parameter (e.g. via prompt injection), the config value wins.
+        const mergedInput = mergeFixedInputs(grant.input, resolvedFixedInputs);
+        const rawResult = await session.client.callTool(
+          { name: toolName, arguments: mergedInput },
+          undefined, // use the SDK's default CallToolResultSchema
+          { signal: controller.signal, timeout: timeoutMs },
+        );
+        const result = mapMcpResult(rawResult, logger, session.serverId, toolName);
+        if (!result.success) {
+          // Log stable metadata only so operators can spot persistently failing
+          // tools. We deliberately DON'T log result.error: an MCP server receives
+          // vault-resolved fixed_inputs (secrets) as tool arguments, and a
+          // misbehaving server can echo those back in its error text, which would
+          // then leak into pino logs. The detail still reaches the agent via the
+          // returned ToolResult (secret-redacted by the execution layer).
+          logger.warn(
+            { server: session.serverId, tool: toolName },
+            'MCP tool returned an error result',
+          );
+        }
+        if (result.success && grant.raisedFrom.length > 0 && typeof result.data === 'string') {
+          return { success: true, data: `${result.data}\n\n${principalDriveGrantNote(grant.raisedFrom)}` };
+        }
+        return result;
+      } catch (err) {
+        // Log before converting — a thrown rejection here (transport/subprocess
+        // crash, JSON-RPC protocol error, the SDK's RequestTimeout, or our own
+        // abort above) is a MORE severe failure than the tool-level `isError`
+        // result logged above, yet would otherwise be invisible: the execution
+        // layer only logs when handler.execute *throws*, and we deliberately
+        // return `{ success: false }` instead (skills must never throw).
+        //
+        // Log the error CLASS (SDK/runtime-controlled — e.g. McpError, AbortError),
+        // never the raw message: like result.error above, a thrown message can carry
+        // server-echoed fixed_input secrets.
+        logger.warn(
+          { server: session.serverId, tool: toolName, errorName: err instanceof Error ? err.name : typeof err },
+          'MCP tool call threw',
+        );
+        const message = err instanceof Error ? err.message : String(err);
+        return { success: false, error: `MCP tool '${toolName}' error: ${message}` };
+      } finally {
+        // Always clear the timer so a completed call doesn't leave a pending abort
+        // (which would also keep the event loop alive during graceful shutdown).
+        clearTimeout(abortTimer);
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
 /**
  * Load MCP servers from config/skills.yaml, connect to each one, discover
- * tools via tools/list, and register them in the SkillRegistry.
+ * tools via tools/list, and register them in the ToolRegistry.
  *
- * @param configDir - Absolute path to the config/ directory (same as used by loadYamlConfig).
- * @param registry  - The SkillRegistry to register discovered tools into.
- * @param logger    - Pino logger for structured log output.
- * @returns Array of live McpSession objects. Pass to the shutdown handler to close them.
+ * @param configDir          - Absolute path to the config/ directory (same as used by loadYamlConfig).
+ * @param registry           - The ToolRegistry to register discovered tools into.
+ * @param logger             - Pino logger for structured log output.
+ * @param secrets            - Vault accessor. A server's `env:` empty-string sentinels and
+ *                             `fixed_inputs` "env:VAR" references are resolved from the vault
+ *                             at spawn time (vault-only, #913). A missing secret skips that
+ *                             server, the same as a connection failure.
+ * @param enabledServerNames - When provided, only servers whose name is in this set are spawned.
+ *                             Servers absent from the set are skipped with a debug log (not an error).
+ *                             Pass undefined to skip the filter (legacy / test behavior).
+ * @param principalIdentities - The principal's identity snapshot, mutated in place on hot
+ *                             reload. Tool handlers read it at call time (Drive grants).
+ * @returns Live sessions plus per-server tool names registered this boot.
  */
 export async function loadMcpServers(
   configDir: string,
-  registry: SkillRegistry,
+  registry: ToolRegistry,
   logger: Logger,
-): Promise<McpSession[]> {
+  secrets: SecretsService,
+  enabledServerNames?: Set<string>,
+  principalIdentities?: readonly ChannelIdentity[],
+): Promise<McpLoadResult> {
   const config = loadSkillsConfig(configDir);
   const servers = config.servers ?? [];
 
   if (servers.length === 0) {
     logger.debug('No MCP servers configured in config/skills.yaml');
-    return [];
+    return { sessions: [], projectedTools: new Map(), serverStatuses: new Map(), fixedInputs: new Map() };
   }
 
   const sessions: McpSession[] = [];
+  const projectedTools = new Map<string, string[]>();
+  const serverStatuses = new Map<string, McpServerLoadStatus>();
+  const fixedInputs = new Map<string, Record<string, string>>();
 
   for (const serverEntry of servers) {
+    // Registry filter first: disabled servers must not affect health (#1500).
+    if (enabledServerNames !== undefined && !enabledServerNames.has(serverEntry.name)) {
+      logger.debug(
+        { server: serverEntry.name },
+        'MCP server not in enabled registry set — skipping',
+      );
+      continue;
+    }
+
     // Validate required transport-specific fields here rather than in the JSON Schema
     // so that the error messages are human-readable and include the server name.
     if (serverEntry.transport === 'stdio' && !serverEntry.command) {
@@ -212,6 +478,10 @@ export async function loadMcpServers(
         { server: serverEntry.name },
         'MCP server config missing required "command" for stdio transport — skipping',
       );
+      serverStatuses.set(serverEntry.name, {
+        status: 'unavailable',
+        reason: 'missing stdio command',
+      });
       continue;
     }
     if (serverEntry.transport === 'sse' && !serverEntry.url) {
@@ -219,46 +489,136 @@ export async function loadMcpServers(
         { server: serverEntry.name },
         'MCP server config missing required "url" for sse transport — skipping',
       );
+      serverStatuses.set(serverEntry.name, {
+        status: 'unavailable',
+        reason: 'missing sse url',
+      });
       continue;
     }
 
-    // Resolve fixed_inputs once at startup. These values are captured in closures
-    // and merged into every callTool invocation for this server's tools.
-    // Env-var references (e.g. "env:CURIA_GOOGLE_EMAIL") are resolved here —
-    // a missing env var skips this server entirely (same as a connection failure).
-    // This keeps google-workspace optional: deployments without CURIA_GOOGLE_EMAIL
-    // simply don't get Workspace tools, rather than crashing the process.
-    const rawFixedInputs = 'fixed_inputs' in serverEntry ? serverEntry.fixed_inputs : undefined;
+    // SSE servers: the secrets: block is schema-valid but not injected (no subprocess).
+    // Warn early so the operator knows their config is a no-op and should use headers: instead.
+    if (serverEntry.transport === 'sse') {
+      const rawSecrets = (serverEntry as unknown as Record<string, unknown>)['secrets'];
+      if (Array.isArray(rawSecrets) && rawSecrets.length > 0) {
+        logger.warn(
+          { server: serverEntry.name },
+          'SSE MCP server declares secrets: block, but SSE transport has no subprocess — secrets are not injected. Use headers: for SSE auth instead.',
+        );
+      }
+    }
+
+    // Resolve credentials and build the env for the subprocess.
+    // New path: if the server declares a secrets: block, resolve from it and merge with
+    // any non-secret env literals. Legacy path: resolve env: "" sentinels and
+    // fixed_inputs: "env:VAR" references from the vault (kept for backward-compat).
+    const declarations = serverEntry.transport === 'stdio' ? ((serverEntry as McpStdioServerEntry).secrets ?? []) : [];
     const resolvedFixedInputs: Record<string, string> = {};
-    if (rawFixedInputs) {
-      let resolutionFailed = false;
-      for (const [key, value] of Object.entries(rawFixedInputs)) {
+    let connectEntry: McpServerEntry = serverEntry;
+
+    if (declarations.length > 0) {
+      let secretsResult: { env: Record<string, string>; fixedInputs: Record<string, string> };
+      try {
+        secretsResult = await resolveSecretsBlock(declarations, secrets, serverEntry.name);
+      } catch (err) {
+        logger.error(
+          { err, server: serverEntry.name },
+          'secrets block resolution failed — skipping this MCP server',
+        );
+        serverStatuses.set(serverEntry.name, {
+          status: 'unavailable',
+          reason: 'secrets resolution failed',
+        });
+        continue;
+      }
+      // Non-secret literals in env: pass through; secrets block env values overlay them.
+      const literalEnv = serverEntry.transport === 'stdio' ? ((serverEntry as McpStdioServerEntry).env ?? {}) : {};
+      connectEntry = { ...serverEntry, env: { ...literalEnv, ...secretsResult.env } } as McpStdioServerEntry;
+      // Any old literal fixed_inputs + secrets block fixed_inputs.
+      const literalFixed = 'fixed_inputs' in serverEntry ? (serverEntry.fixed_inputs ?? {}) : {};
+      // Guard against partial migrations: if fixed_inputs still carries 'env:VAR' sentinels while
+      // secrets: is also present, those sentinels would land as literal strings in the subprocess
+      // env instead of being vault-resolved. Fail fast so the misconfiguration is obvious.
+      const sentinelKeys = Object.entries(literalFixed)
+        .filter(([, v]) => v.startsWith('env:'))
+        .map(([k]) => k);
+      if (sentinelKeys.length > 0) {
+        logger.error(
+          { server: serverEntry.name, keys: sentinelKeys },
+          "MCP server has secrets: block but fixed_inputs still contains 'env:VAR' sentinels — " +
+          'migrate them to the secrets: block and remove from fixed_inputs; skipping this server',
+        );
+        serverStatuses.set(serverEntry.name, {
+          status: 'unavailable',
+          reason: 'fixed_inputs env sentinels with secrets block',
+        });
+        continue;
+      }
+      Object.assign(resolvedFixedInputs, literalFixed, secretsResult.fixedInputs);
+      logger.info(
+        { server: serverEntry.name, envKeys: Object.keys(secretsResult.env), fixedKeys: Object.keys(secretsResult.fixedInputs) },
+        'MCP server secrets block resolved',
+      );
+    } else {
+      // Legacy path: env: "" sentinels and fixed_inputs: "env:VAR" references.
+      const rawFixedInputs = 'fixed_inputs' in serverEntry ? serverEntry.fixed_inputs : undefined;
+      if (rawFixedInputs) {
+        let resolutionFailed = false;
+        for (const [key, value] of Object.entries(rawFixedInputs)) {
+          try {
+            resolvedFixedInputs[key] = await resolveFixedInputFromVault(
+              value,
+              secrets,
+              `MCP server '${serverEntry.name}' fixed_inputs.${key}`,
+            );
+          } catch (err) {
+            logger.error(
+              { err, server: serverEntry.name, key },
+              'fixed_inputs resolution failed — skipping this MCP server',
+            );
+            resolutionFailed = true;
+            break;
+          }
+        }
+        if (resolutionFailed) {
+          serverStatuses.set(serverEntry.name, {
+            status: 'unavailable',
+            reason: 'fixed_inputs resolution failed',
+          });
+          continue;
+        }
+        logger.info(
+          { server: serverEntry.name, keys: Object.keys(resolvedFixedInputs) },
+          'MCP server fixed_inputs resolved',
+        );
+      }
+      if (serverEntry.transport === 'stdio' && serverEntry.env) {
         try {
-          resolvedFixedInputs[key] = resolveEnvValue(
-            value,
-            `MCP server '${serverEntry.name}' fixed_inputs.${key}`,
+          const resolvedEnv = await resolveStdioEnvFromVault(
+            serverEntry.env,
+            secrets,
+            serverEntry.name,
           );
+          connectEntry = { ...serverEntry, env: resolvedEnv };
         } catch (err) {
           logger.error(
-            { err, server: serverEntry.name, key },
-            'fixed_inputs resolution failed — skipping this MCP server',
+            { err, server: serverEntry.name },
+            'env secret resolution from vault failed — skipping this MCP server',
           );
-          resolutionFailed = true;
-          break;
+          serverStatuses.set(serverEntry.name, {
+            status: 'unavailable',
+            reason: 'env secret resolution failed',
+          });
+          continue;
         }
       }
-      if (resolutionFailed) continue;
-      logger.info(
-        { server: serverEntry.name, keys: Object.keys(resolvedFixedInputs) },
-        'MCP server fixed_inputs resolved',
-      );
     }
 
     let session: McpSession;
     try {
-      session = serverEntry.transport === 'stdio'
-        ? await connectStdio(serverEntry, logger)
-        : await connectSse(serverEntry, logger);
+      session = connectEntry.transport === 'stdio'
+        ? await connectStdio(connectEntry, logger)
+        : await connectSse(connectEntry, logger);
     } catch (err) {
       // Connection failure is non-recoverable without a restart — tools from this
       // server will be unavailable for the lifetime of this process. Log at error
@@ -267,6 +627,10 @@ export async function loadMcpServers(
         { err, server: serverEntry.name },
         'Failed to connect to MCP server — tools from this server will be unavailable until restart',
       );
+      serverStatuses.set(serverEntry.name, {
+        status: 'unavailable',
+        reason: 'connect failed',
+      });
       continue;
     }
 
@@ -283,128 +647,238 @@ export async function loadMcpServers(
       await session.close().catch((closeErr: unknown) => {
         logger.error({ err: closeErr, server: serverEntry.name }, 'Error closing MCP session after tools/list failure');
       });
+      serverStatuses.set(serverEntry.name, {
+        status: 'unavailable',
+        reason: 'tools/list failed',
+      });
       continue;
     }
 
     const tools = toolList.tools ?? [];
     if (tools.length === 0) {
-      // Zero tools most commonly means the OAuth flow hasn't been completed yet.
-      // The server starts and handshakes successfully but won't expose tools until
-      // the user authenticates. Check docs/dev/google-drive.md Step 5 if this is
-      // the google-workspace server. Token cache: ~/.workspace-mcp/cli-tokens/
-      logger.warn({ server: serverEntry.name }, 'MCP server advertises no tools — nothing to register. If this is the google-workspace server, the OAuth flow may not have been completed (see docs/dev/google-drive.md Step 5).');
+      // Zero tools most commonly means the OAuth flow hasn't been completed yet,
+      // or the server crashed mid-boot before advertising tools (curia-deploy#181).
+      // This is a loud health failure (#1500) — not a silent warn-and-continue.
+      logger.error(
+        { server: serverEntry.name },
+        'MCP server advertises no tools — tools from this server will be unavailable until restart. If this is google-workspace, the OAuth flow may not have been completed (see docs/dev/google-drive.md Step 5).',
+      );
       // Keep the session open — the server might add tools in a future protocol version.
+      // Still project an empty skill so the server name is pinnable/discoverable.
+      projectedTools.set(serverEntry.name, []);
       sessions.push(session);
+      serverStatuses.set(serverEntry.name, { status: 'zero_tools' });
       continue;
     }
 
-    let registered = 0;
-    for (const tool of tools) {
-      // Build a minimal SkillManifest from the tool's metadata.
-      // inputs is left empty ({}) because toToolDefinitions() uses mcpInputSchema
-      // instead of the shorthand inputs notation for MCP-sourced tools.
-      const manifest: SkillManifest = {
-        name: tool.name,
-        description: tool.description ?? `Tool '${tool.name}' from MCP server '${serverEntry.name}'`,
-        version: '1.0.0',
-        sensitivity: serverEntry.sensitivity ?? 'normal',
-        action_risk: serverEntry.action_risk,
-        inputs: {},
-        outputs: {},
-        permissions: [],
-        secrets: [],
-        timeout: serverEntry.timeout_ms ?? 30000,
-      };
+    const registeredNames = registerMcpServerTools({
+      serverEntry, session, tools, resolvedFixedInputs, registry, logger, principalIdentities,
+    });
 
-      // Capture the session reference in the closure — each tool needs its own
-      // copy so the reference stays valid across the async loop.
-      const capturedSession = session;
-      const toolName = tool.name;
-
-      const handler: SkillHandler = {
-        async execute(ctx: SkillContext): Promise<SkillResult> {
-          try {
-            // Merge fixed_inputs into the tool call arguments. Fixed values take
-            // precedence — even if an agent somehow passed a value for a stripped
-            // parameter (e.g. via prompt injection), the config value wins.
-            const mergedInput = mergeFixedInputs(ctx.input, resolvedFixedInputs);
-            const rawResult = await capturedSession.client.callTool({
-              name: toolName,
-              arguments: mergedInput,
-            });
-            const result = mapMcpResult(rawResult, logger, capturedSession.serverId, toolName);
-            if (!result.success) {
-              // Log tool-level errors so operators can detect persistently failing tools.
-              logger.warn(
-                { server: capturedSession.serverId, tool: toolName, error: result.error },
-                'MCP tool returned an error result',
-              );
-            }
-            return result;
-          } catch (err) {
-            // Skills must never throw — return a failure result instead.
-            const message = err instanceof Error ? err.message : String(err);
-            return { success: false, error: `MCP tool '${toolName}' error: ${message}` };
-          }
-        },
-      };
-
-      // Build the raw MCP input schema for the fast-path in toToolDefinitions.
-      // The MCP SDK returns `inputSchema` as a full JSON Schema object; we cast
-      // it to the ToolDefinition input_schema shape which shares the same structure.
-      //
-      // When fixed_inputs are configured, strip those keys from the schema so
-      // agents never see them as tool parameters. The values are injected
-      // server-side in the execute handler below.
-      let mcpInputSchema = tool.inputSchema as import('./types.js').ToolDefinition['input_schema'];
-      const fixedKeys = Object.keys(resolvedFixedInputs);
-      if (fixedKeys.length > 0) {
-        // Warn if a fixed_inputs key doesn't match any parameter in this tool's
-        // schema — likely means the upstream MCP server renamed the parameter and
-        // the config is stale. The tool call will still work (extra keys are
-        // ignored by most MCP servers) but the intended parameter won't be set.
-        for (const key of fixedKeys) {
-          if (mcpInputSchema.properties && !(key in mcpInputSchema.properties)) {
-            logger.warn(
-              { server: serverEntry.name, tool: tool.name, fixedInputKey: key },
-              'fixed_inputs key not found in tool schema — the MCP server may not recognize this parameter',
-            );
-          }
-        }
-        mcpInputSchema = stripFixedInputsFromSchema(mcpInputSchema, fixedKeys);
-      }
-
-      try {
-        registry.register(manifest, handler, mcpInputSchema);
-        registered++;
-        logger.debug(
-          { server: serverEntry.name, tool: tool.name },
-          'MCP tool registered',
-        );
-      } catch (err) {
-        const isDuplicate = err instanceof Error && err.message.toLowerCase().includes('already registered');
-        if (isDuplicate) {
-          // Duplicate name — another local skill or MCP server registered this tool first.
-          logger.warn(
-            { server: serverEntry.name, tool: tool.name },
-            'MCP tool name collision with existing skill — skipping; first registration wins',
-          );
-        } else {
-          // Unexpected error — likely a bug or a malformed manifest derived from the tool metadata.
-          logger.error(
-            { err, server: serverEntry.name, tool: tool.name },
-            'Unexpected error registering MCP tool — skipping',
-          );
-        }
-      }
-    }
-
+    projectedTools.set(serverEntry.name, registeredNames);
     logger.info(
-      { server: serverEntry.name, registered, total: tools.length },
+      { server: serverEntry.name, registered: registeredNames.length, total: tools.length, tools: registeredNames },
       'MCP server tools registered',
     );
     sessions.push(session);
+    serverStatuses.set(serverEntry.name, { status: 'ok', toolCount: registeredNames.length });
+    fixedInputs.set(serverEntry.name, resolvedFixedInputs);
   }
 
-  return sessions;
+  return { sessions, projectedTools, serverStatuses, fixedInputs };
+}
+
+/** One entry of an MCP server's tools/list result: what registration reads from it. */
+export interface McpListedTool {
+  name: string;
+  description?: string;
+  inputSchema: unknown;
+}
+
+/**
+ * Register one server's listed tools in the ToolRegistry, the way boot does: a
+ * manifest from the server entry, a handler that calls `session`, and the input
+ * schema minus the server's fixed inputs. Returns the names that registered.
+ *
+ * Extracted from loadMcpServers so the test-mode stack can register a server from a
+ * tools/list snapshot with a canned session (#2024) through the same code.
+ */
+export function registerMcpServerTools(params: {
+  serverEntry: McpServerEntry;
+  session: McpToolSession;
+  tools: readonly McpListedTool[];
+  resolvedFixedInputs: Record<string, string>;
+  registry: ToolRegistry;
+  logger: Logger;
+  principalIdentities?: readonly ChannelIdentity[];
+}): string[] {
+  const { serverEntry, session, tools, resolvedFixedInputs, registry, logger, principalIdentities } = params;
+  const registeredNames: string[] = [];
+  for (const tool of tools) {
+    // The `--tools` allowlist keeps Calendar out (#1957); nothing here filters it.
+    // If a calendar tool appears anyway, the config has drifted. Say so at error
+    // level: the old holdback corrected this at info, which is how a deployment
+    // ran with no allowlist for months unnoticed. Nothing else stands between such
+    // a tool and an agent (#1957), so this must stay loud.
+    if (serverEntry.name === 'google-workspace' && GOOGLE_WORKSPACE_CALENDAR_TOOL_NAME.test(tool.name)) {
+      logger.error(
+        { server: serverEntry.name, tool: tool.name },
+        'google-workspace advertised a Calendar tool — the --tools allowlist in config/skills.yaml has drifted; remove calendar from it (#1853, #1957)',
+      );
+    }
+
+    // Build a minimal ToolManifest from the tool's metadata.
+    // inputs is left empty ({}) because toToolDefinitions() uses mcpInputSchema
+    // instead of the shorthand inputs notation for MCP-sourced tools.
+    const manifest: ToolManifest = {
+      name: tool.name,
+      description: tool.description ?? `Tool '${tool.name}' from MCP server '${serverEntry.name}'`,
+      version: '1.0.0',
+      sensitivity: serverEntry.sensitivity ?? 'normal',
+      action_risk: serverEntry.action_risk,
+      inputs: {},
+      outputs: {},
+      permissions: [],
+      secrets: [],
+      timeout: serverEntry.timeout_ms ?? 30000,
+    };
+
+    const handler = buildMcpToolHandler({
+      session,
+      toolName: tool.name,
+      resolvedFixedInputs,
+      timeoutMs: manifest.timeout,
+      logger,
+      principalIdentities,
+    });
+
+    // Build the raw MCP input schema for the fast-path in toToolDefinitions.
+    // The MCP SDK returns `inputSchema` as a full JSON Schema object; we cast
+    // it to the ToolDefinition input_schema shape which shares the same structure.
+    //
+    // When fixed_inputs are configured, strip those keys from the schema so
+    // agents never see them as tool parameters. The values are injected
+    // server-side in the execute handler below.
+    let mcpInputSchema = tool.inputSchema as import('./types.js').ToolDefinition['input_schema'];
+    const fixedKeys = Object.keys(resolvedFixedInputs);
+    if (fixedKeys.length > 0) {
+      // Warn if a fixed_inputs key doesn't match any parameter in this tool's
+      // schema — likely means the upstream MCP server renamed the parameter and
+      // the config is stale. The tool call will still work (extra keys are
+      // ignored by most MCP servers) but the intended parameter won't be set.
+      for (const key of fixedKeys) {
+        if (mcpInputSchema.properties && !(key in mcpInputSchema.properties)) {
+          logger.warn(
+            { server: serverEntry.name, tool: tool.name, fixedInputKey: key },
+            'fixed_inputs key not found in tool schema — the MCP server may not recognize this parameter',
+          );
+        }
+      }
+      mcpInputSchema = stripFixedInputsFromSchema(mcpInputSchema, fixedKeys);
+    }
+
+    try {
+      registry.register(manifest, handler, mcpInputSchema);
+      registeredNames.push(tool.name);
+      logger.debug(
+        { server: serverEntry.name, tool: tool.name },
+        'MCP tool registered',
+      );
+    } catch (err) {
+      const isDuplicate = err instanceof Error && err.message.toLowerCase().includes('already registered');
+      if (isDuplicate) {
+        // Duplicate name — another local skill or MCP server registered this tool first.
+        logger.warn(
+          { server: serverEntry.name, tool: tool.name },
+          'MCP tool name collision with existing skill — skipping; first registration wins',
+        );
+      } else {
+        // Unexpected error — likely a bug or a malformed manifest derived from the tool metadata.
+        logger.error(
+          { err, server: serverEntry.name, tool: tool.name },
+          'Unexpected error registering MCP tool — skipping',
+        );
+      }
+    }
+  }
+  return registeredNames;
+}
+
+/**
+ * Project each connected MCP server as a skill into SkillRegistry (ADR-032).
+ *
+ * Membership is the live tool set registered this boot (dynamic — can change
+ * between restarts). Pinning the server name (e.g. `google-workspace`) expands
+ * to those tools. Individual MCP tool pins remain first-class via polymorphic pins.
+ *
+ * An upstream server's tool descriptions are not ours to edit, so how-to notes for
+ * its tools live on disk instead: when `skillsDir` has a directory named after the
+ * server, its `references/` and `assets/` files attach to the projected skill and
+ * load on demand through skill-activate (#1960). The directory holds no SKILL.md —
+ * that would make it a native bundle, and this projection would then be skipped.
+ *
+ * Returns the number of skills registered.
+ */
+export function registerMcpProjectedSkills(
+  projectedTools: Map<string, string[]>,
+  skillRegistry: SkillRegistry,
+  logger: Logger,
+  skillsDir?: string,
+): number {
+  let added = 0;
+  for (const [serverName, tools] of projectedTools) {
+    if (skillRegistry.get(serverName)) {
+      logger.warn(
+        { server: serverName },
+        'MCP skill projection skipped — a skill with this name is already registered',
+      );
+      continue;
+    }
+    // Membership is exactly what registered; the server's --tools allowlist is the
+    // only gate on it (#1957).
+    const membership = tools;
+    const resourceDir = skillsDir ? path.join(skillsDir, serverName) : '';
+    // References are optional, so an unreadable directory must not abort boot:
+    // register the skill without them and say why.
+    let hasResourceDir = false;
+    let resources: ReturnType<typeof discoverSkillResources> | null = null;
+    if (resourceDir !== '') {
+      try {
+        hasResourceDir = fs.statSync(resourceDir, { throwIfNoEntry: false })?.isDirectory() === true;
+        resources = hasResourceDir ? discoverSkillResources(resourceDir) : null;
+      } catch (err) {
+        logger.warn(
+          { err, server: serverName, resourceDir },
+          'MCP skill resource discovery failed — projecting without references',
+        );
+        hasResourceDir = false;
+        resources = null;
+      }
+    }
+    skillRegistry.register(
+      {
+        name: serverName,
+        description: `MCP server '${serverName}' — ${membership.length} tool${membership.length === 1 ? '' : 's'} projected as a skill (ADR-032)`,
+        version: '1.0.0',
+        tools: membership,
+        instructions: '',
+        references: resources && resources.references.length > 0 ? resources.references : undefined,
+        assets: resources && resources.assets.length > 0 ? resources.assets : undefined,
+      },
+      // Membership is live from tools/list; the directory only carries references.
+      hasResourceDir ? resourceDir : '',
+    );
+    logger.info(
+      {
+        skill: serverName,
+        tools: membership,
+        kind: 'mcp',
+        references: resources?.references.length ?? 0,
+        assets: resources?.assets.length ?? 0,
+      },
+      'MCP server projected as skill',
+    );
+    added++;
+  }
+  return added;
 }

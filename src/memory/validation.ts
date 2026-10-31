@@ -2,21 +2,80 @@ import type { KnowledgeGraphStore } from './knowledge-graph.js';
 // Value import (not `import type`) because we call the static method
 // EmbeddingService.cosineSimilarity() at runtime.
 import { EmbeddingService } from './embedding.js';
+import { embeddingStamp } from './embedding-profiles.js';
 import type { StoreFactOptions, ValidationResult } from './types.js';
-
-// Spec line 116: cosine similarity threshold for deduplication
-const DEDUP_SIMILARITY_THRESHOLD = 0.92;
+// Value import — config-store only type-imports EntityMemory, so no runtime cycle.
+import { SYSTEM_CONFIG_SOURCE } from './config-store.js';
 
 // Spec line 126: max writes per agent per task
 // Exported so tests can exhaust the limit without hard-coding the magic number.
 export const MAX_WRITES_PER_AGENT_TASK = 50;
 
 /**
+ * True when either the incoming write or the existing fact is multi-valued AND
+ * their `value` properties differ — these are independent facts, not duplicates
+ * or contradictions. Incoming writes set `StoreFactOptions.multiValued`; existing
+ * facts persist the marker as `properties.multi_valued` so subsequent unrelated
+ * writes cannot silently merge into them (#1623).
+ */
+function isDistinctMultiValuedFact(
+  options: StoreFactOptions,
+  existingProperties: Record<string, unknown>,
+): boolean {
+  const incomingMulti =
+    options.multiValued === true ||
+    (options.properties as Record<string, unknown> | undefined)?.multi_valued === true;
+  const existingMulti = existingProperties.multi_valued === true;
+  if (!incomingMulti && !existingMulti) return false;
+
+  const existingValue = existingProperties.value;
+  const incomingValue = (options.properties as Record<string, unknown> | undefined)?.value;
+  return existingValue !== incomingValue;
+}
+
+/**
+ * True when semantic dedup must not merge into (or from) an exact-key fact.
+ * Either side may carry the protection: a persisted `exact_key` / string `key`
+ * on the existing node, or an incoming write with `exactKey` / string `key`.
+ * Same string key is allowed through (idempotent merge); anything else is
+ * skipped so mergeEntities / memory-store cannot recreate #2252.
+ */
+function isExactKeyProtected(
+  options: StoreFactOptions,
+  existingProperties: Record<string, unknown>,
+): boolean {
+  const incomingProps = (options.properties ?? {}) as Record<string, unknown>;
+  const incomingExact =
+    options.exactKey === true ||
+    incomingProps.exact_key === true ||
+    typeof incomingProps.key === 'string';
+  const existingExact =
+    existingProperties.exact_key === true ||
+    typeof existingProperties.key === 'string';
+  if (!incomingExact && !existingExact) return false;
+
+  const incomingKey = incomingProps.key;
+  const existingKey = existingProperties.key;
+  if (typeof incomingKey === 'string' && incomingKey === existingKey) return false;
+  return true;
+}
+
+/**
+ * Only ConfigStore's fixed source is exempt from the per-task write cap.
+ * Broader `system:` matching would also exempt checkpoint fact extraction
+ * (`system:checkpoint/...`), which must stay capped (spec 01 §Rate Limiting).
+ */
+function isConfigStoreSystemSource(source: string): boolean {
+  return source === SYSTEM_CONFIG_SOURCE;
+}
+
+/**
  * Memory validation gates per spec 01 (lines 107-131).
  *
  * All writes to entity memory pass through these checks:
  * 1. Rate limiting — max 50 writes per agent per task execution
- * 2. Deduplication — same entity + similar label (cosine > 0.92) → merge
+ * 2. Deduplication — same entity + similar label (cosine at or above the profile's
+ *    factDedup threshold) → merge
  * 3. Contradiction detection — conflicting facts → escalate to user
  * 4. Source attribution — every write records full provenance chain
  *
@@ -42,6 +101,10 @@ export class MemoryValidator {
    * doesn't call this internally because the caller owns the store write.
    */
   recordWrite(agentTaskKey: string): void {
+    // ConfigStore's source is process-lifetime and never reset — counting it
+    // would trip the limit after 50 infrastructure writes. Other system:
+    // sources (e.g. checkpoint extraction) must still be capped.
+    if (isConfigStoreSystemSource(agentTaskKey)) return;
     const count = this.writeCounts.get(agentTaskKey) ?? 0;
     this.writeCounts.set(agentTaskKey, count + 1);
   }
@@ -67,13 +130,17 @@ export class MemoryValidator {
    * - 'create' with validated fact data (label, properties, temporal, embedding) ready to persist
    */
   async validate(options: StoreFactOptions): Promise<ValidationResult> {
-    // 1. Rate limiting — checked against the source string which encodes agent+task identity
-    const writeCount = this.writeCounts.get(options.source) ?? 0;
-    if (writeCount >= MAX_WRITES_PER_AGENT_TASK) {
-      return {
-        action: 'rate_limited',
-        reason: `Memory write rate limit exceeded (${MAX_WRITES_PER_AGENT_TASK} per agent per task)`,
-      };
+    // 1. Rate limiting — per agent+task source. Only ConfigStore's fixed source
+    //    is exempt (process-lifetime, never reset). Checkpoint extraction and
+    //    other system: sources stay capped.
+    if (!isConfigStoreSystemSource(options.source)) {
+      const writeCount = this.writeCounts.get(options.source) ?? 0;
+      if (writeCount >= MAX_WRITES_PER_AGENT_TASK) {
+        return {
+          action: 'rate_limited',
+          reason: `Memory write rate limit exceeded (${MAX_WRITES_PER_AGENT_TASK} per agent per task)`,
+        };
+      }
     }
 
     // 2. Entity existence — reject early if the target entity has been deleted
@@ -87,25 +154,40 @@ export class MemoryValidator {
       };
     }
 
-    // 4. Deduplication — scoped to the entity's edges, not a global scan.
-    //    Spec line 115: "same entity + similar label" prevents cross-entity false matches
-    //    and avoids a full table scan as the fact count grows.
-    const entityEdges = await this.store.getEdgesForNode(options.entityNodeId);
-    const newEmbedding = await this.embeddingService.embed(options.label);
+    // Exact-key path (#2252): config keys are opaque identifiers, not prose.
+    if (options.exactKey === true) {
+      return this.validateExactKey(options);
+    }
 
-    for (const edge of entityEdges) {
-      // Walk either direction of the edge to find the connected node
-      const targetId = edge.sourceNodeId === options.entityNodeId
-        ? edge.targetNodeId
-        : edge.sourceNodeId;
-      const targetNode = await this.store.getNode(targetId);
+    // 4. Deduplication — one JOIN for connected facts, then early-exit on the
+    //    first cosine hit (spec line 115: same entity + similar label).
+    const connectedFacts = await this.store.getConnectedFacts(options.entityNodeId);
 
-      // Only compare against existing fact nodes that have been embedded
-      if (!targetNode || targetNode.type !== 'fact') continue;
+    const newEmbedding = await this.embeddingService.embed(options.label, 'similarity');
+    // The threshold belongs to the model that produced the scores (ADR-051).
+    const dedupThreshold = this.embeddingService.profile.thresholds.factDedup;
+
+    for (const targetNode of connectedFacts) {
       if (!targetNode.embedding) continue;
+      // A vector from another model or document prefix is not comparable (ADR-051).
+      if (targetNode.embeddingModel !== embeddingStamp(this.embeddingService.profile)) continue;
 
       const similarity = EmbeddingService.cosineSimilarity(newEmbedding, targetNode.embedding);
-      if (similarity >= DEDUP_SIMILARITY_THRESHOLD) {
+      if (similarity >= dedupThreshold) {
+        const existingProps = targetNode.properties as Record<string, unknown>;
+        // Multi-valued facts must not be merged when their `value` differs —
+        // near-identical labels would otherwise overwrite `value` and destroy
+        // the first fact. Check either side so an unrelated incoming write
+        // cannot merge into an existing multi-valued fact either.
+        if (isDistinctMultiValuedFact(options, existingProps)) {
+          continue;
+        }
+        // Exact-key facts (config-store) must not be merged by label similarity —
+        // a write without exactKey (e.g. mergeEntities) would otherwise recreate #2252.
+        if (isExactKeyProtected(options, existingProps)) {
+          continue;
+        }
+
         // Near-duplicate detected — signal a merge. Caller is responsible for
         // persisting the merged properties via store.updateNode().
         return {
@@ -121,17 +203,106 @@ export class MemoryValidator {
     }
 
     // 5. No duplicate found — return validated fact data for the caller to persist.
-    //    The caller owns ID generation and the store write so that it can coordinate
-    //    with edge creation atomically. We only provide what we've computed here:
-    //    the validated inputs plus the embedding from the dedup scan above.
-    //    Timestamps are intentionally omitted — the store always stamps its own
-    //    createdAt/lastConfirmedAt on INSERT; any value we set here would be ignored.
+    //    Reuse the dedup vector only when similarity and document prefixes match
+    //    (ADR-051); otherwise the store embeds as document.
+    return this.buildCreateResult(options, this.embeddingForCreate(newEmbedding));
+  }
+
+  /**
+   * Exact-key upsert for opaque identifiers (config-store). Never compares
+   * embeddings. Matches properties.key, or a legacy label-only fact whose
+   * label equals the key (adopts it and stamps key/exact_key) — but never a
+   * fact that already carries a conflicting `properties.namespace` (meta-index
+   * rows corrupted by the old semantic merge).
+   */
+  private async validateExactKey(options: StoreFactOptions): Promise<ValidationResult> {
+    const incomingProps = (options.properties ?? {}) as Record<string, unknown>;
+    const incomingKey = incomingProps.key;
+    if (typeof incomingKey !== 'string') {
+      // Programmer error — silently creating would pile up permanent duplicates.
+      throw new Error(
+        'StoreFactOptions.exactKey requires a string properties.key (opaque identifier upsert)',
+      );
+    }
+
+    // Persist the marker so semantic writes without exactKey still skip this fact.
+    const optionsWithMarker: StoreFactOptions = {
+      ...options,
+      properties: { ...options.properties, exact_key: true },
+    };
+
+    // Key-filtered in the store — debrief anchors grow unbounded with per-instance
+    // keys, so loading every fact (and embedding) per write would scale with the
+    // namespace. The checks below remain the source of truth for a match.
+    const connectedFacts = await this.store.getConnectedFactsByKey(options.entityNodeId, incomingKey);
+
+    // Prefer the most recently confirmed match when duplicates somehow exist.
+    // Also adopt legacy label-only facts (no properties.key) so a rewrite does
+    // not create a twin that list() would show twice — unless the fact already
+    // names a different namespace (corrupted index fact from #2252).
+    let bestMatch: { id: string; properties: Record<string, unknown>; confirmedAt: number } | undefined;
+
+    for (const targetNode of connectedFacts) {
+      const props = targetNode.properties as Record<string, unknown>;
+      const existingKey = props.key;
+      const keyMatch = existingKey === incomingKey;
+      const namespaceOk =
+        props.namespace === undefined || props.namespace === incomingProps.namespace;
+      const legacyLabelMatch =
+        existingKey === undefined
+        && targetNode.label === incomingKey
+        && namespaceOk;
+      if (!keyMatch && !legacyLabelMatch) continue;
+
+      const confirmedAt = targetNode.temporal.lastConfirmedAt.getTime();
+      if (!bestMatch || confirmedAt > bestMatch.confirmedAt) {
+        bestMatch = {
+          id: targetNode.id,
+          properties: props,
+          confirmedAt,
+        };
+      }
+    }
+
+    if (bestMatch) {
+      return {
+        action: 'update',
+        existingNodeId: bestMatch.id,
+        mergedProperties: {
+          ...bestMatch.properties,
+          ...(optionsWithMarker.properties ?? {}),
+        },
+        // Keep label === key so retrieve and the mismatch query stay clean.
+        newLabel: options.label,
+      };
+    }
+
+    // Exact-key matching never uses embeddings — let the store embed as document.
+    return this.buildCreateResult(optionsWithMarker, undefined);
+  }
+
+  /**
+   * Embedding to pass through on create when the profile uses the same vector
+   * for similarity and document storage; otherwise undefined so the store embeds
+   * as document (ADR-051). Accepts a precomputed similarity vector so the
+   * semantic path does not embed twice.
+   */
+  private embeddingForCreate(similarityEmbedding: number[]): number[] | undefined {
+    const { prefixes } = this.embeddingService.profile;
+    if (prefixes.similarity !== prefixes.document) return undefined;
+    return similarityEmbedding;
+  }
+
+  private buildCreateResult(
+    options: StoreFactOptions,
+    embedding: number[] | undefined,
+  ): ValidationResult {
     return {
       action: 'create',
       validated: {
         label: options.label,
         properties: options.properties ?? {},
-        embedding: newEmbedding,
+        ...(embedding ? { embedding } : {}),
         provenance: {
           confidence: options.confidence ?? 0.7,
           decayClass: options.decayClass ?? 'slow_decay',
@@ -177,6 +348,12 @@ export class MemoryValidator {
 
       const existingAttribute = (targetNode.properties as Record<string, unknown>).attribute;
       if (existingAttribute !== attribute) continue;
+
+      // Multi-valued facts can hold N distinct values per entity. Skip contradiction
+      // when either side is multi-valued and the value property differs.
+      if (isDistinctMultiValuedFact(options, targetNode.properties as Record<string, unknown>)) {
+        continue;
+      }
 
       // Same entity, same attribute, different label → contradiction.
       // Identical label is not a contradiction (dedup will handle it).

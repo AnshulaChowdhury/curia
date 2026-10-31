@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { SuspensionNotifier } from '../../../src/scheduler/suspension-notifier.js';
 import type { ScheduleSuspendedEvent } from '../../../src/bus/events.js';
+import { makeJob, mockSchedulerService } from './notifier-fixtures.js';
 
 // -- Mock helpers --
 
@@ -46,18 +47,28 @@ function makeEvent(overrides: Partial<ScheduleSuspendedEvent['payload']> = {}): 
 describe('SuspensionNotifier', () => {
   let bus: ReturnType<typeof mockBus>;
   let gateway: ReturnType<typeof mockOutboundGateway>;
+  let schedulerService: ReturnType<typeof mockSchedulerService>;
   let logger: ReturnType<typeof mockLogger>;
   let notifier: SuspensionNotifier;
 
   beforeEach(() => {
     bus = mockBus();
     gateway = mockOutboundGateway();
+    schedulerService = mockSchedulerService(makeJob({
+      agentId: 'ceo-inbox',
+      status: 'suspended',
+      intentAnchor: 'Process inbox daily',
+      consecutiveFailures: 3,
+    }));
     logger = mockLogger();
     notifier = new SuspensionNotifier({
       bus: bus as never,
       outboundGateway: gateway as never,
+      schedulerService: schedulerService as never,
       ceoEmail: 'ceo@example.com',
       logger: logger as never,
+      appOrigin: 'https://curia.example.com',
+      httpPort: 3000,
     });
   });
 
@@ -78,16 +89,19 @@ describe('SuspensionNotifier', () => {
     await (notifier as never as { handle(e: ScheduleSuspendedEvent): Promise<void> })
       .handle(makeEvent());
 
+    expect(schedulerService.getJob).toHaveBeenCalledWith('job-abc123');
     expect(gateway.sendNotification).toHaveBeenCalledOnce();
     const call = gateway.sendNotification.mock.calls[0][0];
     expect(call.notificationType).toBe('schedule_suspended');
     expect(call.ceoEmail).toBe('ceo@example.com');
     expect(call.subject).toContain('ceo-inbox');
     expect(call.body).toContain('ceo-inbox');       // agentId
+    expect(call.body).toContain('Process inbox daily'); // objective from intent_anchor
+    expect(call.body).toContain('One-shot (was due: `2026-07-03 08:00 UTC`)');
     expect(call.body).toContain('3');               // consecutiveFailures
     expect(call.body).toContain('400 — credit balance is too low to access the Anthropic API'); // lastError
-    expect(call.body).toContain('job-abc123');      // jobId
-    expect(call.body).toContain('web app');         // resume instructions
+    expect(call.body).toContain('https://curia.example.com/jobs/job-abc123');
+    expect(call.body).toContain('Resume');
   });
 
   it('logs an error and resolves when sendNotification returns false', async () => {

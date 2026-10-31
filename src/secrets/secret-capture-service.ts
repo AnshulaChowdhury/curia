@@ -6,11 +6,11 @@
 // yields a URL), the user submits the value to the public form, and redeem() writes it
 // straight into the encrypted vault. The token store holds metadata only — never the value.
 //
-// Two name policies live here as pure functions so the two sibling skills can share one
-// service and differ only in WHICH policy they apply:
-//   - resolveUserSecretName   — slugifies to `user.<slug>`; an unprivileged agent literally
-//                               cannot name a system/channel key (no dot-free or `channel.`
-//                               output is possible), so it is sandboxed by construction.
+// Two name policies live here so the two sibling skills can share one service and
+// differ only in WHICH policy they apply:
+//   - resolveUserSecretName   — canonical `user.*` key with fingerprint dedup (#1497);
+//                               an unprivileged agent literally cannot name a system/channel
+//                               key (no dot-free or `channel.` output is possible).
 //   - resolveSystemSecretName — must be a declared skill secret or channel credential key
 //                               (the same allowlist the vault PUT route enforces).
 
@@ -18,37 +18,15 @@ import type { DbPool } from '../db/connection.js';
 import type { Logger } from '../logger.js';
 import { hashToken } from '../channels/http/session-auth.js';
 import { randomBytes } from 'node:crypto';
+import { resolveUserSecretName } from './user-secret-name.js';
+import { hasUserSecretDetails, type UserSecretDetails } from './user-secret-details.js';
+
+export { resolveUserSecretName } from './user-secret-name.js';
 
 export type CaptureValueFormat = 'string' | 'json';
 
 /** Default link lifetime — short by design (single-use + 30 min, per #971). */
 export const DEFAULT_CAPTURE_TTL_MINUTES = 30;
-
-/** Upper bound on the raw user-supplied name before slugification. */
-const MAX_SECRET_NAME_INPUT = 128;
-
-/**
- * Slugify an arbitrary user description into a `user.<a-z0-9_>+` vault key.
- *
- * The `user.` namespace is the sandbox: the dot-separated prefix cannot be produced by
- * snake_case system keys (e.g. `anthropic_api_key`) or `channel.*` credential keys, so a
- * general-purpose capture can never overwrite a privileged secret — even if the agent
- * passes the literal name of one (it just becomes `user.anthropic_api_key`).
- */
-export function resolveUserSecretName(input: string): string {
-  if (typeof input !== 'string') throw new Error('secret_name must be a string');
-  const trimmed = input.trim();
-  if (trimmed.length === 0) throw new Error('secret_name must not be empty');
-  if (trimmed.length > MAX_SECRET_NAME_INPUT) {
-    throw new Error(`secret_name exceeds ${MAX_SECRET_NAME_INPUT} characters`);
-  }
-  // Lowercase, collapse every non-alphanumeric run to a single underscore, trim edge underscores.
-  const slug = trimmed.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-  if (slug.length === 0) {
-    throw new Error(`secret_name '${input}' has no usable alphanumeric characters`);
-  }
-  return `user.${slug}`;
-}
 
 /**
  * Validate a system secret name against the live allowlist (declared skill secrets ∪ known
@@ -69,10 +47,15 @@ export function resolveSystemSecretName(input: string, allowedNames: ReadonlySet
   return name;
 }
 
-/** The narrow slice of SecretsService that redeem() needs — write a value, never read one. */
+/** The narrow slice of SecretsService that capture needs — write a value, never read one.
+ *  `listUserNames` is names-only / `user.*`-only so mint can dedup without seeing values
+ *  or the rest of the keyspace (#1497). */
 export interface CaptureSecretsPort {
   set(name: string, value: string): Promise<void>;
   setJSON(name: string, obj: unknown): Promise<void>;
+  listUserNames(): Promise<string[]>;
+  /** Non-secret sign-in details for a `user.*` key (#2201). */
+  upsertUserDetails(name: string, details: UserSecretDetails): Promise<void>;
 }
 
 /** The mint-only surface injected into skills as the `secretCapture` capability.
@@ -80,6 +63,8 @@ export interface CaptureSecretsPort {
 export interface SecretCaptureMinter {
   mintUserSecret(args: MintNameArgs): Promise<MintResult>;
   mintSystemSecret(args: MintNameArgs): Promise<MintResult>;
+  /** Record sign-in details on an already-stored `user.*` key without minting a link (#2201). */
+  setUserSecretDetails(rawName: string, details: UserSecretDetails): Promise<{ secretName: string }>;
 }
 
 /**
@@ -100,6 +85,10 @@ export interface CaptureOrigin {
   originator?: Record<string, unknown>;
   /** Natural-language description of what to resume, e.g. the original user ask. */
   resumeIntent?: string;
+  /** Base64 delegate resume_token (#995). Present only when a delegated specialist minted the
+   *  link; carries no secret value. Lets the redeem endpoint thread it onto secret.captured so
+   *  the coordinator can re-delegate to the specialist. */
+  resumeToken?: string;
 }
 
 export interface MintNameArgs {
@@ -109,6 +98,8 @@ export interface MintNameArgs {
   valueFormat?: CaptureValueFormat;
   /** Origin routing context (#972), persisted so redeem can re-enter the agent. Optional. */
   origin?: CaptureOrigin;
+  /** Non-secret sign-in details stored with a user.* key (#2201). Ignored for system secrets. */
+  details?: UserSecretDetails;
   // NOTE: TTL is intentionally NOT caller-controlled. The lifetime is a fixed security
   // property of the feature (single-use + 30 min, per #971), so callers cannot mint links
   // that are already dead, absurdly long-lived, or NaN. See DEFAULT_CAPTURE_TTL_MINUTES.
@@ -119,6 +110,8 @@ export interface MintResult {
   /** The fully resolved vault key the value will be written to. */
   secretName: string;
   expiresAt: Date;
+  /** True when mint bound the token to an already-stored `user.*` key (#1497). */
+  reusedExisting?: boolean;
 }
 
 export interface SecretCaptureServiceOptions {
@@ -149,6 +142,7 @@ export interface CapturedContext {
   taskEventId?: string;
   originator?: Record<string, unknown>;
   resumeIntent?: string;
+  resumeToken?: string;
 }
 
 /**
@@ -200,8 +194,8 @@ export class SecretCaptureService implements SecretCaptureMinter {
     const result = await this.pool.query<{ expires_at: Date }>(
       `INSERT INTO secret_capture_tokens
          (token_hash, secret_name, label, value_format, expires_at,
-          conversation_id, channel_id, agent_id, task_event_id, originator, resume_intent)
-       VALUES ($1, $2, $3, $4, now() + make_interval(mins => $5), $6, $7, $8, $9, $10, $11)
+          conversation_id, channel_id, agent_id, task_event_id, originator, resume_intent, resume_token)
+       VALUES ($1, $2, $3, $4, now() + make_interval(mins => $5), $6, $7, $8, $9, $10, $11, $12)
        RETURNING expires_at`,
       [
         tokenHash, secretName, label ?? null, valueFormat, DEFAULT_CAPTURE_TTL_MINUTES,
@@ -211,15 +205,35 @@ export class SecretCaptureService implements SecretCaptureMinter {
         origin?.taskEventId ?? null,
         origin?.originator ?? null,
         origin?.resumeIntent ?? null,
+        origin?.resumeToken ?? null,
       ],
     );
     return { rawToken, expiresAt: result.rows[0]!.expires_at };
   }
 
   async mintUserSecret(args: MintNameArgs): Promise<MintResult> {
-    const secretName = resolveUserSecretName(args.rawName);
+    const existing = await this.secrets.listUserNames();
+    const secretName = resolveUserSecretName(args.rawName, existing);
+    const reusedExisting = existing.includes(secretName);
     const { rawToken, expiresAt } = await this.mint(secretName, args.label, args.valueFormat ?? 'string', args.origin);
-    return { rawToken, secretName, expiresAt };
+    if (args.details && hasUserSecretDetails(args.details)) {
+      await this.secrets.upsertUserDetails(secretName, args.details);
+    }
+    return { rawToken, secretName, expiresAt, reusedExisting };
+  }
+
+  async setUserSecretDetails(rawName: string, details: UserSecretDetails): Promise<{ secretName: string }> {
+    if (!hasUserSecretDetails(details)) throw new Error('Give login_url, username, or both.');
+    const existing = await this.secrets.listUserNames();
+    const secretName = resolveUserSecretName(rawName, existing);
+    if (!existing.includes(secretName)) {
+      throw new Error(
+        `No stored secret matches '${rawName}'. Call list-user-secrets for the exact key, ` +
+        'or mint a capture link with these details instead.',
+      );
+    }
+    await this.secrets.upsertUserDetails(secretName, details);
+    return { secretName };
   }
 
   async mintSystemSecret(args: MintNameArgs): Promise<MintResult> {
@@ -307,12 +321,13 @@ export class SecretCaptureService implements SecretCaptureMinter {
       task_event_id: string | null;
       originator: Record<string, unknown> | null;
       resume_intent: string | null;
+      resume_token: string | null;
     }>(
       `UPDATE secret_capture_tokens
           SET consumed_at = now()
         WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
         RETURNING secret_name, value_format, label,
-                  conversation_id, channel_id, agent_id, task_event_id, originator, resume_intent`,
+                  conversation_id, channel_id, agent_id, task_event_id, originator, resume_intent, resume_token`,
       [tokenHash],
     );
     const claimed = claim.rows[0];
@@ -358,6 +373,7 @@ export class SecretCaptureService implements SecretCaptureMinter {
         taskEventId: claimed.task_event_id ?? undefined,
         originator: claimed.originator ?? undefined,
         resumeIntent: claimed.resume_intent ?? undefined,
+        resumeToken: claimed.resume_token ?? undefined,
       },
     };
   }

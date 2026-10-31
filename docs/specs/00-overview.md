@@ -5,28 +5,30 @@
 
 ## Spec Index
 
-| # | Document | Scope | Status |
-|---|----------|-------|--------|
-| 00 | This file | Architecture, layers, bus, message flow, design principles | ✅ Implemented |
-| 01 | [Memory System](01-memory-system.md) | Knowledge graph, entity memory, working memory, Bullpen, embeddings | ✅ 12 of 12 Done |
-| 02 | [Agent System](02-agent-system.md) | Agent definition, lifecycle, state, execution modes, LLM providers | 20 of 25 Done |
-| 03 | [Skills & Execution](03-skills-and-execution.md) | Local skills, MCP, discovery, secrets, permissions, allowed_callers | 24 of 27 Done |
-| 04 | [Channels](04-channels.md) | Adapter interface, CLI, HTTP, Signal, Email channels, message normalization | 10 of 17 Done |
-| 05 | [Error Recovery](05-error-recovery.md) | Error budgets, state continuity, pattern detection, failure model | 10 of 18 Done |
-| 06 | [Audit & Security](06-audit-and-security.md) | Audit log, redaction, tool sanitization, intent drift, security | 25 of 27 Done |
-| 07 | [Scheduler](07-scheduler.md) | Job model, cron, one-shot, persistent tasks, burst execution, stale-job cleanup | 21 of 22 Done |
-| 08 | [Operations](08-operations.md) | Config, deployment, health checks, logging, project structure, container security | 17 of 18 Done |
-| 09 | [Contacts & Identity](09-contacts-and-identity.md) | Contact resolution, identity verification, unknown sender policy, authorization, channel identity linking, canonical attributes | 12 of 17 Done |
-| 10 | [Audit Log Hardening](10-audit-log-hardening.md) | Structured audit fields, LLM provenance, tamper evidence, source attribution, HITL records | 2 of 17 Done |
-| 11 | [Entity Context Enrichment](11-entity-context-enrichment.md) | Entity model, KG-backed sender/entity profiles, context assembly, agent self-identity, skill convention, delegation-aware outbound context bridge | 23 of 30 Done |
-| 12 | [Knowledge Graph Web Explorer](12-knowledge-graph-web-explorer.md) | Knowledge graph browser, relationship visualization, entity memory viewer | ✅ 5 of 5 Done |
-| 13 | [Office Identity](13-office-identity.md) | Persona config, voice settings, runtime identity injection | ✅ 10 of 10 Done |
-| 14 | [Autonomy Engine](14-autonomy-engine.md) | Global score, autonomy bands, skill action_risk, per-task prompt injection, CEO controls | ✅ 10 of 10 Done |
-| 15 | [Outbound Safety](15-outbound-safety.md) | Content filter, display name sanitization, caller verification, LLM-as-judge gateway | 10 of 17 Done |
-| 16 | [Smoke Test Framework](16-smoke-test-framework.md) | Chat-based test cases, LLM-as-judge evaluation, HTML reports | 8 of 18 Done |
-| 17 | [Meeting Debrief](17-meeting-debrief.md) | Proactive debrief agent, detection pipeline, follow-up execution via Bullpen-through-coordinator | 15 of 17 Done |
-| 18 | [Onboarding](18-onboarding.md) | Single-command host bootstrap, React form wizard at `/setup`, in-chat `setup-wizard` specialist | ✅ 15 of 15 Done |
-| 19 | [Tasks & Backlog](19-tasks-and-backlog.md) | `tasks` table (promoted from `agent_tasks`), `task-*` skills, `enable_task_management`, BacklogHeartbeat, digest backlog sections, project decomposition | ✅ Shipped (v0.33) |
+| # | Document | Scope |
+|---|----------|-------|
+| 00 | This file | Architecture, layers, bus, message flow, design principles |
+| 01 | [Memory System](01-memory-system.md) | Knowledge graph, entity memory, working memory, Bullpen, embeddings |
+| 02 | [Agent System](02-agent-system.md) | Agent definition, lifecycle, state, execution modes, LLM providers |
+| 03 | [Skills & Execution](03-tools-and-execution.md) | Local skills, MCP, discovery, secrets, permissions, allowed_callers |
+| 04 | [Channels](04-channels.md) | Adapter interface, CLI, HTTP, Signal, Email, Slack, SMS, Voice channels, message normalization |
+| 05 | [Error Recovery](05-error-recovery.md) | Error budgets, state continuity, pattern detection, failure model |
+| 06 | [Audit & Security](06-audit-and-security.md) | Audit log, redaction, tool sanitization, intent drift, security |
+| 07 | [Scheduler](07-scheduler.md) | Job model, cron, one-shot, persistent tasks, burst execution, stale-job cleanup |
+| 08 | [Operations](08-operations.md) | Config, deployment, health checks, logging, project structure, container security |
+| 09 | [Contacts & Identity](09-contacts-and-identity.md) | Contact resolution, identity verification, unknown sender policy, authorization, channel identity linking, canonical attributes |
+| 10 | [Audit Log Hardening](10-audit-log-hardening.md) | Structured audit fields, LLM provenance, tamper evidence, source attribution, HITL records |
+| 11 | [Entity Context Enrichment](11-entity-context-enrichment.md) | Entity model, KG-backed sender/entity profiles, context assembly, agent self-identity, skill convention, delegation-aware outbound context bridge |
+| 12 | [Knowledge Graph Web Explorer](12-knowledge-graph-web-explorer.md) | Knowledge graph browser, relationship visualization, entity memory viewer |
+| 13 | [Office Identity](13-office-identity.md) | Persona config, voice settings, runtime identity injection |
+| 14 | [Autonomy Engine](14-autonomy-engine.md) | Global score, autonomy bands, skill action_risk, per-task prompt injection, CEO controls |
+| 15 | [Outbound Safety](15-outbound-safety.md) | Content filter, display name sanitization, caller verification, LLM-as-judge gateway |
+| 16 | [Smoke Test Framework](16-smoke-test-framework.md) | Chat-based test cases, LLM-as-judge evaluation, HTML reports |
+| 17 | [Meeting Debrief](17-meeting-debrief.md) | Proactive debrief agent, detection pipeline, follow-up execution via Bullpen-through-coordinator |
+| 18 | [Onboarding](18-onboarding.md) | Single-command host bootstrap, React form wizard at `/setup`, in-chat `setup-wizard` specialist |
+| 19 | [Tasks, Backlog & Resumable Projects](19-tasks-and-backlog.md) | `tasks` table (promoted from `agent_tasks`), `task-*` tools, `tasks`/`documents` skills, BacklogHeartbeat, digest backlog sections, project decomposition; resumable-execution contract (checkpoint/pause), `plan` primitive, frontier advancement, throughput telemetry, adaptive re-planning, principal-facing escalation |
+| 20 | [Agent Document Workspace (OKF)](20-agent-document-workspace.md) | OKF `working_documents` store, `doc-*` skills, backlink index, accumulator spill, `/scratch` TTL sweep, KG distillation |
+| 21 | [Ant Farm Visualization](21-antfarm-visualization.md) | Pixel-art office replay of the audit log, `@curia/antfarm` SPA (Phaser + React), event→directive interpreter, timeline/stream/asset routes, scoped CSP |
 
 ---
 
@@ -57,7 +59,7 @@ All communication flows through a central in-process message bus backed by Postg
 
 ### Bus Security Enforcement
 
-The bus validates publisher authorization at registration time. A module registered as `layer: "channel"` can only publish event types in the channel allowlist (`inbound.message`, `inbound.event`). Attempting to publish `skill.invoke` throws an error. This is the hard security boundary — it's architectural, not policy.
+The bus validates publisher authorization at registration time. A module registered as `layer: "channel"` can only publish event types in the channel allowlist (`inbound.message`, `inbound.event`). Attempting to publish `tool.invoke` throws an error. This is the hard security boundary — it's architectural, not policy.
 
 The exception is the **System layer**, which has full publish and subscribe access to all event types. This is reserved for trusted infrastructure components (audit logger, memory engine, scheduler) that need cross-cutting access to operate.
 
@@ -66,10 +68,10 @@ The exception is the **System layer**, which has full publish and subscribe acce
 Full round-trip for an inbound message:
 1. Channel adapter publishes `inbound.message`
 2. Dispatch layer (subscribed to `inbound.message`) evaluates policy, publishes `agent.task`
-3. Agent (subscribed to `agent.task`) calls LLM, may publish `skill.invoke`
-4. Execution layer (subscribed to `skill.invoke`) runs skill, publishes `skill.result`
-5. Agent (subscribed to `skill.result`) incorporates result, publishes `agent.response`
-6. Dispatch layer (subscribed to `agent.response`) translates to `outbound.message`
+3. Agent (subscribed to `agent.task`) calls LLM, may publish `tool.invoke`
+4. Execution layer (subscribed to `tool.invoke`) runs skill, publishes `tool.result`
+5. Agent (subscribed to `tool.result`) incorporates result, publishes `agent.response`
+6. Dispatch layer (subscribed to `agent.response`) translates to `outbound.message`, or publishes `outbound.no_reply` when the agent returns the `NO_REPLY` sentinel (#1732)
 7. Channel adapter (subscribed to `outbound.message`) sends via platform API
 
 Bullpen flow: Agent publishes `agent.discuss` → target agent (subscribed to `agent.discuss`) responds in the same thread.
@@ -77,6 +79,8 @@ Bullpen flow: Agent publishes `agent.discuss` → target agent (subscribed to `a
 ### Bus Delivery Guarantees
 
 **Write-ahead audit logging.** The audit logger writes events to Postgres *before* delivering to other subscribers. If the process crashes after audit write but before subscriber delivery, the event is logged but unprocessed — on restart, the system can replay unacknowledged events from the audit log. This gives at-least-once delivery for all events and exactly-once audit recording.
+
+**Subscriber wait.** `publish()` resolves after every subscriber has been attempted. `publishDetached()` resolves once the write-ahead hook has succeeded and delivers subscribers in the background; a write-ahead failure rejects either call before any subscriber runs. Voice `async-offramp` uses the detached form so a spoken turn is not held for the coordinator's whole task (#2265).
 
 For launch, the replay mechanism is manual (operator can query unprocessed events). Automatic replay on startup is a future enhancement.
 
@@ -88,9 +92,9 @@ All event types are defined as a TypeScript discriminated union — no `any` pay
 
 ## Tech Stack
 
-- **Runtime:** Node.js 22+ with TypeScript (ESM)
+- **Runtime:** Node.js 24+ with TypeScript (ESM)
 - **Database:** PostgreSQL 16+ with pgvector extension
-- **LLM SDKs:** @anthropic-ai/sdk, openai (embeddings + OpenRouter provider), ollama
+- **LLM SDKs:** @anthropic-ai/sdk, openai (embeddings + OpenRouter provider); `ollama` planned for a future local-model provider (not yet implemented — see spec 02)
 - **MCP:** @modelcontextprotocol/sdk (client)
 - **HTTP:** Fastify (for HTTP API channel + dashboard endpoints)
 - **Testing:** Vitest
@@ -98,16 +102,14 @@ All event types are defined as a TypeScript discriminated union — no `any` pay
 - **Config:** YAML (js-yaml) with env var interpolation
 - **Logging:** pino (structured JSON)
 - **Migrations:** node-pg-migrate (plain SQL migrations, no ORM coupling)
-- **Embeddings:** OpenAI `text-embedding-3-small` (1536 dimensions), pgvector HNSW index
+- **Embeddings:** any OpenAI-compatible `/embeddings` endpoint, OpenAI `text-embedding-3-small` by default; width and thresholds from a per-model profile (ADR-051); pgvector HNSW index
 
 ---
 
 ## What Is NOT In Scope (Launch)
 
 - Multi-tenancy
-- Web dashboard UI (HTTP API is ready for it, but no frontend yet)
 - Memory decay engine (schema supports it, logic deferred)
-- Voice/telephony channel
-- Secrets vault (env vars behind ctx.secret() interface for now)
-- Skill marketplace or versioning
+- Voice/telephony beyond Phase 1 console duplex (Signal calling and PSTN remain deferred)
+- Skill marketplace (skill/agent *versioning* has since shipped — see the `version` field convention in [CLAUDE.md](../../CLAUDE.md))
 - Automatic event replay on startup (manual query for now)

@@ -22,4 +22,5 @@ export type BrowserAction =
   | 'wait_for'
   | 'get_content'
   | 'screenshot'
-  | 'close_session';
+  | 'close_session'
+  | 'clear_site_data';

@@ -1,0 +1,21 @@
+{
+  "name": "decline-grant-recommendation",
+  "description": "Decline a pending grant recommendation. Permanently marks it as declined — Curia will never surface this specific recommendation again (anti-nag). Use when the principal says no to a suggested grant ('no', 'not Dana', 'don't recommend that again'). recommendation_id must be the UUID from the recommendation. The id is in the recommendation's task (task-list tag grant-recommendation): the part of its grant-rec:<uuid> tag after the colon. Once this succeeds, task-complete that task with the outcome; if it fails, leave the task open.",
+  "version": "0.1.4",
+  "sensitivity": "elevated",
+  "action_risk": "low",
+  "inputs": {
+    "recommendation_id": "string (UUID of the pending grant recommendation)"
+  },
+  "outputs": {
+    "recommendation_id": "string",
+    "contact_id": "string",
+    "permission": "string",
+    "status": "string",
+    "already_resolved": "boolean? (true when it was already declined: nothing changed; close its task)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 15000,
+  "capabilities": []
+}

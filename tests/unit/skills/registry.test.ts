@@ -1,12 +1,12 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { SkillRegistry } from '../../../src/skills/registry.js';
-import type { SkillManifest, SkillHandler } from '../../../src/skills/types.js';
+import { ToolRegistry, expandTypeArraysToAnyOf, assertNoUnionTypeArrays } from '../../../src/skills/registry.js';
+import type { ToolManifest, ToolHandler } from '../../../src/skills/types.js';
 
-const stubHandler: SkillHandler = {
+const stubHandler: ToolHandler = {
   execute: async () => ({ success: true, data: 'stub' }),
 };
 
-function makeManifest(overrides: Partial<SkillManifest> = {}): SkillManifest {
+function makeManifest(overrides: Partial<ToolManifest> = {}): ToolManifest {
   return {
     name: 'test-skill',
     description: 'A test skill',
@@ -22,11 +22,11 @@ function makeManifest(overrides: Partial<SkillManifest> = {}): SkillManifest {
   };
 }
 
-describe('SkillRegistry', () => {
-  let registry: SkillRegistry;
+describe('ToolRegistry', () => {
+  let registry: ToolRegistry;
 
   beforeEach(() => {
-    registry = new SkillRegistry();
+    registry = new ToolRegistry();
   });
 
   it('registers and retrieves a skill by name', () => {
@@ -108,7 +108,7 @@ describe('SkillRegistry', () => {
       },
     }), stubHandler);
     const tools = registry.toToolDefinitions(['template-skill']);
-    const props = tools[0].input_schema.properties;
+    const props = tools[0].input_schema.properties as Record<string, { type: string; description?: string }>;
 
     // Required field with parenthetical description
     expect(props.action.type).toBe('string');
@@ -156,6 +156,161 @@ describe('SkillRegistry', () => {
     expect(props.tags).toEqual({ type: 'array', items: { type: 'string' }, description: 'optional list of tags' });
     // ids is required, tags is not
     expect(tools[0].input_schema.required).toEqual(['ids']);
+  });
+
+  it('converts string|null? inputs to JSON Schema anyOf (Gemini-safe, #1508)', () => {
+    registry.register(makeManifest({
+      name: 'null-union-skill',
+      description: 'Accepts explicit null',
+      inputs: {
+        blocked_by_task_id: 'string|null? (UUID, or null to clear)',
+        required_note: 'string|null (always present, may be null)',
+      },
+    }), stubHandler);
+    const tools = registry.toToolDefinitions(['null-union-skill']);
+    const props = tools[0]!.input_schema.properties;
+    expect(props.blocked_by_task_id).toEqual({
+      anyOf: [{ type: 'string' }, { type: 'null' }],
+      description: 'UUID, or null to clear',
+    });
+    expect(props.required_note).toEqual({
+      anyOf: [{ type: 'string' }, { type: 'null' }],
+      description: 'always present, may be null',
+    });
+    expect(tools[0]!.input_schema.required).toEqual(['required_note']);
+  });
+
+  it('converts multi-type unions (string|object|null) to anyOf, not type-arrays (#1508)', () => {
+    // Polymorphic inputs: the checkpoint tool's `cursor` is string | object | null
+    // (ResumableCursor). Type-arrays break Gemini via OpenRouter.
+    registry.register(makeManifest({
+      name: 'union-skill',
+      description: 'Accepts a polymorphic cursor',
+      inputs: {
+        cursor: 'string|object|null? (opaque resume position)',
+      },
+    }), stubHandler);
+    const tools = registry.toToolDefinitions(['union-skill']);
+    const props = tools[0]!.input_schema.properties;
+    expect(props.cursor).toEqual({
+      anyOf: [{ type: 'string' }, { type: 'object' }, { type: 'null' }],
+      description: 'opaque resume position',
+    });
+    // Optional → not required
+    expect(tools[0]!.input_schema.required).toEqual([]);
+  });
+
+  it('converts an array|object union (object[]|object) to anyOf with array items (#1508)', () => {
+    // The checkpoint tool's `accumulator` is either an inline object array or a single
+    // spilled document-pointer object.
+    registry.register(makeManifest({
+      name: 'array-union-skill',
+      description: 'Accepts an inline array or a single pointer object',
+      inputs: {
+        accumulator: 'object[]|object? (inline results, or a spilled pointer)',
+      },
+    }), stubHandler);
+    const tools = registry.toToolDefinitions(['array-union-skill']);
+    const props = tools[0]!.input_schema.properties;
+    expect(props.accumulator).toEqual({
+      anyOf: [
+        { type: 'array', items: { type: 'object' } },
+        { type: 'object' },
+      ],
+      description: 'inline results, or a spilled pointer',
+    });
+  });
+
+  it('assembled schemas pass a Gemini-style strict validator (no type-arrays) (#1508)', () => {
+    registry.register(makeManifest({
+      name: 'checkpoint-shaped',
+      description: 'Mirrors checkpoint polymorphic inputs',
+      inputs: {
+        cursor: 'string|object|null?',
+        accumulator: 'object[]|object?',
+        note: 'string|null?',
+      },
+    }), stubHandler);
+    const tools = registry.toToolDefinitions(['checkpoint-shaped']);
+    expect(() => assertNoUnionTypeArrays(tools[0]!.input_schema)).not.toThrow();
+  });
+
+  it('expands MCP type-arrays to anyOf so pass-through schemas stay Gemini-safe (#1508)', () => {
+    const expanded = expandTypeArraysToAnyOf({
+      type: 'object',
+      properties: {
+        cursor: { type: ['string', 'object', 'null'] },
+      },
+      required: ['cursor'],
+    });
+    expect(expanded).toEqual({
+      type: 'object',
+      properties: {
+        cursor: { anyOf: [{ type: 'string' }, { type: 'object' }, { type: 'null' }] },
+      },
+      required: ['cursor'],
+    });
+    expect(() => assertNoUnionTypeArrays(expanded)).not.toThrow();
+  });
+
+  it('preserves type-arrays inside instance-valued keywords (default/const/examples/enum) (#1508)', () => {
+    // A `type` array under default/const/examples/enum is literal data, not a schema —
+    // it must survive verbatim and must not be flagged by the strict validator.
+    const schema = {
+      type: 'object',
+      properties: {
+        mode: {
+          type: 'string',
+          default: { type: ['a', 'b'] },
+          const: { type: ['c1', 'c2'] },
+          examples: [{ type: ['e1', 'e2'] }],
+          enum: [{ type: ['x', 'y'] }, 'plain'],
+        },
+      },
+    };
+    const expanded = expandTypeArraysToAnyOf(schema) as {
+      properties: { mode: Record<string, unknown> };
+    };
+    const mode = expanded.properties.mode;
+    expect(mode.default).toEqual({ type: ['a', 'b'] });
+    expect(mode.const).toEqual({ type: ['c1', 'c2'] });
+    expect(mode.examples).toEqual([{ type: ['e1', 'e2'] }]);
+    expect(mode.enum).toEqual([{ type: ['x', 'y'] }, 'plain']);
+    expect(() => assertNoUnionTypeArrays(expanded)).not.toThrow();
+  });
+
+  it('still transforms a property literally named "default" (context-aware, not name-based) (#1508)', () => {
+    // Here `default` is a property NAME whose value is a real schema — unlike a
+    // `default` keyword holding instance data, it must be transformed.
+    const expanded = expandTypeArraysToAnyOf({
+      type: 'object',
+      properties: { default: { type: ['string', 'null'] } },
+    }) as { properties: { default: unknown } };
+    expect(expanded.properties.default).toEqual({ anyOf: [{ type: 'string' }, { type: 'null' }] });
+  });
+
+  it('composes a generated union with an existing anyOf via allOf, not overwrite (#1508)', () => {
+    const expanded = expandTypeArraysToAnyOf({
+      type: ['string', 'number'],
+      anyOf: [{ minLength: 1 }],
+    });
+    expect(expanded).toEqual({
+      allOf: [
+        { anyOf: [{ type: 'string' }, { type: 'number' }] },
+        { anyOf: [{ minLength: 1 }] },
+      ],
+    });
+    expect(() => assertNoUnionTypeArrays(expanded)).not.toThrow();
+  });
+
+  it('throws on a union member with an invalid primitive type', () => {
+    registry.register(makeManifest({
+      name: 'bad-union-skill',
+      description: 'Bad union',
+      inputs: { cursor: 'string|widget' },
+    }), stubHandler);
+    expect(() => registry.toToolDefinitions(['bad-union-skill']))
+      .toThrow(/invalid/i);
   });
 
   it('throws on invalid primitive type in skill manifest (e.g. em-dash format)', () => {

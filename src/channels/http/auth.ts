@@ -37,3 +37,52 @@ export function validateBearerToken(
     Buffer.from(configuredToken),
   );
 }
+
+/**
+ * API route prefixes that authenticate themselves (session cookie /
+ * x-web-bootstrap-secret via assertSecret, a capability token, or a webhook
+ * signature) and so bypass the adapter's global bearer-token hook. A console
+ * route missing from here is rejected by that hook before assertSecret runs, so
+ * the browser sees "provide a valid Bearer token" (#2285's /api/activity).
+ */
+const SELF_AUTHED_API_PREFIXES = [
+  '/api/kg',
+  // Console CRUD moved off /api/kg/* (#872) — each prefix self-auths via assertSecret.
+  '/api/tasks',
+  '/api/contacts',
+  '/api/chat',
+  '/api/grant-recommendations',
+  '/api/voice',
+  '/api/identity',
+  '/api/executive',
+  '/api/jobs',
+  '/api/antfarm',
+  '/api/activity',
+  '/api/dashboard',
+  '/api/autonomy',
+  '/api/memory',
+  '/api/documents',
+  '/api/system',
+  '/api/registry',
+  '/api/vault',
+  // Secret-capture routes are token-authed (the single-use token in the URL is the
+  // capability), so they bypass bearer auth and self-authorize via the token (#971).
+  '/api/secret-capture',
+  // The onboarding wizard runs in the browser with the same curia_session cookie /
+  // x-web-bootstrap-secret pair as the identity routes.
+  '/api/setup',
+  // Telnyx SMS webhooks authenticate via Ed25519 signature, not bearer token (ADR-036).
+  '/api/webhooks/telnyx',
+];
+
+/**
+ * True when the registered route URL skips bearer enforcement (see SELF_AUTHED_API_PREFIXES).
+ * Match on a path-segment boundary so `/api/chat` does not exempt `/api/chat-export`
+ * (and likewise for tasks/contacts/… — #872 review).
+ */
+export function bypassesBearerAuth(routeUrl: string): boolean {
+  if (routeUrl === '/api/health') return true;
+  return SELF_AUTHED_API_PREFIXES.some(
+    (p) => routeUrl === p || routeUrl.startsWith(`${p}/`),
+  );
+}

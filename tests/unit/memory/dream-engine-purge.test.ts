@@ -1,18 +1,23 @@
 /**
  * Unit test verifying DreamEngine calls workingMemory.purgeExpired()
  * after the decay pass commits — issue #220.
+ * Extended for scratch document purge — issue #1212.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { DreamEngine } from '../../../src/memory/dream-engine.js';
 import type { EventBus } from '../../../src/bus/bus.js';
 import type { WorkingMemory } from '../../../src/memory/working-memory.js';
+import type { WorkingDocsRepo } from '../../../src/db/working-docs-repo.js';
 
 function makeBus(): EventBus {
   return { publish: vi.fn().mockResolvedValue(undefined), subscribe: vi.fn() } as unknown as EventBus;
 }
 
 function makeSilentLogger() {
-  return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never;
+  // Cast through unknown to never so this minimal mock can be passed to DreamEngine,
+  // which expects a full pino.Logger. Tests that need to assert on mock calls should
+  // create their own inline mock object and cast separately (see the third test).
+  return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as never;
 }
 
 function makePool() {
@@ -75,7 +80,9 @@ describe('DreamEngine — working memory purge', () => {
 
   it('logs a purge failure but does not throw', async () => {
     const { pool } = makePool();
-    const logger = makeSilentLogger();
+    // Hold a typed reference for assertions; pass as never to satisfy pino.Logger.
+    const loggerMock = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const logger = loggerMock as unknown as never;
     const mockWorkingMemory = {
       purgeExpired: vi.fn().mockRejectedValue(new Error('DB connection lost')),
     } as unknown as WorkingMemory;
@@ -91,9 +98,77 @@ describe('DreamEngine — working memory purge', () => {
 
     // Should not throw — purge failure is best-effort
     await expect(engine.runDecayPass()).resolves.toBeDefined();
-    expect(logger.error).toHaveBeenCalledWith(
+    expect(loggerMock.error).toHaveBeenCalledWith(
       expect.objectContaining({ err: expect.any(Error) }),
       expect.stringContaining('working memory purge failed'),
+    );
+  });
+});
+
+describe('DreamEngine — scratch document purge', () => {
+  it('calls purgeExpiredScratch() after the decay pass completes', async () => {
+    const { pool } = makePool();
+    const mockWorkingDocsRepo = {
+      purgeExpiredScratch: vi.fn().mockResolvedValue(2),
+    } as unknown as WorkingDocsRepo;
+
+    const engine = new DreamEngine(
+      pool as never,
+      makeBus(),
+      makeSilentLogger(),
+      baseConfig,
+      undefined,
+      undefined,
+      mockWorkingDocsRepo,
+      7,
+    );
+
+    await engine.runDecayPass();
+
+    expect(mockWorkingDocsRepo.purgeExpiredScratch).toHaveBeenCalledWith(7);
+  });
+
+  it('does not call purgeExpiredScratch when workingDocsRepo is not injected', async () => {
+    const { pool } = makePool();
+    const mockWorkingDocsRepo = {
+      purgeExpiredScratch: vi.fn(),
+    } as unknown as WorkingDocsRepo;
+
+    const engine = new DreamEngine(
+      pool as never,
+      makeBus(),
+      makeSilentLogger(),
+      baseConfig,
+    );
+
+    await engine.runDecayPass();
+
+    expect(mockWorkingDocsRepo.purgeExpiredScratch).not.toHaveBeenCalled();
+  });
+
+  it('logs a scratch purge failure but does not throw', async () => {
+    const { pool } = makePool();
+    const loggerMock = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const logger = loggerMock as unknown as never;
+    const mockWorkingDocsRepo = {
+      purgeExpiredScratch: vi.fn().mockRejectedValue(new Error('DB connection lost')),
+    } as unknown as WorkingDocsRepo;
+
+    const engine = new DreamEngine(
+      pool as never,
+      makeBus(),
+      logger,
+      baseConfig,
+      undefined,
+      undefined,
+      mockWorkingDocsRepo,
+      7,
+    );
+
+    await expect(engine.runDecayPass()).resolves.toBeDefined();
+    expect(loggerMock.error).toHaveBeenCalledWith(
+      expect.objectContaining({ err: expect.any(Error), scratchTtlDays: 7 }),
+      expect.stringContaining('scratch document purge failed'),
     );
   });
 });

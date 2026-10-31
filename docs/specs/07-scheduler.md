@@ -87,16 +87,18 @@ The Docker container does not set `TZ`. Even if it did, relying on a host-level 
 
 ## Scheduler Loop
 
-The scheduler runs inside the main process and checks for due jobs every 30 seconds:
+The scheduler runs inside the main process and checks for due jobs every 30 seconds. A poll does not wait for the agent run.
 
-1. Query: `SELECT * FROM scheduled_jobs WHERE next_run_at <= now() AND status IN ('pending', 'failed') FOR UPDATE SKIP LOCKED`
-2. For each due job:
-   - Set `status = 'running'` (atomically via the FOR UPDATE lock)
-   - Publish `agent.task` to the bus with the job's `task_payload`
-   - On success: update `last_run_at`, calculate `next_run_at` from cron_expr (or set `status = 'completed'` for one-shot), reset `consecutive_failures = 0`
-   - On failure: increment `consecutive_failures`, set `last_error`, if >= 3 set `status = 'suspended'` and notify user
+1. Read up to `scheduler.maxInFlight` minus the runs already in flight (default cap 8, headroom above the observed peak of 6):
+   `SELECT ... FROM scheduled_jobs WHERE next_run_at <= now() AND status IN ('pending', 'failed') ORDER BY next_run_at LIMIT $slots`
+2. For each selected job, claim it with an atomic `UPDATE` that sets `status = 'running'` only while `status IN ('pending', 'failed')` and returns `run_started_at::text`. Cron claims also require `next_run_at <= now()` and advance `next_run_at` to the following occurrence. A publish that later rejects reverts only that returned timestamp, cast back to `timestamptz`, so it cannot undo a newer run and does not lose the microseconds a JavaScript `Date` would drop.
+3. Hand `schedule.fired` and `agent.task` to a detached runner and return. The runner holds one in-flight slot until publish settles, or until the watchdog recovery timeout (`LEAST(expected × 7.5, expected + 3600)`) elapses, whichever comes first. A timeout releases only the slot — the agent run keeps going — so a hung run cannot fill the cap until process restart.
+4. When the cap is full, the poll claims nothing and logs the number of due rows left pending at `info`. Due jobs stay `pending` until a slot frees on a later tick.
+5. On completion the bus subscriber calls `completeJobRun`: update `last_run_at`, calculate the next `next_run_at` (or `completed` for a one-shot), reset `consecutive_failures`. On failure, increment `consecutive_failures`, set `last_error`, and at 3 consecutive failures set `status = 'suspended'` and notify the user.
 
-The `FOR UPDATE SKIP LOCKED` pattern ensures that if the scheduler loop overlaps (e.g., a job takes longer than 30s), the same job isn't claimed twice.
+The claim `UPDATE` is the mutual-exclusion primitive across overlapping polls and multiple scheduler processes. A row lock on the read would release when the `SELECT` returned, before the claim, so the poll does not use `FOR UPDATE SKIP LOCKED`. The `next_run_at <= now()` predicate on the cron claim is what stops a stale poll from firing a second copy after the first claim already advanced the schedule (#1124, #1159, #1160).
+
+Polls are deliberately allowed to overlap. Firing is serial within one poll, but a new poll starts every 30 seconds whether or not the last one has finished, and that overlap is what keeps fire lateness low (prod baseline before #1160: p90 45.8s on the `*/15` ceo-inbox job). An `isPolling` guard that skipped a poll while another ran would drain a busy batch one run at a time, pushing lateness toward minutes. It is a regression, not a fix — the in-flight cap is the bound.
 
 ---
 
@@ -157,15 +159,73 @@ Agent context: {"events_sent": 6}
 
 If the job has never run, no prior-run block is injected.
 
+Both fields are size-capped on the read path, and every cut is logged at `warn` with the job
+id and the original length.
+
+The summary is prose, so it is cut at 2,000 characters and marked `…[truncated]`. The marker
+counts against the cap rather than being appended past it, so the injected value is never
+longer than the limit.
+
+The context is reduced **per value** rather than cut as a string, and is always valid JSON
+and always within the cap.
+`JSON.stringify` emits keys in insertion order, so cutting the serialised form would drop
+whatever sorts last — and `last_run_context` carries continuity state, such as the promotion
+sweep's offset cursor (see [spec 05](05-error-recovery.md)), which no skill can read back.
+Reduction runs in two stages: values over 160 characters are replaced with
+`…[elided N chars]` while every key is kept, and only if the result still exceeds 4,000
+characters are keys dropped from the tail and counted under `__truncated__` (suffixed if a
+caller key already holds that name, since the column is opaque JSONB and the name is not
+reserved). Stage one
+cannot lose a cursor; stage two can, which is why the log records `elidedValues` and
+`omittedKeys` separately.
+
+The column is JSONB, so it can hold an array or a scalar despite the declared object type.
+Arrays get the same two-stage treatment element-wise; a scalar keeps a prefix inside a valid
+JSON string. The falsy JSON values `0`, `false` and `""` are injected like any other context —
+only a genuinely absent (`null`) context omits the line.
+
+There is currently no write-time cap in `scheduler-report`, so this read cap is the only
+bound on what the column holds.
+
 ### What gets written and by whom
 
 | Field | Written by | When |
 |---|---|---|
 | `last_run_outcome` | Scheduler | On `completeJobRun()` success/failure; stuck-job recovery writes `timed_out` |
-| `last_run_summary` | Agent (via `scheduler-report` skill) | At the end of a successful run |
-| `last_run_context` | Agent (via `scheduler-report` skill) | At the end of a successful run |
+| `last_run_summary` | Agent (via `scheduler-report` skill), or scheduler auto-summary | Mid-run via `scheduler-report`; otherwise `completeJobRun` COALESCE on success (claim clears first) |
+| `last_run_context` | Agent (via `scheduler-report`) **and** scheduler (`completeJobRun`) | Agent writes opaque continuity state; scheduler merges/clears `failedSkills` / `failedSkillsOmitted` on every completion (#1830) |
 
-Agents are not required to call `scheduler-report`. Stateless jobs (e.g. a daily email that simply reads the calendar and sends) can skip it — `last_run_context` stays `NULL` and the next run starts with only the outcome/summary from the scheduler.
+Agents are not required to call `scheduler-report`. Stateless jobs (e.g. a daily email that simply reads the calendar and sends) can skip it — without a report, continuity state stays unset, but `completeJobRun` may still write a `failedSkills` key when tools failed during the run. `failedSkills` is diagnostics-only: `buildPriorRunBlock` strips it before injecting context into the next run's prompt.
+
+`reportJobRun` replaces the column wholesale. `completeJobRun` then merges `failedSkills` (or clears it) after the agent finishes, so a mid-run report cannot permanently drop this run's tool-failure visibility. A future writer must preserve that two-step ownership.
+
+### Which bus event completes a job
+
+The scheduler completes a fired job from `agent.response`, not from `agent.error`:
+
+- **Success** — a non-error `agent.response` calls `completeJobRun(…, success=true)` (and may merge `failedSkills` from tools that failed mid-run without flipping health).
+- **Failure** — the runtime emits `agent.error` *then* `agent.response(isError)` with the same `parentEventId`. The scheduler stashes the structured message from `agent.error` and completes on the response (which also carries `failedSkills`). `agent.error` alone does **not** complete the job.
+
+That pairing is load-bearing: every runtime failure path must emit both events in that order. An unpaired `agent.error` leaves the row in `running` until the stuck-job watchdog times it out; an unpaired `agent.response(isError)` still completes, but `last_error` falls back to the response content (and the scheduler logs a warning).
+
+### Task-wake disposition (#1951)
+
+An ordinary task wake (`task_payload.type = 'task-wake'`, not a delegation-retry brief) carries a disposition instruction in its `agent.task` body: before the run finishes, `task-complete` the task, cancel it, or park it (`waiting`/`blocked` plus a progress note and `wake_at`; `wake_at` is optional only when the task waits on a contact or a blocking task).
+
+The body also carries `messages_back_on_open_sends` when recipients have written back on the agent's still-open sends (#2261): a wake cannot read message threads, so this is where a reply that arrived on another conversation shows up. Up to 10 entries, the waking task's own sends first (`asked_by_this_task`), with a `replies_note` that marks each text as the contact's untrusted words. A wake an outside contact started lists only the entries sent to that contact and only their own messages; an unresolved outsider's wake lists none. The list is added after `${principal_contact_id}` substitution, so nothing in a contact's words is filled in. See spec 11 for how the messages are recorded.
+
+If that run **succeeds** and the task is still undisposed, the scheduler publishes **one** follow-up `agent.task` to the same agent on the same `scheduler:<job>:<run>` conversation. `toolAllowlist` is `task-complete` and `task-update`, so the follow-up cannot repeat the wake's sends. The job stays `running` until that follow-up ends, and `tasks.updated_at` is touched when the follow-up is asked for, so BacklogHeartbeat cannot select the task in the gap. A failed or timed-out wake does not get a follow-up. A wake with `created_by = resumable-continuation` (a paused-slice continuation or a plan-parent wake) does not get one either: those runs are meant to leave the task open. The hourly heartbeat remains the backstop, and a heartbeat wake of the same task still gets the follow-up.
+
+Undisposed means either of:
+
+- status `open` or `in_progress`, progress notes unchanged, no new wake;
+- status `waiting` or `blocked` with nothing to wake it: no new or other pending wake, and no `waiting_on_contact_id` or `blocked_by_task_id` (#2084). A progress note does not count here. A re-arming loop that parks its tick task with a note but no `wake_at` has stopped, and the parked follow-up prompt asks for `wake_at` by name.
+
+If the follow-up leaves a **parked** task with still nothing to wake it, the scheduler logs a warning and leaves it to heartbeat revival after `staleWaitThresholdHours`. It is not tagged and no review is filed: the tag would remove that backstop.
+
+If the follow-up leaves an **open** task undisposed, the scheduler tags it `needs-disposition` (heartbeat selection excludes that tag), logs a warning, notifies the coordinator with a review-only notice parented on that follow-up event, and files a CEO backlog row tagged `needs-attention`. It does not auto-complete the task and it does not ask again.
+
+`enqueueTaskWake` keeps `last_run_outcome` when it revives a `completed` row, so the next fire still receives `[Prior run context]`. `consecutive_failures` still resets. Delegation-retry tasks stay closed at fire time (`closeDelegationRetryTask`) and do not use this follow-up.
 
 ---
 
@@ -185,7 +245,7 @@ The agent runtime (`src/agents/runtime.ts`) detects scheduler-originated tasks b
 
 > *You are running a scheduled task. The task description in your user message is the ONLY work you may do this run. Ambient context entries — including the active-outbound-context block — are informational, not action triggers. If you find no work matching the task description, call `scheduler-report` with an empty summary and exit.*
 
-The fence is unconditional for scheduler-originated runs. It does not depend on which agent is running — the same instruction applies whether coordinator, meeting-debrief, or any other agent is invoked via a scheduled job. This protects against new agents being added without inheriting the same discipline.
+The fence is unconditional for scheduler-originated runs. It does not depend on which agent is running — the same instruction applies whether coordinator, meeting-debrief, or any other agent is invoked via a scheduled job. This protects against new agents being added without inheriting the same discipline. A turn that sets `toolAllowlist` (the task-wake disposition follow-up) replaces the `scheduler-report` sentence with an instruction to use only the tools it was given.
 
 ### What the fence does and doesn't do
 
@@ -252,42 +312,19 @@ Four skills available to agents:
 - **`scheduler-create`** — create a cron or one-shot job, optionally with a linked persistent task (`intent_anchor`)
 - **`scheduler-list`** — list jobs with optional status/agent_id filters
 - **`scheduler-cancel`** — cancel a job by ID
-- **`scheduler-report`** — write prior-run context at the end of a run. Input: `{ job_id, summary, context? }`. Action risk: `none`. The scheduler writes `last_run_outcome` itself; this skill writes `last_run_summary` and `last_run_context`.
+- **`scheduler-report`** — write prior-run context at the end of a run. Input: `{ summary, context?, job_id? }`. On a scheduled run, `job_id` is optional and derived from `conversationId` (`scheduler:<uuid>:<runId>`); an explicit `job_id` that disagrees with the run is ignored (derived wins) so a hallucinated UUID cannot cost the report. Outside a scheduled run, pass `job_id` explicitly. Action risk: `none`. The scheduler writes `last_run_outcome` itself; this skill writes `last_run_summary` and `last_run_context`. It does **not** close a linked task — that is `task-complete` / `task-update` (#1951). After the agent finishes, `completeJobRun` may merge `failedSkills` into the same column (#1830). Bare job UUIDs are not injected into the system prompt or the fired task content — they were an attractive nuisance for bullpen `thread_id` (#1828).
 
 ---
 
 ## Job Observability
 
 - All job executions are audit-logged (start, success, failure, suspension)
-- The health endpoint does not yet include scheduler stats (active jobs, suspended jobs, next due time) — see Implementation Status below
+- The health endpoint does not yet include scheduler stats (active jobs, suspended jobs, next due time) — see Known Deficiencies below
 - Suspended jobs trigger a `SuspensionNotifier` direct email to the CEO (bypasses LLM — see Overview above)
 - Watchdog-recovered stuck jobs trigger a `RecoveryNotifier` direct email to the CEO
 
 ---
 
-## Implementation Status
+## Known Deficiencies
 
-| Item | Status |
-|---|---|
-| `scheduled_jobs` table (cron, one-shot, status, error tracking) | Done |
-| `scheduled_jobs` timezone column (per-job override) | Done |
-| `scheduled_jobs` prior run context columns (`last_run_outcome`, `last_run_summary`, `last_run_context`) | Done |
-| `tasks` table (formerly `agent_tasks`; forward FK `scheduled_jobs.task_id`, see [spec 19](19-tasks-and-backlog.md)) | Done |
-| `SchedulerService` class (job CRUD, shared by loop and skills) | Done |
-| Scheduler loop (30s poll, `FOR UPDATE SKIP LOCKED`, failure tracking) | Done |
-| Declarative schedules from agent YAML config (upserted at startup) | Done |
-| Skill: `scheduler-create` | Done |
-| Skill: `scheduler-list` | Done |
-| Skill: `scheduler-cancel` | Done |
-| Skill: `scheduler-report` (writes `last_run_summary` and `last_run_context`) | Done |
-| HTTP API routes (`POST/GET/PATCH/DELETE /api/jobs`) | Done |
-| Prior run context injection (structured system message prepended to task) | Done |
-| Timezone handling (per-job tz passed to `cron-parser`) | Done |
-| `SuspensionNotifier` — direct CEO email on suspension (bypasses LLM via `OutboundGateway.sendNotification`) | Done |
-| `RecoveryNotifier` — direct CEO email when watchdog resets a stuck job to pending | Done |
-| Audit logging (`schedule.fired`, `schedule.suspended`, `schedule.recovered` events) | Done |
-| Declarative job cleanup — auto-cancel stale YAML schedules on cron changes or removals | Done |
-| Health endpoint: scheduler stats (active jobs, suspended jobs, next due) | Not Done |
-| `TaskOriginator` threaded through declarative (YAML-defined) scheduled jobs so specialist tasks fired by cron carry the originating caller through the bus | Done |
-| Periodic cleanup of expired or released `outbound_context` rows via a scheduled job (see [spec 11 §Outbound Context Bridge](11-entity-context-enrichment.md#outbound-context-bridge)) | Done |
-| `delegate.defaultTimeoutMs` and `scheduler.defaultExpectedDurationSeconds` config keys (camelCase) with startup validation | Done |
+- **Health endpoint scheduler stats** — the `/api/health` endpoint reports basic scheduler liveness (ok/fail based on watchdog tick recency, see `src/health/health-checks.ts`), but does not yet expose scheduler *stats* (active job count, suspended job count, next-due time) as originally scoped for this spec.

@@ -1,6 +1,6 @@
 // types.ts — Executive Profile types.
 //
-// These types define the shape of the executive (CEO) profile that is stored
+// These types define the shape of the executive (principal) profile that is stored
 // in the DB and loaded from config/executive-profile.yaml on first startup.
 // The writing voice is consumed at runtime by the executive-profile-get skill,
 // which compiles it via compileWritingVoiceBlock() for the requesting agent
@@ -32,6 +32,9 @@ export interface WritingVoice {
   };
   /** Email sign-off when drafting in the executive's voice. */
   signOff: string;
+  /** Learned, free-form markdown describing how the executive actually writes.
+   *  Maintained by the weekly voice-learn LLM pass; '' until first learned. */
+  guide: string;
 }
 
 export interface ExecutiveProfileVersion {

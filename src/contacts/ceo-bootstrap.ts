@@ -1,38 +1,22 @@
 // src/contacts/ceo-bootstrap.ts
 //
-// CEO contact bootstrap.
+// Principal contact utilities.
 //
-// Ensures the CEO's primary email is linked to a principal-tier, verified contact
-// before the email adapter starts polling. Without this, the first inbound email
-// from the CEO triggers auto-creation via extractParticipants(), which always
-// creates contacts as unknown-tier — causing their messages to be held.
-//
-// Also ensures the CEO contact has a KG person node (kg_node_id). Without one,
-// entity context enrichment is non-functional for the CEO: no facts, standing
-// instructions, or relationship data can be stored or retrieved. See issue #380.
-//
-// This module is called once at startup. It is idempotent under serial execution
-// (safe for single-process deployments, consistent with the migration runner).
-// Handles three cases:
-//   1. Contact + identity already exist at tier='principal'/verified → ensure kg_node_id, no-op otherwise
-//   2. Contact + identity exist at lower tier/unverified → repair via repairPrincipalMetadata + verify
-//   3. Neither exists → create KG node, then create contact + identity in a transaction
+// The env-var-driven principal bootstrap (`bootstrapCeoContact`, keyed on CEO_PRIMARY_EMAIL)
+// was removed in #1049: the in-app onboarding wizard (#771) now creates the principal,
+// and `findContactBySystemRole('principal')` is the single startup resolution path
+// (see src/index.ts). What remains here are the shared, channel-agnostic utilities the
+// wizard path (ensure-principal.ts) and the startup resolution both rely on:
+//   - repairPrincipalMetadata: idempotent self-heal of role/system_role/tier/kind
+//   - insertKgPersonNode / createAndLinkKgNode: KG person-node creation + linkage
 //
 // Legacy status/trust_level columns are not written by this module (#955).
 
-import { randomUUID } from 'crypto';
 import type { DbPool } from '../db/connection.js';
 import type { Logger } from '../logger.js';
 
-export interface CeoContactBootstrapResult {
-  contactId: string;
-  kgNodeId: string;
-  /** true if the contact already existed (possibly promoted), false if newly created */
-  alreadyExisted: boolean;
-}
-
 /**
- * Repair a principal/CEO contact's capability metadata to the canonical values.
+ * Repair a principal contact's capability metadata to the canonical values.
  *
  * Idempotent — the WHERE guard makes it a no-op when the row is already correct.
  * Called on EVERY path that returns an existing principal row (initial bootstrap,
@@ -58,7 +42,7 @@ export async function repairPrincipalMetadata(contactId: string, pool: DbPool, l
     );
   } catch (err) {
     // Log with context, then propagate. A failure to apply the canonical principal
-    // capability metadata means the CEO's trust gates (e.g. PII-redaction bypass)
+    // capability metadata means the principal's trust gates (e.g. PII-redaction bypass)
     // may not apply, so every caller treats this as fatal rather than silently
     // continuing with a possibly-downgraded principal. Centralizing the log+rethrow
     // here keeps all four call sites (bootstrap main + race winners + ensure-principal)
@@ -72,222 +56,79 @@ export async function repairPrincipalMetadata(contactId: string, pool: DbPool, l
 }
 
 /**
- * Ensure the CEO's primary email contact exists, is confirmed + verified, and has a
- * linked KG person node.
- *
- * @param ceoPrimaryEmail  The CEO's primary email address (from CEO_PRIMARY_EMAIL env)
- * @param displayName      Display name to use if creating a new contact (defaults to "CEO")
- * @param pool             Postgres connection pool
- * @param logger           Pino logger
- */
-export async function bootstrapCeoContact(
-  ceoPrimaryEmail: string,
-  displayName: string,
-  pool: DbPool,
-  logger: Logger,
-): Promise<CeoContactBootstrapResult> {
-  // Look up by channel identity first — this is the authoritative key for email senders.
-  // Also fetch kg_node_id and display_name so we can detect and fix the missing-KG-node case.
-  // Fetch tier (the canonical capability axis, #945) instead of the legacy status column.
-  // repairPrincipalMetadata will be called before any gate checks so tier reflects the
-  // current canonical value even if the row was written by older code.
-  const existing = await pool.query<{
-    contact_id: string;
-    contact_tier: string;
-    identity_verified: boolean;
-    kg_node_id: string | null;
-    display_name: string;
-  }>(
-    `SELECT ci.contact_id,
-            c.tier          AS contact_tier,
-            ci.verified     AS identity_verified,
-            c.kg_node_id,
-            c.display_name
-     FROM contact_channel_identities ci
-     JOIN contacts c ON c.id = ci.contact_id
-     WHERE ci.channel = 'email' AND ci.channel_identifier = $1`,
-    [ceoPrimaryEmail],
-  );
-
-  if (existing.rows[0]) {
-    const { contact_id, contact_tier, identity_verified, display_name: existingName } = existing.rows[0];
-    let { kg_node_id } = existing.rows[0];
-
-    // Always ensure role = 'ceo', tier = 'principal', and kind = 'principal' on the CEO
-    // contact regardless of which path brought us here. This is idempotent — the UPDATE
-    // is a no-op when all values are already correct. Setting role keeps metadata consistent
-    // even if the contact was initially auto-created without a role.
-    // repairPrincipalMetadata logs with context and rethrows on failure (see its body).
-    await repairPrincipalMetadata(contact_id, pool, logger);
-
-    // Backfill KG node if missing. This handles existing deployments where the contact
-    // was created without a KG node (pre-#380 fix). Uses the contact's existing display_name
-    // rather than the passed-in default so we don't overwrite a name that was already set.
-    if (!kg_node_id) {
-      kg_node_id = await createAndLinkKgNode(contact_id, existingName, pool);
-      logger.info(
-        { contactId: contact_id, kgNodeId: kg_node_id, email: ceoPrimaryEmail },
-        'ceo-bootstrap: backfilled KG person node for existing CEO contact',
-      );
-    }
-
-    // Already at principal tier + identity verified — nothing else to do.
-    // After repairPrincipalMetadata, a CEO contact is always at tier='principal',
-    // so this is the fast-path for every steady-state startup. (#955: gate was
-    // previously on contact_status === 'confirmed'; the tier check is equivalent
-    // for the principal because repairPrincipalMetadata already ran above.)
-    if (contact_tier === 'principal' && identity_verified) {
-      logger.info({ contactId: contact_id, kgNodeId: kg_node_id, email: ceoPrimaryEmail }, 'ceo-bootstrap: CEO contact already at principal tier and verified');
-      return { contactId: contact_id, kgNodeId: kg_node_id, alreadyExisted: true };
-    }
-
-    // Promote in-place: update the identity verified flag if needed.
-    // The contact's tier is already set to 'principal' by repairPrincipalMetadata above,
-    // so we do not write status here — #955 removes that column.
-    if (!identity_verified) {
-      await pool.query(
-        `UPDATE contact_channel_identities
-         SET verified = true, verified_at = now(), updated_at = now()
-         WHERE channel = 'email' AND channel_identifier = $1`,
-        [ceoPrimaryEmail],
-      );
-    }
-
-    logger.info(
-      { contactId: contact_id, kgNodeId: kg_node_id, email: ceoPrimaryEmail, wasTier: contact_tier, wasVerified: identity_verified },
-      'ceo-bootstrap: CEO contact promoted to principal tier + verified',
-    );
-    return { contactId: contact_id, kgNodeId: kg_node_id, alreadyExisted: true };
-  }
-
-  // No existing record — create the KG person node first, then create the contact and
-  // channel identity in a single transaction so a partial failure cannot leave an orphaned
-  // contacts row. The KG node is created outside the transaction intentionally: if the
-  // transaction fails with 23505 (concurrent startup race), we rescue the orphaned KG node
-  // by linking it to the winning contact (see below).
-  //
-  // Note: creating the KG node before the transaction means a failed transaction leaves an
-  // unlinked kg_nodes row. This is acceptable for single-process deployments — next startup
-  // will find the contact (via the winning process) and take the existing-contact path above.
-  const kgNodeId = await insertKgPersonNode(displayName, pool);
-
-  const contactId = randomUUID();
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    // tier='principal' and kind='principal' added in migration 055 (issue #945).
-    // status/trust_level are legacy columns not written here (#955).
-    await client.query(
-      `INSERT INTO contacts (id, kg_node_id, display_name, role, system_role, tier, kind, created_at, updated_at)
-       VALUES ($1, $2, $3, 'ceo', 'principal', 'principal', 'principal', now(), now())`,
-      [contactId, kgNodeId, displayName],
-    );
-    await client.query(
-      `INSERT INTO contact_channel_identities
-         (id, contact_id, channel, channel_identifier, verified, verified_at, source, created_at, updated_at)
-       VALUES ($1, $2, 'email', $3, true, now(), 'bootstrap', now(), now())`,
-      [randomUUID(), contactId, ceoPrimaryEmail],
-    );
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    // 23505 = unique_violation: another instance won the race and already created the
-    // identity. Re-query for the winning row and treat as idempotent success.
-    // We also rescue the KG node we created above by linking it to the winner's contact
-    // if the winner ran old code and has no kg_node_id yet.
-    const pgCode = (err as { code?: string }).code;
-    const constraint = (err as { constraint?: string }).constraint;
-    // If the violation is the system_role partial unique index, a contact with
-    // system_role='principal' already exists under a different email. This is a
-    // data-integrity problem that requires manual resolution — re-querying by email
-    // would return no rows and give a misleading warning, so log clearly and rethrow.
-    if (pgCode === '23505' && constraint?.startsWith('idx_contacts_system_role_')) {
-      logger.error(
-        { constraint, email: ceoPrimaryEmail },
-        'ceo-bootstrap: another contact already holds system_role=principal — refusing to create a second principal. Inspect the contacts table and reconcile manually.',
-      );
-      throw err;
-    }
-    if (pgCode === '23505') {
-      const winner = await pool.query<{ contact_id: string; kg_node_id: string | null }>(
-        `SELECT c.id AS contact_id, c.kg_node_id
-         FROM contact_channel_identities ci
-         JOIN contacts c ON c.id = ci.contact_id
-         WHERE ci.channel = 'email' AND ci.channel_identifier = $1`,
-        [ceoPrimaryEmail],
-      );
-      if (winner.rows[0]) {
-        const winnerContactId = winner.rows[0].contact_id;
-        let winnerKgNodeId = winner.rows[0].kg_node_id;
-        if (!winnerKgNodeId) {
-          // Winner ran old code — link the orphaned KG node we already created to them.
-          await pool.query(
-            `UPDATE contacts SET kg_node_id = $1, updated_at = now() WHERE id = $2 AND kg_node_id IS NULL`,
-            [kgNodeId, winnerContactId],
-          );
-          // Re-SELECT to confirm the rescue UPDATE landed — a third concurrent process may
-          // have beaten us to it, in which case the winner's kg_node_id is theirs, not ours.
-          const recheck = await pool.query<{ kg_node_id: string | null }>(
-            `SELECT kg_node_id FROM contacts WHERE id = $1`,
-            [winnerContactId],
-          );
-          winnerKgNodeId = recheck.rows[0]?.kg_node_id ?? null;
-          if (!winnerKgNodeId) {
-            throw new Error(
-              `ceo-bootstrap: winner contact ${winnerContactId} still has no kg_node_id after rescue UPDATE — inspect contacts table`,
-            );
-          }
-        }
-        // Self-heal: the winner may be an older writer that left tier/kind at
-        // migration defaults. Repair before returning (mirrors the main path).
-        await repairPrincipalMetadata(winnerContactId, pool, logger);
-        logger.info({ contactId: winnerContactId, kgNodeId: winnerKgNodeId, email: ceoPrimaryEmail }, 'ceo-bootstrap: concurrent startup race resolved — existing CEO contact used');
-        return { contactId: winnerContactId, kgNodeId: winnerKgNodeId, alreadyExisted: true };
-      }
-      // 23505 fired but the winner re-query returned no rows — the winning contact may have
-      // been deleted between the violation and the re-query, or a different constraint fired.
-      logger.warn(
-        { pgCode, email: ceoPrimaryEmail },
-        'ceo-bootstrap: 23505 unique violation but winner re-query returned no rows — re-throwing',
-      );
-    }
-    throw err;
-  } finally {
-    client.release();
-  }
-
-  logger.info({ contactId, kgNodeId, email: ceoPrimaryEmail }, 'ceo-bootstrap: CEO contact created with KG person node');
-  return { contactId, kgNodeId, alreadyExisted: false };
-}
-
-/**
- * Upsert a KG person node for the CEO and return its id.
+ * Upsert a KG person node for the principal and return its id.
  * Uses decay_class='permanent' and confidence=1.0 to match the agent identity pattern —
  * bootstrap nodes are never decayed by the DreamEngine.
  *
- * Uses ON CONFLICT on the idx_kg_nodes_unique index (migration 016) rather than a blind
- * INSERT, because a person node with the same label may already exist — either from a
- * concurrent startup or from email-based contact extraction that ran before bootstrap.
- * Without this, a blind INSERT would 23505 outside the contact-identity recovery block
- * and propagate as an unhandled error.
+ * Adopt-or-mint, the ADR-040 rule applied to the principal. A person node with the same
+ * label may already exist — from a concurrent startup, or from email-based contact
+ * extraction that ran before bootstrap — and the principal should inherit it rather than
+ * start empty beside it.
+ *
+ * Step 1 promotes an existing *unanchored* node to the principal's identity. It also
+ * pins decay_class='permanent' and confidence 1.0: extraction creates person nodes at the
+ * default slow_decay, which used to make them eligible for DreamEngine archival once
+ * confidence decayed. ADR-040's anchoring now covers that on its own, but the explicit
+ * values are kept so the repair still holds for anyone reading decay_class directly.
+ * GREATEST ensures we never *demote* a node that already has a higher confidence value.
+ * `source` is intentionally not updated: preserving the original creator (e.g.
+ * 'extraction') keeps the audit trail honest. (Issue #1004)
+ *
+ * At most one row can match step 1 — idx_kg_nodes_unique still guarantees one label-tier
+ * person node per label — and the identity_source predicate makes it a compare-and-set,
+ * so two concurrent boots cannot both adopt.
+ *
+ * Clearing warned_at mirrors anchorNode() and migration 085: DreamEngine may have warned
+ * the extraction node before we adopted it, and nothing clears an anchored node's warning
+ * afterwards (the decay passes, listDecayWarnings and dismissDecayWarning all skip the
+ * anchored tier now), so it would sit warned forever.
+ *
+ * Step 2 mints a fresh anchored node. It needs no ON CONFLICT: anchored nodes are outside
+ * idx_kg_nodes_unique, so the INSERT cannot raise 23505 on the label. The cost is that
+ * two concurrent boots can each mint one; both call sites resolve that by keeping the
+ * node the winning contact actually points at and deleting the unreferenced loser.
+ *
+ * Returns `created` alongside the id so callers can tell an ADOPTED node — which may
+ * already carry facts and edges from extraction — apart from one this call minted. Only
+ * the latter is safe to delete on a lost race; deleting the former destroys pre-existing
+ * knowledge that was never ours to remove.
  *
  * Exported so ensure-principal.ts can reuse the exact same node-creation semantics
  * for the wizard's no-channel principal-creation path.
  */
-export async function insertKgPersonNode(displayName: string, pool: DbPool): Promise<string> {
-  const result = await pool.query<{ id: string }>(
-    `INSERT INTO kg_nodes (type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at)
-     VALUES ('person', $1, '{}', 1.0, 'permanent', 'bootstrap', now(), now())
-     ON CONFLICT (lower(label), type) WHERE type != 'fact' AND archived_at IS NULL
-     DO UPDATE SET last_confirmed_at = now()
+export async function insertKgPersonNode(
+  displayName: string,
+  pool: DbPool,
+): Promise<{ id: string; created: boolean }> {
+  const adopted = await pool.query<{ id: string }>(
+    `UPDATE kg_nodes
+        SET identity_source   = 'contact',
+            last_confirmed_at = now(),
+            decay_class       = 'permanent',
+            confidence        = GREATEST(confidence, 1.0),
+            warned_at         = NULL,
+            warn_reason       = NULL
+      WHERE type = 'person'
+        AND lower(label) = lower($1)
+        AND archived_at IS NULL
+        AND identity_source = 'label'
+      RETURNING id`,
+    [displayName],
+  );
+  const adoptedId = adopted.rows[0]?.id;
+  if (adoptedId) return { id: adoptedId, created: false };
+
+  const created = await pool.query<{ id: string }>(
+    `INSERT INTO kg_nodes (type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, identity_source)
+     VALUES ('person', $1, '{}', 1.0, 'permanent', 'bootstrap', now(), now(), 'contact')
      RETURNING id`,
     [displayName],
   );
-  const id = result.rows[0]?.id;
+  const id = created.rows[0]?.id;
   if (!id) {
-    throw new Error('ceo-bootstrap: INSERT INTO kg_nodes returned no rows or no id — check migrations 004 and 016 were applied');
+    throw new Error('ceo-bootstrap: INSERT INTO kg_nodes returned no rows or no id — check migrations 004, 016 and 085 were applied');
   }
-  return id;
+  return { id, created: true };
 }
 
 /**
@@ -298,7 +139,7 @@ export async function insertKgPersonNode(displayName: string, pool: DbPool): Pro
  * Exported so ensure-principal.ts can reuse the same backfill semantics.
  */
 export async function createAndLinkKgNode(contactId: string, displayName: string, pool: DbPool): Promise<string> {
-  const newKgNodeId = await insertKgPersonNode(displayName, pool);
+  const { id: newKgNodeId, created } = await insertKgPersonNode(displayName, pool);
   await pool.query(
     `UPDATE contacts SET kg_node_id = $1, updated_at = now() WHERE id = $2 AND kg_node_id IS NULL`,
     [newKgNodeId, contactId],
@@ -309,8 +150,27 @@ export async function createAndLinkKgNode(contactId: string, displayName: string
     `SELECT kg_node_id FROM contacts WHERE id = $1`,
     [contactId],
   );
-  if (!result.rows[0]?.kg_node_id) {
+  const linkedKgNodeId = result.rows[0]?.kg_node_id;
+  if (!linkedKgNodeId) {
     throw new Error(`ceo-bootstrap: contact ${contactId} still has no kg_node_id after UPDATE — possible concurrent conflict`);
   }
-  return result.rows[0].kg_node_id;
+  // Loser-path cleanup: under ADR-040 insertKgPersonNode mints anchored nodes, which no
+  // longer collide on the label, so a lost race leaves OUR node unreferenced rather than
+  // resolving to the same row. Mirrors ensure-principal.ts — the NOT EXISTS guard keeps
+  // the delete safe if a further concurrent writer claimed it in the meantime.
+  //
+  // Gated on `created`. An ADOPTED node predates this call and may carry extraction facts
+  // and edges that would go with it (kg_edges cascades on node delete); losing a link race
+  // is no licence to destroy them. Such a node is left anchored but unreferenced — a
+  // harmless orphan, and deliberately not reverted to the label tier, since another node
+  // may have taken that label in the meantime and the revert would raise 23505 here.
+  if (created && linkedKgNodeId !== newKgNodeId) {
+    await pool.query(
+      `DELETE FROM kg_nodes
+        WHERE id = $1
+          AND NOT EXISTS (SELECT 1 FROM contacts WHERE kg_node_id = $1)`,
+      [newKgNodeId],
+    );
+  }
+  return linkedKgNodeId;
 }

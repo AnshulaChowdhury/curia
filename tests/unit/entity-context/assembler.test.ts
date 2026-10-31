@@ -5,7 +5,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import pino from 'pino';
-import { EntityContextAssembler } from '../../../src/entity-context/assembler.js';
+import { EntityContextAssembler, isRetryableAssemblyError } from '../../../src/entity-context/assembler.js';
 import type { DbPool } from '../../../src/db/connection.js';
 
 const logger = pino({ level: 'silent' });
@@ -23,18 +23,22 @@ function makeMockPool(): DbPool {
 }
 
 // Helper: build a pool mock that responds to queries in order.
-// Each call to pool.query() returns the next response in the queue.
-function makeSequentialPool(responses: Array<{ rows: unknown[] }>): DbPool {
+// Each call to pool.query() returns the next response in the queue, or rejects
+// when the step is `{ reject: Error }`.
+type SequentialPoolStep = { rows: unknown[] } | { reject: Error };
+
+function makeSequentialPool(steps: SequentialPoolStep[]): DbPool {
   const pool = makeMockPool();
   let callIndex = 0;
   vi.mocked(pool.query).mockImplementation(() => {
-    const res = responses[callIndex++];
-    if (!res) {
-      // Throw so tests fail fast when the assembler issues more queries than expected.
-      // A silent empty-rows fallback would mask regressions where extra DB calls are added.
+    const step = steps[callIndex++];
+    if (!step) {
       throw new Error(`Unexpected query call #${callIndex} — add a response to makeSequentialPool`);
     }
-    return Promise.resolve(res as ReturnType<DbPool['query']>);
+    if ('reject' in step) {
+      return Promise.reject(step.reject);
+    }
+    return Promise.resolve({ rows: step.rows } as unknown as ReturnType<DbPool['query']>);
   });
   return pool;
 }
@@ -219,10 +223,262 @@ describe('EntityContextAssembler', () => {
       ]);
 
       const assembler = new EntityContextAssembler(pool, logger);
-      const { entities, unresolved } = await assembler.assembleMany(['ghost-id']);
+      const { entities, unresolved, nodeless } = await assembler.assembleMany(['ghost-id']);
 
       expect(entities).toHaveLength(0);
       expect(unresolved).toEqual(['ghost-id']);
+      // An ID we have never heard of is *unknown*, not nodeless — the two buckets
+      // answer different questions and must not be conflated (#1694).
+      expect(nodeless).toHaveLength(0);
+    });
+  });
+
+  // -- Nodeless contacts (#1694 / ADR-040) --
+  //
+  // A contact with kg_node_id = NULL exists but cannot hold facts, relationships,
+  // or context. Before this bucket existed it landed in `unresolved` alongside IDs
+  // that match nothing at all, so a caller could not tell "we have never heard of
+  // this person" from "this person is structurally unable to hold knowledge".
+  describe('assembleMany — nodeless contacts', () => {
+    it('reports a contact with no KG node as nodeless, not unresolved', async () => {
+      const pool = makeSequentialPool([
+        { rows: [{ kg_node_id: null, display_name: 'Seth Berman' }] },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const { entities, unresolved, nodeless } = await assembler.assembleMany(['contact-2']);
+
+      expect(entities).toHaveLength(0);
+      expect(unresolved).toHaveLength(0);
+      expect(nodeless).toEqual([
+        { inputId: 'contact-2', contactId: 'contact-2', displayName: 'Seth Berman', cause: 'missing' },
+      ]);
+    });
+
+    it('reports an email that resolves to a nodeless contact as nodeless', async () => {
+      const pool = makeSequentialPool([
+        { rows: [{ contact_id: 'contact-2', kg_node_id: null, display_name: 'Seth Berman' }] },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const { entities, unresolved, nodeless } = await assembler.assembleMany(['seth@example.com']);
+
+      expect(entities).toHaveLength(0);
+      expect(unresolved).toHaveLength(0);
+      // inputId keeps the caller's original string so it can correlate the result
+      // back to what it asked for; contactId is what the row actually resolved to.
+      expect(nodeless).toEqual([
+        { inputId: 'seth@example.com', contactId: 'contact-2', displayName: 'Seth Berman', cause: 'missing' },
+      ]);
+    });
+
+    it('separates resolved, nodeless, and unknown IDs in one batch', async () => {
+      const pool = makeSequentialPool([
+        // 'contact-1' — resolves fully
+        { rows: [{ kg_node_id: 'node-1', display_name: 'Jenna Smith' }] },
+        { rows: [personNodeRow] },
+        { rows: [] },                // facts
+        { rows: [contactRow] },
+        { rows: [] },                // calendars
+        { rows: [] },                // relationships
+        // 'contact-2' — exists, no KG node
+        { rows: [{ kg_node_id: null, display_name: 'Seth Berman' }] },
+        // 'ghost-id' — matches nothing
+        { rows: [] },                // not a contact
+        { rows: [] },                // not a KG node
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const { entities, unresolved, nodeless } = await assembler.assembleMany([
+        'contact-1',
+        'contact-2',
+        'ghost-id',
+      ]);
+
+      expect(entities).toHaveLength(1);
+      expect(entities[0].entityId).toBe('node-1');
+      expect(unresolved).toEqual(['ghost-id']);
+      expect(nodeless.map(n => n.contactId)).toEqual(['contact-2']);
+    });
+
+    it('leaves assembleOne returning undefined for a nodeless contact', async () => {
+      // assembleOne's signature is deliberately unchanged — the classification is
+      // only surfaced through assembleMany, which is what every caller uses.
+      const pool = makeSequentialPool([
+        { rows: [{ kg_node_id: null, display_name: 'Seth Berman' }] },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      expect(await assembler.assembleOne('contact-2')).toBeUndefined();
+    });
+
+    it('does not cache nodeless results', async () => {
+      // Caching a nodeless verdict would keep a contact context-free for the whole
+      // TTL after a backfill or merge gave it a node.
+      const pool = makeSequentialPool([
+        { rows: [{ kg_node_id: null, display_name: 'Seth Berman' }] },
+        { rows: [{ kg_node_id: null, display_name: 'Seth Berman' }] },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      await assembler.assembleMany(['contact-2']);
+      await assembler.assembleMany(['contact-2']);
+
+      expect(vi.mocked(pool.query)).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // -- Archived nodes (#1707) --
+  //
+  // DreamEngine (and, once ADR-040 increment 3 lands, contact deletion) retires
+  // knowledge by setting archived_at. The write path has always respected that;
+  // the entity-context read path did not, so retired facts still assembled.
+  describe('assembleMany — archived nodes', () => {
+    function querySql(pool: DbPool): string[] {
+      return vi.mocked(pool.query).mock.calls.map(call => String(call[0]));
+    }
+
+    it('reports a contact whose KG node is archived as nodeless, not assembled', async () => {
+      const pool = makeSequentialPool([
+        { rows: [{ kg_node_id: 'node-retired', display_name: 'Retired Person', node_archived: true }] },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const { entities, unresolved, nodeless } = await assembler.assembleMany(['contact-retired']);
+
+      expect(entities).toHaveLength(0);
+      expect(unresolved).toHaveLength(0);
+      expect(nodeless).toEqual([
+        {
+          inputId: 'contact-retired',
+          contactId: 'contact-retired',
+          displayName: 'Retired Person',
+          cause: 'archived',
+        },
+      ]);
+    });
+
+    it('reports an email that resolves to an archived-node contact as nodeless', async () => {
+      const pool = makeSequentialPool([
+        {
+          rows: [{
+            contact_id: 'contact-retired',
+            kg_node_id: 'node-retired',
+            display_name: 'Retired Person',
+            node_archived: true,
+          }],
+        },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const { entities, unresolved, nodeless } = await assembler.assembleMany(['retired@example.com']);
+
+      expect(entities).toHaveLength(0);
+      expect(unresolved).toHaveLength(0);
+      expect(nodeless).toEqual([
+        {
+          inputId: 'retired@example.com',
+          contactId: 'contact-retired',
+          displayName: 'Retired Person',
+          cause: 'archived',
+        },
+      ]);
+    });
+
+    it('reports a direct lookup of an archived node ID as nodeless when a contact owns it', async () => {
+      // Agents reuse entities[].entityId across turns. An archived node reached
+      // that way must not read as "genuinely unknown" (#1694 / #1707).
+      const pool = makeSequentialPool([
+        { rows: [] }, // not a contact UUID
+        { rows: [{ id: 'node-retired', archived: true }] },
+        { rows: [{ id: 'contact-retired', display_name: 'Retired Person' }] },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const { entities, unresolved, nodeless } = await assembler.assembleMany(['node-retired']);
+
+      expect(entities).toHaveLength(0);
+      expect(unresolved).toHaveLength(0);
+      expect(nodeless).toEqual([
+        {
+          inputId: 'node-retired',
+          contactId: 'contact-retired',
+          displayName: 'Retired Person',
+          cause: 'archived',
+        },
+      ]);
+    });
+
+    it('treats a direct lookup of an unanchored archived node as unresolved', async () => {
+      const pool = makeSequentialPool([
+        { rows: [] }, // not a contact UUID
+        { rows: [{ id: 'node-retired', archived: true }] },
+        { rows: [] }, // no owning contact
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const { entities, unresolved, nodeless } = await assembler.assembleMany(['node-retired']);
+
+      expect(entities).toHaveLength(0);
+      expect(nodeless).toHaveLength(0);
+      expect(unresolved).toEqual(['node-retired']);
+    });
+
+    it('does not cache archived-node nodeless results', async () => {
+      const pool = makeSequentialPool([
+        { rows: [{ kg_node_id: 'node-retired', display_name: 'Retired Person', node_archived: true }] },
+        { rows: [{ kg_node_id: 'node-retired', display_name: 'Retired Person', node_archived: true }] },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      await assembler.assembleMany(['contact-retired']);
+      await assembler.assembleMany(['contact-retired']);
+
+      expect(vi.mocked(pool.query)).toHaveBeenCalledTimes(2);
+    });
+
+    it('excludes archived entity nodes, facts, and relationship endpoints from the read SQL', async () => {
+      // Three cases in one assembly of a live contact:
+      //   1. getKgNode must not return an archived entity node
+      //   2. getFacts must not return an archived fact hanging off a live node
+      //   3. getRelationships must not return an edge whose other end is archived
+      // The mock pool does not execute SQL, so the assertions are on the predicates
+      // both UNION halves send to Postgres.
+      const pool = makeSequentialPool([
+        { rows: [{ kg_node_id: 'node-1', display_name: 'Jenna Smith' }] },
+        { rows: [personNodeRow] },
+        { rows: [timezoneFactRow] },
+        { rows: [contactRow] },
+        { rows: [calendarRow] },
+        { rows: [relationshipRow] },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const ctx = await assembler.assembleOne('contact-1');
+      expect(ctx).toBeDefined();
+
+      const sql = querySql(pool);
+
+      const nodeLookup = sql.find(s => s.includes('SELECT id, type, label, properties'));
+      expect(nodeLookup, 'getKgNode query').toMatch(/archived_at IS NULL/);
+
+      const facts = sql.find(s => s.includes("e.type = 'relates_to'"));
+      expect(facts, 'getFacts query').toBeDefined();
+      const factHalves = facts!.split(/UNION ALL/i);
+      expect(factHalves).toHaveLength(2);
+      for (const half of factHalves) {
+        expect(half).toMatch(/e\.archived_at IS NULL/);
+        expect(half).toMatch(/n\.archived_at IS NULL/);
+      }
+
+      const rels = sql.find(s => s.includes("n.type != 'fact'"));
+      expect(rels, 'getRelationships query').toBeDefined();
+      const relHalves = rels!.split(/UNION ALL/i);
+      expect(relHalves).toHaveLength(2);
+      for (const half of relHalves) {
+        expect(half).toMatch(/e\.archived_at IS NULL/);
+        expect(half).toMatch(/n\.archived_at IS NULL/);
+      }
     });
   });
 
@@ -230,7 +486,7 @@ describe('EntityContextAssembler', () => {
     // Cache is keyed by the input ID in assembleMany. Direct assembleOne()
     // calls bypass the cache — the cache only applies when going through assembleMany().
 
-    it('returns cached result on second assembleMany call without hitting DB again', async () => {
+    it('returns cached result on second assembleMany call after confirming the node is still live', async () => {
       const pool = makeSequentialPool([
         { rows: [{ kg_node_id: 'node-1' }] },
         { rows: [personNodeRow] },
@@ -238,17 +494,46 @@ describe('EntityContextAssembler', () => {
         { rows: [contactRow] },
         { rows: [] },
         { rows: [] },
+        { rows: [{ id: 'node-1' }] }, // isLiveKgNode
       ]);
 
       const assembler = new EntityContextAssembler(pool, logger);
 
-      // First call — hits DB
       await assembler.assembleMany(['contact-1']);
       const callsAfterFirst = vi.mocked(pool.query).mock.calls.length;
 
-      // Second call — should hit cache, no additional DB queries
       await assembler.assembleMany(['contact-1']);
-      expect(vi.mocked(pool.query).mock.calls.length).toBe(callsAfterFirst);
+      // One indexed live-check; the assembly queries must not re-run.
+      expect(vi.mocked(pool.query).mock.calls.length).toBe(callsAfterFirst + 1);
+      expect(String(vi.mocked(pool.query).mock.calls[callsAfterFirst]![0])).toMatch(/archived_at IS NULL/);
+    });
+
+    it('does not serve a cached payload after the entity node is archived', async () => {
+      const pool = makeSequentialPool([
+        { rows: [{ kg_node_id: 'node-1', display_name: 'Jenna Smith' }] },
+        { rows: [personNodeRow] },
+        { rows: [] },
+        { rows: [contactRow] },
+        { rows: [] },
+        { rows: [] },
+        { rows: [] }, // isLiveKgNode: archived
+        { rows: [{ kg_node_id: 'node-1', display_name: 'Jenna Smith', node_archived: true }] },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const first = await assembler.assembleMany(['contact-1']);
+      expect(first.entities).toHaveLength(1);
+
+      const second = await assembler.assembleMany(['contact-1']);
+      expect(second.entities).toHaveLength(0);
+      expect(second.nodeless).toEqual([
+        {
+          inputId: 'contact-1',
+          contactId: 'contact-1',
+          displayName: 'Jenna Smith',
+          cause: 'archived',
+        },
+      ]);
     });
 
     it('clears cache for entity on clearCacheForEntity()', async () => {
@@ -404,7 +689,7 @@ describe('EntityContextAssembler', () => {
     it('assembleMany resolves a mix of email addresses and contact UUIDs', async () => {
       // putInCache stores under all aliases: inputId ('jenna@example.com'),
       // entityId ('node-1'), and contactId ('contact-1'). So the second
-      // lookup for 'contact-1' is a cache hit — no extra DB queries needed.
+      // lookup for 'contact-1' is a cache hit — one live-check, no re-assembly.
       const pool = makeSequentialPool([
         // First ID: email address — full resolution + assembly
         { rows: [channelIdentityRow] },    // email resolution
@@ -413,7 +698,7 @@ describe('EntityContextAssembler', () => {
         { rows: [contactRow] },             // getContactByKgNodeId
         { rows: [] },                       // getConnectedAccounts
         { rows: [] },                       // getRelationships
-        // Second ID 'contact-1': cache hit, no DB queries
+        { rows: [{ id: 'node-1' }] },       // isLiveKgNode for cached 'contact-1'
       ]);
 
       const assembler = new EntityContextAssembler(pool, logger);
@@ -463,14 +748,90 @@ describe('EntityContextAssembler', () => {
       await expect(assembler.assembleOne('jenna@example.com')).rejects.toThrow('Connection reset by peer');
     });
 
-    it('treats email DB errors as unresolved in assembleMany', async () => {
+    it('treats email DB errors as failed in assembleMany, not unresolved', async () => {
       const pool = makeMockPool();
       vi.mocked(pool.query).mockRejectedValueOnce(new Error('pool timeout'));
 
       const assembler = new EntityContextAssembler(pool, logger);
-      const { entities, unresolved } = await assembler.assembleMany(['jenna@example.com']);
+      const { entities, unresolved, failed } = await assembler.assembleMany(['jenna@example.com']);
       expect(entities).toHaveLength(0);
-      expect(unresolved).toEqual(['jenna@example.com']);
+      expect(unresolved).toHaveLength(0);
+      expect(failed).toEqual([
+        { inputId: 'jenna@example.com', retryable: true },
+      ]);
+    });
+
+    it('classifies permanent schema errors as non-retryable', async () => {
+      const pool = makeMockPool();
+      vi.mocked(pool.query).mockRejectedValueOnce(
+        Object.assign(new Error('column does not exist'), { code: '42703' }),
+      );
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const { failed } = await assembler.assembleMany(['contact-1']);
+      expect(failed).toEqual([{ inputId: 'contact-1', retryable: false }]);
+    });
+
+    it('returns partial entities plus failed when a mid-batch DB error occurs', async () => {
+      const pool = makeSequentialPool([
+        { rows: [{ kg_node_id: 'node-1' }] },
+        { rows: [personNodeRow] },
+        { rows: [] },
+        { rows: [contactRow] },
+        { rows: [] },
+        { rows: [] },
+        { reject: Object.assign(new Error('too many connections'), { code: '53300' }) },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const { entities, unresolved, failed } = await assembler.assembleMany(['contact-1', 'contact-2']);
+
+      expect(entities).toHaveLength(1);
+      expect(entities[0]!.entityId).toBe('node-1');
+      expect(unresolved).toHaveLength(0);
+      expect(failed).toEqual([{ inputId: 'contact-2', retryable: true }]);
+    });
+  });
+
+  describe('isRetryableAssemblyError', () => {
+    it('treats connection-limit and schema errors differently', () => {
+      expect(isRetryableAssemblyError(Object.assign(new Error('limit'), { code: '53300' }))).toBe(true);
+      expect(isRetryableAssemblyError(Object.assign(new Error('missing col'), { code: '42703' }))).toBe(false);
+      expect(isRetryableAssemblyError(new TypeError('cannot read property'))).toBe(false);
+    });
+  });
+
+  describe('assembleMany — all four buckets', () => {
+    it('places each ID in exactly one bucket in a mixed batch', async () => {
+      const pool = makeSequentialPool([
+        // contact-1 — resolves fully
+        { rows: [{ kg_node_id: 'node-1', display_name: 'Jenna Smith' }] },
+        { rows: [personNodeRow] },
+        { rows: [] },
+        { rows: [contactRow] },
+        { rows: [] },
+        { rows: [] },
+        // contact-2 — nodeless
+        { rows: [{ kg_node_id: null, display_name: 'Seth Berman' }] },
+        // ghost-id — unknown
+        { rows: [] },
+        { rows: [] },
+        // contact-3 — DB error
+        { reject: Object.assign(new Error('too many connections'), { code: '53300' }) },
+      ]);
+
+      const assembler = new EntityContextAssembler(pool, logger);
+      const { entities, unresolved, nodeless, failed } = await assembler.assembleMany([
+        'contact-1',
+        'contact-2',
+        'ghost-id',
+        'contact-3',
+      ]);
+
+      expect(entities).toHaveLength(1);
+      expect(nodeless.map(n => n.contactId)).toEqual(['contact-2']);
+      expect(unresolved).toEqual(['ghost-id']);
+      expect(failed).toEqual([{ inputId: 'contact-3', retryable: true }]);
     });
   });
 });

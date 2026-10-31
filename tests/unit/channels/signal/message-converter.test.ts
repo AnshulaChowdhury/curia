@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { convertSignalEnvelope } from '../../../../src/channels/signal/message-converter.js';
+import {
+  convertSignalEnvelope,
+  convertSignalReaction,
+} from '../../../../src/channels/signal/message-converter.js';
 import type { SignalEnvelope } from '../../../../src/channels/signal/types.js';
 
 // ---------------------------------------------------------------------------
@@ -40,6 +43,7 @@ describe('convertSignalEnvelope', () => {
     expect(result!.metadata.groupId).toBeUndefined();
     expect(result!.metadata.signalTimestamp).toBe(1700000000000);
     expect(result!.metadata.sourceName).toBe('Alice');
+    expect(result!.metadata.sourceUuid).toBe('uuid-123');
   });
 
   it('converts a group text message', () => {
@@ -109,7 +113,7 @@ describe('convertSignalEnvelope', () => {
     expect(result).toBeNull();
   });
 
-  it('returns null for a reaction', () => {
+  it('returns null for a reaction (handled by convertSignalReaction)', () => {
     const result = convertSignalEnvelope(makeEnvelope({
       dataMessage: {
         timestamp: 1700000000000,
@@ -166,6 +170,26 @@ describe('convertSignalEnvelope', () => {
       },
     }));
     expect(result).toBeNull();
+  });
+
+  it('converts an audio-only voice note with empty text', () => {
+    const result = convertSignalEnvelope(makeEnvelope({
+      dataMessage: {
+        timestamp: 1700000000000,
+        message: null,
+        expiresInSeconds: 0,
+        viewOnce: false,
+        attachments: [{
+          id: 'att-voice',
+          contentType: 'audio/ogg',
+          size: 12,
+          isVoiceNote: true,
+        }],
+      },
+    }));
+    expect(result).not.toBeNull();
+    expect(result!.content).toBe('');
+    expect(result!.metadata.attachments).toHaveLength(1);
   });
 
   it('returns null for a group UPDATE event (management, not a message)', () => {
@@ -227,5 +251,123 @@ describe('convertSignalEnvelope', () => {
   it('uses the E.164 number directly for 1:1 conversation IDs', () => {
     const result = convertSignalEnvelope(makeEnvelope({ sourceNumber: '+14155559999' }));
     expect(result!.conversationId).toBe('signal:+14155559999');
+  });
+
+  it('falls back to sourceUuid for ACI-only 1:1 senders', () => {
+    const result = convertSignalEnvelope(makeEnvelope({
+      source: '',
+      sourceNumber: '',
+      sourceUuid: 'aci-uuid-1',
+    }));
+    expect(result).not.toBeNull();
+    expect(result!.senderId).toBe('aci-uuid-1');
+    expect(result!.conversationId).toBe('signal:aci-uuid-1');
+  });
+
+  it('uses sourceUuid as senderId for ACI-only group messages', () => {
+    const result = convertSignalEnvelope(makeEnvelope({
+      source: '',
+      sourceNumber: '',
+      sourceUuid: 'aci-uuid-1',
+      dataMessage: {
+        timestamp: 1700000000000,
+        message: 'Team meeting at 3pm',
+        expiresInSeconds: 0,
+        viewOnce: false,
+        groupInfo: { groupId: 'abc123==', type: 'DELIVER' },
+      },
+    }));
+    expect(result).not.toBeNull();
+    expect(result!.senderId).toBe('aci-uuid-1');
+    expect(result!.conversationId).toBe('signal:group=abc123==');
+  });
+
+  it('returns null when both sourceNumber and sourceUuid are empty', () => {
+    expect(convertSignalEnvelope(makeEnvelope({
+      source: '',
+      sourceNumber: '',
+      sourceUuid: '',
+    }))).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reactions → inbound.reaction shape (#1479)
+// ---------------------------------------------------------------------------
+
+describe('convertSignalReaction', () => {
+  it('normalizes a reaction without mapping intent', () => {
+    const result = convertSignalReaction(makeEnvelope({
+      dataMessage: {
+        timestamp: 1700000000000,
+        message: null,
+        expiresInSeconds: 0,
+        viewOnce: false,
+        reaction: {
+          emoji: '👍',
+          targetAuthor: '+14155559999',
+          targetTimestamp: 1699999999999,
+          isRemove: false,
+        },
+      },
+    }));
+
+    expect(result).toEqual({
+      conversationId: 'signal:+14155551234',
+      channelId: 'signal',
+      senderId: '+14155551234',
+      emoji: '👍',
+      targetMessageId: '1699999999999',
+      metadata: {
+        sourceName: 'Alice',
+        targetAuthor: '+14155559999',
+        isRemove: false,
+        signalTimestamp: 1700000000000,
+      },
+    });
+  });
+
+  it('carries isRemove: true for un-reacts', () => {
+    const result = convertSignalReaction(makeEnvelope({
+      dataMessage: {
+        timestamp: 1700000000000,
+        message: null,
+        expiresInSeconds: 0,
+        viewOnce: false,
+        reaction: {
+          emoji: '👍',
+          targetAuthor: '+14155559999',
+          targetTimestamp: 1699999999999,
+          isRemove: true,
+        },
+      },
+    }));
+    expect(result?.metadata.isRemove).toBe(true);
+  });
+
+  it('returns null for non-reaction envelopes', () => {
+    expect(convertSignalReaction(makeEnvelope())).toBeNull();
+  });
+
+  it('falls back to sourceUuid for ACI-only reactors', () => {
+    const result = convertSignalReaction(makeEnvelope({
+      source: '',
+      sourceNumber: '',
+      sourceUuid: 'aci-uuid-1',
+      dataMessage: {
+        timestamp: 1700000000000,
+        message: null,
+        expiresInSeconds: 0,
+        viewOnce: false,
+        reaction: {
+          emoji: '👍',
+          targetAuthor: '+14155559999',
+          targetTimestamp: 1699999999999,
+          isRemove: false,
+        },
+      },
+    }));
+    expect(result?.senderId).toBe('aci-uuid-1');
+    expect(result?.conversationId).toBe('signal:aci-uuid-1');
   });
 });

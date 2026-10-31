@@ -1,6 +1,6 @@
 // src/scheduler/suspension-notifier.ts
 //
-// SuspensionNotifier — system-layer bus subscriber that emails the CEO whenever
+// SuspensionNotifier — system-layer bus subscriber that emails the principal whenever
 // a scheduled job is auto-suspended after 3 consecutive failures.
 //
 // Design constraint: this path MUST NOT touch the LLM pipeline. The most
@@ -14,12 +14,24 @@ import type { Logger } from '../logger.js';
 import type { OutboundGateway } from '../skills/outbound-gateway.js';
 import type { ScheduleSuspendedEvent, BusEvent } from '../bus/events.js';
 import { classifyError } from '../errors/classify.js';
+import type { SchedulerService } from './scheduler-service.js';
+import {
+  loadJobNotificationContext,
+} from './job-notification-context.js';
+import {
+  resolvePrincipalEmail,
+  type PrincipalEmailRef,
+} from '../contacts/types.js';
 
 export interface SuspensionNotifierConfig {
   bus: EventBus;
   outboundGateway: OutboundGateway;
-  ceoEmail: string;
+  schedulerService: SchedulerService;
+  /** Plain string (tests) or live ref so post-boot email binds hot-reload (#1514). */
+  ceoEmail: string | PrincipalEmailRef;
   logger: Logger;
+  appOrigin?: string;
+  httpPort: number;
 }
 
 export class SuspensionNotifier {
@@ -49,25 +61,45 @@ export class SuspensionNotifier {
   private async handle(event: ScheduleSuspendedEvent): Promise<void> {
     const { jobId, agentId, lastError, consecutiveFailures } = event.payload;
 
+    const jobContext = await loadJobNotificationContext(
+      this.config.schedulerService,
+      this.config.appOrigin,
+      this.config.httpPort,
+      jobId,
+      this.log,
+      'suspension-notifier',
+    );
+
     const subject = `Scheduled job suspended: ${agentId}`;
     const body = [
       'Scheduled job suspended.',
       '',
-      `Agent:    ${agentId}`,
-      `Failures: ${consecutiveFailures}`,
-      `Error:    ${lastError}`,
+      `Agent:      ${agentId}`,
+      `Objective:  ${jobContext.objective}`,
+      `Recurrence: ${jobContext.recurrence}`,
+      `Failures:   ${consecutiveFailures}`,
+      `Error:      ${lastError}`,
       '',
-      `Job ID: ${jobId}`,
+      `View job: ${jobContext.consoleUrl}`,
       '',
-      'To resume this job, open the web app and navigate to Scheduler → Jobs.',
+      'To resume this job, open the link above and click Resume.',
     ].join('\n');
+
+    const ceoEmail = resolvePrincipalEmail(this.config.ceoEmail);
+    if (!ceoEmail) {
+      this.log.warn(
+        { jobId, agentId },
+        'SuspensionNotifier: principal email not bound yet — skipping notification',
+      );
+      return;
+    }
 
     // sendNotification() catches its own errors and returns false on failure —
     // it does not throw. We log at error if it returns false so the anomaly is
     // visible in alerting.
     const sent = await this.config.outboundGateway.sendNotification({
       notificationType: 'schedule_suspended',
-      ceoEmail: this.config.ceoEmail,
+      ceoEmail,
       subject,
       body,
     });

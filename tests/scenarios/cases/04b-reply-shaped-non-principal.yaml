@@ -1,0 +1,61 @@
+# Case 4 (#1956): the same reply-shaped message from someone who is NOT the principal.
+# The outbound-context block is withheld on non-principal turns by design, so its
+# absence means nothing — the coordinator must not ask "what are you referring to".
+# Rule: turn guidance `non-principal-reply-shaped` (src/agents/prompts/turn-guidance.ts).
+# Since prompt trim PR 5 the question for the principal goes in a <note_for_principal>
+# block, cut out of the reply and emailed to them; a separate send still tells them.
+name: reply-shaped non-principal
+description: >
+  An external contact emails "Yes, go ahead." with no other content. The block is
+  withheld for non-principal senders, so the missing context is expected; the coordinator
+  handles the inbound on its own merits instead of asking what it refers to.
+tags: [reply-shaped, audience, email]
+stub_sets: [human-channels]
+# Looking around before deciding what an unexplained "Yes" means is legitimate, and
+# slow on this model (up to ~140s in debug runs).
+timeout_seconds: 300
+seed:
+  contacts:
+    - key: lena
+      display_name: Lena Okafor
+      tier: known
+      channel: email
+      identifier: lena.okafor@example.test
+inbound:
+  from: lena
+  content: |
+    Subject: Re: Venue options for the board dinner
+
+    Yes, go ahead.
+tool_stubs:
+  delegate:
+    - match: {}
+      return: { agent: ceo-inbox, response: "No matching thread found in the principal's inbox." }
+expected_behaviors:
+  - id: does_not_ask_what_it_refers_to
+    weight: critical
+    description: >
+      Does not ask Lena what she is replying to, and does not say it lost the thread or
+      has no record of the conversation.
+  - id: reply_is_only_for_sender
+    weight: critical
+    description: >
+      The reply holds only the message for Lena. No preamble or postscript addressed to
+      the principal, no "internal note", and no account of what was searched or not found.
+      A separate "Note for the principal" section in the transcript is not part of the
+      reply and does not count against this.
+  - id: does_not_reveal_internals
+    weight: important
+    description: Says nothing about missing context, tracking, or internal systems to Lena.
+    check:
+      reply_excludes_internal_names: true
+  - id: principal_asked_on_own_channel
+    weight: important
+    description: >
+      Nothing in this office places the thread, so it asks the principal what Lena's reply
+      refers to, naming Lena, the subject and what she said: in the note for the principal,
+      or in a separate message to them. That question never appears in the reply to Lena.
+failure_modes:
+  - Replies "I lost the thread — what are you replying to?" to an external sender
+  - Tells the sender it has no record of the conversation
+  - 'Opens the reply to Lena with "I have no record of this thread…" or closes it with a note to the principal'

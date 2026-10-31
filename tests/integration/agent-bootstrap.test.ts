@@ -22,6 +22,7 @@ import { createLogger } from '../../src/logger.js';
 const { Pool } = pg;
 
 const DATABASE_URL = process.env.DATABASE_URL;
+const VECTOR = `[${Array.from({ length: 1536 }, () => 0.1).join(',')}]`;
 const describeIf = DATABASE_URL ? describe : describe.skip;
 
 describeIf('bootstrapAgentIdentity', () => {
@@ -34,17 +35,25 @@ describeIf('bootstrapAgentIdentity', () => {
     await pool.query('SELECT 1 FROM kg_nodes LIMIT 0');
   });
 
-  afterAll(async () => {
-    await pool.end();
-  });
-
-  // Strip the singleton agent rows before each test. The partial unique indexes
+  // Strip the singleton agent rows. The partial unique indexes
   // (idx_kg_nodes_agent_singleton, idx_contacts_kg_node_unique, idx_contacts_system_role_agent)
   // mean we can only have one agent at a time, so wipe completely before each case.
-  beforeEach(async () => {
+  // afterAll repeats it: this file shares the database, and the last case's rows
+  // would otherwise block a later suite's contact-linked node deletes.
+  async function deleteAgentIdentity(): Promise<void> {
     await pool.query(`DELETE FROM contacts WHERE system_role = 'agent'`);
     await pool.query(`DELETE FROM kg_nodes WHERE (properties->>'is_agent') = 'true'`);
+  }
+
+  afterAll(async () => {
+    try {
+      await deleteAgentIdentity();
+    } finally {
+      await pool.end();
+    }
   });
+
+  beforeEach(deleteAgentIdentity);
 
   it('creates a fresh agent identity (KG node + contact) with the given display name', async () => {
     const result = await bootstrapAgentIdentity('Agent Test First', pool, logger);
@@ -109,5 +118,38 @@ describeIf('bootstrapAgentIdentity', () => {
       [first.kgNodeId],
     );
     expect(afterNode.rows[0]?.label).toBe('Agent Test New Name');
+  });
+
+  async function stampVector(kgNodeId: string): Promise<void> {
+    await pool.query(
+      `UPDATE kg_nodes SET embedding = $1::vector, embedding_model = 'test-model' WHERE id = $2`,
+      [VECTOR, kgNodeId],
+    );
+  }
+
+  async function readVector(kgNodeId: string): Promise<{ hasEmbedding: boolean; model: string | null }> {
+    const { rows } = await pool.query<{ has_embedding: boolean; embedding_model: string | null }>(
+      `SELECT embedding IS NOT NULL AS has_embedding, embedding_model FROM kg_nodes WHERE id = $1`,
+      [kgNodeId],
+    );
+    return { hasEmbedding: rows[0]!.has_embedding, model: rows[0]!.embedding_model };
+  }
+
+  it('clears the vector and its model when a restart renames the agent', async () => {
+    const first = await bootstrapAgentIdentity('Agent Test Before Rename', pool, logger);
+    await stampVector(first.kgNodeId);
+
+    await bootstrapAgentIdentity('Agent Test After Rename', pool, logger);
+
+    expect(await readVector(first.kgNodeId)).toEqual({ hasEmbedding: false, model: null });
+  });
+
+  it('keeps the vector and its model when a restart keeps the name', async () => {
+    const first = await bootstrapAgentIdentity('Agent Test Same Name', pool, logger);
+    await stampVector(first.kgNodeId);
+
+    await bootstrapAgentIdentity('Agent Test Same Name', pool, logger);
+
+    expect(await readVector(first.kgNodeId)).toEqual({ hasEmbedding: true, model: 'test-model' });
   });
 });

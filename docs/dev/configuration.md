@@ -11,6 +11,35 @@ Changes to `default.yaml` take effect on restart. Changes to `.env` also require
 
 ## `config/default.yaml` — full reference
 
+### `model_routing`
+
+Maps each capability tier to a model (ADR-014). The provider follows from the model registry.
+
+```yaml
+model_routing:
+  tiers:
+    fast:
+      model: claude-haiku-5-5
+    standard:
+      model: claude-sonnet-4-6
+      # reasoning:            # Optional (ADR-048). Unset = the model's own default.
+      #   effort: low         # none | low | medium | high | max
+    powerful:
+      model: claude-opus-4-6
+  default_tier: standard
+```
+
+`reasoning.effort` applies to agent turns on that tier; the judges, infra skills, scoring, summarization and voice set their own. Boot fails if the tier's model does not list the effort in the model registry. Each model lists these efforts:
+
+- DeepSeek V4.1 Flash takes `low`, `high` and `max`.
+- Haiku 5.5, Sonnet 5.5, Sonnet 4.6 and Opus 4.6 take `none` through `max`.
+- Opus 5.5 takes `low` through `max`, because it cannot turn thinking off.
+- Haiku 4.5 takes no effort setting.
+
+Unset means the provider's default, so Haiku 5.5 thinks adaptively at `medium`. On the Anthropic models, an effort turns on adaptive thinking with summarized display. `none` turns thinking off, on the models that accept it. On Sonnet 5.5, `none` turns off thinking before the first response. Anthropic documents short thinking between tool calls, though none appeared in 16 live requests on 2026-10-21. Curia gives a Sonnet 5.5 call with tools at `none` the 16,384-token output cap as a precaution.
+
+Boot refuses a model that cannot turn thinking off as the fast-tier model, either judge's model or, when the voice channel starts, `channels.voice.model`, and the error names the key. Opus 5.5, DeepSeek V4.1 Flash and the reasoning models with no measurement (DeepSeek V4 Pro, GLM 5.3 Flash, Qwen 3.8 Flash) are refused there (see `src/agents/llm/small-cap-models.ts`).
+
 ### `channels`
 
 Controls which channel adapters activate at startup.
@@ -18,10 +47,18 @@ Controls which channel adapters activate at startup.
 ```yaml
 channels:
   cli:
-    enabled: true   # Set to false to disable the terminal CLI entirely
+    enabled: true             # Set to false to disable the terminal CLI entirely
+  max_message_bytes: 102400   # 100KB — inbound messages larger than this are rejected before routing
+  slack:
+    allowed_channel_ids: []   # Optional allowlist of Slack channel ids (C…) for @mentions.
+                              # Empty = all channels the bot is in. DMs are never filtered by this list.
+  voice:
+    model: ""                 # Optional concrete model for voice turns. Empty = the fast tier.
+    livekit_management_url: "http://livekit:7880"  # server→LiveKit RoomService (DeleteRoom / admin).
+                              # Distinct from the browser signaling URL (wss://…) set in Settings → Channels → Voice.
 ```
 
-Signal and email are **not** controlled here — they activate based on environment variables (`SIGNAL_PHONE_NUMBER`, `NYLAS_API_KEY`, etc.). See [setup.md](setup.md) for details.
+The credential-bearing channels — **email, Signal, Slack, SMS, and Voice** — are **not** activated here. They are governed by the channel registry (install/enable lifecycle): enable them via **Settings → Channels** in the console once their credentials are in the vault. The keys above are only *tuning* knobs for channels that are already enabled. Per-channel **trust, unknown-sender policy, and threading** live in `config/channel-trust.yaml` (see [Channel trust and policy](#channel-trust-and-policy)). See [setup.md](setup.md) for enablement details.
 
 ---
 
@@ -35,10 +72,16 @@ browser:
   sweepIntervalMs: 120000 # How often the session cleanup sweep runs (ms). Default: 2 minutes.
   profileDir: ""          # Persistent profile directory. Empty → ${HOME}/.curia/browser-profile. Mount on a volume in production so logins survive restarts.
   channel: ""             # "chrome" for real Chrome (must be installed in the image), empty for the bundled Playwright Chromium.
-  locale: "en-US"         # Context locale (BCP 47), part of fingerprint hardening.
+  locale: "en-US"         # Browser locale (BCP 47), part of fingerprint hardening.
+  languages: []           # Ordered navigator.languages / Accept-Language, e.g. [en-CA, en-US, en]. Empty → [locale].
+  settleCapMs: 35000      # Longest web-browser waits for a page to finish redirecting before reading it (ms). Max 90000.
 ```
 
-Raise `sessionTtlMs` if skills that open browser sessions are timing out mid-task. Lower it to free resources faster on memory-constrained deployments. `sessionTtlMs` and `sweepIntervalMs` are validated at startup (a non-positive value is a hard failure); `profileDir`, `channel`, and `locale` must be strings.
+`settleCapMs` bounds the adaptive settle (#2244): an ordinary page is read at once, and the wait runs only while a page is blank, still changing URL, or on a sign-in handoff. Air Canada's sign-in chain takes up to ~28s. It must be a positive integer of at most 90000, so one wait stays inside the skill's 120s timeout.
+
+Raise `sessionTtlMs` if skills that open browser sessions are timing out mid-task. Lower it to free resources faster on memory-constrained deployments. `sessionTtlMs` and `sweepIntervalMs` are validated at startup (a non-positive value is a hard failure); `profileDir`, `channel`, and `locale` must be strings, and `languages` a list of language tags.
+
+`locale` and `languages` are applied natively as Chrome's `--lang` / `--accept-lang` flags and the browser's `LANG`, not Playwright emulation, so `navigator.languages` and the `Accept-Language` header carry the same full list. `locale` is always first in that list. Set them to match the principal's country and the egress IP.
 
 > **`block_ads` is not a config knob.** Ad-blocking is a per-call input on the `web-browser` skill (`block_ads`, off by default), not a global `browser.*` setting. Keep it **off** for auth / login / form-fill flows — the blocker is fingerprinted as a privacy extension and triggers bot detection.
 
@@ -60,14 +103,21 @@ You generally don't need to change this unless you're testing a different coordi
 
 ### `dispatch`
 
-Controls the conversation checkpoint pipeline — the debounced background process that runs relationship extraction and other memory tasks after conversations go quiet.
+Controls the conversation checkpoint pipeline and turn lanes.
 
 ```yaml
 dispatch:
   conversationCheckpointDebounceMs: 600000  # Default: 10 minutes
+  turnInjection:
+    enabled: true                 # Shipped value. false, or omitting the key, keeps concurrent turns.
+    maxInjectionsPerTurn: 5       # Same-contact follow-ups drained into one turn.
+    extraRoundsPerInjection: 2    # Added to that turn's round budget per drained follow-up.
+    laneWaitTimeoutMs: 1200000    # 20 minutes, then the waiter runs anyway.
 ```
 
-Lower this to run memory extraction sooner after conversations end. Raise it on slow or cost-sensitive deployments to batch more activity before triggering extraction.
+`conversationCheckpointDebounceMs` is the quiet period before relationship extraction and other memory tasks run. Lower it to extract sooner. Raise it on slow or cost-sensitive deployments to batch more activity first.
+
+`turnInjection` holds one coordinator turn per human-channel conversation and drains a same-contact follow-up into it ([ADR-053](../adr/053-turn-lanes-and-mid-turn-injection.md), [spec 02](../specs/02-agent-system.md)). The shipped config sets `enabled` true. That rests on the passing case 26 run: `deepseek/deepseek-v4.1-flash`, judge `openai/gpt-4o`, every drain at `round:1`, critical checks at 100%. Omitting `enabled`, or setting it to `false`, keeps concurrent turns and skips injection. The other three fields keep the values above when omitted. A waiter that reaches `laneWaitTimeoutMs` logs an error and runs anyway, without taking the lane.
 
 ---
 
@@ -93,6 +143,24 @@ workingMemory:
 
 ---
 
+### `documentWorkspace`
+
+Controls the agent document workspace — the OKF-serialized working-document store injected into task-management agents ([spec 20 — Agent Document Workspace](../specs/20-agent-document-workspace.md)). Two independent knobs: how long ephemeral scratch documents live, and whether completed project deliverables are distilled into the knowledge graph.
+
+```yaml
+documentWorkspace:
+  scratchTtlDays: 7          # Default /scratch inactivity TTL. Positive integer ≤ 36500.
+  kgPromotion:
+    enabled: true            # Distil a completed plan's deliverable into the KG.
+    maxFacts: 50             # Per-project cap on promoted facts.
+    maxRelationships: 50     # Per-project cap on promoted relationships.
+```
+
+- **`scratchTtlDays`** — days of inactivity (measured from a document's `updated_at`) before the nightly DreamEngine pass purges a `/scratch/<conversation-id>/…` document. `/projects/…` documents are durable and never auto-purged. A per-document `ttl_days` in frontmatter overrides this (`0` opts out; `1`–`36500` sets an explicit window). Validated at startup as a positive integer ≤ 36500.
+- **`kgPromotion.enabled`** — when a planned parent completes, distil its curated deliverable into the knowledge graph through the `extract-*` gates ([spec 19 — Tasks, Backlog & Resumable Projects](../specs/19-tasks-and-backlog.md) §15). Set `false` to disable globally. `maxFacts` / `maxRelationships` cap how much a single project can promote (non-negative integers).
+
+---
+
 ### `skillOutput`
 
 Controls truncation of skill results before they're included in LLM context.
@@ -112,10 +180,21 @@ Controls how long the coordinator waits for a delegated specialist's reply befor
 
 ```yaml
 delegate:
-  defaultTimeoutMs: 90000   # 90 seconds — appropriate for interactive Sonnet-class delegations
+  defaultTimeoutMs: 450000   # 450 seconds — pooled p99 before 2026-09-20, rounded up
+  lateDelivery:
+    enabled: true
+    ttlMinutes: 60            # how long to keep waiting for the abandoned specialist
+    sweepIntervalMinutes: 5   # restart recovery from audit_log + expiry of dead handles
+    maxResultChars: 8000      # cap on the result text copied into the review task note
 ```
 
-Override in `config/local.yaml` to match the deployment's model latency profile. The value is validated at startup; non-numeric or non-positive values cause a hard startup failure.
+Sized to the pooled p99 (444s) of 1,550 delegate runs before 2026-09-20, the clean baseline confirmed after the provider regression (#1873, #1857). Override in `config/local.yaml` to match the deployment's model latency profile. The value is validated at startup; non-numeric or non-positive values cause a hard startup failure. A value below 450000 logs a startup warning: specialists with no duration hint will time out healthy runs.
+
+This is the **fallback**, used when the runtime resolves no expected duration for the delegation. The runtime resolves the wait window in priority order: a scheduled task's `expectedDurationSeconds`, then the target agent's `expected_duration_seconds` (both plus bounded headroom), then this default. The coordinator LLM is not a source — `timeout_ms` is not in the `delegate` input schema, and the runtime discards any value the model emits (#1797).
+
+Startup logs at info the name of every registered specialist that omits `expected_duration_seconds`. That line is an inventory: those agents inherit the floor on purpose. Core agents whose clean-baseline p99 sits near or above the old 240s wait declare one: `calendar` 300, `ceo-inbox` 240, `research-analyst` 240, `meeting-debrief` 210. `writing-scout` (480) and `social-media` (320) live in the deployment repo and need the same field there. The computed wait is clamped at 895s; runs past that ceiling are late-delivery-only ([ADR-044](../adr/044-delegate-wait-clamp-ceiling.md)).
+
+`lateDelivery` (#1799) covers that case: a timed-out wait does not stop the specialist, so a handle keeps its eventual result from being orphaned — the result is correlated back to the delegation, recorded on the escalation review task (truncated to `maxResultChars`), and audited. Curia stops waiting for the result after `ttlMinutes`; every `sweepIntervalMinutes` a sweep expires dead handles and, after a restart, recovers open ones from `audit_log`.
 
 ---
 
@@ -126,9 +205,78 @@ Runtime defaults for the scheduler watchdog and recovery logic.
 ```yaml
 scheduler:
   defaultExpectedDurationSeconds: 600   # 10 minutes
+  maxInFlight: 8                        # concurrent agent runs the scheduler may start
 ```
 
 `defaultExpectedDurationSeconds` is used by the watchdog to compute a recovery timeout (`LEAST(expected × 7.5, expected + 3600)`) for scheduled jobs that don't declare an explicit `expectedDurationSeconds`. Raise this if you run long-running scheduled jobs without explicit duration hints. Validated at startup.
+
+`maxInFlight` caps how many scheduled agent runs execute at once. Each poll claims at most this many due jobs and returns without waiting for the agent; further due jobs stay pending until a slot frees on a later tick. Default 8, which is headroom above the observed production peak of 6, so that peak still runs. A hung run releases its slot when the watchdog recovery timeout elapses; the agent keeps going. Validated at startup as a positive integer.
+
+---
+
+### `autonomy.gating`
+
+Which policy decides when Curia asks first (#2159, [ADR-049](../adr/049-band-driven-autonomy.md)).
+
+```yaml
+autonomy:
+  gating: tier   # or band
+```
+
+- `tier` (the default): contact tier gates consequential actions (Gate C) and what a recipient may be told (Stage 2.5 of the outbound filter).
+- `band`: the autonomy score decides. The escalation judge reviews each send for an outsider steering Curia, for statements in the principal's voice, and for claims about the principal that the drafting turn did not look up. `contact-data-leak` and Stage 2.5 are off.
+
+`band` needs the escalation judge: config load refuses `gating: band` with `escalation.judge.enabled: false`. The judge's brief has its own timeout, `escalation.judge.review_timeout_ms` (default 15000, between 250 and 2147483647), longer than the classifiers' `timeout_ms` because it reads the turn's evidence. The live gating is logged at boot. See [spec 14](../specs/14-autonomy-engine.md#band-gating-2159).
+
+### `autonomy.approval_expiry`
+
+How often the approval sweep runs.
+
+```yaml
+autonomy:
+  approval_expiry:
+    sweep_interval_minutes: 15
+```
+
+The sweep is a system interval, not a scheduled agent job, so it uses no agent turn and no LLM call (#2013). Each tick does two things:
+
+1. It delivers, once, any pending approval no agent delivered within 15 minutes. It uses email first, then each of the principal's other channels in turn. At the default interval that is 15–30 minutes after the approval was raised.
+2. It marks stale `pending_approval` rows expired and queues a digest item for each (#2159).
+
+The first tick runs a minute after startup and then every interval, so frequent restarts never starve it. The value is validated at startup as a positive integer within the Node.js timer limit.
+
+### `autonomy.report_fallback`
+
+The weekly summary for installs whose digest jobs don't report queued items.
+
+```yaml
+autonomy:
+  report_fallback:
+    max_age_days: 7
+    check_interval_hours: 24
+```
+
+Notes, block notices and approval mentions go to the principal's digest queue (`principal.report`, #2159). Digest jobs read the queue with `list-principal-reports` and acknowledge it with `ack-principal-reports`. Once the oldest unacknowledged item is older than `max_age_days`, this check emails a numbered summary itself. It acknowledges only after the send succeeds. Both values must be positive integers.
+
+---
+
+### `verification`
+
+Delegated sign-in with external verification (a code the site sends the principal; [ADR-050](../adr/050-external-verifications-as-first-class-state.md)). Every field is optional; the defaults are shown.
+
+```yaml
+verification:
+  askChannelOrder: [signal, sms, slack, email]  # where to ask the principal for an SMS/app code: first enabled channel with a verified principal identity
+  defaultExpiryMinutes: 10        # a pending verification is treated as expired after this (a hint, not a cliff)
+  recentWindowMinutes: 120        # a closed verification still counts as recent, and still tracks codes, for this long
+  codeTtlMinutesAfterClose: 120   # a tracked code value is scrubbed this long after its verification closes
+  emailWaitSeconds: 180           # how long ceo-inbox waits for an emailed code before the coordinator asks the principal
+  identityProviderDomains: [b2clogin.com, ciamlogin.com, microsoftonline.com, okta.com, auth0.com, onelogin.com, pingidentity.com, pingone.com, duosecurity.com]
+```
+
+`askChannelOrder` takes `signal`, `sms`, `slack` and `email`, and the configured order alone decides where to ask. The channel the errand arrived on plays no part, because the principal often hands things over by email or voice to be done later. The four numbers must be positive integers. A bad value fails at startup.
+
+`identityProviderDomains` decides which embedded frame may receive a sign-in code. When the sign-in page's own frame has no code input, a child frame that holds one becomes the verification's page domain only if it is on the top page's own domain (never the site the model names) or one of these providers, and only if it is the sole such frame. Otherwise the top page stays the destination, and a code typed into any other frame is refused. Each entry must be a bare registrable domain (`okta.com`, not `https://login.okta.com`). Setting the list replaces the default, so repeat the defaults when you add a provider.
 
 ---
 
@@ -153,20 +301,41 @@ Controls TTL (time-to-live) for outbound context entries — the records that le
 
 ```yaml
 contextBridge:
-  defaultExpiryHours: 6     # TTL for auto-registered entries (no explicit context_bridge param). Default: 6.
+  defaultExpiryHours: 6     # TTL for auto-registered entries on channels with no per-channel default. Default: 6.
   explicitExpiryHours: 24   # TTL for entries with explicit context_bridge delegation metadata. Default: 24.
+  channelDefaultExpiryHours: # Per-channel auto-registration TTL, keyed by channel id.
+    email: 72                # Built-in default for email. Default: {email: 72}.
 ```
 
-Every outbound message (Signal, email) automatically registers a context entry so that if the recipient replies, the coordinator knows what they're replying to. Entries registered without explicit `context_bridge` metadata get the shorter `defaultExpiryHours` TTL. Entries with delegation hints and expected-reply metadata get the longer `explicitExpiryHours` TTL.
+Every outbound message (Signal, email, Slack, SMS) *attempts* to register a context entry so that if the recipient replies, the coordinator knows what they're replying to. Registration is **best-effort**: it happens after delivery, and a failure is logged and swallowed rather than failing a send that already went out — so an entry can be missing entirely, not just expired. Entries registered without explicit `context_bridge` metadata get the auto-registration TTL. Entries with delegation hints and expected-reply metadata get the longer `explicitExpiryHours` TTL, floored at the channel default.
 
-When a caller passes `expires_in_hours` inside the `context_bridge` JSON param, it overrides `explicitExpiryHours` for that individual entry.
+At the shipped defaults that makes the two tiers differ per channel, which matters when reading a `context_bridge` description:
 
-Expired entries are cleaned up automatically by the background scheduler. The coordinator can also release entries manually via the `context-bridge-release` skill.
+| Channel | Bare send, or a malformed `context_bridge` | With a **valid** `context_bridge` (no `expires_in_hours`) |
+|---|---|---|
+| `email` | 72h | 72h (`max(24, 72)`) |
+| `signal`, `slack`, `sms` | 6h | 24h (`max(24, 6)`) |
+
+`parseContextBridge` drops malformed metadata (bad JSON, a missing or blank `agent_id`, a non-object payload) and returns `null`, so the send falls through to auto-registration — it logs a warning but does not fail the send. On the chat channels that silently costs ~18h of window, so the distinction is load-bearing wherever the tiers are quoted to an agent.
+
+A system-injected task-wake binding (168h) is floored the same way: if a channel's default is longer than 168h, the binding is raised to it, so the system's own binding cannot expire before a bare entry on that channel. An agent's explicit `expires_in_hours` is never floored — a deliberately short window is a legitimate choice.
+
+**The auto-registration TTL is per channel**, because reply rhythms differ by channel. A channel listed in `channelDefaultExpiryHours` uses its own value; every other channel uses `defaultExpiryHours`. Email ships at 72h: its replies run on business days, so a 6h window expired before a correspondent who answered the next morning could land — their reply then arrived as an unrecognised cold inbound (#1816). Synchronous chat channels keep the 6h window.
+
+Note the asymmetry: raising `defaultExpiryHours` does **not** change a channel that has its own entry. To change email, set `channelDefaultExpiryHours.email`.
+
+An explicit `context_bridge` entry never expires sooner than a bare one on the same channel — `explicitExpiryHours` is raised to the channel default when that is longer. When a caller passes `expires_in_hours` inside the `context_bridge` JSON param, that wins outright for that individual entry, including when it is shorter than the channel default.
+
+**Observability.** The resolved policy — `defaultExpiryHours`, `explicitExpiryHours`, and the merged per-channel map — is logged once at startup at `info` (`Outbound context TTL policy resolved`). That line is the one to check when an override appears to have had no effect: a mistyped channel id is accepted as written, so an inert `emial: 96` shows up in the map next to a still-72 `email`.
+
+Per-registration, the resolved window and the rule that chose it are logged at `debug` (`ttlSource`: `agent`, `task-wake`, `explicit-tier`, or `channel-default`). Prod runs at `LOG_LEVEL=info`, so **these per-send lines do not appear by default** — raise the level to see them.
+
+Expired entries are cleaned up automatically by the background scheduler. Agents can also release entries manually via the `context-bridge-release` skill — an unhinted entry or one they own (#1972).
 
 **Tuning guidance:**
-- Raise `defaultExpiryHours` if users commonly reply to proactive notifications after more than 6 hours.
-- Lower it if the `[ACTIVE OUTBOUND CONTEXT]` block is accumulating too many stale entries and causing noise.
-- `explicitExpiryHours` should be higher because explicit entries carry delegation metadata that's expensive to re-derive.
+- Add a channel to `channelDefaultExpiryHours` if its recipients commonly reply later than `defaultExpiryHours` allows.
+- Lower a value if the `[ACTIVE OUTBOUND CONTEXT]` block is accumulating too many stale entries and causing noise.
+- `explicitExpiryHours` should be higher than `defaultExpiryHours` because explicit entries carry delegation metadata that's expensive to re-derive.
 
 ---
 
@@ -195,18 +364,86 @@ Changes take effect on restart.
 
 ---
 
+### `filter.identityGate`
+
+```yaml
+filter:
+  identityGate: enforce   # enforce (default) | shadow | off
+```
+
+The identity gate (#1818) checks a non-principal send for an unconfirmed-name hedge, or an unresolved name next to an invitation or attendance cue. `enforce` blocks the send, `shadow` logs the block and sends anyway, `off` skips the check. The rest of `filter` configures the outbound LLM judge (`filter.llmJudge`).
+
+---
+
+### `audit.llmCallArchive`
+
+```yaml
+audit:
+  llmCallArchive:
+    enabled: true            # kill-switch for new archive writes
+    hotRetentionDays: 90     # older rows are deleted by the nightly decay pass
+    includeReasoning: true   # false keeps the reasoning token count, drops the text
+```
+
+`llm_call_archive` stores redacted full prompts and responses keyed to `llm.call` rows (spec 10, #1383). Reasoning text can be most of a row, so `includeReasoning: false` (#2042) shrinks the archive without turning it off.
+
+---
+
+### `embedding.profiles`
+
+A profile tells Curia how to use one embedding model: the vector width to store, a text
+prefix for each purpose, and the three similarity thresholds (ADR-051). The endpoint
+itself is set in `.env` (`EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`), so embedding
+configuration spans both files.
+
+`text-embedding-3-small` and `Qwen3-Embedding-4B` are built in
+(`src/memory/embedding-profiles.ts`). Add a profile in `config/local.yaml`, keyed by the
+exact `EMBEDDING_MODEL` value:
+
+```yaml
+embedding:
+  profiles:
+    # The same model under another server's id: `base` copies a built-in profile,
+    # and any field given beside it overrides that field.
+    "qwen3-embedding:4b":
+      base: Qwen3-Embedding-4B
+    # A model with no built-in profile gives dimensions and all three thresholds.
+    # Placeholder values: calibrate your own with `pnpm embedding-eval`.
+    my-embedding-model:
+      dimensions: 1024
+      prefixes: { query: "", document: "", similarity: "" }
+      thresholds: { fact_dedup: 0.92, fuzzy_resolve: 0.90, fuzzy_ambiguity_floor: 0.75 }
+```
+
+| Key | Description |
+|---|---|
+| `dimensions` | Width stored in `kg_nodes.embedding`, at most 2,000 (pgvector's HNSW limit). A longer vector from the server is truncated and renormalised. Truncation is only valid for a Matryoshka-trained model, and Curia logs a warning once after each start, the first time it truncates. |
+| `prefixes.query` / `.document` / `.similarity` | Text put before a search query, a stored node label, and a label matched against stored labels. Each defaults to empty. |
+| `thresholds.fact_dedup` | Cosine score at or above which a new fact merges into an existing one. |
+| `thresholds.fuzzy_resolve` | Score at or above which a name resolves to an existing entity. |
+| `thresholds.fuzzy_ambiguity_floor` | Score at or above which an entity is offered as an ambiguous candidate. Must be below `fuzzy_resolve`. |
+
+A malformed profile fails boot with the key named. Thresholds copied from another model
+can merge distinct people and facts; calibrate them with `pnpm embedding-eval` (see
+`scripts/embedding-eval.ts`). A model change on an install that already holds vectors
+leaves entity memory off until `pnpm reembed:kg` has run with Curia stopped. A change to
+`prefixes.document` counts as a model change, because stored vectors keep the prefix they
+were embedded with.
+
 ## Skill, agent, and channel registry
 
-Skills, agents, and channels are not enabled simply by existing on disk — they are tracked in three registry tables (`skill_registry`, `agent_registry`, `channel_registry`) with an explicit **install → enable** lifecycle.
+Tools, skills, agents, and channels are not enabled simply by existing on disk — they are tracked in registry tables (`tool_registry`, `skill_registry` for bundles, `agent_registry`, `channel_registry`) with an explicit **install → enable** lifecycle.
 
-- **Disabled by default.** A newly added skill or agent is registered at startup but starts **disabled**. It must be enabled before it can be loaded.
+- **Disabled by default.** A newly added tool, skill, or agent is registered at startup but starts **disabled**. It must be enabled before it can be loaded. Exceptions: the core set in `config/registry-defaults.yaml`, and member tools of an enabled bundle.
+- **Bundle expansion (#1974).** Listing a tool in an enabled bundle's SKILL.md `tools:` enrolls it on the next boot, so `registry-defaults.yaml` `tools:` lists standalone tools only. A member gated by `install.requires_secrets` enrolls on the first boot after its keys exist. A member can't be uninstalled while its bundle is enabled — the next boot would re-enroll it — so disable it instead. See the [ADR-022](../adr/022-skill-agent-registry.md) amendment. Toggleable channels (`email`, `signal`, `slack`, `sms`, `voice`) follow the same rule: seeding credentials does **not** install or enable them — use **Settings → Channels** (install, then enable, then restart).
 - **Restart-based enforcement.** Enabled items are loaded/registered at startup; disabled items are skipped. Changing enable state takes effect on the next restart.
 - **Secret gating (`install.requires_secrets`).** A skill manifest may declare `install: { requires_secrets: [...] }` — vault secret keys that must already exist before the registry will install or enable the skill. `RegistryService` rejects install/enable until every declared key is present in the vault. (`web-search` declares `["tavily_api_key"]`.)
-- **Always-on channels.** The `http` and `cli` channels have `isToggleable: false` — they always start and cannot be disabled, an operator-lockout safeguard. `email` and `signal` are toggleable.
+- **Always-on channels.** The `http` and `cli` channels have `isToggleable: false` — they always start and cannot be disabled, an operator-lockout safeguard. `email`, `signal`, `slack`, `sms`, and `voice` are toggleable and require explicit install→enable; outbound egress is gated on the same registry state as inbound adapters.
 
 Lifecycle is driven via the registry HTTP API (or the admin UI):
 
 ```
+GET    /api/registry/tools
 GET    /api/registry/skills
 GET    /api/registry/agents
 POST   /api/registry/:kind/:name/install
@@ -228,12 +465,36 @@ For example, the email channel's Nylas API key is stored under `channel.email.ny
 
 ---
 
+## Channel trust and policy
+
+`config/channel-trust.yaml` sets each channel's **security posture** — separate from the vault (credentials) and the registry (enablement). Every channel gets a block with three keys:
+
+```yaml
+channels:
+  slack:
+    trust: medium          # high | medium | low — caps the sensitivity of actions this channel can drive
+    unknown_sender: allow  # allow | ignore — what to do with messages from unrecognized senders
+    threaded: true         # true = native threads; false = enable context bridging
+```
+
+| Key | Values | Meaning |
+|---|---|---|
+| `trust` | `high`, `medium`, `low` | Caps the max sensitivity of actions a message on this channel can drive. Combined with the sender's contact tier and injection-risk score into the message trust score. Defaults to `low` when unset. |
+| `unknown_sender` | `allow`, `ignore` | `allow` routes messages from unrecognized senders to the coordinator in low-trust mode (auto-created as a `tier=unknown` contact); `ignore` silently drops them. |
+| `threaded` | `true`, `false` | `true` when the platform has native threads (email, Slack). `false` enables context bridging for channels without a thread reference (Signal, SMS, CLI, HTTP). Voice is a live call, so bridging does not apply. |
+
+Current defaults: CLI, Signal, and Voice are `high`; HTTP, Slack, and SMS are `medium`; email is `low`. HTTP and Voice use `unknown_sender: ignore`; the rest `allow`. (`web` — the authenticated console — is `high`.)
+
+---
+
 ## `config/local.yaml` — deployment overrides
 
 `config/local.yaml` is an optional file that, when present, is deep-merged on
 top of `default.yaml` at startup. It exists so deployment-specific config can
 live in a deployment repo (e.g. `curia-deploy`) rather than in the `curia`
-repo itself.
+repo itself. Overlay agent prompts and tool descriptions in that repo should
+say "the principal", not a job title — see
+[Principal vocabulary](adding-an-agent.md#principal-vocabulary).
 
 **`config/local.yaml` is gitignored** — it is never committed to the `curia`
 repo. Your deployment tooling writes it to the server at deploy time.
@@ -248,35 +509,11 @@ repo. Your deployment tooling writes it to the server at deploy time.
 - A key present only in `local.yaml` is added. A key present only in
   `default.yaml` is preserved unchanged.
 
-### Primary use case: multi-account email
+### Email accounts
 
-The most common reason to use `local.yaml` is to configure
-`channel_accounts.email`, which defines the named email accounts Curia manages.
-Because this structure varies per deployment, it belongs in `local.yaml` rather
-than `default.yaml`.
+Email accounts are managed in the console, not in YAML. Go to **Settings → Channels → Email → Email accounts** to add, edit, or remove agent-owned mailboxes. Each account stores its Nylas grant in the vault at `channel.email.<name>.nylas_grant_id`. `NYLAS_API_KEY` remains the shared app-level key and is still seeded via the vault in the usual way. Changes take effect on restart.
 
-Example `local.yaml`:
-
-```yaml
-channel_accounts:
-  email:
-    curia:
-      nylas_grant_id: "env:NYLAS_GRANT_ID"
-      self_email:     "env:NYLAS_SELF_EMAIL"
-```
-
-The `env:VAR_NAME` references are resolved from environment variables at
-startup — no credentials are stored in `local.yaml`. The actual grant IDs and
-email addresses live in `.env`.
-
-> **Note:** The multi-account `channel_accounts.email` path resolves
-> `env:VAR` references straight from `.env`, **not** from the vault — it is the
-> one path the vault-only model ([ADR-021](../adr/021-vault-only-secret-resolution.md))
-> does not yet cover. The legacy single-account Nylas secrets *are* vault-resolved.
-> Routing multi-account secrets through the vault is tracked as follow-up work (#920).
-
-For a full description of the `channel_accounts.email` schema, see the
-`channel_accounts` comment block in `config/default.yaml`.
+The legacy `channel_accounts.email` YAML path (previously configured in `config/local.yaml`) is retired as of #1101. Remove any `channel_accounts:` block from `local.yaml` if upgrading — it will be ignored on startup.
 
 ### Error handling
 
@@ -297,13 +534,15 @@ without writing any TypeScript. At startup, Curia connects to each configured
 server, discovers its tools via `tools/list`, and registers them in the skill
 registry alongside local skills.
 
-The file does not exist by default — its absence means no MCP servers are
-configured. Create it when you add the first server.
+Core ships the file with one server, `google-workspace` (stdio, the
+`workspace-mcp` launcher restricted to Drive, Docs and Sheets, #1957).
+Deployment overlays replace the file wholesale, so they must carry that entry
+too. An absent file means no MCP servers are configured.
 
 ```yaml
 servers:
   - name: gdrive
-    transport: stdio          # "stdio" spawns a local process; "sse" connects to an HTTP endpoint
+    transport: stdio          # "stdio" spawns a local process; "sse" connects to a hosted endpoint over StreamableHTTP
     command: npx
     args: ["-y", "@modelcontextprotocol/server-gdrive"]
     action_risk: low          # required — none | low | medium | high | critical
@@ -311,6 +550,10 @@ servers:
     timeout_ms: 30000         # optional — per-invocation timeout in ms (default: 30000)
     # env:                    # optional — extra env vars for the spawned process only
     #   SOME_VAR: value       # vars already in .env are inherited automatically
+    # secrets:                # optional — declare vault keys this server needs
+    #   - key: my_api_key     # vault key name (stored encrypted, injected at spawn time)
+    #     label: "My API Key"
+    #     masked: true        # true → shown as ••••• in the console credential form
 ```
 
 Connection failures at startup are non-fatal but logged at `error` level — a
@@ -318,9 +561,12 @@ missing MCP server won't take Curia down. The failed server's tools will be
 unavailable until restart. Search logs for `ERROR Failed to connect to MCP server`
 to diagnose.
 
-After adding a server, pin its tools in `agents/coordinator.yaml` under
-`pinned_skills` so the coordinator's LLM can call them. Tool names come from
-the server's `tools/list` response — check the startup logs to confirm.
+Each server's tools project as one skill named after the server (ADR-032).
+Agents reach it with `skill-activate` (e.g. skill `google-workspace`) rather
+than a pin: a pin puts every tool definition on every call (#2024).
+`tests/unit/agents/prompt-budget.test.ts` forbids MCP pins on the coordinator
+and the budgeted specialists (`allowMcpPins: false`). Tool names come from the
+server's `tools/list` response — check the startup logs to confirm.
 
 See [google-drive.md](google-drive.md) for a full walkthrough of the Google
 Drive integration (service account setup, folder sharing, credential wiring).
@@ -337,25 +583,60 @@ in `.env`, because they are needed to reach and unlock the vault itself:
   the vault.
 - `SECRET_ENCRYPTION_KEY` — decrypts the vault.
 
-Every other secret (Anthropic, OpenAI, OpenRouter, API token, web-app bootstrap secret,
+Every other secret (Anthropic, OpenAI, OpenRouter, AWS Bedrock, API token, web-app bootstrap secret,
 Nylas trio, Signal number, Tavily) lives only in the vault.
 
 **Seeding:**
 
 - **Fresh install** — `pnpm run setup` seeds the vault automatically after migrations,
   so the app never boots against an empty vault.
-- **Add or update one secret later** — supply it as a transient env var and run the
-  seeder: `VAR=value pnpm run seed-vault`. The seeder upserts present values; absent
-  ones are skipped, never cleared.
+- **Add or update one secret later** — supply it as a transient env var and scope the
+  run to it: `SEED_VAULT_ONLY=var_name VAR_NAME=value pnpm run seed-vault`. The seeder
+  loads `.env` too, so without `SEED_VAULT_ONLY` it re-upserts every other secret `.env`
+  holds. It upserts present values; absent ones are skipped, never cleared.
 
 **Missing secrets:** a missing *required* secret fails closed. Most fail at their consumer
-(e.g. `anthropic_api_key`). `api_token` is special-cased with an explicit boot guard that
+(e.g. a provider key, which fails the boot with the tier, model and provider named). `api_token` is special-cased with an explicit boot guard that
 refuses to start, because its HTTP-auth consumer fails *open* (no token configured = auth
 disabled) — an absent token would otherwise silently expose the API. `setup.sh` also runs
-`seed-vault` with `SEED_VAULT_VERIFY=1`, which confirms the required rows (`anthropic_api_key`,
-`api_token`, `web_app_bootstrap_secret`) landed and aborts the install if any are missing.
-A missing *optional* secret (OpenAI, OpenRouter, Signal) disables its feature via the
+`seed-vault` with `SEED_VAULT_VERIFY=1`, which confirms the required rows (`api_token`,
+`web_app_bootstrap_secret`) landed and aborts the install if any are missing.
+A missing *optional* secret (OpenAI, OpenRouter, AWS Bedrock, Signal) disables its feature via the
 existing `if (config.x)` guards rather than failing the boot.
+
+### Running tiers on AWS Bedrock
+
+Bedrock is an additive provider (ADR-041). Nothing changes for a deployment without AWS
+credentials. To use it, seed the two vault secrets, set `AWS_REGION` in `.env`, and map a
+tier in **`config/local.yaml`** — not `default.yaml`, which would change the default for
+every deployment:
+
+```yaml
+# config/local.yaml
+model_routing:
+  tiers:
+    standard:
+      model: global.anthropic.claude-sonnet-4-6
+```
+
+Model ids are Bedrock **inference-profile** ids: the `bedrock-runtime` endpoint rejects a
+bare model id for these models. `global.` may route outside your region; `us.` / `eu.` keep
+requests inside that geography (data residency). Registered today: Claude Sonnet 4.6
+(`<prefix>.anthropic.claude-sonnet-4-6`) and Claude Haiku 4.5
+(`<prefix>.anthropic.claude-haiku-4-5-20251001-v1:0`) for `global`, `us` and `eu`. A tier
+mapped to a Bedrock model with no Bedrock credentials fails the boot validation.
+
+Before routing the coordinator's tiers to a Bedrock model, run
+`pnpm run smoke:bedrock-tools -- --model <profile id>`. It sends a production-shaped load
+(10K+ token prompt, 40+ tools) several times and fails unless every run makes a real tool
+call, because some models narrate the call as text under that load and nothing else notices.
+It needs the AWS vault secrets and a reachable database.
+
+Limits: the Bedrock provider has no `stream()`, so the model behind the voice channel
+(`channels.voice.model`, or the `fast` tier when unset) must not be a Bedrock model. It emits no
+prompt-cache checkpoints. The IAM user needs `bedrock:InvokeModel` on the chosen profile, and
+Anthropic models are billed through AWS Marketplace, which can need an extra subscription
+permission on first use.
 
 ---
 
@@ -379,17 +660,23 @@ from `.env`.
 | `DATABASE_URL` | Yes | `.env` | Postgres connection string (also reads the vault that hosts the secrets) |
 | `DB_USER` / `DB_PASSWORD` | Yes | `.env` | Postgres credentials |
 | `TIMEZONE` | Yes | `.env` | IANA timezone (e.g. `America/Toronto`) |
-| `CEO_PRIMARY_EMAIL` | Recommended | `.env` | Prevents first CEO email from being held |
-| `ANTHROPIC_API_KEY` | Yes | vault | Powers all agents |
+| `ANTHROPIC_API_KEY` | Yes¹ | vault | Powers the agents on the default tiers. ¹ No provider is mandatory: boot requires a credential only for each provider a tier is actually mapped to, and fails naming the tier, model and provider if one is missing. |
 | `API_TOKEN` | Yes | vault | Authenticates HTTP API requests |
 | `WEB_APP_BOOTSTRAP_SECRET` | Yes | vault | Web app login secret |
-| `OPENAI_API_KEY` | Tier 2 | vault | Enables entity memory and semantic search |
+| `OPENAI_API_KEY` | Tier 2 | vault | Enables entity memory and semantic search through OpenAI embeddings when `EMBEDDING_BASE_URL` is unset. Also used by `image-generate`. |
+| `EMBEDDING_BASE_URL` | Optional | `.env` | Base URL of an OpenAI-compatible `/embeddings` server (llama.cpp, Ollama, vLLM), e.g. `http://localhost:8080/v1`. Replaces OpenAI as the embedding source for entity memory (ADR-051). |
+| `EMBEDDING_MODEL` | With `EMBEDDING_BASE_URL` | `.env` | Model name sent to the embedding server, and the key of its profile. Required when `EMBEDDING_BASE_URL` is set: without it entity memory stays off. With no base URL it defaults to `text-embedding-3-small`. A model with no profile leaves entity memory off; see [`embedding.profiles`](#embeddingprofiles). |
+| `EMBEDDING_API_KEY` | Optional | vault | Vault key `embedding_api_key`. Sent as a Bearer token to `EMBEDDING_BASE_URL` when the server checks one. |
 | `OPENROUTER_API_KEY` | Optional | vault | Enables multi-model routing via OpenRouter (Gemini Flash, DeepSeek V3, GPT-4o). When set, tiers can map to OpenRouter-hosted models. |
-| `NYLAS_API_KEY` | Tier 2 | vault | Email channel |
-| `NYLAS_GRANT_ID` | Tier 2 | vault | Email grant (connected account) |
-| `NYLAS_SELF_EMAIL` | Tier 2 | vault | Address Curia reads and sends from |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Optional | vault | Vault keys `aws_access_key_id` / `aws_secret_access_key`. With `AWS_REGION`, registers the Bedrock provider so tiers can map to Bedrock-hosted Claude models. A partial set logs a warning and leaves Bedrock off. |
+| `AWS_REGION` | Optional | `.env` | Bedrock region (e.g. `ca-central-1`). Required for Bedrock to register. |
+| `AWS_BEDROCK_TIMEOUT` | Optional | `.env` | Per-call Bedrock timeout in seconds (default `120`). |
+| `NYLAS_API_KEY` | Tier 2 | vault | Shared Nylas app key for the email channel. Per-account grants are managed in the console (Settings → Channels → Email) and stored in the vault at `channel.email.<name>.nylas_grant_id`. |
 | `SIGNAL_PHONE_NUMBER` | Tier 3 | vault | Enables Signal channel |
 | `TAVILY_API_KEY` | Tier 3 | vault | Gates `web-search` (`install.requires_secrets`). Provision `tavily_api_key` via the console (Settings → Skills → web-search); the env var is a fallback only and should be unset in production. |
+| `SIGNAL_VOICE_CALLS_ENABLED` | Optional | `.env` | Enables inbound Signal voice calls (default `false`). Requires the Signal channel, the fully configured Voice channel (LiveKit + Deepgram + Cartesia), `SIGNAL_PULSE_SOCKET_PATH`, and deploy-side infrastructure (signal-cli ≥ 0.14.7, `signal-call-tunnel`, PulseAudio in the signal-cli container). Missing prerequisites log a warning at boot and leave the bridge unstarted. See [voice-setup.md](voice-setup.md#signal-calls-experimental). |
+| `SIGNAL_PULSE_SOCKET_PATH` | Optional | `.env` | Path to the PulseAudio socket shared out of the signal-cli container (production compose: `/var/run/pulse-shared/native`). Required for Signal voice calls; also what the `signal_voice` health probe connects to. |
+| `SIGNAL_VOICE_MAX_CALL_SECONDS` | Optional | `.env` | Hard per-call duration cap in seconds (default `600`). The call is hung up on expiry with no spoken wrap-up. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional | `.env` | Path to service account JSON for Google Drive |
 | `CURIA_TEMPFILE_DIR` | Optional | `.env` | Base directory under which the `file-parse` skill resolves `temp_file_url` inputs. The skill rejects paths that escape this directory. Defaults to the OS temp dir when unset. |
 

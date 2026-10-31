@@ -1,12 +1,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import yaml from 'js-yaml';
-
-// UUID v4 format: 8-4-4-4-12 hex groups separated by hyphens.
-// Used to validate agentContactId before system prompt interpolation —
-// guards against prompt injection if the ID source ever changes from
-// the current gen_random_uuid() call in bootstrap.ts.
-const UUID_FORMAT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+import * as yaml from 'js-yaml';
+import { AGENT_NAME_RULE, isAgentName } from './agent-name.js';
+import { isUuid } from '../util/uuid.js';
+import { parsePinnedContext } from './pinned-context.js';
 
 /**
  * Shape of an agent YAML config file.
@@ -16,7 +13,23 @@ export interface AgentYamlConfig {
   name: string;
   version?: string;
   role?: string;
+  /** What the agent does, for people: the admin UI, the audit log and docs. */
   description?: string;
+  /**
+   * When to delegate to this agent, for the model: its line in the coordinator's
+   * `## Available Specialists` roster and in `${available_specialists}`. A short
+   * routing statement, not an account of how the agent works. When omitted, the
+   * roster shows `description` instead.
+   */
+  delegate_when?: string;
+  /**
+   * What a model might call this agent in a principal-facing reply. Since #1975
+   * delegation-failure replies never name the specialist; this label is checked
+   * for and rejected, not shown. Not `persona.display_name`, which is
+   * interpolated into the system prompt only. When omitted, the runtime derives
+   * a label from `name`.
+   */
+  display_name?: string;
   persona?: {
     display_name?: string;
     tone?: string;
@@ -29,10 +42,14 @@ export interface AgentYamlConfig {
   };
   system_prompt: string;
   pinned_skills?: string[];
+  /**
+   * `/shared/` documents and config-store keys rendered into every turn's
+   * `## Pinned context` block (#2338, ADR-056). A mapping with optional `docs` and
+   * `configs`, each a string or a list of strings / `{ path|key, description }`.
+   * loadAgentConfig validates it; read it through parsePinnedContext().
+   */
+  pinned_context?: unknown;
   allow_discovery?: boolean;
-  memory?: {
-    scopes?: string[];
-  };
   schedule?: Array<{
     cron: string;
     task: string;
@@ -44,8 +61,9 @@ export interface AgentYamlConfig {
     intent_anchor?: string;
   }>;
   /** Expected wall-clock duration for delegate calls targeting this agent, in seconds.
-   *  When set, the runtime injects timeout_ms = expected_duration_seconds * 1000 into
-   *  delegate calls that don't already carry an explicit timeout. */
+   *  When set, the runtime injects timeout_ms (duration + bounded headroom) into delegate
+   *  calls, overriding anything the model emitted (#1797). Used only when the scheduler
+   *  supplied no expectedDurationSeconds. */
   expected_duration_seconds?: number;
   error_budget?: {
     max_turns?: number;
@@ -65,10 +83,6 @@ export interface AgentYamlConfig {
    * know what other agents are available (e.g. to make ACTIONABLE routing decisions).
    */
   inject_specialists?: boolean;
-  /** When true, the runtime auto-pins the task-* skills, injects the shared
-   *  task-management discipline block, and marks the agent heartbeat-eligible.
-   *  See docs/wip/2026-06-04-task-execution-heartbeat-design.md §6. Default: false. */
-  enable_task_management?: boolean;
   /** Optional declarative install/uninstall blocks (skill/agent registry, #541).
    *  Reserved schema surface — parsed but inert in PR1. */
   install?: Record<string, unknown>;
@@ -94,8 +108,29 @@ export function loadAgentConfig(filePath: string): AgentYamlConfig {
     throw new Error(`Invalid YAML in agent config at ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // Same character class as tasks.source_agent_id (#1882) — reject at load so the
+  // roster and POST /api/tasks cannot drift apart. Guard config itself: yaml.load
+  // can return null/non-object for empty or scalar documents.
+  const name = config?.name;
+  if (typeof name !== 'string' || !isAgentName(name)) {
+    throw new Error(
+      `Invalid agent name in ${filePath}: ${JSON.stringify(name)} (must be ${AGENT_NAME_RULE})`,
+    );
+  }
+
+  // A blank or non-string routing line would put an empty or garbled entry in the roster.
+  const delegateWhen: unknown = config.delegate_when;
+  if (delegateWhen !== undefined && (typeof delegateWhen !== 'string' || delegateWhen.trim() === '')) {
+    throw new Error(`Invalid delegate_when in ${filePath}: must be a non-empty string`);
+  }
+
+  // A bad declaration fails the load here rather than rendering a broken block or
+  // granting write access to the wrong path later.
+  parsePinnedContext(config.pinned_context, name);
+
   // Interpolate ${persona.*} placeholders in the system prompt.
-  // The persona section is the single source of truth for display name, tone, etc.
+  // persona.display_name, tone, and signature are prompt text only. The
+  // top-level display_name field is separate (#1860, #1975).
   // Keeping them as references in system_prompt avoids duplication and makes
   // persona changes a one-field edit rather than a find-and-replace across the prompt.
   if (config.persona) {
@@ -175,8 +210,6 @@ export function discoverAgentManifests(dirPath: string): AgentDiscovery[] {
  * Currently supports:
  * - ${office_identity_block} — compiled identity block from OfficeIdentityService
  * - ${available_specialists} — list of specialist agents from the agent registry
- * - ${current_date} — today's date in the configured timezone (YYYY-MM-DD, Day)
- * - ${timezone} — the configured IANA timezone name
  * - ${agent_contact_id} — the agent's own contact ID (seeded at bootstrap)
  * - ${principal_contact_id} — the principal's contact ID (loaded at bootstrap from
  *   contactService.findContactBySystemRole('principal')). Agents that need to act
@@ -186,6 +219,12 @@ export function discoverAgentManifests(dirPath: string): AgentDiscovery[] {
  *
  * This runs at bootstrap time (after all agents are registered) and is separate
  * from persona interpolation which runs at config load time.
+ *
+ * There is deliberately no date/time or timezone placeholder: a value substituted
+ * here would be frozen at boot. The runtime appends a fresh `## Current Date & Time`
+ * block every turn instead (src/time/time-context.ts), and prompts should point
+ * at that. Any other `${...}` token reaches the model literally;
+ * tests/unit/agents/loader.test.ts fails the build if an agent YAML has one (#1997).
  */
 export function interpolateRuntimeContext(
   systemPrompt: string,
@@ -216,7 +255,7 @@ export function interpolateRuntimeContext(
       // The current bootstrap always produces a Postgres-generated UUID, but an
       // explicit check here ensures a future change (env var, config, etc.) can't
       // accidentally inject arbitrary text into the system prompt.
-      UUID_FORMAT.test(context.agentContactId ?? '') ? (context.agentContactId ?? '') : '',
+      isUuid(context.agentContactId) ? (context.agentContactId ?? '') : '',
     )
     .replace(
       /\$\{principal_contact_id\}/g,
@@ -226,6 +265,6 @@ export function interpolateRuntimeContext(
       // readiness gate (check: principal-contact) before this code ever runs
       // on a real prompt, so the empty-string fallback is unreachable in
       // practice — pure belt-and-suspenders.
-      UUID_FORMAT.test(context.principalContactId ?? '') ? (context.principalContactId ?? '') : '',
+      isUuid(context.principalContactId) ? (context.principalContactId ?? '') : '',
     );
 }

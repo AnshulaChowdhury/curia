@@ -196,25 +196,45 @@ A new skill that assembles the full context payload for one or more entities. Av
   },
   "outputs": {
     "entities": "EntityContext[]",
-    "unresolved": "string[] (IDs that couldn't be found)"
+    "unresolved": "string[] (IDs that matched no contact and no KG node)",
+    "nodeless": "{inputId, contactId, displayName, cause, reason}[]? (contacts that exist but cannot hold facts: cause `missing` = never had a stored profile, cause `archived` = profile was retired; not evidence of absence)",
+    "failed": "{inputId, reason}[]? (lookups that errored — retry may succeed; not evidence of absence)"
   }
 }
 ```
 
+**Result buckets** — `assembleMany` and the skill surface four disjoint outcomes per input ID:
+
+| Bucket | Meaning | Agent action |
+|---|---|---|
+| `entities` | Full `EntityContext` assembled | Use the payload |
+| `unresolved` | ID matched no contact and no KG node | Treat as genuinely unknown |
+| `nodeless` | Contact exists but cannot hold a KG node — never had one, or the linked node is archived (#1694, #1707) | Report capability gap; do not store facts or infer absence |
+| `failed` | Assembly threw (#1702) | If reason says retryable: retry. If not: report failure. **Not** evidence the contact is unknown |
+
+Diagnostic buckets (`nodeless`, `failed`, `unresolved`) are emitted before `entities` in the skill result so head-slice output truncation sacrifices bulk entity data rather than the warnings.
+
+When every requested ID lands in `failed` and `entities`, `unresolved`, and `nodeless` are all empty, the skill returns `success: false` (not a success-shaped empty result with retry hints) so the agent does not loop against a hard-down database. Batches mixing `failed` with `unresolved` or `nodeless` still return `success: true` with all diagnostic buckets.
+
 **Resolution priority for each ID:**
-1. If the ID matches a `contacts.id` → look up `kg_node_id` from the contact, then assemble from the KG node
-2. If the ID matches a `kg_nodes.id` directly → assemble from the KG node
-3. Special values: `"caller"` → resolve to `ctx.caller.contactId`, `"agent"` → resolve to the agent's contactId
-4. If no match → include in the `unresolved` array (not a hard error)
+1. If the ID matches a `contacts.id` with a non-null `kg_node_id` pointing at a live (`archived_at IS NULL`) KG node → assemble from that KG node
+2. If the ID matches a `contacts.id` with a null `kg_node_id` → include in `nodeless` with `cause: "missing"` (contact exists but never had a stored profile)
+3. If the ID matches a `contacts.id` whose `kg_node_id` points at an archived node → include in `nodeless` with `cause: "archived"` (the profile was retired; not silently assembled)
+4. If the ID matches a live `kg_nodes.id` directly → assemble from that KG node
+5. If the ID matches an archived `kg_nodes.id` owned by a contact → include in `nodeless` with `cause: "archived"` (agents reuse `entities[].entityId` across turns)
+6. Special values: `"caller"` → resolve to `ctx.caller.contactId`, `"agent"` → resolve to the agent's contactId
+7. If no match (including an unanchored archived node ID) → include in the `unresolved` array (not a hard error)
+8. If assembly throws → include in `failed` with a retry classification (not `unresolved`)
 
 ### Assembly Pipeline
 
 For each resolved entity:
 
 ```
-KG node lookup
+KG node lookup (live rows only — `archived_at IS NULL`)
     │
     ├─→ Extract facts (kg_nodes where type='fact', linked via kg_edges)
+    │     Skip archived fact nodes and archived edges
     │     Group by category, include confidence + freshness
     │
     ├─→ Contact record lookup (contacts table, via kg_node_id)
@@ -226,6 +246,7 @@ KG node lookup
     │     contact_integrations (future)
     │
     ├─→ First-degree relationships (kg_edges, depth=1)
+    │     Skip archived edges and archived related nodes
     │     Include related entity label + type
     │
     └─→ Compose EntityContext payload
@@ -235,7 +256,9 @@ The pipeline is a database read path — no LLM involvement, no external API cal
 
 ### Caching
 
-Entity context changes infrequently compared to how often it's queried. A simple TTL cache (keyed by entity ID, 5-minute TTL) avoids redundant DB queries when multiple skills operate on the same entity in a single conversation. Cache invalidation on contact/KG mutations is straightforward since those writes go through `ContactService` and `EntityMemory`, which can clear the cache.
+Entity context changes infrequently compared to how often it's queried. A simple TTL cache (keyed by entity ID, 5-minute TTL) avoids redundant DB queries when multiple skills operate on the same entity in a single conversation.
+
+A cache hit always re-checks that the entity node is still live (`archived_at IS NULL`). If DreamEngine or contact deletion archived it, the cached payload is dropped and the ID is re-assembled into `nodeless`. DreamEngine also flushes the whole cache after a decay pass that archives any node or edge, so retired facts hanging off a still-live entity cannot keep assembling from a TTL hit. Per-mutation invalidation for ordinary contact/KG writes (`clearCacheForEntity`) is still not wired (see Known Deficiencies).
 
 ---
 
@@ -253,7 +276,7 @@ Skills that operate on entities follow a consistent convention:
 ### Example: Calendar List Events (after adoption)
 
 ```typescript
-async execute(ctx: SkillContext): Promise<SkillResult> {
+async execute(ctx: ToolContext): Promise<ToolResult> {
   // 1. Resolve who we're looking up events for
   const contacts = ctx.input.contacts as string[] | undefined;
   const entityIds = contacts ?? [ctx.caller?.contactId ?? 'caller'];
@@ -350,7 +373,7 @@ LLM: "Now I can list her events"
 
 ### Option B: Execution layer pre-enrichment
 
-The execution layer automatically calls `entity-context` before invoking the handler, based on a manifest declaration. The handler receives the enriched context as part of `SkillContext`.
+The execution layer automatically calls `entity-context` before invoking the handler, based on a manifest declaration. The handler receives the enriched context as part of `ToolContext`.
 
 ```json
 {
@@ -436,7 +459,7 @@ A single table records every outbound message Curia sends, with enough metadata 
 | Column | Type | Purpose |
 |---|---|---|
 | `id` | `UUID` | Primary key |
-| `conversation_id` | `TEXT` | Conversation the outbound belongs to (scopes the read query) |
+| `conversation_id` | `TEXT` | Conversation associated with the outbound registration; it does not scope the dispatcher read query |
 | `channel_id` | `TEXT` | Channel the message was sent on (`email`, `signal`, future) |
 | `agent_id` | `TEXT` | Originating agent (`coordinator`, `research-analyst`, `meeting-debrief`, ...) |
 | `content_preview` | `TEXT` | Truncated message body (≤ 300 chars) for the LLM to recognize the thread |
@@ -446,8 +469,11 @@ A single table records every outbound message Curia sends, with enough metadata 
 | `created_at` | `TIMESTAMPTZ` | Insert time |
 | `expires_at` | `TIMESTAMPTZ` | Auto-expiry deadline |
 | `released` | `BOOLEAN` | `true` once an agent explicitly closes the thread |
+| `recipient_contact_ids` | `UUID[]?` | Contacts the message was sent to (#2261); `NULL` on rows written before migration 104, which are never shown to a non-principal |
+| `recipient_messages` | `JSONB` | Messages those recipients sent while the entry was active, `[{at, from, contact_id, preview, risk_score}]`, the first three and the latest three (#2261) |
+| `last_recipient_message_at` | `TIMESTAMPTZ?` | When the latest of those arrived; orders the task-wake list |
 
-A partial index `(expires_at, created_at DESC) WHERE released = false` covers the dispatcher's hot read.
+A partial index `(expires_at, created_at DESC) WHERE released = false` covers the dispatcher's hot read. A partial GIN index on `recipient_contact_ids` (same predicate) serves the recipient lookup, which uses `@>`.
 
 ### `OutboundContextService`
 
@@ -455,7 +481,7 @@ Owns all CRUD against `outbound_context`. Two surfaces:
 
 1. **Full service** — held by the dispatcher and other system-layer code. Methods include `register()`, `getActive(limit)`, `release(id, conversationId?)`, `cleanupExpired()`, and `formatInjectionBlock(entries, originalContent)`.
 
-2. **`ScopedOutboundContext`** — a per-conversation wrapper exposed to skills via the `outboundContext` capability. Pre-binds `conversationId` so skills don't need to know it. Exposes only `register` and `release`, plus `defaultExpiryHours` / `explicitExpiryHours` for skills that want to be explicit.
+2. **`ScopedOutboundContext`** — a per-conversation wrapper exposed to skills via the `outboundContext` capability. Pre-binds `conversationId` so skills don't need to know it. Exposes only `register` and `release`, plus `defaultExpiryHours` / `explicitExpiryHours` / `defaultExpiryHoursFor(channelId)` for skills that want to be explicit.
 
 ### The `outboundContext` Skill Capability
 
@@ -466,7 +492,8 @@ Skills that currently use the capability:
 - `email-send` — auto-registers on every successful send; honors explicit `context_bridge` JSON input.
 - `email-reply` — same pattern; the registered entry covers the *reply we just sent*, not the original message.
 - `signal-send` — same pattern.
-- `context-bridge-release` — **coordinator-only** skill (enforced via `allowed_callers`, see [spec 03](03-skills-and-execution.md)). Lets the coordinator explicitly close a thread when the LLM detects the conversation has concluded, freeing the slot before TTL expiry.
+- `context-bridge-release` — closes a thread when the LLM detects the conversation has concluded, freeing the slot before TTL expiry. Open to any agent since #1972 (no `allowed_callers`): an agent may release an entry with no delegation hint or one it owns, and the tool refuses an entry whose hint names another agent. To route a reply to that agent, the caller passes the entry id to `delegate` as `outbound_entry_id`; the platform releases the entry when the specialist returns.
+- `context-bridge-keep-open` — called by the specialist handling a routed reply to hold the entry open when the exchange still needs another answer from the principal on it (#1972).
 
 A shared helper module `src/dispatch/context-bridge-parse.ts` (not a skill — it's used internally by send-skill handlers) normalizes the optional `context_bridge` JSON string input into the structured `OutboundContextEntry` shape consumed by `register()`.
 
@@ -474,9 +501,9 @@ A shared helper module `src/dispatch/context-bridge-parse.ts` (not a skill — i
 
 All send-skill handlers register an outbound context entry on success — **regardless of whether the caller passed an explicit `context_bridge` input**. This fixes the v1 bug (#609) where proactive outbounds frequently shipped without a memo and the reply arrived as a context-less inbound.
 
-- **Auto-registered entries** carry the agent ID and content preview only. They expire in `defaultExpiryHours` (6h default).
-- **Explicit entries** (caller passed `context_bridge` JSON) carry the full hint set and expire in `explicitExpiryHours` (24h default).
-- A caller-specified `expires_in_hours` in the JSON always overrides the defaults.
+- **Auto-registered entries** carry the agent ID and content preview only. They expire after the **channel's** default window — 72h on email, 6h on synchronous chat channels.
+- **Explicit entries** (caller passed `context_bridge` JSON) carry the full hint set and expire in `explicitExpiryHours` (24h default), raised to the channel default when that is longer so an annotated entry never outlives less than a bare one.
+- A caller-specified `expires_in_hours` in the JSON always overrides the defaults, in either direction.
 
 ### TTL Configuration
 
@@ -484,21 +511,35 @@ Defaults live under `contextBridge.*` in `config/default.yaml`:
 
 ```yaml
 contextBridge:
-  defaultExpiryHours: 6      # auto-registered entries (proactive sends without metadata)
+  defaultExpiryHours: 6      # channels with no per-channel entry below
   explicitExpiryHours: 24    # entries with explicit context_bridge JSON
+  channelDefaultExpiryHours: # per-channel auto-registration windows
+    email: 72
 ```
+
+The auto-registration TTL is channel-aware because reply rhythms are (#1816): email correspondence runs on business days, so a flat 6h window expired roughly 15 hours before a recipient who answered the next morning, and their reply arrived as an unrecognised cold inbound. Channels absent from `channelDefaultExpiryHours` fall through to `defaultExpiryHours`; raising that global value does not pull a per-channel value down to it. The resolved TTL and its source are logged at registration.
 
 Agent-specific overrides (e.g. `debrief.contextBridgeTtlHours = 48`) are passed via the explicit `context_bridge.expires_in_hours` field by the calling agent.
 
 ### Dispatcher Injection
 
-On every inbound message, the dispatcher:
+On every **dispatcher-routed principal** inbound (`liveTurn: true`), the dispatcher:
 
-1. Queries `OutboundContextService.getActive()` for non-released, non-expired entries.
+1. Queries `OutboundContextService.getActive()` for the newest non-released, non-expired entries system-wide (conversation-agnostic — proactive sends register under bullpen/scheduler/peer ids that differ from the reply conversation; see ADR-019 / #1817).
 2. If any exist, calls `formatInjectionBlock(entries, originalContent)` to prepend an `[ACTIVE OUTBOUND CONTEXT — messages you've sent that may receive replies]` block to the content the coordinator sees.
-3. Each block includes `entry_id`, channel, originating agent, age, expiry-relative time, content preview, and any explicit hint fields.
+3. Each block keeps the key name `entry_id` (for `context-bridge-release`) but labels it as an outbound_context UUID — not a Nylas/email message id — plus channel, originating agent, age, expiry-relative time, content preview, and any explicit hint fields.
 
-The coordinator reads this block, decides whether the inbound is a continuation of an outbound thread, and (if so) delegates to the originating agent — or invokes `context-bridge-release` if the LLM concludes the thread is done.
+Non-principal dispatcher inbounds never get that global block — it is principal-audience content (#1848). Voice inbounds never reach this path; `VoiceRuntime` applies the same `liveTurn` gate on its own injection path (#1598). `stampOriginator()` runs once per dispatcher inbound and supplies that signal.
+
+**Recipient-matched block (#2261, Fix B of #1848).** Each entry records the contact IDs it was sent to (`recipient_contact_ids`, written by all five send skills from verified identities; Signal group sends record the members that passed the trust check). A non-principal sender's inbound gets a block of only the active entries sent to them (`getActiveForRecipient`), headed `[ACTIVE OUTBOUND CONTEXT — messages you sent to this sender that may receive replies]`, with the `recipient-outbound-context` turn guidance (act on the entry the message answers, leave the others open). Every gate decides who can see what and fails closed (`Dispatcher.injectRecipientOutboundContext`):
+
+- the sender is a resolved, **verified**, non-blocked contact, and the message is not machine mail;
+- the channel authenticated this message's sender (`inboundSenderAuthenticated`: Signal, Slack, and email with `senderVerified`; never SMS or voice), since a verified identity alone does not stop a forged From;
+- the conversation is **one-to-one** (`inboundIsOneToOne`: a Signal message with `isGroup: false`, a Slack DM, or an email with `curiaRole: 'to'` and `otherRecipientCount: 0`, which the email adapter sets only when it knows its own address). In a group, a channel or a multi-party email the reply would reach people the entry was never sent to.
+
+The recipient block shows what the sender received, the owning agent's id (the hint's leading word) and `bind_reply: true` where set; `expected reply`, the hint's text and the `context` JSON stay on the principal's block. When the block is injected, the dispatcher records the sender's message on those entries (`recipient_messages`, with their contact id and the injection scan's risk score; an email without its Subject line and quoted thread). Principal blocks list the messages under `messages back from its recipients since it was sent`, each JSON-encoded and labelled untrusted, with a flag when the scan scored it. Task wakes list the waking agent's entries that have any as `messages_back_on_open_sends` (up to 10, the waking task's own sends first); a wake an outside contact started lists only the entries sent to that contact and only their own messages, without `expected_reply`, and an unresolved outsider's wake lists none. Placeholders in the wake payload are filled in before the messages are added, so nothing in a contact's words is substituted. On a turn an outside sender started, `context-bridge-release`, `context-bridge-keep-open` and `delegate`'s `outbound_entry_id` refuse any entry not sent to that sender, and `context-bridge-clear` is refused outright (`src/dispatch/outbound-entry-access.ts`). A contact's answer recorded on a principal-owned task leaves it with the principal. A contact merge re-points `recipient_contact_ids` and the recorded messages' contact ids.
+
+The coordinator reads this block, decides whether the inbound is a continuation of an outbound thread, and (if so) delegates to the originating agent (passing the entry as `outbound_entry_id`) — or invokes `context-bridge-release` if the LLM concludes the thread is done and the entry is not another agent's.
 
 ### Coordinator Delegation Guidance
 
@@ -510,7 +551,7 @@ A scheduled job runs `cleanupExpired()` on a fixed cadence. The dispatcher's rea
 
 ### Cross-References
 
-- [Spec 03 — Skills and Execution](03-skills-and-execution.md): the `outboundContext` capability surface and the coordinator-only `allowed_callers` restriction on `context-bridge-release`.
+- [Spec 03 — Skills and Execution](03-tools-and-execution.md): the `outboundContext` capability surface.
 - [Spec 04 — Channels](04-channels.md): how `email-send` / `email-reply` / `signal-send` register entries on successful send.
 - [Spec 15 — Outbound Safety](15-outbound-safety.md): how outbound-safety gates interact with auto-registration — registration happens on success only, after the safety pipeline has cleared the message.
 - [Spec 17 — Meeting Debrief](17-meeting-debrief.md): the debrief agent uses the outbound context bridge with a 48-hour TTL to claim replies to its proactive prompts.
@@ -547,7 +588,7 @@ A scheduled job runs `cleanupExpired()` on a fixed cadence. The dispatcher's rea
 |---|---|
 | **01 — Memory System** | Entity context reads from the KG (nodes, edges, facts). The assembly pipeline is a read-only query pattern — it does not write to the KG. Fact categories in the payload map to the KG's `fact` node type. |
 | **02 — Agent System** | Agent self-identity (Curia's contact record) is seeded at bootstrap. The agent's contactId is injected into the coordinator's system prompt. |
-| **03 — Skills & Execution** | `entity_enrichment` manifest declaration is a new feature of the execution layer. `ctx.entityContext` is a new field on `SkillContext`. The `entity-context` skill is a new local skill. |
+| **03 — Skills & Execution** | `entity_enrichment` manifest declaration is a new feature of the execution layer. `ctx.entityContext` is a new field on `ToolContext`. The `entity-context` skill is a new local skill. |
 | **09 — Contacts & Identity** | Contacts are the identity resolution layer for person entities. Entity-context reads from contacts but does not modify them. The agent's seeded contact record is a new bootstrap step. |
 
 ---
@@ -556,7 +597,7 @@ A scheduled job runs `cleanupExpired()` on a fixed cadence. The dispatcher's rea
 
 - **Entity context is read-only.** The assembly pipeline queries the KG, contacts, and connected accounts but never writes. All mutations go through their respective services (ContactService, EntityMemory).
 - **No cross-entity leakage.** The entity-context payload includes only the requested entities. A skill asking for Jenna's context does not receive the CEO's connected accounts.
-- **Cached context respects mutations.** The TTL cache is invalidated on contact/KG writes. Stale context is a convenience issue (slightly outdated preferences), not a security issue (wrong person's data).
+- **Cached context is TTL-bounded, with an archival live-check.** A 5-minute TTL caps staleness for ordinary mutations. Archival is a correctness boundary (#1707): cache hits re-validate `archived_at IS NULL` on the entity node, and DreamEngine flushes the cache after a decay pass that archives anything. Per-mutation invalidation (`clearCacheForEntity`) exists but is not yet wired to the contact/KG write paths (see Known Deficiencies). Stale *preferences* from an unwired write are a convenience issue; stale *retired* knowledge is not served.
 - **Agent self-identity is seeded, not self-created.** Curia's contact record is created during bootstrap by the orchestrator, not by the agent itself. The agent cannot modify its own identity.
 - **LLM sees entity IDs, not raw KG internals.** The payload exposes curated facts with labels, not raw JSONB properties or internal node IDs beyond what's needed for skill invocation.
 
@@ -566,7 +607,7 @@ A scheduled job runs `cleanupExpired()` on a fixed cadence. The dispatcher's rea
 
 1. **Fact categorization: freeform with convention.** The `category` field is a plain string, not an enum. Common values (`preference`, `identifier`, `location`, `scheduling`, `faith`, etc.) emerge by convention. No schema enforcement — new categories appear naturally as the KG grows.
 
-2. **Connected account discovery: proactive.** When the pipeline finds an entity with no connected accounts, it checks available providers (e.g., Nylas) and surfaces discoverable accounts in the payload. These are not auto-linked — the LLM prompts the user to confirm.
+2. **Connected account discovery: proactive.** The resolved design has the pipeline, on finding an entity with no connected accounts, check available providers (e.g., Nylas) and surface discoverable accounts in the payload — not auto-linked; the LLM prompts the user to confirm. This is the decided approach, not yet the implemented one: the `discoveredAccounts` field is still pending (see [Known Deficiencies](#known-deficiencies)).
 
 3. **Entity search: separate `entity-lookup` skill.** `contact-lookup` stays focused on people — identity resolution is high-stakes and mistakes have real consequences. A new `entity-lookup` skill handles broad KG search (orgs, events, places, projects) where fuzzy matching is acceptable.
 
@@ -576,82 +617,13 @@ A scheduled job runs `cleanupExpired()` on a fixed cadence. The dispatcher's rea
 
 ---
 
-## Implementation Checklist
+## Known Deficiencies
 
-### Phase 1: Foundation
-- [ ] Agent self-identity: KG node + contact record for Curia, bootstrap seeding
-- [ ] Agent contactId injection into coordinator system prompt
-- [ ] Entity-context assembly module (`src/entity-context/`)
-- [ ] Proactive account discovery in the assembly pipeline
-- [ ] `entity-context` skill (manifest + handler)
-- [ ] `ctx.entityContext` field on `SkillContext`
-- [ ] `entity_enrichment` manifest declaration support in execution layer
-- [ ] TTL cache for entity context payloads
-- [ ] Cache invalidation on contact/KG mutations
-- [ ] Unit tests: entity-context assembly for person, org, event entities
-- [ ] Unit tests: execution layer pre-enrichment
-- [ ] Unit tests: cache behavior (hit, miss, invalidation)
-
-### Phase 2: Calendar adoption
-- [ ] Calendar skills adoption (list-events, create-event, find-free-time, check-conflicts)
-- [ ] Remove `calendarId` from LLM-visible tool definitions
-- [ ] Integration test: end-to-end "What's on Jenna's calendar?" flow
-
-### Phase 3: Broader adoption
-- [ ] `entity-lookup` skill for broad KG entity search (orgs, events, places)
-- [ ] Knowledge skills adoption (travel-preferences, loyalty-programs, etc.)
-- [ ] Email skills adoption (when email connected accounts are added)
-
----
-
-## Implementation Status
-
-### Phase 1: Foundation
-
-| Item | Status |
-|---|---|
-| Agent self-identity: KG node + contact record, bootstrap seeding | Done |
-| Agent contactId injection into coordinator system prompt | Done |
-| Entity-context assembly module (`src/entity-context/`) | Done |
-| `entity-context` skill (manifest + handler) | Done |
-| `ctx.entityContext` field on `SkillContext` | Done |
-| `entity_enrichment` manifest declaration support in execution layer | Done |
-| TTL cache for entity context payloads | Done |
-| Cache invalidation on contact/KG mutations | Done |
-| Proactive account discovery (`discoveredAccounts` field) | Not done |
-| Unit tests: entity-context assembly | Done |
-| Unit tests: execution layer pre-enrichment | Done |
-| Unit tests: cache behavior (hit, miss, invalidation) | Done |
-
-### Phase 2: Calendar adoption
-
-| Item | Status |
-|---|---|
-| Calendar skills declare `entity_enrichment` in their manifests | Not done |
-| Remove `calendarId` from LLM-visible tool definitions | Not done |
-| Integration test: end-to-end "What's on Jenna's calendar?" flow | Not done |
-
-### Phase 3: Broader adoption
-
-| Item | Status |
-|---|---|
-| `entity-lookup` skill for broad KG entity search (orgs, events, places) | Not done |
-| Knowledge skills adoption (travel-preferences, loyalty-programs, etc.) | Not done |
-| Email skills adoption (when email connected accounts are added) | Not done |
-
-### Outbound Context Bridge (v2)
-
-| Item | Status |
-|---|---|
-| `outbound_context` table + partial index (migration 042) | Done |
-| `OutboundContextService` with full CRUD + injection-block formatting | Done |
-| `ScopedOutboundContext` + `outboundContext` skill capability | Done |
-| `context-bridge-parse` helper module (`src/dispatch/`) for skill input normalization | Done |
-| `context-bridge-release` coordinator-only skill | Done |
-| Unconditional auto-registration in `email-send` / `email-reply` / `signal-send` | Done |
-| Two-tier TTL config (`contextBridge.defaultExpiryHours` / `explicitExpiryHours`) | Done |
-| Dispatcher injection of `[ACTIVE OUTBOUND CONTEXT]` block on inbound | Done |
-| Periodic cleanup of expired/released rows (scheduled job) | Done |
-| Coordinator delegation-hint guidance in system prompt | Done |
-| v1 `context-memo.ts` write path removed | Done |
-| v1 `context-memo.ts` module deleted | Done |
+- **Proactive account discovery** — the `discoveredAccounts` field in the entity-context assembly pipeline is not yet implemented.
+- **Cache invalidation on mutations is not wired** — `EntityContextAssembler.clearCacheForEntity()` exists and is unit-tested, but no contact/KG write path (`ContactService`, `EntityMemory`) actually calls it. Cached entity context for ordinary mutations (renames, new facts) is bounded only by the 5-minute TTL. Archival is handled separately: cache hits re-check `archived_at`, and DreamEngine flushes the cache after a decay pass that archives (#1707). Remaining gap is convenience-level staleness, not retired knowledge leaking back into context.
+- **Calendar `entity_enrichment` manifests** — calendar skills do not yet declare `entity_enrichment` in their manifests. (#544)
+- **Remove `calendarId` from tool definitions** — `calendarId` has not yet been removed from LLM-visible tool definitions; pending cleanup.
+- **Calendar integration test** — the end-to-end "What's on Jenna's calendar?" integration test is not yet implemented. (#544)
+- **`entity-lookup` skill** — the broad KG entity search skill (orgs, events, places) is not yet implemented.
+- **Knowledge-skills adoption** — knowledge skills (travel-preferences, loyalty-programs, etc.) have not yet adopted entity context enrichment.
+- **Email-skills adoption** — email skills adoption is not yet implemented (pending email connected accounts).

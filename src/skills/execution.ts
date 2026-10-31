@@ -2,7 +2,7 @@
 //
 // This is the security boundary between agents and the outside world.
 // It resolves skills from the registry, validates permissions, provides
-// a sandboxed SkillContext, enforces timeouts, and sanitizes outputs.
+// a sandboxed ToolContext, enforces timeouts, and sanitizes outputs.
 //
 // Normal skills get: validated input, scoped secret access, a scoped logger,
 // and universal services (contactService, entityContextAssembler, agentPersona).
@@ -17,35 +17,134 @@
 // before invoking the handler. The handler receives ctx.entityContext[] and
 // never needs to call entity-context itself.
 
-import type { SkillResult, SkillContext, CallerContext, AgentPersona, ToolDefinition, SkillManifest } from './types.js';
+import type { ToolResult, ToolContext, CallerContext, AgentPersona, ToolDefinition, ToolManifest, ActionRisk } from './types.js';
 import { normalizeTimestamp } from '../time/timestamp.js';
-import { isPrincipalOriginated, isSystemOriginated, getInitiatingTier, isExternalOriginatorMissingTier } from '../contacts/principal.js';
-import { applyActionPolicy, mapActionRiskToConsequenceClass, moreSevereConsequence } from '../autonomy/escalation-policy.js';
+import { isPrincipalOriginated, isLivePrincipalTurn, getInitiatingTier, isExternalOriginatorMissingTier } from '../contacts/principal.js';
+import { resolvePrincipalIsSoleRecipientFromSkillInput, isSolelyInitiatingSender } from '../contacts/principal-recipient.js';
+import { findCarveoutSkill } from '../contacts/principal-channel-registry.js';
+import { emailAccountIdFromInput } from '../channels/email/account-id.js';
+import { ReplyToMessageIdShapeError } from '../channels/email/principal-rules.js';
+import {
+  looksLikeOutboundContextEntryId,
+  replyToMessageIdLooksLikeEntryIdError,
+  validateNylasMessageId,
+} from '../channels/email/nylas-message-id.js';
+import type { ChannelIdentity } from '../contacts/types.js';
+import { provenanceSourceText } from '../contacts/identifier-provenance.js';
+import { applyActionPolicy, mapActionRiskToConsequenceClass, moreSevereConsequence, KG_WRITE_TOOLS } from '../autonomy/escalation-policy.js';
 import type { ActionConsequenceClass, EscalationDecision } from '../autonomy/escalation-policy.js';
 import type { EscalationJudge } from '../autonomy/escalation-judge.js';
 import type { ContactTier } from '../contacts/types.js';
-import type { SkillRegistry } from './registry.js';
+import type { ToolRegistry } from './registry.js';
+import type { SkillRegistry } from './skill-registry.js';
+import { unifiedToolSearch, resolveSkillActivation } from './skill-activation.js';
 import { sanitizeOutput, sanitizeObjectOutput } from './sanitize.js';
-import { createSecretAccessed, createAutonomySkillBlocked } from '../bus/events.js';
+import {
+  isHumanReplySkill,
+  ORIGIN_TURN_OWNS_REPLY_ERROR,
+  ORIGIN_TURN_OWNS_REPLY_KEY,
+  parseOriginTurnOwnsReply,
+} from '../dispatch/origin-turn-reply.js';
+import { createSecretAccessed, createAutonomySkillBlocked, createAuthorizationDecision, createPrincipalReport } from '../bus/events.js';
 import type { Logger } from '../logger.js';
 import type { EventBus } from '../bus/bus.js';
 import type { AgentRegistry } from '../agents/agent-registry.js';
 import type { ContactService } from '../contacts/contact-service.js';
-import type { OutboundGateway } from './outbound-gateway.js';
+import { UnknownEmailAccountError, type OutboundGateway } from './outbound-gateway.js';
+
+/**
+ * Per-invoke wrapper so Gate C and the handler share one `getEmailMessage`
+ * snapshot. Closes the TOCTOU window between the set Gate C judged and the
+ * set the handler sends, and avoids a second Nylas round trip (#1815).
+ *
+ * The cache key is `${accountId ?? ''}\0${messageId}`. Both callers must pass
+ * the account from `emailAccountIdFromInput` and the id from
+ * `replyToMessageIdFromInput` — a second parser misses this cache (#1832).
+ */
+function withCachedGetEmailMessage(
+  gateway: OutboundGateway,
+  cache: Map<string, ReturnType<OutboundGateway['getEmailMessage']>>,
+): OutboundGateway {
+  const getEmailMessage: OutboundGateway['getEmailMessage'] = (messageId, accountId) => {
+    const key = `${accountId ?? ''}\0${messageId}`;
+    const cached = cache.get(key);
+    if (cached) return cached;
+    const pending = gateway.getEmailMessage(messageId, accountId);
+    cache.set(key, pending);
+    return pending;
+  };
+  return new Proxy(gateway, {
+    get(target, prop, receiver) {
+      if (prop === 'getEmailMessage') return getEmailMessage;
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value === 'function') {
+        return (value as (...args: never[]) => unknown).bind(target);
+      }
+      return value;
+    },
+  });
+}
 import type { SchedulerService } from '../scheduler/scheduler-service.js';
 import type { EntityMemory, CreateEntityOptions, StoreFactResult } from '../memory/entity-memory.js';
+import type { SensitivityClassifier } from '../memory/sensitivity.js';
 import type { StoreFactOptions } from '../memory/types.js';
 import { createMemoryStore } from '../bus/events.js';
 import type { NylasCalendarClient } from '../channels/calendar/nylas-calendar-client.js';
 import type { EntityContextAssembler } from '../entity-context/assembler.js';
 import { AutonomyService } from '../autonomy/autonomy-service.js';
 import type { AutonomyConfig } from '../autonomy/autonomy-service.js';
+import { HUMAN_SEND_SKILLS, isSpotCheckOrAbove, type AutonomyGating } from '../autonomy/band-policy.js';
+import type { SendEvidenceCollector } from '../autonomy/send-evidence.js';
+import type { BriefEvidence, BriefQuestion } from '../autonomy/judge-brief.js';
+import { meetsMinimumTier } from '../contacts/types.js';
+import { computeEffectiveTaskMetadata, DEFAULT_BYPASS_LADDER } from '../autonomy/effective-standing.js';
+import type { BypassLadderConfig } from '../autonomy/effective-standing.js';
 import type { BrowserService } from '../browser/browser-service.js';
-import type { ApprovalTriggerService } from '../autonomy/approval-trigger.js';
+import { formatAuthorizationSubjectSummary } from '../contacts/authorization.js';
+import { approvalAdvisory, buildDescription, type ApprovalTriggerService } from '../autonomy/approval-trigger.js';
+import { formatEmailSummary, isNoOpResult, isSampledTool, sampleEmailFromResult, TRIAGE_SKILLS } from '../autonomy/sample-pool.js';
 import { TempFileStore } from './temp-file-store.js';
 import type { InfraLlmService } from './infra-llm.js';
 import { OutboundContextService, ScopedOutboundContext } from '../dispatch/outbound-context.js';
+import type { TaskOutreachCapability } from '../dispatch/task-outreach-capability.js';
+import type { DisclosureDecisionRecorder } from '../autonomy/disclosure-decisions.js';
+import { relayRequesterFor, rosterFromRegistry } from '../dispatch/delegation-hint.js';
 import { buildRateLimitSourceKey } from '../memory/rate-limit-key.js';
+import { DEFAULT_RESUMABLE_CEILINGS, type ResumableCeilingsConfig } from '../config.js';
+import type { ExportControlService } from '../security/export-controls.js';
+import {
+  MCP_EXPORT_TOOLS,
+  GATEWAY_ATTACHMENT_TOOLS,
+  ExportControlService as ExportControlServiceClass,
+  extractDestinationFromInput,
+  formatDestination,
+  maxItemSensitivity,
+} from '../security/export-controls.js';
+import { createExportDelivered } from '../bus/events.js';
+import { isDbUnavailableError } from '../db/resilience.js';
+import { USER_SECRET_PREFIX } from '../secrets/user-secret-name.js';
+import { splitCommaSeparatedAddresses } from '../contacts/principal-carveout-parse.js';
+import type { ErrorType } from '../errors/types.js';
+import type { VerificationRuntime } from '../verification/index.js';
+import {
+  RECIPIENT_REFERENCE_SKILLS,
+  addressOrReferenceError,
+  emptyRecipientListError,
+  findRetiredRecipientField,
+  formatResolvedRecipient,
+  parseRecipientReference,
+  resolveRecipientReference,
+  retiredRecipientFieldError,
+  sendPinsMatch,
+  STALE_SEND_APPROVAL_ERROR,
+  type RecipientReferenceFields,
+  type SendRecipientPin,
+} from './_shared/recipient-reference.js';
+
+export { STALE_SEND_APPROVAL_ERROR };
+
+/** Contact references one send may name across to/cc/recipient (#2033). */
+const MAX_SEND_REFERENCES = 25;
 
 // Default max output length — used when no value is configured in default.yaml.
 // Skills returning more than this will have their output truncated before it
@@ -58,14 +157,31 @@ const DEFAULT_SKILL_OUTPUT_MAX_LENGTH = 200_000;
 // trust boundary established by #971: it cannot name a system key (snake_case, e.g.
 // `anthropic_api_key`) or a channel credential (`channel.*`), so form-fill material is
 // structurally separated from privileged secrets.
-const USER_SECRET_PREFIX = 'user.';
 
 // Hard allowlist of skills permitted to declare and use the `secretResolver` capability.
 // Mirrors the executionLayer→approve-action restriction below: declaring the capability in
-// skill.json is necessary but NOT sufficient — the skill name must also appear here. Kept as
+// tool.json is necessary but NOT sufficient — the skill name must also appear here. Kept as
 // a set so sibling skills that legitimately need by-reference injection (e.g. a future
 // http-request skill) can be added deliberately rather than by manifest edit alone.
-export const SECRET_RESOLVER_ALLOWED_SKILLS: ReadonlySet<string> = new Set(['web-browser']);
+export const SECRET_RESOLVER_ALLOWED_TOOLS: ReadonlySet<string> = new Set(['web-browser']);
+
+// Names-only `user.*` index (#1497) — see ctx.listUserSecretNames.
+// Hard-allowlisted to list-user-secrets: declaring userSecretIndex elsewhere has no effect.
+export const USER_SECRET_INDEX_ALLOWED_TOOLS: ReadonlySet<string> = new Set(['list-user-secrets']);
+
+/**
+ * The one tool whose input skips the default-deny sign-in-code scrub (#2017): it must
+ * receive the real code to type it, and its own destination guard decides where.
+ */
+const SIGN_IN_CODE_SCRUB_EXEMPT_TOOL = 'web-browser';
+
+/** Gate advisory tail when the blocked call carries a sign-in code (#2017). */
+const NO_APPROVAL_FOR_SIGN_IN_CODE =
+  'No approval request was created: this call carries a sign-in code, and a sign-in code is never ' +
+  'stored for approval. Tell the principal the sign-in could not be finished at the current autonomy level.';
+
+/** Appended when an object result is too large and collapsed to a string (#1487). */
+const OBJECT_OUTPUT_TRUNCATED_MARKER = '[truncated — output exceeded limit]';
 
 /** Options passed to ExecutionLayer.invoke() by the agent runtime. */
 export interface InvokeOptions {
@@ -76,11 +192,43 @@ export interface InvokeOptions {
   parentEventId?: string;
   /** Task-level metadata forwarded from the agent.task event payload. */
   taskMetadata?: Record<string, unknown>;
+  /** Live-principal-turn signal (#1126) — forwarded from agent.task.payload.liveTurn, distinct
+   *  from taskMetadata so it can never be swept into a persisted row. The elevated-skill gate
+   *  requires it (plus principal lineage). Stamped only on fresh principal inbounds and forwarded
+   *  by `delegate` across a synchronous delegation. */
+  liveTurn?: boolean;
   /** When true, autonomy gates (A and B) are skipped — the skill runs as if the
    *  score were sufficient. Only the approve-action skill (#428) should set this.
    *  All other checks (elevated-skill gate, content filter, blocked-contact) still run.
    *  See ADR-018. */
   humanApproved?: boolean;
+  /**
+   * Hinted recipients recorded when the approval was filed. On a humanApproved
+   * replay, the send is refused unless each one still resolves to the same
+   * identity and name (#2047).
+   */
+  sendResolution?: readonly SendRecipientPin[];
+  /** Per-task-turn guard against blind identical re-delegation (#1171). Owned by the agent
+   *  runtime; forwarded to the delegate skill for defense in depth. */
+  delegationGuard?: import('../agents/delegation-guard.js').DelegationGuard;
+  /** date-resolve outputs from earlier in this agent turn (#1612). Forwarded to delegate. */
+  turnDateResolveResults?: readonly import('../agents/delegate-brief-date-validation.js').TurnDateResolveResult[];
+  /**
+   * Inbound channel sender identifier from agent.task.payload.senderId (#1815).
+   * Gate C uses it to compare resolved recipients against the initiating sender.
+   */
+  senderId?: string;
+  /**
+   * Where an identifier an agent enters may have come from (#2061, ADR-047). Built by the
+   * agent runtime per task and forwarded to the skill as `ctx.identifierSources`.
+   */
+  identifierSources?: import('../contacts/identifier-provenance.js').IdentifierSources;
+  /**
+   * Aborts when a same-contact follow-up is queued on this turn (#2018). Set only
+   * when turn injection is on, the turn is laned, and late delivery is enabled.
+   * The delegate handler ends its wait; it does not cancel the specialist.
+   */
+  inputSignal?: AbortSignal;
 }
 
 /** Cap on the input rendering passed to the escalation judge — keeps full email bodies and
@@ -94,14 +242,19 @@ const JUDGE_INPUT_DESCRIPTION_MAX_LENGTH = 1000;
  * The judge's action classifier expects a short description (e.g. "send an email to X") and
  * decides isThirdPartyFacing from the target it sees. We surface the skill's purpose plus a
  * length-capped rendering of its inputs — the recipient/target fields (e.g. `to`) are what
- * let the judge distinguish a reply-to-sender from a message to a third party. The judge
- * JSON-encodes and treats this as opaque data, so embedded content cannot alter the verdict.
+ * let the judge distinguish a reply-to-sender from a message to a third party. The initiating
+ * sender identifier and resolved recipient set are JSON-encoded as separate clauses so they
+ * survive input truncation and cannot alter the verdict via embedded punctuation (#1815).
  * A vague or truncated description fails safe: the judge leans toward escalate.
  */
 function buildActionDescription(
-  skillName: string,
-  manifest: SkillManifest,
+  toolName: string,
+  manifest: ToolManifest,
   input: Record<string, unknown>,
+  extras?: {
+    initiatingSender?: readonly string[];
+    resolvedRecipients?: readonly string[] | null;
+  },
 ): string {
   let inputJson: string;
   try {
@@ -113,11 +266,25 @@ function buildActionDescription(
   if (inputJson.length > JUDGE_INPUT_DESCRIPTION_MAX_LENGTH) {
     inputJson = inputJson.slice(0, JUDGE_INPUT_DESCRIPTION_MAX_LENGTH) + '…(truncated)';
   }
-  return `Skill "${skillName}" (${manifest.description}). Invocation input: ${inputJson}`;
+  // JSON-encode every variable fragment so a header/identifier cannot inject
+  // a fake "Resolved recipients:" clause into the classifier prompt.
+  const senderLabel = extras?.initiatingSender && extras.initiatingSender.length > 0
+    ? JSON.stringify(extras.initiatingSender)
+    : JSON.stringify('(unknown)');
+  const recipientsLabel = extras?.resolvedRecipients && extras.resolvedRecipients.length > 0
+    ? JSON.stringify(extras.resolvedRecipients)
+    : JSON.stringify('(not resolved)');
+  return (
+    `Skill "${toolName}" (${manifest.description}). ` +
+    `Initiating sender: ${senderLabel}. ` +
+    `Resolved recipients: ${recipientsLabel}. ` +
+    `Invocation input: ${inputJson}`
+  );
 }
 
 export class ExecutionLayer {
-  private registry: SkillRegistry;
+  private registry: ToolRegistry;
+  private skillRegistry?: SkillRegistry;
   private logger: Logger;
   private bus?: EventBus;
   private agentRegistry?: AgentRegistry;
@@ -138,18 +305,32 @@ export class ExecutionLayer {
   private bullpenService?: import('../memory/bullpen.js').BullpenService;
   private approvalTrigger?: ApprovalTriggerService;
   private escalationJudge?: EscalationJudge;
+  private gating: AutonomyGating;
+  private sendEvidence?: Pick<SendEvidenceCollector, 'collect'>;
   private actionLogRepo?: import('../autonomy/action-log-repo.js').ActionLogRepo;
+  private approvalDelivery?: import('../autonomy/approval-delivery.js').ApprovalDelivery;
+  private auditLogRepo?: import('../audit/audit-log-repo.js').AuditLogRepo;
+  private diagnosticsRepo?: import('../diagnostics/diagnostics-repo.js').DiagnosticsRepo;
   private taskRepo?: import('../db/task-repo.js').TaskRepo;
+  private workingDocsRepo?: import('../db/working-docs-repo.js').WorkingDocsRepo;
+  /** Backs the 'voiceSessions' capability (#2347). */
+  private voiceSessions?: Pick<import('../channels/voice/session-store.js').VoiceSessionStore, 'markNotesRequested'>;
   private confidencePipeline?: import('../contacts/confidence-pipeline.js').ConfidencePipeline;
   private tempFileStore?: TempFileStore;
   private readonly infraLlmService?: InfraLlmService;
   private outboundContextService?: OutboundContextService;
+  /** Task outreach writer (#2312) — backs the 'taskOutreach' capability. */
+  private taskOutreach?: TaskOutreachCapability;
+  /** The principal's answer to a personal-data ask (#2312) — backs the 'disclosureDecisions' capability. */
+  private disclosureDecisions?: Pick<DisclosureDecisionRecorder, 'recordForApproval'>;
   /** The agent's own contactId — injected into ctx.agentContactId for entity_enrichment default='agent' */
   private agentContactId?: string;
   /** IANA timezone name used for normalizing offset-less timestamp inputs from the LLM. */
   private timezone: string;
   /** Curia's own email address — used by email skills to filter self from CC lists. */
   private selfEmail?: string;
+  /** Every owned mailbox — Gate C reply-all exclusion (#1815). Falls back to `selfEmail`. */
+  private selfEmails: readonly string[];
   /** Max character length for sanitized skill output before truncation. */
   private skillOutputMaxLength: number;
   /** Configurable fallback timeout for the delegate skill when no timeout_ms is supplied. */
@@ -161,8 +342,27 @@ export class ExecutionLayer {
    *  the magic-link URL (appOrigin in prod, http://localhost:{httpPort} in dev). */
   private appOrigin?: string;
   private httpPort?: number;
+  /** Bypass-ladder thresholds (#1125) governing how much lineage standing a woken/derived task
+   *  inherits at the live autonomy score. Defaults to 70 (same-task) / 90 (derived child). */
+  private bypassLadder: BypassLadderConfig;
+  /** Resumable / plan-adaptive ceiling defaults from tasks.resumableCeilings (#1266). */
+  private resumableCeilings: ResumableCeilingsConfig;
+  /** Principal verified channel identities — used by Gate C for structural recipient checks (#1301). */
+  private principalIdentities: readonly ChannelIdentity[];
+  /** Bulk export gates for MCP and attachment exports (#201). */
+  private exportControlService?: ExportControlService;
+  /** Shared sensitivity classifier (#1419) — available to skills declaring
+   *  'sensitivityClassifier' in capabilities. Built once at startup from
+   *  yamlConfig.sensitivity_rules and reused across skills and EntityMemory. */
+  private sensitivityClassifier?: SensitivityClassifier;
+  /** Read-only pending-delegation lookup, attached to `delegate` only (#1858).
+   *  Not a manifest capability: declaring one would fail-closed every ExecutionLayer
+   *  that loads the real delegate tool without a pool (integration tests, smoke). */
+  private openDelegationLookup?: import('../db/queries/pending-delegations.js').OpenDelegationLookup;
+  /** Delegated sign-in verification (#2017). When set, every tool input except web-browser's is scrubbed of tracked codes. */
+  private verification?: VerificationRuntime;
 
-  constructor(registry: SkillRegistry, logger: Logger, options?: {
+  constructor(registry: ToolRegistry, logger: Logger, options?: {
     bus?: EventBus;
     agentRegistry?: AgentRegistry;
     contactService?: ContactService;
@@ -182,21 +382,57 @@ export class ExecutionLayer {
     /** LLM escalation judge — consulted by Gate C only when the tier decision hinges on
      *  whether the action is third-party-facing (a runtime property the manifest can't encode). */
     escalationJudge?: EscalationJudge;
+    /**
+     * Which policy Gate C follows (#2159). Under 'band' the autonomy score decides and the
+     * escalation judge's brief flags an outsider steering Curia or a send that speaks for
+     * the principal. Default 'tier'. A gating on the autonomy config overrides it per call
+     * (#2312): production stamps this same value there; the scenario suite pins it per case.
+     */
+    gating?: AutonomyGating;
+    /** The drafting turn's evidence, for Gate C's band questions (#2159). */
+    sendEvidence?: Pick<SendEvidenceCollector, 'collect'>;
     actionLogRepo?: import('../autonomy/action-log-repo.js').ActionLogRepo;
+    approvalDelivery?: import('../autonomy/approval-delivery.js').ApprovalDelivery;
+    auditLogRepo?: import('../audit/audit-log-repo.js').AuditLogRepo;
+    diagnosticsRepo?: import('../diagnostics/diagnostics-repo.js').DiagnosticsRepo;
     taskRepo?: import('../db/task-repo.js').TaskRepo;
+    workingDocsRepo?: import('../db/working-docs-repo.js').WorkingDocsRepo;
+    /** Backs the 'voiceSessions' capability (#2347). */
+    voiceSessions?: Pick<import('../channels/voice/session-store.js').VoiceSessionStore, 'markNotesRequested'>;
     confidencePipeline?: import('../contacts/confidence-pipeline.js').ConfidencePipeline;
     tempFileStore?: TempFileStore;
     infraLlmService?: InfraLlmService;
     outboundContextService?: OutboundContextService;
+    /** Task outreach writer (#2312) — backs the 'taskOutreach' capability. */
+    taskOutreach?: TaskOutreachCapability;
+    /** The principal's answer to a personal-data ask (#2312) — backs the 'disclosureDecisions' capability. */
+    disclosureDecisions?: Pick<DisclosureDecisionRecorder, 'recordForApproval'>;
     agentContactId?: string;
     timezone?: string;
     selfEmail?: string;
+    /** Every owned mailbox address. When omitted, falls back to `[selfEmail]`. */
+    selfEmails?: readonly string[];
     skillOutputMaxLength?: number;
     defaultDelegateTimeoutMs?: number;
     appOrigin?: string;
     httpPort?: number;
+    bypassLadder?: BypassLadderConfig;
+    resumableCeilings?: ResumableCeilingsConfig;
+    /** Verified principal channel identities for Gate C principal-only carve-out (#1301). */
+    principalIdentities?: readonly ChannelIdentity[];
+    /** Bulk export gate service (#201). */
+    exportControlService?: ExportControlService;
+    /** Shared sensitivity classifier (#1419) — available to skills declaring 'sensitivityClassifier'. */
+    sensitivityClassifier?: SensitivityClassifier;
+    /** Skill (bundle) registry — enables unified discovery + skill-activate (#1495). */
+    skillRegistry?: SkillRegistry;
+    /** Pending-delegation lookup for the delegate skill (#1858). */
+    openDelegationLookup?: import('../db/queries/pending-delegations.js').OpenDelegationLookup;
+    /** Delegated sign-in verification (#2017) — scrubs tracked codes from tool inputs and backs the 'verification' capability. */
+    verification?: VerificationRuntime;
   }) {
     this.registry = registry;
+    this.skillRegistry = options?.skillRegistry;
     this.logger = logger;
     this.bus = options?.bus;
     this.agentRegistry = options?.agentRegistry;
@@ -215,8 +451,15 @@ export class ExecutionLayer {
     this.bullpenService = options?.bullpenService;
     this.approvalTrigger = options?.approvalTrigger;
     this.escalationJudge = options?.escalationJudge;
+    this.gating = options?.gating ?? 'tier';
+    this.sendEvidence = options?.sendEvidence;
     this.actionLogRepo = options?.actionLogRepo;
+    this.approvalDelivery = options?.approvalDelivery;
+    this.auditLogRepo = options?.auditLogRepo;
+    this.diagnosticsRepo = options?.diagnosticsRepo;
     this.taskRepo = options?.taskRepo;
+    this.workingDocsRepo = options?.workingDocsRepo;
+    this.voiceSessions = options?.voiceSessions;
     this.confidencePipeline = options?.confidencePipeline;
     this.tempFileStore = options?.tempFileStore;
     this.infraLlmService = options?.infraLlmService;
@@ -224,10 +467,169 @@ export class ExecutionLayer {
     this.agentContactId = options?.agentContactId;
     this.timezone = options?.timezone ?? 'UTC';
     this.selfEmail = options?.selfEmail;
+    this.selfEmails = options?.selfEmails
+      ?? (options?.selfEmail ? [options.selfEmail] : []);
     this.skillOutputMaxLength = options?.skillOutputMaxLength ?? DEFAULT_SKILL_OUTPUT_MAX_LENGTH;
     this.defaultDelegateTimeoutMs = options?.defaultDelegateTimeoutMs;
     this.appOrigin = options?.appOrigin;
     this.httpPort = options?.httpPort;
+    this.bypassLadder = options?.bypassLadder ?? DEFAULT_BYPASS_LADDER;
+    this.resumableCeilings = options?.resumableCeilings ?? DEFAULT_RESUMABLE_CEILINGS;
+    this.principalIdentities = options?.principalIdentities ?? [];
+    this.exportControlService = options?.exportControlService;
+    this.sensitivityClassifier = options?.sensitivityClassifier;
+    this.openDelegationLookup = options?.openDelegationLookup;
+    this.verification = options?.verification;
+    this.taskOutreach = options?.taskOutreach;
+    this.disclosureDecisions = options?.disclosureDecisions;
+    if (!this.actionLogRepo) {
+      // Once here rather than per call: without the repo no autonomous action reaches the
+      // spot-check pool (#2159 Phase 3), and that should not be invisible.
+      this.logger.warn({ actionLogRepo: false }, 'execution: spot-check pool disabled: no actionLogRepo');
+    }
+  }
+
+  /**
+   * Capability name → wired service (undefined when absent). One map shared by invoke()
+   * and unavailableCapabilities() so the two cannot disagree about what is configured.
+   */
+  private capabilityServiceMap(outboundGateway: OutboundGateway | undefined): Record<string, unknown> {
+    // Explicit lookup map — enumerates every capability-gated service by name.
+    // Using a map rather than `(this as Record<string, unknown>)[cap]` keeps TypeScript
+    // aware that each field is read, satisfying noUnusedLocals.
+    // Field names here MUST match the VALID_CAPABILITIES set in loader.ts.
+    return {
+      bus: this.bus,
+      agentRegistry: this.agentRegistry,
+      outboundGateway,
+      schedulerService: this.schedulerService,
+      entityMemory: this.entityMemory,
+      nylasCalendarClient: this.nylasCalendarClient,
+      autonomyService: this.autonomyService,
+      browserService: this.browserService,
+      bullpenService: this.bullpenService,
+      executiveProfileService: this.executiveProfileService,
+      officeIdentityService: this.officeIdentityService,
+      actionLogRepo: this.actionLogRepo,
+      approvalDelivery: this.approvalDelivery,
+      auditLogRepo: this.auditLogRepo,
+      diagnosticsRepo: this.diagnosticsRepo,
+      taskRepo: this.taskRepo,
+      workingDocs: this.workingDocsRepo,
+      voiceSessions: this.voiceSessions,
+      confidencePipeline: this.confidencePipeline,
+      // tempFileStore is handled as a special case in the injection loop (writeTempFile closure).
+      // Listed here so the missing-cap guard knows it's configured when this.tempFileStore is set.
+      tempFileStore: this.tempFileStore,
+      // executionLayer injects `this` so approve-action can re-invoke blocked skills
+      // with humanApproved: true (see ADR-018). Only approve-action should declare this.
+      executionLayer: this,
+      // infraLlm is a constrained LLM service (classify/extract only, no raw chat)
+      // with full telemetry (llm.call bus events). The narrow API surface IS the
+      // security policy — any skill can declare this capability. See #637.
+      // Listed here so the missing-cap guard knows it's configured when infraLlmService is set.
+      infraLlm: this.infraLlmService,
+      // outboundContext bridges outbound message context into skills. The ScopedOutboundContext
+      // instance is created per-invocation (pre-scoped with conversationId) in the injection loop.
+      // Listed here so the missing-cap guard knows it's configured when outboundContextService is set.
+      outboundContext: this.outboundContextService,
+      // secretCapture is the mint-only minter for agent-initiated secret capture (#971).
+      // Injected as a plain field (default branch in the loop). Listed here so the
+      // missing-cap guard fails closed if a skill declares it before it's wired.
+      secretCapture: this.secretCaptureService,
+      // secretResolver injects the by-reference resolver closure (#973), built in the
+      // loop below. Backed by secretsService — listed here so the missing-cap guard fails
+      // closed when a skill declares the capability but no vault is wired.
+      secretResolver: this.secretsService,
+      // userSecretIndex injects the names-only `user.*` listing closure (#1497). Backed
+      // by secretsService.listUserNames() — listed here so the missing-cap guard fails
+      // closed. The actual injection is a scoped closure; this map entry is presence only.
+      userSecretIndex: this.secretsService,
+      // sensitivityClassifier (#1419) — plain field injection, no special-casing needed.
+      // Classifies free text against config sensitivity_rules; shared with EntityMemory.
+      sensitivityClassifier: this.sensitivityClassifier,
+      // verification (#2017) — plain field injection: the service, code tracker and ask channel.
+      verification: this.verification,
+      // taskOutreach (#2312) — plain field injection: record outreach for a task-bound turn.
+      taskOutreach: this.taskOutreach,
+      // disclosureDecisions (#2312) — plain field injection: approve/deny record the principal's answer to an ask.
+      disclosureDecisions: this.disclosureDecisions,
+    };
+  }
+
+  /**
+   * The outbound-context capability for one invocation, scoped to its conversation.
+   * Attribution (#1972): the platform, not the model's context_bridge JSON, decides
+   * who owns a reply. That needs the roster; without one, entries pass through as
+   * written (unit-test wiring only — bootstrap always passes it).
+   */
+  private scopedOutboundContext(
+    service: OutboundContextService,
+    conversationId: string,
+    options: InvokeOptions | undefined,
+    skillLogger: Logger,
+  ): ScopedOutboundContext {
+    const roster = this.agentRegistry ? rosterFromRegistry(this.agentRegistry) : undefined;
+    return new ScopedOutboundContext(
+      service,
+      conversationId,
+      roster
+        ? {
+            roster,
+            relayRequester: relayRequesterFor({
+              channelId: options?.channelId,
+              taskMetadata: options?.taskMetadata,
+              invokingAgentId: options?.agentId,
+              roster,
+            }),
+            log: skillLogger,
+          }
+        : undefined,
+      // A live verification for the task (pending, or expired within the recent window)
+      // suppresses the task-wake auto-bind (#2017).
+      this.verification
+        ? async (taskId) => (await this.verification!.service.liveForTask(taskId)) !== null
+        : undefined,
+    );
+  }
+
+  /** Declared capabilities this layer cannot satisfy — the same check invoke() fails closed on. */
+  private missingCapabilities(caps: readonly string[], services: Record<string, unknown>): string[] {
+    return caps.filter(cap => {
+      if (cap === 'toolSearch') return false; // toolSearch is synthesized, not a field on `this`
+      if (cap === 'skillRegistry') return this.skillRegistry === undefined;
+      return services[cap] === undefined;
+    });
+  }
+
+  /**
+   * Capabilities `toolName` declares that this layer has no service for. A non-empty
+   * result means invoke() will refuse the tool. Lets a caller that deliberately leaves
+   * services unwired (the test-mode stack, #1966) report which tools are disabled.
+   */
+  unavailableCapabilities(toolName: string): string[] {
+    const caps = this.registry.get(toolName)?.manifest.capabilities ?? [];
+    return this.missingCapabilities(caps, this.capabilityServiceMap(this.outboundGateway));
+  }
+
+  /**
+   * The part of a successful `toolName` result that is source text for identifier
+   * provenance (#2061), or null. Null unless the manifest sets `provenance_source`, and
+   * for a call that reads drafts (a `folder` naming drafts, or a `draft_id`): a draft may
+   * be Curia's, and for an object result invoke() collapsed to a truncated string.
+   * Otherwise every string in the result except messages from Curia's own
+   * addresses and drafts (provenanceSourceText). The runtime asks after each result, so a
+   * stubbed result in smoke or scenarios is recorded just like a real one.
+   */
+  provenanceSourceText(toolName: string, input: Record<string, unknown>, data: unknown): string | null {
+    if (this.registry.get(toolName)?.manifest.provenance_source !== true) return null;
+    const folder = input['folder'];
+    if (typeof folder === 'string' && /draft/i.test(folder)) return null;
+    if (input['draft_id'] !== undefined && input['draft_id'] !== null && input['draft_id'] !== '') return null;
+    // An object result collapsed to a truncated string has lost the structure that tells
+    // Curia's own messages and drafts apart, so none of it counts.
+    if (typeof data === 'string' && data.endsWith(OBJECT_OUTPUT_TRUNCATED_MARKER)) return null;
+    return provenanceSourceText(data, this.selfEmails);
   }
 
   /**
@@ -243,7 +645,7 @@ export class ExecutionLayer {
    * Sanitize a skill error message and wrap it in <skill_error> tags.
    *
    * Wrapping in a structured tag serves two purposes:
-   * 1. The skill.result bus event carries clearly-typed error data for the audit log.
+   * 1. The tool.result bus event carries clearly-typed error data for the audit log.
    * 2. If the error string ever reaches the LLM directly, it reads as structured data
    *    rather than a free-form instruction that could be mistaken for a system directive.
    *
@@ -270,6 +672,36 @@ export class ExecutionLayer {
   }
 
   /**
+   * The escalation judge's description of a call (buildActionDescription), with any tracked
+   * sign-in code scrubbed (#2017). Every judge prompt goes through here: the scrub-exempt
+   * tool's input still carries the real code, and the judge needs the action, not the code.
+   * Every other tool's input was already scrubbed on entry; scrubbing again is a no-op.
+   */
+  private describeActionForJudge(
+    toolName: string,
+    manifest: ToolManifest,
+    input: Record<string, unknown>,
+    extras?: Parameters<typeof buildActionDescription>[3],
+  ): string {
+    const tracker = this.verification?.tracker;
+    return buildActionDescription(toolName, manifest, tracker ? tracker.scrubDeep(input) : input, extras);
+  }
+
+  /**
+   * True when `input` still carries a tracked sign-in code (#2017). Only the scrub-exempt
+   * tool can: every other tool's input was scrubbed on entry. Such an input is never queued
+   * for approval, because an approval stores the input verbatim (and re-runs it on approve)
+   * and shows it to the approver: the code would land in the approval row, the digest
+   * mention and the approval message. Scrubbing the stored copy is no answer either: the
+   * approved call would then type "[sign-in code]".
+   */
+  private holdsUnscrubbedCode(toolName: string, input: Record<string, unknown>): boolean {
+    const tracker = this.verification?.tracker;
+    if (!tracker || toolName !== SIGN_IN_CODE_SCRUB_EXEMPT_TOOL) return false;
+    return JSON.stringify(tracker.scrubDeep(input)) !== JSON.stringify(input);
+  }
+
+  /**
    * Build the advisory error message for a gate block, optionally triggering
    * an approval request via ApprovalTriggerService.
    *
@@ -278,17 +710,20 @@ export class ExecutionLayer {
    * Otherwise, returns the existing error message unchanged (fail-open).
    */
   private async buildGateError(
-    skillName: string,
+    toolName: string,
     input: Record<string, unknown>,
     currentScore: number,
     requiredScore: number,
     actionRisk: string | number,
     options: InvokeOptions | undefined,
     skillLogger: Logger,
+    sendResolution?: readonly SendRecipientPin[],
   ): Promise<string> {
     const baseMsg =
-      `Skill '${skillName}' blocked — autonomy score is ${currentScore}, ` +
+      `Tool '${toolName}' blocked — autonomy score is ${currentScore}, ` +
       `but this skill (action_risk: ${String(actionRisk)}) requires ${requiredScore}. `;
+
+    if (this.holdsUnscrubbedCode(toolName, input)) return baseMsg + NO_APPROVAL_FOR_SIGN_IN_CODE;
 
     // Approval trigger — only if wired and task context is available.
     if (this.approvalTrigger && options?.taskEventId) {
@@ -296,38 +731,34 @@ export class ExecutionLayer {
         const result = await this.approvalTrigger.request({
           taskId: options.taskEventId,
           conversationId: options.conversationId,
-          skillName,
+          toolName,
           actionRisk: String(actionRisk),
           input,
+          displayInput: await this.approvalDisplayInput(toolName, input, skillLogger),
           currentScore,
           requiredScore,
+          ...(sendResolution && sendResolution.length > 0 ? { sendResolution } : {}),
         });
         if (!result.created) {
           return (
-            `Skill '${skillName}' blocked — an approval request for this action ` +
+            `Tool '${toolName}' blocked — an approval request for this action ` +
             `is already pending (ref: ${result.existingShortRef}).`
           );
         }
-        if (result.notificationSent) {
-          return baseMsg + `An approval request has been sent to the CEO (ref: ${result.shortRef}).`;
-        }
-        return (
-          baseMsg +
-          `An approval request was created (ref: ${result.shortRef}) but ` +
-          `notification could not be delivered — the CEO will see it in the next digest.`
-        );
+        // The trigger notifies no one; the agent delivers it on one channel (#2159).
+        return baseMsg + approvalAdvisory(result.shortRef, options?.agentId, result.approvalNumber);
       } catch (err) {
         // Approval trigger failure should not change the gate behavior.
         // The skill is still blocked; we just can't create the approval row.
         skillLogger.warn(
-          { err, skillName },
+          { err, toolName },
           'approval trigger failed — returning standard gate error',
         );
       }
     }
 
     // Fallback: no trigger, no taskEventId, or trigger failed
-    return baseMsg + `The CEO can raise the score with the set-autonomy skill.`;
+    return baseMsg + `The principal can raise the score with the set-autonomy skill.`;
   }
 
   /**
@@ -335,55 +766,539 @@ export class ExecutionLayer {
    * Creates an approval request when the trigger is wired; falls back to a static message.
    */
   private async buildTierGateError(
-    skillName: string,
+    toolName: string,
     input: Record<string, unknown>,
     initiatingTier: string,
     actionRisk: string | number,
     currentScore: number,
     options: InvokeOptions | undefined,
     skillLogger: Logger,
+    sendResolution?: readonly SendRecipientPin[],
+    /** Band gating (#2159): why the band asks first. Replaces the tier wording when set. */
+    bandReason?: string,
   ): Promise<string> {
-    const baseMsg =
-      `Skill '${skillName}' blocked — the initiating contact's tier ('${initiatingTier}') ` +
-      `does not permit ${String(actionRisk)}-risk actions without approval. `;
+    const baseMsg = bandReason
+      ? `Tool '${toolName}' needs the principal's approval: ${bandReason}. `
+      : `Tool '${toolName}' blocked — the initiating contact's tier ('${initiatingTier}') ` +
+        `does not permit ${String(actionRisk)}-risk actions without approval. `;
+
+    if (this.holdsUnscrubbedCode(toolName, input)) return baseMsg + NO_APPROVAL_FOR_SIGN_IN_CODE;
 
     if (this.approvalTrigger && options?.taskEventId) {
       try {
         const result = await this.approvalTrigger.request({
           taskId: options.taskEventId,
           conversationId: options.conversationId,
-          skillName,
+          toolName,
           actionRisk: String(actionRisk),
           input,
+          displayInput: await this.approvalDisplayInput(toolName, input, skillLogger),
           currentScore,
           requiredScore: currentScore,
-          reason:
-            `Curia wanted to run '${skillName}', but the initiating contact's tier ` +
-            `('${initiatingTier}') requires approval for ${String(actionRisk)}-risk actions.`,
+          reason: bandReason
+            ? `Curia wanted to run '${toolName}', and ${bandReason}.`
+            : `Curia wanted to run '${toolName}', but the initiating contact's tier ` +
+              `('${initiatingTier}') requires approval for ${String(actionRisk)}-risk actions.`,
+          ...(sendResolution && sendResolution.length > 0 ? { sendResolution } : {}),
         });
         if (!result.created) {
           return (
-            `Skill '${skillName}' blocked — an approval request for this action ` +
+            `Tool '${toolName}' blocked — an approval request for this action ` +
             `is already pending (ref: ${result.existingShortRef}).`
           );
         }
-        if (result.notificationSent) {
-          return baseMsg + `An approval request has been sent to the CEO (ref: ${result.shortRef}).`;
-        }
-        return (
-          baseMsg +
-          `An approval request was created (ref: ${result.shortRef}) but ` +
-          `notification could not be delivered — the CEO will see it in the next digest.`
-        );
+        // The trigger notifies no one; the agent delivers it on one channel (#2159).
+        return baseMsg + approvalAdvisory(result.shortRef, options?.agentId, result.approvalNumber);
       } catch (err) {
         skillLogger.warn(
-          { err, skillName },
+          { err, toolName },
           'tier gate approval trigger failed — returning standard gate error',
         );
       }
     }
 
-    return baseMsg + `No approval request was created — the CEO must authorize this action manually.`;
+    return baseMsg + `No approval request was created — the principal must authorize this action manually.`;
+  }
+
+  /**
+   * Publish authorization.decision for a Gate C allow/escalate outcome (#1379).
+   * Awaits the write-ahead audit publish and fail-closes (returns a failed
+   * ToolResult) when it rejects so an allow cannot proceed without a durable
+   * authorization record. When no bus is wired, returns null (unchanged).
+   */
+  private async publishGateCDecision(
+    decision: 'allow' | 'escalate',
+    toolName: string,
+    tier: ContactTier | 'unresolved',
+    options: InvokeOptions | undefined,
+    skillLogger: Logger,
+    recipientCount?: number,
+  ): Promise<ToolResult | null> {
+    if (!this.bus) return null;
+
+    // Validate originator shape before narrowing (malformed metadata must not
+    // place non-strings into the audit payload). Cast through unknown after the
+    // runtime check per repo policy.
+    const rawOriginator: unknown = options?.taskMetadata?.['originator'];
+    let contactId: string | undefined;
+    let channel: string | undefined = options?.channelId;
+    if (rawOriginator !== null && typeof rawOriginator === 'object') {
+      const originator = rawOriginator as unknown as {
+        contactId?: unknown;
+        channel?: unknown;
+      };
+      if (typeof originator.contactId === 'string') contactId = originator.contactId;
+      if (typeof originator.channel === 'string') channel = originator.channel;
+    }
+
+    try {
+      await this.bus.publish('execution', createAuthorizationDecision({
+        decision,
+        gate: 'gate_c',
+        contactId,
+        tier,
+        channel,
+        action: toolName,
+        subjectSummary: formatAuthorizationSubjectSummary({
+          decision,
+          gate: 'gate_c',
+          contactId,
+          tier,
+          channel,
+          action: toolName,
+        }),
+        agentId: options?.agentId,
+        taskEventId: options?.taskEventId,
+        conversationId: options?.conversationId,
+        parentEventId: options?.taskEventId ?? options?.parentEventId,
+        sourceLayer: 'execution',
+        ...(recipientCount !== undefined ? { recipientCount } : {}),
+      }));
+      return null;
+    } catch (err) {
+      skillLogger.warn({ err, toolName }, 'Gate C: failed to publish authorization.decision event — failing closed');
+      return {
+        success: false,
+        error: this.wrapSkillError(
+          `Tool '${toolName}' blocked — failed to audit Gate C authorization.decision (fail-closed).`,
+        ),
+      };
+    }
+  }
+
+  /**
+   * Build the advisory error for bulk export gate blocks (#201).
+   * Restricted bulk blocks do not create approval rows.
+   */
+  private async buildExportGateError(
+    toolName: string,
+    input: Record<string, unknown>,
+    message: string,
+    items: import('../security/export-controls.js').ExportItem[],
+    actionRisk: string | number,
+    options: InvokeOptions | undefined,
+    skillLogger: Logger,
+  ): Promise<string> {
+    const itemSummary = ExportControlServiceClass.formatItemSummary(items);
+    const baseMsg = `${message}\n\nItems:\n${itemSummary}\n`;
+
+    if (this.holdsUnscrubbedCode(toolName, input)) return baseMsg + NO_APPROVAL_FOR_SIGN_IN_CODE;
+
+    if (this.approvalTrigger && options?.taskEventId) {
+      try {
+        const exportItems = items.map((i) => ({
+          node_id: i.nodeId,
+          label: i.label,
+          sensitivity: i.sensitivity,
+        }));
+        const result = await this.approvalTrigger.request({
+          taskId: options.taskEventId,
+          conversationId: options.conversationId,
+          toolName,
+          actionRisk: String(actionRisk),
+          input: { ...input, export_items: exportItems },
+          displayInput: {
+            ...(await this.approvalDisplayInput(toolName, input, skillLogger)),
+            export_items: exportItems,
+          },
+          currentScore: 0,
+          requiredScore: 0,
+          reason: `${message}\n\n${itemSummary}`,
+        });
+        if (!result.created) {
+          return (
+            baseMsg +
+            `An approval request for this export is already pending (ref: ${result.existingShortRef}).`
+          );
+        }
+        // The trigger notifies no one; the agent delivers it on one channel (#2159).
+        return baseMsg + approvalAdvisory(result.shortRef, options?.agentId, result.approvalNumber);
+      } catch (err) {
+        skillLogger.warn({ err, toolName }, 'export gate approval trigger failed');
+      }
+    }
+
+    return baseMsg + 'No approval request was created.';
+  }
+
+  /**
+   * Resolve outbound recipients for Gate C (#1815). Prefers an async
+   * `resolveRecipients` hook (email-reply); otherwise uses the sync parser.
+   * `resolutionFailed` is true only when an async resolver ran and returned null
+   * or threw — the gate must escalate rather than allow.
+   * `inputError` is set when the resolver rejects malformed input before any
+   * gateway call (e.g. UUID-shaped reply_to_message_id — #1817); callers should
+   * return that error to the agent instead of a generic Gate C escalate.
+   */
+  private async resolveGateCRecipients(
+    toolName: string,
+    input: Record<string, unknown>,
+    skillLogger: Logger,
+    fetchMessage?: (
+      messageId: string,
+      accountId?: string,
+    ) => ReturnType<OutboundGateway['getEmailMessage']>,
+  ): Promise<{
+    recipients: string[] | null;
+    resolutionFailed: boolean;
+    inputError?: string;
+    inputErrorKind?: 'message-id-shape' | 'unknown-account';
+  }> {
+    const found = findCarveoutSkill(toolName);
+    if (!found) return { recipients: null, resolutionFailed: false };
+
+    if (found.carveout.resolveRecipients) {
+      try {
+        const recipients = await found.carveout.resolveRecipients(input, {
+          fetchMessage: fetchMessage ?? (this.outboundGateway
+            ? (messageId, accountId) => this.outboundGateway!.getEmailMessage(messageId, accountId)
+            : undefined),
+          selfEmails: this.selfEmails,
+        });
+        if (recipients === null) return { recipients: null, resolutionFailed: true };
+        return { recipients, resolutionFailed: false };
+      } catch (err) {
+        if (err instanceof ReplyToMessageIdShapeError) {
+          return {
+            recipients: null,
+            resolutionFailed: true,
+            inputError: err.message,
+            inputErrorKind: 'message-id-shape',
+          };
+        }
+        if (err instanceof UnknownEmailAccountError) {
+          return {
+            recipients: null,
+            resolutionFailed: true,
+            inputError: err.message,
+            inputErrorKind: 'unknown-account',
+          };
+        }
+        skillLogger.warn(
+          { err, toolName },
+          'autonomy gate: Gate C recipient resolution failed — failing closed (#1815)',
+        );
+        return { recipients: null, resolutionFailed: true };
+      }
+    }
+
+    return { recipients: found.carveout.parseRecipients(input), resolutionFailed: false };
+  }
+
+  /**
+   * The copy of a send skill's input that an approval shows the principal (#2033).
+   *
+   * Each reference is resolved to "address (contact "Name")". The stored payload
+   * stays the agent's own input, so approval re-runs the skill as called (and
+   * re-resolves the reference then). Display only: a failed lookup shows the
+   * reference as written and never blocks the approval. Raw-address inputs are
+   * retired and refused before any gate (#2041), so none reaches an approval.
+   */
+  private async approvalDisplayInput(
+    toolName: string,
+    input: Record<string, unknown>,
+    skillLogger: Logger,
+  ): Promise<Record<string, unknown>> {
+    const skill = RECIPIENT_REFERENCE_SKILLS[toolName];
+    if (!skill) return input;
+    const shown: Record<string, unknown> = { ...input };
+
+    // References were checked before the gates, so a failure here is a lookup
+    // error or a change since then.
+    for (const field of skill.references) {
+      const value = input[field];
+      if (typeof value !== 'string' || !value.trim() || !this.contactService) continue;
+      const entries = skill.channel === 'email' ? splitCommaSeparatedAddresses(value) : [value.trim()];
+      const parts: string[] = [];
+      for (const entry of entries) {
+        if (parseRecipientReference(entry) === null) {
+          parts.push(entry);
+          continue;
+        }
+        const resolved = await resolveRecipientReference(
+          entry,
+          skill.channel,
+          { field },
+          { contactService: this.contactService, principalContactId: this.principalIdentities[0]?.contactId },
+        );
+        if (resolved.ok) {
+          parts.push(formatResolvedRecipient(resolved));
+        } else if (resolved.cause !== undefined) {
+          skillLogger.warn({ err: resolved.cause, toolName }, 'approval display: recipient reference lookup failed — showing it unresolved');
+          parts.push(`${entry} (contact lookup failed)`);
+        } else {
+          parts.push(`${entry} (could not be resolved)`);
+        }
+      }
+      shown[field] = parts.join(', ');
+    }
+    return shown;
+  }
+
+  /**
+   * Check and resolve a send skill's recipient references (#2033, ADR-047), before
+   * any gate runs.
+   *
+   * - A retired raw-address input (#2041) is refused. It is not ignored: dropping a
+   *   cc list would send to fewer people than the agent asked for.
+   * - Every entry in a reference input (`to`, `cc`, `recipient`) must be a contact
+   *   UUID or "principal". An address or a template token there is refused with the
+   *   resolver's message, before any lookup. An input listed in `addresses`
+   *   (email-reply's cc, #2131) also passes a well-formed address through unresolved.
+   * - References resolve through the same resolver the skill uses, including a
+   *   `#label` hint (`principal#personal`, #2047), so the gate sees the address the
+   *   skill will send to.
+   *
+   * Returns reference → address. Without a contact service the map is empty: the
+   * skill still resolves (and fails closed) itself, and Gate C refuses any reference
+   * it cannot look up.
+   */
+  private async resolveSendSkillReferences(
+    toolName: string,
+    input: Record<string, unknown>,
+    skillLogger: Logger,
+  ): Promise<
+    | { ok: true; resolved: Map<string, string>; pins: SendRecipientPin[] }
+    | { ok: false; error: string; errorType?: ErrorType }
+  > {
+    const resolved = new Map<string, string>();
+    const pins: SendRecipientPin[] = [];
+    const skill = RECIPIENT_REFERENCE_SKILLS[toolName];
+    if (!skill) return { ok: true, resolved, pins };
+    const entriesOf = (value: unknown): string[] => {
+      if (typeof value !== 'string' || !value.trim()) return [];
+      return skill.channel === 'email' ? splitCommaSeparatedAddresses(value) : [value.trim()];
+    };
+
+    const retired = findRetiredRecipientField(skill, input);
+    if (retired) {
+      skillLogger.info({ toolName, field: retired }, 'send recipient refused: a retired raw-address input (#2041)');
+      return { ok: false, error: retiredRecipientFieldError(skill, retired) };
+    }
+
+    // Each reference costs a contact read before any gate. Bound the fan-out from a
+    // long list; the handler's own length cap runs later. A literal address in an
+    // input that takes one (email-reply's cc) costs no read and is not counted.
+    const referenceCount = new Set(skill.references.flatMap((field) =>
+      entriesOf(input[field]).filter((entry) =>
+        !skill.addresses?.includes(field) || parseRecipientReference(entry) !== null),
+    )).size;
+    if (referenceCount > MAX_SEND_REFERENCES) {
+      return { ok: false, error: `Too many recipients (${referenceCount}); the limit is ${MAX_SEND_REFERENCES}. Nothing was sent.` };
+    }
+
+    for (const field of skill.references) {
+      const takesAddresses = skill.addresses?.includes(field) ?? false;
+      const value = input[field];
+      // `cc: ","` is not `cc: ""` (sender-only on email-reply). Refuse it here so no
+      // approval is filed for a reply the handler would refuse (#2131).
+      if (takesAddresses && typeof value === 'string' && value.trim() && entriesOf(value).length === 0) {
+        skillLogger.info({ toolName, field }, 'send recipient refused: an explicit list with no entries (#2131)');
+        return { ok: false, error: emptyRecipientListError(field) };
+      }
+      for (const entry of entriesOf(value)) {
+        if (resolved.has(entry.trim())) continue;
+        const parsed = parseRecipientReference(entry);
+        const isReference = parsed !== null;
+        // An address in an input that takes one is sent as written (#2131). Anything
+        // else there that is not a reference is refused before any gate.
+        if (!isReference && takesAddresses) {
+          const error = addressOrReferenceError(entry, skill.channel, field);
+          if (error === null) continue;
+          skillLogger.info({ toolName, field }, 'send recipient refused: neither an address nor a reference (#2131)');
+          return { ok: false, error };
+        }
+        if (isReference && !this.contactService) continue;
+        const result = await resolveRecipientReference(entry, skill.channel, { field }, {
+          // Never called for a reference without a contact service (skipped above);
+          // a non-reference returns its error before any lookup.
+          contactService: this.contactService ?? { getContactWithIdentities: async () => undefined },
+          principalContactId: this.principalIdentities[0]?.contactId,
+        });
+        if (!result.ok) {
+          if (result.cause !== undefined) {
+            skillLogger.warn(
+              { err: result.cause, toolName, field },
+              'send recipient reference lookup failed — refusing (fail-closed, #2033)',
+            );
+            return {
+              ok: false,
+              error: result.error,
+              ...(isDbUnavailableError(result.cause) ? { errorType: 'DATABASE_UNAVAILABLE' as const } : {}),
+            };
+          }
+          skillLogger.info({ toolName, field, isReference }, 'send recipient reference refused before the gates (#2033)');
+          return { ok: false, error: result.error };
+        }
+        resolved.set(entry.trim(), result.identifier);
+        if (parsed?.label) {
+          pins.push({
+            ref: entry.trim(),
+            identityId: result.identityId,
+            identityName: result.identityName,
+          });
+        }
+      }
+    }
+    return { ok: true, resolved, pins };
+  }
+
+  /**
+   * Re-resolve the recipients an approval pinned. Nothing is sent when the
+   * identity row or its name has changed (#2047).
+   */
+  async confirmPinnedSendResolution(
+    toolName: string,
+    approved: readonly SendRecipientPin[],
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (approved.length === 0) return { ok: true };
+    const skill = RECIPIENT_REFERENCE_SKILLS[toolName];
+    if (!skill || !this.contactService) return { ok: false, error: STALE_SEND_APPROVAL_ERROR };
+    const current: SendRecipientPin[] = [];
+    for (const pin of approved) {
+      const result = await resolveRecipientReference(
+        pin.ref,
+        skill.channel,
+        { field: skill.references[0] ?? 'to' },
+        { contactService: this.contactService, principalContactId: this.principalIdentities[0]?.contactId },
+      );
+      if (!result.ok) return { ok: false, error: STALE_SEND_APPROVAL_ERROR };
+      current.push({ ref: pin.ref, identityId: result.identityId, identityName: result.identityName });
+    }
+    if (!sendPinsMatch(current, approved)) return { ok: false, error: STALE_SEND_APPROVAL_ERROR };
+    return { ok: true };
+  }
+
+  /**
+   * Replace references in a Gate C recipient list with the addresses resolved
+   * before the gates. Raw identifiers pass through: a reference shape cannot
+   * collide with an address on any send channel (see parseRecipientReference).
+   * A reference with no resolved address fails closed — the gate cannot see
+   * where the send would go.
+   */
+  private substituteResolvedRecipients(
+    recipients: string[],
+    resolved: ReadonlyMap<string, string> | undefined,
+  ): { ok: true; recipients: string[] } | { ok: false; error: string } {
+    const out: string[] = [];
+    for (const recipient of recipients) {
+      if (parseRecipientReference(recipient) === null) {
+        out.push(recipient);
+        continue;
+      }
+      const address = resolved?.get(recipient.trim());
+      if (address === undefined) {
+        return { ok: false, error: 'The recipient reference cannot be resolved here (no contact service). Nothing was sent.' };
+      }
+      out.push(address);
+    }
+    return { ok: true, recipients: out };
+  }
+
+  /**
+   * Whether a send's recipient set is exclusively the verified principal, for the gates A/B
+   * bypass (#2337). Uses the same recipients Gate C would judge: references swapped for the
+   * addresses resolved before the gates, and email-reply's thread participants fetched
+   * through the per-invoke cache the handler reuses. Every doubt is false (the gates apply):
+   * a skill with no carve-out, an unmodeled recipient field, an unresolved reference, or a
+   * failed or malformed email-reply lookup. Input errors are not reported here; Gate C or the
+   * skill reports them as before.
+   */
+  private async isPrincipalOnlySend(
+    toolName: string,
+    input: Record<string, unknown>,
+    sendRecipients: ReadonlyMap<string, string> | undefined,
+    skillLogger: Logger,
+    fetchMessage?: (
+      messageId: string,
+      accountId?: string,
+    ) => ReturnType<OutboundGateway['getEmailMessage']>,
+  ): Promise<boolean> {
+    if (this.principalIdentities.length === 0) return false;
+    const resolved = await this.resolveGateCRecipients(toolName, input, skillLogger, fetchMessage);
+    if (resolved.resolutionFailed || resolved.recipients === null) return false;
+    const normalized = this.substituteResolvedRecipients(resolved.recipients, sendRecipients);
+    if (!normalized.ok) return false;
+    return resolvePrincipalIsSoleRecipientFromSkillInput(
+      toolName, input, this.principalIdentities, normalized.recipients,
+    );
+  }
+
+  /**
+   * Collect initiating-sender identifiers on `channel` only: the inbound senderId
+   * when the originator arrived on this channel, plus verified active identities
+   * on this channel. Never includes contactId, unverified, defunct, bounced, or
+   * cross-channel rows (#1815 review).
+   */
+  private async collectInitiatingSenderIdentifiers(
+    options: InvokeOptions | undefined,
+    skillLogger: Logger,
+    channel: string,
+  ): Promise<string[]> {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    const add = (value: string | undefined | null): void => {
+      if (!value || value.length === 0) return;
+      const key = value.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      ids.push(value);
+    };
+
+    const rawOriginator: unknown = options?.taskMetadata?.['originator'];
+    let contactId: string | undefined;
+    let originatorChannel: string | undefined;
+    if (rawOriginator !== null && typeof rawOriginator === 'object') {
+      const originator = rawOriginator as unknown as { contactId?: unknown; channel?: unknown };
+      if (typeof originator.contactId === 'string') contactId = originator.contactId;
+      if (typeof originator.channel === 'string') originatorChannel = originator.channel;
+    }
+
+    if (originatorChannel === channel) {
+      add(options?.senderId);
+    }
+
+    if (this.contactService && contactId) {
+      try {
+        const identities = await this.contactService.getIdentitiesForContact(contactId);
+        for (const identity of identities) {
+          if (
+            identity.channel === channel
+            && identity.verified
+            && identity.status === 'active'
+          ) {
+            add(identity.channelIdentifier);
+          }
+        }
+      } catch (err) {
+        skillLogger.warn(
+          { err, contactId, channel },
+          'autonomy gate: Gate C failed to load originator identities — continuing with senderId only',
+        );
+      }
+    }
+
+    return ids;
   }
 
   /**
@@ -400,57 +1315,134 @@ export class ExecutionLayer {
    * emailing a third party must escalate — the static manifest cannot distinguish the two.
    * Defer to the EscalationJudge, which inspects the actual action. The judge is fail-closed
    * internally (LLM error/timeout/malformed verdict → escalate). When no judge is wired or it
-   * is disabled, we fail closed here as well — an ambiguous consequential action is never
-   * silently allowed.
+   * is disabled, an *ambiguous* consequential action (third-party axis not pinned) still
+   * fails closed. A structural pin is trusted without a judge: there is no class-upgrade
+   * mechanism when the judge is off, and failing closed would re-escalate every known
+   * sender-only reply (#1815).
    */
   private async resolveTierGateDecision(
     initiatingTier: ContactTier,
     actionClass: ActionConsequenceClass,
-    skillName: string,
-    manifest: SkillManifest,
+    toolName: string,
+    manifest: ToolManifest,
     input: Record<string, unknown>,
     options: InvokeOptions | undefined,
     skillLogger: Logger,
+    isPrincipalSoleRecipient: boolean,
+    structuralIsThirdPartyFacing: boolean | undefined,
+    judgeDescriptionExtras?: {
+      initiatingSender?: readonly string[];
+      resolvedRecipients?: readonly string[] | null;
+    },
   ): Promise<EscalationDecision> {
-    const decisionIfReplyToSender = applyActionPolicy(initiatingTier, actionClass, false);
-    const decisionIfThirdParty = applyActionPolicy(initiatingTier, actionClass, true);
+    const decisionIfReplyToSender = applyActionPolicy(initiatingTier, actionClass, false, isPrincipalSoleRecipient);
+    const decisionIfThirdParty = applyActionPolicy(initiatingTier, actionClass, true, isPrincipalSoleRecipient);
 
     // Obvious: the third-party-facing axis doesn't change the outcome → no judge needed.
     if (decisionIfReplyToSender === decisionIfThirdParty) {
+      if (isPrincipalSoleRecipient && decisionIfReplyToSender === 'allow') {
+        skillLogger.info(
+          { toolName, initiatingTier, actionClass, isPrincipalSoleRecipient },
+          'autonomy gate: Gate C allowed — recipient set is exclusively the verified principal (#1301)',
+        );
+      }
       return decisionIfReplyToSender;
     }
 
-    // Ambiguous: the outcome depends on who the action actually targets. Ask the judge —
-    // but only to resolve the third-party-facing axis. We recompute the policy ourselves
-    // against the manifest's consequence class so a misclassification (or crafted input)
+    // Structural determination (#1815): when recipients resolved against the
+    // initiating sender, pin isThirdPartyFacing. The judge still runs when a
+    // class upgrade to irreversible could change the outcome (it spots a
+    // payment behind a "send"). Skip the judge only when that upgrade cannot
+    // change the decision — otherwise this path would fail open.
+    if (structuralIsThirdPartyFacing !== undefined) {
+      const decisionWithClass = applyActionPolicy(
+        initiatingTier,
+        actionClass,
+        structuralIsThirdPartyFacing,
+        isPrincipalSoleRecipient,
+      );
+      const decisionIfIrreversible = applyActionPolicy(
+        initiatingTier,
+        'irreversible',
+        structuralIsThirdPartyFacing,
+        isPrincipalSoleRecipient,
+      );
+      if (decisionWithClass === decisionIfIrreversible) {
+        skillLogger.info(
+          {
+            toolName,
+            initiatingTier,
+            actionClass,
+            isPrincipalSoleRecipient,
+            isThirdPartyFacing: structuralIsThirdPartyFacing,
+            decision: decisionWithClass,
+          },
+          'autonomy gate: Gate C used structurally resolved recipients for the third-party-facing determination (#1815)',
+        );
+        return decisionWithClass;
+      }
+      // Structural pin is stronger evidence than the judge's third-party guess.
+      // With the judge off there is no class-upgrade path anywhere, so trusting
+      // the pin (including allow for known + sender-only) is the #1815 outcome.
+      // Failing closed here would re-escalate every known sender-only reply
+      // whenever the judge is unwired or kill-switched.
+      if (!this.escalationJudge?.isEnabled()) {
+        skillLogger.info(
+          {
+            toolName,
+            initiatingTier,
+            actionClass,
+            isPrincipalSoleRecipient,
+            isThirdPartyFacing: structuralIsThirdPartyFacing,
+            decision: decisionWithClass,
+          },
+          'autonomy gate: Gate C trusted structurally resolved recipients with no escalation judge (#1815)',
+        );
+        return decisionWithClass;
+      }
+    }
+
+    // Ambiguous: the outcome depends on who the action actually targets, and/or a
+    // class upgrade could still escalate. Ask the judge — but only to resolve the
+    // axes we do not already know. We recompute the policy ourselves against the
+    // manifest's consequence class so a misclassification (or crafted input)
     // cannot DOWNGRADE the action below the class the manifest already established. The
     // judge's class is honored only when it is MORE severe (an upgrade, e.g. it spots a
     // payment behind a "send"). A failed/timed-out judge returns escalate with no flag
-    // (isThirdPartyFacing === undefined) → fail closed.
+    // (isThirdPartyFacing === undefined) → fail closed, unless the third-party axis
+    // was already pinned structurally.
     if (this.escalationJudge?.isEnabled()) {
       const verdict = await this.escalationJudge.classifyAction({
-        description: buildActionDescription(skillName, manifest, input),
+        description: this.describeActionForJudge(toolName, manifest, input, judgeDescriptionExtras),
         initiatingTier,
         conversationId: options?.conversationId ?? 'system',
       });
-      if (verdict.isThirdPartyFacing === undefined) {
+      const isThirdPartyFacing = structuralIsThirdPartyFacing ?? verdict.isThirdPartyFacing;
+      if (isThirdPartyFacing === undefined) {
         skillLogger.info(
-          { skillName, initiatingTier, actionClass, reason: verdict.reason },
+          { toolName, initiatingTier, actionClass, reason: verdict.reason },
           'autonomy gate: Gate C escalation judge returned no third-party determination — failing closed (escalate)',
         );
         return 'escalate';
       }
       // Clamp the consequence class up to the manifest floor before applying the policy.
       const effectiveClass = moreSevereConsequence(actionClass, verdict.actionClass ?? actionClass);
-      const decision = applyActionPolicy(initiatingTier, effectiveClass, verdict.isThirdPartyFacing);
+      const decision = applyActionPolicy(
+        initiatingTier,
+        effectiveClass,
+        isThirdPartyFacing,
+        isPrincipalSoleRecipient,
+      );
       skillLogger.info(
         {
-          skillName,
+          toolName,
           initiatingTier,
           manifestClass: actionClass,
           judgedClass: verdict.actionClass,
           effectiveClass,
-          isThirdPartyFacing: verdict.isThirdPartyFacing,
+          isThirdPartyFacing,
+          judgedIsThirdPartyFacing: verdict.isThirdPartyFacing,
+          isPrincipalSoleRecipient,
           decision,
           reason: verdict.reason,
         },
@@ -459,26 +1451,293 @@ export class ExecutionLayer {
       return decision;
     }
 
-    // No judge available — fail closed rather than guess permissively.
+    // No judge available and the third-party axis was not pinned structurally —
+    // fail closed rather than guess permissively.
     skillLogger.warn(
-      { skillName, initiatingTier, actionClass },
+      { toolName, initiatingTier, actionClass },
       'autonomy gate: Gate C decision is third-party-sensitive but no escalation judge is configured — failing closed (escalate)',
     );
     return 'escalate';
   }
 
   /**
+   * The gating this call follows (#2312): the autonomy config's, else the constructed value.
+   * Production's AutonomyService stamps the configured gating on every read, so the two agree
+   * there; the scenario suite's fixture service pins it per case on one shared layer. Takes the
+   * invocation's one config read rather than reading again, so score and gating always agree.
+   */
+  private currentGating(config: AutonomyConfig | null): AutonomyGating {
+    return config?.gating ?? this.gating;
+  }
+
+  /**
+   * Gate C under band gating (#2159, spec "Phase 2 → Gate C"). Runs after Gates A and B, for
+   * a consequential action that is not principal-originated. Returns `{ blocked: null }` to
+   * proceed, or `{ blocked }` with a failed ToolResult that escalates (an approval request, as
+   * Gate C's tier escalation does). On proceed, `gateProceeded` says whether band gating let
+   * through what the tier policy would have held, which the spot-check pool records.
+   *
+   *   a send, any band              → proceed. The gateway's band review asks all four
+   *                                   questions with the whole message and its resolved
+   *                                   recipients, and a hold there raises the same approval.
+   *                                   Gate C's view of a send is a truncated description with
+   *                                   contact references, so judging it here would be weaker.
+   *   80+, any other action         → ask *purpose* if an outsider (below trusted) initiated
+   *                                   it; escalate on "steered".
+   *   below 80, medium risk and up  → ask *purpose* and *speaks as principal*; escalate on
+   *                                   "steered" or "yes".
+   *   below 80, low risk            → ask *purpose* only when an outsider initiated it.
+   *   judge or evidence failure     → escalate, at every band. Purpose is an outsider's only
+   *                                   check on a non-send, so it never fails open here.
+   *
+   * At 80+, a non-send the tier policy would have escalated emits a `gate_proceeded` digest
+   * item, so the principal sees what band gating let through.
+   */
+  private async runBandGateC(args: {
+    toolName: string;
+    manifest: ToolManifest;
+    input: Record<string, unknown>;
+    options: InvokeOptions | undefined;
+    skillLogger: Logger;
+    currentScore: number;
+    initiatingTier: ContactTier | null;
+    sendPins: readonly SendRecipientPin[] | undefined;
+  }): Promise<{ blocked: ToolResult } | { blocked: null; gateProceeded: boolean }> {
+    const { toolName, manifest, input, options, skillLogger, currentScore, initiatingTier } = args;
+    const isSend = HUMAN_SEND_SKILLS.has(toolName);
+    // An outsider: someone outside the principal's trusted circle initiated this.
+    const outsider = initiatingTier !== null && !meetsMinimumTier(initiatingTier, 'trusted');
+    const highBand = isSpotCheckOrAbove(currentScore);
+    const lowRisk = manifest.action_risk === 'low';
+
+    let questions: BriefQuestion[] = [];
+    if (!isSend) {
+      if (highBand || lowRisk) {
+        questions = outsider ? ['purpose'] : [];
+      } else {
+        questions = ['purpose', 'speaks-as-principal'];
+      }
+    }
+
+    if (questions.length > 0) {
+      const verdict = await this.askBandGateC(questions, toolName, manifest, input, options, currentScore);
+      if (!verdict.ok) {
+        skillLogger.warn({ toolName, failure: verdict.failure, currentScore }, 'autonomy gate: Gate C band review unavailable — escalating');
+        return { blocked: await this.escalateBandGateC(args, 'the reviewer was unavailable to check it') };
+      }
+      if (verdict.purpose === 'steered') {
+        skillLogger.info({ toolName, reason: verdict.reason }, 'autonomy gate: Gate C band review — steered by an outsider');
+        return { blocked: await this.escalateBandGateC(args, 'it looks steered by someone outside the principal\'s business') };
+      }
+      if (verdict.speaksAsPrincipal === true) {
+        skillLogger.info({ toolName, reason: verdict.reason, currentScore }, 'autonomy gate: Gate C band review — speaks for the principal below 80');
+        return { blocked: await this.escalateBandGateC(args, 'it speaks for or commits the principal, and this autonomy band asks first for that') };
+      }
+    }
+
+    if (initiatingTier !== null) {
+      const auditFail = await this.publishGateCDecision('allow', toolName, initiatingTier, options, skillLogger);
+      if (auditFail) return { blocked: auditFail };
+    } else {
+      // authorization.decision carries a contact tier; system and agent originators have none.
+      skillLogger.info({ toolName, currentScore }, 'autonomy gate: Gate C band — allowed (system or agent originator)');
+    }
+
+    // What band gating let through that the tier policy would have held, for the digest.
+    // Not for sends: the gateway has not reviewed them yet, and it reports its own outcome.
+    let gateProceeded = false;
+    if (highBand && !isSend && initiatingTier !== null && applyActionPolicy(
+      initiatingTier, mapActionRiskToConsequenceClass(manifest.action_risk), true,
+    ) === 'escalate') {
+      await this.publishGateProceeded(toolName, initiatingTier, options, skillLogger);
+      gateProceeded = true;
+    }
+    return { blocked: null, gateProceeded };
+  }
+
+  /** Ask the escalation judge Gate C's band questions about a proposed action. Never throws. */
+  private async askBandGateC(
+    questions: BriefQuestion[],
+    toolName: string,
+    manifest: ToolManifest,
+    input: Record<string, unknown>,
+    options: InvokeOptions | undefined,
+    currentScore: number,
+  ): Promise<import('../autonomy/judge-brief.js').BriefVerdict> {
+    if (!this.escalationJudge?.isEnabled()) return { ok: false, failure: 'disabled' };
+    try {
+      // Purpose depends on what the turn was answering; without that the judge sees only the
+      // action, which leans toward "serving". A failed lookup is a review failure.
+      let evidence: BriefEvidence = { toolResults: [] };
+      if (this.sendEvidence) {
+        if (!options?.taskEventId) return { ok: false, failure: 'unreachable' };
+        const collected = await this.sendEvidence.collect([options.taskEventId]);
+        if (collected.unavailable) return { ok: false, failure: 'unreachable' };
+        evidence = collected;
+      }
+      return await this.escalationJudge.review({
+        questions,
+        message: this.describeActionForJudge(toolName, manifest, input),
+        recipients: [],
+        band: AutonomyService.bandForScore(currentScore),
+        evidence,
+        conversationId: options?.conversationId ?? 'system',
+      });
+    } catch (err) {
+      // review() and collect() are documented never to throw; treat a throw as a failure.
+      this.logger.error({ err, toolName }, 'autonomy gate: Gate C band review threw');
+      return { ok: false, failure: 'unreachable' };
+    }
+  }
+
+  /** Escalate a band Gate C decision: audit, approval request, agent-facing error. */
+  private async escalateBandGateC(
+    args: {
+      toolName: string;
+      manifest: ToolManifest;
+      input: Record<string, unknown>;
+      options: InvokeOptions | undefined;
+      skillLogger: Logger;
+      currentScore: number;
+      initiatingTier: ContactTier | null;
+      sendPins: readonly SendRecipientPin[] | undefined;
+    },
+    reason: string,
+  ): Promise<ToolResult> {
+    const { toolName, manifest, input, options, skillLogger, currentScore, initiatingTier, sendPins } = args;
+    if (initiatingTier !== null) {
+      const auditFail = await this.publishGateCDecision('escalate', toolName, initiatingTier, options, skillLogger);
+      if (auditFail) return auditFail;
+    }
+    const gateCError = await this.buildTierGateError(
+      toolName, input, initiatingTier ?? 'none', manifest.action_risk, currentScore, options, skillLogger, sendPins, reason,
+    );
+    return { success: false, error: this.wrapSkillError(gateCError) };
+  }
+
+  /** Queue a digest item for an action band gating let through (#2159). Never throws. */
+  private async publishGateProceeded(
+    toolName: string,
+    initiatingTier: ContactTier,
+    options: InvokeOptions | undefined,
+    skillLogger: Logger,
+  ): Promise<void> {
+    if (!this.bus) {
+      skillLogger.warn({ toolName }, 'autonomy gate: no bus — the gate_proceeded digest item is only in this log');
+      return;
+    }
+    const article = /^[aeiou]/i.test(initiatingTier) ? 'an' : 'a';
+    try {
+      await this.bus.publish('execution', createPrincipalReport({
+        summary: `Went ahead with ${toolName} on a request from ${article} ${initiatingTier} contact without asking first.`,
+        urgency: 'digest',
+        source: 'gate_proceeded',
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        parentEventId: options?.taskEventId ?? options?.parentEventId ?? 'system',
+        sourceLayer: 'execution',
+      }));
+    } catch (err) {
+      // The action was allowed after a successful review; only its digest line is lost.
+      skillLogger.error({ err, toolName }, 'autonomy gate: failed to queue the gate_proceeded report item');
+    }
+  }
+
+  /**
+   * Put a successful autonomous action in the spot-check pool (#2159 Phase 3). Sends are
+   * recorded by the gateway. Not for principal-approved re-executions (they have their own
+   * approved row) or live principal turns (the principal asked for it). Never throws.
+   */
+  private async recordSampledAction(
+    toolName: string,
+    actionRisk: ActionRisk,
+    input: Record<string, unknown>,
+    options: InvokeOptions | undefined,
+    gateProceeded: boolean,
+    skillLogger: Logger,
+    resultData?: unknown,
+  ): Promise<void> {
+    if (!this.actionLogRepo) return;
+    if (options?.humanApproved || isLivePrincipalTurn(options?.liveTurn, options?.taskMetadata)) return;
+    // Tools loaded from an MCP server are never sampled. Their manifest inherits the server's
+    // one action_risk (mcp-loader), so on a medium-risk server every call, reads included,
+    // would qualify; a read cannot be told from a write by name; and the generic "Run <tool>"
+    // summary gives the principal nothing to grade.
+    if (this.registry.isMcpSourced(toolName)) return;
+    // The pool row keeps the input and a summary built from it, so an input still carrying a
+    // sign-in code (only the scrub-exempt tool's can, #2017) never enters it.
+    if (this.holdsUnscrubbedCode(toolName, input)) return;
+    try {
+      // Inside the try: isSampledTool → minScoreForActionRisk throws on an unknown risk label,
+      // and invoke()'s outer catch would turn the action's success into a failure. The action
+      // has already run, so a throw here may cost only its spot-check row.
+      if (!isSampledTool(toolName, actionRisk)) return;
+      // A call that reports it changed nothing (ceo-inbox-archive on a message already out of
+      // the inbox) is not an action the principal can grade.
+      if (isNoOpResult(resultData)) return;
+      // A triage tool that already read the message returns its subject and sender; naming
+      // them makes the sample gradable ("Archive an email" alone is not). Only triage tools
+      // are read this way, so another tool's `subject` output is never mistaken for an email's.
+      const email = TRIAGE_SKILLS.has(toolName) ? sampleEmailFromResult(resultData) : undefined;
+      const base = buildDescription(toolName, input);
+      await this.actionLogRepo.insertSampled({
+        taskId: options?.taskEventId ?? options?.parentEventId ?? 'system',
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        toolName,
+        actionRisk: String(actionRisk),
+        summary: email ? formatEmailSummary(base, email.subject, email.from) : base,
+        ...(email ? { email } : {}),
+        // Kept on the row when small (the repo decides), so the spot check can later name
+        // what a triage action touched; triage tools carry only a message id.
+        input,
+        signals: {
+          ...(TRIAGE_SKILLS.has(toolName) ? { triage: true } : {}),
+          ...(gateProceeded ? { gateProceeded: true } : {}),
+        },
+      });
+    } catch (err) {
+      // The action already ran; only its chance of being spot-checked is lost, so no rethrow.
+      // Logged at error all the same: a pool that silently stops filling starves the spot
+      // check. The pg SQLSTATE code, when there is one, tells a schema problem from an outage.
+      const code = (err as { code?: unknown } | null)?.code;
+      skillLogger.error(
+        { err, toolName, taskEventId: options?.taskEventId, ...(typeof code === 'string' ? { code } : {}) },
+        'execution: could not record the action for spot checks — it ran, but will not be sampled',
+      );
+    }
+  }
+
+  /**
    * Return LLM tool definitions for the named skills.
    *
    * Used by AgentRuntime to expand the per-task working tool list after a
-   * skill-registry discovery call — the runtime calls this with the names
-   * returned by skill-registry, gets back full tool schemas, and appends
+   * tool-registry discovery call — the runtime calls this with the names
+   * returned by tool-registry, gets back full tool schemas, and appends
    * them so the LLM can call the newly-discovered skills in subsequent turns.
    *
    * Unknown names are silently skipped (same as toToolDefinitions).
    */
-  getToolDefinitions(skillNames: string[]): ToolDefinition[] {
-    return this.registry.toToolDefinitions(skillNames);
+  getToolDefinitions(toolNames: string[]): ToolDefinition[] {
+    return this.registry.toToolDefinitions(toolNames);
+  }
+
+  /**
+   * Resolve a skill activation for an agent (#1495). Returns member tools the
+   * agent may call (allowed_callers) plus SKILL.md instructions — never widens
+   * authority. Requires skillRegistry on this layer.
+   */
+  resolveSkillActivationForAgent(
+    skillName: string,
+    agentId: string,
+  ): import('./skill-activation.js').SkillActivationResult | import('./skill-activation.js').SkillActivationFailure {
+    if (!this.skillRegistry) {
+      return { error: 'skillRegistry not configured on ExecutionLayer' };
+    }
+    return resolveSkillActivation({
+      skillName,
+      skillRegistry: this.skillRegistry,
+      toolRegistry: this.registry,
+      agentId,
+    });
   }
 
   /**
@@ -486,31 +1745,49 @@ export class ExecutionLayer {
    *
    * Steps:
    * 1. Resolve the skill from the registry
-   * 2. Build a sandboxed SkillContext with scoped secret access
+   * 2. Build a sandboxed ToolContext with scoped secret access
    * 3. If manifest declares entity_enrichment, pre-assemble EntityContext
    * 4. Execute the handler with a timeout
    * 5. Sanitize the output (strip injection vectors, redact secrets, truncate)
    * 6. Return the result
    *
-   * Never throws — always returns a SkillResult.
+   * Never throws — always returns a ToolResult.
    */
   async invoke(
-    skillName: string,
+    toolName: string,
     input: Record<string, unknown>,
     caller?: CallerContext,
     options?: InvokeOptions,
-  ): Promise<SkillResult> {
-    const skill = this.registry.get(skillName);
+  ): Promise<ToolResult> {
+    const skill = this.registry.get(toolName);
 
     if (!skill) {
-      return { success: false, error: this.wrapSkillError(`Skill '${skillName}' not found in registry`) };
+      return { success: false, error: this.wrapSkillError(`Tool '${toolName}' not found in registry`) };
     }
 
     const { manifest, handler } = skill;
 
     // Declare skillLogger here (before the normalization loop) so it is in scope
     // for both the normalization error path and the rest of the method.
-    const skillLogger = this.logger.child({ skill: skillName });
+    const skillLogger = this.logger.child({ skill: toolName });
+
+    // Per-invoke cache: Gate C's getEmailMessage and the handler's share one
+    // snapshot so an allowed email-reply is not fetched twice / raced (#1815).
+    // The wrapper is created lazily on first Gate C fetch so other skills keep
+    // the original gateway object identity.
+    const emailMessageCache = new Map<string, ReturnType<OutboundGateway['getEmailMessage']>>();
+    let outboundGatewayForCtx = this.outboundGateway;
+    const sourceOutboundGateway = this.outboundGateway;
+    const fetchMessageForGateC = sourceOutboundGateway
+      ? (messageId: string, accountId?: string) => {
+          if (outboundGatewayForCtx === sourceOutboundGateway) {
+            outboundGatewayForCtx = withCachedGetEmailMessage(sourceOutboundGateway, emailMessageCache);
+          }
+          // Forward the resolver's accountId into the cached wrapper. The
+          // handler passes the same id from emailAccountIdFromInput (#1832).
+          return outboundGatewayForCtx!.getEmailMessage(messageId, accountId);
+        }
+      : undefined;
 
     // Normalize timestamp inputs to UTC Z-suffix before invoking the handler.
     // The LLM often emits offset-less ISO strings (e.g. "2026-04-06T08:00:00")
@@ -530,39 +1807,98 @@ export class ExecutionLayer {
         // would silently create events at the wrong time (the server runs UTC, so an
         // offset-less string passed to new Date() is interpreted as UTC, not local time).
         // Return a skill error so the LLM can re-emit the value with an explicit offset.
-        skillLogger.error({ err, key, raw }, 'timestamp normalization failed; refusing to invoke handler with unnormalized value');
+        // The default-deny scrub below has not run yet, and the value (and the parser's
+        // error message, which quotes it) can be a tracked sign-in code (#2017): scrub
+        // both before they reach the log line or the error the model reads back.
+        const tracker = this.verification?.tracker;
+        const safeRaw = tracker ? tracker.scrubText(raw) : raw;
+        const safeErr = tracker && err instanceof Error ? new Error(tracker.scrubText(err.message)) : err;
+        skillLogger.error({ err: safeErr, key, raw: safeRaw }, 'timestamp normalization failed; refusing to invoke handler with unnormalized value');
         return {
           success: false,
-          error: this.wrapSkillError(`Input '${key}' could not be parsed as a valid datetime: "${raw}". Please provide an ISO 8601 string with a UTC offset (e.g. "2026-04-06T08:00:00-04:00").`),
+          error: this.wrapSkillError(`Input '${key}' could not be parsed as a valid datetime: "${safeRaw}". Please provide an ISO 8601 string with a UTC offset (e.g. "2026-04-06T08:00:00-04:00").`),
         };
       }
     }
 
-    // Elevated-skill gate: require principal or system origination.
-    // Principal = CEO in an active conversation. System = operator-declared YAML job,
-    // version-controlled and reviewed — more trustworthy than agent-self-scheduled.
-    // Agent-originated tasks (systemRole: "agent") are deliberately excluded: those
-    // are autonomously invented by the LLM and must not have standing access to the
-    // approval queue.
+    // Default-deny scrub of sign-in codes (#2017). Everything below — gates, approval
+    // payloads, audit rows and the handler itself — sees the scrubbed input. web-browser
+    // is the one tool that must receive the real value (its own guard decides where a
+    // tracked code may be typed). Its input is therefore never queued for approval while it
+    // holds a code (holdsUnscrubbedCode). MCP tools come through here too. scrubDeep returns
+    // a copy, so the caller's object is never mutated.
+    if (this.verification && toolName !== SIGN_IN_CODE_SCRUB_EXEMPT_TOOL) {
+      input = this.verification.tracker.scrubDeep(input);
+    }
+
+    // Read the live autonomy score ONCE per invocation (#1125). Used by both the
+    // effective-standing ladder (immediately below) and the autonomy gates further down.
+    // Hoisted above the elevated gate because that gate's INPUT is now effective standing,
+    // which needs the live score for a woken task. Fail-open to null on any error / unwired
+    // service — a transient DB issue must not silently disable the agent.
+    let autonomyConfig: AutonomyConfig | null = null;
+    if (this.autonomyService) {
+      try {
+        autonomyConfig = await this.autonomyService.getConfig();
+      } catch (err) {
+        skillLogger.warn({ err, toolName }, 'autonomy gate: failed to read autonomy_config — skipping gate (fail-open)');
+      }
+    }
+    // Gate C's policy, from the same read (#2312): the config's gating, else the constructed one.
+    const gating = this.currentGating(autonomyConfig);
+
+    // Effective standing (#1125): for a live turn this is the raw task metadata (lineage IS the
+    // standing); for a heartbeat wake the bypass ladder lets the live score only DOWNGRADE the
+    // lineage's standing to agent (propose-only), never grant it. The execution-layer gates read
+    // EFFECTIVE standing; audit logs below keep the raw lineage. Computed from the LIVE score, so
+    // lowering the score mid-flight removes inherited bypass on the very next action.
+    const effectiveTaskMetadata = computeEffectiveTaskMetadata(
+      options?.taskMetadata,
+      autonomyConfig?.score ?? null,
+      this.bypassLadder,
+    );
+
+    // Elevated-skill gate (#1126): require a LIVE PRINCIPAL TURN — the current turn originated
+    // from a fresh principal inbound. This is the SOLE enforcement point for `elevated`; there
+    // are no handler-level re-checks (they froze the old "principal-only", then "principal-or-
+    // system", definitions and drifted out of sync — abolished in #1126). The live-principal
+    // signal is stamped by the dispatcher only on real principal inbounds and is structurally
+    // absent from wakes, derivations (delegated sub-tasks / child tasks), and scheduler fires.
     //
-    // Handler-level defense-in-depth: skills that must never accept system origination
-    // (approve/deny/dismiss — require active CEO authorization) retain their own
-    // isPrincipalOriginated() checks. Read-only elevated skills (list-pending-actions)
-    // mirror this gate's logic. When changing this gate, audit elevated handler.ts files.
-    // See docs/wip/2026-05-10-principal-identity-design.md
+    // Consequences, by caller:
+    //  - System-declared jobs (the 8am digest) NO LONGER pass this gate. The one read that needed
+    //    it — list-pending-actions — moved to `normal` + allowed_callers:[coordinator] (#1126), so
+    //    the digest still works because the coordinator is the caller, not because of origination.
+    //  - A woken/derived PRINCIPAL-LINEAGE task fails: lineage is not a live turn. This closes the
+    //    self-approval hole with zero per-skill exceptions (a heartbeat-woken task can never approve
+    //    its own pending action). It can still inherit the principal-bypass of the *autonomy* gate
+    //    below via the ladder — a different, intentional notion of "principal" (acting within
+    //    principal-authorized work vs. exercising authority now). See the autonomy gate's comment + ADR-017.
+    //
+    // The signal is `options.liveTurn` (a DISTINCT field off the metadata bag, so it can never be
+    // persisted); isLivePrincipalTurn also requires principal originator on the effective metadata
+    // for defence in depth. A live turn carries no wakeContext, so its effective standing equals
+    // its raw lineage. See docs/specs/03-tools-and-execution.md (elevated = live principal turn) and ADR-017.
     if (manifest.sensitivity === 'elevated') {
-      if (!isPrincipalOriginated(options?.taskMetadata) && !isSystemOriginated(options?.taskMetadata)) {
+      // Defence in depth (#1126): a heartbeat-woken / scheduled task is NEVER a live principal turn.
+      // The live signal is a distinct off-bag field the wake path never sets, so a woken task should
+      // never carry `liveTurn` in the first place — but we reject on `wakeContext` explicitly so the
+      // self-approval-hole closure does not lean solely on the dispatcher/scheduler keeping `liveTurn`
+      // off a wake. If the flag ever leaks onto a wake, this still fails closed.
+      const isWokenTurn = (options?.taskMetadata as Record<string, unknown> | undefined)?.['wakeContext'] !== undefined;
+      if (isWokenTurn || !isLivePrincipalTurn(options?.liveTurn, effectiveTaskMetadata)) {
         this.logger.warn(
           {
-            skillName,
+            toolName,
             caller: caller ? { role: caller.role, channel: caller.channel } : null,
+            // Log the raw LINEAGE (audit), not the downgraded effective standing.
             originator: (options?.taskMetadata as Record<string, unknown> | undefined)?.originator ?? null,
           },
-          'Elevated skill blocked: task not originated by principal or system',
+          'Elevated skill blocked: not a live principal turn (system, agent, and woken/inherited principal-lineage all fail)',
         );
         return {
           success: false,
-          error: this.wrapSkillError(`Skill '${skillName}' requires elevated privileges — task was not originated by the principal or a system-declared job`),
+          error: this.wrapSkillError(`Tool '${toolName}' requires a live principal turn — it can only be invoked directly by the principal, not by a system job, an agent, or a woken/scheduled task`),
         };
       }
     }
@@ -573,24 +1909,85 @@ export class ExecutionLayer {
     // 'system' is the fallback for system-layer invocations (checkpoint processor,
     // scheduler) where no agentId is present in InvokeOptions.
     //
-    // Skipped when humanApproved is set: the CEO explicitly approved this action
+    // Skipped when humanApproved is set: the principal explicitly approved this action
     // via approve-action, which re-invokes with humanApproved: true but no agentId.
-    // The CEO is the ultimate authority — blocking a CEO-approved re-execution on
+    // The principal is the ultimate authority — blocking a principal-approved re-execution on
     // caller identity would be counterproductive.
     const allowedCallers = manifest.allowed_callers;
     if (allowedCallers && allowedCallers.length > 0 && !options?.humanApproved) {
       const callerId = options?.agentId ?? 'system';
       if (!allowedCallers.includes(callerId)) {
         skillLogger.warn(
-          { skillName, callerId, allowedCallers },
+          { toolName, callerId, allowedCallers },
           'Skill blocked: caller not in allowed_callers',
         );
         return {
           success: false,
           error: this.wrapSkillError(
-            `Skill '${skillName}' is restricted to agents: ${allowedCallers.join(', ')}`,
+            `Tool '${toolName}' is restricted to agents: ${allowedCallers.join(', ')}`,
           ),
         };
+      }
+    }
+
+    // A bullpen wake stamped originTurnOwnsReply is the delegator being told
+    // about work its own still-open turn will answer. Refuse the human-channel
+    // send here, before autonomy can write an approval for a message that must
+    // not go out. humanApproved is a principal re-execution and is not this race.
+    // A malformed stamp fails open inside the parser. (#1917)
+    if (!options?.humanApproved && isHumanReplySkill(toolName)) {
+      const owner = parseOriginTurnOwnsReply(
+        options?.taskMetadata?.[ORIGIN_TURN_OWNS_REPLY_KEY],
+      );
+      if (owner) {
+        skillLogger.info(
+          {
+            toolName,
+            agentId: options?.agentId,
+            taskEventId: options?.taskEventId,
+            delegateEventId: owner.delegateEventId,
+            originConversationId: owner.originConversationId,
+            originChannelId: owner.originChannelId,
+          },
+          'outbound suppressed — originating turn still owns the principal reply (#1917)',
+        );
+        return {
+          success: false,
+          error: this.wrapSkillError(ORIGIN_TURN_OWNS_REPLY_ERROR),
+        };
+      }
+    }
+
+    // Send-skill recipient references (#2033, #2041): check them once, before any gate can
+    // file an approval. A retired raw-address input or an address in a reference input is
+    // refused here with the skill's own message. When a contact service is configured, each
+    // reference is also resolved here, and one that does not resolve is refused, so the
+    // principal is never asked to approve a send that cannot run; Gate C reuses the resolved
+    // addresses, so it judges exactly where the skill will send. Without a contact service
+    // references are not resolved here, and Gate C fails closed on them.
+    let sendRecipients: Map<string, string> | undefined;
+    let sendPins: readonly SendRecipientPin[] | undefined;
+    if (RECIPIENT_REFERENCE_SKILLS[toolName]) {
+      const checked = await this.resolveSendSkillReferences(toolName, input, skillLogger);
+      if (!checked.ok) {
+        return {
+          success: false,
+          error: this.wrapSkillError(checked.error),
+          ...(checked.errorType ? { errorType: checked.errorType } : {}),
+        };
+      }
+      sendRecipients = checked.resolved;
+      sendPins = checked.pins;
+      // A hinted approval recorded the identity it showed. Replay must still
+      // name that identity, including when the fresh resolve would fall back
+      // to a different unlabelled address (#2047).
+      if (
+        options?.humanApproved
+        && options.sendResolution
+        && options.sendResolution.length > 0
+        && !sendPinsMatch(checked.pins, options.sendResolution)
+      ) {
+        return { success: false, error: this.wrapSkillError(STALE_SEND_APPROVAL_ERROR) };
       }
     }
 
@@ -601,16 +1998,16 @@ export class ExecutionLayer {
     if (options?.humanApproved) {
       // agentId is intentionally absent on the approve-action re-execution path.
       // Log taskEventId (correlates to the original action log entry) and
-      // originator (the CEO who triggered the task chain) for forensic attribution.
+      // originator (the principal who triggered the task chain) for forensic attribution.
       skillLogger.info(
         {
-          skillName,
+          toolName,
           agentId: options.agentId,
           taskEventId: options.taskEventId,
           originator: options.taskMetadata?.['originator'],
           allowedCallers: manifest.allowed_callers,
         },
-        'caller gate and autonomy gates skipped — humanApproved flag set (CEO-authorized re-execution, see ADR-018)',
+        'caller gate and autonomy gates skipped — humanApproved flag set (principal-authorized re-execution, see ADR-018)',
       );
     }
 
@@ -619,55 +2016,76 @@ export class ExecutionLayer {
     // via CallerContext (sensitivity: 'elevated' gate above). Gating them on
     // autonomy score would create a deadlock: set-autonomy requires score 80
     // but is the only way to raise the score.
-    // Read the live score once per invocation. Fail-open if the service is not
-    // wired or the config table doesn't exist yet (getConfig returns null).
-    // humanApproved bypasses gates A and B — the skill runs as CEO-authorized.
-    if (this.autonomyService && manifest.sensitivity !== 'elevated' && !options?.humanApproved) {
-      let autonomyConfig: AutonomyConfig | null = null;
-      try {
-        autonomyConfig = await this.autonomyService.getConfig();
-      } catch (err) {
-        // DB error reading autonomy_config — fail-open with a warn log.
-        // A transient DB issue should not silently disable the agent.
-        skillLogger.warn({ err, skillName }, 'autonomy gate: failed to read autonomy_config — skipping gate (fail-open)');
-      }
-
-      if (autonomyConfig !== null) {
+    // autonomyConfig was read once above (hoisted for the effective-standing ladder). Fail-open
+    // when the service is not wired or the config table doesn't exist yet (getConfig → null).
+    // humanApproved bypasses gates A and B — the skill runs as principal-authorized.
+    //
+    // The outer condition is NOT gated on `this.autonomyService`: the no-score branch below must
+    // be reachable even when the service is absent, so a woken task fails closed regardless of WHY
+    // the score is unavailable (unwired service vs. null config) — otherwise the metadata downgrade
+    // would be decorative for an autonomous execution with no human in the loop (#1125).
+    //
+    // gateProceeded: band Gate C let this through where the tier policy would have asked. The
+    // spot-check pool row records it after the handler succeeds (#2159 Phase 3).
+    let gateProceeded = false;
+    if (manifest.sensitivity !== 'elevated' && !options?.humanApproved) {
+      if (this.autonomyService && autonomyConfig !== null) {
         const currentScore = autonomyConfig.score;
 
-        // Principal bypass — if the task was originated by the principal (CEO), skip gates A and B.
-        // The autonomy gate governs *autonomous* behavior; a direct CEO instruction overrides it
-        // by intent. Log at info so bypasses are visible in production.
-        if (isPrincipalOriginated(options?.taskMetadata)) {
+        // Principal bypass — if the task's EFFECTIVE standing is principal, skip gates A and B.
+        // For a live principal turn this is the raw principal lineage; for a heartbeat wake it is the
+        // post-ladder standing, so a woken task only bypasses when the live score clears the
+        // posture threshold (#1125). The autonomy gate governs *autonomous* behavior; a direct
+        // principal instruction overrides it by intent. Log at info so bypasses are visible in prod.
+        if (isPrincipalOriginated(effectiveTaskMetadata)) {
           skillLogger.info(
-            { skillName, currentScore, agentId: options?.agentId, taskEventId: options?.taskEventId },
+            { toolName, currentScore, agentId: options?.agentId, taskEventId: options?.taskEventId },
             'autonomy gate: skipped — task originated by principal',
           );
         } else {
+          // Principal-only send bypass (#2337): a send whose recipients are all the verified
+          // principal skips gates A and B, whoever started the task. Messaging the principal is
+          // how a restricted Curia reports or asks for help; the gateway already exempts these
+          // sends from its own score gate, and the relay budget caps their volume. Checked only
+          // when A or B would block, so a send above the threshold pays no extra lookup. Gate C
+          // still runs below.
+          const requiredScore = AutonomyService.minScoreForActionRisk(manifest.action_risk);
+          const gateABWouldBlock =
+            (currentScore < 60 && manifest.action_risk !== 'none') || currentScore < requiredScore;
+          const principalOnlySend = gateABWouldBlock && await this.isPrincipalOnlySend(
+            toolName, input, sendRecipients, skillLogger, fetchMessageForGateC,
+          );
+          if (principalOnlySend) {
+            skillLogger.info(
+              { toolName, currentScore, requiredScore, agentId: options?.agentId, taskEventId: options?.taskEventId },
+              'autonomy gate: gates A and B skipped — recipient set is exclusively the verified principal (#2337)',
+            );
+          }
+
           // Gate A: Full restriction — score < 60 blocks all non-read skills.
           // action_risk: 'none' is exempt (reads, retrieval, summarisation).
-          if (currentScore < 60 && manifest.action_risk !== 'none') {
+          if (!principalOnlySend && currentScore < 60 && manifest.action_risk !== 'none') {
             skillLogger.info(
-              { skillName, currentScore, actionRisk: manifest.action_risk },
+              { toolName, currentScore, actionRisk: manifest.action_risk },
               'autonomy gate: skill blocked — agent is in restricted mode (score < 60)',
             );
             if (this.bus) {
               this.bus.publish('execution', createAutonomySkillBlocked({
-                skillName,
+                toolName,
                 actionRisk: manifest.action_risk,
                 currentScore,
                 requiredScore: 60,
                 agentId: options?.agentId,
                 taskEventId: options?.taskEventId,
               })).catch((err) => {
-                skillLogger.warn({ err, skillName }, 'autonomy gate: failed to publish autonomy.skill_blocked event');
+                skillLogger.warn({ err, toolName }, 'autonomy gate: failed to publish autonomy.tool_blocked event');
               });
             }
             // Note: `input` here is post-timestamp-normalization (mutated in-place above).
             // The stored payload in autonomy_action_log will contain normalized timestamps,
             // which is correct — re-normalization on approve-action re-invocation is a no-op.
             const gateAError = await this.buildGateError(
-              skillName, input, currentScore, 60, manifest.action_risk, options, skillLogger,
+              toolName, input, currentScore, 60, manifest.action_risk, options, skillLogger, sendPins,
             );
             return {
               success: false,
@@ -678,27 +2096,26 @@ export class ExecutionLayer {
           // action_risk: 'none' skills fall through Gate A above and reach Gate B.
           // minScoreForActionRisk('none') returns 0, so Gate B is always a no-op for reads.
           // Gate B: Per-skill action_risk threshold.
-          const requiredScore = AutonomyService.minScoreForActionRisk(manifest.action_risk);
-          if (currentScore < requiredScore) {
+          if (!principalOnlySend && currentScore < requiredScore) {
             skillLogger.info(
-              { skillName, currentScore, requiredScore, actionRisk: manifest.action_risk },
+              { toolName, currentScore, requiredScore, actionRisk: manifest.action_risk },
               'autonomy gate: skill blocked — score below action_risk threshold',
             );
             if (this.bus) {
               this.bus.publish('execution', createAutonomySkillBlocked({
-                skillName,
+                toolName,
                 actionRisk: manifest.action_risk,
                 currentScore,
                 requiredScore,
                 agentId: options?.agentId,
                 taskEventId: options?.taskEventId,
               })).catch((err) => {
-                skillLogger.warn({ err, skillName }, 'autonomy gate: failed to publish autonomy.skill_blocked event');
+                skillLogger.warn({ err, toolName }, 'autonomy gate: failed to publish autonomy.tool_blocked event');
               });
             }
             // Note: same post-normalization `input` as Gate A — see comment above.
             const gateBError = await this.buildGateError(
-              skillName, input, currentScore, requiredScore, manifest.action_risk, options, skillLogger,
+              toolName, input, currentScore, requiredScore, manifest.action_risk, options, skillLogger, sendPins,
             );
             return {
               success: false,
@@ -713,28 +2130,233 @@ export class ExecutionLayer {
           // checkpoint processor invoking extract-facts with no task metadata). An EXTERNAL
           // originator that carries no resolved tier instead FAILS CLOSED (#1059) — see the
           // else-if below — because we cannot establish the tier the gate needs.
-          const initiatingTier = getInitiatingTier(options?.taskMetadata);
+          // Gate C reads EFFECTIVE standing too (#1125): a wake the ladder downgraded to agent
+          // reads as a non-external originator → skips the tier gate (gates A/B already enforced).
+          // The ladder never downgrades an EXTERNAL lineage (only principal/system), so an
+          // external-originated woken task still has its tier enforced here.
+          const initiatingTier = getInitiatingTier(effectiveTaskMetadata);
           if (initiatingTier !== null && manifest.action_risk !== 'none') {
-            const actionClass = mapActionRiskToConsequenceClass(manifest.action_risk);
-            const tierDecision = await this.resolveTierGateDecision(
-              initiatingTier, actionClass, skillName, manifest, input, options, skillLogger,
-            );
-            if (tierDecision === 'escalate') {
+            // KG writes from unknown/blocked external senders are not prompt-only (#1290).
+            if (
+              KG_WRITE_TOOLS.has(toolName) &&
+              (initiatingTier === 'unknown' || initiatingTier === 'blocked')
+            ) {
               skillLogger.info(
-                { skillName, initiatingTier, actionClass, actionRisk: manifest.action_risk },
-                'autonomy gate: skill blocked — initiating contact tier below required minimum (Gate C)',
+                { toolName, initiatingTier, actionRisk: manifest.action_risk },
+                'autonomy gate: skill blocked — KG write from untrusted external originator (Gate C, #1290)',
               );
+              const auditFail = await this.publishGateCDecision(
+                'escalate', toolName, initiatingTier, options, skillLogger,
+              );
+              if (auditFail) return auditFail;
               const gateCError = await this.buildTierGateError(
-                skillName, input, initiatingTier, manifest.action_risk, currentScore, options, skillLogger,
+                toolName, input, initiatingTier, manifest.action_risk, currentScore, options, skillLogger, sendPins,
               );
               return {
                 success: false,
                 error: this.wrapSkillError(gateCError),
               };
             }
+            if (gating === 'band') {
+              // Band gating (#2159): the score decides; the judge flags steering and speaking
+              // for the principal. The #1290 KG-write block above still applies.
+              const gate = await this.runBandGateC({
+                toolName, manifest, input, options, skillLogger, currentScore, initiatingTier, sendPins,
+              });
+              if (gate.blocked) return gate.blocked;
+              gateProceeded = gate.gateProceeded;
+            } else {
+              const actionClass = mapActionRiskToConsequenceClass(manifest.action_risk);
+              const foundCarveout = findCarveoutSkill(toolName);
+              // Shape-check email-reply before the Gate C policy shortcut (#1817 /
+              // CodeRabbit). When both policy axes escalate (e.g. unknown tier),
+              // resolveGateCRecipients is skipped and the agent would only see a
+              // generic escalate error. This check is sync and never fetches.
+              if (toolName === 'email-reply') {
+                const replyTo = input['reply_to_message_id'];
+                if (typeof replyTo === 'string' && looksLikeOutboundContextEntryId(replyTo)) {
+                  skillLogger.info(
+                    { toolName },
+                    'autonomy gate: email-reply reply_to_message_id failed shape check before Gate C shortcut (#1817)',
+                  );
+                  return {
+                    success: false,
+                    error: this.wrapSkillError(replyToMessageIdLooksLikeEntryIdError()),
+                  };
+                }
+                // Placeholder text or a malformed Gmail ID would otherwise reach
+                // Gate C's message fetch and come back as a 404 escalation (#2083).
+                const shapeError =
+                  typeof replyTo === 'string' && replyTo.trim()
+                    ? validateNylasMessageId(replyTo, 'reply_to_message_id')
+                    : null;
+                if (shapeError) {
+                  skillLogger.info(
+                    { toolName },
+                    'autonomy gate: email-reply reply_to_message_id failed shape check before Gate C shortcut (#2083)',
+                  );
+                  return { success: false, error: this.wrapSkillError(shapeError), errorType: 'VALIDATION_ERROR' };
+                }
+              }
+              // Cheap sync parse only. Async resolveRecipients (Nylas) waits until the
+              // third-party axis actually matters — blocked/unknown never pay that round trip.
+              let recipients: string[] | null = null;
+              let resolutionFailed = false;
+              if (foundCarveout && !foundCarveout.carveout.resolveRecipients) {
+                recipients = foundCarveout.carveout.parseRecipients(input);
+                // Send skills take contact references (#2033, #2041). The pre-gate check
+                // above refused anything that is not a reference and, when a contact
+                // service is configured, resolved each one, so swap in the resolved
+                // address here: the principal carve-out and the reply-to-sender check then
+                // compare the address that will actually be sent to. Without a contact
+                // service there is no resolved address, and the reference is refused here
+                // (fail closed). No contact read happens here. An entry that is not
+                // reference-shaped would pass through unchanged, but no send skill
+                // produces one now; a caller that holds a raw address (a non-skill call
+                // to OutboundGateway.send) never reaches this skill-input path.
+                if (recipients !== null) {
+                  const normalized = this.substituteResolvedRecipients(recipients, sendRecipients);
+                  if (!normalized.ok) {
+                    skillLogger.info({ toolName }, 'autonomy gate: Gate C refused an unresolved recipient reference (#2033)');
+                    return { success: false, error: this.wrapSkillError(normalized.error) };
+                  }
+                  recipients = normalized.recipients;
+                }
+              }
+              let isPrincipalSoleRecipient = resolvePrincipalIsSoleRecipientFromSkillInput(
+                toolName,
+                input,
+                this.principalIdentities,
+                recipients,
+              );
+              const decisionIfReplyToSender = applyActionPolicy(
+                initiatingTier, actionClass, false, isPrincipalSoleRecipient,
+              );
+              const decisionIfThirdParty = applyActionPolicy(
+                initiatingTier, actionClass, true, isPrincipalSoleRecipient,
+              );
+
+              // Both axes already agree, so resolveGateCRecipients is skipped below
+              // and a misspelled mailbox would become a generic escalation (#1832).
+              // Validate the name against the client map — no message fetch.
+              if (
+                decisionIfReplyToSender === decisionIfThirdParty
+                && toolName === 'email-reply'
+                && this.outboundGateway
+              ) {
+                const accountId = emailAccountIdFromInput(input);
+                if (accountId) {
+                  try {
+                    this.outboundGateway.requireKnownEmailAccount(accountId);
+                  } catch (err) {
+                    if (err instanceof UnknownEmailAccountError) {
+                      skillLogger.info(
+                        { toolName },
+                        'autonomy gate: email-reply account is not a configured mailbox (#1832)',
+                      );
+                      return {
+                        success: false,
+                        error: this.wrapSkillError(err.message),
+                      };
+                    }
+                    throw err;
+                  }
+                }
+              }
+
+              let structuralIsThirdPartyFacing: boolean | undefined;
+              let initiatingIdentifiers: string[] = [];
+              if (decisionIfReplyToSender !== decisionIfThirdParty) {
+                if (foundCarveout?.carveout.resolveRecipients) {
+                  const resolved = await this.resolveGateCRecipients(
+                    toolName, input, skillLogger, fetchMessageForGateC,
+                  );
+                  if (resolved.inputError) {
+                    skillLogger.info(
+                      { toolName },
+                      resolved.inputErrorKind === 'unknown-account'
+                        ? 'autonomy gate: email-reply account is not a configured mailbox (#1832)'
+                        : 'autonomy gate: email-reply reply_to_message_id failed shape check before Nylas fetch (#1817)',
+                    );
+                    return {
+                      success: false,
+                      error: this.wrapSkillError(resolved.inputError),
+                    };
+                  }
+                  recipients = resolved.recipients;
+                  resolutionFailed = resolved.resolutionFailed;
+                  // email-reply's cc may hold references (#2131). Compare the addresses
+                  // the handler will send to, as the sync path does for email-send.
+                  if (recipients !== null) {
+                    const normalized = this.substituteResolvedRecipients(recipients, sendRecipients);
+                    if (!normalized.ok) {
+                      skillLogger.info({ toolName }, 'autonomy gate: Gate C refused an unresolved recipient reference (#2131)');
+                      return { success: false, error: this.wrapSkillError(normalized.error) };
+                    }
+                    recipients = normalized.recipients;
+                  }
+                  isPrincipalSoleRecipient = resolvePrincipalIsSoleRecipientFromSkillInput(
+                    toolName,
+                    input,
+                    this.principalIdentities,
+                    resolutionFailed ? null : recipients,
+                  );
+                }
+                if (foundCarveout) {
+                  initiatingIdentifiers = await this.collectInitiatingSenderIdentifiers(
+                    options, skillLogger, foundCarveout.rules.channel,
+                  );
+                }
+                if (resolutionFailed) {
+                  // Resolver ran and failed — never allow (#1815).
+                  structuralIsThirdPartyFacing = true;
+                } else if (
+                  recipients !== null
+                  && initiatingIdentifiers.length > 0
+                  && foundCarveout
+                ) {
+                  structuralIsThirdPartyFacing = !isSolelyInitiatingSender(
+                    recipients,
+                    initiatingIdentifiers,
+                    foundCarveout.rules.identifiersEqual.bind(foundCarveout.rules),
+                  );
+                }
+              }
+              const recipientCount = recipients === null ? undefined : recipients.length;
+              const tierDecision = await this.resolveTierGateDecision(
+                initiatingTier, actionClass, toolName, manifest, input, options, skillLogger,
+                isPrincipalSoleRecipient,
+                structuralIsThirdPartyFacing,
+                {
+                  initiatingSender: initiatingIdentifiers,
+                  resolvedRecipients: foundCarveout ? recipients : undefined,
+                },
+              );
+              if (tierDecision === 'escalate') {
+                skillLogger.info(
+                  { toolName, initiatingTier, actionClass, actionRisk: manifest.action_risk },
+                  'autonomy gate: skill blocked — initiating contact tier below required minimum (Gate C)',
+                );
+                const auditFail = await this.publishGateCDecision(
+                  'escalate', toolName, initiatingTier, options, skillLogger, recipientCount,
+                );
+                if (auditFail) return auditFail;
+                const gateCError = await this.buildTierGateError(
+                  toolName, input, initiatingTier, manifest.action_risk, currentScore, options, skillLogger, sendPins,
+                );
+                return {
+                  success: false,
+                  error: this.wrapSkillError(gateCError),
+                };
+              }
+              const allowAuditFail = await this.publishGateCDecision(
+                'allow', toolName, initiatingTier, options, skillLogger, recipientCount,
+              );
+              if (allowAuditFail) return allowAuditFail;
+            }
           } else if (
             manifest.action_risk !== 'none' &&
-            isExternalOriginatorMissingTier(options?.taskMetadata)
+            isExternalOriginatorMissingTier(effectiveTaskMetadata)
           ) {
             // Fail-closed (#1059): an external contact (systemRole not system/agent) drove a
             // consequential action but carries no resolved tier — a pre-#950 task in flight
@@ -745,34 +2367,116 @@ export class ExecutionLayer {
             // originatorContactId is hoisted out as a flat field (in addition to the full
             // originator object) so operators can aggregate this warn by contact when sizing
             // how often the unstamped-tier gap is hit.
-            const failedOriginator = options?.taskMetadata?.['originator'] as
-              | { contactId?: string }
-              | undefined;
+            const rawFailedOriginator: unknown = options?.taskMetadata?.['originator'];
+            const failedOriginatorContactId =
+              rawFailedOriginator !== null &&
+              typeof rawFailedOriginator === 'object' &&
+              typeof (rawFailedOriginator as { contactId?: unknown }).contactId === 'string'
+                ? (rawFailedOriginator as { contactId: string }).contactId
+                : undefined;
             skillLogger.warn(
               {
-                skillName,
+                toolName,
                 actionRisk: manifest.action_risk,
                 originator: options?.taskMetadata?.['originator'],
-                originatorContactId: failedOriginator?.contactId,
+                originatorContactId: failedOriginatorContactId,
                 agentId: options?.agentId,
                 taskEventId: options?.taskEventId,
               },
               'autonomy gate: skill blocked — external originator has no resolved tier, failing closed (Gate C, see #1059)',
             );
+            const auditFail = await this.publishGateCDecision(
+              'escalate', toolName, 'unresolved', options, skillLogger,
+            );
+            if (auditFail) return auditFail;
             // No tier to feed buildTierGateError — pass an explicit sentinel label so the
             // escalation message and approval request read sensibly (tier 'unresolved').
             const gateCError = await this.buildTierGateError(
-              skillName, input, 'unresolved', manifest.action_risk, currentScore, options, skillLogger,
+              toolName, input, 'unresolved', manifest.action_risk, currentScore, options, skillLogger, sendPins,
             );
             return {
               success: false,
               error: this.wrapSkillError(gateCError),
             };
+          } else if (gating === 'band' && manifest.action_risk !== 'none') {
+            // System and agent originators (#2159): tier gating skipped them, but the band
+            // table is about what Curia does, not who asked.
+            const gate = await this.runBandGateC({
+              toolName, manifest, input, options, skillLogger, currentScore, initiatingTier: null, sendPins,
+            });
+            if (gate.blocked) return gate.blocked;
+            gateProceeded = gate.gateProceeded;
           }
         }
       } else {
-        // autonomyConfig is null — pre-migration or empty table. Fail-open.
-        skillLogger.warn({ skillName }, 'autonomy gate: autonomy_config not found — skipping gate (fail-open, pre-migration?)');
+        // No score available — autonomyService unwired, or autonomyConfig null (pre-migration /
+        // empty table / transient DB error).
+        //
+        // Fail-OPEN is correct for a live turn: a transient DB issue must not silently disable an
+        // agent acting under a human's direction. But a WOKEN task has no human in the loop, and
+        // with no score the bypass ladder cannot compute effective standing — so the same null
+        // that downgrades its inherited standing (effective-standing.ts) would otherwise let it run
+        // every non-read skill ungated, making the downgrade cosmetic. For a woken task we fail
+        // CLOSED on non-read actions instead (#1125): no score → no autonomous consequential action.
+        const isWoken = (options?.taskMetadata as Record<string, unknown> | undefined)?.['wakeContext'] !== undefined;
+        if (isWoken && manifest.action_risk !== 'none') {
+          skillLogger.warn(
+            { toolName, actionRisk: manifest.action_risk, agentId: options?.agentId, taskEventId: options?.taskEventId },
+            'autonomy gate: score unavailable on a woken task — failing closed (no human in the loop)',
+          );
+          return {
+            success: false,
+            error: this.wrapSkillError(
+              `Tool '${toolName}' blocked — the autonomy score is temporarily unavailable and this is an autonomous (woken) task. ` +
+              `It will be retried once the score can be read.`,
+            ),
+          };
+        }
+        skillLogger.warn({ toolName }, 'autonomy gate: score unavailable — skipping gate (fail-open; service unwired or pre-migration?)');
+      }
+    }
+
+    // Export control gate — MCP bulk exports and email attachments (#201).
+    // humanApproved bypasses threshold and destination gates but NOT restricted bulk blocks.
+    const isExportSkill = MCP_EXPORT_TOOLS.has(toolName)
+      || (GATEWAY_ATTACHMENT_TOOLS.has(toolName) && Array.isArray(input['attachments']) && input['attachments'].length > 0);
+    let resolvedMcpExportAudit: { items: import('../security/export-controls.js').ExportItem[]; destination: import('../security/export-controls.js').ExportDestination } | undefined;
+    if (this.exportControlService && isExportSkill) {
+      const exportEval = await this.exportControlService.evaluateSkillExport({
+        toolName,
+        input,
+        humanApproved: options?.humanApproved,
+      });
+      if (exportEval) {
+        const { outcome, items } = exportEval;
+        const destination = extractDestinationFromInput(toolName, input)
+          ?? { kind: 'email' as const, address: '(implicit reply)' };
+        if (outcome.action === 'block') {
+          skillLogger.info(
+            { toolName, code: outcome.code, itemCount: items.length },
+            'export gate: bulk restricted export blocked',
+          );
+          return { success: false, error: this.wrapSkillError(outcome.message) };
+        }
+        if (outcome.action === 'approval_required') {
+          skillLogger.info(
+            { toolName, code: outcome.code, itemCount: items.length },
+            'export gate: export requires principal approval',
+          );
+          const gateError = await this.buildExportGateError(
+            toolName,
+            input,
+            outcome.message,
+            items,
+            manifest.action_risk,
+            options,
+            skillLogger,
+          );
+          return { success: false, error: this.wrapSkillError(gateError) };
+        }
+        if (MCP_EXPORT_TOOLS.has(toolName)) {
+          resolvedMcpExportAudit = { items, destination };
+        }
       }
     }
 
@@ -830,11 +2534,16 @@ export class ExecutionLayer {
       if (entry) secretCache.set(entry[0], entry[1]);
     }
 
-    const ctx: SkillContext = {
+    const contactServiceForRefs = this.contactService;
+    const ctx: ToolContext = {
+      // Invoking skill's manifest identity — lets handlers read their own name/version
+      // from ctx instead of hardcoding a const that must be kept in sync with tool.json.
+      toolName: manifest.name,
+      toolVersion: manifest.version,
       input,
       secret: (name: string): string => {
         if (!declaredSecrets.has(name)) {
-          throw new Error(`Secret '${name}' is not declared in the manifest for skill '${skillName}'`);
+          throw new Error(`Secret '${name}' is not declared in the manifest for skill '${toolName}'`);
         }
         const entry = secretCache.get(name);
         if (!entry) {
@@ -849,7 +2558,7 @@ export class ExecutionLayer {
         // Falls back to debug-only logging if the bus is not wired (e.g. test environments).
         if (this.bus) {
           this.bus.publish('execution', createSecretAccessed({
-            skillName,
+            toolName,
             secretName: name,
             agentId: options?.agentId,
             taskEventId: options?.taskEventId,
@@ -859,7 +2568,7 @@ export class ExecutionLayer {
             // surface at error level so it reaches SIEM/alerting dashboards. The debug
             // log below still fires, but it is not a durable audit record.
             skillLogger.error(
-              { err, secretName: name, skillName, agentId: options?.agentId, taskEventId: options?.taskEventId },
+              { err, secretName: name, toolName, agentId: options?.agentId, taskEventId: options?.taskEventId },
               'AUDIT FAILURE: secret.accessed event could not be published — secret was returned but access may not be recorded',
             );
           });
@@ -879,6 +2588,7 @@ export class ExecutionLayer {
       agentId: options?.agentId,
       taskEventId: options?.taskEventId,
       conversationId: options?.conversationId,
+      humanApproved: options?.humanApproved,
       channelId: options?.channelId,
       // Pre-construct the memory write source key so skills pass a rate-limit-compatible
       // source to entityMemory.storeFact(). This key matches the format that
@@ -893,85 +2603,98 @@ export class ExecutionLayer {
         ? buildRateLimitSourceKey(options.agentId ?? 'human-approved', options.taskEventId, options.channelId)
         : undefined,
       // Forward task-level metadata so skills can inspect task-wide signals.
-      taskMetadata: options?.taskMetadata,
+      // EFFECTIVE standing (#1125), not raw lineage. #1126 abolished the standing/origination
+      // re-checks on every elevated skill (the gate above is now the sole enforcement point), but
+      // two NORMAL skills the gate does not cover deliberately retain a re-check: send-draft and
+      // calendar-list-events (both action_risk:'none', so the autonomy gate cannot govern them —
+      // a read/none is autonomy-exempt). Those re-checks must see post-ladder standing, or a
+      // heartbeat-woken principal-lineage task would ride borrowed standing the ladder downgraded.
+      // Effective standing also keeps lineage-forwarding handlers (delegate, scheduler-create,
+      // bullpen) from minting a fresh sub-task with standing the woken task no longer holds — a
+      // derived sub-turn carries no wakeContext and would otherwise escape the ladder entirely.
+      // For a live turn this is referentially identical to the raw metadata. Audit logs above
+      // read the raw lineage directly from options.taskMetadata, not from here.
+      taskMetadata: effectiveTaskMetadata,
+      // Live-principal-turn signal (#1126), forwarded so the `delegate` skill can propagate it to
+      // a synchronously-delegated specialist (a specialist acting inside the principal's live turn).
+      // Distinct from taskMetadata so no persistence skill can sweep it into a wakeable row.
+      liveTurn: options?.liveTurn,
+      ...(options?.inputSignal !== undefined ? { inputSignal: options.inputSignal } : {}),
+      delegationGuard: options?.delegationGuard,
+      turnDateResolveResults: options?.turnDateResolveResults,
+      identifierSources: options?.identifierSources,
+      // Reference resolution for skills that address drafts without the gateway (#2053).
+      // The principal alias resolves from the same hot-reloaded snapshot the gateway uses.
+      ...(contactServiceForRefs
+        ? {
+            resolveRecipientReference: (channel: string, value: string, fields: RecipientReferenceFields) =>
+              resolveRecipientReference(value, channel, fields, {
+                contactService: contactServiceForRefs,
+                principalContactId: this.principalIdentities[0]?.contactId,
+              }),
+          }
+        : {}),
       // Expose the configured timezone so skills can format output timestamps
       // in the user's local time. See toLocalIso() in src/time/timestamp.ts.
       timezone: this.timezone,
       // Expose Curia's own email address so email skills can filter self from CC lists.
       selfEmail: this.selfEmail,
+      selfEmails: this.selfEmails,
       // Configurable fallback timeout for the delegate skill (sourced from config.delegate.defaultTimeoutMs).
       defaultDelegateTimeoutMs: this.defaultDelegateTimeoutMs,
+      resumableCeilings: this.resumableCeilings,
       // Console origin + local port so the capture skills can build the magic-link URL
       // (appOrigin in prod, http://localhost:{httpPort} in dev). Harmless for other skills.
       appOrigin: this.appOrigin,
       httpPort: this.httpPort,
+      // In-flight delegation check (#1858) and the dispatch claim (#1893). Only
+      // `delegate` reads them; other skills must not gain a path into the table.
+      // senderId is the same gate: the claim's origin_sender_id column is NOT NULL.
+      ...(manifest.name === 'delegate' && this.openDelegationLookup
+        ? { openDelegationLookup: this.openDelegationLookup }
+        : {}),
+      ...(manifest.name === 'delegate' && options?.senderId
+        ? { senderId: options.senderId }
+        : {}),
     };
 
     // Capability-gated service injection.
     // Skills declare which privileged services they need in manifest.capabilities.
     // The loader validates the names and freezes the manifest at startup.
     // We inject only the declared services — skills cannot escalate privilege.
-    const caps = manifest.capabilities ?? [];
+    const capabilityServices = this.capabilityServiceMap(outboundGatewayForCtx);
 
-    // Explicit lookup map — enumerates every capability-gated service by name.
-    // Using a map rather than `(this as Record<string, unknown>)[cap]` keeps TypeScript
-    // aware that each field is read, satisfying noUnusedLocals.
-    // Field names here MUST match the VALID_CAPABILITIES set in loader.ts.
-    const capabilityServices: Record<string, unknown> = {
-      bus: this.bus,
-      agentRegistry: this.agentRegistry,
-      outboundGateway: this.outboundGateway,
-      schedulerService: this.schedulerService,
-      entityMemory: this.entityMemory,
-      nylasCalendarClient: this.nylasCalendarClient,
-      autonomyService: this.autonomyService,
-      browserService: this.browserService,
-      bullpenService: this.bullpenService,
-      executiveProfileService: this.executiveProfileService,
-      officeIdentityService: this.officeIdentityService,
-      actionLogRepo: this.actionLogRepo,
-      taskRepo: this.taskRepo,
-      confidencePipeline: this.confidencePipeline,
-      // tempFileStore is handled as a special case in the injection loop (writeTempFile closure).
-      // Listed here so the missing-cap guard knows it's configured when this.tempFileStore is set.
-      tempFileStore: this.tempFileStore,
-      // executionLayer injects `this` so approve-action can re-invoke blocked skills
-      // with humanApproved: true (see ADR-018). Only approve-action should declare this.
-      executionLayer: this,
-      // infraLlm is a constrained LLM service (classify/extract only, no raw chat)
-      // with full telemetry (llm.call bus events). The narrow API surface IS the
-      // security policy — any skill can declare this capability. See #637.
-      // Listed here so the missing-cap guard knows it's configured when infraLlmService is set.
-      infraLlm: this.infraLlmService,
-      // outboundContext bridges outbound message context into skills. The ScopedOutboundContext
-      // instance is created per-invocation (pre-scoped with conversationId) in the injection loop.
-      // Listed here so the missing-cap guard knows it's configured when outboundContextService is set.
-      outboundContext: this.outboundContextService,
-      // secretCapture is the mint-only minter for agent-initiated secret capture (#971).
-      // Injected as a plain field (default branch in the loop). Listed here so the
-      // missing-cap guard fails closed if a skill declares it before it's wired.
-      secretCapture: this.secretCaptureService,
-      // secretResolver injects the by-reference resolver closure (#973), built in the
-      // loop below. Backed by secretsService — listed here so the missing-cap guard fails
-      // closed when a skill declares the capability but no vault is wired.
-      secretResolver: this.secretsService,
-    };
+    // Optional capabilities (#2024) are injected when this layer has the service and
+    // skipped when it does not, so they never refuse the call. They join `caps` before
+    // the guards below, so every allowlist check applies to them as to required ones.
+    const declaredOptional = manifest.optional_capabilities ?? [];
+    const optionalCaps = declaredOptional
+      .filter(cap => this.missingCapabilities([cap], capabilityServices).length === 0);
+    if (optionalCaps.length < declaredOptional.length) {
+      // Expected where a deployment leaves a service out (the test-mode stack has no
+      // task repo); logged so a production wiring gap is findable.
+      skillLogger.debug(
+        { toolName, skippedOptionalCapabilities: declaredOptional.filter(cap => !optionalCaps.includes(cap)) },
+        'Optional capabilities not configured on ExecutionLayer — not injected',
+      );
+    }
+    const caps = [...(manifest.capabilities ?? []), ...optionalCaps];
 
     // Hard-restrict executionLayer to approve-action only.
     // executionLayer grants invoke() with humanApproved: true, which bypasses autonomy
     // gates A and B. This capability MUST NOT be available to any other skill — a
-    // compromised or misconfigured skill with executionLayer could execute arbitrary
-    // actions as if the CEO approved them. The manifest comment is advisory; this
+    // compromised or misconfigured tool with executionLayer could execute arbitrary
+    // actions as if the principal approved them. The manifest comment is advisory; this
     // guard is the enforcement boundary.
     if (caps.includes('executionLayer') && manifest.name !== 'approve-action') {
       skillLogger.error(
-        { skillName, manifestName: manifest.name },
+        { toolName, manifestName: manifest.name },
         'SECURITY: executionLayer capability is restricted to approve-action — refusing to run skill',
       );
       return {
         success: false,
         error: this.wrapSkillError(
-          `Skill '${skillName}' declares capability 'executionLayer' but only 'approve-action' is permitted to use it`,
+          `Tool '${toolName}' declares capability 'executionLayer' but only 'approve-action' is permitted to use it`,
         ),
       };
     }
@@ -980,36 +2703,50 @@ export class ExecutionLayer {
     // resolveSecretRef dereferences stored user.* secrets into the handler at runtime — a
     // surface that must not be available to arbitrary skills even if they declare it. The
     // manifest capability is necessary but not sufficient; the skill name must also be on
-    // SECRET_RESOLVER_ALLOWED_SKILLS. This guard is the enforcement boundary (mirrors the
+    // SECRET_RESOLVER_ALLOWED_TOOLS. This guard is the enforcement boundary (mirrors the
     // executionLayer→approve-action restriction above).
-    if (caps.includes('secretResolver') && !SECRET_RESOLVER_ALLOWED_SKILLS.has(manifest.name)) {
+    if (caps.includes('secretResolver') && !SECRET_RESOLVER_ALLOWED_TOOLS.has(manifest.name)) {
       skillLogger.error(
-        { skillName, manifestName: manifest.name },
+        { toolName, manifestName: manifest.name },
         'SECURITY: secretResolver capability is restricted to an allowlist — refusing to run skill',
       );
       return {
         success: false,
         error: this.wrapSkillError(
-          `Skill '${skillName}' declares capability 'secretResolver' but is not on the resolver allowlist`,
+          `Tool '${toolName}' declares capability 'secretResolver' but is not on the resolver allowlist`,
+        ),
+      };
+    }
+
+    // Hard-restrict userSecretIndex to the allowlist (#1497).
+    // listUserSecretNames enumerates user.* key names (never values). Declaring the
+    // capability is necessary but not sufficient; the skill name must also be on
+    // USER_SECRET_INDEX_ALLOWED_TOOLS.
+    if (caps.includes('userSecretIndex') && !USER_SECRET_INDEX_ALLOWED_TOOLS.has(manifest.name)) {
+      skillLogger.error(
+        { toolName, manifestName: manifest.name },
+        'SECURITY: userSecretIndex capability is restricted to an allowlist — refusing to run skill',
+      );
+      return {
+        success: false,
+        error: this.wrapSkillError(
+          `Tool '${toolName}' declares capability 'userSecretIndex' but is not on the user-secret index allowlist`,
         ),
       };
     }
 
     // Fail-closed: if a declared capability is not available on this ExecutionLayer,
     // refuse to run the skill. This catches configuration errors at invocation time.
-    const missingCaps = caps.filter(cap => {
-      if (cap === 'skillSearch') return false; // skillSearch is synthesized, not a field on `this`
-      return capabilityServices[cap] === undefined;
-    });
+    const missingCaps = this.missingCapabilities(caps, capabilityServices);
     if (missingCaps.length > 0) {
       skillLogger.error(
-        { skillName, missingCapabilities: missingCaps },
+        { toolName, missingCapabilities: missingCaps },
         'Skill declares capabilities not available on ExecutionLayer',
       );
       return {
         success: false,
         error: this.wrapSkillError(
-          `Skill '${skillName}' requires capabilities [${missingCaps.join(', ')}] ` +
+          `Tool '${toolName}' requires capabilities [${missingCaps.join(', ')}] ` +
           `but they are not configured on the ExecutionLayer`,
         ),
       };
@@ -1028,41 +2765,63 @@ export class ExecutionLayer {
         ctx.entityMemory = memAudit && this.bus
           ? buildEntityMemoryObserver(this.entityMemory!, this.bus, memAudit, skillLogger)
           : this.entityMemory;
-      } else if (cap === 'skillSearch') {
-        // Special case: skillSearch is a closure over the registry, not a service field.
-        // Filters out skill-registry itself (circular self-discovery) and skills whose
-        // allowed_callers list does not include the calling agent (defense-in-depth —
-        // prevents LLM from discovering skills it cannot invoke).
-        ctx.skillSearch = (query: string) =>
-          this.registry.search(query)
-            .filter(s => s.manifest.name !== 'skill-registry')
-            .filter(s => {
-              const allowed = s.manifest.allowed_callers;
-              if (!allowed || allowed.length === 0) return true;
-              return allowed.includes(options?.agentId ?? 'system');
-            })
-            .map(s => ({ name: s.manifest.name, description: s.manifest.description }));
+      } else if (cap === 'toolSearch') {
+        // Special case: toolSearch is a closure over ToolRegistry + SkillRegistry.
+        // Filters out tool-registry / skill-activate (circular self-discovery) and
+        // tools whose allowed_callers list does not include the calling agent.
+        //
+        // Phase 3a (#1495): returns kind:'skill' for non-synthetic bundles and
+        // promotes member-atom matches to their owning skill (lazy instruction-loading).
+        const skillRegistry = this.skillRegistry;
+        ctx.toolSearch = (query: string) => {
+          if (!skillRegistry) {
+            // Fallback: tools-only (pre-Phase-3a behaviour) when skillRegistry unset.
+            return this.registry.search(query)
+              .filter(s =>
+                s.manifest.name !== 'tool-registry'
+                && s.manifest.name !== 'skill-activate'
+                && s.manifest.name !== 'async-offramp')
+              .filter(s => {
+                const allowed = s.manifest.allowed_callers;
+                if (!allowed || allowed.length === 0) return true;
+                return allowed.includes(options?.agentId ?? 'system');
+              })
+              .map(s => ({
+                name: s.manifest.name,
+                description: s.manifest.description,
+                kind: 'tool' as const,
+              }));
+          }
+          return unifiedToolSearch({
+            query,
+            toolRegistry: this.registry,
+            skillRegistry,
+            agentId: options?.agentId ?? 'system',
+          });
+        };
+      } else if (cap === 'skillRegistry') {
+        // skill-activate needs both the bundle catalog and the atom catalog to
+        // resolve member tools under allowed_callers without widening authority.
+        ctx.skillRegistry = this.skillRegistry;
+        ctx.toolRegistry = this.registry;
       } else if (cap === 'infraLlm') {
         // Special case: infraLlm creates a scoped instance per invocation that
-        // carries telemetry context (agentId, taskEventId, conversationId, skillName).
+        // carries telemetry context (agentId, taskEventId, conversationId, toolName).
         if (this.infraLlmService) {
           ctx.infraLlm = this.infraLlmService.scoped({
             agentId: options?.agentId,
             taskEventId: options?.taskEventId,
             conversationId: options?.conversationId,
-            skillName,
+            toolName,
           });
         }
       } else if (cap === 'outboundContext') {
         // Scoped instance: pre-fills conversationId so skills don't need it.
         if (this.outboundContextService && options?.conversationId) {
-          ctx.outboundContext = new ScopedOutboundContext(
-            this.outboundContextService,
-            options.conversationId,
-          );
+          ctx.outboundContext = this.scopedOutboundContext(this.outboundContextService, options.conversationId, options, skillLogger);
         } else if (this.outboundContextService && !options?.conversationId) {
           skillLogger.debug(
-            { skillName },
+            { toolName },
             'outboundContext capability declared but conversationId not available — bridge registration disabled for this invocation',
           );
         }
@@ -1082,7 +2841,7 @@ export class ExecutionLayer {
         //      before the vault is ever consulted, so they can never be form-fill material.
         //   2. Audit: every resolution emits secret.accessed (name + source, byReference:true)
         //      — never the value. The value is returned to the handler only; the handler
-        //      contract (see SkillContext.resolveSecretRef) forbids placing it in results/logs.
+        //      contract (see ToolContext.resolveSecretRef) forbids placing it in results/logs.
         ctx.resolveSecretRef = async (ref: string): Promise<string> => {
           if (typeof ref !== 'string' || !ref.startsWith(USER_SECRET_PREFIX)) {
             throw new Error(
@@ -1101,7 +2860,7 @@ export class ExecutionLayer {
           // Audit — fire-and-forget, name + source only, flagged as by-reference.
           if (this.bus) {
             this.bus.publish('execution', createSecretAccessed({
-              skillName,
+              toolName,
               secretName: ref,
               agentId: options?.agentId,
               taskEventId: options?.taskEventId,
@@ -1109,7 +2868,7 @@ export class ExecutionLayer {
               byReference: true,
             })).catch((err) => {
               skillLogger.error(
-                { err, secretName: ref, skillName, agentId: options?.agentId, taskEventId: options?.taskEventId },
+                { err, secretName: ref, toolName, agentId: options?.agentId, taskEventId: options?.taskEventId },
                 'AUDIT FAILURE: secret.accessed (by-reference) event could not be published — secret was returned but access may not be recorded',
               );
             });
@@ -1118,9 +2877,36 @@ export class ExecutionLayer {
           skillLogger.debug({ secretName: ref, source: 'vault', byReference: true }, 'Secret resolved by reference');
           return value;
         };
+      } else if (cap === 'userSecretIndex') {
+        // Names-only `user.*` listing (#1497). Two guardrails on top of the skill allowlist:
+        //   1. Calls listUserNames() (prefix query), never list() — system/channel keys
+        //      never enter this path.
+        //   2. Filters startsWith(user.) again so a mismatched mock cannot leak names.
+        ctx.listUserSecretNames = async (): Promise<string[]> => {
+          if (!this.secretsService) {
+            throw new Error('listUserSecretNames: secrets service is not configured');
+          }
+          const names = await this.secretsService.listUserNames();
+          return names.filter(n => n.startsWith(USER_SECRET_PREFIX));
+        };
+        ctx.listUserSecretDetails = async () => {
+          if (!this.secretsService) {
+            throw new Error('listUserSecretDetails: secrets service is not configured');
+          }
+          return this.secretsService.listUserDetails();
+        };
       } else {
         (ctx as unknown as Record<string, unknown>)[cap] = capabilityServices[cap];
       }
+    }
+
+    // delegate links and releases the outbound-context entry whose reply it routes
+    // (#1972). That is best-effort, so it is injected here rather than declared as a
+    // capability: a declared capability fails closed when the service is absent,
+    // and the test-mode stack deliberately runs without it. Same pattern as the
+    // delegate-only openDelegationLookup / senderId above.
+    if (manifest.name === 'delegate' && this.outboundContextService && options?.conversationId) {
+      ctx.outboundContext = this.scopedOutboundContext(this.outboundContextService, options.conversationId, options, skillLogger);
     }
 
     // entityContextAssembler — universal (not capability-gated).
@@ -1138,7 +2924,7 @@ export class ExecutionLayer {
       // A skill declared entity_enrichment but the assembler was not wired in —
       // this is a configuration mistake, not a designed degradation path.
       skillLogger.warn(
-        { skillName },
+        { toolName },
         'entity_enrichment declared in manifest but EntityContextAssembler not configured — skipping pre-enrichment; ctx.entityContext will be undefined',
       );
     }
@@ -1158,7 +2944,7 @@ export class ExecutionLayer {
           idsToEnrich = [this.agentContactId];
         } else {
           // No IDs to enrich — log and continue without pre-enrichment
-          skillLogger.debug({ skillName, enrichmentDefault: enrichment.default }, 'entity_enrichment: no IDs to resolve, skipping pre-enrichment');
+          skillLogger.debug({ toolName, enrichmentDefault: enrichment.default }, 'entity_enrichment: no IDs to resolve, skipping pre-enrichment');
         }
       }
 
@@ -1179,36 +2965,103 @@ export class ExecutionLayer {
           ]).finally(() => { clearTimeout(enrichmentTimer); });
 
           if (enrichmentResult.unresolved.length > 0) {
-            skillLogger.warn({ skillName, unresolved: enrichmentResult.unresolved }, 'entity_enrichment: some IDs could not be resolved');
+            skillLogger.warn({ toolName, unresolved: enrichmentResult.unresolved }, 'entity_enrichment: some IDs could not be resolved');
+          }
+          // Nodeless contacts get their own line rather than joining `unresolved`.
+          // They are a different operational signal: the contact is real and was
+          // addressed by a skill, but it holds no KG node, so it ran with no context
+          // at all and no retry will change that (#1694 / ADR-040).
+          //
+          // No tool.json currently declares entity_enrichment, so this branch is
+          // dormant. It is kept because the assembler's own warn covers the live
+          // paths, and any future manifest that opts into pre-enrichment should
+          // report the gap with the skill name attached rather than silently.
+          if (enrichmentResult.nodeless.length > 0) {
+            skillLogger.warn(
+              {
+                toolName,
+                contactIds: enrichmentResult.nodeless.map(n => n.contactId),
+                causes: enrichmentResult.nodeless.map(n => n.cause),
+              },
+              'entity_enrichment: contacts have no KG node — skill ran without their context',
+            );
+          }
+          if (enrichmentResult.failed.length > 0) {
+            const retryableCount = enrichmentResult.failed.filter(f => f.retryable).length;
+            // Same dormant note as the nodeless branch above — no tool.json currently
+            // declares entity_enrichment, but a future manifest should report failures
+            // with the skill name attached rather than silently.
+            skillLogger.warn(
+              { toolName, failedCount: enrichmentResult.failed.length, retryableCount },
+              'entity_enrichment: some entity lookups failed — see assembler failed bucket',
+            );
           }
           ctx.entityContext = enrichmentResult.entities;
-          skillLogger.debug({ skillName, enrichedCount: enrichmentResult.entities.length }, 'entity_enrichment: pre-enrichment complete');
+          skillLogger.debug({ toolName, enrichedCount: enrichmentResult.entities.length }, 'entity_enrichment: pre-enrichment complete');
         } catch (err) {
           // Non-fatal: log and continue without ctx.entityContext.
           // The handler should check ctx.entityContext and handle its absence gracefully.
-          skillLogger.error({ err, skillName }, 'entity_enrichment: pre-enrichment failed, continuing without entity context');
+          skillLogger.error({ err, toolName }, 'entity_enrichment: pre-enrichment failed, continuing without entity context');
         }
       }
     }
 
     skillLogger.info({ input: Object.keys(input) }, 'Invoking skill');
 
+    // Losing the race does not stop the handler. The abort signal cancels its
+    // in-flight requests, so a late read-modify-write cannot land after the agent
+    // has moved on and undo a newer call (#2083).
+    const abort = new AbortController();
+    ctx.signal = abort.signal;
+    ctx.deadline = Date.now() + manifest.timeout;
+
     // Track the timeout timer so we can clean it up after the race resolves.
     // Without cleanup, successful skill invocations leak timers that keep the
     // process alive during graceful shutdown.
     let timer: NodeJS.Timeout;
-    const timeoutPromise = new Promise<SkillResult>((_, reject) => {
-      timer = setTimeout(
-        () => reject(new Error(`Skill '${skillName}' timed out after ${manifest.timeout}ms`)),
-        manifest.timeout,
-      );
+    const timeoutPromise = new Promise<ToolResult>((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error(`Tool '${toolName}' timed out after ${manifest.timeout}ms`);
+        abort.abort(err);
+        reject(err);
+      }, manifest.timeout);
     });
 
     try {
+      // Do NOT wrap handler.execute in withDbRetry: handlers may have already
+      // sent external messages or mutated other systems before a later DB write
+      // fails, and a full replay would duplicate side effects (#1381 review).
+      // Transient DB faults are classified below as DATABASE_UNAVAILABLE so the
+      // runtime can degrade without burning the consecutive-error budget.
       const result = await Promise.race([
         handler.execute(ctx),
         timeoutPromise,
       ]);
+
+      if (result.success) {
+        await this.recordSampledAction(toolName, manifest.action_risk, input, options, gateProceeded, skillLogger, result.data);
+      }
+
+      // MCP export audit trail (#201) — reuse items resolved at gate time.
+      if (result.success && resolvedMcpExportAudit && this.bus) {
+        const { items, destination } = resolvedMcpExportAudit;
+        this.bus.publish('execution', createExportDelivered({
+          toolName,
+          agentId: options?.agentId,
+          taskEventId: options?.taskEventId,
+          conversationId: options?.conversationId,
+          destination: formatDestination(destination),
+          items: items.map((i) => ({
+            nodeId: i.nodeId,
+            label: i.label,
+            sensitivity: i.sensitivity,
+          })),
+          maxSensitivity: maxItemSensitivity(items),
+          parentEventId: options?.parentEventId,
+        })).catch((err) => {
+          skillLogger.warn({ err, toolName }, 'export gate: failed to publish export.delivered event');
+        });
+      }
 
       // Sanitize successful output before returning.
       // Strips dangerous tags, redacts secrets, and truncates to the configured limit.
@@ -1221,7 +3074,7 @@ export class ExecutionLayer {
         // Check the original length — post-sanitize length includes the suffix so >=
         // would fire a false positive when output is exactly skillOutputMaxLength chars.
         if (result.data.length > this.skillOutputMaxLength) {
-          skillLogger.warn({ skillName, outputLength: result.data.length }, 'Skill output truncated to configured limit');
+          skillLogger.warn({ toolName, outputLength: result.data.length }, 'Skill output truncated to configured limit');
         }
         return { success: true, data: sanitized };
       } else if (result.success && result.data !== null && result.data !== undefined) {
@@ -1234,12 +3087,27 @@ export class ExecutionLayer {
           maxLength: this.skillOutputMaxLength,
           skipSecretRedaction,
         });
-        // Rough post-sanitize size check for observability: if the sanitized object
-        // would serialize larger than the limit, at least one leaf was truncated.
-        // This is a warn-only signal — sanitizeObjectOutput already capped each leaf.
-        const sanitizedSize = JSON.stringify(sanitizedData).length;
-        if (sanitizedSize > this.skillOutputMaxLength) {
-          skillLogger.warn({ skillName, outputLength: sanitizedSize }, 'Skill output truncated to configured limit');
+        // Enforce an AGGREGATE size cap, not just per-leaf. sanitizeObjectOutput bounds
+        // every string leaf to skillOutputMaxLength, but a result with many leaves or
+        // array elements (e.g. scheduler-list over a large jobs table) can still serialize
+        // far larger than the limit. Left unbounded, that payload becomes a single oversized
+        // tool_result and overflows the next LLM call's context window — the provider rejects
+        // it with a non-retryable 400 (VALIDATION_ERROR) and the agent falls back to the
+        // generic "unable to process" message. String outputs are hard-capped above; object
+        // outputs must be too. (#1487)
+        const serialized = JSON.stringify(sanitizedData);
+        if (serialized.length > this.skillOutputMaxLength) {
+          skillLogger.warn(
+            { toolName, outputLength: serialized.length, limit: this.skillOutputMaxLength },
+            'Object tool output exceeded size limit — truncating to protect the LLM context window',
+          );
+          // Last-resort fallback: collapse to a bounded string form. Structure is lost,
+          // but a truncated, clearly-marked payload is safe to feed back to the model —
+          // an unbounded one is not. Tools that can legitimately return large results
+          // should page or trim at the source (see scheduler-list) so this never fires.
+          const truncated =
+            serialized.slice(0, this.skillOutputMaxLength) + OBJECT_OUTPUT_TRUNCATED_MARKER;
+          return { success: true, data: truncated };
         }
         return { success: true, data: sanitizedData };
       }
@@ -1247,14 +3115,30 @@ export class ExecutionLayer {
       // Handler returned { success: false, error } directly (did not throw).
       // Sanitize and wrap the error message — handler errors can contain
       // user-supplied values or external content that poses injection risk.
+      // Preserve handler-set errorType (#1381 / #1854): stripping it here made
+      // IDENTITY_MISMATCH (and AUTH_FAILURE from calendar-list-events) invisible
+      // to the runtime, so hard-fail / structured audit never fired.
       if (!result.success && result.error) {
-        return { success: false, error: this.wrapSkillError(result.error) };
+        return {
+          success: false,
+          error: this.wrapSkillError(result.error),
+          ...(result.errorType !== undefined && { errorType: result.errorType }),
+        };
       }
 
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       skillLogger.error({ err }, 'Skill invocation failed');
+      // Classify DB outages so the runtime can track them separately from the
+      // consecutive error budget (spec 05 / #1381).
+      if (isDbUnavailableError(err)) {
+        return {
+          success: false,
+          error: this.wrapSkillError(message),
+          errorType: 'DATABASE_UNAVAILABLE',
+        };
+      }
       return { success: false, error: this.wrapSkillError(message) };
     } finally {
       // Clean up the timeout timer whether we succeeded, failed, or timed out

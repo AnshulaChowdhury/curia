@@ -7,14 +7,45 @@
 # Pinned-Dependencies Docker finding on this line). Tag kept inline so Dependabot's
 # docker ecosystem (see .github/dependabot.yml) can read the pg16 version and bump
 # the digest within the major. Re-resolve the digest when intentionally moving pg majors.
-FROM pgvector/pgvector:pg16@sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc
+FROM pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-16-pgaudit \
+# Acquire::Retries covers a transient Debian mirror hiccup, the apt-side equivalent of
+# the npm registry drop that motivated #1699. Without it a single failed fetch fails the
+# whole publish — and for the curia-postgres image this apt call is the ONLY network step,
+# so it gets no benefit from the pnpm retry wrapper.
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends postgresql-16-pgaudit \
     && rm -rf /var/lib/apt/lists/*
 
 # Startup verification script ensures pgAudit is correctly set up on every boot,
 # not just on first init. Handles the existing-volume case where initdb.d scripts
 # were skipped because the data directory already existed.
 COPY docker/postgres-verify-pgaudit.sh /usr/local/bin/verify-pgaudit.sh
+
+# Bake the pgAudit init script into the image so a source-free self-host stack
+# (no repo checkout to volume-mount) still runs it on first DB init. The compose
+# volume mount is removed in lockstep (see docker-compose.yml).
+COPY docker/postgres-init-pgaudit.sql /docker-entrypoint-initdb.d/10-pgaudit.sql
+
+# Setting ENTRYPOINT above resets the base image's `CMD ["postgres"]` to null, so
+# without this the image would run `verify-pgaudit.sh` with no server command and
+# never start Postgres. Restore the default. When the compose files provide their
+# own `command:` (which starts with `postgres`), it replaces this CMD entirely and
+# the wrapper receives `postgres -c ...` either way.
+#
+# The missing-USER finding anchors on this ENTRYPOINT line, so its suppression must
+# live here (Semgrep only honours nosemgrep on the finding's own line or the line
+# directly above). This is the intentional-root case justified below: the server
+# drops to non-root `postgres` via gosu at runtime. Note the *entrypoint* rule id —
+# distinct from the CMD-anchored `missing-user` variant suppressed further down.
+# nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint
 ENTRYPOINT ["verify-pgaudit.sh"]
+# No `USER` instruction is intentional. The Postgres entrypoint must start as root
+# to run initdb and chown a fresh (root-owned) data volume on first boot, then it
+# drops to the non-root `postgres` user via `gosu` to run the server itself
+# (docker-entrypoint.sh: `exec gosu postgres ...`). Adding `USER postgres` here
+# breaks first-time init on a fresh volume — the very failure #1350 fixes. So the
+# running server is non-root despite the absence of a USER instruction; Semgrep's
+# generic missing-user heuristic can't see the runtime gosu drop.
+# nosemgrep: dockerfile.security.missing-user.missing-user
+CMD ["postgres"]
