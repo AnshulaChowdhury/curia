@@ -21,10 +21,13 @@ here and the phone token works on nothing else. With no token in the vault the r
 |---|---|
 | `phone_inbox_token` | Bearer token entered on the phone |
 | `nylas_api_key` | Shared Nylas key (already used by email) |
+| `nylas_region` | `us` (default) or `eu`: where the Nylas application lives. Must match, or Nylas answers 401 |
 | `phone_inbox_grant_personal` / `_moonray` / `_work_outlook` | Nylas grant id per mailbox |
 | `phone_inbox_address_personal` / `_moonray` / `_work_outlook` | Address shown on the phone (optional; `null` until set) |
 
-A mailbox without a grant is listed empty. Seed with `pnpm run seed-vault`.
+A mailbox without a grant (or without the Nylas key) is listed with `syncing: false` and zero counts, so the phone
+can show "not syncing" instead of "nothing needs you". Work Outlook is expected to be in this state if the employer blocks
+third-party access. Seed with `pnpm run seed-vault`.
 
 ## Needs the triage to cooperate
 - **Decision tagging on** (`ceo_inbox/decision_tagging`) so the groups exist as labels.

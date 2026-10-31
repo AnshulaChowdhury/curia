@@ -8,7 +8,7 @@ import { createSilentLogger } from '../../../../../src/logger.js';
 
 const INBOX: PhoneInbox = {
   updatedAt: '2026-11-01T12:00:00.000Z',
-  accounts: [{ id: 'moonray', address: 'ac@example.com', needsYou: 0, unread: 0, items: [] }],
+  accounts: [{ id: 'moonray', address: 'ac@example.com', syncing: true, needsYou: 0, unread: 0, items: [] }],
 };
 
 let app: FastifyInstance | undefined;

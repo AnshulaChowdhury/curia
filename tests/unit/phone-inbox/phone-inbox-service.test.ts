@@ -60,6 +60,7 @@ describe('PhoneInboxService', () => {
     const account = result.accounts[0]!;
     expect(account.items.map((i) => i.subject)).toEqual(['Newer', 'Older']);
     expect(account.items.map((i) => i.group)).toEqual(['urgent', 'seen']);
+    expect(account.syncing).toBe(true);
     expect(account.needsYou).toBe(2);
     expect(account.unread).toBe(3);
     expect(result.updatedAt).toBe('2026-11-01T12:00:00.000Z');
@@ -110,7 +111,15 @@ describe('PhoneInboxService', () => {
 
   it('lists an account with no grant as empty', async () => {
     const result = await build([['work-outlook', null]]);
-    expect(result.accounts[0]).toEqual({ id: 'work-outlook', address: 'work-outlook@example.com', needsYou: 0, unread: 0, items: [] });
+    expect(result.accounts[0]).toEqual({ id: 'work-outlook', address: 'work-outlook@example.com', syncing: false, needsYou: 0, unread: 0, items: [] });
+  });
+
+  it('reports a mailbox that is not connected as not syncing, and does not call it syncing when it is', async () => {
+    const result = await build([
+      ['moonray', reader([])],
+      ['work-outlook', null],
+    ]);
+    expect(result.accounts.map((a) => [a.id, a.syncing])).toEqual([['moonray', true], ['work-outlook', false]]);
   });
 
   it('never exposes anything beyond the contract fields', async () => {

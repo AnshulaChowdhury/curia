@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **`/phone/inbox` `syncing` flag** — a mailbox with no Nylas grant reports `syncing: false`, so the phone shows "not syncing" rather than "all clear".
 - **`GET /phone/inbox`** — read-only email summary for the Command Hub phone launcher: Urgent/Seen/Drafted mail that is still unread, in the inbox and unanswered, per mailbox. Own token, no bodies.
 - **Recurring calendar events** — create, edit and delete a series or one occurrence; standing meetings become one event. (#2385)
 - **ADR-057** — retire bearer `/api/messages`; console chat on `/api/chat` is the only ingress. (#999)

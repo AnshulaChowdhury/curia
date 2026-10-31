@@ -5,7 +5,10 @@
 
 import type { InboxMessage, MailboxReader, SentMessage } from './phone-inbox-service.js';
 
-const NYLAS_BASE = 'https://api.us.nylas.com/v3/grants';
+// Nylas applications live in one data region; its API host must match (an EU app's key and grants
+// don't work against the US host). Only these two are accepted, so a typo can't send the key elsewhere.
+export const NYLAS_REGIONS = { us: 'https://api.us.nylas.com', eu: 'https://api.eu.nylas.com' } as const;
+export type NylasRegion = keyof typeof NYLAS_REGIONS;
 // Nylas caps one page at 200. More unread than this is already far past "needs you".
 const PAGE_LIMIT = 200;
 
@@ -41,8 +44,9 @@ export class NylasMailbox implements MailboxReader {
     private readonly apiKey: string,
     grantId: string,
     private readonly fetchImpl: typeof fetch = fetch,
+    region: NylasRegion = 'us',
   ) {
-    this.baseUrl = `${NYLAS_BASE}/${encodeURIComponent(grantId)}`;
+    this.baseUrl = `${NYLAS_REGIONS[region]}/v3/grants/${encodeURIComponent(grantId)}`;
   }
 
   async unreadInbox(): Promise<InboxMessage[]> {
