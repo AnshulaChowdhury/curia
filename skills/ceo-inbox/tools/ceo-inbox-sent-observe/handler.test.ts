@@ -1983,10 +1983,10 @@ describe('CeoInboxSentObserveHandler', () => {
     }
 
     // Serve a fixed corpus newest-first, honoring received_after (>=), received_before (<=), limit,
-    // and page_token. The cursor encodes `${nextOffset}:${after}:${before}` so a page_token request
-    // (which omits the filters — Nylas carries them on the cursor) still filters correctly. When
-    // `observed` is supplied, every date served in a list page is recorded, so a test can assert no
-    // message was ever skipped across the drain.
+    // and page_token. As with real Nylas, the cursor holds only the position: filters are read from
+    // the query params on every request, so a follow-up that dropped them would page the whole
+    // corpus (#2377). When `observed` is supplied, every date served in a list page is recorded, so
+    // a test can assert no message was ever skipped across the drain.
     function serveSentCorpus(
       fetchSpy: ReturnType<typeof vi.spyOn>,
       corpus: Array<{ id: string; date: number }>,
@@ -2003,21 +2003,11 @@ describe('CeoInboxSentObserveHandler', () => {
           );
         }
         const token = u.searchParams.get('page_token');
-        let start: number;
-        let after: number | null;
-        let before: number | null;
-        if (token) {
-          const [s, a, b] = token.split(':');
-          start = Number(s);
-          after = a === '' ? null : Number(a);
-          before = b === '' ? null : Number(b);
-        } else {
-          start = 0;
-          const a = u.searchParams.get('received_after');
-          const b = u.searchParams.get('received_before');
-          after = a === null ? null : Number(a);
-          before = b === null ? null : Number(b);
-        }
+        const start = token ? Number(token) : 0;
+        const a = u.searchParams.get('received_after');
+        const b = u.searchParams.get('received_before');
+        const after = a === null ? null : Number(a);
+        const before = b === null ? null : Number(b);
         const filtered = sorted.filter(
           (m) => (after === null || m.date >= after) && (before === null || m.date <= before),
         );
@@ -2026,7 +2016,7 @@ describe('CeoInboxSentObserveHandler', () => {
         if (observed) for (const m of slice) observed.add(m.date);
         const nextStart = start + limit;
         const body: Record<string, unknown> = { data: slice.map((m) => sentMsg(m.id, m.date)) };
-        if (nextStart < filtered.length) body.next_cursor = `${nextStart}:${after ?? ''}:${before ?? ''}`;
+        if (nextStart < filtered.length) body.next_cursor = String(nextStart);
         return new Response(JSON.stringify(body), { status: 200 });
       });
     }
