@@ -11,7 +11,8 @@ import {
   holdHasAttendees,
   type HoldMatchCriteria,
 } from '../../../../src/channels/calendar/holds.js';
-import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import { formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import { localizeEventTimes } from '../../../../src/channels/calendar/event-display.js';
 
 type InviteResponse = 'accept' | 'decline' | 'tentative';
 
@@ -103,11 +104,7 @@ export class CalendarRespondToInviteHandler implements ToolHandler {
 
       const tz = ctx.timezone;
       const formattedEvent = event
-        ? {
-            ...event,
-            startTime: toLocalIso(event.startTime, tz),
-            endTime: toLocalIso(event.endTime, tz),
-          }
+        ? localizeEventTimes(event, tz)
         : null;
 
       return {

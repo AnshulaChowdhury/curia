@@ -1,7 +1,7 @@
 {
   "name": "calendar-delete-event",
-  "description": "Delete a calendar event. By default, attendees receive cancellation emails. Set notifyAttendees=false to suppress those emails on Google. Microsoft rejects false and the delete fails; iCloud ignores it and still emails.",
-  "version": "1.0.2",
+  "description": "Delete a calendar event. An occurrence's id deletes only it; its masterEventId deletes the series. By default, attendees receive cancellation emails. Set notifyAttendees=false to suppress those emails on Google. Microsoft rejects false and the delete fails; iCloud ignores it and still emails.",
+  "version": "1.0.3",
   "sensitivity": "normal",
   "action_risk": "high",
   "inputs": {

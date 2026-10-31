@@ -11,8 +11,16 @@
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
 import type { CreateEventInput } from '../../../../src/channels/calendar/nylas-calendar-client.js';
 import { parseWritableAttendees } from '../../../../src/channels/calendar/attendee-input.js';
-import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import { formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import { localizeEventTimes } from '../../../../src/channels/calendar/event-display.js';
 import { holdHasAttendees, isHoldEvent, eventsOverlap } from '../../../../src/channels/calendar/holds.js';
+import { parseRecurrence } from '../../../../src/channels/calendar/recurrence-input.js';
+import { undeclaredInputError } from '../../../../src/skills/_shared/undeclared-input-guard.js';
+
+// Mirrors tool.json `inputs`. Anything else is refused rather than silently dropped (#2385).
+const DECLARED_INPUTS = [
+  'calendarId', 'title', 'start', 'end', 'description', 'location', 'attendees', 'conferencing', 'recurrence',
+] as const;
 
 export class CalendarCreateEventHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
@@ -20,7 +28,10 @@ export class CalendarCreateEventHandler implements ToolHandler {
       return { success: false, error: 'Calendar not configured — Nylas credentials missing' };
     }
 
-    const { calendarId, title, start, end, description, location, attendees, conferencing } = ctx.input as {
+    const undeclared = undeclaredInputError(ctx.input, DECLARED_INPUTS);
+    if (undeclared) return { success: false, error: undeclared };
+
+    const { calendarId, title, start, end, description, location, attendees, conferencing, recurrence } = ctx.input as {
       calendarId?: string;
       title?: string;
       start?: string;
@@ -29,6 +40,7 @@ export class CalendarCreateEventHandler implements ToolHandler {
       location?: string;
       attendees?: unknown;
       conferencing?: Record<string, unknown>;
+      recurrence?: unknown;
     };
 
     if (!calendarId || typeof calendarId !== 'string') {
@@ -58,6 +70,16 @@ export class CalendarCreateEventHandler implements ToolHandler {
       if (!parsed.ok) return { success: false, error: parsed.error };
       parsedAttendees = parsed.attendees;
     }
+    let parsedRecurrence: string[] | undefined;
+    if (recurrence !== undefined) {
+      // A series needs a named timezone so occurrences keep their wall-clock time across DST.
+      if (!ctx.timezone) {
+        return { success: false, error: 'Cannot create a recurring event: no timezone is configured for Curia' };
+      }
+      const parsed = parseRecurrence(recurrence, { start, timezone: ctx.timezone });
+      if (!parsed.ok) return { success: false, error: parsed.error };
+      parsedRecurrence = parsed.recurrence;
+    }
 
     try {
       // Read-only check: if the calendar is registered and marked read-only, refuse.
@@ -75,6 +97,10 @@ export class CalendarCreateEventHandler implements ToolHandler {
       if (location) eventData.location = location;
       if (parsedAttendees) eventData.attendees = parsedAttendees;
       if (conferencing) eventData.conferencing = conferencing;
+      if (parsedRecurrence) {
+        eventData.recurrence = parsedRecurrence;
+        eventData.timezone = ctx.timezone;
+      }
 
       const event = await ctx.nylasCalendarClient.createEvent(calendarId, eventData);
       ctx.log.info({ calendarId, eventId: event.id }, 'Created calendar event');
@@ -120,11 +146,7 @@ export class CalendarCreateEventHandler implements ToolHandler {
       return {
         success: true,
         data: {
-          event: {
-            ...event,
-            startTime: toLocalIso(event.startTime, tz),
-            endTime: toLocalIso(event.endTime, tz),
-          },
+          event: localizeEventTimes(event, tz),
           displayTimezone: tz ? formatDisplayTimezone(tz, new Date()) : null,
           ...(warnings.length > 0 ? { warnings } : {}),
         },

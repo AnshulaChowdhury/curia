@@ -1,0 +1,132 @@
+import { describe, it, expect } from 'vitest';
+import { parseRecurrence } from '../../../../src/channels/calendar/recurrence-input.js';
+
+// 2026-11-02 is a Monday. 14:00Z is 9:00 AM in Toronto (EST).
+const MONDAY_9AM = '2026-11-02T14:00:00.000Z';
+const TZ = 'America/Toronto';
+
+describe('parseRecurrence', () => {
+  it('accepts a weekly rule whose BYDAY includes the start day', () => {
+    const out = parseRecurrence(['RRULE:FREQ=WEEKLY;BYDAY=MO'], { start: MONDAY_9AM, timezone: TZ });
+    expect(out).toEqual({ ok: true, recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'] });
+  });
+
+  it('accepts an RRULE with EXDATE lines', () => {
+    const lines = ['RRULE:FREQ=WEEKLY;BYDAY=MO', 'EXDATE;TZID=America/Toronto:20261221T090000'];
+    expect(parseRecurrence(lines, { start: MONDAY_9AM, timezone: TZ }).ok).toBe(true);
+  });
+
+  it('checks the start day in the given timezone, not UTC', () => {
+    // 02:00Z Tuesday is still Monday evening in Toronto.
+    const out = parseRecurrence(['RRULE:FREQ=WEEKLY;BYDAY=MO'], { start: '2026-11-03T02:00:00.000Z', timezone: TZ });
+    expect(out.ok).toBe(true);
+  });
+
+  it('rejects a weekly rule whose BYDAY excludes the start day', () => {
+    const out = parseRecurrence(['RRULE:FREQ=WEEKLY;BYDAY=TU'], { start: MONDAY_9AM, timezone: TZ });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/Monday/);
+  });
+
+  it('skips the weekday check when no start is given (series edit without a time change)', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;BYDAY=TU'], { timezone: TZ }).ok).toBe(true);
+  });
+
+  it('rejects a non-array', () => {
+    expect(parseRecurrence('RRULE:FREQ=WEEKLY', { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects an empty array', () => {
+    expect(parseRecurrence([], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects a non-string entry', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY', 7], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects a line without an RRULE/EXDATE/RDATE prefix', () => {
+    const out = parseRecurrence(['FREQ=WEEKLY;BYDAY=MO'], { timezone: TZ });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/RRULE:/);
+  });
+
+  it('rejects two RRULE lines', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;BYDAY=MO', 'RRULE:FREQ=DAILY'], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects lines with no RRULE at all', () => {
+    expect(parseRecurrence(['EXDATE:20261221T140000Z'], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects an RRULE whose FREQ is not an RFC 5545 frequency', () => {
+    const out = parseRecurrence(['RRULE:FREQ=NOT_A_FREQUENCY'], { timezone: TZ });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/FREQ/);
+  });
+
+  it('accepts a lower-case FREQ value', () => {
+    expect(parseRecurrence(['RRULE:freq=weekly;byday=mo'], { start: MONDAY_9AM, timezone: TZ }).ok).toBe(true);
+  });
+
+  it('returns an error, not a throw, when start is not a valid date', () => {
+    const out = parseRecurrence(['RRULE:FREQ=WEEKLY;BYDAY=MO'], { start: 'tomorrow', timezone: TZ });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/start/);
+  });
+
+  it('rejects a duplicated RRULE property', () => {
+    const out = parseRecurrence(['RRULE:FREQ=DAILY;FREQ=WEEKLY'], { timezone: TZ });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/FREQ/);
+  });
+
+  it('rejects a non-integer COUNT', () => {
+    const out = parseRecurrence(['RRULE:FREQ=WEEKLY;COUNT=banana'], { timezone: TZ });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/COUNT/);
+  });
+
+  it('rejects a non-positive INTERVAL', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;INTERVAL=0'], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects a malformed UNTIL', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=next-year'], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects an UNTIL that is the right shape but an impossible date or time', () => {
+    for (const until of ['20261399T000000Z', '20260230T000000Z', '20261231T256199Z', '20261231T236000Z', '20261231T235961Z']) {
+      expect(parseRecurrence([`RRULE:FREQ=WEEKLY;UNTIL=${until}`], { timezone: TZ }).ok, until).toBe(false);
+    }
+  });
+
+  it('accepts a leap day, and second 60 for a leap second', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20280229T235959Z'], { timezone: TZ }).ok).toBe(true);
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20261231T235960Z'], { timezone: TZ }).ok).toBe(true);
+  });
+
+  it('rejects COUNT and UNTIL together', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;COUNT=5;UNTIL=20261231T235959Z'], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects a property with no value', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;BYDAY'], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('accepts COUNT, INTERVAL and a UTC date-time UNTIL', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=10'], { timezone: TZ }).ok).toBe(true);
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20261231T235959Z'], { timezone: TZ }).ok).toBe(true);
+  });
+
+  it('rejects a date-only or floating UNTIL, since series are timed and timezone-anchored (RFC 5545 §3.3.10)', () => {
+    for (const until of ['20261231', '20261231T090000']) {
+      const out = parseRecurrence([`RRULE:FREQ=WEEKLY;UNTIL=${until}`], { timezone: TZ });
+      expect(out.ok, until).toBe(false);
+      if (!out.ok) expect(out.error).toMatch(/UTC/);
+    }
+  });
+
+  it('rejects an RRULE without FREQ', () => {
+    expect(parseRecurrence(['RRULE:BYDAY=MO'], { timezone: TZ }).ok).toBe(false);
+  });
+});

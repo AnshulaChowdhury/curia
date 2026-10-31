@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Recurring calendar events** — create, edit and delete a series or one occurrence; standing meetings become one event. (#2385)
 - **ADR-057** — retire bearer `/api/messages`; console chat on `/api/chat` is the only ingress. (#999)
 - **`doc-write` `section-delete`** — removes one `##` section and its heading; a missing section errors. (#2339)
 - **`migrate:standing-rules`** — one-off script moves inbox and calendar rule arrays into `/shared/` documents. (#2339)
@@ -234,6 +235,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Fixed
 
 - **Principal inbox paging** — follow-up pages keep their folder/unread filters, ending drain re-triage of handled mail. (#2377)
+- **Calendar write tools** — `calendar-create-event` and `calendar-update-event` refuse undeclared inputs instead of silently dropping them. (#2385)
 - **Signal call bridge** — logs every call event; a call ended mid-resolution is skipped with its reason. (#2372)
 - **ceo-inbox decision tagging** — reads `enabled` from the full setting; toggling keeps its other fields. (#2339)
 - **Agent YAML schema** — startup validation accepts `pinned_context`; it rejected any agent declaring it. (#2339)

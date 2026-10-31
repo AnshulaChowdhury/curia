@@ -97,6 +97,81 @@ describe('NylasCalendarClient — metadata/status/busy plumbing', () => {
   });
 });
 
+describe('NylasCalendarClient — recurrence plumbing', () => {
+  it('sends recurrence with start/end timezones on create and surfaces it on the result', async () => {
+    const create = vi.fn().mockResolvedValue({
+      data: {
+        id: 'master_1',
+        recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'],
+        when: { startTime: 1000, endTime: 2000 },
+      },
+    });
+    const client = makeClientWith({ events: { create } as unknown as NylasCalendarLike['events'] });
+    const out = await client.createEvent('cal_1', {
+      title: 'Weekly sync',
+      start: '2026-11-02T14:00:00Z',
+      end: '2026-11-02T14:15:00Z',
+      recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO'],
+      timezone: 'America/Toronto',
+    });
+
+    const body = create.mock.calls[0]![0].requestBody;
+    expect(body.recurrence).toEqual(['RRULE:FREQ=WEEKLY;BYDAY=MO']);
+    expect(body.when.start_timezone).toBe('America/Toronto');
+    expect(body.when.end_timezone).toBe('America/Toronto');
+    expect(out.recurrence).toEqual(['RRULE:FREQ=WEEKLY;BYDAY=MO']);
+  });
+
+  it('leaves recurrence and timezones out of a one-off create', async () => {
+    const create = vi.fn().mockResolvedValue({ data: { id: 'evt_1', when: { startTime: 1000, endTime: 2000 } } });
+    const client = makeClientWith({ events: { create } as unknown as NylasCalendarLike['events'] });
+    const out = await client.createEvent('cal_1', {
+      title: 'One-off',
+      start: '2026-11-02T14:00:00Z',
+      end: '2026-11-02T14:15:00Z',
+    });
+
+    const body = create.mock.calls[0]![0].requestBody;
+    expect(body).not.toHaveProperty('recurrence');
+    expect(body.when).not.toHaveProperty('start_timezone');
+    expect(out).not.toHaveProperty('recurrence');
+    expect(out).not.toHaveProperty('masterEventId');
+  });
+
+  it('surfaces masterEventId and originalStartTime on recurring instances', async () => {
+    const list = vi.fn().mockResolvedValue({
+      data: [{
+        id: 'master_1_20261109T140000Z',
+        masterEventId: 'master_1',
+        originalStartTime: 1794232800,
+        when: { startTime: 1794232800, endTime: 1794233700 },
+        calendarId: 'cal_1',
+      }],
+    });
+    const client = makeClientWith({ events: { list } as unknown as NylasCalendarLike['events'] });
+    const [evt] = await client.listEvents('cal_1', '2026-11-09T00:00:00Z', '2026-11-10T00:00:00Z');
+
+    expect(evt!.masterEventId).toBe('master_1');
+    expect(evt!.originalStartTime).toBe(1794232800);
+  });
+
+  it('sends recurrence on update, with timezones when the time also changes', async () => {
+    const update = vi.fn().mockResolvedValue({ data: { id: 'master_1', when: { startTime: 1000, endTime: 2000 } } });
+    const client = makeClientWith({ events: { update } as unknown as NylasCalendarLike['events'] });
+    await client.updateEvent('cal_1', 'master_1', {
+      start: '2026-11-02T14:30:00Z',
+      end: '2026-11-02T14:45:00Z',
+      recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261231T235959Z'],
+      timezone: 'America/Toronto',
+    });
+
+    const body = update.mock.calls[0]![0].requestBody;
+    expect(body.recurrence).toEqual(['RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261231T235959Z']);
+    expect(body.when.start_timezone).toBe('America/Toronto');
+    expect(body.when.end_timezone).toBe('America/Toronto');
+  });
+});
+
 describe('NylasCalendarClient — updateEvent attendee writes', () => {
   it('sends the full guest list as email and name and omits participant status', async () => {
     const update = vi.fn().mockResolvedValue({

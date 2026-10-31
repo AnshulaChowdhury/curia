@@ -145,6 +145,11 @@ interface NylasRawEvent {
   calendarId?: string;
   busy?: boolean;
   metadata?: Record<string, string>;
+  // Recurring events: masters carry `recurrence`; expanded instances carry
+  // `masterEventId` and `originalStartTime` (unix seconds).
+  recurrence?: string[];
+  masterEventId?: string;
+  originalStartTime?: number;
 }
 
 interface NylasRawFreeBusy {
@@ -194,6 +199,15 @@ export interface NylasCalendarEvent {
   busy: boolean;
   /** Arbitrary string key/value pairs attached to the event by Curia (e.g. `{ "curia-hold": "true" }`). Null when absent. */
   metadata: Record<string, string> | null;
+  /** RFC 5545 RRULE/EXDATE/RDATE lines. Present only on a recurring series' master event. */
+  recurrence?: string[];
+  /** The series' master event ID. Present only on an instance of a recurring event. */
+  masterEventId?: string;
+  /**
+   * Unix seconds: the slot this occurrence holds in the series, even after it was moved.
+   * Instances only. Skills localize it with localizeEventTimes before returning it.
+   */
+  originalStartTime?: number;
 }
 
 export interface NylasFreeBusyResult {
@@ -226,6 +240,14 @@ export interface CreateEventInput {
   status?: string;
   /** Whether the event should block calendar time. Defaults to true in Nylas. */
   busy?: boolean;
+  /** RFC 5545 RRULE/EXDATE/RDATE lines that make this a recurring series. */
+  recurrence?: string[];
+  /**
+   * IANA timezone the series repeats in. Sent as `when.start_timezone`/`end_timezone`
+   * whenever `recurrence` is set (Nylas requires it, and it keeps occurrences at the
+   * same wall-clock time across DST). Ignored for one-off events.
+   */
+  timezone?: string;
 }
 
 // -- SDK constructor workaround (same as email NylasClient) --
@@ -446,8 +468,12 @@ export class NylasCalendarClient {
         when: {
           start_time: startUnix,
           end_time: endUnix,
+          ...(event.recurrence && event.timezone
+            ? { start_timezone: event.timezone, end_timezone: event.timezone }
+            : {}),
         },
       };
+      if (event.recurrence) requestBody.recurrence = event.recurrence;
       if (event.description) requestBody.description = event.description;
       if (event.location) requestBody.location = event.location;
       if (event.attendees) {
@@ -495,8 +521,12 @@ export class NylasCalendarClient {
         requestBody.when = {
           ...(changes.start ? { start_time: this.toUnixSeconds(changes.start, 'start') } : {}),
           ...(changes.end ? { end_time: this.toUnixSeconds(changes.end, 'end') } : {}),
+          ...(changes.recurrence && changes.timezone
+            ? { start_timezone: changes.timezone, end_timezone: changes.timezone }
+            : {}),
         };
       }
+      if (changes.recurrence) requestBody.recurrence = changes.recurrence;
       if (changes.attendees) {
         requestBody.participants = this.toWritableParticipants(changes.attendees);
       }
@@ -742,6 +772,10 @@ export class NylasCalendarClient {
       calendarId: evt.calendarId ?? '',
       busy: evt.busy ?? true,
       metadata: evt.metadata ?? null,
+      // Included only when present, so one-off events read exactly as before.
+      ...(evt.recurrence && evt.recurrence.length > 0 ? { recurrence: evt.recurrence } : {}),
+      ...(evt.masterEventId ? { masterEventId: evt.masterEventId } : {}),
+      ...(typeof evt.originalStartTime === 'number' ? { originalStartTime: evt.originalStartTime } : {}),
     };
   }
 }
