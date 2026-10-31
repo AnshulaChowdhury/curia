@@ -40,6 +40,14 @@ describe('NylasMailbox', () => {
     }
   });
 
+  it('talks to the EU host for an EU application, and the US host by default', async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => jsonResponse({ data: [] }));
+    await new NylasMailbox('key', 'g', fetchMock as unknown as typeof fetch, 'eu').sentSince(0);
+    await new NylasMailbox('key', 'g', fetchMock as unknown as typeof fetch).sentSince(0);
+    expect(String(fetchMock.mock.calls[0]![0])).toMatch(/^https:\/\/api\.eu\.nylas\.com\/v3\/grants\/g\//);
+    expect(String(fetchMock.mock.calls[1]![0])).toMatch(/^https:\/\/api\.us\.nylas\.com\/v3\/grants\/g\//);
+  });
+
   it('lists sent mail since a time', async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => jsonResponse({ data: [{ id: 's1', thread_id: 't1', date: 2000 }] }));
     const sent = await new NylasMailbox('key', 'g', fetchMock as unknown as typeof fetch).sentSince(1500);
@@ -68,6 +76,11 @@ describe('loadPhoneInboxAccounts', () => {
     expect(accounts.map((a) => a.id)).toEqual(['personal', 'moonray', 'work-outlook']);
     expect(accounts.map((a) => a.address)).toEqual(['me@example.com', 'ac@example.com', null]);
     expect(accounts.map((a) => a.reader !== null)).toEqual([false, true, false]);
+  });
+
+  it('rejects an unknown region instead of sending the key to an unexpected host', async () => {
+    await expect(loadPhoneInboxAccounts({ get: async (name: string) => (name === 'nylas_region' ? 'mars' : null) }))
+      .rejects.toThrow(/nylas_region/);
   });
 
   it('has no readers at all without the Nylas key', async () => {

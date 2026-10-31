@@ -41,6 +41,7 @@ export const SEED_SECRET_NAMES = [
   'ceo_self_email',
   'tavily_api_key',
   // phone launcher inbox (GET /phone/inbox): its own read-only token, plus a grant and address per mailbox
+  'nylas_region',
   'phone_inbox_token',
   'phone_inbox_grant_personal',
   'phone_inbox_grant_moonray',

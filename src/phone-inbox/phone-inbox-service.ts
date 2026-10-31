@@ -60,6 +60,11 @@ export interface PhoneInboxItem {
 export interface PhoneInboxAccount {
   id: PhoneInboxAccountId;
   address: string | null;
+  /**
+   * False when this mailbox isn't connected (no Nylas grant, e.g. an employer that blocks third-party
+   * access). Its counts are then 0 because nothing was read, not because it is clear; the phone says so.
+   */
+  syncing: boolean;
   needsYou: number;
   unread: number;
   items: PhoneInboxItem[];
@@ -119,7 +124,7 @@ export class PhoneInboxService {
 
   private async buildAccount(account: PhoneInboxAccountConfig, now: Date): Promise<PhoneInboxAccount> {
     const { id, address, reader } = account;
-    if (!reader) return { id, address, needsYou: 0, unread: 0, items: [] };
+    if (!reader) return { id, address, syncing: false, needsYou: 0, unread: 0, items: [] };
 
     const sinceSeconds = Math.floor(now.getTime() / 1000) - REPLY_LOOKBACK_SECONDS;
     let unreadMessages: InboxMessage[];
@@ -159,6 +164,6 @@ export class PhoneInboxService {
         ...(id === 'work-outlook' ? { messageId: message.id } : {}),
       }));
 
-    return { id, address, needsYou: items.length, unread: unreadMessages.length, items };
+    return { id, address, syncing: true, needsYou: items.length, unread: unreadMessages.length, items };
   }
 }
