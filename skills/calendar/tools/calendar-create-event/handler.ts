@@ -11,7 +11,8 @@
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
 import type { CreateEventInput } from '../../../../src/channels/calendar/nylas-calendar-client.js';
 import { parseWritableAttendees } from '../../../../src/channels/calendar/attendee-input.js';
-import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import { formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import { localizeEventTimes } from '../../../../src/channels/calendar/event-display.js';
 import { holdHasAttendees, isHoldEvent, eventsOverlap } from '../../../../src/channels/calendar/holds.js';
 import { parseRecurrence } from '../../../../src/channels/calendar/recurrence-input.js';
 import { undeclaredInputError } from '../../../../src/skills/_shared/undeclared-input-guard.js';
@@ -145,11 +146,7 @@ export class CalendarCreateEventHandler implements ToolHandler {
       return {
         success: true,
         data: {
-          event: {
-            ...event,
-            startTime: toLocalIso(event.startTime, tz),
-            endTime: toLocalIso(event.endTime, tz),
-          },
+          event: localizeEventTimes(event, tz),
           displayTimezone: tz ? formatDisplayTimezone(tz, new Date()) : null,
           ...(warnings.length > 0 ? { warnings } : {}),
         },

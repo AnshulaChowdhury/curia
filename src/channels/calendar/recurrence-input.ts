@@ -11,6 +11,8 @@ export type ParseRecurrenceResult =
 
 const MAX_LINES = 20;
 const LINE_PREFIX = /^(RRULE:|EXDATE[:;]|RDATE[:;])/;
+// RFC 5545 §3.3.10 FREQ values. Values are case-insensitive.
+const FREQUENCIES = new Set(['SECONDLY', 'MINUTELY', 'HOURLY', 'DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY']);
 const BYDAY_CODES: Record<string, string> = {
   SU: 'Sunday', MO: 'Monday', TU: 'Tuesday', WE: 'Wednesday', TH: 'Thursday', FR: 'Friday', SA: 'Saturday',
 };
@@ -52,20 +54,29 @@ export function parseRecurrence(
   const parts = new Map(
     rrules[0]!.slice('RRULE:'.length).split(';').map((p) => {
       const [k, v] = p.split('=');
-      return [(k ?? '').toUpperCase(), v ?? ''] as const;
+      return [(k ?? '').toUpperCase(), (v ?? '').toUpperCase()] as const;
     }),
   );
-  if (!parts.get('FREQ')) {
-    return { ok: false, error: 'Invalid input: the RRULE must set FREQ (e.g. FREQ=WEEKLY)' };
+  const freq = parts.get('FREQ');
+  if (!freq || !FREQUENCIES.has(freq)) {
+    return {
+      ok: false,
+      error: `Invalid input: the RRULE must set FREQ to one of ${[...FREQUENCIES].join(', ')} (got ${freq ? `"${freq}"` : 'none'})`,
+    };
   }
 
   const byday = parts.get('BYDAY');
-  if (opts.start && parts.get('FREQ') === 'WEEKLY' && byday) {
+  if (opts.start && freq === 'WEEKLY' && byday) {
     const codes = byday.split(',').map((d) => d.trim().toUpperCase());
     // Only plain day codes; ordinal forms like 1MO belong to MONTHLY rules.
     if (codes.every((c) => c in BYDAY_CODES)) {
+      // Intl throws a RangeError on an Invalid Date; this function returns errors, never throws.
+      const startMs = Date.parse(opts.start);
+      if (Number.isNaN(startMs)) {
+        return { ok: false, error: `Invalid input: start "${opts.start}" is not a valid date` };
+      }
       const startDay = new Intl.DateTimeFormat('en-US', { weekday: 'long', timeZone: opts.timezone })
-        .format(new Date(opts.start));
+        .format(new Date(startMs));
       const allowed = codes.map((c) => BYDAY_CODES[c]!);
       if (!allowed.includes(startDay)) {
         return {

@@ -528,3 +528,28 @@ describe('CalendarListEventsHandler — maxResults > 200 end to end', () => {
     expect(limits.every((l) => l <= 200)).toBe(true);
   });
 });
+
+describe('CalendarListEventsHandler — recurring occurrences (#2385)', () => {
+  it('returns masterEventId and a local-ISO originalStartTime, never raw unix seconds', async () => {
+    const handler = new CalendarListEventsHandler();
+    const listEvents = vi.fn().mockResolvedValue([{
+      id: 'master_20261109T140000Z', title: 'Weekly sync', description: '', location: '',
+      startTime: 1794232800, endTime: 1794233700, startDate: null, endDate: null,
+      participants: [], conferencing: null, status: 'confirmed', calendarId: 'cal-primary', busy: true, metadata: null,
+      masterEventId: 'master', originalStartTime: 1794232800,
+    }]);
+
+    const result = await handler.execute(makeCtx({
+      input: { calendarId: 'cal-primary', timeMin: '2026-11-09T00:00:00Z', timeMax: '2026-11-10T00:00:00Z' },
+      nylasCalendarClient: { listEvents } as unknown as ToolContext['nylasCalendarClient'],
+      timezone: 'America/Toronto',
+    }));
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const [evt] = (result.data as { events: Array<Record<string, unknown>> }).events;
+      expect(evt!.masterEventId).toBe('master');
+      expect(evt!.originalStartTime).toBe('2026-11-09T09:00:00.000-05:00');
+    }
+  });
+});

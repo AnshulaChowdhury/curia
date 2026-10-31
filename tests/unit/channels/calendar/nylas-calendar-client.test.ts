@@ -138,7 +138,7 @@ describe('NylasCalendarClient — recurrence plumbing', () => {
     expect(out).not.toHaveProperty('masterEventId');
   });
 
-  it('surfaces masterEventId on recurring instances', async () => {
+  it('surfaces masterEventId and originalStartTime on recurring instances', async () => {
     const list = vi.fn().mockResolvedValue({
       data: [{
         id: 'master_1_20261109T140000Z',
@@ -152,6 +152,7 @@ describe('NylasCalendarClient — recurrence plumbing', () => {
     const [evt] = await client.listEvents('cal_1', '2026-11-09T00:00:00Z', '2026-11-10T00:00:00Z');
 
     expect(evt!.masterEventId).toBe('master_1');
+    expect(evt!.originalStartTime).toBe(1794232800);
   });
 
   it('sends recurrence on update, with timezones when the time also changes', async () => {

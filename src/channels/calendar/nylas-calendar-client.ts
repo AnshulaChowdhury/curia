@@ -145,9 +145,11 @@ interface NylasRawEvent {
   calendarId?: string;
   busy?: boolean;
   metadata?: Record<string, string>;
-  // Recurring events: masters carry `recurrence`; expanded instances carry `masterEventId`.
+  // Recurring events: masters carry `recurrence`; expanded instances carry
+  // `masterEventId` and `originalStartTime` (unix seconds).
   recurrence?: string[];
   masterEventId?: string;
+  originalStartTime?: number;
 }
 
 interface NylasRawFreeBusy {
@@ -201,6 +203,11 @@ export interface NylasCalendarEvent {
   recurrence?: string[];
   /** The series' master event ID. Present only on an instance of a recurring event. */
   masterEventId?: string;
+  /**
+   * Unix seconds: the slot this occurrence holds in the series, even after it was moved.
+   * Instances only. Skills localize it with localizeEventTimes before returning it.
+   */
+  originalStartTime?: number;
 }
 
 export interface NylasFreeBusyResult {
@@ -768,6 +775,7 @@ export class NylasCalendarClient {
       // Included only when present, so one-off events read exactly as before.
       ...(evt.recurrence && evt.recurrence.length > 0 ? { recurrence: evt.recurrence } : {}),
       ...(evt.masterEventId ? { masterEventId: evt.masterEventId } : {}),
+      ...(typeof evt.originalStartTime === 'number' ? { originalStartTime: evt.originalStartTime } : {}),
     };
   }
 }

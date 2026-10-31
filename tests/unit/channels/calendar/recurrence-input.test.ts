@@ -58,6 +58,22 @@ describe('parseRecurrence', () => {
     expect(parseRecurrence(['EXDATE:20261221T140000Z'], { timezone: TZ }).ok).toBe(false);
   });
 
+  it('rejects an RRULE whose FREQ is not an RFC 5545 frequency', () => {
+    const out = parseRecurrence(['RRULE:FREQ=NOT_A_FREQUENCY'], { timezone: TZ });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/FREQ/);
+  });
+
+  it('accepts a lower-case FREQ value', () => {
+    expect(parseRecurrence(['RRULE:freq=weekly;byday=mo'], { start: MONDAY_9AM, timezone: TZ }).ok).toBe(true);
+  });
+
+  it('returns an error, not a throw, when start is not a valid date', () => {
+    const out = parseRecurrence(['RRULE:FREQ=WEEKLY;BYDAY=MO'], { start: 'tomorrow', timezone: TZ });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/start/);
+  });
+
   it('rejects an RRULE without FREQ', () => {
     expect(parseRecurrence(['RRULE:BYDAY=MO'], { timezone: TZ }).ok).toBe(false);
   });

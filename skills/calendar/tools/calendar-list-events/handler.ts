@@ -13,7 +13,8 @@
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
 import type { NylasCalendarEvent } from '../../../../src/channels/calendar/nylas-calendar-client.js';
-import { toLocalIso, formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import { formatDisplayTimezone } from '../../../../src/time/timestamp.js';
+import { localizeEventTimes } from '../../../../src/channels/calendar/event-display.js';
 import { isSystemOriginated, isPrincipalOriginated } from '../../../../src/contacts/principal.js';
 import { isUnresolvedPlaceholder, unresolvedPlaceholderError } from '../../../../src/skills/_shared/placeholder-guard.js';
 import { guardNylasExplicitCalendarIdentity } from '../../../../src/skills/_shared/calendar-identity-guard.js';
@@ -223,11 +224,7 @@ export class CalendarListEventsHandler implements ToolHandler {
       // correct wall-clock times. Falls back to UTC when timezone is not configured,
       // and returns null for null/invalid timestamp values.
       const tz = ctx.timezone;
-      const formattedEvents = events.map((evt) => ({
-        ...evt,
-        startTime: toLocalIso(evt.startTime, tz),
-        endTime: toLocalIso(evt.endTime, tz),
-      }));
+      const formattedEvents = events.map((evt) => localizeEventTimes(evt, tz));
 
       ctx.log.info({ calendarIds, count: formattedEvents.length, failedCalendarIds }, 'Listed events');
       const data: Record<string, unknown> = {
