@@ -76,6 +76,68 @@ describe('CalendarUpdateEventHandler -- recurrence', () => {
     expect(updateEvent).not.toHaveBeenCalled();
   });
 
+  it('sends the series start and end with a recurrence-only change, so Nylas gets a full when', async () => {
+    const updateEvent = vi.fn().mockResolvedValue(makeEvent({ id: 'master' }));
+    const ctx = makeCtx({ calendarId: 'cal-work', eventId: 'master', recurrence: UNTIL_RULE }, { updateEvent });
+
+    const result = await new CalendarUpdateEventHandler().execute(ctx);
+
+    expect(result.success).toBe(true);
+    const changes = updateEvent.mock.calls[0]![2];
+    expect(changes.start).toBe('2026-11-02T14:00:00.000Z');
+    expect(changes.end).toBe('2026-11-02T14:15:00.000Z');
+  });
+
+  it('keeps a caller-supplied start and derives the end from the series duration', async () => {
+    const updateEvent = vi.fn().mockResolvedValue(makeEvent({ id: 'master' }));
+    const ctx = makeCtx(
+      { calendarId: 'cal-work', eventId: 'master', start: '2026-11-09T14:30:00Z', recurrence: UNTIL_RULE },
+      { updateEvent },
+    );
+
+    await new CalendarUpdateEventHandler().execute(ctx);
+
+    const changes = updateEvent.mock.calls[0]![2];
+    expect(changes.start).toBe('2026-11-09T14:30:00Z');
+    expect(changes.end).toBe('2026-11-09T14:45:00.000Z');
+  });
+
+  it('names an unparseable start instead of failing with "Invalid time value"', async () => {
+    const updateEvent = vi.fn();
+    const ctx = makeCtx({ calendarId: 'cal-work', eventId: 'master', start: 'tomorrow', recurrence: UNTIL_RULE }, { updateEvent });
+
+    const result = await new CalendarUpdateEventHandler().execute(ctx);
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toMatch(/start "tomorrow" is not a valid date/);
+    expect(updateEvent).not.toHaveBeenCalled();
+  });
+
+  it('refuses a recurrence change on an all-day event', async () => {
+    const getEvent = vi.fn().mockResolvedValue(makeEvent({ id: 'master', startTime: null, endTime: null, startDate: '2026-11-02', endDate: '2026-11-02' }));
+    const updateEvent = vi.fn();
+    const ctx = makeCtx({ calendarId: 'cal-work', eventId: 'master', recurrence: UNTIL_RULE }, { getEvent, updateEvent });
+
+    const result = await new CalendarUpdateEventHandler().execute(ctx);
+
+    expect(result.success).toBe(false);
+    expect(updateEvent).not.toHaveBeenCalled();
+  });
+
+  it('refuses EXDATE lines and points at calendar-delete-event', async () => {
+    const updateEvent = vi.fn();
+    const ctx = makeCtx(
+      { calendarId: 'cal-work', eventId: 'master', recurrence: ['RRULE:FREQ=WEEKLY;BYDAY=MO', 'EXDATE:20261116T140000Z'] },
+      { updateEvent },
+    );
+
+    const result = await new CalendarUpdateEventHandler().execute(ctx);
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain('calendar-delete-event');
+    expect(updateEvent).not.toHaveBeenCalled();
+  });
+
   it('checks a new start against the new weekly rule', async () => {
     const updateEvent = vi.fn();
     // 2026-11-02 (Monday) 9:00 AM Toronto, against a Tuesday rule.

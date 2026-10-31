@@ -74,6 +74,40 @@ describe('parseRecurrence', () => {
     if (!out.ok) expect(out.error).toMatch(/start/);
   });
 
+  it('rejects a duplicated RRULE property', () => {
+    const out = parseRecurrence(['RRULE:FREQ=DAILY;FREQ=WEEKLY'], { timezone: TZ });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/FREQ/);
+  });
+
+  it('rejects a non-integer COUNT', () => {
+    const out = parseRecurrence(['RRULE:FREQ=WEEKLY;COUNT=banana'], { timezone: TZ });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/COUNT/);
+  });
+
+  it('rejects a non-positive INTERVAL', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;INTERVAL=0'], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects a malformed UNTIL', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=next-year'], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects COUNT and UNTIL together', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;COUNT=5;UNTIL=20261231T235959Z'], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('rejects a property with no value', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;BYDAY'], { timezone: TZ }).ok).toBe(false);
+  });
+
+  it('accepts COUNT, INTERVAL and a date or date-time UNTIL', () => {
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=10'], { timezone: TZ }).ok).toBe(true);
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20261231'], { timezone: TZ }).ok).toBe(true);
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20261231T235959Z'], { timezone: TZ }).ok).toBe(true);
+  });
+
   it('rejects an RRULE without FREQ', () => {
     expect(parseRecurrence(['RRULE:BYDAY=MO'], { timezone: TZ }).ok).toBe(false);
   });

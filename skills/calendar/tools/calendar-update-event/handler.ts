@@ -93,6 +93,14 @@ export class CalendarUpdateEventHandler implements ToolHandler {
         // Validate shape first so a malformed rule costs no Nylas call.
         const shape = parseRecurrence(recurrence, { timezone: ctx.timezone });
         if (!shape.ok) return { success: false, error: shape.error };
+        // An update replaces the series' rule lines, and nothing here confirms an
+        // EXDATE/RDATE took effect. Cancelling one occurrence is a delete by its id.
+        if (shape.recurrence.some((line) => !line.startsWith('RRULE:'))) {
+          return {
+            success: false,
+            error: 'On update, recurrence takes the RRULE line only. To cancel one occurrence, use calendar-delete-event with that occurrence\'s id. Nothing was changed.',
+          };
+        }
         // The rule lives on the series master. An instance id here would at best
         // detach that one occurrence, so refuse and name the master instead.
         const target = await ctx.nylasCalendarClient.getEvent(calendarId, eventId);
@@ -102,10 +110,27 @@ export class CalendarUpdateEventHandler implements ToolHandler {
             error: `Event '${eventId}' is one occurrence of a recurring series. Change the rule on the series by passing its master event id '${target.masterEventId}' as eventId. Nothing was changed.`,
           };
         }
+        if (target.startTime === null || target.endTime === null) {
+          return { success: false, error: `Event '${eventId}' is an all-day event; recurring all-day events are not supported. Nothing was changed.` };
+        }
+        // Nylas needs a complete `when` (both times plus timezones) alongside a rule,
+        // so fill whichever bound the caller left out, keeping the event's duration.
+        const durationMs = (target.endTime - target.startTime) * 1000;
+        for (const [name, value] of [['start', changes.start], ['end', changes.end]] as const) {
+          if (value !== undefined && Number.isNaN(Date.parse(value))) {
+            return { success: false, error: `Invalid input: ${name} "${value}" is not a valid date` };
+          }
+        }
+        if (changes.start === undefined && changes.end === undefined) {
+          changes.start = new Date(target.startTime * 1000).toISOString();
+          changes.end = new Date(target.endTime * 1000).toISOString();
+        } else if (changes.end === undefined) {
+          changes.end = new Date(Date.parse(changes.start!) + durationMs).toISOString();
+        } else if (changes.start === undefined) {
+          changes.start = new Date(Date.parse(changes.end) - durationMs).toISOString();
+        }
         // Check the rule against the start the series will have after this write.
-        const seriesStart = changes.start
-          ?? (target.startTime !== null ? new Date(target.startTime * 1000).toISOString() : undefined);
-        const parsed = parseRecurrence(recurrence, { start: seriesStart, timezone: ctx.timezone });
+        const parsed = parseRecurrence(recurrence, { start: changes.start, timezone: ctx.timezone });
         if (!parsed.ok) return { success: false, error: parsed.error };
         changes.recurrence = parsed.recurrence;
         changes.timezone = ctx.timezone;

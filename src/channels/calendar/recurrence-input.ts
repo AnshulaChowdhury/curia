@@ -51,12 +51,34 @@ export function parseRecurrence(
   if (rrules.length !== 1) {
     return { ok: false, error: `Invalid input: recurrence needs exactly one RRULE line (got ${rrules.length})` };
   }
-  const parts = new Map(
-    rrules[0]!.slice('RRULE:'.length).split(';').map((p) => {
-      const [k, v] = p.split('=');
-      return [(k ?? '').toUpperCase(), (v ?? '').toUpperCase()] as const;
-    }),
-  );
+  // Targeted property checks, not a full RFC 5545 validator: catch what would
+  // otherwise reach the provider malformed or be silently collapsed.
+  const parts = new Map<string, string>();
+  for (const part of rrules[0]!.slice('RRULE:'.length).split(';')) {
+    const eq = part.indexOf('=');
+    const key = (eq === -1 ? part : part.slice(0, eq)).trim().toUpperCase();
+    const value = eq === -1 ? '' : part.slice(eq + 1).trim().toUpperCase();
+    if (!key || !value) {
+      return { ok: false, error: `Invalid input: RRULE property "${part}" must be NAME=VALUE` };
+    }
+    if (parts.has(key)) {
+      return { ok: false, error: `Invalid input: RRULE sets ${key} more than once` };
+    }
+    parts.set(key, value);
+  }
+  for (const key of ['COUNT', 'INTERVAL']) {
+    const value = parts.get(key);
+    if (value !== undefined && !/^[1-9]\d*$/.test(value)) {
+      return { ok: false, error: `Invalid input: RRULE ${key} must be a positive integer (got "${value}")` };
+    }
+  }
+  const until = parts.get('UNTIL');
+  if (until !== undefined && !/^\d{8}(T\d{6}Z?)?$/.test(until)) {
+    return { ok: false, error: `Invalid input: RRULE UNTIL must be a date (YYYYMMDD) or UTC date-time (YYYYMMDDTHHMMSSZ), got "${until}"` };
+  }
+  if (until !== undefined && parts.has('COUNT')) {
+    return { ok: false, error: 'Invalid input: an RRULE may set COUNT or UNTIL, not both' };
+  }
   const freq = parts.get('FREQ');
   if (!freq || !FREQUENCIES.has(freq)) {
     return {

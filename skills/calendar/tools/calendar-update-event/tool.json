@@ -14,7 +14,7 @@
     "location": "string?",
     "attendees": "object[]? (full guest-list replacement: each { email, name? }. Cannot set RSVP status. Replaces membership; RSVP preservation on retained guests is unverified — re-read after writing.)",
     "conferencing": "object?",
-    "recurrence": "string[]? (replaces the series' RRULE/EXDATE lines)",
+    "recurrence": "string[]? (the series' new RRULE line only; cancel one occurrence with calendar-delete-event)",
     "notifyAttendees": "boolean? (default true. false suppresses invitation emails on Google only; Microsoft rejects false, iCloud ignores it.)"
   },
   "outputs": {
