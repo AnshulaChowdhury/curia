@@ -34,6 +34,14 @@ export const SEED_SECRET_NAMES = [
   'ceo_nylas_grant_id',
   'ceo_self_email',
   'tavily_api_key',
+  // phone launcher inbox (GET /phone/inbox): its own read-only token, plus a grant and address per mailbox
+  'phone_inbox_token',
+  'phone_inbox_grant_personal',
+  'phone_inbox_grant_moonray',
+  'phone_inbox_grant_work_outlook',
+  'phone_inbox_address_personal',
+  'phone_inbox_address_moonray',
+  'phone_inbox_address_work_outlook',
 ] as const;
 
 // The subset of secrets that MUST exist in the vault for a working install. Their

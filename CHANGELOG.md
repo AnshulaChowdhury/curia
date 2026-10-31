@@ -13,6 +13,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /phone/inbox`** — read-only email summary for the Command Hub phone launcher: Urgent/Seen/Drafted mail that is still unread, in the inbox and unanswered, per mailbox. Own token, no bodies.
+
 ### Changed
 
 - **Coordinator Drive moves** — pinned `update_drive_file` to the coordinator and documented reparenting (`add_parents`/`remove_parents`), so "move this doc into a folder" requests are performed instead of declined. (#1062)
