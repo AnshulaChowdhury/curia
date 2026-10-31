@@ -95,13 +95,13 @@ describe('parseRecurrence', () => {
   });
 
   it('rejects an UNTIL that is the right shape but an impossible date or time', () => {
-    for (const until of ['20261399', '20260230', '20261231T256199Z', '20261231T236000Z', '20261231T235961Z']) {
+    for (const until of ['20261399T000000Z', '20260230T000000Z', '20261231T256199Z', '20261231T236000Z', '20261231T235961Z']) {
       expect(parseRecurrence([`RRULE:FREQ=WEEKLY;UNTIL=${until}`], { timezone: TZ }).ok, until).toBe(false);
     }
   });
 
   it('accepts a leap day, and second 60 for a leap second', () => {
-    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20280229'], { timezone: TZ }).ok).toBe(true);
+    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20280229T235959Z'], { timezone: TZ }).ok).toBe(true);
     expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20261231T235960Z'], { timezone: TZ }).ok).toBe(true);
   });
 
@@ -113,10 +113,17 @@ describe('parseRecurrence', () => {
     expect(parseRecurrence(['RRULE:FREQ=WEEKLY;BYDAY'], { timezone: TZ }).ok).toBe(false);
   });
 
-  it('accepts COUNT, INTERVAL and a date or date-time UNTIL', () => {
+  it('accepts COUNT, INTERVAL and a UTC date-time UNTIL', () => {
     expect(parseRecurrence(['RRULE:FREQ=WEEKLY;INTERVAL=2;COUNT=10'], { timezone: TZ }).ok).toBe(true);
-    expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20261231'], { timezone: TZ }).ok).toBe(true);
     expect(parseRecurrence(['RRULE:FREQ=WEEKLY;UNTIL=20261231T235959Z'], { timezone: TZ }).ok).toBe(true);
+  });
+
+  it('rejects a date-only or floating UNTIL, since series are timed and timezone-anchored (RFC 5545 §3.3.10)', () => {
+    for (const until of ['20261231', '20261231T090000']) {
+      const out = parseRecurrence([`RRULE:FREQ=WEEKLY;UNTIL=${until}`], { timezone: TZ });
+      expect(out.ok, until).toBe(false);
+      if (!out.ok) expect(out.error).toMatch(/UTC/);
+    }
   });
 
   it('rejects an RRULE without FREQ', () => {
