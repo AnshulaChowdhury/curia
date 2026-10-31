@@ -715,6 +715,40 @@ describe('SignalCallBridge', () => {
     expect(rpc.acceptCall).not.toHaveBeenCalled();
   });
 
+  // #2372 review: when ENDED lands mid-resolution and resolution then throws,
+  // the call is already gone — rejecting it only fails with "No active call".
+  // Skip the reject and warn with the ENDED reason, as on the success path.
+  it('does not reject a call that ENDED mid-resolution when resolution then throws, and logs the reason', async () => {
+    let failResolution!: (err: Error) => void;
+    const resolveImpl = async (): Promise<InboundSenderContext> =>
+      new Promise<InboundSenderContext>((_resolve, reject) => {
+        failResolution = reject;
+      });
+    const { logger, warn, error } = stubLogger();
+    const { bridge, rpc } = setup({ resolveImpl, logger });
+    bridge.start();
+    const callId = 97n;
+
+    rpc.emit('callEvent', ringingEvent(callId));
+    rpc.emit('callEvent', endedEvent(callId, { reason: 'InternalFailure' }));
+    await new Promise(resolve => setImmediate(resolve));
+
+    failResolution(new Error('contact resolver DB blip'));
+    await vi.waitFor(() =>
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ callId: callId.toString(), reason: 'InternalFailure' }),
+        expect.stringContaining('ended before it could be answered'),
+      ),
+    );
+    // The resolution failure itself is still reported.
+    expect(error).toHaveBeenCalledWith(
+      expect.objectContaining({ callId: callId.toString() }),
+      expect.stringContaining('Caller resolution threw'),
+    );
+    expect(rpc.rejectCall).not.toHaveBeenCalled();
+    expect(rpc.acceptCall).not.toHaveBeenCalled();
+  });
+
   // I5: acceptCall itself failing (after a successful caller resolution)
   // must also send an explicit reject, for consistency with every other
   // rejection path in handleRingingIncoming.
@@ -726,6 +760,52 @@ describe('SignalCallBridge', () => {
 
     rpc.emit('callEvent', ringingEvent(callId));
     await vi.waitFor(() => expect(rpc.rejectCall).toHaveBeenCalledWith(callId));
+  });
+
+  // #2372: the exact sequence a Signal Desktop call produced in prod
+  // (2026-10-30). signal-cli emitted RINGING_INCOMING twice, then ENDED with
+  // reason InternalFailure ~340ms later — before caller resolution finished.
+  // The bridge then accepted and rejected a call signal-cli no longer had, and
+  // the reason was never logged. It must skip both and warn with the reason.
+  it('does not answer a call that ENDED while caller resolution was running, and logs the reason (desktop sequence)', async () => {
+    let resolveFirst!: (v: InboundSenderContext) => void;
+    let resolveCalls = 0;
+    const resolveImpl = async (): Promise<InboundSenderContext> => {
+      resolveCalls += 1;
+      if (resolveCalls === 1) {
+        return new Promise<InboundSenderContext>(resolve => {
+          resolveFirst = resolve;
+        });
+      }
+      return resolvedSenderContext();
+    };
+    const { logger, warn } = stubLogger();
+    const { bridge, rpc, startSession } = setup({ resolveImpl, logger });
+    bridge.start();
+    const callId = -4740296052351557946n;
+    const device = { inputDeviceName: 'signal_input_1', outputDeviceName: 'signal_output_1', uuid: 'aci-uuid' };
+
+    rpc.emit('callEvent', ringingEvent(callId, device));
+    rpc.emit('callEvent', ringingEvent(callId, device));
+    rpc.emit('callEvent', endedEvent(callId, { ...device, reason: 'InternalFailure' }));
+    await new Promise(resolve => setImmediate(resolve));
+
+    resolveFirst(resolvedSenderContext());
+    await vi.waitFor(() =>
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ callId: callId.toString(), reason: 'InternalFailure' }),
+        expect.stringContaining('ended before it could be answered'),
+      ),
+    );
+    expect(rpc.acceptCall).not.toHaveBeenCalled();
+    expect(rpc.rejectCall).not.toHaveBeenCalled();
+    expect(startSession).not.toHaveBeenCalled();
+
+    // The dead call leaves no state behind: the next call is answered, not busy-rejected.
+    const nextCall = 7n;
+    rpc.emit('callEvent', ringingEvent(nextCall));
+    await vi.waitFor(() => expect(rpc.acceptCall).toHaveBeenCalledWith(nextCall));
+    expect(rpc.rejectCall).not.toHaveBeenCalled();
   });
 
   // I3: the busy check races two RINGING_INCOMING events for different
