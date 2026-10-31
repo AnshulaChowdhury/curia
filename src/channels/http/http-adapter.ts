@@ -40,6 +40,9 @@ import { registryRoutes } from './routes/registry.js';
 import { channelRegistryRoutes } from './routes/channel-registry.js';
 import { vaultRoutes } from './routes/vault.js';
 import { secretCaptureRoutes } from './routes/secret-capture.js';
+import { phoneInboxRoutes } from './routes/phone-inbox.js';
+import { PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
+import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { setupRoutes } from './routes/setup.js';
 import type { OfficeIdentityService } from '../../identity/service.js';
 import type { ExecutiveProfileService } from '../../executive/service.js';
@@ -409,6 +412,17 @@ export class HttpAdapter implements Channel {
         logger,
         // Pass the bus so a successful redeem publishes secret.captured for agent resume (#972).
         bus,
+      });
+    }
+
+    // Phone inbox (Command Hub launcher) — outside /api, with its own single-purpose token read from
+    // the vault per request. Needs the vault; without it the route isn't mounted.
+    if (this.config.secretsService) {
+      const secrets = this.config.secretsService;
+      await this.app.register(phoneInboxRoutes, {
+        logger,
+        getToken: () => secrets.get('phone_inbox_token'),
+        getService: async () => new PhoneInboxService(await loadPhoneInboxAccounts(secrets), logger),
       });
     }
 
