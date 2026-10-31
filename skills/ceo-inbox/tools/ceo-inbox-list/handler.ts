@@ -16,6 +16,17 @@ const DRAFTS_FOLDER_NAMES = new Set(['DRAFT', 'DRAFTS']);
 // messages, and a cursor that never ends cannot loop forever.
 const LIST_PAGE_CAP = 25;
 
+// Gmail system labels whose Nylas folder ID is the label name itself, so a
+// result can be checked against the requested folder. A user label's ID is
+// opaque (`Label_123`) and may not match the name the caller passed, so the
+// folder check is skipped for those rather than dropping every result.
+const SYSTEM_FOLDER_IDS = new Set(['INBOX', 'SENT', 'SPAM', 'TRASH', 'STARRED', 'IMPORTANT']);
+
+function isSystemFolder(folder: string): boolean {
+  const upper = folder.toUpperCase();
+  return SYSTEM_FOLDER_IDS.has(upper) || upper.startsWith('CATEGORY_');
+}
+
 export class CeoInboxListHandler implements ToolHandler {
   async execute(ctx: ToolContext): Promise<ToolResult> {
     const apiKey = ctx.secret('nylas_api_key');
@@ -86,8 +97,22 @@ export class CeoInboxListHandler implements ToolHandler {
       // `has_more` is computed from the filtered results. An empty batch must
       // not report has_more: nothing gets archived, so the next run would see
       // the same page and reschedule forever (#2035).
+      //
+      // Follow-up pages once came back unfiltered, because the cursor does
+      // not carry in/unread (#2377). Read, archived mail then never left the
+      // result set, so has_more stayed true and every drain wake re-triaged
+      // handled mail. The client now re-sends the filters. As a backstop,
+      // results that contradict the request are dropped here too, the same
+      // way as Curia-self mail, before has_more is decided.
+      const checkFolder = isSystemFolder(folder);
+      const wantFolder = folder.toUpperCase();
+      const isStale = (msg: NylasMessageSummary): boolean =>
+        (unreadOnly && !msg.unread) ||
+        (checkFolder && !msg.folders.some((f) => f.toUpperCase() === wantFolder));
+
       const collected: NylasMessageSummary[] = [];
       let droppedSelf = 0;
+      let droppedStale = 0;
       let pageToken: string | undefined;
       let hasMore = false;
       let scanIncomplete = false;
@@ -103,12 +128,14 @@ export class CeoInboxListHandler implements ToolHandler {
           ...(pageToken ? { pageToken } : {}),
         });
 
+        const fresh = raw.filter((msg) => !isStale(msg));
+        droppedStale += raw.length - fresh.length;
         const pageFiltered = curiaEmail
-          ? raw.filter(
+          ? fresh.filter(
               (msg) => !msg.from.some((p) => p.email.toLowerCase() === curiaEmail),
             )
-          : raw;
-        droppedSelf += raw.length - pageFiltered.length;
+          : fresh;
+        droppedSelf += fresh.length - pageFiltered.length;
         collected.push(...pageFiltered);
 
         if (collected.length > limit) {
@@ -137,6 +164,12 @@ export class CeoInboxListHandler implements ToolHandler {
         ctx.log.info(
           { filtered: droppedSelf },
           'ceo-inbox-list: filtered out messages from Curia',
+        );
+      }
+      if (droppedStale > 0) {
+        ctx.log.warn(
+          { dropped: droppedStale, folder, unreadOnly },
+          'ceo-inbox-list: dropped provider results that contradict the requested filter',
         );
       }
 

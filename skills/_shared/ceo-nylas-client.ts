@@ -211,9 +211,10 @@ export class CeoNylasClient {
   }
 
   // One page of listMessages, plus Nylas's `next_cursor` so callers can keep
-  // paging. A follow-up page sends only `page_token` (and limit): the cursor
-  // already encodes the original query, and re-sending filters is rejected
-  // when the first request used search_query_native.
+  // paging. A follow-up page re-sends the in/unread/received_* filters with
+  // `page_token`: the cursor does NOT carry them, and a token-only request
+  // pages through the whole mailbox (#2377). A search_query_native follow-up
+  // stays token-only; re-sending filters there is rejected.
   async listMessagesPage(
     options: ListMessagesOptions & { pageToken?: string } = {},
   ): Promise<{ messages: NylasMessageSummary[]; nextCursor?: string }> {
@@ -221,31 +222,22 @@ export class CeoNylasClient {
     params.set('limit', String(Math.min(options.limit ?? NYLAS_MAX_LIST_LIMIT, NYLAS_MAX_LIST_LIMIT)));
     if (options.pageToken) {
       params.set('page_token', options.pageToken);
-    } else if (options.query) {
-      // Nylas v3: search_query_native cannot be combined with any other filter
-      // param except limit and page_token — sending in/unread/received_after
-      // alongside it returns HTTP 400 "invalid_request_error".
-      if (options.folder || options.unread !== undefined || options.receivedAfter !== undefined || options.receivedBefore !== undefined) {
-        this.log.warn(
-          { suppressedOptions: { folder: options.folder, unread: options.unread, receivedAfter: options.receivedAfter, receivedBefore: options.receivedBefore } },
-          'nylas: listMessages — folder/unread/receivedAfter/receivedBefore ignored because search_query_native is set (Nylas v3 limitation)',
-        );
-      }
-      params.set('search_query_native', options.query);
-    } else {
-      if (options.folder) {
-        const normalized = GMAIL_FOLDER_ALIASES[options.folder] ?? options.folder;
-        if (normalized !== options.folder) {
-          this.log.info(
-            { original: options.folder, normalized },
-            'nylas: listMessages — normalized folder alias to Gmail label ID',
+    }
+    if (options.query) {
+      if (!options.pageToken) {
+        // Nylas v3: search_query_native cannot be combined with any other filter
+        // param except limit and page_token — sending in/unread/received_after
+        // alongside it returns HTTP 400 "invalid_request_error".
+        if (options.folder || options.unread !== undefined || options.receivedAfter !== undefined || options.receivedBefore !== undefined) {
+          this.log.warn(
+            { suppressedOptions: { folder: options.folder, unread: options.unread, receivedAfter: options.receivedAfter, receivedBefore: options.receivedBefore } },
+            'nylas: listMessages — folder/unread/receivedAfter/receivedBefore ignored because search_query_native is set (Nylas v3 limitation)',
           );
         }
-        params.set('in', normalized);
+        params.set('search_query_native', options.query);
       }
-      if (options.unread !== undefined) params.set('unread', String(options.unread));
-      if (options.receivedAfter !== undefined) params.set('received_after', String(options.receivedAfter));
-      if (options.receivedBefore !== undefined) params.set('received_before', String(options.receivedBefore));
+    } else {
+      this.setMessageFilters(params, options, !options.pageToken);
     }
 
     const url = `${this.baseUrl}/messages?${params}`;
@@ -254,15 +246,37 @@ export class CeoNylasClient {
     return { messages: data.map(normalizeMessageSummary), nextCursor };
   }
 
+  // The in/unread/received_* filters for a /messages request. Sent on every
+  // page, follow-ups included, because Nylas's cursor does not carry them.
+  private setMessageFilters(
+    params: URLSearchParams,
+    options: ListMessagesOptions,
+    logAlias: boolean,
+  ): void {
+    if (options.folder) {
+      const normalized = GMAIL_FOLDER_ALIASES[options.folder] ?? options.folder;
+      if (logAlias && normalized !== options.folder) {
+        this.log.info(
+          { original: options.folder, normalized },
+          'nylas: listMessages — normalized folder alias to Gmail label ID',
+        );
+      }
+      params.set('in', normalized);
+    }
+    if (options.unread !== undefined) params.set('unread', String(options.unread));
+    if (options.receivedAfter !== undefined) params.set('received_after', String(options.receivedAfter));
+    if (options.receivedBefore !== undefined) params.set('received_before', String(options.receivedBefore));
+  }
+
   // Exhaustively list messages by following Nylas's `next_cursor`, up to `maxScan`
   // total messages. Nylas returns messages newest-first, so a single fixed-limit
   // listMessages() call silently drops everything past the first page — on a busy
   // Sent folder that means lost observations (issue: #1429 review). This walks all
   // pages so a watermark-scoped poll actually sees every message in the window.
   //
-  // Filters (in/received_after/received_before) are only sent on the first request; Nylas's cursor
-  // encodes the original query, so subsequent pages carry the filter automatically
-  // (same contract listAllDrafts relies on). `truncated` is true when the maxScan
+  // Filters (in/unread/received_after/received_before) are re-sent with every
+  // page_token: Nylas's cursor does not carry them, so a token-only follow-up
+  // pages through the whole mailbox (#2377). `truncated` is true when the maxScan
   // ceiling was hit with more pages still available — callers must NOT treat the
   // window as fully drained in that case.
   async listAllMessages(
@@ -278,22 +292,8 @@ export class CeoNylasClient {
     for (;;) {
       const params = new URLSearchParams();
       params.set('limit', String(pageSize));
-      if (pageToken) {
-        // Cursor carries the original filter — do not re-send in/received_after.
-        params.set('page_token', pageToken);
-      } else {
-        if (options.folder) {
-          const normalized = GMAIL_FOLDER_ALIASES[options.folder] ?? options.folder;
-          params.set('in', normalized);
-        }
-        if (options.unread !== undefined) params.set('unread', String(options.unread));
-        if (options.receivedAfter !== undefined) {
-          params.set('received_after', String(options.receivedAfter));
-        }
-        if (options.receivedBefore !== undefined) {
-          params.set('received_before', String(options.receivedBefore));
-        }
-      }
+      if (pageToken) params.set('page_token', pageToken);
+      this.setMessageFilters(params, options, false);
       const url = `${this.baseUrl}/messages?${params}`;
 
       const { data, nextCursor } = await this.requestWithCursor<NylasApiMessage[]>(

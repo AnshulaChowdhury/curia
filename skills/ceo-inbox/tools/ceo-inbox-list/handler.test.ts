@@ -197,9 +197,9 @@ describe('CeoInboxListHandler — batch listing (no watermark)', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     const second = new URL(fetchSpy.mock.calls[1]![0] as string);
     expect(second.searchParams.get('page_token')).toBe('p2');
-    // The cursor already carries the first page's filters.
-    expect(second.searchParams.get('in')).toBeNull();
-    expect(second.searchParams.get('unread')).toBeNull();
+    // The cursor does not carry the first page's filters, so they are re-sent (#2377).
+    expect(second.searchParams.get('in')).toBe('INBOX');
+    expect(second.searchParams.get('unread')).toBe('true');
     expect(second.searchParams.get('limit')).toBe('20');
   });
 
@@ -254,6 +254,121 @@ describe('CeoInboxListHandler — batch listing (no watermark)', () => {
     expect(ctx.log.error).toHaveBeenCalled();
     const followUp = new URL(fetchSpy.mock.calls[1]![0] as string);
     expect(followUp.searchParams.get('limit')).toBe('20');
+  });
+});
+
+/** Messages Nylas returns for `in=INBOX&unread=true` that are read and archived (#2377). */
+function staleMessages(n: number, prefix = 'old'): unknown[] {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `${prefix}${i}`,
+    threadId: `t${prefix}${i}`,
+    date: i + 1,
+    subject: `handled ${i}`,
+    from: [{ email: `s${i}@x.com`, name: `Sender ${i}` }],
+    to: [],
+    cc: [],
+    snippet: '',
+    unread: false,
+    folders: ['Label_handled'],
+    attachments: [],
+  }));
+}
+
+describe('CeoInboxListHandler — stale provider results (#2377)', () => {
+  let handler: CeoInboxListHandler;
+
+  beforeEach(() => {
+    handler = new CeoInboxListHandler();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('reports count 0 and has_more false when the provider returns only stale entries', async () => {
+    const ctx = makeCtx({ unread_only: true, limit: 5 });
+    const fetchSpy = mockFetchReturning(staleMessages(6));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const result = await handler.execute(ctx);
+    if (!result.success) throw new Error(result.error);
+    const data = result.data as { count: number; has_more: boolean };
+    expect(data.count).toBe(0);
+    expect(data.has_more).toBe(false);
+    expect(ctx.log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ dropped: 6 }),
+      expect.any(String),
+    );
+  });
+
+  it('drops a message that is read, and one that is unread but no longer in INBOX', async () => {
+    const ctx = makeCtx({ unread_only: true, limit: 5 });
+    const [real] = unreadMessages(1) as Array<Record<string, unknown>>;
+    const readInInbox = { ...real, id: 'read', unread: false, folders: ['INBOX'] };
+    const unreadArchived = { ...real, id: 'archived', unread: true, folders: ['UNREAD'] };
+    const fetchSpy = mockFetchReturning([readInInbox, unreadArchived, real]);
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const result = await handler.execute(ctx);
+    if (!result.success) throw new Error(result.error);
+    const data = result.data as { count: number; has_more: boolean; messages: Array<{ id: string }> };
+    expect(data.messages.map((m) => m.id)).toEqual(['m0']);
+    expect(data.has_more).toBe(false);
+  });
+
+  it('keeps real unread mail mixed in with stale entries and computes has_more from it', async () => {
+    const ctx = makeCtx({ unread_only: true, limit: 2 });
+    // limit 2 → fetch 3. Two stale + one real, no further page.
+    const fetchSpy = mockFetchReturning([...staleMessages(2), ...unreadMessages(1)]);
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const result = await handler.execute(ctx);
+    if (!result.success) throw new Error(result.error);
+    const data = result.data as { count: number; has_more: boolean; messages: Array<{ id: string; unread: boolean }> };
+    expect(data.count).toBe(1);
+    expect(data.has_more).toBe(false);
+    expect(data.messages.every((m) => m.unread)).toBe(true);
+  });
+
+  it('pages past a full page of stale entries to reach real mail on the next page', async () => {
+    const ctx = makeCtx({ unread_only: true, limit: 5 });
+    const fetchSpy = vi.fn().mockImplementation(async (url: string) => {
+      const page = new URL(url).searchParams.get('page_token');
+      if (!page) {
+        return { ok: true, json: async () => ({ data: staleMessages(6), next_cursor: 'p2' }) };
+      }
+      return { ok: true, json: async () => ({ data: unreadMessages(2) }) };
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const result = await handler.execute(ctx);
+    if (!result.success) throw new Error(result.error);
+    const data = result.data as { count: number; has_more: boolean; messages: Array<{ id: string }> };
+    expect(data.messages.map((m) => m.id)).toEqual(['m0', 'm1']);
+    expect(data.has_more).toBe(false);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps read messages when unread_only is false', async () => {
+    const ctx = makeCtx({ unread_only: false, limit: 5 });
+    const [real] = unreadMessages(1) as Array<Record<string, unknown>>;
+    const fetchSpy = mockFetchReturning([{ ...real, unread: false }]);
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const result = await handler.execute(ctx);
+    if (!result.success) throw new Error(result.error);
+    expect((result.data as { count: number }).count).toBe(1);
+  });
+
+  it('skips the folder check for a user label, whose folder ID is opaque', async () => {
+    const ctx = makeCtx({ unread_only: true, limit: 5, folder: 'Receipts' });
+    const [real] = unreadMessages(1) as Array<Record<string, unknown>>;
+    const fetchSpy = mockFetchReturning([{ ...real, folders: ['Label_42'] }]);
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const result = await handler.execute(ctx);
+    if (!result.success) throw new Error(result.error);
+    expect((result.data as { count: number }).count).toBe(1);
   });
 });
 

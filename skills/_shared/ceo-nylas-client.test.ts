@@ -408,7 +408,7 @@ describe('CeoNylasClient — received_before filter', () => {
     expect(calledUrl.searchParams.get('received_after')).toBe('50');
   });
 
-  it('listAllMessages sends received_before on page 1 and not on cursor pages', async () => {
+  it('listAllMessages re-sends the filters on cursor pages (#2377)', async () => {
     // Page 1: one message + a cursor. Page 2 (page_token present): empty, no cursor → loop exits.
     const fetchMock = vi.fn().mockImplementation(async (url: string) => {
       if (String(url).includes('page_token')) {
@@ -435,7 +435,10 @@ describe('CeoNylasClient — received_before filter', () => {
     expect(page1.searchParams.get('received_before')).toBe('200');
     expect(page1.searchParams.get('received_after')).toBe('50');
     expect(page2.searchParams.get('page_token')).toBe('CUR');
-    expect(page2.searchParams.has('received_before')).toBe(false);
+    // The cursor does not carry the filters, so they are re-sent.
+    expect(page2.searchParams.get('in')).toBe('SENT');
+    expect(page2.searchParams.get('received_after')).toBe('50');
+    expect(page2.searchParams.get('received_before')).toBe('200');
   });
 });
 

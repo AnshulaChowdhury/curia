@@ -233,6 +233,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Principal inbox paging** — follow-up pages keep their folder/unread filters, ending drain re-triage of handled mail. (#2377)
 - **Signal call bridge** — logs every call event; a call ended mid-resolution is skipped with its reason. (#2372)
 - **ceo-inbox decision tagging** — reads `enabled` from the full setting; toggling keeps its other fields. (#2339)
 - **Agent YAML schema** — startup validation accepts `pinned_context`; it rejected any agent declaring it. (#2339)

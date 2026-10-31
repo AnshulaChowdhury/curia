@@ -153,7 +153,47 @@ describe('CeoNylasClient.listMessages — folder alias normalization', () => {
     expect(url.searchParams.get('in')).toBe('DRAFT');
   });
 
-  it('sends only page_token on a follow-up page', async () => {
+  it('re-sends in/unread/received_* with page_token on a follow-up page (#2377)', async () => {
+    const fetchSpy = mockFetchSuccess();
+    const client = new CeoNylasClient('key', 'grant', logger);
+
+    await client.listMessagesPage({
+      pageToken: 'CUR',
+      folder: 'INBOX',
+      unread: true,
+      receivedAfter: 100,
+      receivedBefore: 200,
+      limit: 20,
+    });
+
+    const url = new URL(fetchSpy.mock.calls[0]![0] as string);
+    expect(url.searchParams.get('page_token')).toBe('CUR');
+    expect(url.searchParams.get('in')).toBe('INBOX');
+    expect(url.searchParams.get('unread')).toBe('true');
+    expect(url.searchParams.get('received_after')).toBe('100');
+    expect(url.searchParams.get('received_before')).toBe('200');
+  });
+
+  it('listAllMessages re-sends the filters on every page (#2377)', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: 'a' }], next_cursor: 'CUR2' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: 'b' }] }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }));
+    const client = new CeoNylasClient('key', 'grant', logger);
+
+    const { messages } = await client.listAllMessages({ folder: 'SENT', receivedAfter: 100 });
+
+    expect(messages.map((m) => m.id)).toEqual(['a', 'b']);
+    const second = new URL(fetchSpy.mock.calls[1]![0] as string);
+    expect(second.searchParams.get('page_token')).toBe('CUR2');
+    expect(second.searchParams.get('in')).toBe('SENT');
+    expect(second.searchParams.get('received_after')).toBe('100');
+  });
+
+  it('sends only page_token on a search_query_native follow-up page', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ data: [], next_cursor: 'CUR' }), {
         status: 200,
