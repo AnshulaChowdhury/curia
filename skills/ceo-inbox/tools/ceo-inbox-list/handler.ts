@@ -98,11 +98,12 @@ export class CeoInboxListHandler implements ToolHandler {
       // not report has_more: nothing gets archived, so the next run would see
       // the same page and reschedule forever (#2035).
       //
-      // Nylas also returns messages that contradict the filter it was sent:
-      // already read, or no longer in the folder (#2377). Those never leave
-      // the result set, so trusting them kept has_more true and re-triaged
-      // handled mail on every drain wake. Drop them the same way as
-      // Curia-self mail, before has_more is decided.
+      // Follow-up pages once came back unfiltered, because the cursor does
+      // not carry in/unread (#2377). Read, archived mail then never left the
+      // result set, so has_more stayed true and every drain wake re-triaged
+      // handled mail. The client now re-sends the filters. As a backstop,
+      // results that contradict the request are dropped here too, the same
+      // way as Curia-self mail, before has_more is decided.
       const checkFolder = isSystemFolder(folder);
       const wantFolder = folder.toUpperCase();
       const isStale = (msg: NylasMessageSummary): boolean =>

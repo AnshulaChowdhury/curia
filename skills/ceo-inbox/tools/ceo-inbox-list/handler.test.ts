@@ -197,9 +197,9 @@ describe('CeoInboxListHandler — batch listing (no watermark)', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     const second = new URL(fetchSpy.mock.calls[1]![0] as string);
     expect(second.searchParams.get('page_token')).toBe('p2');
-    // The cursor already carries the first page's filters.
-    expect(second.searchParams.get('in')).toBeNull();
-    expect(second.searchParams.get('unread')).toBeNull();
+    // The cursor does not carry the first page's filters, so they are re-sent (#2377).
+    expect(second.searchParams.get('in')).toBe('INBOX');
+    expect(second.searchParams.get('unread')).toBe('true');
     expect(second.searchParams.get('limit')).toBe('20');
   });
 
