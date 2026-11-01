@@ -118,6 +118,7 @@ export interface ModelReasoningSupport {
 //
 // Ids and context/output limits checked against the AWS model cards on 2026-10-16:
 //   claude-sonnet-4-6  → {prefix}.anthropic.claude-sonnet-4-6
+//   claude-sonnet-4-5  → {prefix}.anthropic.claude-sonnet-4-5-20250929-v1:0
 //   claude-haiku-4-5   → {prefix}.anthropic.claude-haiku-4-5-20251001-v1:0
 // Opus and the Claude 5 family are not registered: add them with their own card's id
 // once there is a tier that needs one.
@@ -139,6 +140,15 @@ function bedrockClaudeEntries(): Record<string, ModelMetadata> {
       pricing: { inputPerMToken: 3.00, outputPerMToken: 15.00, cacheCreationPerMToken: 3.75, cacheReadPerMToken: 0.30 },
       capabilities: ['vision', 'reasoning', 'coding', 'large_context', 'tools'],
       // Sonnet 4.6 thinks only when a request turns thinking on, and bedrock.ts never does.
+      thinksByDefault: false,
+    };
+    // Sonnet 4.5: same price and behaviour class as 4.6 (thinks only when asked, which bedrock.ts never does).
+    // Added for deployments whose AWS account has the Sonnet 4.5 Marketplace subscription but not 4.6's.
+    entries[`${prefix}.anthropic.claude-sonnet-4-5-20250929-v1:0`] = {
+      provider: 'bedrock',
+      contextWindow: 200_000,
+      pricing: { inputPerMToken: 3.00, outputPerMToken: 15.00, cacheCreationPerMToken: 3.75, cacheReadPerMToken: 0.30 },
+      capabilities: ['vision', 'reasoning', 'coding', 'large_context', 'tools'],
       thinksByDefault: false,
     };
     entries[`${prefix}.anthropic.claude-haiku-4-5-20251001-v1:0`] = {
