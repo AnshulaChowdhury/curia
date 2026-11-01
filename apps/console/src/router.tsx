@@ -27,6 +27,7 @@ const ToolsPage = lazy(() =>
 const AgentsPage = lazy(() =>
   import('./pages/RegistrySettings').then(m => ({ default: m.AgentsPage })),
 );
+const ConnectionsPage = lazy(() => import('./pages/ConnectionsPage'));
 const ChannelsPage = lazy(() =>
   import('./pages/ChannelSettings').then(m => ({ default: m.ChannelsPage })),
 );
@@ -241,6 +242,12 @@ const channelsRoute = createRoute({
   component: ChannelsPage,
 });
 
+const connectionsRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/connections',
+  component: ConnectionsPage,
+});
+
 const mcpSkillsRoute = createRoute({
   getParentRoute: () => authedRoute,
   path: '/mcp-skills',
@@ -282,6 +289,7 @@ const routeTree = rootRoute.addChildren([
     legacySkillsRedirect,
     agentsRoute,
     channelsRoute,
+    connectionsRoute,
     mcpSkillsRoute,
     kgRoute,
     documentsRoute,
