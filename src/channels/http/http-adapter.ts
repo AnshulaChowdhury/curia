@@ -66,6 +66,7 @@ import { quickbooksRoutes } from './routes/quickbooks.js';
 import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { QboConnection, qboSettingsFromEnv } from '../../quickbooks/qbo-connection.js';
+import { BooksToken } from '../../quickbooks/books-token.js';
 import { setupRoutes } from './routes/setup.js';
 import { smsWebhookRoutes } from '../sms/webhook-route.js';
 import { SmsWebhookBridge } from '../sms/webhook-bridge.js';
@@ -681,7 +682,7 @@ export class HttpAdapter implements Channel {
       await this.app.register(quickbooksRoutes, {
         logger,
         connection: new QboConnection(qboSettingsFromEnv(), this.config.secretsService, logger),
-        getToken: () => process.env.BOOKS_API_TOKEN ?? null,
+        booksToken: new BooksToken(this.config.secretsService),
         webAppBootstrapSecret,
         sessions,
       });

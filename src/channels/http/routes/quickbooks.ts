@@ -1,6 +1,8 @@
 // quickbooks.ts — the QuickBooks connection and the narrow API the books agent on the Mac mini uses.
 //
 //   GET  /api/connections       — signed-in person only: the API connections and their status, for the Settings page
+//   PUT  /api/connections/quickbooks/settings — signed-in person only: save the Intuit app's client id and secret
+//   POST /api/connections/books-token         — signed-in person only: make a new books token, shown once
 //   GET  /books/qbo/connect     — signed-in person only (session cookie): redirects to Intuit to authorise
 //   GET  /books/qbo-callback    — where Intuit sends the browser back; the single-use `state` is the credential
 //   GET  /books/qbo/status      — books token: is QuickBooks connected
@@ -10,10 +12,10 @@
 // Outside /api on purpose, like /phone/inbox: the books token (env BOOKS_API_TOKEN) works for these routes only and the
 // main API_TOKEN does not work here. QuickBooks tokens never leave Curia. Without BOOKS_API_TOKEN the machine routes are 404.
 
-import { createHash, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Logger } from '../../../logger.js';
-import { QboApiError, QboAuthError, type QboConnection } from '../../../quickbooks/qbo-connection.js';
+import type { BooksToken } from '../../../quickbooks/books-token.js';
+import { QboApiError, QboAuthError, QboSettingsError, type QboConnection } from '../../../quickbooks/qbo-connection.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
 
 const READABLE = new Set([
@@ -26,14 +28,10 @@ const SELECT_RX = /^select\s+[\w*,\s().]+?\s+from\s+(\w+)(\s|$)/i;
 export interface QuickbooksRouteOptions {
   logger: Logger;
   connection: QboConnection;
-  /** The books token, read per request; null when not configured. */
-  getToken: () => string | null;
+  /** The books agent's token (generated on the connections page, or BOOKS_API_TOKEN in the environment). */
+  booksToken: BooksToken;
   webAppBootstrapSecret: string | undefined;
   sessions: SessionStore;
-}
-
-function tokensMatch(provided: string, expected: string): boolean {
-  return timingSafeEqual(createHash('sha256').update(provided).digest(), createHash('sha256').update(expected).digest());
 }
 
 const page = (title: string, body: string): string =>
@@ -41,7 +39,7 @@ const page = (title: string, body: string): string =>
   `<body style="font-family:system-ui;max-width:32rem;margin:4rem auto;padding:0 1rem"><h1>${title}</h1><p>${body}</p></body>`;
 
 export async function quickbooksRoutes(app: FastifyInstance, options: QuickbooksRouteOptions): Promise<void> {
-  const { logger, connection, getToken, webAppBootstrapSecret, sessions } = options;
+  const { logger, connection, booksToken, webAppBootstrapSecret, sessions } = options;
   const RATE = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
 
   // The console's API connections page. Session auth like the other console routes; never returns a token.
@@ -54,16 +52,38 @@ export async function quickbooksRoutes(app: FastifyInstance, options: Quickbooks
         name: 'QuickBooks Online',
         description: 'MowMow Ventures books. Curia holds the authorisation and the books agent posts through it.',
         ...status,
+        booksTokenSet: await booksToken.isSet(),
         connectUrl: '/books/qbo/connect',
       }],
     });
+  });
+
+  // Saves the app's client id and secret (encrypted in the vault). The secret is never returned.
+  app.put<{ Body: Record<string, unknown> }>('/api/connections/quickbooks/settings', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return reply;
+    try {
+      await connection.saveSettings(request.body ?? {});
+      return reply.header('Cache-Control', 'no-store').send({ ok: true });
+    } catch (err) {
+      if (err instanceof QboSettingsError) return reply.status(400).send({ error: err.message });
+      logger.error({ err }, 'quickbooks: saving settings failed');
+      return reply.status(500).send({ error: 'Internal error' });
+    }
+  });
+
+  // Makes a new books token and shows it once. Only its hash is kept, so it cannot be shown again.
+  app.post('/api/connections/books-token', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return reply;
+    const token = await booksToken.generate();
+    logger.info('books: a new books token was generated');
+    return reply.header('Cache-Control', 'no-store').send({ token });
   });
 
   // A person starts the connection from a browser that is signed in to Curia.
   app.get('/books/qbo/connect', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return reply;
     try {
-      return reply.header('Cache-Control', 'no-store').redirect(connection.authorizationUrl());
+      return reply.header('Cache-Control', 'no-store').redirect(await connection.authorizationUrl());
     } catch (err) {
       if (err instanceof QboAuthError) return reply.status(503).type('text/html').send(page('QuickBooks is not set up', err.message));
       throw err;
@@ -91,15 +111,15 @@ export async function quickbooksRoutes(app: FastifyInstance, options: Quickbooks
   );
 
   // Everything below is for the books agent and needs the books token.
-  const authorised = (request: FastifyRequest, reply: FastifyReply): boolean => {
-    const expected = getToken()?.trim();
-    if (!expected) {
+  const authorised = async (request: FastifyRequest, reply: FastifyReply): Promise<boolean> => {
+    const header = request.headers.authorization;
+    const provided = header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : '';
+    const ok = await booksToken.verify(provided);
+    if (ok === null) {
       void reply.status(404).send({ error: 'Not found' });
       return false;
     }
-    const header = request.headers.authorization;
-    const provided = header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : '';
-    if (!provided || !tokensMatch(provided, expected)) {
+    if (!provided || !ok) {
       logger.warn({ ip: request.ip, reason: provided ? 'invalid_token' : 'missing_token' }, 'books: auth failed');
       void reply.status(401).header('WWW-Authenticate', 'Bearer').send({ error: 'Unauthorized' });
       return false;
@@ -118,12 +138,12 @@ export async function quickbooksRoutes(app: FastifyInstance, options: Quickbooks
   };
 
   app.get('/books/qbo/status', RATE, async (request, reply) => {
-    if (!authorised(request, reply)) return reply;
+    if (!(await authorised(request, reply))) return reply;
     return reply.header('Cache-Control', 'no-store').send(await connection.status());
   });
 
   app.post<{ Body: { query?: unknown } }>('/books/qbo/query', RATE, async (request, reply) => {
-    if (!authorised(request, reply)) return reply;
+    if (!(await authorised(request, reply))) return reply;
     const q = typeof request.body?.query === 'string' ? request.body.query.trim() : '';
     const m = SELECT_RX.exec(q);
     if (!m || !READABLE.has(m[1]!) || q.length > 1000 || q.includes(';')) {
@@ -137,7 +157,7 @@ export async function quickbooksRoutes(app: FastifyInstance, options: Quickbooks
   });
 
   app.post<{ Body: { entity?: unknown; payload?: unknown; request_id?: unknown } }>('/books/qbo/create', RATE, async (request, reply) => {
-    if (!authorised(request, reply)) return reply;
+    if (!(await authorised(request, reply))) return reply;
     const { entity, payload, request_id: requestId } = request.body ?? {};
     if (typeof entity !== 'string' || !CREATABLE.has(entity)) {
       return reply.status(400).send({ error: `entity must be one of ${[...CREATABLE].join(', ')}` });
