@@ -1,0 +1,25 @@
+# Deployment override (merged over default.yaml; see loadYamlConfig in src/config.ts).
+# This deployment runs on AWS Bedrock only (no Anthropic API key), kept in the EU
+# (ADR-041): `eu.` inference profiles stay inside the EU. Only Claude Sonnet 4.6 and
+# Haiku 4.5 are registered for Bedrock, so `powerful` shares Sonnet until another model
+# is added to the registry.
+#
+# This file is gitignored upstream; it is force-added on this fork so the Docker build
+# (which copies config/) picks it up. It holds model ids only, no secrets.
+model_routing:
+  tiers:
+    fast:
+      model: eu.anthropic.claude-haiku-4-5-20251001-v1:0
+    standard:
+      model: eu.anthropic.claude-sonnet-4-6
+    powerful:
+      model: eu.anthropic.claude-sonnet-4-6
+  default_tier: standard
+
+# The two judges also name Anthropic API models in default.yaml; point them at Bedrock too.
+filter:
+  llmJudge:
+    model: eu.anthropic.claude-haiku-4-5-20251001-v1:0
+escalation:
+  judge:
+    model: eu.anthropic.claude-haiku-4-5-20251001-v1:0
