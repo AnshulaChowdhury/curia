@@ -50,8 +50,13 @@ export class AgentRegistry {
     return Array.from(this.agents.values());
   }
 
+  /**
+   * Delegation targets: every agent except the coordinator and `internal` agents. An internal agent
+   * is started only by system code (e.g. email-classifier by the inbox watcher), so it stays out of
+   * the coordinator's roster and out of the duration-hint warning.
+   */
   listSpecialists(): AgentRegistryEntry[] {
-    return this.list().filter(a => a.role !== 'coordinator');
+    return this.list().filter(a => a.role !== 'coordinator' && a.role !== 'internal');
   }
 
   /**
