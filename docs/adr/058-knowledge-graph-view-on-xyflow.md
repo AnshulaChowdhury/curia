@@ -44,7 +44,8 @@ To make xyflow cope with large neighbourhoods, three measures are mandatory:
    - Node and edge components are memoised, and `nodeTypes`/`edgeTypes` are defined at module scope.
    - When the page redraws, nodes whose appearance didn't change keep the same object, so their components don't re-render (`buildFlow`'s cache).
    - Edges are straight, with one shared arrowhead and no animation.
-   - Node CSS uses plain fills and borders: no shadows, filters or `backdrop-filter`.
+   - Node CSS avoids filters and `backdrop-filter`. Nodes get a drop shadow and a glow in their own colour only while zoomed in (above 0.75), where few nodes are on screen; the zoomed-out view drops them. Measured in headless Chromium with 400 nodes on screen while zooming: median frame time 16.7 ms with or without the shadows (95th percentile 33.4 ms against 32.5 ms).
+   - Hovering a node highlights it, its neighbours and their edges by toggling classes on the existing DOM elements. It doesn't re-render React, so hovering stays cheap on a large canvas.
    - xyflow's selection, connection and delete handling are off; the page decides what is selected.
 
 While the page waits on the server or the layout, the Moonray loader (`AnimatedMoonrayMark`) shows: centred over the canvas for a load, small in the corner for an expansion, and at the top of the search results. It fades in after 150 ms, so quick answers never flash it, and it never blocks the canvas.

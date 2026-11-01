@@ -163,6 +163,12 @@ export function colorClass(n: ApiKgNode, mode: ColorMode): string {
   return `kg-c-type-${KNOWN_TYPES.has(n.type) ? n.type : 'other'}`;
 }
 
+/** Colour class for a filter option or list card, matching how the canvas colours that value. */
+export function swatchClass(axis: 'types' | 'sensitivities', value: string): string {
+  if (axis === 'sensitivities') return `kg-c-sens-${KNOWN_SENS.has(value) ? value : 'other'}`;
+  return `kg-c-type-${KNOWN_TYPES.has(value) ? value : 'other'}`;
+}
+
 // Two shared arrowhead definitions (quiet and focal); colours follow the theme.
 const ARROW = { type: MarkerType.ArrowClosed, color: 'var(--kg-edge)', width: 8, height: 8 };
 const ARROW_FOCAL = { type: MarkerType.ArrowClosed, color: 'var(--kg-edge-focal)', width: 8, height: 8 };
