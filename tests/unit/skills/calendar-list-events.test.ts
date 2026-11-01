@@ -1,5 +1,5 @@
 // tests/unit/skills/calendar-list-events.test.ts
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, onTestFinished } from 'vitest';
 import { CalendarListEventsHandler } from '../../../skills/calendar/tools/calendar-list-events/handler.js';
 import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
@@ -221,6 +221,11 @@ describe('CalendarListEventsHandler', () => {
   });
 
   it('formats timed event timestamps in the configured timezone', async () => {
+    // The displayTimezone label uses today's offset. Pin today inside daylight time so the
+    // assertion doesn't flip when the real clock crosses a DST change (it broke on 2026-11-01).
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-04-06T15:30:00Z'));
+    onTestFinished(() => {{ vi.useRealTimers(); }});
     // 1775489400 Unix seconds = 2026-04-06T15:30:00Z = 11:30 AM EDT (UTC-4)
     // 1775491200 Unix seconds = 2026-04-06T16:00:00Z = 12:00 PM EDT (UTC-4)
     const timedEvent = {

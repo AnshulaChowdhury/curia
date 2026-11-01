@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi, onTestFinished } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import pino from 'pino';
@@ -120,6 +120,11 @@ describe('meeting-agenda-load', () => {
   });
 
   it('returns scheduledFor and history dates in the caller timezone', async () => {
+    // The displayTimezone label uses today's offset. Pin today inside daylight time so the
+    // assertion doesn't flip when the real clock crosses a DST change (it broke on 2026-11-01).
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-28T16:00:00Z'));
+    onTestFinished(() => {{ vi.useRealTimers(); }});
     const { repo, agendaId, store } = await parkedRepo({
       scheduledFor: new Date('2026-10-28T16:00:00.000Z'),
     });

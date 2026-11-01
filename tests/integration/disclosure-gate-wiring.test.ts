@@ -12,6 +12,8 @@
 // ExecutionLayer → signal-send → OutboundGateway → filter with the write-ahead
 // AuditLogger, and asserts what lands in audit_log. It needs DATABASE_URL.
 
+import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
@@ -39,6 +41,13 @@ import signalSendManifest from '../../skills/signal-send/tool.json' with { type:
 const logger = createSilentLogger();
 const CONFIG_DIR = path.resolve(import.meta.dirname, '../../config');
 
+// The shipped default.yaml on its own. loadYamlConfig also merges config/local.yaml when one
+// exists (a developer's, or a deployment's committed override), which can point the judge at a
+// provider this test doesn't stub, so the test reads default.yaml from a directory of its own.
+const DEFAULT_ONLY_DIR = mkdtempSync(path.join(os.tmpdir(), 'curia-default-config-'));
+copyFileSync(path.join(CONFIG_DIR, 'default.yaml'), path.join(DEFAULT_ONLY_DIR, 'default.yaml'));
+afterAll(() => { rmSync(DEFAULT_ONLY_DIR, { recursive: true, force: true }); });
+
 // The 2026-09-17 shape (#1815): a third party's surname, sent to an external `known` contact.
 const THIRD_PARTY_BODY = "Sarah's surname is Okafor, for the guest list.";
 
@@ -55,7 +64,7 @@ function stubProvider(cls: DisclosureClass): LLMProvider & { chat: ReturnType<ty
 
 /** Build the filter exactly as src/index.ts does, from the repo's default.yaml. */
 function buildProductionFilter(bus: EventBus, provider: LLMProvider): OutboundContentFilter {
-  const yamlConfig = loadYamlConfig(CONFIG_DIR);
+  const yamlConfig = loadYamlConfig(DEFAULT_ONLY_DIR);
   const escalationJudge = buildEscalationJudge({
     yaml: yamlConfig.escalation?.judge,
     modelRegistry: new ModelRegistry(logger),
