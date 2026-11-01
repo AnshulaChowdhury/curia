@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **`/phone/inbox` resilience** — 60 s per-mailbox cache, last good answer served up to 30 min on failure, 429 back-off, sequential Nylas calls; one bad mailbox no longer fails the response.
 - **Console login** — Moonray Ventures OS branding: the moonray.ventures turning-rings hero, the Moonray mark, and "powered by Curia." (fork only).
 - **`/phone/inbox` `syncing` flag** — a mailbox with no Nylas grant reports `syncing: false`, so the phone shows "not syncing" rather than "all clear".
 - **`GET /phone/inbox`** — read-only email summary for the Command Hub phone launcher: Urgent/Seen/Drafted mail that is still unread, in the inbox and unanswered, per mailbox. Own token, no bodies.

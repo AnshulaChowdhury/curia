@@ -1,8 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { Logger } from '../../../src/logger.js';
 import {
+  MailboxRateLimitedError,
+  PhoneInboxCache,
   PhoneInboxService,
-  PhoneInboxUnavailableError,
   groupOfLabel,
   type InboxMessage,
   type MailboxReader,
@@ -127,8 +128,97 @@ describe('PhoneInboxService', () => {
     expect(Object.keys(result.accounts[0]!.items[0]!).sort()).toEqual(['from', 'group', 'receivedAt', 'subject', 'threadId']);
   });
 
-  it('fails the whole answer if a mailbox cannot be read', async () => {
-    const broken: MailboxReader = { unreadInbox: async () => { throw new Error('boom'); }, sentSince: async () => [] };
-    await expect(build([['personal', broken]])).rejects.toBeInstanceOf(PhoneInboxUnavailableError);
+  describe('when a mailbox cannot be read, and caching', () => {
+    function counting(unread: InboxMessage[]) {
+      let calls = 0;
+      let failWith: Error | null = null;
+      const r: MailboxReader = {
+        unreadInbox: async () => { calls++; if (failWith) throw failWith; return unread; },
+        sentSince: async () => [],
+      };
+      return { r, calls: () => calls, fail: (e: Error | null) => { failWith = e; } };
+    }
+    const at = (offsetSec: number) => new Date(NOW.getTime() + offsetSec * 1000);
+    const make = (accounts: Array<[string, MailboxReader | null]>, cache: PhoneInboxCache, clock: { t: Date }) =>
+      new PhoneInboxService(
+        accounts.map(([id, r]) => ({ id: id as 'personal', address: `${id}@example.com`, reader: r })),
+        logger,
+        () => clock.t,
+        cache,
+      );
+
+    it('serves a recent answer from memory instead of asking the provider again', async () => {
+      const m = counting([message({ id: 'a' })]);
+      const clock = { t: NOW };
+      const svc = make([['personal', m.r]], new PhoneInboxCache(), clock);
+      await svc.build();
+      clock.t = at(30);
+      await svc.build();
+      expect(m.calls()).toBe(1);
+      clock.t = at(61);
+      await svc.build();
+      expect(m.calls()).toBe(2);
+    });
+
+    it('keeps serving the last good answer when a later read fails', async () => {
+      const m = counting([message({ id: 'a', subject: 'Keep me' })]);
+      const clock = { t: NOW };
+      const svc = make([['personal', m.r]], new PhoneInboxCache(), clock);
+      await svc.build();
+      m.fail(new Error('boom'));
+      clock.t = at(120);
+      const result = await svc.build();
+      expect(result.accounts[0]!.syncing).toBe(true);
+      expect(result.accounts[0]!.items.map((i) => i.subject)).toEqual(['Keep me']);
+    });
+
+    it('says not syncing, not "all clear", once the last good answer is too old or there never was one', async () => {
+      const m = counting([message({ id: 'a' })]);
+      m.fail(new Error('boom'));
+      const clock = { t: NOW };
+      const svc = make([['personal', m.r]], new PhoneInboxCache(), clock);
+      expect((await svc.build()).accounts[0]).toMatchObject({ syncing: false, needsYou: 0, items: [] });
+
+      m.fail(null);
+      clock.t = at(10);
+      await svc.build(); // good answer cached at t=10
+      m.fail(new Error('boom'));
+      clock.t = at(10 + 31 * 60);
+      expect((await svc.build()).accounts[0]!.syncing).toBe(false);
+    });
+
+    it('one failing mailbox does not stop the others', async () => {
+      const bad = counting([]);
+      bad.fail(new Error('boom'));
+      const good = counting([message({ id: 'g' })]);
+      const result = await make([['personal', bad.r], ['moonray', good.r]], new PhoneInboxCache(), { t: NOW }).build();
+      expect(result.accounts.map((a) => [a.id, a.syncing, a.needsYou])).toEqual([['personal', false, 0], ['moonray', true, 1]]);
+    });
+
+    it('leaves a rate-limited mailbox alone until its cool-down ends', async () => {
+      const m = counting([message({ id: 'a' })]);
+      m.fail(new MailboxRateLimitedError(120));
+      const clock = { t: NOW };
+      const svc = make([['personal', m.r]], new PhoneInboxCache(), clock);
+      await svc.build();
+      expect(m.calls()).toBe(1);
+      clock.t = at(100); // inside Retry-After (120s)
+      await svc.build();
+      expect(m.calls()).toBe(1);
+      m.fail(null);
+      clock.t = at(121);
+      const result = await svc.build();
+      expect(m.calls()).toBe(2);
+      expect(result.accounts[0]!.syncing).toBe(true);
+    });
+
+    it('asks the provider one call at a time within a mailbox', async () => {
+      let running = 0;
+      let peak = 0;
+      const slow = async <T,>(v: T): Promise<T> => { running++; peak = Math.max(peak, running); await new Promise((r) => setTimeout(r, 5)); running--; return v; };
+      const r: MailboxReader = { unreadInbox: () => slow([message({ id: 'a' })]), sentSince: () => slow([] as SentMessage[]) };
+      await make([['personal', r]], new PhoneInboxCache(), { t: NOW }).build();
+      expect(peak).toBe(1);
+    });
   });
 });

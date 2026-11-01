@@ -3,7 +3,7 @@
 // Uses fetch directly, like skills/_shared/ceo-nylas-client.ts, so the phone endpoint depends on
 // nothing but the API key and one grant id per mailbox. Never requests or returns message bodies.
 
-import type { InboxMessage, MailboxReader, SentMessage } from './phone-inbox-service.js';
+import { MailboxRateLimitedError, type InboxMessage, type MailboxReader, type SentMessage } from './phone-inbox-service.js';
 
 // Nylas applications live in one data region; its API host must match (an EU app's key and grants
 // don't work against the US host). Only these two are accepted, so a typo can't send the key elsewhere.
@@ -50,10 +50,12 @@ export class NylasMailbox implements MailboxReader {
   }
 
   async unreadInbox(): Promise<InboxMessage[]> {
-    const [folders, messages] = await Promise.all([
-      this.get<NylasFolder>('/folders', 'folders'),
-      this.get<NylasMessage>(`/messages?${new URLSearchParams({ in: 'INBOX', unread: 'true', limit: String(PAGE_LIMIT) })}`, 'messages'),
-    ]);
+    // Sequential, not parallel: Nylas rate-limits per mailbox.
+    const folders = await this.get<NylasFolder>('/folders', 'folders');
+    const messages = await this.get<NylasMessage>(
+      `/messages?${new URLSearchParams({ in: 'INBOX', unread: 'true', limit: String(PAGE_LIMIT) })}`,
+      'messages',
+    );
     const nameById = new Map(folders.map((f) => [f.id, f.name ?? ''] as const));
     return messages.map((m) => ({
       id: m.id,
@@ -79,6 +81,10 @@ export class NylasMailbox implements MailboxReader {
       headers: { Authorization: `Bearer ${this.apiKey}`, Accept: 'application/json' },
     });
     // The status is enough to debug; the response body is never logged or surfaced.
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers.get('retry-after'));
+      throw new MailboxRateLimitedError(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined);
+    }
     if (!res.ok) throw new NylasMailboxError(res.status, endpoint);
     const json = (await res.json()) as NylasListResponse<T>;
     return json.data ?? [];

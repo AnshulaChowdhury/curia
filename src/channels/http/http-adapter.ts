@@ -62,7 +62,7 @@ import { vaultRoutes } from './routes/vault.js';
 import { emailAccountsRoutes } from './routes/email-accounts.js';
 import { secretCaptureRoutes } from './routes/secret-capture.js';
 import { phoneInboxRoutes } from './routes/phone-inbox.js';
-import { PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
+import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { setupRoutes } from './routes/setup.js';
 import { smsWebhookRoutes } from '../sms/webhook-route.js';
@@ -654,10 +654,12 @@ export class HttpAdapter implements Channel {
     // the vault per request. Needs the vault; without it the route isn't mounted.
     if (this.config.secretsService) {
       const secrets = this.config.secretsService;
+      // Lives as long as the process: remembers each mailbox's last good answer and any rate-limit cool-down.
+      const phoneInboxCache = new PhoneInboxCache();
       await this.app.register(phoneInboxRoutes, {
         logger,
         getToken: () => secrets.get('phone_inbox_token'),
-        getService: async () => new PhoneInboxService(await loadPhoneInboxAccounts(secrets), logger),
+        getService: async () => new PhoneInboxService(await loadPhoneInboxAccounts(secrets), logger, undefined, phoneInboxCache),
       });
     }
     // Telnyx SMS webhook — always mounted; SmsAdapter installs the handler on start.
