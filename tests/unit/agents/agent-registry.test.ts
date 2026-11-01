@@ -69,6 +69,16 @@ describe('AgentRegistry', () => {
       .toBe('Specialists with no expected_duration_seconds inherit delegate.defaultTimeoutMs: contacts, diagnostics');
   });
 
+  it('keeps internal agents out of the specialist roster', () => {
+    const registry = new AgentRegistry();
+    registry.register('coordinator', { role: 'coordinator', description: 'c' });
+    registry.register('contacts', { role: 'specialist', description: 'People.' });
+    registry.register('email-classifier', { role: 'internal', description: 'Watcher-only.' });
+    expect(registry.listSpecialists().map(a => a.name)).toEqual(['contacts']);
+    expect(registry.specialistSummary()).not.toContain('email-classifier');
+    expect(registry.specialistsWithoutDurationHint()).toEqual(['contacts']);
+  });
+
   it('names the shipped specialists that still inherit the floor (#1857)', () => {
     const registry = new AgentRegistry();
     for (const config of loadAllAgentConfigs(join(import.meta.dirname, '../../../agents'))) {

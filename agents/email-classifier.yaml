@@ -1,6 +1,7 @@
 name: email-classifier
 version: "0.1.0"
-role: specialist
+# internal: started only by the inbox watcher, never a delegation target (not in the coordinator's roster).
+role: internal
 description: >
   First-pass email classifier for real-time triage. Reads one new message's
   sender, subject and preview and answers with a group (urgent, drafted, seen or
