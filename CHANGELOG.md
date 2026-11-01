@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Collapsed sidebar uses the space** — with the sidebar collapsed, the topbar, home, settings, chat, records and docs pages shrink their margins and padding and widen their content columns to use the reclaimed width.
 - **Knowledge Graph look** — moon-shaded nodes in a new palette, soft shadows, hover highlights neighbours, Gotham throughout.
 - **Knowledge Graph fit** — fits stop at 1.25× zoom and allow for the detail drawer.
 - **Knowledge Graph view** — drawn with xyflow; layout runs off the main thread; follows the console theme. (ADR-058)

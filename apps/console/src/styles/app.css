@@ -3985,3 +3985,28 @@ table.records-table tbody tr.active td { background: transparent; }
   :root:not([data-theme="light"]) .kg-merge-ready { color: var(--app-fg); }
   :root:not([data-theme="light"]) .kg-merge-card-eyebrow { filter: brightness(1.35); }
 }
+
+/* ── Collapsed sidebar: give the pages the reclaimed width ───────────────
+   The sidebar owns its collapsed state, so pages key off it with :has()
+   instead of threading a prop through every route. Mobile never gets
+   .is-collapsed (the drawer replaces it), so these only apply on desktop. */
+.app-root:has(.sidebar.is-collapsed) .topbar { padding-left: 14px; padding-right: 14px; }
+
+/* Home */
+.app-root:has(.sidebar.is-collapsed) .dash-scroll { padding: 6px 10px 16px; }
+.app-root:has(.sidebar.is-collapsed) .dash-inner { max-width: 100%; }
+
+/* Settings pages: tighter gutters, wider content column */
+.app-root:has(.sidebar.is-collapsed) .settings-content { padding: 24px 24px 64px; }
+.app-root:has(.sidebar.is-collapsed) .settings-page-header,
+.app-root:has(.sidebar.is-collapsed) .settings-section,
+.app-root:has(.sidebar.is-collapsed) .autonomy-history { max-width: 960px; }
+
+/* Chat: wider message column and matching composer */
+.app-root:has(.sidebar.is-collapsed) .chat-messages { padding: 16px max(14px, calc((100% - 1040px) / 2)); }
+.app-root:has(.sidebar.is-collapsed) .chat-composer { padding: 12px max(14px, calc((100% - 1040px) / 2)); }
+
+/* Records, docs */
+.app-root:has(.sidebar.is-collapsed) .records-toolbar { padding: 8px 12px; }
+.app-root:has(.sidebar.is-collapsed) .docs-view-header { padding: 12px 14px 10px; }
+.app-root:has(.sidebar.is-collapsed) .docs-body { padding: 14px 16px 32px; }
