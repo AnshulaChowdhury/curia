@@ -158,7 +158,7 @@ const CY_STYLE = [
       'text-wrap': 'ellipsis',
       'text-max-width': '90px',
       'font-size': 10,
-      'font-family': 'Manrope, system-ui, sans-serif',
+      'font-family': 'Gotham, system-ui, sans-serif',
       // Degree-based size: updated by updateDegrees() after every cy.add().
       // Wider range than before so hub nodes stand out more dramatically.
       width: 'mapData(degree, 0, 15, 20, 80)',
@@ -168,7 +168,7 @@ const CY_STYLE = [
     },
   },
   // Type colour overrides.
-  { selector: 'node[type="person"]',       style: { 'background-color': '#478189' } },
+  { selector: 'node[type="person"]',       style: { 'background-color': '#36aab7' } },
   { selector: 'node[type="organization"]', style: { 'background-color': '#6BAED6' } },
   { selector: 'node[type="project"]',      style: { 'background-color': '#7E6BA8' } },
   { selector: 'node[type="decision"]',     style: { 'background-color': '#C9874A' } },
@@ -192,7 +192,7 @@ const CY_STYLE = [
       'target-arrow-color': 'rgba(255,255,255,0.6)',
       label: 'data(label)',
       'font-size': 8,
-      'font-family': 'Manrope, system-ui, sans-serif',
+      'font-family': 'Gotham, system-ui, sans-serif',
       color: '#ADADAD',
       'text-outline-color': '#111827',
       'text-outline-width': 1,

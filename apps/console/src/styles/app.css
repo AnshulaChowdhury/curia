@@ -1,64 +1,122 @@
 /* Curia console app styles — design tokens + layout.
    Sourced from curia-design-system/ui_kits/web-app/styles.css. */
 
+/* ── 0. Fonts — Gotham (Moonray Ventures brand) ─────────────────────── */
+@font-face {
+  font-family: 'Gotham';
+  src: url('/fonts/gotham-thin-webfont.woff2') format('woff2');
+  font-weight: 100;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Gotham';
+  src: url('/fonts/gotham-light-webfont.woff2') format('woff2');
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Gotham';
+  src: url('/fonts/gotham-book-webfont.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Gotham';
+  src: url('/fonts/gotham-medium-webfont.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Gotham';
+  src: url('/fonts/gotham-bold-webfont.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Gotham';
+  src: url('/fonts/gotham-bold-webfont.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Gotham';
+  src: url('/fonts/gotham-black-webfont.woff2') format('woff2');
+  font-weight: 800;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Gotham';
+  src: url('/fonts/gotham-black-webfont.woff2') format('woff2');
+  font-weight: 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 /* ── 1. Theme tokens ─────────────────────────────────────────────────── */
 :root {
-  --app-bg:           #F5F4F1;
-  --app-bg-sunken:    #ECEAE5;
+  --app-bg:           #F1F5F9;
+  --app-bg-sunken:    #E5EAF2;
   --app-card:         #FFFFFF;
   --app-card-elev:    #FFFFFF;
   --app-side:         #FFFFFF;
-  --app-muted:        #ECEAE5;
-  --app-accent-bg:    #D9D6D0;
-  --app-border:       rgba(28,28,30,0.10);
-  --app-border-soft:  rgba(28,28,30,0.06);
-  --app-input-bd:     rgba(28,28,30,0.16);
-  --app-fg:           #1C1C1E;
-  --app-fg-muted:     #6F6E6B;
-  --app-fg-subtle:    #8E8C87;
-  --app-primary:      #1C1C1E;
+  --app-muted:        #E5EAF2;
+  --app-accent-bg:    #CBD5E4;
+  --app-border:       rgba(9,27,82,0.12);
+  --app-border-soft:  rgba(9,27,82,0.07);
+  --app-input-bd:     rgba(9,27,82,0.20);
+  --app-fg:           #091b52;
+  --app-fg-muted:     #51608A;
+  --app-fg-subtle:    #8A99AF;
+  --app-primary:      #091b52;
   --app-primary-fg:   #FFFFFF;
   --app-destructive:  #C24A30;
-  --app-teal:         #1A6B5E;
-  --app-teal-soft:    rgba(26,107,94,0.10);
-  --app-blue:         #4174C8;
-  --app-blue-soft:    #6BAED6;
+  --app-teal:         #30689a;
+  --app-teal-soft:    rgba(48,104,154,0.10);
+  --app-blue:         #30689a;
+  --app-blue-soft:    #36aab7;
   --app-green:        #5E9E6B;
   --app-amber:        #C9874A;
   --app-violet:       #7E6BA8;
-  --app-row-zebra:    rgba(28,28,30,0.025);
-  --app-row-hover:    rgba(26,107,94,0.06);
-  --shadow-1:         0 1px 2px rgba(28,28,30,0.06);
-  --shadow-2:         0 4px 16px rgba(28,28,30,0.10);
-  --shadow-drawer:    -16px 0 32px -16px rgba(28,28,30,0.18);
+  --app-row-zebra:    rgba(9,27,82,0.025);
+  --app-row-hover:    rgba(54,170,183,0.08);
+  --shadow-1:         0 1px 2px rgba(9,27,82,0.08);
+  --shadow-2:         0 4px 16px rgba(9,27,82,0.12);
+  --shadow-drawer:    -16px 0 32px -16px rgba(9,27,82,0.22);
 }
 
 [data-theme="dark"] {
-  --app-bg:           #111111;
-  --app-bg-sunken:    #0A0A0A;
-  --app-card:         #1E1E1E;
-  --app-card-elev:    #2A2A2C;
-  --app-side:         #1E1E1E;
-  --app-muted:        #373737;
-  --app-accent-bg:    #555555;
-  --app-border:       rgba(255,255,255,0.10);
-  --app-border-soft:  rgba(255,255,255,0.06);
-  --app-input-bd:     rgba(255,255,255,0.15);
-  --app-fg:           #FAFAFA;
-  --app-fg-muted:     #ADADAD;
-  --app-fg-subtle:    #6F6F70;
-  --app-primary:      #DEDEDE;
-  --app-primary-fg:   #1E1E1E;
+  --app-bg:           #050D29;
+  --app-bg-sunken:    #030820;
+  --app-card:         #091b52;
+  --app-card-elev:    #0F2766;
+  --app-side:         #07153F;
+  --app-muted:        #14307A;
+  --app-accent-bg:    #1D3F8F;
+  --app-border:       rgba(222,228,238,0.14);
+  --app-border-soft:  rgba(222,228,238,0.08);
+  --app-input-bd:     rgba(222,228,238,0.20);
+  --app-fg:           #F5F7FD;
+  --app-fg-muted:     #AEB7C0;
+  --app-fg-subtle:    #8A99AF;
+  --app-primary:      #DEE4EE;
+  --app-primary-fg:   #091b52;
   --app-destructive:  #E86040;
-  --app-teal:         #478189;
-  --app-teal-soft:    rgba(71,129,137,0.14);
-  --app-blue:         #4174C8;
-  --app-blue-soft:    #6BAED6;
+  --app-teal:         #36aab7;
+  --app-teal-soft:    rgba(54,170,183,0.16);
+  --app-blue:         #53A0DB;
+  --app-blue-soft:    #36aab7;
   --app-green:        #5E9E6B;
   --app-amber:        #C9874A;
   --app-violet:       #7E6BA8;
   --app-row-zebra:    rgba(255,255,255,0.025);
-  --app-row-hover:    rgba(71,129,137,0.10);
+  --app-row-hover:    rgba(54,170,183,0.12);
   --shadow-1:         0 1px 2px rgba(0,0,0,0.40);
   --shadow-2:         0 4px 16px rgba(0,0,0,0.45);
   --shadow-drawer:    -16px 0 32px -16px rgba(0,0,0,0.40);
@@ -66,26 +124,26 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --app-bg:           #111111;
-    --app-bg-sunken:    #0A0A0A;
-    --app-card:         #1E1E1E;
-    --app-card-elev:    #2A2A2C;
-    --app-side:         #1E1E1E;
-    --app-muted:        #373737;
-    --app-accent-bg:    #555555;
-    --app-border:       rgba(255,255,255,0.10);
-    --app-border-soft:  rgba(255,255,255,0.06);
-    --app-input-bd:     rgba(255,255,255,0.15);
-    --app-fg:           #FAFAFA;
-    --app-fg-muted:     #ADADAD;
-    --app-fg-subtle:    #6F6F70;
-    --app-primary:      #DEDEDE;
-    --app-primary-fg:   #1E1E1E;
+    --app-bg:           #050D29;
+    --app-bg-sunken:    #030820;
+    --app-card:         #091b52;
+    --app-card-elev:    #0F2766;
+    --app-side:         #07153F;
+    --app-muted:        #14307A;
+    --app-accent-bg:    #1D3F8F;
+    --app-border:       rgba(222,228,238,0.14);
+    --app-border-soft:  rgba(222,228,238,0.08);
+    --app-input-bd:     rgba(222,228,238,0.20);
+    --app-fg:           #F5F7FD;
+    --app-fg-muted:     #AEB7C0;
+    --app-fg-subtle:    #8A99AF;
+    --app-primary:      #DEE4EE;
+    --app-primary-fg:   #091b52;
     --app-destructive:  #E86040;
-    --app-teal:         #478189;
-    --app-teal-soft:    rgba(71,129,137,0.14);
+    --app-teal:         #36aab7;
+    --app-teal-soft:    rgba(54,170,183,0.16);
     --app-row-zebra:    rgba(255,255,255,0.025);
-    --app-row-hover:    rgba(71,129,137,0.10);
+    --app-row-hover:    rgba(54,170,183,0.12);
     --shadow-1:         0 1px 2px rgba(0,0,0,0.40);
     --shadow-2:         0 4px 16px rgba(0,0,0,0.45);
     --shadow-drawer:    -16px 0 32px -16px rgba(0,0,0,0.40);
@@ -101,7 +159,7 @@ html, body { height: 100%; margin: 0; }
 body {
   background: var(--app-bg);
   color: var(--app-fg);
-  font-family: Manrope, system-ui, sans-serif;
+  font-family: Gotham, system-ui, sans-serif;
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -223,7 +281,7 @@ body {
 }
 .topbar-h1 {
   margin: 0;
-  font-family: Lora, Georgia, serif;
+  font-family: Gotham, system-ui, sans-serif;
   font-weight: 500;
   font-size: 18px;
   line-height: 1.15;
@@ -372,7 +430,7 @@ input:focus, textarea:focus, select:focus {
   flex: 1;
   display: flex; align-items: center; justify-content: center;
   color: var(--app-fg-muted);
-  font-family: Lora, Georgia, serif;
+  font-family: Gotham, system-ui, sans-serif;
   font-size: 16px;
 }
 
@@ -418,7 +476,7 @@ input:focus, textarea:focus, select:focus {
   display: flex; flex-direction: column; gap: 6px;
 }
 .settings-page-title {
-  font-family: Lora, Georgia, serif;
+  font-family: Gotham, system-ui, sans-serif;
   font-size: 28px; font-weight: 500;
   margin: 0; color: var(--app-fg);
   line-height: 1.2;
@@ -620,7 +678,7 @@ input:focus, textarea:focus, select:focus {
 }
 
 .wizard-heading {
-  font-family: Lora, Georgia, serif;
+  font-family: Gotham, system-ui, sans-serif;
   font-size: 1.375rem;
   font-weight: 600;
   color: var(--app-fg);
@@ -893,11 +951,11 @@ input:focus, textarea:focus, select:focus {
 /* Task owner badges — use filled bg with white text for WCAG 1.4.3 contrast */
 /* Contrast checks (light/dark): curia 6.35/4.4:1, ceo 4.61:1, external 2.98:1 */
 /* badge-external uses dark text (#111) since amber (#C9874A) only reaches 2.98:1 with white */
-/* dark-mode badge-curia overrides to #1A6B5E (same as light --app-teal) to hit 6.35:1 */
+/* dark-mode badge-curia overrides to #30689a (same as light --app-teal) to hit 6.35:1 */
 .badge-curia    { background: var(--app-teal);   color: #fff; }
 .badge-ceo      { background: var(--app-violet); color: #fff; }
 .badge-external { background: var(--app-amber);  color: #111; }
-[data-theme="dark"] .badge-curia { background: #1A6B5E; }
+[data-theme="dark"] .badge-curia { background: #30689a; }
 
 /* Status pills — outlined, subtle, with a colored leading dot */
 .status-pill {
@@ -961,7 +1019,7 @@ input:focus, textarea:focus, select:focus {
 }
 .drawer-title-h2 {
   margin: 2px 0 0;
-  font-family: Lora, Georgia, serif;
+  font-family: Gotham, system-ui, sans-serif;
   font-weight: 500; font-size: 22px; line-height: 1.2;
   color: var(--app-fg);
 }
@@ -1180,7 +1238,7 @@ table.records-table tbody tr.active td { background: transparent; }
   box-shadow: 0 0 0 3px var(--app-teal-soft);
 }
 
-/* Dark mode: --app-teal (#478189) on --app-muted (#373737) is only 2.7:1.
+/* Dark mode: --app-teal (#36aab7) on --app-muted (#14307A) is too low-contrast.
    Use --app-fg instead to meet WCAG AA at 13px. */
 [data-theme="dark"] .task-related-link { color: var(--app-fg); }
 
@@ -1276,10 +1334,10 @@ table.records-table tbody tr.active td { background: transparent; }
   text-decoration: underline;
 }
 
-/* In dark mode --app-teal is #478189 (4.41:1 against white — just below AA).
-   Override to light-mode teal (#1A6B5E, 6.4:1) so the bubble stays AA-compliant. */
+/* In dark mode --app-teal is bright turquoise (#36aab7), too light for white text.
+   Override to brand mid-blue (#30689a, ~5.9:1 against white) to stay AA-compliant. */
 [data-theme="dark"] .msg-bubble.user {
-  background: #1A6B5E;
+  background: #30689a;
 }
 
 .msg-bubble.agent {
@@ -1547,7 +1605,7 @@ table.records-table tbody tr.active td { background: transparent; }
 }
 
 .kg-detail-title {
-  font-family: Lora, Georgia, serif;
+  font-family: Gotham, system-ui, sans-serif;
   font-size: 1.125rem;
   font-weight: 500;
   color: var(--app-fg);
@@ -1608,7 +1666,7 @@ table.records-table tbody tr.active td { background: transparent; }
 }
 
 /* Badge variants for KG node types (extend the existing badge styles) */
-.badge-kg-person       { background: rgba(71,129,137,0.12); color: #478189; border: 1px solid rgba(71,129,137,0.3); }
+.badge-kg-person       { background: rgba(54,170,183,0.12); color: #36aab7; border: 1px solid rgba(54,170,183,0.3); }
 .badge-kg-organization { background: rgba(107,174,214,0.12); color: #4174C8; border: 1px solid rgba(107,174,214,0.3); }
 .badge-kg-project      { background: rgba(126,107,168,0.12); color: #7E6BA8; border: 1px solid rgba(126,107,168,0.3); }
 .badge-kg-decision     { background: rgba(201,135,74,0.12); color: #C9874A; border: 1px solid rgba(201,135,74,0.3); }

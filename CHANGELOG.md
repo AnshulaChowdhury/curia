@@ -15,7 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
-- **Console branding** — UI wordmark, page title, and chat labels now read "Moonray Ventures OS powered by Curia".
+- **Console branding** — UI wordmark, page title, and chat labels now read "Moonray Ventures OS powered by Curia"; theme moves to the Moonray palette (dark blue #091b52, mid blue #30689a, turquoise #36aab7) and Gotham typeface.
 
 ### Added
 
