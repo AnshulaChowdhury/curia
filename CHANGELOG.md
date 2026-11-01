@@ -16,6 +16,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Added
 
 - **Real-time inbox triage** — new mail is classified within ~30s, labelled, and wakes the phone via ntfy. Off by default.
+- **Inbox triage settings** — a form under API connections saves ntfy details to the vault, restarts the watcher, sends a test push.
 
 ### Changed
 

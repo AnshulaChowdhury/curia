@@ -67,7 +67,7 @@ import { resolveKnowledgeGraphEmbedding } from './memory/embedding-schema.js';
 import { KnowledgeGraphStore } from './memory/knowledge-graph.js';
 import { MemoryValidator } from './memory/validation.js';
 import { EntityMemory } from './memory/entity-memory.js';
-import { startInboxTriage } from './inbox-triage/start.js';
+import { InboxTriageController } from './inbox-triage/controller.js';
 import { ConfigStore } from './memory/config-store.js';
 import { ToolRegistry } from './skills/registry.js';
 import { ExecutionLayer } from './skills/execution.js';
@@ -3185,14 +3185,14 @@ async function main(): Promise<void> {
 
   // Real-time inbox triage: off unless the vault says `inbox_triage_enabled` = "true".
   // Started after the scheduler so the email-classifier agent's tasks have a runtime to run in.
-  let stopInboxTriage: (() => void) | null = null;
+  const inboxTriage = new InboxTriageController({
+    bus,
+    logger,
+    secrets: secretsService,
+    store: entityMemory ? new ConfigStore(entityMemory, logger) : undefined,
+  });
   try {
-    stopInboxTriage = await startInboxTriage({
-      bus,
-      logger,
-      secrets: secretsService,
-      store: entityMemory ? new ConfigStore(entityMemory, logger) : undefined,
-    });
+    await inboxTriage.reload();
   } catch (err) {
     // Triage is an add-on to the 15-minute sweep: failing to start it must not stop Curia.
     logger.error({ err }, 'inbox-triage failed to start; the 15-minute sweep still runs');
@@ -3430,6 +3430,7 @@ async function main(): Promise<void> {
     channelRegistryService,
     mcpRegistryService,
     secretsService,
+    inboxTriage,
     secretCaptureService,
     setupRequiredAtBoot,
     bootStartedAt,
@@ -3474,7 +3475,7 @@ async function main(): Promise<void> {
   // the HTTP server, pool, and other already-started resources are closed cleanly.
   const shutdown = async (exitCode = 0) => {
     logger.info('Shutting down...');
-    stopInboxTriage?.();
+    inboxTriage.stop();
     // Parallel so several mailboxes share one drain budget. A sequential stop
     // waits 5s per hung account and can outlast Docker's default 10s grace
     // before Signal, Slack, and the pool close (#2254).

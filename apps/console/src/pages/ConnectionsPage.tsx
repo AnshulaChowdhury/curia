@@ -4,6 +4,7 @@ import { Sidebar } from '../components/Sidebar.js';
 import { Topbar } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
+import InboxTriageCard from './InboxTriageCard.js';
 
 // Mirrors GET /api/connections (src/channels/http/routes/quickbooks.ts). No tokens are ever returned.
 interface Connection {
@@ -98,6 +99,7 @@ export default function ConnectionsPage() {
                 </div>
               </section>
             ))}
+            <InboxTriageCard />
           </div>
         </main>
       </div>
