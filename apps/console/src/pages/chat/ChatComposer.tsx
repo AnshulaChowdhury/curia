@@ -53,7 +53,7 @@ export function ChatComposer({ disabled, onSend }: ChatComposerProps) {
         value={value}
         onChange={handleChange}
         onKeyDown={handleKeyDown}
-        placeholder="Message Curia…"
+        placeholder="Message Moonray Ventures OS…"
         disabled={disabled}
         rows={1}
         aria-label="Message"
