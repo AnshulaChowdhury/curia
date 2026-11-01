@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import type { ReactNode } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { useMobileMenu } from '../context/MobileMenu';
 import { apiFetch } from '../api.js';
@@ -19,7 +20,10 @@ import {
   IconChevron,
   IconServer,
   IconBrain,
+  IconPanelLeft,
+  IconChannels,
 } from './Icons';
+import { MoonrayMark } from './MoonrayMark';
 
 type Theme = 'light' | 'system' | 'dark';
 
@@ -45,12 +49,31 @@ const ROUTES: Record<string, string> = {
   settings:   '/settings',
 };
 
-function ThemeToggle({ theme, onChange }: { theme: Theme; onChange: (t: Theme) => void }) {
-  const options: Array<{ v: Theme; label: string }> = [
-    { v: 'light', label: 'Light' },
-    { v: 'system', label: 'Auto' },
-    { v: 'dark', label: 'Dark' },
-  ];
+const THEME_OPTIONS: Array<{ v: Theme; label: string }> = [
+  { v: 'light', label: 'Light' },
+  { v: 'system', label: 'Auto' },
+  { v: 'dark', label: 'Dark' },
+];
+
+function ThemeToggle({ theme, onChange, compact }: { theme: Theme; onChange: (t: Theme) => void; compact: boolean }) {
+  const options = THEME_OPTIONS;
+  if (compact) {
+    // Collapsed rail: one button that cycles Light → Auto → Dark.
+    const i = Math.max(0, options.findIndex(o => o.v === theme));
+    const current = options[i] ?? options[1]!;
+    const next = options[(i + 1) % options.length] ?? options[0]!;
+    return (
+      <button
+        type="button"
+        className="theme-cycle-btn"
+        onClick={() => onChange(next.v)}
+        title={`${current.label} theme — switch to ${next.label}`}
+        aria-label={`Theme: ${current.label}. Switch to ${next.label}`}
+      >
+        {current.label}
+      </button>
+    );
+  }
   return (
     <div className="theme-toggle" role="group" aria-label="Theme">
       {options.map((opt) => (
@@ -78,7 +101,61 @@ function getInitials(name: string | null): string {
   return ((parts[0] ?? '')[0] ?? '').toUpperCase() + ((parts[parts.length - 1] ?? '')[0] ?? '').toUpperCase();
 }
 
+// Collapsed (icon rail) or expanded, remembered across pages and visits.
+const COLLAPSED_KEY = 'curia.sidebar.collapsed';
+const MOBILE_QUERY = '(max-width: 768px)';
+
+function readCollapsed(): boolean {
+  try {
+    return localStorage.getItem(COLLAPSED_KEY) === '1';
+  } catch {
+    // Storage blocked (private mode, policy): start expanded.
+    return false;
+  }
+}
+
+function useIsMobile(): boolean {
+  const [mobile, setMobile] = useState(() => typeof window !== 'undefined' && window.matchMedia(MOBILE_QUERY).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(MOBILE_QUERY);
+    const onChange = () => setMobile(mq.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+  return mobile;
+}
+
+interface NavButtonProps {
+  label: string;
+  icon: ReactNode;
+  active?: boolean;
+  sub?: boolean;
+  collapsed: boolean;
+  onClick: () => void;
+  trailing?: ReactNode;
+}
+
+/** A nav row. Collapsed, it shows only the icon, with the label as its tooltip and name. */
+function NavButton({ label, icon, active, sub, collapsed, onClick, trailing }: NavButtonProps) {
+  return (
+    <button
+      className={`${sub ? 'nav-sub-item' : 'nav-item'}${active ? ' active' : ''}`}
+      onClick={onClick}
+      {...(collapsed ? { title: label, 'aria-label': label } : {})}
+      {...(active ? { 'aria-current': 'page' as const } : {})}
+    >
+      {icon}
+      <span className="nav-label">{label}</span>
+      {!collapsed && trailing}
+    </button>
+  );
+}
+
 export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
+  const [collapsedPref, setCollapsedPref] = useState(readCollapsed);
+  // The mobile drawer always shows the full menu.
+  const isMobile = useIsMobile();
+  const collapsed = collapsedPref && !isMobile;
   const [memoryOpen, setMemoryOpen] = useState(true);
   // Expand the Settings group when on any of its pages (Skills/Agents are now
   // standalone pages but still live under the sidebar's Settings group).
@@ -131,6 +208,30 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
     return () => controller.abort();
   }, []);
 
+  const toggleCollapsed = useCallback(() => {
+    setCollapsedPref(prev => {
+      const next = !prev;
+      try {
+        localStorage.setItem(COLLAPSED_KEY, next ? '1' : '0');
+      } catch (err) {
+        console.error('[Sidebar] could not save the collapsed state:', err);
+      }
+      return next;
+    });
+  }, []);
+
+  // ⌘\ / Ctrl+\ collapses or expands the sidebar from anywhere.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === '\\' && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        toggleCollapsed();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [toggleCollapsed]);
+
   const go = (view: string) => {
     const to = ROUTES[view];
     if (to) {
@@ -143,134 +244,99 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
     setOpen(false);
   };
 
+  const item = (view: string, label: string, icon: ReactNode, sub = false) => (
+    <NavButton
+      key={view}
+      label={label}
+      icon={icon}
+      sub={sub && !collapsed}
+      active={activeView === view}
+      collapsed={collapsed}
+      onClick={() => go(view)}
+    />
+  );
+
+  const memoryItems = [
+    item('kg', 'Knowledge Graph', <IconGraph />, true),
+    item('documents', 'Documents', <IconDocument />, true),
+    item('contacts', 'Contacts', <IconPerson />, true),
+    item('tasks', 'Tasks', <IconChecklist />, true),
+    item('jobs', 'Scheduled Jobs', <IconClock />, true),
+  ];
+  const settingsItems = [
+    item('tools', 'Tools', <IconWand />, true),
+    item('agents', 'Agents', <IconAutonomy />, true),
+    item('channels', 'Channels', <IconChannels />, true),
+    item('mcp-skills', 'MCP Skills', <IconPlug />, true),
+    item('settings', 'Personality', <IconBrain />, true),
+    item('system', 'System', <IconServer />, true),
+  ];
+  const toggleLabel = collapsed ? 'Expand sidebar (⌘\\)' : 'Collapse sidebar (⌘\\)';
+
   return (
-    <nav className="sidebar">
-      <div className="sidebar-wordmark" aria-label="Moonray Ventures OS powered by Curia">
-        <BrandWordmark />
+    <nav className={`sidebar${collapsed ? ' is-collapsed' : ''}`} aria-label="Main">
+      <div className="sidebar-head">
+        <div className="sidebar-wordmark" aria-label="Moonray Ventures OS powered by Curia">
+          {collapsed ? <MoonrayMark size={30} /> : <BrandWordmark />}
+        </div>
+        {!isMobile && (
+          <button
+            type="button"
+            className="sidebar-collapse-btn"
+            onClick={toggleCollapsed}
+            title={toggleLabel}
+            aria-label={toggleLabel}
+            aria-expanded={!collapsed}
+          >
+            <IconPanelLeft open={!collapsed} size={16} />
+          </button>
+        )}
       </div>
 
       <div className="nav-group">
-        <button
-          className={`nav-item${activeView === 'dashboard' ? ' active' : ''}`}
-          onClick={() => go('dashboard')}
-        >
-          <IconHome />
-          Home
-        </button>
+        {item('dashboard', 'Home', <IconHome />)}
+        {item('chat', 'Chat', <IconChat />)}
 
-        <button
-          className={`nav-item${activeView === 'chat' ? ' active' : ''}`}
-          onClick={() => go('chat')}
-        >
-          <IconChat />
-          Chat
-        </button>
-
-        <div>
-          <button className="nav-item" onClick={() => setMemoryOpen(!memoryOpen)}>
-            <IconMemory />
-            Memory
-            <IconChevron collapsed={!memoryOpen} />
-          </button>
-          {memoryOpen && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 2 }}>
-              <button
-                className={`nav-sub-item${activeView === 'kg' ? ' active' : ''}`}
-                onClick={() => go('kg')}
-              >
-                <IconGraph />
-                Knowledge Graph
-              </button>
-              <button
-                className={`nav-sub-item${activeView === 'documents' ? ' active' : ''}`}
-                onClick={() => go('documents')}
-              >
-                <IconDocument />
-                Documents
-              </button>
-              <button
-                className={`nav-sub-item${activeView === 'contacts' ? ' active' : ''}`}
-                onClick={() => go('contacts')}
-              >
-                <IconPerson />
-                Contacts
-              </button>
-              <button
-                className={`nav-sub-item${activeView === 'tasks' ? ' active' : ''}`}
-                onClick={() => go('tasks')}
-              >
-                <IconChecklist />
-                Tasks
-              </button>
-              <button
-                className={`nav-sub-item${activeView === 'jobs' ? ' active' : ''}`}
-                onClick={() => go('jobs')}
-              >
-                <IconClock />
-                Scheduled Jobs
-              </button>
+        {collapsed ? (
+          // Icon rail: no group headers; each group's pages as icons, set apart by a divider.
+          <>
+            <div className="nav-divider" role="separator" />
+            {memoryItems}
+            <div className="nav-divider" role="separator" />
+            {settingsItems}
+          </>
+        ) : (
+          <>
+            <div>
+              <NavButton
+                label="Memory"
+                icon={<IconMemory />}
+                collapsed={false}
+                onClick={() => setMemoryOpen(!memoryOpen)}
+                trailing={<IconChevron collapsed={!memoryOpen} />}
+              />
+              {memoryOpen && <div className="nav-subgroup">{memoryItems}</div>}
             </div>
-          )}
-        </div>
-
-        <div>
-          <button className="nav-item" onClick={() => setSettingsOpen(!settingsOpen)}>
-            <IconSettings />
-            Settings
-            <IconChevron collapsed={!settingsOpen} />
-          </button>
-          {settingsOpen && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 2 }}>
-              <button
-                className={`nav-sub-item${activeView === 'tools' ? ' active' : ''}`}
-                onClick={() => go('tools')}
-              >
-                <IconWand />
-                Tools
-              </button>
-              <button
-                className={`nav-sub-item${activeView === 'agents' ? ' active' : ''}`}
-                onClick={() => go('agents')}
-              >
-                <IconAutonomy />
-                Agents
-              </button>
-              <button
-                className={`nav-sub-item${activeView === 'channels' ? ' active' : ''}`}
-                onClick={() => go('channels')}
-              >
-                <IconWand />
-                Channels
-              </button>
-              <button
-                className={`nav-sub-item${activeView === 'mcp-skills' ? ' active' : ''}`}
-                onClick={() => go('mcp-skills')}
-              >
-                <IconPlug />
-                MCP Skills
-              </button>
-              <button
-                className={`nav-sub-item${activeView === 'settings' ? ' active' : ''}`}
-                onClick={() => go('settings')}
-              >
-                <IconBrain />
-                Personality
-              </button>
-              <button
-                className={`nav-sub-item${activeView === 'system' ? ' active' : ''}`}
-                onClick={() => go('system')}
-              >
-                <IconServer />
-                System
-              </button>
+            <div>
+              <NavButton
+                label="Settings"
+                icon={<IconSettings />}
+                collapsed={false}
+                onClick={() => setSettingsOpen(!settingsOpen)}
+                trailing={<IconChevron collapsed={!settingsOpen} />}
+              />
+              {settingsOpen && <div className="nav-subgroup">{settingsItems}</div>}
             </div>
-          )}
-        </div>
+          </>
+        )}
       </div>
 
       <div className="sidebar-footer">
-        <ThemeToggle theme={theme} onChange={onThemeChange} />
-        <button className="sidebar-user">
+        <ThemeToggle theme={theme} onChange={onThemeChange} compact={collapsed} />
+        <button
+          className="sidebar-user"
+          {...(collapsed ? { title: `${principalName ?? 'Setting up…'}${version ? ` · v${version}` : ''}` } : {})}
+        >
           <span className="sidebar-user-avatar">{getInitials(principalName)}</span>
           <span className="sidebar-user-meta">
             <span className="sidebar-user-name">{principalName ?? 'Setting up…'}</span>

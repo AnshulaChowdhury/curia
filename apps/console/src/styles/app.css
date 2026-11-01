@@ -222,11 +222,53 @@ body {
 .sidebar {
   flex: none; width: 220px; padding: 16px 10px 10px;
   background: var(--app-side); border-right: 1px solid var(--app-border);
-  display: flex; flex-direction: column; overflow-y: auto;
+  display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden;
+  transition: width .2s cubic-bezier(.2,.8,.2,1), padding .2s ease;
+}
+.sidebar-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 6px;
 }
 .sidebar-wordmark {
   color: var(--app-fg); padding: 6px 10px 22px;
   display: flex; align-items: center;
+  min-width: 0;
+}
+.sidebar-collapse-btn {
+  flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; margin-top: 4px;
+  border: none; border-radius: 7px;
+  background: transparent; color: var(--app-fg-subtle);
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+.sidebar-collapse-btn:hover { background: var(--app-muted); color: var(--app-fg); }
+.sidebar-collapse-btn:focus-visible { outline: 2px solid var(--app-teal); outline-offset: 1px; }
+.nav-subgroup { display: flex; flex-direction: column; gap: 2px; margin-top: 2px; }
+.nav-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-divider { height: 1px; margin: 6px 10px; background: var(--app-border); }
+.theme-cycle-btn {
+  margin: 4px auto;
+  padding: 4px 0; width: 44px;
+  border: 1px solid var(--app-border); border-radius: 999px;
+  background: var(--app-muted); color: var(--app-fg-muted);
+  font-family: inherit; font-size: 9px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  cursor: pointer;
+  transition: color 120ms, background 120ms;
+}
+.theme-cycle-btn:hover { color: var(--app-fg); background: var(--app-card); }
+
+/* Collapsed: an icon rail (desktop only; the mobile drawer always shows the full menu). */
+@media (min-width: 769px) {
+  .sidebar.is-collapsed { width: 64px; padding: 16px 8px 10px; }
+  .sidebar.is-collapsed .sidebar-head { flex-direction: column; align-items: center; gap: 4px; margin-bottom: 14px; }
+  .sidebar.is-collapsed .sidebar-wordmark { padding: 4px 0 0; }
+  .sidebar.is-collapsed .nav-item,
+  .sidebar.is-collapsed .nav-sub-item { justify-content: center; padding: 9px 0; }
+  .sidebar.is-collapsed .nav-label,
+  .sidebar.is-collapsed .sidebar-user-meta { display: none; }
+  .sidebar.is-collapsed .sidebar-user { justify-content: center; padding: 6px 0; }
 }
 .sidebar-wordmark svg { display: block; height: 22px; width: auto; }
 .brand-wordmark { display: inline-flex; flex-direction: column; gap: 3px; color: inherit; }

@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Console sidebar** — collapses to an icon rail (button or ⌘\\); remembered across pages and visits.
 - **Knowledge Graph look** — themed palette shared with badges, orbit-ringed nodes, focal-edge labels, zoom controls.
 - **Knowledge Graph fit** — automatic fits stop at 1.25× zoom, so small graphs stay readable.
 - **Knowledge Graph view** — drawn with xyflow; layout runs off the main thread; follows the console theme. (ADR-058)
