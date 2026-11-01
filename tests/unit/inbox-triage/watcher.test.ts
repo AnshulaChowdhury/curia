@@ -30,7 +30,7 @@ describe('InboxWatcher', () => {
     const { s, applied } = source([candidate('a', 1), candidate('b', 2), candidate('c', 3)]);
     const groups: TriageVerdict['group'][] = ['urgent', 'drafted', 'seen'];
     const classify = vi.fn(async () => verdict(groups.shift()!));
-    const notify = vi.fn(async () => {});
+    const notify = vi.fn(async (_group: TriageGroup) => {});
     await new InboxWatcher({ sources: [s], classifier: { classify }, notifier: { notify }, seen: memorySeen(), logger, intervalMs: 1000 }).tick();
     expect(applied).toEqual([['a', 'urgent'], ['b', 'drafted'], ['c', 'seen']]);
     expect(notify.mock.calls.map((c) => c[0])).toEqual(['urgent', 'drafted', 'seen']);
