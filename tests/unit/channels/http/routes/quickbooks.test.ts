@@ -1,9 +1,9 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
-import { quickbooksRoutes } from './quickbooks.js';
-import { QboApiError, QboAuthError, type QboConnection } from '../../../quickbooks/qbo-connection.js';
-import { createSilentLogger } from '../../../logger.js';
-import { hashToken } from '../session-auth.js';
+import { quickbooksRoutes } from '../../../../../src/channels/http/routes/quickbooks.js';
+import { QboApiError, QboAuthError, type QboConnection } from '../../../../../src/quickbooks/qbo-connection.js';
+import { createSilentLogger } from '../../../../../src/logger.js';
+import { hashToken } from '../../../../../src/channels/http/session-auth.js';
 
 function fakeConnection(overrides: Partial<Record<keyof QboConnection, unknown>> = {}) {
   const api: Array<[string, string, Record<string, string>, unknown]> = [];

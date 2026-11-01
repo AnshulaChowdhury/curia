@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { QboAuthError, QboApiError, QboConnection, type Fetch, type QboSettings } from './qbo-connection.js';
-import { createSilentLogger } from '../logger.js';
+import { QboAuthError, QboApiError, QboConnection, type Fetch, type QboSettings } from '../../../src/quickbooks/qbo-connection.js';
+import { createSilentLogger } from '../../../src/logger.js';
 
 const SETTINGS: QboSettings = { clientId: 'cid', clientSecret: 'sec', redirectUri: 'https://curia.test/books/qbo-callback', environment: 'production' };
 
