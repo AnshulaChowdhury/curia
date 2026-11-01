@@ -19,6 +19,7 @@ const MINOR_VERSION = '75';
 const REFRESH_MARGIN_MS = 5 * 60_000;
 const STATE_TTL_MS = 10 * 60_000;
 const TOKENS_SECRET = 'qbo_tokens';
+const SETTINGS_SECRET = 'qbo_settings';
 
 export type QboEnvironment = keyof typeof API_BASE;
 
@@ -43,10 +44,14 @@ interface StoredTokens {
 export interface QboSecretsPort {
   getJSON<T>(name: string): Promise<T | null>;
   setJSON(name: string, obj: unknown): Promise<void>;
+  delete(name: string): Promise<void>;
 }
 
 /** The authorization is missing, expired or revoked: someone has to press Connect again. */
 export class QboAuthError extends Error {}
+
+/** The person typed something unusable into the settings form. */
+export class QboSettingsError extends Error {}
 
 export class QboApiError extends Error {
   constructor(readonly status: number, message: string, readonly fault?: unknown) {
@@ -56,6 +61,10 @@ export class QboApiError extends Error {
 
 export interface QboStatus {
   configured: boolean;
+  /** Where the client id and secret come from; the secret itself is never returned. */
+  settingsSource?: 'vault' | 'env';
+  redirectUri?: string;
+  clientIdHint?: string;
   connected: boolean;
   environment?: QboEnvironment;
   realmId?: string;
@@ -82,7 +91,7 @@ export class QboConnection {
   private refreshing: Promise<StoredTokens> | null = null;
 
   constructor(
-    private readonly settings: QboSettings | null,
+    private readonly envSettings: QboSettings | null,
     private readonly secrets: QboSecretsPort,
     private readonly logger: Logger,
     private readonly fetchFn: Fetch = (url, init) => fetch(url, init),
@@ -90,11 +99,47 @@ export class QboConnection {
     private readonly sleep: (ms: number) => Promise<void> = ms => new Promise(r => setTimeout(r, ms)),
   ) {}
 
+  // -- settings --------------------------------------------------------------------------------------------------
+
+  /** Settings entered on the API connections page (vault) win over the environment variables. */
+  private async settings(): Promise<{ value: QboSettings; source: 'vault' | 'env' } | null> {
+    const saved = await this.secrets.getJSON<QboSettings>(SETTINGS_SECRET);
+    if (saved && saved.clientId && saved.clientSecret && saved.redirectUri && saved.environment in API_BASE) {
+      return { value: saved, source: 'vault' };
+    }
+    return this.envSettings ? { value: this.envSettings, source: 'env' } : null;
+  }
+
+  /** Saves the app's client id and secret (encrypted in the vault). A different client id means a different app, so any old connection is dropped. */
+  async saveSettings(input: { clientId?: unknown; clientSecret?: unknown; redirectUri?: unknown; environment?: unknown }): Promise<void> {
+    const clientId = typeof input.clientId === 'string' ? input.clientId.trim() : '';
+    const clientSecret = typeof input.clientSecret === 'string' ? input.clientSecret.trim() : '';
+    const redirectUri = typeof input.redirectUri === 'string' ? input.redirectUri.trim() : '';
+    const environment = input.environment === 'sandbox' ? 'sandbox' : input.environment === 'production' ? 'production' : null;
+    if (!clientId || !clientSecret || clientId.length > 200 || clientSecret.length > 200) {
+      throw new QboSettingsError('Enter the app\'s client ID and client secret');
+    }
+    if (!environment) throw new QboSettingsError('Environment must be production or sandbox');
+    let url: URL;
+    try {
+      url = new URL(redirectUri);
+    } catch {
+      throw new QboSettingsError('The redirect address must be a full https address');
+    }
+    if (url.protocol !== 'https:' || redirectUri.length > 300) throw new QboSettingsError('The redirect address must be a full https address');
+    const before = await this.settings();
+    await this.secrets.setJSON(SETTINGS_SECRET, { clientId, clientSecret, redirectUri, environment });
+    if (before && (before.value.clientId !== clientId || before.value.environment !== environment)) {
+      await this.secrets.delete(TOKENS_SECRET); // tokens belong to the old app or company
+    }
+    this.logger.info({ environment, source: 'vault' }, 'quickbooks: settings saved');
+  }
+
   // -- connecting ------------------------------------------------------------------------------------------------
 
   /** The Intuit sign-in address. The `state` is single-use and only valid for ten minutes. */
-  authorizationUrl(): string {
-    const s = this.requireSettings();
+  async authorizationUrl(): Promise<string> {
+    const s = await this.requireSettings();
     const state = randomBytes(24).toString('base64url');
     this.pruneStates();
     this.pendingStates.set(hash(state), this.now() + STATE_TTL_MS);
@@ -110,7 +155,7 @@ export class QboConnection {
 
   /** Called with the query Intuit sent to the redirect address. Throws QboAuthError on anything not right. */
   async handleCallback(query: { code?: string; realmId?: string; state?: string; error?: string }): Promise<void> {
-    const s = this.requireSettings();
+    const s = await this.requireSettings();
     if (query.error) throw new QboAuthError(`QuickBooks did not authorise the connection (${query.error})`);
     if (!query.state || !this.consumeState(query.state)) {
       throw new QboAuthError('this link has expired or was not started from Curia: press Connect again');
@@ -123,15 +168,15 @@ export class QboConnection {
   }
 
   async status(): Promise<QboStatus> {
-    if (!this.settings) return { configured: false, connected: false };
+    const cur = await this.settings();
+    if (!cur) return { configured: false, connected: false };
+    const { value, source } = cur;
+    const base = { configured: true, settingsSource: source, redirectUri: value.redirectUri, clientIdHint: `…${value.clientId.slice(-4)}`, environment: value.environment };
     const t = await this.secrets.getJSON<StoredTokens>(TOKENS_SECRET);
-    if (!t || t.environment !== this.settings.environment || t.refreshExpiresAt <= this.now()) {
-      return { configured: true, connected: false, environment: this.settings.environment };
-    }
+    if (!t || t.environment !== value.environment || t.refreshExpiresAt <= this.now()) return { ...base, connected: false };
     return {
-      configured: true,
+      ...base,
       connected: true,
-      environment: t.environment,
       realmId: t.realmId,
       connectedAt: t.connectedAt,
       refreshExpiresAt: new Date(t.refreshExpiresAt).toISOString(),
@@ -141,7 +186,7 @@ export class QboConnection {
   // -- tokens ----------------------------------------------------------------------------------------------------
 
   private async tokens(forceRefresh = false): Promise<StoredTokens> {
-    const s = this.requireSettings();
+    const s = await this.requireSettings();
     const t = await this.secrets.getJSON<StoredTokens>(TOKENS_SECRET);
     if (!t) throw new QboAuthError('QuickBooks is not connected: press Connect in Curia');
     if (t.environment !== s.environment) {
@@ -166,7 +211,7 @@ export class QboConnection {
   }
 
   private async tokenRequest(form: Record<string, string>): Promise<Pick<StoredTokens, 'accessToken' | 'refreshToken' | 'accessExpiresAt' | 'refreshExpiresAt'>> {
-    const s = this.requireSettings();
+    const s = await this.requireSettings();
     const started = this.now();
     const res = await this.fetchFn(TOKEN_URL, {
       method: 'POST',
@@ -196,7 +241,7 @@ export class QboConnection {
 
   /** One QuickBooks call. Refreshes once on a 401; backs off on 429 and 5xx. Path is relative to the company. */
   async api(method: 'GET' | 'POST', path: string, params: Record<string, string> = {}, body?: unknown): Promise<unknown> {
-    const s = this.requireSettings();
+    const s = await this.requireSettings();
     let refreshed = false;
     for (let attempt = 0; attempt < 5; attempt++) {
       const t = await this.tokens();
@@ -242,9 +287,10 @@ export class QboConnection {
     for (const [k, exp] of this.pendingStates) if (exp <= t) this.pendingStates.delete(k);
   }
 
-  private requireSettings(): QboSettings {
-    if (!this.settings) throw new QboAuthError('QuickBooks is not configured (QBO_CLIENT_ID, QBO_CLIENT_SECRET, QBO_REDIRECT_URI)');
-    return this.settings;
+  private async requireSettings(): Promise<QboSettings> {
+    const cur = await this.settings();
+    if (!cur) throw new QboAuthError('QuickBooks is not set up: enter the app\'s client ID and secret on the API connections page');
+    return cur.value;
   }
 }
 
