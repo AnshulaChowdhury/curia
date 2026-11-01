@@ -15,6 +15,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Knowledge Graph look** — themed palette shared with badges, orbit-ringed nodes, focal-edge labels, zoom controls.
+- **Knowledge Graph fit** — automatic fits stop at 1.25× zoom, so small graphs stay readable.
 - **Knowledge Graph view** — drawn with xyflow; layout runs off the main thread; follows the console theme. (ADR-058)
 - **Knowledge Graph loading** — Moonray loader shows while the graph loads, expands or searches.
 - **Console dark theme** — Moonray night palette: navy surfaces, moonlight text, lavender accent; subtler rings (fork only).

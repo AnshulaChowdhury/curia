@@ -2505,12 +2505,18 @@ table.records-table tbody tr.active td { background: transparent; }
   flex: 1;
   position: relative;
   min-height: 0;
-  background: var(--app-bg-sunken);
+  /* A soft glow behind the middle of the canvas; static, so it costs nothing per frame. */
+  background:
+    radial-gradient(ellipse 70% 60% at 50% 42%, color-mix(in srgb, var(--app-accent-bg) 55%, transparent), transparent 75%),
+    var(--app-bg-sunken);
   /* Graph colours follow the theme (ADR-058). */
-  --kg-node-text: var(--app-fg);
-  --kg-edge: var(--app-fg-muted);
-  --kg-edge-label: var(--app-fg-subtle);
-  --kg-focal: var(--app-fg);
+  --kg-node-text: var(--app-fg-muted);
+  --kg-node-text-strong: var(--app-fg);
+  --kg-edge: color-mix(in srgb, var(--app-fg-muted) 75%, transparent);
+  --kg-edge-focal: var(--app-teal);
+  --kg-edge-label: var(--app-fg-muted);
+  --kg-focal: var(--app-teal);
+  --kg-grid: color-mix(in srgb, var(--app-fg-subtle) 35%, transparent);
 }
 .kg-canvas .react-flow { background: transparent; }
 
@@ -2540,27 +2546,69 @@ table.records-table tbody tr.active td { background: transparent; }
   animation: kg-loader-in .2s ease .15s both;
 }
 
-/* Graph nodes: a dot with its label hanging below. Kept to plain fills and borders (no
-   shadows or filters) because a canvas can hold hundreds of them. */
+/* Knowledge Graph palette: one set of colours for the graph and the drawer badges,
+   softer in dark mode, deeper in light. Hues keep their meaning in both. */
+:root {
+  --kg-person: #3F7CC4;  --kg-organization: #2E8E9A; --kg-project: #6E63B5;
+  --kg-decision: #B9822F; --kg-event: #4F9466;       --kg-concept: #7A7D92;
+  --kg-fact: #A3A6B8;     --kg-public: #4F9466;      --kg-internal: #3F7CC4;
+  --kg-confidential: #B9822F; --kg-restricted: #D0583D; --kg-other: #8A8DA3;
+}
+[data-theme="dark"] {
+  --kg-person: #8AB8F0;  --kg-organization: #7FD1D9; --kg-project: #B8BAE0;
+  --kg-decision: #E9C98B; --kg-event: #9AD9BE;       --kg-concept: #9A9CB5;
+  --kg-fact: #63667F;     --kg-public: #9AD9BE;      --kg-internal: #8AB8F0;
+  --kg-confidential: #E9C98B; --kg-restricted: #EE8B7A; --kg-other: #8A8DA3;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --kg-person: #8AB8F0;  --kg-organization: #7FD1D9; --kg-project: #B8BAE0;
+    --kg-decision: #E9C98B; --kg-event: #9AD9BE;       --kg-concept: #9A9CB5;
+    --kg-fact: #63667F;     --kg-public: #9AD9BE;      --kg-internal: #8AB8F0;
+    --kg-confidential: #E9C98B; --kg-restricted: #EE8B7A; --kg-other: #8A8DA3;
+  }
+}
+
+/* Graph nodes: a dot in a thin orbit ring (the Moonray mark's motif), label below.
+   Plain fills, borders and outlines only (no shadows or filters): a canvas can hold
+   hundreds of these. */
 .kg-gnode {
   position: relative;
   box-sizing: border-box;
   border-radius: 50%;
-  background: var(--kg-fill, #4174C8);
+  background: var(--kg-fill, var(--kg-other));
+  border: 1px solid color-mix(in srgb, var(--kg-fill, var(--kg-other)) 55%, var(--app-fg));
+  outline: 1px solid color-mix(in srgb, var(--kg-fill, var(--kg-other)) 30%, transparent);
+  outline-offset: 3px;
   cursor: pointer;
+  transition: transform .14s ease, outline-color .14s ease;
 }
-.kg-gnode.is-focal { border: 3px solid var(--kg-focal); }
+.kg-gnode:hover { transform: scale(1.1); outline-color: color-mix(in srgb, var(--kg-fill, var(--kg-other)) 70%, transparent); }
+.kg-gnode.is-focal {
+  outline: 1.5px solid var(--kg-focal);
+  outline-offset: 4px;
+}
 .kg-gnode-label {
   position: absolute; top: 100%; left: 50%;
   transform: translateX(-50%);
-  margin-top: 5px;
-  max-width: 90px;
+  margin-top: 7px;
+  max-width: 104px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  /* A pill in the canvas colour, so edges pass behind the text instead of through it. */
+  background: color-mix(in srgb, var(--app-bg-sunken) 82%, transparent);
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
-  font-size: 10px; line-height: 1.2;
+  font-size: 10.5px; font-weight: 500; line-height: 1.25; letter-spacing: 0.01em;
   color: var(--kg-node-text);
   pointer-events: none;
+  transition: color .14s ease;
 }
-/* Facts are small dots; their label shows only while selected. */
+.kg-gnode:hover .kg-gnode-label,
+.kg-gnode.is-focal .kg-gnode-label,
+.kg-gnode.is-selected .kg-gnode-label { color: var(--kg-node-text-strong); }
+.kg-gnode.is-focal .kg-gnode-label { font-weight: 600; margin-top: 9px; }
+/* Facts are small plain dots; their label shows only while selected. */
+.kg-gnode.is-fact { outline: none; border: none; }
 .kg-gnode.is-fact .kg-gnode-label { display: none; }
 .kg-gnode.is-fact.is-selected .kg-gnode-label { display: block; font-size: 9px; }
 /* Edges attach at the node centre; the edge component trims each line to the rim. */
@@ -2572,31 +2620,59 @@ table.records-table tbody tr.active td { background: transparent; }
   pointer-events: none;
 }
 .kg-canvas .react-flow__edge-path { stroke: var(--kg-edge); }
-.kg-canvas .react-flow__edge-text { fill: var(--kg-edge-label); font-size: 8px; }
+.kg-canvas .react-flow__edge.is-focal-edge .react-flow__edge-path { stroke: var(--kg-edge-focal); }
+.kg-canvas .react-flow__edge-text {
+  fill: var(--kg-edge-label);
+  font-size: 9px; font-weight: 500; letter-spacing: 0.04em;
+}
+.kg-canvas .react-flow__edge-textbg { fill: var(--app-bg-sunken); }
 .kg-canvas .react-flow__node { cursor: pointer; }
 /* Zoomed out (below LOD_ZOOM in kg-graph-view.tsx): dots and lines only. */
 .kg-canvas.is-zoomed-out .kg-gnode-label,
 .kg-canvas.is-zoomed-out .react-flow__edge-text,
 .kg-canvas.is-zoomed-out .react-flow__edge-textbg { display: none; }
+.kg-canvas.is-zoomed-out .kg-gnode { outline: none; }
 
-/* Node fills: type (default), sensitivity, decay. Unknown values fall back to grey. */
-.kg-c-type-person       { --kg-fill: #53A0DB; }
-.kg-c-type-organization { --kg-fill: #6BAED6; }
-.kg-c-type-project      { --kg-fill: #7E6BA8; }
-.kg-c-type-decision     { --kg-fill: #C9874A; }
-.kg-c-type-event        { --kg-fill: #5E9E6B; }
-.kg-c-type-concept      { --kg-fill: #888888; }
-.kg-c-type-fact         { --kg-fill: #444444; }
-.kg-c-type-other        { --kg-fill: #4174C8; }
-.kg-c-sens-public       { --kg-fill: #5E9E6B; }
-.kg-c-sens-internal     { --kg-fill: #4174C8; }
-.kg-c-sens-confidential { --kg-fill: #C9874A; }
-.kg-c-sens-restricted   { --kg-fill: #E86040; }
-.kg-c-sens-other        { --kg-fill: #888888; }
-.kg-c-decay-permanent   { --kg-fill: #5E9E6B; }
-.kg-c-decay-slow_decay  { --kg-fill: #4174C8; }
-.kg-c-decay-fast_decay  { --kg-fill: #E86040; }
-.kg-c-decay-other       { --kg-fill: #888888; }
+/* Zoom and fit buttons, in the console's card style. */
+.kg-canvas .react-flow__controls {
+  margin: 14px;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--app-card);
+}
+.kg-canvas .react-flow__controls-button {
+  width: 30px; height: 30px; padding: 8px;
+  border: none; border-bottom: 1px solid var(--app-border-soft);
+  background: transparent; color: var(--app-fg-muted);
+  cursor: pointer;
+}
+.kg-canvas .react-flow__controls-button:last-child { border-bottom: none; }
+.kg-canvas .react-flow__controls-button:hover { background: var(--app-row-hover); color: var(--app-fg); }
+
+/* xyflow's attribution link (kept, as xyflow asks), quiet and on-theme. */
+.kg-canvas .react-flow__attribution { background: transparent; padding: 4px 10px; }
+.kg-canvas .react-flow__attribution a { color: var(--app-fg-subtle); opacity: .55; font-size: 9px; letter-spacing: .04em; }
+.kg-canvas .react-flow__attribution a:hover { opacity: 1; }
+
+/* Node fills: type (default), sensitivity, decay. Unknown values use --kg-other. */
+.kg-c-type-person       { --kg-fill: var(--kg-person); }
+.kg-c-type-organization { --kg-fill: var(--kg-organization); }
+.kg-c-type-project      { --kg-fill: var(--kg-project); }
+.kg-c-type-decision     { --kg-fill: var(--kg-decision); }
+.kg-c-type-event        { --kg-fill: var(--kg-event); }
+.kg-c-type-concept      { --kg-fill: var(--kg-concept); }
+.kg-c-type-fact         { --kg-fill: var(--kg-fact); }
+.kg-c-type-other        { --kg-fill: var(--kg-other); }
+.kg-c-sens-public       { --kg-fill: var(--kg-public); }
+.kg-c-sens-internal     { --kg-fill: var(--kg-internal); }
+.kg-c-sens-confidential { --kg-fill: var(--kg-confidential); }
+.kg-c-sens-restricted   { --kg-fill: var(--kg-restricted); }
+.kg-c-sens-other        { --kg-fill: var(--kg-other); }
+.kg-c-decay-permanent   { --kg-fill: var(--kg-public); }
+.kg-c-decay-slow_decay  { --kg-fill: var(--kg-internal); }
+.kg-c-decay-fast_decay  { --kg-fill: var(--kg-restricted); }
+.kg-c-decay-other       { --kg-fill: var(--kg-other); }
 
 /* Right: read-only node detail panel */
 .kg-detail-drawer {
@@ -2692,19 +2768,19 @@ table.records-table tbody tr.active td { background: transparent; }
 }
 
 /* Badge variants for KG node types (extend the existing badge styles) */
-.badge-kg-person       { background: color-mix(in srgb, var(--app-blue) 14%, transparent); color: var(--app-blue); border: 1px solid color-mix(in srgb, var(--app-blue) 35%, transparent); }
-.badge-kg-organization { background: rgba(107,174,214,0.12); color: #4174C8; border: 1px solid rgba(107,174,214,0.3); }
-.badge-kg-project      { background: rgba(126,107,168,0.12); color: #7E6BA8; border: 1px solid rgba(126,107,168,0.3); }
-.badge-kg-decision     { background: rgba(201,135,74,0.12); color: #C9874A; border: 1px solid rgba(201,135,74,0.3); }
-.badge-kg-event        { background: rgba(94,158,107,0.12); color: #5E9E6B; border: 1px solid rgba(94,158,107,0.3); }
-.badge-kg-concept      { background: rgba(136,136,136,0.12); color: #888888; border: 1px solid rgba(136,136,136,0.3); }
-.badge-kg-fact         { background: rgba(68,68,68,0.12); color: #888888; border: 1px solid rgba(68,68,68,0.3); }
+.badge-kg-person        { background: color-mix(in srgb, var(--kg-person) 14%, transparent); color: var(--kg-person); border: 1px solid color-mix(in srgb, var(--kg-person) 35%, transparent); }
+.badge-kg-organization  { background: color-mix(in srgb, var(--kg-organization) 14%, transparent); color: var(--kg-organization); border: 1px solid color-mix(in srgb, var(--kg-organization) 35%, transparent); }
+.badge-kg-project       { background: color-mix(in srgb, var(--kg-project) 14%, transparent); color: var(--kg-project); border: 1px solid color-mix(in srgb, var(--kg-project) 35%, transparent); }
+.badge-kg-decision      { background: color-mix(in srgb, var(--kg-decision) 14%, transparent); color: var(--kg-decision); border: 1px solid color-mix(in srgb, var(--kg-decision) 35%, transparent); }
+.badge-kg-event         { background: color-mix(in srgb, var(--kg-event) 14%, transparent); color: var(--kg-event); border: 1px solid color-mix(in srgb, var(--kg-event) 35%, transparent); }
+.badge-kg-concept       { background: color-mix(in srgb, var(--kg-concept) 14%, transparent); color: var(--kg-concept); border: 1px solid color-mix(in srgb, var(--kg-concept) 35%, transparent); }
+.badge-kg-fact          { background: color-mix(in srgb, var(--kg-fact) 14%, transparent); color: var(--app-fg-muted); border: 1px solid color-mix(in srgb, var(--kg-fact) 35%, transparent); }
 
 /* Badge variants for sensitivity */
-.badge-kg-public       { background: rgba(94,158,107,0.12); color: #5E9E6B; border: 1px solid rgba(94,158,107,0.3); }
-.badge-kg-internal     { background: rgba(65,116,200,0.12); color: #4174C8; border: 1px solid rgba(65,116,200,0.3); }
-.badge-kg-confidential { background: rgba(201,135,74,0.12); color: #C9874A; border: 1px solid rgba(201,135,74,0.3); }
-.badge-kg-restricted   { background: rgba(232,96,64,0.12); color: #E86040; border: 1px solid rgba(232,96,64,0.3); }
+.badge-kg-public        { background: color-mix(in srgb, var(--kg-public) 14%, transparent); color: var(--kg-public); border: 1px solid color-mix(in srgb, var(--kg-public) 35%, transparent); }
+.badge-kg-internal      { background: color-mix(in srgb, var(--kg-internal) 14%, transparent); color: var(--kg-internal); border: 1px solid color-mix(in srgb, var(--kg-internal) 35%, transparent); }
+.badge-kg-confidential  { background: color-mix(in srgb, var(--kg-confidential) 14%, transparent); color: var(--kg-confidential); border: 1px solid color-mix(in srgb, var(--kg-confidential) 35%, transparent); }
+.badge-kg-restricted    { background: color-mix(in srgb, var(--kg-restricted) 14%, transparent); color: var(--kg-restricted); border: 1px solid color-mix(in srgb, var(--kg-restricted) 35%, transparent); }
 
 /* Mobile: stack sidebar above canvas, hide detail drawer inline */
 @media (max-width: 768px) {

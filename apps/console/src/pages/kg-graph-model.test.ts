@@ -62,11 +62,11 @@ describe('model', () => {
 });
 
 describe('appearance', () => {
-  it('sizes by degree with the old 20–80px range; facts are fixed', () => {
-    expect(nodeSize('person', 0)).toBe(20);
-    expect(nodeSize('person', 15)).toBe(80);
-    expect(nodeSize('person', 40)).toBe(80);
-    expect(nodeSize('fact', 30)).toBe(10);
+  it('sizes by degree from 14px to 56px; facts are fixed', () => {
+    expect(nodeSize('person', 0)).toBe(14);
+    expect(nodeSize('person', 15)).toBe(56);
+    expect(nodeSize('person', 40)).toBe(56);
+    expect(nodeSize('fact', 30)).toBe(8);
   });
 
   it('colours by type, sensitivity or decay, with an "other" fallback', () => {
@@ -95,6 +95,19 @@ describe('buildFlow', () => {
     expect(nodes.find(n => n.id === 'a')!.hidden).toBe(false);
     expect(edges.find(e => e.id === 'af')!.hidden).toBe(true);
     expect(edges.find(e => e.id === 'ab')!.hidden).toBe(false);
+  });
+
+  it('brings the focal node\'s edges forward with their labels; others stay quiet', () => {
+    const { edges } = buildFlow(sample(), opts({ focalId: 'b' }), emptyFlowCache());
+    const ab = edges.find(e => e.id === 'ab')!;
+    const af = edges.find(e => e.id === 'af')!;
+    expect(ab.data!.focal).toBe(true);
+    expect(ab.className).toBe('is-focal-edge');
+    expect(ab.data!.labelAt).toBe(0.4); // b is the target: label sits nearer a
+    expect(af.data!.focal).toBe(false);
+    expect(af.data!.labelAt).toBeNull();
+    expect(af.className).toBeUndefined();
+    expect(Number(ab.style!.opacity)).toBeGreaterThan(Number(af.style!.opacity));
   });
 
   it('reuses unchanged node objects so memoised nodes skip re-rendering', () => {

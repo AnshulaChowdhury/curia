@@ -39,6 +39,14 @@ export type KgNodeData = {
 
 export type KgEdgeData = {
   label: string;
+  /** Touches the focal node: drawn in the accent colour. */
+  focal: boolean;
+  /**
+   * Where along the line (0 = source, 1 = target) to put the relationship label, or null for
+   * none. Only the focal node's edges are labelled, away from the focal end so labels around
+   * a hub spread out; edges to fact dots are never labelled.
+   */
+  labelAt: number | null;
   /** Radii of the end nodes, so the line stops at each circle's edge and the arrow shows. */
   sourceR: number;
   targetR: number;
@@ -132,10 +140,10 @@ export function graphStatus(m: GraphModel, filter: KgFilter): string {
 
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 
-/** Hubs stand out: 20px with no edges up to 80px at 15 or more. Facts are fixed small dots. */
+/** Hubs stand out: 14px with no edges up to 56px at 15 or more. Facts are fixed small dots. */
 export function nodeSize(type: string, degree: number): number {
-  if (type === 'fact') return 10;
-  return 20 + (Math.min(Math.max(degree, 0), 15) / 15) * 60;
+  if (type === 'fact') return 8;
+  return 14 + (Math.min(Math.max(degree, 0), 15) / 15) * 42;
 }
 
 const KNOWN_TYPES = new Set(['person', 'organization', 'project', 'decision', 'event', 'concept', 'fact']);
@@ -155,8 +163,9 @@ export function colorClass(n: ApiKgNode, mode: ColorMode): string {
   return `kg-c-type-${KNOWN_TYPES.has(n.type) ? n.type : 'other'}`;
 }
 
-// One shared arrowhead definition for every edge; its colour follows the theme.
-const ARROW = { type: MarkerType.ArrowClosed, color: 'var(--kg-edge)', width: 10, height: 10 };
+// Two shared arrowhead definitions (quiet and focal); colours follow the theme.
+const ARROW = { type: MarkerType.ArrowClosed, color: 'var(--kg-edge)', width: 8, height: 8 };
+const ARROW_FOCAL = { type: MarkerType.ArrowClosed, color: 'var(--kg-edge-focal)', width: 8, height: 8 };
 
 export interface FlowOptions {
   colorMode: ColorMode;
@@ -222,13 +231,18 @@ export function buildFlow(m: GraphModel, opts: FlowOptions, cache: FlowCache): {
     const hidden = hiddenIds.has(e.sourceNodeId) || hiddenIds.has(e.targetNodeId);
     const sourceR = (sizes.get(e.sourceNodeId) ?? 0) / 2;
     const targetR = (sizes.get(e.targetNodeId) ?? 0) / 2;
-    const key = [hidden, e.type, conf, sourceR, targetR].join('|');
+    const focal = opts.focalId !== null && (e.sourceNodeId === opts.focalId || e.targetNodeId === opts.focalId);
+    const toFact = m.nodes.get(e.sourceNodeId)?.type === 'fact' || m.nodes.get(e.targetNodeId)?.type === 'fact';
+    const labelAt = focal && !toFact ? (e.sourceNodeId === opts.focalId ? 0.6 : 0.4) : null;
+    const key = [hidden, e.type, conf, sourceR, targetR, focal, labelAt].join('|');
     const prev = cache.edges.get(e.id);
     const edge: KgFlowEdge = prev && prev.key === key ? prev.edge : {
       id: e.id, type: 'kg', source: e.sourceNodeId, target: e.targetNodeId, hidden,
-      markerEnd: ARROW,
-      style: { strokeWidth: 1 + conf * 2.5, opacity: 0.15 + conf * 0.55 },
-      data: { label: e.type, sourceR, targetR },
+      markerEnd: focal ? ARROW_FOCAL : ARROW,
+      // Width and strength by confidence; the focal node's edges stand forward.
+      style: { strokeWidth: 0.75 + conf * 1.75, opacity: focal ? 0.55 + conf * 0.4 : 0.12 + conf * 0.45 },
+      ...(focal ? { className: 'is-focal-edge' } : {}),
+      data: { label: e.type, sourceR, targetR, focal, labelAt },
     };
     nextEdgeCache.set(e.id, { key, edge });
     edges.push(edge);

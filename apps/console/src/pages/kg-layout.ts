@@ -57,7 +57,7 @@ const DECAY_SCORE: Record<string, number> = {
 };
 
 /** Labels are clipped to this width; the collision radius keeps neighbours' labels apart. */
-export const LABEL_WIDTH = 90;
+export const LABEL_WIDTH = 96;
 
 const FULL_TICKS = 300;
 const EXPAND_TICKS = 150;
@@ -78,15 +78,15 @@ interface SimLink extends SimulationLinkDatum<SimNode> {
 /** Repulsion: facts barely push (they cluster on their entity); hub types need room. */
 export function chargeFor(type: string): number {
   if (type === 'fact') return -40;
-  if (type === 'person' || type === 'organization' || type === 'event') return -320;
-  return -220;
+  if (type === 'person' || type === 'organization' || type === 'event') return -460;
+  return -320;
 }
 
-/** Rest length: facts hug their entity, strong pairs sit close, the rest settle at 150px. */
+/** Rest length: facts hug their entity, strong pairs sit close, the rest settle at 170px. */
 export function linkDistance(sourceType: string, targetType: string, label: string): number {
-  if (sourceType === 'fact' || targetType === 'fact') return 70;
-  if (STRONG_EDGES.has(label)) return 110;
-  return 150;
+  if (sourceType === 'fact' || targetType === 'fact') return 64;
+  if (STRONG_EDGES.has(label)) return 120;
+  return 170;
 }
 
 /** Spring strength: strong pairs pull hard; otherwise confidence × the staler endpoint. */
@@ -100,7 +100,8 @@ export function linkStrength(label: string, confidence: number, sourceDecay: str
 /** Footprint: facts hide their label, so only the dot counts; others reserve label width. */
 export function collisionRadius(type: string, size: number): number {
   if (type === 'fact') return size / 2 + 4;
-  return Math.max(size / 2 + 8, LABEL_WIDTH / 2);
+  // Half the label width plus a gutter, so neighbouring labels never touch.
+  return Math.max(size / 2 + 10, LABEL_WIDTH / 2 + 14);
 }
 
 // Deterministic randomness (same graph, same picture) for d3's jiggle and new-node scatter.

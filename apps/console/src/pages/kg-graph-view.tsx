@@ -13,7 +13,7 @@ import type { EdgeProps, EdgeTypes, NodeProps, NodeTypes } from '@xyflow/react';
 import type { KgFlowEdge, KgFlowNode } from './kg-graph-model.js';
 
 /** Below this zoom the canvas switches to dots only: no node or edge labels. */
-export const LOD_ZOOM = 0.6;
+export const LOD_ZOOM = 0.75;
 
 const KgGraphNode = memo(function KgGraphNode({ data, selected }: NodeProps<KgFlowNode>) {
   const cls = ['kg-gnode', data.colorClass];
@@ -46,10 +46,15 @@ const KgGraphEdge = memo(function KgGraphEdge({
       path={`M ${x1},${y1} L ${x2},${y2}`}
       markerEnd={markerEnd}
       style={style}
-      label={data?.label}
-      labelX={(x1 + x2) / 2}
-      labelY={(y1 + y2) / 2}
-      labelShowBg={false}
+      // Only the focal node's edges carry a label (see KgEdgeData.labelAt).
+      {...(data && data.labelAt !== null ? {
+        label: data.label,
+        labelX: x1 + (x2 - x1) * data.labelAt,
+        labelY: y1 + (y2 - y1) * data.labelAt,
+        labelShowBg: true,
+        labelBgPadding: [5, 2] as [number, number],
+        labelBgBorderRadius: 4,
+      } : {})}
     />
   );
 });
