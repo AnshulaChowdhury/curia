@@ -673,6 +673,18 @@ export class HttpAdapter implements Channel {
     // to this static bundle instead of the console /* fallback.
     await this.app.register(antfarmStaticRoutes);
 
+    // Books (MowMow bookkeeping) — QuickBooks connection and the narrow API the Mac mini uses. Curia holds the
+    // QuickBooks tokens in the vault; the books token (BOOKS_API_TOKEN) reaches these routes only.
+    if (this.config.secretsService) {
+      await this.app.register(quickbooksRoutes, {
+        logger,
+        connection: new QboConnection(qboSettingsFromEnv(), this.config.secretsService, logger),
+        getToken: () => process.env.BOOKS_API_TOKEN ?? null,
+        webAppBootstrapSecret,
+        sessions,
+      });
+    }
+
     // Console app — registered last so all explicit API/KG routes above take priority
     // over its /* wildcard. The React app handles auth client-side via session cookie.
     await this.app.register(consoleRoutes);
