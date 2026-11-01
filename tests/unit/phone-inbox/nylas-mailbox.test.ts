@@ -8,37 +8,59 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe('NylasMailbox', () => {
-  it('maps folder ids to names, asks only for unread inbox mail, and sends GETs with the bearer key', async () => {
+  it('asks only for each triage tag, never the whole inbox, and maps folder ids to names', async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
       const u = String(url);
-      if (u.endsWith('/folders')) return jsonResponse({ data: [{ id: 'Label_9', name: '🚨 Urgent' }] });
+      if (u.endsWith('/folders')) {
+        return jsonResponse({
+          data: [
+            { id: 'INBOX', name: 'INBOX', unread_count: 4210 },
+            { id: 'Label_9', name: '🚨 Urgent' },
+            { id: 'Label_7', name: 'Receipts' },
+          ],
+        });
+      }
       return jsonResponse({
-        data: [{
-          id: 'm1', thread_id: 't1', subject: 'Hi', date: 1000,
-          from: [{ name: 'Dana', email: 'dana@example.com' }],
-          folders: ['INBOX', 'Label_9'],
-          body: 'SECRET BODY', snippet: 'SECRET SNIPPET',
-        }],
+        data: [
+          {
+            id: 'm1', thread_id: 't1', subject: 'Hi', date: 1000,
+            from: [{ name: 'Dana', email: 'dana@example.com' }],
+            folders: ['INBOX', 'Label_9'],
+            body: 'SECRET BODY', snippet: 'SECRET SNIPPET',
+          },
+          { id: 'm2', thread_id: 't2', subject: 'Archived', date: 900, folders: ['Label_9'] }, // not in the inbox
+        ],
       });
     });
     const mailbox = new NylasMailbox('key', 'grant/1', fetchMock as unknown as typeof fetch);
 
-    const messages = await mailbox.unreadInbox();
+    const snapshot = await mailbox.inboxSnapshot();
 
-    expect(messages).toEqual([
+    expect(snapshot.unreadCount).toBe(4210);
+    expect(snapshot.messages).toEqual([
       { id: 'm1', threadId: 't1', subject: 'Hi', fromName: 'Dana', fromEmail: 'dana@example.com', date: 1000, folderNames: ['INBOX', '🚨 Urgent'] },
     ]);
     // Bodies and snippets are never carried through, even if Nylas sends them.
-    expect(JSON.stringify(messages)).not.toContain('SECRET');
+    expect(JSON.stringify(snapshot)).not.toContain('SECRET');
     const urls = fetchMock.mock.calls.map((c) => String(c[0]));
-    expect(urls.some((u) => u.includes('/grants/grant%2F1/'))).toBe(true);
-    expect(urls.find((u) => u.includes('/messages'))).toContain('in=INBOX');
+    expect(urls).toHaveLength(2); // folders + the one tag; no scan of INBOX
+    expect(urls.find((u) => u.includes('/messages'))).toContain('in=Label_9');
     expect(urls.find((u) => u.includes('/messages'))).toContain('unread=true');
+    expect(urls.find((u) => u.includes('/messages'))).not.toContain('in=INBOX');
+    expect(urls.some((u) => u.includes('/grants/grant%2F1/'))).toBe(true);
     for (const call of fetchMock.mock.calls) {
       const init = call[1] as RequestInit;
       expect(init.method).toBe('GET');
       expect((init.headers as Record<string, string>).Authorization).toBe('Bearer key');
     }
+  });
+
+  it('makes no message calls at all when no triage tags exist yet', async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      jsonResponse({ data: [{ id: 'INBOX', name: 'INBOX', unread_count: 12 }] }));
+    const snapshot = await new NylasMailbox('key', 'g', fetchMock as unknown as typeof fetch).inboxSnapshot();
+    expect(snapshot).toEqual({ messages: [], unreadCount: 12 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('talks to the EU host for an EU application, and the US host by default', async () => {

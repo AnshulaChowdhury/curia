@@ -27,7 +27,7 @@ function message(over: Partial<InboxMessage> & { id: string }): InboxMessage {
 }
 
 function reader(unread: InboxMessage[], sent: SentMessage[] = []): MailboxReader {
-  return { unreadInbox: async () => unread, sentSince: async () => sent };
+  return { inboxSnapshot: async () => ({ messages: unread, unreadCount: undefined }), sentSince: async () => sent };
 }
 
 async function build(accounts: Array<[string, MailboxReader | null]>) {
@@ -128,12 +128,34 @@ describe('PhoneInboxService', () => {
     expect(Object.keys(result.accounts[0]!.items[0]!).sort()).toEqual(['from', 'group', 'receivedAt', 'subject', 'threadId']);
   });
 
+  it('reports the provider unread total, not just the tagged messages', async () => {
+    const r: MailboxReader = {
+      inboxSnapshot: async () => ({ messages: [message({ id: 'a' })], unreadCount: 4210 }),
+      sentSince: async () => [],
+    };
+    const result = await build([['personal', r]]);
+    expect(result.accounts[0]).toMatchObject({ needsYou: 1, unread: 4210 });
+  });
+
+  it('only looks for replies since the oldest candidate, and not at all with no candidates', async () => {
+    const asked: number[] = [];
+    const mk = (messages: InboxMessage[]): MailboxReader => ({
+      inboxSnapshot: async () => ({ messages, unreadCount: undefined }),
+      sentSince: async (since) => { asked.push(since); return []; },
+    });
+    await build([['personal', mk([message({ id: 'a', date: nowSec - 7200 }), message({ id: 'b', date: nowSec - 600 })])]]);
+    expect(asked).toEqual([nowSec - 7200 - 60]);
+    asked.length = 0;
+    await build([['moonray', mk([])]]);
+    expect(asked).toEqual([]);
+  });
+
   describe('when a mailbox cannot be read, and caching', () => {
     function counting(unread: InboxMessage[]) {
       let calls = 0;
       let failWith: Error | null = null;
       const r: MailboxReader = {
-        unreadInbox: async () => { calls++; if (failWith) throw failWith; return unread; },
+        inboxSnapshot: async () => { calls++; if (failWith) throw failWith; return { messages: unread, unreadCount: undefined }; },
         sentSince: async () => [],
       };
       return { r, calls: () => calls, fail: (e: Error | null) => { failWith = e; } };
@@ -216,7 +238,7 @@ describe('PhoneInboxService', () => {
       let running = 0;
       let peak = 0;
       const slow = async <T,>(v: T): Promise<T> => { running++; peak = Math.max(peak, running); await new Promise((r) => setTimeout(r, 5)); running--; return v; };
-      const r: MailboxReader = { unreadInbox: () => slow([message({ id: 'a' })]), sentSince: () => slow([] as SentMessage[]) };
+      const r: MailboxReader = { inboxSnapshot: () => slow({ messages: [message({ id: 'a' })], unreadCount: undefined }), sentSince: () => slow([] as SentMessage[]) };
       await make([['personal', r]], new PhoneInboxCache(), { t: NOW }).build();
       expect(peak).toBe(1);
     });
