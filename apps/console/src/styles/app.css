@@ -2503,9 +2503,100 @@ table.records-table tbody tr.active td { background: transparent; }
 /* Cytoscape canvas container — fills remaining height */
 .kg-canvas {
   flex: 1;
+  position: relative;
   min-height: 0;
   background: var(--app-bg-sunken);
+  /* Graph colours follow the theme (ADR-058). */
+  --kg-node-text: var(--app-fg);
+  --kg-edge: var(--app-fg-muted);
+  --kg-edge-label: var(--app-fg-subtle);
+  --kg-focal: var(--app-fg);
 }
+.kg-canvas .react-flow { background: transparent; }
+
+/* Moonray loader while the graph waits on the server or the layout. It fades in after
+   150ms, so quick answers never flash it; it never blocks the canvas. */
+@keyframes kg-loader-in { from { opacity: 0; } to { opacity: 1; } }
+.kg-loader {
+  position: absolute; z-index: 5;
+  display: flex; align-items: center; gap: 10px;
+  color: var(--app-fg);
+  pointer-events: none;
+  animation: kg-loader-in .2s ease .15s both;
+}
+.kg-loader--load {
+  inset: 0; flex-direction: column; justify-content: center; gap: 14px;
+  background: color-mix(in srgb, var(--app-bg-sunken) 72%, transparent);
+}
+.kg-loader--expand { top: 12px; left: 12px; }
+.kg-loader-label {
+  font-size: 10px; font-weight: 500; text-transform: uppercase;
+  letter-spacing: var(--app-eyebrow-tracking, 0.12em);
+  color: var(--app-fg-muted);
+}
+.kg-loader-inline {
+  display: flex; align-items: center; gap: 8px; padding: 4px 2px 8px;
+  font-size: 11px; color: var(--app-fg-muted);
+  animation: kg-loader-in .2s ease .15s both;
+}
+
+/* Graph nodes: a dot with its label hanging below. Kept to plain fills and borders (no
+   shadows or filters) because a canvas can hold hundreds of them. */
+.kg-gnode {
+  position: relative;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: var(--kg-fill, #4174C8);
+  cursor: pointer;
+}
+.kg-gnode.is-focal { border: 3px solid var(--kg-focal); }
+.kg-gnode-label {
+  position: absolute; top: 100%; left: 50%;
+  transform: translateX(-50%);
+  margin-top: 5px;
+  max-width: 90px;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  font-size: 10px; line-height: 1.2;
+  color: var(--kg-node-text);
+  pointer-events: none;
+}
+/* Facts are small dots; their label shows only while selected. */
+.kg-gnode.is-fact .kg-gnode-label { display: none; }
+.kg-gnode.is-fact.is-selected .kg-gnode-label { display: block; font-size: 9px; }
+/* Edges attach at the node centre; the edge component trims each line to the rim. */
+.kg-gnode .kg-gnode-handle {
+  top: 50%; bottom: auto; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 1px; height: 1px; min-width: 0; min-height: 0;
+  border: 0; background: transparent; opacity: 0;
+  pointer-events: none;
+}
+.kg-canvas .react-flow__edge-path { stroke: var(--kg-edge); }
+.kg-canvas .react-flow__edge-text { fill: var(--kg-edge-label); font-size: 8px; }
+.kg-canvas .react-flow__node { cursor: pointer; }
+/* Zoomed out (below LOD_ZOOM in kg-graph-view.tsx): dots and lines only. */
+.kg-canvas.is-zoomed-out .kg-gnode-label,
+.kg-canvas.is-zoomed-out .react-flow__edge-text,
+.kg-canvas.is-zoomed-out .react-flow__edge-textbg { display: none; }
+
+/* Node fills: type (default), sensitivity, decay. Unknown values fall back to grey. */
+.kg-c-type-person       { --kg-fill: #53A0DB; }
+.kg-c-type-organization { --kg-fill: #6BAED6; }
+.kg-c-type-project      { --kg-fill: #7E6BA8; }
+.kg-c-type-decision     { --kg-fill: #C9874A; }
+.kg-c-type-event        { --kg-fill: #5E9E6B; }
+.kg-c-type-concept      { --kg-fill: #888888; }
+.kg-c-type-fact         { --kg-fill: #444444; }
+.kg-c-type-other        { --kg-fill: #4174C8; }
+.kg-c-sens-public       { --kg-fill: #5E9E6B; }
+.kg-c-sens-internal     { --kg-fill: #4174C8; }
+.kg-c-sens-confidential { --kg-fill: #C9874A; }
+.kg-c-sens-restricted   { --kg-fill: #E86040; }
+.kg-c-sens-other        { --kg-fill: #888888; }
+.kg-c-decay-permanent   { --kg-fill: #5E9E6B; }
+.kg-c-decay-slow_decay  { --kg-fill: #4174C8; }
+.kg-c-decay-fast_decay  { --kg-fill: #E86040; }
+.kg-c-decay-other       { --kg-fill: #888888; }
 
 /* Right: read-only node detail panel */
 .kg-detail-drawer {

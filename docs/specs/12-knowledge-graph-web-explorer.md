@@ -8,7 +8,7 @@ Provide a secure browser-based UI for inspecting Curia's knowledge graph directl
 
 The original design used a hand-rolled Cytoscape.js SPA served directly by Fastify from `node_modules`. This was migrated to the React console (`apps/console/`) as part of the framework migration (#753). The console is now the sole UI; the legacy SPA has been removed.
 
-The KG view in the React console uses `/api/kg/*` for graph primitives (nodes, graph, node merge), rendered via React and Cytoscape.js bundled through Vite. Console task/contact/chat CRUD lives under `/api/tasks`, `/api/contacts`, and `/api/chat` (#872).
+The KG view in the React console uses `/api/kg/*` for graph primitives (nodes, graph, node merge), rendered with xyflow (React Flow) and laid out by d3-force in a Web Worker ([ADR-058](../adr/058-knowledge-graph-view-on-xyflow.md)). Console task/contact/chat CRUD lives under `/api/tasks`, `/api/contacts`, and `/api/chat` (#872).
 
 ## Security model
 
