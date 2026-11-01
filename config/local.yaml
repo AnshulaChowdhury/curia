@@ -1,0 +1,27 @@
+# Deployment override (merged over default.yaml; see loadYamlConfig in src/config.ts).
+# This deployment runs on AWS Bedrock only (no Anthropic API key), calling from
+# ca-central-1. From there Claude is reached through cross-region profiles: `us.` (US
+# regions only) or `global.` (anywhere). `eu.` profiles are for EU source regions, so they
+# are not used here. NOTE: neither keeps inference inside Canada. Only Claude Sonnet 4.6
+# and Haiku 4.5 are registered for Bedrock, so `powerful` shares Sonnet until another model
+# is added to the registry.
+#
+# This file is gitignored upstream; it is force-added on this fork so the Docker build
+# (which copies config/) picks it up. It holds model ids only, no secrets.
+model_routing:
+  tiers:
+    fast:
+      model: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    standard:
+      model: us.anthropic.claude-sonnet-4-6
+    powerful:
+      model: us.anthropic.claude-sonnet-4-6
+  default_tier: standard
+
+# The two judges also name Anthropic API models in default.yaml; point them at Bedrock too.
+filter:
+  llmJudge:
+    model: us.anthropic.claude-haiku-4-5-20251001-v1:0
+escalation:
+  judge:
+    model: us.anthropic.claude-haiku-4-5-20251001-v1:0
