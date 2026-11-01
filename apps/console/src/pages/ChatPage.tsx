@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { MobileMenuContext } from '../context/MobileMenu.js';
 import { Sidebar } from '../components/Sidebar.js';
 import { Topbar } from '../components/Topbar.js';
-import { HeroBackground } from '../components/HeroBackground.js';
+import { MoonrayRings } from '../components/MoonrayRings.js';
 import { useTheme } from '../hooks/useTheme.js';
 import { ChatThread } from './chat/ChatThread.js';
 import { ChatComposer } from './chat/ChatComposer.js';
@@ -34,7 +34,7 @@ export default function ChatPage() {
         <main className="main">
           <Topbar crumb="Moonray Ventures OS" title="Chat" />
           <div className="chat-page">
-            <HeroBackground />
+            <MoonrayRings />
             <ChatThread
               messages={messages}
               hasMore={hasMore}

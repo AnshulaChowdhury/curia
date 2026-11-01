@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { useNavigate } from '@tanstack/react-router';
-import { HeroBackground } from '../components/HeroBackground';
+import { MoonrayRings } from '../components/MoonrayRings.js';
 import { MoonrayMark } from '../components/MoonrayMark';
 import { apiFetch } from '../api';
 
@@ -35,7 +35,7 @@ export default function LoginPage() {
 
   return (
     <div className="login-root moonray-login">
-      <HeroBackground />
+      <MoonrayRings />
       <div className="login-card">
         <div className="login-brand">
           <MoonrayMark />
