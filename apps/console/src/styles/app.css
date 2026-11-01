@@ -61,12 +61,12 @@
 
 /* ── 1. Theme tokens ─────────────────────────────────────────────────── */
 :root {
-  --app-bg:           #F1F5F9;
-  --app-bg-sunken:    #E5EAF2;
+  --app-bg:           #EFEFEF;
+  --app-bg-sunken:    #E4E4E4;
   --app-card:         #FFFFFF;
   --app-card-elev:    #FFFFFF;
   --app-side:         #FFFFFF;
-  --app-muted:        #E5EAF2;
+  --app-muted:        #E4E4E4;
   --app-accent-bg:    #CBD5E4;
   --app-border:       rgba(9,27,82,0.12);
   --app-border-soft:  rgba(9,27,82,0.07);
@@ -78,14 +78,15 @@
   --app-primary-fg:   #FFFFFF;
   --app-destructive:  #C24A30;
   --app-teal:         #30689a;
+  --app-accent-fill:  #30689a;
   --app-teal-soft:    rgba(48,104,154,0.10);
   --app-blue:         #30689a;
-  --app-blue-soft:    #36aab7;
+  --app-blue-soft:    #6F9CC8;
   --app-green:        #5E9E6B;
   --app-amber:        #C9874A;
   --app-violet:       #7E6BA8;
   --app-row-zebra:    rgba(9,27,82,0.025);
-  --app-row-hover:    rgba(54,170,183,0.08);
+  --app-row-hover:    rgba(9,27,82,0.05);
   --shadow-1:         0 1px 2px rgba(9,27,82,0.08);
   --shadow-2:         0 4px 16px rgba(9,27,82,0.12);
   --shadow-drawer:    -16px 0 32px -16px rgba(9,27,82,0.22);
@@ -109,15 +110,16 @@
   --app-primary:      #DEE4EE;
   --app-primary-fg:   #091b52;
   --app-destructive:  #E86040;
-  --app-teal:         #36aab7;
-  --app-teal-soft:    rgba(54,170,183,0.16);
+  --app-teal:         #EFEFEF;
+  --app-accent-fill:  #30689a;
+  --app-teal-soft:    rgba(239,239,239,0.12);
   --app-blue:         #53A0DB;
-  --app-blue-soft:    #36aab7;
+  --app-blue-soft:    #6F9CC8;
   --app-green:        #5E9E6B;
   --app-amber:        #C9874A;
   --app-violet:       #7E6BA8;
   --app-row-zebra:    rgba(255,255,255,0.025);
-  --app-row-hover:    rgba(54,170,183,0.12);
+  --app-row-hover:    rgba(239,239,239,0.06);
   --shadow-1:         0 1px 2px rgba(0,0,0,0.40);
   --shadow-2:         0 4px 16px rgba(0,0,0,0.45);
   --shadow-drawer:    -16px 0 32px -16px rgba(0,0,0,0.40);
@@ -142,10 +144,11 @@
     --app-primary:      #DEE4EE;
     --app-primary-fg:   #091b52;
     --app-destructive:  #E86040;
-    --app-teal:         #36aab7;
-    --app-teal-soft:    rgba(54,170,183,0.16);
+    --app-accent-fill:  #30689a;
+    --app-teal:         #EFEFEF;
+    --app-teal-soft:    rgba(239,239,239,0.12);
     --app-row-zebra:    rgba(255,255,255,0.025);
-    --app-row-hover:    rgba(54,170,183,0.12);
+    --app-row-hover:    rgba(239,239,239,0.06);
     --shadow-1:         0 1px 2px rgba(0,0,0,0.40);
     --shadow-2:         0 4px 16px rgba(0,0,0,0.45);
     --shadow-drawer:    -16px 0 32px -16px rgba(0,0,0,0.40);
@@ -646,7 +649,7 @@ a.dash-activity-headline:hover { text-decoration: underline; }
 .dash-ask-text { margin: 0; font-size: 14px; color: var(--app-fg-muted); max-width: 520px; }
 .dash-ask-cta {
   flex: 0 0 auto; height: 44px;
-  background: var(--app-teal); color: #FFFFFF; border: none;
+  background: var(--app-accent-fill); color: #FFFFFF; border: none;
   text-decoration: none;
 }
 .dash-ask-cta:hover { filter: brightness(1.08); text-decoration: none; }
@@ -849,7 +852,7 @@ a.dash-activity-headline:hover { text-decoration: underline; }
 .dash-bullpen {
   display: flex; flex-direction: column; gap: 4px;
   text-decoration: none; color: #fff;
-  background: linear-gradient(135deg, color-mix(in srgb, var(--app-teal) 42%, #1c2824), var(--app-teal));
+  background: linear-gradient(135deg, color-mix(in srgb, var(--app-accent-fill) 42%, #091b52), var(--app-accent-fill));
   border: none;
 }
 .dash-bullpen:hover { filter: brightness(1.06); text-decoration: none; color: #fff; }
@@ -1638,7 +1641,7 @@ a.dash-activity-headline:hover { text-decoration: underline; }
   font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
   color: #fff; line-height: 1.4;
 }
-.badge-person       { background: var(--app-teal); }
+.badge-person       { background: var(--app-accent-fill); }
 .badge-task         { background: var(--app-violet); }
 .badge-organization { background: var(--app-blue-soft); color: #111; }
 .badge-project      { background: var(--app-violet); }
@@ -1649,11 +1652,9 @@ a.dash-activity-headline:hover { text-decoration: underline; }
 /* Task owner badges — use filled bg with white text for WCAG 1.4.3 contrast */
 /* Contrast checks (light/dark): curia 6.35/4.4:1, ceo 4.61:1, external 2.98:1 */
 /* badge-external uses dark text (#111) since amber (#C9874A) only reaches 2.98:1 with white */
-/* dark-mode badge-curia overrides to #30689a (same as light --app-teal) to hit 6.35:1 */
-.badge-curia    { background: var(--app-teal);   color: #fff; }
+.badge-curia    { background: var(--app-accent-fill); color: #fff; }
 .badge-ceo      { background: var(--app-violet); color: #fff; }
 .badge-external { background: var(--app-amber);  color: #111; }
-[data-theme="dark"] .badge-curia { background: #30689a; }
 
 /* Status pills — outlined, subtle, with a colored leading dot */
 .status-pill {
@@ -1936,8 +1937,7 @@ table.records-table tbody tr.active td { background: transparent; }
   box-shadow: 0 0 0 3px var(--app-teal-soft);
 }
 
-/* Dark mode: --app-teal (#36aab7) on --app-muted (#14307A) is too low-contrast.
-   Use --app-fg instead to meet WCAG AA at 13px. */
+/* Dark mode: --app-teal is light grey in dark mode; keep task links on --app-fg for consistency. */
 [data-theme="dark"] .task-related-link { color: var(--app-fg); }
 
 /* Linked task title in the jobs table */
@@ -1974,6 +1974,7 @@ table.records-table tbody tr.active td { background: transparent; }
 
 /* ── Chat layout ─────────────────────────────────────────────────────── */
 .chat-page {
+  position: relative;
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -2038,7 +2039,7 @@ table.records-table tbody tr.active td { background: transparent; }
 }
 
 .msg-bubble.user {
-  background: var(--app-teal);
+  background: var(--app-accent-fill);
   color: #fff;
   border-radius: 12px 12px 2px 12px;
 }
@@ -2046,12 +2047,6 @@ table.records-table tbody tr.active td { background: transparent; }
 .msg-bubble.user a {
   color: #fff;
   text-decoration: underline;
-}
-
-/* In dark mode --app-teal is bright turquoise (#36aab7), too light for white text.
-   Override to brand mid-blue (#30689a, ~5.9:1 against white) to stay AA-compliant. */
-[data-theme="dark"] .msg-bubble.user {
-  background: #30689a;
 }
 
 .msg-bubble.agent {
@@ -2097,10 +2092,17 @@ table.records-table tbody tr.active td { background: transparent; }
   color: var(--app-destructive);
 }
 
+/* Moonray rings drift behind the thread; the content layers above them. */
+.chat-page > .hero-bg {
+  position: absolute; inset: 0; z-index: 0;
+  display: block; width: 100%; height: 100%; pointer-events: none;
+}
+.chat-page > :not(.hero-bg) { position: relative; z-index: 1; }
 .chat-input-area {
   flex: none;
   border-top: 1px solid var(--app-border);
-  background: var(--app-bg);
+  background: color-mix(in srgb, var(--app-bg) 80%, transparent);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
   padding-bottom: env(safe-area-inset-bottom, 0);
   min-width: 0;
 }
@@ -2558,7 +2560,7 @@ table.records-table tbody tr.active td { background: transparent; }
 }
 
 /* Badge variants for KG node types (extend the existing badge styles) */
-.badge-kg-person       { background: rgba(54,170,183,0.12); color: #36aab7; border: 1px solid rgba(54,170,183,0.3); }
+.badge-kg-person       { background: color-mix(in srgb, var(--app-blue) 14%, transparent); color: var(--app-blue); border: 1px solid color-mix(in srgb, var(--app-blue) 35%, transparent); }
 .badge-kg-organization { background: rgba(107,174,214,0.12); color: #4174C8; border: 1px solid rgba(107,174,214,0.3); }
 .badge-kg-project      { background: rgba(126,107,168,0.12); color: #7E6BA8; border: 1px solid rgba(126,107,168,0.3); }
 .badge-kg-decision     { background: rgba(201,135,74,0.12); color: #C9874A; border: 1px solid rgba(201,135,74,0.3); }
