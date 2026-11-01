@@ -22,7 +22,7 @@ import {
 } from './kg-merge-utils.js';
 import {
   addToModel, applyPositions, buildFlow, closedNeighborhood, drawerNode, emptyFlowCache, emptyModel, facets,
-  graphStatus, layoutRequest, modelFrom, removeNode,
+  graphStatus, layoutRequest, liveEdges, modelFrom, removeNode, swatchClass,
 } from './kg-graph-model.js';
 import type { ApiKgEdge, ColorMode, KgFlowEdge, KgFlowNode } from './kg-graph-model.js';
 import { KG_EDGE_TYPES, KG_NODE_TYPES, ZoomLevelClass } from './kg-graph-view.js';
@@ -450,14 +450,16 @@ function KgPageInner() {
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as { nodes: ApiKgNode[]; edges: ApiKgEdge[] };
       if (controller.signal.aborted) return { ok: false, aborted: true };
-      // Draws the neighbourhood, then fits the view to the focal node and its neighbours.
-      await renderGraph(data, nodeId);
-      if (controller.signal.aborted) return { ok: false, aborted: true };
-      // Sync selection + URL so refresh and back-nav restore this view.
+      // Sync selection + URL so refresh and back-nav restore this view. Selecting first opens
+      // the detail drawer before the view is fitted, so the fit uses the narrower canvas and
+      // nothing ends up hidden under the drawer.
       const focused = data.nodes.find(n => n.id === nodeId) ?? null;
       setSelectedNode(focused);
       syncUrl(searchRef.current, focused?.id);
       setFocalId(focused?.id ?? null);
+      // Draws the neighbourhood, then fits the view to the focal node and its neighbours.
+      await renderGraph(data, nodeId);
+      if (controller.signal.aborted) return { ok: false, aborted: true };
       setStatus(graphStatus(modelRef.current, filterRef.current));
       return { ok: true };
     } catch (err) {
@@ -560,6 +562,26 @@ function KgPageInner() {
     void fitView({ nodes: ids.map(id => ({ id })), padding: '60px', duration: 300, maxZoom: FIT_MAX_ZOOM });
   };
 
+  // Hover: keep the node, its neighbours and their edges bright and dim the rest. Done with
+  // classes on the existing DOM (no React re-render), so it stays cheap on large canvases.
+  function highlight(nodeId: string | null) {
+    const root = canvasRef.current;
+    if (!root) return;
+    root.querySelectorAll('.kg-hl').forEach(el => el.classList.remove('kg-hl'));
+    if (!nodeId) { root.classList.remove('is-hovering'); return; }
+    const m = modelRef.current;
+    for (const id of closedNeighborhood(m, nodeId)) {
+      root.querySelector(`.react-flow__node[data-id="${CSS.escape(id)}"]`)?.classList.add('kg-hl');
+    }
+    for (const e of liveEdges(m)) {
+      if (e.sourceNodeId !== nodeId && e.targetNodeId !== nodeId) continue;
+      root.querySelector(`.react-flow__edge[data-id="${CSS.escape(e.id)}"]`)?.classList.add('kg-hl');
+    }
+    root.classList.add('is-hovering');
+  }
+  const onNodeMouseEnter: NodeMouseHandler<KgFlowNode> = (_e, node) => highlight(node.id);
+  const onNodeMouseLeave: NodeMouseHandler<KgFlowNode> = () => highlight(null);
+
   // xyflow reports drags and measurements; selection is driven by the page, not by xyflow.
   const onNodesChange = useCallback((changes: NodeChange<KgFlowNode>[]) => {
     const relevant = changes.filter(c => c.type === 'position' || c.type === 'dimensions');
@@ -655,6 +677,7 @@ function KgPageInner() {
               checked={filter[axis].has(opt.value)}
               onChange={() => updateFilter(toggleFilterValue(filterRef.current, axis, opt.value))}
             />
+            <span className={`kg-swatch ${swatchClass(axis, opt.value)}`} aria-hidden="true" />
             <span className="kg-filter-option-name">{opt.value}</span>
             <span className="kg-filter-option-count">{opt.count}</span>
           </label>
@@ -806,6 +829,7 @@ function KgPageInner() {
                       >
                         <div className="kg-node-card-label">{node.label}</div>
                         <div className="kg-node-card-meta">
+                          <span className={`kg-swatch ${swatchClass('types', node.type)}`} aria-hidden="true" />
                           {node.type} · {node.confidence != null ? node.confidence.toFixed(2) : '—'}
                         </div>
                       </button>
@@ -873,6 +897,9 @@ function KgPageInner() {
                     onNodeClick={onNodeClick}
                     onNodeDoubleClick={onNodeDoubleClick}
                     onNodeDragStop={onNodeDragStop}
+                    onNodeMouseEnter={onNodeMouseEnter}
+                    onNodeMouseLeave={onNodeMouseLeave}
+                    onMoveStart={() => highlight(null)}
                     nodesConnectable={false}
                     elementsSelectable={false}
                     edgesFocusable={false}
