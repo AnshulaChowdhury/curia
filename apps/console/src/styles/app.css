@@ -121,6 +121,9 @@ body {
   display: flex; align-items: center;
 }
 .sidebar-wordmark svg { display: block; height: 22px; width: auto; }
+.brand-wordmark { display: inline-flex; flex-direction: column; line-height: 1.15; color: inherit; }
+.brand-wordmark-name { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; }
+.brand-wordmark-sub { font-size: 10.5px; font-weight: 500; opacity: 0.65; letter-spacing: 0.02em; }
 
 .nav-group { display: flex; flex-direction: column; gap: 2px; }
 
@@ -349,7 +352,7 @@ input:focus, textarea:focus, select:focus {
 .login-wordmark {
   color: var(--app-fg);
   display: flex; align-items: center;
-  height: 26px;
+  min-height: 26px;
 }
 .login-wordmark svg { display: block; height: 26px; width: auto; }
 .login-form { display: flex; flex-direction: column; gap: 12px; }

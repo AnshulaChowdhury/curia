@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { useNavigate } from '@tanstack/react-router';
-import { CuriaWordmark } from '../components/Icons';
+import { BrandWordmark } from '../components/Icons';
 import { apiFetch } from '../api';
 
 export default function LoginPage() {
@@ -35,8 +35,8 @@ export default function LoginPage() {
   return (
     <div className="login-root">
       <div className="login-card">
-        <div className="login-wordmark" aria-label="Curia">
-          <CuriaWordmark />
+        <div className="login-wordmark" aria-label="Moonray Ventures OS powered by Curia">
+          <BrandWordmark />
         </div>
         <form onSubmit={handleSubmit} className="login-form">
           <input

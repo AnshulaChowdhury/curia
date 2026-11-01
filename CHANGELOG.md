@@ -13,6 +13,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ## [Unreleased]
 
+### Changed
+
+- **Console branding** — UI wordmark, page title, and chat labels now read "Moonray Ventures OS powered by Curia".
+
 ### Added
 
 - **AWS Bedrock LLM provider** — `BedrockMistralProvider` adds a third `LLMProvider` (alongside Anthropic and OpenRouter) via Bedrock's Converse API. Fast tier runs Mixtral 8x7B; standard/powerful run Claude 3 Sonnet via Bedrock, chosen after live load testing showed a candidate Mistral Large model silently narrating tool calls as text instead of invoking them under real prompt/tool-count load. Anthropic is no longer unconditionally required at boot — provider requirements now follow from which models `config/default.yaml`'s `model_routing` tiers actually reference. AWS credentials resolve from the secrets vault (ADR-021), not `.env`. A new `pnpm run smoke:bedrock-tools` script guards against this failure mode regressing. (ADR-023)

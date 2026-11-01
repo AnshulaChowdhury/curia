@@ -3,7 +3,7 @@ import { useNavigate } from '@tanstack/react-router';
 import { useMobileMenu } from '../context/MobileMenu';
 import { apiFetch } from '../api.js';
 import {
-  CuriaWordmark,
+  BrandWordmark,
   IconChat,
   IconMemory,
   IconGraph,
@@ -113,8 +113,8 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
 
   return (
     <nav className="sidebar">
-      <div className="sidebar-wordmark" aria-label="Curia">
-        <CuriaWordmark />
+      <div className="sidebar-wordmark" aria-label="Moonray Ventures OS powered by Curia">
+        <BrandWordmark />
       </div>
 
       <div className="nav-group">
