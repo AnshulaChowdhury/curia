@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   addToModel, applyPositions, buildFlow, closedNeighborhood, colorClass, degrees, drawerNode, emptyFlowCache,
-  graphStatus, layoutRequest, modelFrom, nodeSize, removeNode,
+  graphStatus, layoutRequest, modelFrom, nodeSize, removeNode, swatchClass,
 } from './kg-graph-model.js';
 import type { ApiKgEdge, FlowOptions } from './kg-graph-model.js';
 import { emptyFilter, toggleFilterValue } from './kg-filters.js';
@@ -74,6 +74,14 @@ describe('appearance', () => {
     expect(colorClass(node('a', 'mystery'), 'type')).toBe('kg-c-type-other');
     expect(colorClass(node('a', 'person', { sensitivity: 'secret' }), 'sensitivity')).toBe('kg-c-sens-other');
     expect(colorClass(node('a', 'person', { decayClass: 'fast_decay' }), 'decay')).toBe('kg-c-decay-fast_decay');
+  });
+});
+
+describe('swatchClass', () => {
+  it('matches the canvas colour classes, with an "other" fallback', () => {
+    expect(swatchClass('types', 'person')).toBe(colorClass(node('a'), 'type'));
+    expect(swatchClass('sensitivities', 'restricted')).toBe('kg-c-sens-restricted');
+    expect(swatchClass('types', 'mystery')).toBe('kg-c-type-other');
   });
 });
 

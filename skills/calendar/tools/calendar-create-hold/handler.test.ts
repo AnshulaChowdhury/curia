@@ -6,7 +6,7 @@
 //   - Toggle OFF ('false'): returns held:false without calling createEvent
 //   - createEvent throws: returns held:false but still success:true (never breaks caller)
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest';
 import { CalendarCreateHoldHandler } from './handler.js';
 import type { ToolContext } from '../../../../src/skills/types.js';
 import type { EntityMemory } from '../../../../src/memory/entity-memory.js';
@@ -169,6 +169,11 @@ describe('CalendarCreateHoldHandler -- toggle ON (null)', () => {
   });
 
   it('returns a non-empty display string labelled with the timezone', async () => {
+    // The displayTimezone label uses today's offset. Pin today inside daylight time so the
+    // assertion doesn't flip when the real clock crosses a DST change (it broke on 2026-11-01).
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-06-25T14:30:00Z'));
+    onTestFinished(() => {{ vi.useRealTimers(); }});
     // Context uses America/Toronto with a June start date (UTC-04:00 / EDT).
     // formatDisplayTimezone returns "EDT (UTC-04:00)" for this combination,
     // so the display string must contain the UTC offset and displayTimezone must match.

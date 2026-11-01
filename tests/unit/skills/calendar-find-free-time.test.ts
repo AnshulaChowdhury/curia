@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, onTestFinished } from 'vitest';
 import { CalendarFindFreeTimeHandler } from '../../../skills/calendar/tools/calendar-find-free-time/handler.js';
 import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
@@ -232,6 +232,11 @@ describe('CalendarFindFreeTimeHandler', () => {
   });
 
   it('formats free window timestamps in the configured timezone', async () => {
+    // The displayTimezone label uses today's offset. Pin today inside daylight time so the
+    // assertion doesn't flip when the real clock crosses a DST change (it broke on 2026-11-01).
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-04-06T12:00:00Z'));
+    onTestFinished(() => {{ vi.useRealTimers(); }});
     // Use realistic timestamps: busy 9:00-10:00 AM EDT on 2026-04-06
     // 1775480400 = 2026-04-06T13:00:00Z = 9:00 AM EDT
     // 1775484000 = 2026-04-06T14:00:00Z = 10:00 AM EDT

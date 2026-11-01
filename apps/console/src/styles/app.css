@@ -2313,12 +2313,15 @@ table.records-table tbody tr.active td { background: transparent; }
 
 /* Left sidebar: search box + node list */
 .kg-sidebar {
+  position: relative;
+  z-index: 2;
   width: 240px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--app-border);
   background: var(--app-card);
+  box-shadow: 8px 0 24px -18px rgba(0, 0, 0, 0.6);
   overflow: hidden;
 }
 
@@ -2422,15 +2425,50 @@ table.records-table tbody tr.active td { background: transparent; }
 .kg-filter-option {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 2px 0;
+  gap: 8px;
+  margin: 0 -6px;
+  padding: 4px 6px;
+  border-radius: 6px;
   color: var(--app-fg);
   cursor: pointer;
+  transition: background .12s ease;
 }
+.kg-filter-option:hover { background: var(--app-row-hover); }
 
 .kg-filter-option input {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  display: grid;
+  place-content: center;
+  width: 15px; height: 15px;
   margin: 0;
-  accent-color: var(--app-teal);
+  border: 1px solid var(--app-input-bd);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease;
+}
+.kg-filter-option input::after {
+  content: '';
+  width: 9px; height: 9px;
+  background: var(--app-primary-fg);
+  clip-path: polygon(14% 44%, 0 65%, 50% 100%, 100% 16%, 80% 0%, 43% 62%);
+  transform: scale(0);
+  transition: transform .12s ease;
+}
+.kg-filter-option input:checked { background: var(--app-primary); border-color: var(--app-primary); }
+.kg-filter-option input:checked::after { transform: scale(1); }
+.kg-filter-option input:focus-visible { outline: 2px solid var(--app-teal); outline-offset: 2px; }
+
+/* A dot in the value's graph colour: the filters double as the legend. */
+.kg-swatch {
+  flex: none;
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--kg-fill, var(--kg-other));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--kg-fill, var(--kg-other)) 22%, transparent);
 }
 
 .kg-filter-option-name {
@@ -2443,7 +2481,7 @@ table.records-table tbody tr.active td { background: transparent; }
 .kg-filter-option-count {
   font-size: 11px;
   color: var(--app-fg-subtle);
-  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
 }
 
 .kg-sidebar-list {
@@ -2453,20 +2491,24 @@ table.records-table tbody tr.active td { background: transparent; }
 }
 
 .kg-node-card {
-  padding: 8px 10px;
-  border: 1px solid var(--app-border);
-  border-radius: 6px;
-  margin-bottom: 4px;
+  display: block;
+  padding: 9px 11px;
+  border: 1px solid var(--app-border-soft);
+  border-radius: 9px;
+  margin-bottom: 6px;
   cursor: pointer;
-  background: transparent;
-  transition: background 0.12s, border-color 0.12s;
+  background: var(--app-card-elev);
+  box-shadow: var(--shadow-1);
+  font-family: inherit;
+  transition: transform .14s ease, box-shadow .14s ease, border-color .14s ease;
   text-align: left;
   width: 100%;
 }
 
 .kg-node-card:hover {
-  background: var(--app-row-hover);
-  border-color: var(--app-teal);
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--app-teal) 45%, var(--app-border));
+  box-shadow: var(--shadow-2);
 }
 
 .kg-node-card-label {
@@ -2480,9 +2522,14 @@ table.records-table tbody tr.active td { background: transparent; }
 }
 
 .kg-node-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 11px;
   color: var(--app-fg-muted);
+  font-variant-numeric: tabular-nums;
 }
+.kg-node-card-meta .kg-swatch { width: 7px; height: 7px; }
 
 /* Center: graph canvas + toolbar above */
 .kg-canvas-wrap {
@@ -2495,13 +2542,16 @@ table.records-table tbody tr.active td { background: transparent; }
 }
 
 .kg-toolbar {
+  position: relative;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 12px;
+  padding: 8px 14px;
   border-bottom: 1px solid var(--app-border-soft);
   flex-shrink: 0;
   background: var(--app-card);
+  box-shadow: 0 6px 18px -12px rgba(0, 0, 0, 0.55);
 }
 
 .kg-toolbar-label {
@@ -2530,16 +2580,18 @@ table.records-table tbody tr.active td { background: transparent; }
 }
 
 .kg-color-btn.active {
-  background: var(--app-teal-soft);
-  border-color: var(--app-teal);
-  color: var(--app-teal);
+  background: var(--app-primary);
+  border-color: var(--app-primary);
+  color: var(--app-primary-fg);
+  box-shadow: var(--shadow-1);
 }
 
 .kg-status {
   margin-left: auto;
   font-size: 11px;
   color: var(--app-fg-subtle);
-  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
 }
 
 /* Cytoscape canvas container — fills remaining height */
@@ -2588,26 +2640,27 @@ table.records-table tbody tr.active td { background: transparent; }
   animation: kg-loader-in .2s ease .15s both;
 }
 
-/* Knowledge Graph palette: one set of colours for the graph and the drawer badges,
-   softer in dark mode, deeper in light. Hues keep their meaning in both. */
+/* Knowledge Graph palette: one set of colours for the graph and the drawer badges. Muted
+   jewel tones that sit on Moonray navy (rose-gold people, sea-glass organisations, lavender
+   projects, soft-gold decisions, sage events, slate concepts), deeper in light mode. */
 :root {
-  --kg-person: #3F7CC4;  --kg-organization: #2E8E9A; --kg-project: #6E63B5;
-  --kg-decision: #B9822F; --kg-event: #4F9466;       --kg-concept: #7A7D92;
-  --kg-fact: #A3A6B8;     --kg-public: #4F9466;      --kg-internal: #3F7CC4;
-  --kg-confidential: #B9822F; --kg-restricted: #D0583D; --kg-other: #8A8DA3;
+  --kg-person: #C2715A;  --kg-organization: #2F8077; --kg-project: #6B5BC2;
+  --kg-decision: #B08524; --kg-event: #4E8A58;       --kg-concept: #6A7193;
+  --kg-fact: #A8ADC2;     --kg-public: #4E8A58;      --kg-internal: #6A7193;
+  --kg-confidential: #B08524; --kg-restricted: #C4553C; --kg-other: #8A8DA3;
 }
 [data-theme="dark"] {
-  --kg-person: #8AB8F0;  --kg-organization: #7FD1D9; --kg-project: #B8BAE0;
-  --kg-decision: #E9C98B; --kg-event: #9AD9BE;       --kg-concept: #9A9CB5;
-  --kg-fact: #63667F;     --kg-public: #9AD9BE;      --kg-internal: #8AB8F0;
-  --kg-confidential: #E9C98B; --kg-restricted: #EE8B7A; --kg-other: #8A8DA3;
+  --kg-person: #E8B4A0;  --kg-organization: #8FC9C0; --kg-project: #B3A6E8;
+  --kg-decision: #E6C17A; --kg-event: #92C99A;       --kg-concept: #9BA3C4;
+  --kg-fact: #5D6283;     --kg-public: #92C99A;      --kg-internal: #9BA3C4;
+  --kg-confidential: #E6C17A; --kg-restricted: #EE8B7A; --kg-other: #8A8DA3;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --kg-person: #8AB8F0;  --kg-organization: #7FD1D9; --kg-project: #B8BAE0;
-    --kg-decision: #E9C98B; --kg-event: #9AD9BE;       --kg-concept: #9A9CB5;
-    --kg-fact: #63667F;     --kg-public: #9AD9BE;      --kg-internal: #8AB8F0;
-    --kg-confidential: #E9C98B; --kg-restricted: #EE8B7A; --kg-other: #8A8DA3;
+    --kg-person: #E8B4A0;  --kg-organization: #8FC9C0; --kg-project: #B3A6E8;
+    --kg-decision: #E6C17A; --kg-event: #92C99A;       --kg-concept: #9BA3C4;
+    --kg-fact: #5D6283;     --kg-public: #92C99A;      --kg-internal: #9BA3C4;
+    --kg-confidential: #E6C17A; --kg-restricted: #EE8B7A; --kg-other: #8A8DA3;
   }
 }
 
@@ -2618,14 +2671,54 @@ table.records-table tbody tr.active td { background: transparent; }
   position: relative;
   box-sizing: border-box;
   border-radius: 50%;
-  background: var(--kg-fill, var(--kg-other));
-  border: 1px solid color-mix(in srgb, var(--kg-fill, var(--kg-other)) 55%, var(--app-fg));
+  /* Lit from the upper left, like a small moon. */
+  background:
+    radial-gradient(circle at 34% 30%,
+      color-mix(in srgb, var(--kg-fill, var(--kg-other)) 45%, #FFFFFF) 0%,
+      var(--kg-fill, var(--kg-other)) 48%,
+      color-mix(in srgb, var(--kg-fill, var(--kg-other)) 72%, #000000) 100%);
   outline: 1px solid color-mix(in srgb, var(--kg-fill, var(--kg-other)) 30%, transparent);
   outline-offset: 3px;
   cursor: pointer;
-  transition: transform .14s ease, outline-color .14s ease;
+  transition: transform .16s cubic-bezier(.2,.8,.2,1), outline-color .16s ease, box-shadow .16s ease;
+  /* Eases in when it first appears (initial load, expansion, un-filtering). */
+  animation: kg-node-in .38s cubic-bezier(.2,.8,.2,1) backwards;
 }
-.kg-gnode:hover { transform: scale(1.1); outline-color: color-mix(in srgb, var(--kg-fill, var(--kg-other)) 70%, transparent); }
+@keyframes kg-node-in { from { opacity: 0; transform: scale(.55); } }
+.kg-gnode:hover { transform: scale(1.12); outline-color: color-mix(in srgb, var(--kg-fill, var(--kg-other)) 75%, transparent); }
+
+/* Depth: a drop shadow plus a faint glow in the node's own colour. Only when zoomed in
+   (not .is-zoomed-out), where few nodes are on screen; see ADR-058. */
+.kg-canvas:not(.is-zoomed-out) .kg-gnode {
+  box-shadow: 0 3px 8px -2px rgba(15, 18, 45, 0.35), 0 0 0 0 transparent;
+}
+.kg-canvas:not(.is-zoomed-out) .kg-gnode:hover,
+.kg-canvas:not(.is-zoomed-out) .kg-gnode.is-focal {
+  box-shadow: 0 6px 16px -4px rgba(15, 18, 45, 0.45), 0 0 22px -2px color-mix(in srgb, var(--kg-fill, var(--kg-other)) 55%, transparent);
+}
+[data-theme="dark"] .kg-canvas:not(.is-zoomed-out) .kg-gnode {
+  box-shadow: 0 4px 10px -2px rgba(0, 0, 0, 0.6), 0 0 16px -4px color-mix(in srgb, var(--kg-fill, var(--kg-other)) 45%, transparent);
+}
+[data-theme="dark"] .kg-canvas:not(.is-zoomed-out) .kg-gnode:hover,
+[data-theme="dark"] .kg-canvas:not(.is-zoomed-out) .kg-gnode.is-focal {
+  box-shadow: 0 6px 16px -4px rgba(0, 0, 0, 0.7), 0 0 28px 0 color-mix(in srgb, var(--kg-fill, var(--kg-other)) 55%, transparent);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .kg-canvas:not(.is-zoomed-out) .kg-gnode {
+    box-shadow: 0 4px 10px -2px rgba(0, 0, 0, 0.6), 0 0 16px -4px color-mix(in srgb, var(--kg-fill, var(--kg-other)) 45%, transparent);
+  }
+  :root:not([data-theme="light"]) .kg-canvas:not(.is-zoomed-out) .kg-gnode:hover,
+  :root:not([data-theme="light"]) .kg-canvas:not(.is-zoomed-out) .kg-gnode.is-focal {
+    box-shadow: 0 6px 16px -4px rgba(0, 0, 0, 0.7), 0 0 28px 0 color-mix(in srgb, var(--kg-fill, var(--kg-other)) 55%, transparent);
+  }
+}
+
+/* Hovering a node dims everything except it, its neighbours and their edges. */
+.kg-canvas .react-flow__node,
+.kg-canvas .react-flow__edge { transition: opacity .2s ease .05s; }
+.kg-canvas.is-hovering .react-flow__node:not(.kg-hl) { opacity: .22; }
+.kg-canvas.is-hovering .react-flow__edge:not(.kg-hl) { opacity: .12; }
+.kg-canvas.is-hovering .react-flow__edge.kg-hl .react-flow__edge-path { stroke: var(--kg-edge-focal); }
 .kg-gnode.is-focal {
   outline: 1.5px solid var(--kg-focal);
   outline-offset: 4px;
@@ -2638,7 +2731,8 @@ table.records-table tbody tr.active td { background: transparent; }
   padding: 1px 5px;
   border-radius: 4px;
   /* A pill in the canvas colour, so edges pass behind the text instead of through it. */
-  background: color-mix(in srgb, var(--app-bg-sunken) 82%, transparent);
+  background: color-mix(in srgb, var(--app-bg-sunken) 84%, transparent);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
   font-size: 10.5px; font-weight: 500; line-height: 1.25; letter-spacing: 0.01em;
   color: var(--kg-node-text);
@@ -2677,11 +2771,12 @@ table.records-table tbody tr.active td { background: transparent; }
 
 /* Zoom and fit buttons, in the console's card style. */
 .kg-canvas .react-flow__controls {
-  margin: 14px;
+  margin: 16px;
   border: 1px solid var(--app-border);
-  border-radius: 10px;
+  border-radius: 12px;
   overflow: hidden;
-  background: var(--app-card);
+  background: var(--app-card-elev);
+  box-shadow: var(--shadow-2);
 }
 .kg-canvas .react-flow__controls-button {
   width: 30px; height: 30px; padding: 8px;
@@ -2784,8 +2879,8 @@ table.records-table tbody tr.active td { background: transparent; }
 }
 
 .kg-detail-field-value.mono {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 11px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Properties key/value table inside the detail panel */
