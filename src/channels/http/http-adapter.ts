@@ -41,6 +41,8 @@ import { channelRegistryRoutes } from './routes/channel-registry.js';
 import { vaultRoutes } from './routes/vault.js';
 import { secretCaptureRoutes } from './routes/secret-capture.js';
 import { phoneInboxRoutes } from './routes/phone-inbox.js';
+import { quickbooksRoutes } from './routes/quickbooks.js';
+import { QboConnection, qboSettingsFromEnv } from '../../quickbooks/qbo-connection.js';
 import { PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { setupRoutes } from './routes/setup.js';
@@ -423,6 +425,18 @@ export class HttpAdapter implements Channel {
         logger,
         getToken: () => secrets.get('phone_inbox_token'),
         getService: async () => new PhoneInboxService(await loadPhoneInboxAccounts(secrets), logger),
+      });
+    }
+
+    // Books (MowMow bookkeeping) — QuickBooks connection and the narrow API the Mac mini uses. Curia holds the
+    // QuickBooks tokens in the vault; the books token (BOOKS_API_TOKEN) reaches these routes only.
+    if (this.config.secretsService) {
+      await this.app.register(quickbooksRoutes, {
+        logger,
+        connection: new QboConnection(qboSettingsFromEnv(), this.config.secretsService, logger),
+        getToken: () => process.env.BOOKS_API_TOKEN ?? null,
+        webAppBootstrapSecret,
+        sessions,
       });
     }
 
