@@ -62,8 +62,10 @@ import { vaultRoutes } from './routes/vault.js';
 import { emailAccountsRoutes } from './routes/email-accounts.js';
 import { secretCaptureRoutes } from './routes/secret-capture.js';
 import { phoneInboxRoutes } from './routes/phone-inbox.js';
+import { quickbooksRoutes } from './routes/quickbooks.js';
 import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
+import { QboConnection, qboSettingsFromEnv } from '../../quickbooks/qbo-connection.js';
 import { setupRoutes } from './routes/setup.js';
 import { smsWebhookRoutes } from '../sms/webhook-route.js';
 import { SmsWebhookBridge } from '../sms/webhook-bridge.js';
@@ -672,6 +674,18 @@ export class HttpAdapter implements Channel {
     // Ant Farm SPA — registered before the console wildcard so /antfarm/* resolves
     // to this static bundle instead of the console /* fallback.
     await this.app.register(antfarmStaticRoutes);
+
+    // Books (MowMow bookkeeping) — QuickBooks connection and the narrow API the Mac mini uses. Curia holds the
+    // QuickBooks tokens in the vault; the books token (BOOKS_API_TOKEN) reaches these routes only.
+    if (this.config.secretsService) {
+      await this.app.register(quickbooksRoutes, {
+        logger,
+        connection: new QboConnection(qboSettingsFromEnv(), this.config.secretsService, logger),
+        getToken: () => process.env.BOOKS_API_TOKEN ?? null,
+        webAppBootstrapSecret,
+        sessions,
+      });
+    }
 
     // Console app — registered last so all explicit API/KG routes above take priority
     // over its /* wildcard. The React app handles auth client-side via session cookie.
