@@ -4,6 +4,7 @@ import { Sidebar } from '../components/Sidebar.js';
 import { Topbar } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
+import InboxTriageCard from './InboxTriageCard.js';
 
 // Mirrors GET /api/connections (src/channels/http/routes/quickbooks.ts). Secrets and tokens are never returned.
 interface Connection {
@@ -231,6 +232,7 @@ export default function ConnectionsPage() {
             </div>
             {loadError && <div style={{ color: 'var(--app-destructive)', fontSize: 13 }}>{loadError}</div>}
             {connections.map(c => <QuickbooksCard key={c.id} c={c} reload={() => load()} />)}
+            <InboxTriageCard />
           </div>
         </main>
       </div>

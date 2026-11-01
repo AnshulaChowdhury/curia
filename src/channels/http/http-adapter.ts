@@ -63,6 +63,7 @@ import { emailAccountsRoutes } from './routes/email-accounts.js';
 import { secretCaptureRoutes } from './routes/secret-capture.js';
 import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
+import { inboxTriageRoutes } from './routes/inbox-triage.js';
 import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { QboConnection, qboSettingsFromEnv } from '../../quickbooks/qbo-connection.js';
@@ -130,6 +131,8 @@ export interface HttpAdapterConfig {
   /** Backs the /api/vault/* routes (secrets status + skill-secret entry). Mounted only
    *  alongside registryService, which scopes which secret names may be written. */
   secretsService?: import('../../secrets/secrets-service.js').SecretsService;
+  /** Backs the Inbox triage form on Settings → API connections (restarts the watcher on save). */
+  inboxTriage?: import('../../inbox-triage/controller.js').InboxTriageController;
   /** Backs the public /api/secret-capture/* routes (one-time tokenized secret capture, #971).
    *  Token-authed, so mounted independently of the bootstrap secret. */
   secretCaptureService?: import('../../secrets/secret-capture-service.js').SecretCaptureService;
@@ -683,6 +686,17 @@ export class HttpAdapter implements Channel {
         logger,
         connection: new QboConnection(qboSettingsFromEnv(), this.config.secretsService, logger),
         booksToken: new BooksToken(this.config.secretsService),
+        webAppBootstrapSecret,
+        sessions,
+      });
+    }
+
+    // Inbox triage settings form. Values go to the encrypted vault; the token is write-only.
+    if (this.config.secretsService && this.config.inboxTriage && webAppBootstrapSecret) {
+      await this.app.register(inboxTriageRoutes, {
+        logger,
+        secrets: this.config.secretsService,
+        controller: this.config.inboxTriage,
         webAppBootstrapSecret,
         sessions,
       });

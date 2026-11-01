@@ -33,8 +33,22 @@ export interface InboxTriageDeps {
   fetchImpl?: typeof fetch;
 }
 
-/** Returns a stop function, or null when triage is off or not fully configured. */
-export async function startInboxTriage(deps: InboxTriageDeps): Promise<(() => void) | null> {
+export interface RunningInboxTriage {
+  stop: () => void;
+  accounts: string[];
+}
+
+/** Vault keys the Settings → API connections form writes. */
+export const TRIAGE_SECRET_KEYS = {
+  enabled: 'inbox_triage_enabled',
+  ntfyUrl: 'inbox_triage_ntfy_url',
+  ntfyTopic: 'inbox_triage_ntfy_topic',
+  ntfyToken: 'inbox_triage_ntfy_token',
+  minConfidence: 'inbox_triage_min_confidence',
+} as const;
+
+/** Returns the running watcher, or null when triage is off or not fully configured. */
+export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningInboxTriage | null> {
   const { bus, logger, secrets, store, fetchImpl = fetch } = deps;
   const read = async (key: string): Promise<string | null> => (await secrets.get(key))?.trim() || null;
 
@@ -92,6 +106,7 @@ export async function startInboxTriage(deps: InboxTriageDeps): Promise<(() => vo
     intervalMs: POLL_INTERVAL_MS,
   });
   watcher.start();
-  logger.info({ accounts: sources.map((s) => s.accountId) }, 'inbox-triage: started');
-  return () => watcher.stop();
+  const accounts = sources.map((s) => s.accountId);
+  logger.info({ accounts }, 'inbox-triage: started');
+  return { stop: () => watcher.stop(), accounts };
 }
