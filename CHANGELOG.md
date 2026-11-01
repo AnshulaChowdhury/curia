@@ -13,6 +13,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ## [Unreleased]
 
+### Changed
+
+- **Console branding** — UI wordmark, page title, and chat labels now read "Moonray Ventures OS powered by Curia"; theme moves to the Moonray palette (dark blue #091b52, mid blue #30689a, turquoise #36aab7) and Gotham typeface; the Moonray lockup is the sidebar wordmark, the animated moon mark sits at the top right of the topbar, and the favicon is the moon mark.
+
 ### Added
 
 - **Bedrock Sonnet 4.5** — `{global,us,eu}.anthropic.claude-sonnet-4-5-20250929-v1:0` registered as provider `bedrock`.

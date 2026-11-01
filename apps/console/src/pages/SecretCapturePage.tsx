@@ -7,7 +7,7 @@
 
 import { useState, useEffect, useRef, type FormEvent } from 'react';
 import { useParams } from '@tanstack/react-router';
-import { CuriaWordmark } from '../components/Icons';
+import { BrandWordmark } from '../components/Icons';
 import { apiFetch } from '../api';
 import {
   classifyMetadataResponse,
@@ -102,8 +102,8 @@ export default function SecretCapturePage() {
   return (
     <div className="login-root">
       <div className="login-card">
-        <div className="login-wordmark" aria-label="Curia">
-          <CuriaWordmark />
+        <div className="login-wordmark" aria-label="Moonray Ventures OS powered by Curia">
+          <BrandWordmark />
         </div>
         {renderBody()}
       </div>
