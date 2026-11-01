@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useSearch } from '@tanstack/react-router';
-import { ReactFlow, ReactFlowProvider, applyNodeChanges, useReactFlow } from '@xyflow/react';
+import { Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider, applyNodeChanges, useReactFlow } from '@xyflow/react';
 import type { FitViewOptions, NodeChange, NodeMouseHandler, OnNodeDrag } from '@xyflow/react';
 import '@xyflow/react/dist/base.css';
 import { MobileMenuContext } from '../context/MobileMenu.js';
@@ -42,6 +42,9 @@ interface KgBanner {
 
 /** A single click waits this long so a double-click (zoom to the node) does not also expand it. */
 const DOUBLE_CLICK_MS = 250;
+
+/** Automatic fits stop here, so a small graph is not blown up to fill the canvas. */
+const FIT_MAX_ZOOM = 1.25;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -370,9 +373,9 @@ function KgPageInner() {
       fit: () => {
         const m = modelRef.current;
         if (focusId && m.nodes.has(focusId)) {
-          return { nodes: closedNeighborhood(m, focusId).map(id => ({ id })), padding: '80px', duration: 300 };
+          return { nodes: closedNeighborhood(m, focusId).map(id => ({ id })), padding: '110px', duration: 300, maxZoom: FIT_MAX_ZOOM };
         }
-        return { padding: 0.1 };
+        return { padding: 0.1, maxZoom: FIT_MAX_ZOOM };
       },
     });
   }
@@ -554,7 +557,7 @@ function KgPageInner() {
     if (tapTimerRef.current) clearTimeout(tapTimerRef.current);
     tapTimerRef.current = null;
     const ids = closedNeighborhood(modelRef.current, node.id);
-    void fitView({ nodes: ids.map(id => ({ id })), padding: '60px', duration: 300 });
+    void fitView({ nodes: ids.map(id => ({ id })), padding: '60px', duration: 300, maxZoom: FIT_MAX_ZOOM });
   };
 
   // xyflow reports drags and measurements; selection is driven by the page, not by xyflow.
@@ -878,6 +881,12 @@ function KgPageInner() {
                     minZoom={0.05}
                     maxZoom={4}
                   >
+                    <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} color="var(--kg-grid)" />
+                    <Controls
+                      position="bottom-left"
+                      showInteractive={false}
+                      fitViewOptions={{ padding: 0.15, duration: 300, maxZoom: FIT_MAX_ZOOM }}
+                    />
                     <ZoomLevelClass target={canvasRef} />
                   </ReactFlow>
                   {busy && (

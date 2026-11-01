@@ -27,9 +27,9 @@ function star(): LayoutRequest {
 
 describe('kg-layout tuning', () => {
   it('keeps facts close, strong pairs closer than generic edges', () => {
-    expect(linkDistance('fact', 'person', 'x')).toBe(70);
-    expect(linkDistance('person', 'person', 'reports_to')).toBe(110);
-    expect(linkDistance('person', 'project', 'works_on')).toBe(150);
+    expect(linkDistance('fact', 'person', 'x')).toBe(64);
+    expect(linkDistance('person', 'person', 'reports_to')).toBe(120);
+    expect(linkDistance('person', 'project', 'works_on')).toBe(170);
   });
 
   it('weights springs by strength, confidence and the staler endpoint', () => {
@@ -44,9 +44,9 @@ describe('kg-layout tuning', () => {
   });
 
   it('reserves label width for labelled nodes only', () => {
-    expect(collisionRadius('person', 20)).toBe(LABEL_WIDTH / 2);
-    expect(collisionRadius('person', 80)).toBe(48);
-    expect(collisionRadius('fact', 10)).toBe(9);
+    expect(collisionRadius('person', 20)).toBe(LABEL_WIDTH / 2 + 14);
+    expect(collisionRadius('person', 140)).toBe(80);
+    expect(collisionRadius('fact', 8)).toBe(8);
   });
 });
 

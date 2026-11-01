@@ -38,7 +38,7 @@ To make xyflow cope with large neighbourhoods, three measures are mandatory:
    - If a worker cannot start, or crashes, the same code runs on the main thread.
    - The forces carry over the fCoSE tuning: facts close to their entity, strong relationships tighter, springs weakened by low confidence and fast decay, more repulsion for hub types, a label-wide collision radius and weak gravity.
 2. **Fewer details when zoomed out** (`kg-graph-view.tsx`).
-   - Below zoom 0.6, node and edge labels are hidden.
+   - Below zoom 0.75, node and edge labels are hidden.
    - One component watches the zoom level and toggles a single class on the canvas, so zooming re-renders no nodes.
 3. **Cheap nodes and edges** (`kg-graph-view.tsx`, `kg-graph-model.ts`).
    - Node and edge components are memoised, and `nodeTypes`/`edgeTypes` are defined at module scope.
