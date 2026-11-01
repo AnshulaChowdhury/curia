@@ -39,10 +39,11 @@ const TAU = Math.PI * 2;
 const mod = (v: number, m: number) => ((v % m) + m) % m;
 const rng = (seed: number) => () => (seed = (seed * 16807) % 2147483647) / 2147483647;
 
-// Moonlight on navy in dark; ink on paper in light (light needs a gentler glow to stay subtle).
+// Moonlight on navy in dark; ink on paper in light. Glow peaks (glow × intensity) sit just under
+// moonray.ventures' own hero (0.14 dark, 0.13 light).
 const PALETTE = {
-  dark: { rgb: '233,231,245', glow: 0.3, blend: 'lighter' as GlobalCompositeOperation },
-  light: { rgb: '27,31,59', glow: 0.18, blend: 'source-over' as GlobalCompositeOperation },
+  dark: { rgb: '233,231,245', glow: 0.17, blend: 'lighter' as GlobalCompositeOperation },
+  light: { rgb: '27,31,59', glow: 0.15, blend: 'source-over' as GlobalCompositeOperation },
 };
 
 function isLightTheme(): boolean {
