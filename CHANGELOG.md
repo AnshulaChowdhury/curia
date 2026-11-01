@@ -13,6 +13,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ## [Unreleased]
 
+### Added
+
+- **Real-time inbox triage** — new mail is classified within ~30s, labelled, and wakes the phone via ntfy. Off by default.
+
 ### Changed
 
 - **Collapsed sidebar uses the space** — with the sidebar collapsed, the topbar, home, settings, chat, records and docs pages shrink their margins and padding and widen their content columns to use the reclaimed width.
