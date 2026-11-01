@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **QuickBooks connection and API connections page** — Settings → API connections sets up QuickBooks (enter the app's client ID and secret, authorise, make the books agent's token); Curia holds and refreshes the tokens, and `/books/qbo/{status,query,create}` give the books agent a narrow, token-gated API.
 - **Real-time inbox triage** — new mail is classified within ~30s, labelled, and wakes the phone via ntfy. Off by default.
 - **Inbox triage settings** — a form under API connections saves ntfy details to the vault, restarts the watcher, sends a test push.
 

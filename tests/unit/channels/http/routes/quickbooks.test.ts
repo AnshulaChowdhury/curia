@@ -1,14 +1,16 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { quickbooksRoutes } from '../../../../../src/channels/http/routes/quickbooks.js';
-import { QboApiError, QboAuthError, type QboConnection } from '../../../../../src/quickbooks/qbo-connection.js';
+import type { BooksToken } from '../../../../../src/quickbooks/books-token.js';
+import { QboApiError, QboAuthError, QboSettingsError, type QboConnection } from '../../../../../src/quickbooks/qbo-connection.js';
 import { createSilentLogger } from '../../../../../src/logger.js';
 import { hashToken } from '../../../../../src/channels/http/session-auth.js';
 
 function fakeConnection(overrides: Partial<Record<keyof QboConnection, unknown>> = {}) {
   const api: Array<[string, string, Record<string, string>, unknown]> = [];
   const conn = {
-    authorizationUrl: () => 'https://appcenter.intuit.com/connect/oauth2?state=s',
+    authorizationUrl: async () => 'https://appcenter.intuit.com/connect/oauth2?state=s',
+    saveSettings: async () => {},
     handleCallback: async () => {},
     status: async () => ({ configured: true, connected: true }),
     api: async (m: string, p: string, q: Record<string, string>, b: unknown) => {
@@ -27,6 +29,14 @@ describe('quickbooks routes', () => {
   let app: FastifyInstance;
   afterEach(async () => app?.close());
 
+  function fakeBooksToken(token: string | null, generated = 'new-token-123'): BooksToken {
+    return {
+      isSet: async () => token !== null,
+      verify: async (p: string) => (token === null ? null : p === token),
+      generate: async () => generated,
+    } as unknown as BooksToken;
+  }
+
   async function build(conn: QboConnection, token: string | null = TOKEN) {
     app = Fastify();
     const sessions = new Map<string, number>([[hashToken('sess'), Date.now() + 60_000]]);
@@ -35,7 +45,7 @@ describe('quickbooks routes', () => {
       const m = /curia_session=([^;]+)/.exec(req.headers.cookie ?? '');
       (req as unknown as { cookies: Record<string, string> }).cookies = m ? { curia_session: m[1]! } : {};
     });
-    await app.register(quickbooksRoutes, { logger: createSilentLogger(), connection: conn, getToken: () => token, webAppBootstrapSecret: 'boot', sessions });
+    await app.register(quickbooksRoutes, { logger: createSilentLogger(), connection: conn, booksToken: fakeBooksToken(token), webAppBootstrapSecret: 'boot', sessions });
   }
 
   it('connect redirects a signed-in person to Intuit and refuses everyone else', async () => {
@@ -52,7 +62,7 @@ describe('quickbooks routes', () => {
     const ok = await app.inject({ method: 'GET', url: '/api/connections', headers: { cookie: 'curia_session=sess' } });
     expect(ok.statusCode).toBe(200);
     expect(ok.json().connections[0]).toMatchObject({ id: 'quickbooks', connected: true, connectUrl: '/books/qbo/connect' });
-    expect(ok.body).not.toMatch(/token/i);
+    expect(ok.body).not.toMatch(/accessToken|refreshToken|clientSecret/i);
     expect((await app.inject({ method: 'GET', url: '/api/connections' })).statusCode).toBe(401);
   });
 
@@ -112,5 +122,31 @@ describe('quickbooks routes', () => {
     const refused = await app.inject({ method: 'POST', url: '/books/qbo/create', headers: auth, payload: { entity: 'Vendor', payload: {} } });
     expect(refused.statusCode).toBe(422);
     expect(refused.json().message).toContain('Account is missing');
+  });
+
+  it('saves the app settings for a signed-in person only, and reports bad input as 400', async () => {
+    const saved: unknown[] = [];
+    await build(fakeConnection({ saveSettings: async (i: unknown) => { saved.push(i); } }).conn);
+    const body = { clientId: 'a', clientSecret: 'b', redirectUri: 'https://x.test/cb', environment: 'production' };
+    const put = (headers: Record<string, string> = {}) => app.inject({ method: 'PUT', url: '/api/connections/quickbooks/settings', headers, payload: body });
+    expect((await put()).statusCode).toBe(401);
+    expect((await put({ cookie: 'curia_session=sess' })).statusCode).toBe(200);
+    expect(saved).toEqual([body]);
+    await app.close();
+    await build(fakeConnection({ saveSettings: async () => { throw new QboSettingsError('Enter the app\'s client ID and client secret'); } }).conn);
+    const bad = await app.inject({ method: 'PUT', url: '/api/connections/quickbooks/settings', headers: { cookie: 'curia_session=sess' }, payload: body });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error).toContain('client ID');
+  });
+
+  it('makes a books token once for a signed-in person only', async () => {
+    await build(fakeConnection().conn);
+    expect((await app.inject({ method: 'POST', url: '/api/connections/books-token' })).statusCode).toBe(401);
+    const ok = await app.inject({ method: 'POST', url: '/api/connections/books-token', headers: { cookie: 'curia_session=sess' } });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json()).toEqual({ token: 'new-token-123' });
+    const list = await app.inject({ method: 'GET', url: '/api/connections', headers: { cookie: 'curia_session=sess' } });
+    expect(list.json().connections[0].booksTokenSet).toBe(true);
+    expect(list.body).not.toContain('new-token-123');
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { QboAuthError, QboApiError, QboConnection, type Fetch, type QboSettings } from '../../../src/quickbooks/qbo-connection.js';
+import { QboAuthError, QboApiError, QboConnection, QboSettingsError, type Fetch, type QboSettings } from '../../../src/quickbooks/qbo-connection.js';
 import { createSilentLogger } from '../../../src/logger.js';
 
 const SETTINGS: QboSettings = { clientId: 'cid', clientSecret: 'sec', redirectUri: 'https://curia.test/books/qbo-callback', environment: 'production' };
@@ -13,6 +13,9 @@ function vault() {
     },
     async setJSON(n: string, v: unknown) {
       store.set(n, v);
+    },
+    async delete(n: string) {
+      store.delete(n);
     },
   };
 }
@@ -41,15 +44,15 @@ function make(responses: Array<{ status: number; body?: unknown }>, clock = { t:
 }
 
 const connect = async (conn: QboConnection, v: ReturnType<typeof vault>) => {
-  const url = new URL(conn.authorizationUrl());
+  const url = new URL(await conn.authorizationUrl());
   await conn.handleCallback({ code: 'code1', realmId: '123', state: url.searchParams.get('state')! });
   return v.store.get('qbo_tokens') as { refreshToken: string };
 };
 
 describe('QboConnection', () => {
-  it('builds the authorisation address with the redirect, scope and a state', () => {
+  it('builds the authorisation address with the redirect, scope and a state', async () => {
     const { conn } = make([]);
-    const u = new URL(conn.authorizationUrl());
+    const u = new URL(await conn.authorizationUrl());
     expect(u.origin + u.pathname).toBe('https://appcenter.intuit.com/connect/oauth2');
     expect(u.searchParams.get('redirect_uri')).toBe(SETTINGS.redirectUri);
     expect(u.searchParams.get('scope')).toBe('com.intuit.quickbooks.accounting');
@@ -58,7 +61,7 @@ describe('QboConnection', () => {
 
   it('exchanges the code, stores the tokens in the vault, and the state works once only', async () => {
     const { conn, v, s } = make([{ status: 200, body: tokenBody('1') }]);
-    const url = new URL(conn.authorizationUrl());
+    const url = new URL(await conn.authorizationUrl());
     const state = url.searchParams.get('state')!;
     await conn.handleCallback({ code: 'c', realmId: '99', state });
     expect(s.calls[0]!.body).toContain('grant_type=authorization_code');
@@ -70,7 +73,7 @@ describe('QboConnection', () => {
   it('rejects an unknown or expired state and a denied authorisation without calling Intuit', async () => {
     const { conn, s, clock } = make([]);
     await expect(conn.handleCallback({ code: 'c', realmId: '1', state: 'nope' })).rejects.toThrow(/expired|not started/);
-    const state = new URL(conn.authorizationUrl()).searchParams.get('state')!;
+    const state = new URL(await conn.authorizationUrl()).searchParams.get('state')!;
     clock.t += 11 * 60_000;
     await expect(conn.handleCallback({ code: 'c', realmId: '1', state })).rejects.toThrow(/expired|not started/);
     await expect(conn.handleCallback({ error: 'access_denied' })).rejects.toThrow(/access_denied/);
@@ -153,7 +156,7 @@ describe('QboConnection', () => {
 
   it('is not connected before the first authorisation, and after the refresh token lapses', async () => {
     const { conn, v, clock } = make([{ status: 200, body: tokenBody('1') }]);
-    expect(await conn.status()).toEqual({ configured: true, connected: false, environment: 'production' });
+    expect(await conn.status()).toMatchObject({ configured: true, connected: false, environment: 'production', settingsSource: 'env' });
     await expect(conn.api('GET', 'query', {})).rejects.toBeInstanceOf(QboAuthError);
     await connect(conn, v);
     expect((await conn.status()).connected).toBe(true);
@@ -167,5 +170,48 @@ describe('QboConnection', () => {
     const { conn, v } = make([{ status: 200, body: tokenBody('1') }]);
     await connect(conn, v);
     expect(JSON.stringify(await conn.status())).not.toMatch(/acc-1|ref-1/);
+  });
+
+  describe('settings entered on the page', () => {
+    const form = { clientId: 'newid1234', clientSecret: 'newsecret', redirectUri: 'https://curia.test/books/qbo-callback', environment: 'production' };
+
+    it('saves the client id and secret, and they win over the environment', async () => {
+      const { conn, v } = make([]);
+      await conn.saveSettings(form);
+      expect(v.store.get('qbo_settings')).toEqual(form);
+      const u = new URL(await conn.authorizationUrl());
+      expect(u.searchParams.get('client_id')).toBe('newid1234');
+    });
+
+    it('works with nothing but the form, and never returns the secret', async () => {
+      const v = vault();
+      const conn = new QboConnection(null, v, createSilentLogger());
+      expect(await conn.status()).toEqual({ configured: false, connected: false });
+      await expect(conn.authorizationUrl()).rejects.toBeInstanceOf(QboAuthError);
+      await conn.saveSettings(form);
+      const st = await conn.status();
+      expect(st).toMatchObject({ configured: true, connected: false, settingsSource: 'vault', clientIdHint: '…1234', redirectUri: form.redirectUri });
+      expect(JSON.stringify(st)).not.toContain('newsecret');
+    });
+
+    it('rejects a blank secret, a non-https redirect and a bad environment', async () => {
+      const { conn, v } = make([]);
+      await expect(conn.saveSettings({ ...form, clientSecret: ' ' })).rejects.toBeInstanceOf(QboSettingsError);
+      await expect(conn.saveSettings({ ...form, redirectUri: 'http://curia.test/cb' })).rejects.toBeInstanceOf(QboSettingsError);
+      await expect(conn.saveSettings({ ...form, redirectUri: 'not a url' })).rejects.toBeInstanceOf(QboSettingsError);
+      await expect(conn.saveSettings({ ...form, environment: 'live' })).rejects.toBeInstanceOf(QboSettingsError);
+      expect(v.store.has('qbo_settings')).toBe(false);
+    });
+
+    it('drops the old connection when the client id (a different app) changes, but not when only the secret does', async () => {
+      const { conn, v } = make([{ status: 200, body: tokenBody('1') }]);
+      await connect(conn, v);
+      await conn.saveSettings({ ...form, clientId: 'cid' }); // same id as the environment's
+      expect(v.store.has('qbo_tokens')).toBe(true);
+      await conn.saveSettings({ ...form, clientId: 'cid', clientSecret: 'rotated' });
+      expect(v.store.has('qbo_tokens')).toBe(true);
+      await conn.saveSettings(form);
+      expect(v.store.has('qbo_tokens')).toBe(false);
+    });
   });
 });
