@@ -195,6 +195,7 @@ describe('ModelRegistry', () => {
   describe('AWS Bedrock Claude models', () => {
     const bedrockIds = ['global', 'us', 'eu'].flatMap((prefix) => [
       `${prefix}.anthropic.claude-sonnet-4-6`,
+      `${prefix}.anthropic.claude-sonnet-4-5-20250929-v1:0`,
       `${prefix}.anthropic.claude-haiku-4-5-20251001-v1:0`,
     ]);
 
