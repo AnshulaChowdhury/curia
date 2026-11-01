@@ -77,10 +77,10 @@
   --app-primary:      #091b52;
   --app-primary-fg:   #FFFFFF;
   --app-destructive:  #C24A30;
-  --app-teal:         #30689a;
-  --app-accent-fill:  #30689a;
-  --app-teal-soft:    rgba(48,104,154,0.10);
-  --app-blue:         #30689a;
+  --app-teal:         #234E78;
+  --app-accent-fill:  #234E78;
+  --app-teal-soft:    rgba(35,78,120,0.10);
+  --app-blue:         #234E78;
   --app-blue-soft:    #6F9CC8;
   --app-green:        #5E9E6B;
   --app-amber:        #C9874A;
@@ -111,7 +111,7 @@
   --app-primary-fg:   #091b52;
   --app-destructive:  #E86040;
   --app-teal:         #EFEFEF;
-  --app-accent-fill:  #30689a;
+  --app-accent-fill:  #234E78;
   --app-teal-soft:    rgba(239,239,239,0.12);
   --app-blue:         #53A0DB;
   --app-blue-soft:    #6F9CC8;
@@ -144,7 +144,7 @@
     --app-primary:      #DEE4EE;
     --app-primary-fg:   #091b52;
     --app-destructive:  #E86040;
-    --app-accent-fill:  #30689a;
+    --app-accent-fill:  #234E78;
     --app-teal:         #EFEFEF;
     --app-teal-soft:    rgba(239,239,239,0.12);
     --app-row-zebra:    rgba(255,255,255,0.025);
